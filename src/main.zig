@@ -12,7 +12,7 @@ fn usage() void {
         \\Usage:\n\
         \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
-        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --keep-last N]\n\
+        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N]\n\
         \\  pi-mono-zig replay --session <path.jsonl>\n\
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
@@ -48,6 +48,11 @@ fn safeId(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out;
 }
 
+fn tokensEstFromChars(chars: usize) usize {
+    // crude heuristic, good enough for MVP debug: ~4 chars per token
+    return (chars + 3) / 4;
+}
+
 fn doCompact(
     allocator: std.mem.Allocator,
     sm: *session.SessionManager,
@@ -55,6 +60,10 @@ fn doCompact(
     dry_run: bool,
     label: ?[]const u8,
     prefix: []const u8,
+    reason: ?[]const u8,
+    stats_total_chars: ?usize,
+    stats_threshold_chars: ?usize,
+    stats_threshold_tokens_est: ?usize,
 ) !struct { dryRun: bool, summaryText: []const u8, summaryId: ?[]const u8 } {
     const chain = try sm.buildContextEntries();
 
@@ -97,7 +106,15 @@ fn doCompact(
         return .{ .dryRun = true, .summaryText = sum_text, .summaryId = null };
     }
 
-    const summary_id = try sm.appendSummary(sum_text);
+    const summary_id = try sm.appendSummary(
+        sum_text,
+        reason,
+        stats_total_chars,
+        if (stats_total_chars) |tc| tokensEstFromChars(tc) else null,
+        keep_last,
+        stats_threshold_chars,
+        stats_threshold_tokens_est,
+    );
     if (label) |lab| {
         _ = try sm.setLabel(summary_id, lab);
     }
@@ -116,7 +133,15 @@ fn doCompact(
                 _ = try sm.appendToolResult(tr.tool, tr.ok, tr.content);
             },
             .summary => |s| {
-                _ = try sm.appendSummary(s.content);
+                _ = try sm.appendSummary(
+                    s.content,
+                    s.reason,
+                    s.totalChars,
+                    s.totalTokensEst,
+                    s.keepLast,
+                    s.thresholdChars,
+                    s.thresholdTokensEst,
+                );
             },
             else => {},
         }
@@ -277,6 +302,10 @@ pub fn main() !void {
                     .message => |m| std.debug.print("message {s} parent={s}\nrole={s}\ncontent={s}\n", .{ m.id, m.parentId orelse "(null)", m.role, m.content }),
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
+                    .summary => |s| std.debug.print(
+                        "summary {s} parent={s}\nreason={s}\nkeepLast={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.keepLast, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
+                    ),
                     else => {},
                 }
                 return;
@@ -378,6 +407,10 @@ pub fn main() !void {
             dry_run,
             label,
             "SUMMARY (naive):\n",
+            "manual",
+            null,
+            null,
+            null,
         );
 
         if (res.dryRun) {
@@ -634,6 +667,7 @@ pub fn main() !void {
         var allow_shell = false;
         var auto_compact = false;
         var max_chars: usize = 8_000;
+        var max_tokens_est: usize = 2_000;
         var keep_last: usize = 8;
 
         while (args.next()) |a| {
@@ -646,6 +680,9 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--max-chars")) {
                 const s = args.next() orelse return error.MissingMaxChars;
                 max_chars = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--max-tokens-est")) {
+                const s = args.next() orelse return error.MissingMaxTokensEst;
+                max_tokens_est = try std.fmt.parseInt(usize, s, 10);
             } else if (std.mem.eql(u8, a, "--keep-last")) {
                 const s = args.next() orelse return error.MissingKeepLast;
                 keep_last = try std.fmt.parseInt(usize, s, 10);
@@ -718,7 +755,9 @@ pub fn main() !void {
                     }
                 }
 
-                if (total > max_chars) {
+                const total_tokens_est = tokensEstFromChars(total);
+
+                if (total > max_chars or total_tokens_est > max_tokens_est) {
                     const res = try doCompact(
                         allocator,
                         &sm,
@@ -726,10 +765,14 @@ pub fn main() !void {
                         false,
                         "AUTO_COMPACT",
                         "AUTO_COMPACT (naive):\n",
+                        if (total > max_chars) "auto_chars" else "auto_tokens",
+                        total,
+                        max_chars,
+                        max_tokens_est,
                     );
                     std.debug.print(
-                        "[auto_compact] triggered total_chars={d} > {d} (keep_last={d}) summaryId={s}\n",
-                        .{ total, max_chars, keep_last, res.summaryId.? },
+                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (keep_last={d}) summaryId={s}\n",
+                        .{ total, max_chars, total_tokens_est, max_tokens_est, keep_last, res.summaryId.? },
                     );
                 }
             }

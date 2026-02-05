@@ -55,7 +55,19 @@ pub const SummaryEntry = struct {
     id: []const u8,
     parentId: ?[]const u8 = null,
     timestamp: []const u8,
+
+    /// Why this summary was created (manual|auto_chars|auto_tokens|...)
+    reason: ?[]const u8 = null,
+
+    /// Human readable summary text
     content: []const u8,
+
+    /// Optional stats snapshots for debugging/verification
+    totalChars: ?usize = null,
+    totalTokensEst: ?usize = null,
+    keepLast: ?usize = null,
+    thresholdChars: ?usize = null,
+    thresholdTokensEst: ?usize = null,
 };
 
 pub const Entry = union(enum) {

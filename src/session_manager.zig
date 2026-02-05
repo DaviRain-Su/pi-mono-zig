@@ -101,14 +101,29 @@ pub const SessionManager = struct {
         return id;
     }
 
-    pub fn appendSummary(self: *SessionManager, content: []const u8) ![]const u8 {
+    pub fn appendSummary(
+        self: *SessionManager,
+        content: []const u8,
+        reason: ?[]const u8,
+        totalChars: ?usize,
+        totalTokensEst: ?usize,
+        keepLast: ?usize,
+        thresholdChars: ?usize,
+        thresholdTokensEst: ?usize,
+    ) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = SummaryEntry{
             .id = id,
             .parentId = pid,
             .timestamp = try nowIso(self.arena),
+            .reason = reason,
             .content = content,
+            .totalChars = totalChars,
+            .totalTokensEst = totalTokensEst,
+            .keepLast = keepLast,
+            .thresholdChars = thresholdChars,
+            .thresholdTokensEst = thresholdTokensEst,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -265,12 +280,33 @@ pub const SessionManager = struct {
                 const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
                 const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const reason0 = if (obj.get("reason")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+
+                const totalChars0 = if (obj.get("totalChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const totalTokensEst0 = if (obj.get("totalTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const keepLast0 = if (obj.get("keepLast")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const thresholdChars0 = if (obj.get("thresholdChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const thresholdTokensEst0 = if (obj.get("thresholdTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
+                const reason = try dup.os(self.arena, reason0);
                 const content = try dup.s(self.arena, content0);
-                try out.append(self.arena, .{ .summary = .{ .id = id, .parentId = pid, .timestamp = ts, .content = content } });
+
+                try out.append(self.arena, .{ .summary = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .reason = reason,
+                    .content = content,
+                    .totalChars = totalChars0,
+                    .totalTokensEst = totalTokensEst0,
+                    .keepLast = keepLast0,
+                    .thresholdChars = thresholdChars0,
+                    .thresholdTokensEst = thresholdTokensEst0,
+                } });
                 continue;
             }
 
