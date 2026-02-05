@@ -106,11 +106,18 @@ fn doCompact(
     }
 
     // Turn-boundary: move start backwards until it is immediately AFTER a persisted turn_end.
+    // Prefer a turn_end with phase="final" (or "error") so we cut after a complete user-turn.
     // i.e. tail begins at the start of the next complete turn.
     while (start > 0) {
         const prev = nodes.items[start - 1];
         switch (prev) {
-            .turn_end => break,
+            .turn_end => |te| {
+                if (te.phase) |ph| {
+                    if (std.mem.eql(u8, ph, "final") or std.mem.eql(u8, ph, "error")) break;
+                }
+                // if not a complete turn end, keep searching backwards
+                start -= 1;
+            },
             else => start -= 1,
         }
     }
