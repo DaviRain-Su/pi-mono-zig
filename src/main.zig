@@ -90,7 +90,18 @@ fn doCompact(
     }
 
     const n = nodes.items.len;
-    const start = if (n > keep_last) n - keep_last else 0;
+    var start: usize = if (n > keep_last) n - keep_last else 0;
+
+    // TS-ish compaction cut alignment:
+    // Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
+    // Minimal rule: if cut lands on a tool_result, move it back until it lands on a non-tool_result.
+    while (start > 0) {
+        const e = nodes.items[start];
+        switch (e) {
+            .tool_result => start -= 1,
+            else => break,
+        }
+    }
 
     var sum_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer sum_buf.deinit(allocator);
