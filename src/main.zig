@@ -1,12 +1,17 @@
 const std = @import("std");
 const root = @import("root.zig");
+const session = @import("session_manager.zig");
+const tools = @import("tools.zig");
+const agent_loop = @import("agent_loop.zig");
 
 fn usage() void {
     std.debug.print(
         \\pi-mono-zig (MVP)\n\n\
         \\Usage:\n\
         \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
-        \\  pi-mono-zig verify --run <runId> [--out runs]\n\n\
+        \\  pi-mono-zig verify --run <runId> [--out runs]\n\
+        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell]\n\
+        \\  pi-mono-zig replay --session <path.jsonl>\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -112,6 +117,93 @@ pub fn main() !void {
         usage();
         return;
     };
+
+    if (std.mem.eql(u8, cmd, "replay")) {
+        var session_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        const msgs = try sm.loadMessages();
+        for (msgs) |m| {
+            std.debug.print("[{s}] {s}\n", .{ m.role, m.content });
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "chat")) {
+        var session_path: ?[]const u8 = null;
+        var allow_shell = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--allow-shell")) {
+                allow_shell = true;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        var reg = tools.ToolRegistry.init(allocator);
+        reg.allow_shell = allow_shell;
+        var loop = agent_loop.AgentLoop.init(allocator, &sm, &reg);
+
+        std.debug.print("chat session: {s}\n", .{sp});
+        std.debug.print("type messages. ctrl-d to exit.\n", .{});
+
+        const stdin_file = std.fs.File.stdin();
+        var reader = std.fs.File.deprecatedReader(stdin_file);
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            std.debug.print("> ", .{});
+            const line_opt = try reader.readUntilDelimiterOrEof(&buf, '\n');
+            if (line_opt == null) break;
+            const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
+            if (line.len == 0) continue;
+
+            try sm.appendMessage("user", line);
+
+            // Run model/tools until it returns a final_text (step() -> true)
+            while (true) {
+                const done = try loop.step();
+                if (done) break;
+            }
+
+            // Print last assistant message
+            const msgs = try sm.loadMessages();
+            var i: usize = msgs.len;
+            while (i > 0) : (i -= 1) {
+                const m = msgs[i - 1];
+                if (std.mem.eql(u8, m.role, "assistant")) {
+                    std.debug.print("{s}\n", .{m.content});
+                    break;
+                }
+            }
+        }
+        return;
+    }
 
     if (std.mem.eql(u8, cmd, "verify")) {
         var run_id: ?[]const u8 = null;

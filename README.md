@@ -34,6 +34,22 @@ zig build run -- run --plan examples/hello.plan.json
 zig build run -- verify --run <runId>
 ```
 
+## Chat loop (TS-style: messages + tools + session log)
+
+This is a *minimal* AgentLoop clone (uses a deterministic mock model).
+
+```bash
+# creates/extends a JSONL session
+zig build run -- chat --session /tmp/pi-session.jsonl
+
+# replay the JSONL log
+zig build run -- replay --session /tmp/pi-session.jsonl
+```
+
+Try:
+- `echo: hello`
+- `sh: ls` (only if you pass `--allow-shell`)
+
 This currently checks:
 - `runs/<runId>/plan.json` exists and is valid
 - `runs/<runId>/run.json` exists
