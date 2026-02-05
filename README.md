@@ -43,6 +43,7 @@ JSONL entries are now structured (not just plain messages):
 - `type: message`
 - `type: tool_call`
 - `type: tool_result`
+- `type: leaf` (tracks current leaf for branching)
 
 ```bash
 # creates/extends a JSONL session
@@ -55,6 +56,15 @@ zig build run -- replay --session /tmp/pi-session.jsonl
 Try:
 - `echo: hello`
 - `sh: ls` (only if you pass `--allow-shell`)
+
+Branching (session tree MVP):
+```bash
+# pick an entryId from the JSONL (e.g. a message/tool_result id)
+zig build run -- branch --session /tmp/pi-session.jsonl --to <entryId>
+
+# replay follows current leaf (root -> leaf path)
+zig build run -- replay --session /tmp/pi-session.jsonl
+```
 
 This currently checks:
 - `runs/<runId>/plan.json` exists and is valid

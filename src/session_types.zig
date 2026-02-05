@@ -11,6 +11,7 @@ pub const SessionHeader = struct {
 pub const MessageEntry = struct {
     type: []const u8 = "message",
     id: []const u8,
+    parentId: ?[]const u8 = null,
     timestamp: []const u8,
     role: []const u8, // user|assistant|tool
     content: []const u8,
@@ -19,6 +20,7 @@ pub const MessageEntry = struct {
 pub const ToolCallEntry = struct {
     type: []const u8 = "tool_call",
     id: []const u8,
+    parentId: ?[]const u8 = null,
     timestamp: []const u8,
     tool: []const u8,
     arg: []const u8,
@@ -27,10 +29,17 @@ pub const ToolCallEntry = struct {
 pub const ToolResultEntry = struct {
     type: []const u8 = "tool_result",
     id: []const u8,
+    parentId: ?[]const u8 = null,
     timestamp: []const u8,
     tool: []const u8,
     ok: bool,
     content: []const u8,
+};
+
+pub const LeafEntry = struct {
+    type: []const u8 = "leaf",
+    timestamp: []const u8,
+    targetId: ?[]const u8,
 };
 
 pub const Entry = union(enum) {
@@ -38,6 +47,7 @@ pub const Entry = union(enum) {
     message: MessageEntry,
     tool_call: ToolCallEntry,
     tool_result: ToolResultEntry,
+    leaf: LeafEntry,
 };
 
 pub fn roleOf(e: Entry) ?[]const u8 {
@@ -50,6 +60,24 @@ pub fn roleOf(e: Entry) ?[]const u8 {
 pub fn contentOf(e: Entry) ?[]const u8 {
     return switch (e) {
         .message => |m| m.content,
+        else => null,
+    };
+}
+
+pub fn idOf(e: Entry) ?[]const u8 {
+    return switch (e) {
+        .message => |m| m.id,
+        .tool_call => |t| t.id,
+        .tool_result => |t| t.id,
+        else => null,
+    };
+}
+
+pub fn parentIdOf(e: Entry) ?[]const u8 {
+    return switch (e) {
+        .message => |m| m.parentId,
+        .tool_call => |t| t.parentId,
+        .tool_result => |t| t.parentId,
         else => null,
     };
 }

@@ -15,8 +15,21 @@ pub const ModelOutput = union(enum) {
 ///   - "sh:" => tool_call shell
 ///   - else => final ok
 pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
-    if (entries.len > 0) {
-        const last = entries[entries.len - 1];
+    // Find last significant entry (skip session/leaf)
+    var last_sig: ?st.Entry = null;
+    var j: usize = entries.len;
+    while (j > 0) : (j -= 1) {
+        const e = entries[j - 1];
+        switch (e) {
+            .session, .leaf => continue,
+            else => {
+                last_sig = e;
+                break;
+            },
+        }
+    }
+
+    if (last_sig) |last| {
         switch (last) {
             .tool_result => |tr| {
                 if (tr.ok) {
@@ -28,22 +41,19 @@ pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
         }
     }
 
-    var last_user: ?[]const u8 = null;
-    var i: usize = entries.len;
-    while (i > 0) : (i -= 1) {
-        const e = entries[i - 1];
-        switch (e) {
-            .message => |m| {
-                if (std.mem.eql(u8, m.role, "user")) {
-                    last_user = m.content;
-                    break;
-                }
-            },
-            else => {},
+    const text = blk: {
+        var i: usize = entries.len;
+        while (i > 0) : (i -= 1) {
+            const e = entries[i - 1];
+            switch (e) {
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "user")) break :blk m.content;
+                },
+                else => {},
+            }
         }
-    }
-
-    const text = last_user orelse return .{ .final_text = "(no user input)" };
+        break :blk null;
+    } orelse return .{ .final_text = "(no user input)" };
 
     if (std.mem.startsWith(u8, text, "echo:")) {
         const arg = std.mem.trimLeft(u8, text[5..], " ");

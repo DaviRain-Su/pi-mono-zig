@@ -12,7 +12,8 @@ fn usage() void {
         \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell]\n\
-        \\  pi-mono-zig replay --session <path.jsonl>\n\n\
+        \\  pi-mono-zig replay --session <path.jsonl>\n\
+        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -119,6 +120,32 @@ pub fn main() !void {
         return;
     };
 
+    if (std.mem.eql(u8, cmd, "branch")) {
+        var session_path: ?[]const u8 = null;
+        var to_id: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--to")) {
+                to_id = args.next() orelse return error.MissingTo;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        try sm.branchTo(to_id);
+        std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, to_id orelse "(null)" });
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "replay")) {
         var session_path: ?[]const u8 = null;
         while (args.next()) |a| {
@@ -138,13 +165,13 @@ pub fn main() !void {
 
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
-        const entries = try sm.loadEntries();
+        const entries = try sm.buildContextEntries();
         for (entries) |e| {
             switch (e) {
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
-                .session => |_| {},
+                .session, .leaf => {},
             }
         }
         return;
@@ -207,7 +234,7 @@ pub fn main() !void {
             const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
             if (line.len == 0) continue;
 
-            try sm.appendMessage("user", line);
+            _ = try sm.appendMessage("user", line);
 
             // Run model/tools until it returns a final_text (step() -> true)
             while (true) {
