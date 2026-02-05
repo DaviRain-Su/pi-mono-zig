@@ -713,7 +713,36 @@ pub fn main() !void {
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
-                .summary => |s| std.debug.print("[summary] {s}\n", .{s.content}),
+                .summary => |s| {
+                    if (std.mem.eql(u8, s.format, "json")) {
+                        // Pretty render JSON summary (brief)
+                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, s.content, .{}) catch {
+                            std.debug.print("[summary] (invalid json) {s}\n", .{s.content});
+                            break;
+                        };
+                        defer parsed.deinit();
+                        const obj = switch (parsed.value) {
+                            .object => |o| o,
+                            else => {
+                                std.debug.print("[summary] {s}\n", .{s.content});
+                                break;
+                            },
+                        };
+                        const progress = if (obj.get("progress")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                        const next_steps = if (obj.get("next_steps")) |v| switch (v) { .array => |a| a.items, else => &.{} } else &.{};
+
+                        std.debug.print("[summary] progress:\n{s}\n", .{progress});
+                        if (next_steps.len > 0) {
+                            std.debug.print("[summary] next_steps:\n", .{});
+                            for (next_steps) |it| {
+                                const s2 = switch (it) { .string => |t| t, else => "" };
+                                if (s2.len > 0) std.debug.print("- {s}\n", .{s2});
+                            }
+                        }
+                    } else {
+                        std.debug.print("[summary] {s}\n", .{s.content});
+                    }
+                },
                 .label => |l| std.debug.print("[label] {s} -> {s}\n", .{ l.targetId, l.label orelse "(null)" }),
                 .session, .leaf => {},
             }
