@@ -76,6 +76,9 @@ zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>
 
 # show full session tree ("*" marks current leaf path)
 zig build run -- tree --session /tmp/pi-session.jsonl
+
+# compact current leaf path into a summary + keep last N nodes
+zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8
 ```
 
 This currently checks:

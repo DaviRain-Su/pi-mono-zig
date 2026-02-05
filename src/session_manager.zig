@@ -8,6 +8,7 @@ pub const ToolCallEntry = st.ToolCallEntry;
 pub const ToolResultEntry = st.ToolResultEntry;
 pub const LeafEntry = st.LeafEntry;
 pub const LabelEntry = st.LabelEntry;
+pub const SummaryEntry = st.SummaryEntry;
 pub const Entry = st.Entry;
 
 pub const SessionManager = struct {
@@ -97,6 +98,20 @@ pub const SessionManager = struct {
             .label = label,
         };
         try json_util.appendJsonLine(self.session_path, entry);
+        return id;
+    }
+
+    pub fn appendSummary(self: *SessionManager, content: []const u8) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = SummaryEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .content = content,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
         return id;
     }
 
@@ -243,6 +258,19 @@ pub const SessionManager = struct {
                 const targetId = try dup.s(self.arena, target0);
                 const label = try dup.os(self.arena, label0);
                 try out.append(self.arena, .{ .label = .{ .id = id, .timestamp = ts, .targetId = targetId, .label = label } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "summary")) {
+                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const content = try dup.s(self.arena, content0);
+                try out.append(self.arena, .{ .summary = .{ .id = id, .parentId = pid, .timestamp = ts, .content = content } });
                 continue;
             }
 

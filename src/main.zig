@@ -18,7 +18,8 @@ fn usage() void {
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
-        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\n\
+        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -261,6 +262,105 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "compact")) {
+        var session_path: ?[]const u8 = null;
+        var keep_last: usize = 8;
+
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--keep-last")) {
+                const s = args.next() orelse return error.MissingKeepLast;
+                keep_last = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+
+        // Build current context chain
+        const chain = try sm.buildContextEntries();
+
+        // Keep last N node entries (excluding labels/leaf/session)
+        var nodes = try std.ArrayList(st.Entry).initCapacity(allocator, chain.len);
+        defer nodes.deinit(allocator);
+        for (chain) |e| {
+            switch (e) {
+                .session, .leaf, .label => {},
+                else => try nodes.append(allocator, e),
+            }
+        }
+
+        const n = nodes.items.len;
+        const start = if (n > keep_last) n - keep_last else 0;
+
+        // Generate a naive summary from earlier messages
+        var sum_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
+        defer sum_buf.deinit(allocator);
+        try sum_buf.appendSlice(allocator, "SUMMARY (naive):\n");
+        var i: usize = 0;
+        while (i < start) : (i += 1) {
+            const e = nodes.items[i];
+            switch (e) {
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                        const preview = if (m.content.len > 80) m.content[0..80] else m.content;
+                        try sum_buf.appendSlice(allocator, m.role);
+                        try sum_buf.appendSlice(allocator, ": ");
+                        try sum_buf.appendSlice(allocator, preview);
+                        try sum_buf.appendSlice(allocator, "\n");
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const sum_text = try sum_buf.toOwnedSlice(allocator);
+
+        // Create new compacted branch: summary -> clones of tail
+        const summary_id = try sm.appendSummary(sum_text);
+        var parent_id: []const u8 = summary_id;
+
+        var j: usize = start;
+        while (j < n) : (j += 1) {
+            const e = nodes.items[j];
+            switch (e) {
+                .message => |m| {
+                    // re-append as new message node
+                    // NOTE: we don't preserve original ids; this is a new branch.
+                    const new_id = try sm.appendMessage(m.role, m.content);
+                    parent_id = new_id;
+                },
+                .tool_call => |tc| {
+                    const new_id = try sm.appendToolCall(tc.tool, tc.arg);
+                    parent_id = new_id;
+                },
+                .tool_result => |tr| {
+                    const new_id = try sm.appendToolResult(tr.tool, tr.ok, tr.content);
+                    parent_id = new_id;
+                },
+                .summary => |s| {
+                    const new_id = try sm.appendSummary(s.content);
+                    parent_id = new_id;
+                },
+                else => {},
+            }
+        }
+
+        std.debug.print("ok: true\ncompacted: {s}\nsummaryId: {s}\n", .{ sp, summary_id });
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "tree")) {
         var session_path: ?[]const u8 = null;
         var max_depth: usize = 64;
@@ -410,6 +510,14 @@ pub fn main() !void {
                             std.debug.print("{s} {s} tool_result {s} ok={any}\n", .{ mark, id, tr.tool, tr.ok });
                         }
                     },
+                    .summary => |s| {
+                        const preview = if (s.content.len > 40) s.content[0..40] else s.content;
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} summary \"{s}\" [{s}]\n", .{ mark, id, preview, lab });
+                        } else {
+                            std.debug.print("{s} {s} summary \"{s}\"\n", .{ mark, id, preview });
+                        }
+                    },
                     else => {},
                 }
 
@@ -485,6 +593,7 @@ pub fn main() !void {
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
+                .summary => |s| std.debug.print("[summary] {s}\n", .{s.content}),
                 .label => |l| std.debug.print("[label] {s} -> {s}\n", .{ l.targetId, l.label orelse "(null)" }),
                 .session, .leaf => {},
             }
