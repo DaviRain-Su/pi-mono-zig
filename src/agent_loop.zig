@@ -40,7 +40,7 @@ pub const AgentLoop = struct {
         };
 
         self.turn += 1;
-        _ = try self.session_mgr.appendTurnStart(self.turn, user_mid);
+        _ = try self.session_mgr.appendTurnStart(self.turn, user_mid, "step");
         self.bus.emit(.{ .turn_start = .{ .turn = self.turn } });
 
         const out = try mock_model.next(self.arena, entries);
@@ -48,7 +48,7 @@ pub const AgentLoop = struct {
             .final_text => |t| {
                 _ = try self.session_mgr.appendMessage("assistant", t);
                 self.bus.emit(.{ .message_append = .{ .role = "assistant", .content = t } });
-                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid);
+                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, "final");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                 return true;
             },
@@ -61,7 +61,7 @@ pub const AgentLoop = struct {
                     const err_line = try std.fmt.allocPrint(self.arena, "{s}", .{@errorName(e)});
                     _ = try self.session_mgr.appendToolResult(c.tool, false, err_line);
                     self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = false, .content = err_line } });
-                    _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid);
+                    _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, "error");
                     self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                     return false;
                 };
@@ -69,7 +69,7 @@ pub const AgentLoop = struct {
                 _ = try self.session_mgr.appendToolResult(c.tool, true, res.content);
                 self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = true, .content = res.content } });
 
-                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid);
+                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, "tool");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                 return false; // not done, need another model step
             },
