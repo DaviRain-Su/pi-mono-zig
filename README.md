@@ -84,6 +84,7 @@ zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run
 
 # auto-compact while chatting (naive char-count threshold)
+# (now calls the same compaction logic: summary + keep-last tail clone)
 zig build run -- chat --session /tmp/pi-session.jsonl --auto-compact --max-chars 8000 --keep-last 8
 ```
 

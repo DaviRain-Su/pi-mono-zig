@@ -48,6 +48,83 @@ fn safeId(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out;
 }
 
+fn doCompact(
+    allocator: std.mem.Allocator,
+    sm: *session.SessionManager,
+    keep_last: usize,
+    dry_run: bool,
+    label: ?[]const u8,
+    prefix: []const u8,
+) !struct { dryRun: bool, summaryText: []const u8, summaryId: ?[]const u8 } {
+    const chain = try sm.buildContextEntries();
+
+    var nodes = try std.ArrayList(st.Entry).initCapacity(allocator, chain.len);
+    defer nodes.deinit(allocator);
+    for (chain) |e| {
+        switch (e) {
+            .session, .leaf, .label => {},
+            else => try nodes.append(allocator, e),
+        }
+    }
+
+    const n = nodes.items.len;
+    const start = if (n > keep_last) n - keep_last else 0;
+
+    var sum_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
+    defer sum_buf.deinit(allocator);
+    try sum_buf.appendSlice(allocator, prefix);
+
+    var i: usize = 0;
+    while (i < start) : (i += 1) {
+        const e = nodes.items[i];
+        switch (e) {
+            .message => |m| {
+                if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                    const preview = if (m.content.len > 80) m.content[0..80] else m.content;
+                    try sum_buf.appendSlice(allocator, m.role);
+                    try sum_buf.appendSlice(allocator, ": ");
+                    try sum_buf.appendSlice(allocator, preview);
+                    try sum_buf.appendSlice(allocator, "\n");
+                }
+            },
+            else => {},
+        }
+    }
+
+    const sum_text = try sum_buf.toOwnedSlice(allocator);
+
+    if (dry_run) {
+        return .{ .dryRun = true, .summaryText = sum_text, .summaryId = null };
+    }
+
+    const summary_id = try sm.appendSummary(sum_text);
+    if (label) |lab| {
+        _ = try sm.setLabel(summary_id, lab);
+    }
+
+    var j: usize = start;
+    while (j < n) : (j += 1) {
+        const e = nodes.items[j];
+        switch (e) {
+            .message => |m| {
+                _ = try sm.appendMessage(m.role, m.content);
+            },
+            .tool_call => |tc| {
+                _ = try sm.appendToolCall(tc.tool, tc.arg);
+            },
+            .tool_result => |tr| {
+                _ = try sm.appendToolResult(tr.tool, tr.ok, tr.content);
+            },
+            .summary => |s| {
+                _ = try sm.appendSummary(s.content);
+            },
+            else => {},
+        }
+    }
+
+    return .{ .dryRun = false, .summaryText = sum_text, .summaryId = summary_id };
+}
+
 fn verifyRun(arena: std.mem.Allocator, out_dir: []const u8, run_id: []const u8) !void {
     const run_path = try std.fs.path.join(arena, &.{ out_dir, run_id });
     const plan_path = try std.fs.path.join(arena, &.{ run_path, "plan.json" });
@@ -294,84 +371,21 @@ pub fn main() !void {
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
 
-        // Build current context chain
-        const chain = try sm.buildContextEntries();
+        const res = try doCompact(
+            allocator,
+            &sm,
+            keep_last,
+            dry_run,
+            label,
+            "SUMMARY (naive):\n",
+        );
 
-        // Keep last N node entries (excluding labels/leaf/session)
-        var nodes = try std.ArrayList(st.Entry).initCapacity(allocator, chain.len);
-        defer nodes.deinit(allocator);
-        for (chain) |e| {
-            switch (e) {
-                .session, .leaf, .label => {},
-                else => try nodes.append(allocator, e),
-            }
-        }
-
-        const n = nodes.items.len;
-        const start = if (n > keep_last) n - keep_last else 0;
-
-        // Generate a naive summary from earlier messages
-        var sum_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
-        defer sum_buf.deinit(allocator);
-        try sum_buf.appendSlice(allocator, "SUMMARY (naive):\n");
-        var i: usize = 0;
-        while (i < start) : (i += 1) {
-            const e = nodes.items[i];
-            switch (e) {
-                .message => |m| {
-                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
-                        const preview = if (m.content.len > 80) m.content[0..80] else m.content;
-                        try sum_buf.appendSlice(allocator, m.role);
-                        try sum_buf.appendSlice(allocator, ": ");
-                        try sum_buf.appendSlice(allocator, preview);
-                        try sum_buf.appendSlice(allocator, "\n");
-                    }
-                },
-                else => {},
-            }
-        }
-
-        const sum_text = try sum_buf.toOwnedSlice(allocator);
-
-        if (dry_run) {
-            std.debug.print("ok: true\ndryRun: true\nsummaryPreview:\n{s}\n", .{sum_text});
+        if (res.dryRun) {
+            std.debug.print("ok: true\ndryRun: true\nsummaryPreview:\n{s}\n", .{res.summaryText});
             return;
         }
 
-        // Create new compacted branch: summary -> clones of tail
-        const summary_id = try sm.appendSummary(sum_text);
-        if (label) |lab| {
-            _ = try sm.setLabel(summary_id, lab);
-        }
-        var parent_id: []const u8 = summary_id;
-
-        var j: usize = start;
-        while (j < n) : (j += 1) {
-            const e = nodes.items[j];
-            switch (e) {
-                .message => |m| {
-                    // re-append as new message node
-                    // NOTE: we don't preserve original ids; this is a new branch.
-                    const new_id = try sm.appendMessage(m.role, m.content);
-                    parent_id = new_id;
-                },
-                .tool_call => |tc| {
-                    const new_id = try sm.appendToolCall(tc.tool, tc.arg);
-                    parent_id = new_id;
-                },
-                .tool_result => |tr| {
-                    const new_id = try sm.appendToolResult(tr.tool, tr.ok, tr.content);
-                    parent_id = new_id;
-                },
-                .summary => |s| {
-                    const new_id = try sm.appendSummary(s.content);
-                    parent_id = new_id;
-                },
-                else => {},
-            }
-        }
-
-        std.debug.print("ok: true\ncompacted: {s}\nsummaryId: {s}\n", .{ sp, summary_id });
+        std.debug.print("ok: true\ncompacted: {s}\nsummaryId: {s}\n", .{ sp, res.summaryId.? });
         return;
     }
 
@@ -705,11 +719,17 @@ pub fn main() !void {
                 }
 
                 if (total > max_chars) {
-                    _ = try sm.appendSummary("AUTO_COMPACT (naive)\n");
-                    // TODO: actually preserve last keep_last nodes (like `compact` command).
+                    const res = try doCompact(
+                        allocator,
+                        &sm,
+                        keep_last,
+                        false,
+                        "AUTO_COMPACT",
+                        "AUTO_COMPACT (naive):\n",
+                    );
                     std.debug.print(
-                        "[auto_compact] triggered total_chars={d} > {d} (keep_last={d})\n",
-                        .{ total, max_chars, keep_last },
+                        "[auto_compact] triggered total_chars={d} > {d} (keep_last={d}) summaryId={s}\n",
+                        .{ total, max_chars, keep_last, res.summaryId.? },
                     );
                 }
             }
