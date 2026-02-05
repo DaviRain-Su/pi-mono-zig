@@ -86,7 +86,9 @@ zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run
 # TS-aligned structured summary (markdown)
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run --structured md
 
-# Update an existing structured summary (naive merge; appends to Critical Context)
+# Update an existing structured summary (naive merge):
+# - ensures Next Steps / In Progress placeholders are actionable
+# - appends new snippets into Critical Context
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --structured md --update
 
 # structured summary (json)

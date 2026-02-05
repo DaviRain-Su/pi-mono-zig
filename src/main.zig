@@ -208,7 +208,65 @@ fn doCompact(
             }
         } else {
             // Merge mode
-            const base = prev_summary.?;
+            // Naive TS-aligned updates:
+            // - If Next Steps is "1. (none)", replace with a placeholder actionable step.
+            // - If Progress/In Progress is "- (none)", replace with a placeholder.
+            // - Append new message snippets into Critical Context (existing behavior).
+            const base0 = prev_summary.?;
+
+            // Preprocess: patch a couple of common "(none)" placeholders.
+            var base_buf = try std.ArrayList(u8).initCapacity(allocator, base0.len + 128);
+            defer base_buf.deinit(allocator);
+
+            const pat_next = "## Next Steps\n1. (none)\n";
+            const rep_next = "## Next Steps\n1. Review new messages since last checkpoint\n";
+            const pat_prog = "### In Progress\n- (none)\n";
+            const rep_prog = "### In Progress\n- [ ] Review new messages since last checkpoint\n";
+
+            const idx_next = std.mem.indexOf(u8, base0, pat_next);
+            const idx_prog = std.mem.indexOf(u8, base0, pat_prog);
+
+            // Apply replacements in a deterministic order by earliest match.
+            var cursor: usize = 0;
+            while (cursor < base0.len) {
+                var next_pos: ?usize = null;
+                var which: u8 = 0;
+
+                if (idx_next) |p| {
+                    if (p >= cursor and (next_pos == null or p < next_pos.?)) {
+                        next_pos = p;
+                        which = 1;
+                    }
+                }
+                if (idx_prog) |p| {
+                    if (p >= cursor and (next_pos == null or p < next_pos.?)) {
+                        next_pos = p;
+                        which = 2;
+                    }
+                }
+
+                if (next_pos == null) {
+                    try base_buf.appendSlice(allocator, base0[cursor..]);
+                    break;
+                }
+
+                const p = next_pos.?;
+                try base_buf.appendSlice(allocator, base0[cursor..p]);
+                if (which == 1) {
+                    try base_buf.appendSlice(allocator, rep_next);
+                    cursor = p + pat_next.len;
+                } else if (which == 2) {
+                    try base_buf.appendSlice(allocator, rep_prog);
+                    cursor = p + pat_prog.len;
+                } else {
+                    // should not happen
+                    try base_buf.appendSlice(allocator, base0[p..]);
+                    break;
+                }
+            }
+
+            const base = try base_buf.toOwnedSlice(allocator);
+
             // Find insertion point: after "## Critical Context\n" heading.
             const needle = "## Critical Context\n";
             const pos_opt = std.mem.indexOf(u8, base, needle);
