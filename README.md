@@ -57,13 +57,22 @@ Try:
 - `echo: hello`
 - `sh: ls` (only if you pass `--allow-shell`)
 
-Branching (session tree MVP):
+Branching + labels (session tree MVP):
 ```bash
-# pick an entryId from the JSONL (e.g. a message/tool_result id)
+# list current leaf path (shows entryIds)
+zig build run -- list --session /tmp/pi-session.jsonl
+
+# label a node
+zig build run -- label --session /tmp/pi-session.jsonl --to <entryId> --label ROOT
+
+# branch leaf to an earlier node
 zig build run -- branch --session /tmp/pi-session.jsonl --to <entryId>
 
 # replay follows current leaf (root -> leaf path)
 zig build run -- replay --session /tmp/pi-session.jsonl
+
+# show full details for one entry
+zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>
 ```
 
 This currently checks:

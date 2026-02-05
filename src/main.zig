@@ -4,6 +4,7 @@ const session = @import("session_manager.zig");
 const tools = @import("tools.zig");
 const agent_loop = @import("agent_loop.zig");
 const events = @import("events.zig");
+const st = @import("session_types.zig");
 
 fn usage() void {
     std.debug.print(
@@ -13,7 +14,10 @@ fn usage() void {
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell]\n\
         \\  pi-mono-zig replay --session <path.jsonl>\n\
-        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\n\
+        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
+        \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
+        \\  pi-mono-zig list --session <path.jsonl>\n\
+        \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -120,6 +124,142 @@ pub fn main() !void {
         return;
     };
 
+    if (std.mem.eql(u8, cmd, "label")) {
+        var session_path: ?[]const u8 = null;
+        var to_id: ?[]const u8 = null;
+        var label: ?[]const u8 = null;
+
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--to")) {
+                to_id = args.next() orelse return error.MissingTo;
+            } else if (std.mem.eql(u8, a, "--label")) {
+                label = args.next() orelse return error.MissingLabel;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+        const tid = to_id orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        _ = try sm.setLabel(tid, label);
+        std.debug.print("ok: true\nlabel: {s} -> {s} = {s}\n", .{ sp, tid, label orelse "(null)" });
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "show")) {
+        var session_path: ?[]const u8 = null;
+        var id: ?[]const u8 = null;
+
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--id")) {
+                id = args.next() orelse return error.MissingId;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+        const target = id orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        const entries = try sm.loadEntries();
+        for (entries) |e| {
+            if (st: {
+                if (st.idOf(e)) |eid| break :st std.mem.eql(u8, eid, target);
+                break :st false;
+            }) {
+                switch (e) {
+                    .message => |m| std.debug.print("message {s} parent={s}\nrole={s}\ncontent={s}\n", .{ m.id, m.parentId orelse "(null)", m.role, m.content }),
+                    .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
+                    .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
+                    else => {},
+                }
+                return;
+            }
+        }
+        return error.NotFound;
+    }
+
+    if (std.mem.eql(u8, cmd, "list")) {
+        var session_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+
+        // Build label map
+        const entries_all = try sm.loadEntries();
+        var labels = std.StringHashMap([]const u8).init(allocator);
+        defer labels.deinit();
+        for (entries_all) |e| {
+            switch (e) {
+                .label => |l| {
+                    if (l.label) |name| {
+                        try labels.put(l.targetId, name);
+                    } else {
+                        _ = labels.remove(l.targetId);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const entries = try sm.buildContextEntries();
+        var idx: usize = 0;
+        for (entries) |e| {
+            idx += 1;
+            if (st.idOf(e)) |eid| {
+                const lab = labels.get(eid) orelse "";
+                switch (e) {
+                    .message => |m| std.debug.print("{d}. {s} message {s} {s}\n", .{ idx, eid, m.role, if (lab.len > 0) lab else "" }),
+                    .tool_call => |tc| std.debug.print("{d}. {s} tool_call {s} arg={s} {s}\n", .{ idx, eid, tc.tool, tc.arg, if (lab.len > 0) lab else "" }),
+                    .tool_result => |tr| std.debug.print("{d}. {s} tool_result {s} ok={any} {s}\n", .{ idx, eid, tr.tool, tr.ok, if (lab.len > 0) lab else "" }),
+                    else => {},
+                }
+            }
+        }
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "branch")) {
         var session_path: ?[]const u8 = null;
         var to_id: ?[]const u8 = null;
@@ -171,6 +311,7 @@ pub fn main() !void {
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
+                .label => |l| std.debug.print("[label] {s} -> {s}\n", .{ l.targetId, l.label orelse "(null)" }),
                 .session, .leaf => {},
             }
         }

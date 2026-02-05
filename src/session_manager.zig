@@ -7,6 +7,7 @@ pub const MessageEntry = st.MessageEntry;
 pub const ToolCallEntry = st.ToolCallEntry;
 pub const ToolResultEntry = st.ToolResultEntry;
 pub const LeafEntry = st.LeafEntry;
+pub const LabelEntry = st.LabelEntry;
 pub const Entry = st.Entry;
 
 pub const SessionManager = struct {
@@ -85,6 +86,18 @@ pub const SessionManager = struct {
 
     pub fn branchTo(self: *SessionManager, targetId: ?[]const u8) !void {
         try self.setLeaf(targetId);
+    }
+
+    pub fn setLabel(self: *SessionManager, targetId: []const u8, label: ?[]const u8) ![]const u8 {
+        const id = try self.newId();
+        const entry = LabelEntry{
+            .id = id,
+            .timestamp = try nowIso(self.arena),
+            .targetId = targetId,
+            .label = label,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        return id;
     }
 
     pub fn appendMessage(self: *SessionManager, role: []const u8, content: []const u8) ![]const u8 {
@@ -217,6 +230,19 @@ pub const SessionManager = struct {
                 const ts = try dup.s(self.arena, ts0);
                 const tid = try dup.os(self.arena, tid0);
                 try out.append(self.arena, .{ .leaf = .{ .timestamp = ts, .targetId = tid } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "label")) {
+                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const target0 = switch (obj.get("targetId") orelse continue) { .string => |s| s, else => continue };
+                const label0 = if (obj.get("label")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const id = try dup.s(self.arena, id0);
+                const ts = try dup.s(self.arena, ts0);
+                const targetId = try dup.s(self.arena, target0);
+                const label = try dup.os(self.arena, label0);
+                try out.append(self.arena, .{ .label = .{ .id = id, .timestamp = ts, .targetId = targetId, .label = label } });
                 continue;
             }
 

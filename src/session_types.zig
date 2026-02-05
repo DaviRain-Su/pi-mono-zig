@@ -42,12 +42,21 @@ pub const LeafEntry = struct {
     targetId: ?[]const u8,
 };
 
+pub const LabelEntry = struct {
+    type: []const u8 = "label",
+    id: []const u8,
+    timestamp: []const u8,
+    targetId: []const u8,
+    label: ?[]const u8, // if null => delete label
+};
+
 pub const Entry = union(enum) {
     session: SessionHeader,
     message: MessageEntry,
     tool_call: ToolCallEntry,
     tool_result: ToolResultEntry,
     leaf: LeafEntry,
+    label: LabelEntry,
 };
 
 pub fn roleOf(e: Entry) ?[]const u8 {
