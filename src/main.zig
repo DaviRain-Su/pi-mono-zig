@@ -19,7 +19,7 @@ fn usage() void {
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
         \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME] [--structured]\n\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME] [--structured (md|json)]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -95,8 +95,9 @@ fn doCompact(
     defer sum_buf.deinit(allocator);
 
     const want_json = std.mem.eql(u8, prefix, "SUMMARY_JSON");
+    const want_md = std.mem.eql(u8, prefix, "SUMMARY_MD");
 
-    if (!want_json) {
+    if (!want_json and !want_md) {
         try sum_buf.appendSlice(allocator, prefix);
 
         var i: usize = 0;
@@ -115,9 +116,8 @@ fn doCompact(
                 else => {},
             }
         }
-    } else {
-        // Structured JSON summary (TS-style fields)
-        // This is still naive: we only fill progress with recent lines.
+    } else if (want_json) {
+        // Structured JSON summary (simple fields)
         var progress = try std.ArrayList(u8).initCapacity(allocator, 0);
         defer progress.deinit(allocator);
         var i: usize = 0;
@@ -140,17 +140,48 @@ fn doCompact(
 
         const payload = .{
             .schema = "pi.summary.v1",
-            .goals = [_][]const u8{},
-            .decisions = [_][]const u8{},
-            .progress = progress_s,
-            .open_questions = [_][]const u8{},
+            .goal = "(unknown)",
+            .constraints = [_][]const u8{},
+            .progress = .{ .done = [_][]const u8{}, .in_progress = [_][]const u8{}, .blocked = [_][]const u8{} },
+            .key_decisions = [_][]const u8{},
             .next_steps = [_][]const u8{},
+            .critical_context = [_][]const u8{},
+            .raw = progress_s,
         };
 
-        // Write JSON to sum_buf
         const written = try std.json.Stringify.valueAlloc(allocator, payload, .{ .whitespace = .indent_2 });
         try sum_buf.appendSlice(allocator, written);
-        // NOTE: we'll mark summary.format="json" when persisting.
+    } else {
+        // TS-aligned markdown structured summary (matches SUMMARIZATION_PROMPT format)
+        // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes prior message snippets.
+        try sum_buf.appendSlice(allocator,
+            "## Goal\n(unknown)\n\n" ++
+            "## Constraints & Preferences\n- (none)\n\n" ++
+            "## Progress\n### Done\n- (none)\n\n### In Progress\n- (none)\n\n### Blocked\n- (none)\n\n" ++
+            "## Key Decisions\n- (none)\n\n" ++
+            "## Next Steps\n1. (none)\n\n" ++
+            "## Critical Context\n");
+
+        var i: usize = 0;
+        while (i < start) : (i += 1) {
+            const e = nodes.items[i];
+            switch (e) {
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                        const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+                        try sum_buf.appendSlice(allocator, "- ");
+                        try sum_buf.appendSlice(allocator, m.role);
+                        try sum_buf.appendSlice(allocator, ": ");
+                        try sum_buf.appendSlice(allocator, preview);
+                        try sum_buf.appendSlice(allocator, "\n");
+                    }
+                },
+                else => {},
+            }
+        }
+        if (start == 0) {
+            try sum_buf.appendSlice(allocator, "- (none)\n");
+        }
     }
 
     const sum_text = try sum_buf.toOwnedSlice(allocator);
@@ -162,7 +193,7 @@ fn doCompact(
     const summary_id = try sm.appendSummary(
         sum_text,
         reason,
-        if (want_json) "json" else "text",
+        if (want_json) "json" else if (want_md) "md" else "text",
         stats_total_chars,
         stats_total_tokens_est,
         keep_last,
@@ -429,6 +460,7 @@ pub fn main() !void {
         var dry_run = false;
         var label: ?[]const u8 = null;
         var structured = false;
+        var structured_format: []const u8 = "md"; // md|json
 
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
@@ -442,6 +474,17 @@ pub fn main() !void {
                 label = args.next() orelse return error.MissingLabel;
             } else if (std.mem.eql(u8, a, "--structured")) {
                 structured = true;
+                // Optional: --structured json|md
+                if (args.next()) |maybe| {
+                    if (std.mem.eql(u8, maybe, "md") or std.mem.eql(u8, maybe, "json")) {
+                        structured_format = maybe;
+                    } else {
+                        // push back not supported; treat as unknown arg
+                        return error.UnknownArg;
+                    }
+                } else {
+                    structured_format = "md";
+                }
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -464,7 +507,7 @@ pub fn main() !void {
             keep_last,
             dry_run,
             label,
-            if (structured) "SUMMARY_JSON" else "SUMMARY (naive):\n",
+            if (structured and std.mem.eql(u8, structured_format, "json")) "SUMMARY_JSON" else if (structured) "SUMMARY_MD" else "SUMMARY (naive):\n",
             "manual",
             null,
             null,
@@ -728,10 +771,10 @@ pub fn main() !void {
                                 break;
                             },
                         };
-                        const progress = if (obj.get("progress")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                        const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| t, else => "" } else "";
                         const next_steps = if (obj.get("next_steps")) |v| switch (v) { .array => |a| a.items, else => &.{} } else &.{};
 
-                        std.debug.print("[summary] progress:\n{s}\n", .{progress});
+                        std.debug.print("[summary] raw:\n{s}\n", .{raw});
                         if (next_steps.len > 0) {
                             std.debug.print("[summary] next_steps:\n", .{});
                             for (next_steps) |it| {
