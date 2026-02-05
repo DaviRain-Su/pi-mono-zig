@@ -12,14 +12,14 @@ fn usage() void {
         \\Usage:\n\
         \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
-        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell]\n\
+        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --keep-last N]\n\
         \\  pi-mono-zig replay --session <path.jsonl>\n\
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
         \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N]\n\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -265,6 +265,8 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "compact")) {
         var session_path: ?[]const u8 = null;
         var keep_last: usize = 8;
+        var dry_run = false;
+        var label: ?[]const u8 = null;
 
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
@@ -272,6 +274,10 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--keep-last")) {
                 const s = args.next() orelse return error.MissingKeepLast;
                 keep_last = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--dry-run")) {
+                dry_run = true;
+            } else if (std.mem.eql(u8, a, "--label")) {
+                label = args.next() orelse return error.MissingLabel;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -327,8 +333,16 @@ pub fn main() !void {
 
         const sum_text = try sum_buf.toOwnedSlice(allocator);
 
+        if (dry_run) {
+            std.debug.print("ok: true\ndryRun: true\nsummaryPreview:\n{s}\n", .{sum_text});
+            return;
+        }
+
         // Create new compacted branch: summary -> clones of tail
         const summary_id = try sm.appendSummary(sum_text);
+        if (label) |lab| {
+            _ = try sm.setLabel(summary_id, lab);
+        }
         var parent_id: []const u8 = summary_id;
 
         var j: usize = start;
@@ -604,11 +618,23 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "chat")) {
         var session_path: ?[]const u8 = null;
         var allow_shell = false;
+        var auto_compact = false;
+        var max_chars: usize = 8_000;
+        var keep_last: usize = 8;
+
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
             } else if (std.mem.eql(u8, a, "--allow-shell")) {
                 allow_shell = true;
+            } else if (std.mem.eql(u8, a, "--auto-compact")) {
+                auto_compact = true;
+            } else if (std.mem.eql(u8, a, "--max-chars")) {
+                const s = args.next() orelse return error.MissingMaxChars;
+                max_chars = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--keep-last")) {
+                const s = args.next() orelse return error.MissingKeepLast;
+                keep_last = try std.fmt.parseInt(usize, s, 10);
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -664,6 +690,28 @@ pub fn main() !void {
             while (true) {
                 const done = try loop.step();
                 if (done) break;
+            }
+
+            if (auto_compact) {
+                // naive context size estimate: sum of message contents on current leaf path
+                const chain = try sm.buildContextEntries();
+                var total: usize = 0;
+                for (chain) |e| {
+                    switch (e) {
+                        .message => |m| total += m.content.len,
+                        .summary => |s| total += s.content.len,
+                        else => {},
+                    }
+                }
+
+                if (total > max_chars) {
+                    _ = try sm.appendSummary("AUTO_COMPACT (naive)\n");
+                    // TODO: actually preserve last keep_last nodes (like `compact` command).
+                    std.debug.print(
+                        "[auto_compact] triggered total_chars={d} > {d} (keep_last={d})\n",
+                        .{ total, max_chars, keep_last },
+                    );
+                }
             }
 
             // Print last assistant message

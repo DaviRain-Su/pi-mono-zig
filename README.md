@@ -79,6 +79,12 @@ zig build run -- tree --session /tmp/pi-session.jsonl
 
 # compact current leaf path into a summary + keep last N nodes
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8
+
+# preview compaction summary without writing
+zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run
+
+# auto-compact while chatting (naive char-count threshold)
+zig build run -- chat --session /tmp/pi-session.jsonl --auto-compact --max-chars 8000 --keep-last 8
 ```
 
 This currently checks:
