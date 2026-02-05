@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const session = @import("session_manager.zig");
 const tools = @import("tools.zig");
 const agent_loop = @import("agent_loop.zig");
+const events = @import("events.zig");
 
 fn usage() void {
     std.debug.print(
@@ -168,7 +169,25 @@ pub fn main() !void {
         try sm.ensure();
         var reg = tools.ToolRegistry.init(allocator);
         reg.allow_shell = allow_shell;
-        var loop = agent_loop.AgentLoop.init(allocator, &sm, &reg);
+
+        var bus = events.EventBus.init(allocator);
+        // Print all events (MVP: debug-style)
+        const PrinterCtx = struct {};
+        const printer = struct {
+            fn onEvent(_: *anyopaque, ev: events.Event) void {
+                switch (ev) {
+                    .turn_start => |p| std.debug.print("[turn_start] {d}\n", .{p.turn}),
+                    .turn_end => |p| std.debug.print("[turn_end] {d}\n", .{p.turn}),
+                    .message_append => |m| std.debug.print("[message_append] {s}: {s}\n", .{ m.role, m.content }),
+                    .tool_execution_start => |t| std.debug.print("[tool_start] {s} arg={s}\n", .{ t.tool, t.arg }),
+                    .tool_execution_end => |t| std.debug.print("[tool_end] {s} ok={any}\n", .{ t.tool, t.ok }),
+                }
+            }
+        };
+        var ctx = PrinterCtx{};
+        try bus.subscribe(@ptrCast(&ctx), printer.onEvent);
+
+        var loop = agent_loop.AgentLoop.init(allocator, &sm, &reg, &bus);
 
         std.debug.print("chat session: {s}\n", .{sp});
         std.debug.print("type messages. ctrl-d to exit.\n", .{});
