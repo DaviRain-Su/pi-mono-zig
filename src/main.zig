@@ -209,63 +209,122 @@ fn doCompact(
         } else {
             // Merge mode
             // Naive TS-aligned updates:
-            // - If Next Steps is "1. (none)", replace with a placeholder actionable step.
-            // - If Progress/In Progress is "- (none)", replace with a placeholder.
+            // - Patch a couple of common "(none)" placeholders.
+            // - Extract a few heuristic updates from NEW messages since previous summary:
+            //   - user messages -> Next Steps items
+            //   - assistant messages starting with "ack:" -> Done items
             // - Append new message snippets into Critical Context (existing behavior).
             const base0 = prev_summary.?;
 
+            // Collect heuristic updates from new messages after prev summary.
+            var next_steps_dyn = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+            defer next_steps_dyn.deinit(allocator);
+            var done_dyn = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+            defer done_dyn.deinit(allocator);
+
+            const from_i: usize = (prev_idx orelse 0) + 1;
+            var ii: usize = from_i;
+            while (ii < start) : (ii += 1) {
+                const e = nodes.items[ii];
+                switch (e) {
+                    .message => |m| {
+                        if (std.mem.eql(u8, m.role, "user")) {
+                            const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+                            const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
+                            try next_steps_dyn.append(allocator, item);
+                        } else if (std.mem.eql(u8, m.role, "assistant")) {
+                            if (std.mem.startsWith(u8, m.content, "ack:")) {
+                                const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+                                const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
+                                try done_dyn.append(allocator, item);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+
             // Preprocess: patch a couple of common "(none)" placeholders.
-            var base_buf = try std.ArrayList(u8).initCapacity(allocator, base0.len + 128);
+            var base_buf = try std.ArrayList(u8).initCapacity(allocator, base0.len + 512);
             defer base_buf.deinit(allocator);
 
             const pat_next = "## Next Steps\n1. (none)\n";
             const rep_next = "## Next Steps\n1. Review new messages since last checkpoint\n";
-            const pat_prog = "### In Progress\n- (none)\n";
-            const rep_prog = "### In Progress\n- [ ] Review new messages since last checkpoint\n";
+            const pat_inprog = "### In Progress\n- (none)\n";
+            const rep_inprog = "### In Progress\n- [ ] Review new messages since last checkpoint\n";
+            const pat_done = "### Done\n- (none)\n";
+            const rep_done = "### Done\n- [x] (no completed items recorded yet)\n";
 
-            const idx_next = std.mem.indexOf(u8, base0, pat_next);
-            const idx_prog = std.mem.indexOf(u8, base0, pat_prog);
+            var tmp = base0;
+            // Apply at most once each.
+            if (std.mem.indexOf(u8, tmp, pat_next)) |p| {
+                try base_buf.appendSlice(allocator, tmp[0..p]);
+                try base_buf.appendSlice(allocator, rep_next);
+                tmp = tmp[p + pat_next.len ..];
+            }
+            if (std.mem.indexOf(u8, tmp, pat_inprog)) |p| {
+                try base_buf.appendSlice(allocator, tmp[0..p]);
+                try base_buf.appendSlice(allocator, rep_inprog);
+                tmp = tmp[p + pat_inprog.len ..];
+            }
+            if (std.mem.indexOf(u8, tmp, pat_done)) |p| {
+                try base_buf.appendSlice(allocator, tmp[0..p]);
+                try base_buf.appendSlice(allocator, rep_done);
+                tmp = tmp[p + pat_done.len ..];
+            }
+            try base_buf.appendSlice(allocator, tmp);
 
-            // Apply replacements in a deterministic order by earliest match.
-            var cursor: usize = 0;
-            while (cursor < base0.len) {
-                var next_pos: ?usize = null;
-                var which: u8 = 0;
+            var base = try base_buf.toOwnedSlice(allocator);
 
-                if (idx_next) |p| {
-                    if (p >= cursor and (next_pos == null or p < next_pos.?)) {
-                        next_pos = p;
-                        which = 1;
+            // Insert heuristic Done items into "### Done" section.
+            if (done_dyn.items.len > 0) {
+                const h = "### Done\n";
+                if (std.mem.indexOf(u8, base, h)) |hp| {
+                    const insert_pos = hp + h.len;
+                    const tail = base[insert_pos..];
+                    const next_hdr = std.mem.indexOf(u8, tail, "\n### In Progress\n") orelse tail.len;
+
+                    var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
+                    defer b2.deinit(allocator);
+                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
+                    for (done_dyn.items) |it| {
+                        try b2.appendSlice(allocator, "- [x] ");
+                        try b2.appendSlice(allocator, it);
+                        try b2.appendSlice(allocator, "\n");
                     }
-                }
-                if (idx_prog) |p| {
-                    if (p >= cursor and (next_pos == null or p < next_pos.?)) {
-                        next_pos = p;
-                        which = 2;
-                    }
-                }
-
-                if (next_pos == null) {
-                    try base_buf.appendSlice(allocator, base0[cursor..]);
-                    break;
-                }
-
-                const p = next_pos.?;
-                try base_buf.appendSlice(allocator, base0[cursor..p]);
-                if (which == 1) {
-                    try base_buf.appendSlice(allocator, rep_next);
-                    cursor = p + pat_next.len;
-                } else if (which == 2) {
-                    try base_buf.appendSlice(allocator, rep_prog);
-                    cursor = p + pat_prog.len;
-                } else {
-                    // should not happen
-                    try base_buf.appendSlice(allocator, base0[p..]);
-                    break;
+                    try b2.appendSlice(allocator, base[insert_pos + next_hdr ..]);
+                    base = try b2.toOwnedSlice(allocator);
                 }
             }
 
-            const base = try base_buf.toOwnedSlice(allocator);
+            // Insert heuristic Next Steps into "## Next Steps" section.
+            if (next_steps_dyn.items.len > 0) {
+                const h = "## Next Steps\n";
+                if (std.mem.indexOf(u8, base, h)) |hp| {
+                    const insert_pos = hp + h.len;
+                    const tail = base[insert_pos..];
+                    const next_hdr = std.mem.indexOf(u8, tail, "\n## Critical Context\n") orelse tail.len;
+
+                    // Determine next numbering (naive): count existing lines starting with digit+'.'
+                    var nsteps: usize = 0;
+                    {
+                        var it = std.mem.splitScalar(u8, tail[0..next_hdr], '\n');
+                        while (it.next()) |ln| {
+                            if (ln.len >= 2 and ln[0] >= '0' and ln[0] <= '9' and ln[1] == '.') nsteps += 1;
+                        }
+                    }
+
+                    var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
+                    defer b2.deinit(allocator);
+                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
+                    for (next_steps_dyn.items) |it| {
+                        nsteps += 1;
+                        try b2.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}. {s}\n", .{ nsteps, it }));
+                    }
+                    try b2.appendSlice(allocator, base[insert_pos + next_hdr ..]);
+                    base = try b2.toOwnedSlice(allocator);
+                }
+            }
 
             // Find insertion point: after "## Critical Context\n" heading.
             const needle = "## Critical Context\n";
@@ -288,8 +347,7 @@ fn doCompact(
             }
 
             // Append new message snippets after previous summary node up to start.
-            const from_i: usize = (prev_idx orelse 0) + 1;
-            var i: usize = from_i;
+            var i: usize = (prev_idx orelse 0) + 1;
             while (i < start) : (i += 1) {
                 const e = nodes.items[i];
                 switch (e) {
