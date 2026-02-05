@@ -56,6 +56,7 @@ pub const TurnStartEntry = struct {
     parentId: ?[]const u8 = null,
     timestamp: []const u8,
     turn: u64,
+    userMessageId: ?[]const u8 = null,
 };
 
 pub const TurnEndEntry = struct {
@@ -64,6 +65,7 @@ pub const TurnEndEntry = struct {
     parentId: ?[]const u8 = null,
     timestamp: []const u8,
     turn: u64,
+    userMessageId: ?[]const u8 = null,
 };
 
 pub const SummaryEntry = struct {
