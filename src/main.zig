@@ -217,6 +217,11 @@ fn doCompact(
             const base0 = prev_summary.?;
 
             // Collect heuristic updates from new messages after prev summary.
+            // We'll de-duplicate and cap later to keep summary concise (TS-like).
+            const MAX_NEW_DONE: usize = 10;
+            const MAX_NEW_NEXT: usize = 10;
+            const MAX_NEW_CTX: usize = 20;
+
             var next_steps_dyn = try std.ArrayList([]const u8).initCapacity(allocator, 0);
             defer next_steps_dyn.deinit(allocator);
             var done_dyn = try std.ArrayList([]const u8).initCapacity(allocator, 0);
@@ -242,6 +247,28 @@ fn doCompact(
                     },
                     else => {},
                 }
+            }
+
+            // De-duplicate NEW items (keep order)
+            var seen_done = std.StringHashMap(bool).init(allocator);
+            defer seen_done.deinit();
+            var seen_next = std.StringHashMap(bool).init(allocator);
+            defer seen_next.deinit();
+
+            var done_items = try std.ArrayList([]const u8).initCapacity(allocator, done_dyn.items.len);
+            var next_items = try std.ArrayList([]const u8).initCapacity(allocator, next_steps_dyn.items.len);
+            // NOTE: using arena allocator; no deinit needed for these arrays in this command.
+
+            for (done_dyn.items) |it| {
+                if (seen_done.contains(it)) continue;
+                try seen_done.put(it, true);
+                try done_items.append(allocator, it);
+            }
+
+            for (next_steps_dyn.items) |it| {
+                if (seen_next.contains(it)) continue;
+                try seen_next.put(it, true);
+                try next_items.append(allocator, it);
             }
 
             // Preprocess: patch a couple of common "(none)" placeholders.
@@ -277,7 +304,7 @@ fn doCompact(
             var base = try base_buf.toOwnedSlice(allocator);
 
             // Insert heuristic Done items into "### Done" section.
-            if (done_dyn.items.len > 0) {
+            if (done_items.items.len > 0) {
                 const h = "### Done\n";
                 if (std.mem.indexOf(u8, base, h)) |hp| {
                     const insert_pos = hp + h.len;
@@ -287,10 +314,16 @@ fn doCompact(
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
                     try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
-                    for (done_dyn.items) |it| {
+
+                    var added: usize = 0;
+                    for (done_items.items) |it| {
+                        if (added >= MAX_NEW_DONE) break;
+                        // Skip if already present anywhere in summary
+                        if (std.mem.indexOf(u8, base, it) != null) continue;
                         try b2.appendSlice(allocator, "- [x] ");
                         try b2.appendSlice(allocator, it);
                         try b2.appendSlice(allocator, "\n");
+                        added += 1;
                     }
                     try b2.appendSlice(allocator, base[insert_pos + next_hdr ..]);
                     base = try b2.toOwnedSlice(allocator);
@@ -298,7 +331,7 @@ fn doCompact(
             }
 
             // Insert heuristic Next Steps into "## Next Steps" section.
-            if (next_steps_dyn.items.len > 0) {
+            if (next_items.items.len > 0) {
                 const h = "## Next Steps\n";
                 if (std.mem.indexOf(u8, base, h)) |hp| {
                     const insert_pos = hp + h.len;
@@ -317,10 +350,17 @@ fn doCompact(
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
                     try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
-                    for (next_steps_dyn.items) |it| {
+
+                    var added: usize = 0;
+                    for (next_items.items) |it| {
+                        if (added >= MAX_NEW_NEXT) break;
+                        // Skip if already present anywhere in summary
+                        if (std.mem.indexOf(u8, base, it) != null) continue;
                         nsteps += 1;
                         try b2.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}. {s}\n", .{ nsteps, it }));
+                        added += 1;
                     }
+
                     try b2.appendSlice(allocator, base[insert_pos + next_hdr ..]);
                     base = try b2.toOwnedSlice(allocator);
                 }
@@ -347,18 +387,26 @@ fn doCompact(
             }
 
             // Append new message snippets after previous summary node up to start.
+            // De-dup + cap to keep summary concise.
+            var seen_ctx = std.StringHashMap(bool).init(allocator);
+            defer seen_ctx.deinit();
+            var added_ctx: usize = 0;
+
             var i: usize = (prev_idx orelse 0) + 1;
             while (i < start) : (i += 1) {
+                if (added_ctx >= MAX_NEW_CTX) break;
                 const e = nodes.items[i];
                 switch (e) {
                     .message => |m| {
                         if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
                             const preview = if (m.content.len > 120) m.content[0..120] else m.content;
-                            try sum_buf.appendSlice(allocator, "- ");
-                            try sum_buf.appendSlice(allocator, m.role);
-                            try sum_buf.appendSlice(allocator, ": ");
-                            try sum_buf.appendSlice(allocator, preview);
+                            const line = try std.fmt.allocPrint(allocator, "- {s}: {s}", .{ m.role, preview });
+                            if (seen_ctx.contains(line)) continue;
+                            try seen_ctx.put(line, true);
+                            if (std.mem.indexOf(u8, base, line) != null) continue;
+                            try sum_buf.appendSlice(allocator, line);
                             try sum_buf.appendSlice(allocator, "\n");
+                            added_ctx += 1;
                         }
                     },
                     else => {},
