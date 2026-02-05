@@ -17,7 +17,8 @@ fn usage() void {
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl>\n\
-        \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\n\
+        \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
+        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -257,6 +258,179 @@ pub fn main() !void {
                 }
             }
         }
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "tree")) {
+        var session_path: ?[]const u8 = null;
+        var max_depth: usize = 64;
+
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--max-depth")) {
+                const s = args.next() orelse return error.MissingMaxDepth;
+                max_depth = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        const entries = try sm.loadEntries();
+
+        // label map (targetId -> label)
+        var labels = std.StringHashMap([]const u8).init(allocator);
+        defer labels.deinit();
+        for (entries) |e| {
+            switch (e) {
+                .label => |l| {
+                    if (l.label) |name| {
+                        try labels.put(l.targetId, name);
+                    } else {
+                        _ = labels.remove(l.targetId);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // find leaf
+        var leaf: ?[]const u8 = null;
+        for (entries) |e| {
+            switch (e) {
+                .leaf => |l| leaf = l.targetId,
+                else => {},
+            }
+        }
+
+        // build id -> entry map
+        var by_id = std.StringHashMap(st.Entry).init(allocator);
+        defer by_id.deinit();
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                try by_id.put(id, e);
+            }
+        }
+
+        // build leaf path set
+        var on_path = std.StringHashMap(bool).init(allocator);
+        defer on_path.deinit();
+        var cur = leaf;
+        while (cur) |cid| {
+            try on_path.put(cid, true);
+            const e = by_id.get(cid) orelse break;
+            cur = st.parentIdOf(e);
+        }
+
+        // build parent -> children ids map
+        var children = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
+        defer {
+            var it = children.iterator();
+            while (it.next()) |kv| {
+                kv.value_ptr.deinit(allocator);
+            }
+            children.deinit();
+        }
+
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                const pid = st.parentIdOf(e) orelse "";
+                if (!children.contains(pid)) {
+                    try children.put(pid, try std.ArrayList([]const u8).initCapacity(allocator, 0));
+                }
+                var listp = children.getPtr(pid).?;
+                try listp.append(allocator, id);
+            }
+        }
+
+        // sort children lists for deterministic output
+        {
+            var it = children.iterator();
+            while (it.next()) |kv| {
+                std.mem.sort([]const u8, kv.value_ptr.items, {}, struct {
+                    fn lt(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.lessThan(u8, a, b);
+                    }
+                }.lt);
+            }
+        }
+
+        const Printer = struct {
+            fn printNode(
+                alloc: std.mem.Allocator,
+                by_id_map: *std.StringHashMap(st.Entry),
+                children_map: *std.StringHashMap(std.ArrayList([]const u8)),
+                labels_map: *std.StringHashMap([]const u8),
+                path_map: *std.StringHashMap(bool),
+                id: []const u8,
+                depth: usize,
+                maxd: usize,
+            ) void {
+                if (depth > maxd) return;
+
+                const e = by_id_map.get(id) orelse return;
+                const mark = if (path_map.contains(id)) "*" else " ";
+                const lab = labels_map.get(id) orelse "";
+                const indent = depth * 2;
+                std.debug.print("{s}{s}", .{ std.mem.zeroes([0]u8), "" });
+                // manual indent
+                var i: usize = 0;
+                while (i < indent) : (i += 1) std.debug.print(" ", .{});
+
+                switch (e) {
+                    .message => |m| {
+                        const preview = if (m.content.len > 40) m.content[0..40] else m.content;
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} message {s} \"{s}\" [{s}]\n", .{ mark, id, m.role, preview, lab });
+                        } else {
+                            std.debug.print("{s} {s} message {s} \"{s}\"\n", .{ mark, id, m.role, preview });
+                        }
+                    },
+                    .tool_call => |tc| {
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} tool_call {s} arg={s} [{s}]\n", .{ mark, id, tc.tool, tc.arg, lab });
+                        } else {
+                            std.debug.print("{s} {s} tool_call {s} arg={s}\n", .{ mark, id, tc.tool, tc.arg });
+                        }
+                    },
+                    .tool_result => |tr| {
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} tool_result {s} ok={any} [{s}]\n", .{ mark, id, tr.tool, tr.ok, lab });
+                        } else {
+                            std.debug.print("{s} {s} tool_result {s} ok={any}\n", .{ mark, id, tr.tool, tr.ok });
+                        }
+                    },
+                    else => {},
+                }
+
+                const key = st.parentIdOf(e) orelse "";
+                _ = key;
+
+                if (children_map.get(id)) |kids| {
+                    for (kids.items) |kid| {
+                        printNode(alloc, by_id_map, children_map, labels_map, path_map, kid, depth + 1, maxd);
+                    }
+                }
+            }
+        };
+
+        // roots are nodes whose parentId is null/""
+        if (children.get("")) |roots| {
+            for (roots.items) |rid| {
+                Printer.printNode(allocator, &by_id, &children, &labels, &on_path, rid, 0, max_depth);
+            }
+        }
+
         return;
     }
 

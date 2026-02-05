@@ -73,6 +73,9 @@ zig build run -- replay --session /tmp/pi-session.jsonl
 
 # show full details for one entry
 zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>
+
+# show full session tree ("*" marks current leaf path)
+zig build run -- tree --session /tmp/pi-session.jsonl
 ```
 
 This currently checks:
