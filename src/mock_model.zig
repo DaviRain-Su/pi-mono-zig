@@ -15,13 +15,13 @@ pub const ModelOutput = union(enum) {
 ///   - "sh:" => tool_call shell
 ///   - else => final ok
 pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
-    // Find last significant entry (skip session/leaf)
+    // Find last significant entry (skip structural entries that shouldn't affect decisions)
     var last_sig: ?st.Entry = null;
     var j: usize = entries.len;
     while (j > 0) : (j -= 1) {
         const e = entries[j - 1];
         switch (e) {
-            .session, .leaf => continue,
+            .session, .leaf, .label, .turn_start, .turn_end => continue,
             else => {
                 last_sig = e;
                 break;

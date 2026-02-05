@@ -59,6 +59,8 @@ fn tokensEstForEntry(e: st.Entry) usize {
         // tool call/results tend to be denser / more verbose
         .tool_call => |tc| tokensEstFromChars(tc.arg.len) + 8,
         .tool_result => |tr| tokensEstFromChars(tr.content.len) + 8,
+        .turn_start => 2,
+        .turn_end => 2,
         .summary => |s| tokensEstFromChars(s.content.len),
         else => 0,
     };
@@ -103,15 +105,12 @@ fn doCompact(
         }
     }
 
-    // Turn-boundary heuristic: move start backwards until it lands on a user message.
-    // This keeps tool_call/tool_result + assistant messages together more often (TS-like behavior).
+    // Turn-boundary heuristic: move start backwards until it lands on a persisted turn_start.
+    // This is closer to TS behavior than guessing via user messages.
     while (start > 0) {
         const e = nodes.items[start];
         switch (e) {
-            .message => |m| {
-                if (std.mem.eql(u8, m.role, "user")) break;
-                start -= 1;
-            },
+            .turn_start => break,
             else => start -= 1,
         }
     }
@@ -573,6 +572,12 @@ fn doCompact(
     while (j < n) : (j += 1) {
         const e = nodes.items[j];
         switch (e) {
+            .turn_start => |t| {
+                _ = try sm.appendTurnStart(t.turn);
+            },
+            .turn_end => |t| {
+                _ = try sm.appendTurnEnd(t.turn);
+            },
             .message => |m| {
                 _ = try sm.appendMessage(m.role, m.content);
             },
@@ -1122,6 +1127,8 @@ pub fn main() !void {
         const entries = try sm.buildContextEntries();
         for (entries) |e| {
             switch (e) {
+                .turn_start => |t| std.debug.print("[turn_start] {d}\n", .{t.turn}),
+                .turn_end => |t| std.debug.print("[turn_end] {d}\n", .{t.turn}),
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),

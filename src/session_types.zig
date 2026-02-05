@@ -50,6 +50,22 @@ pub const LabelEntry = struct {
     label: ?[]const u8, // if null => delete label
 };
 
+pub const TurnStartEntry = struct {
+    type: []const u8 = "turn_start",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    turn: u64,
+};
+
+pub const TurnEndEntry = struct {
+    type: []const u8 = "turn_end",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    turn: u64,
+};
+
 pub const SummaryEntry = struct {
     type: []const u8 = "summary",
     id: []const u8,
@@ -78,6 +94,8 @@ pub const Entry = union(enum) {
     message: MessageEntry,
     tool_call: ToolCallEntry,
     tool_result: ToolResultEntry,
+    turn_start: TurnStartEntry,
+    turn_end: TurnEndEntry,
     summary: SummaryEntry,
     leaf: LeafEntry,
     label: LabelEntry,
@@ -102,6 +120,8 @@ pub fn idOf(e: Entry) ?[]const u8 {
         .message => |m| m.id,
         .tool_call => |t| t.id,
         .tool_result => |t| t.id,
+        .turn_start => |t| t.id,
+        .turn_end => |t| t.id,
         .summary => |s| s.id,
         else => null,
     };
@@ -112,6 +132,8 @@ pub fn parentIdOf(e: Entry) ?[]const u8 {
         .message => |m| m.parentId,
         .tool_call => |t| t.parentId,
         .tool_result => |t| t.parentId,
+        .turn_start => |t| t.parentId,
+        .turn_end => |t| t.parentId,
         .summary => |s| s.parentId,
         else => null,
     };

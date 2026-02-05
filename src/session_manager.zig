@@ -8,6 +8,8 @@ pub const ToolCallEntry = st.ToolCallEntry;
 pub const ToolResultEntry = st.ToolResultEntry;
 pub const LeafEntry = st.LeafEntry;
 pub const LabelEntry = st.LabelEntry;
+pub const TurnStartEntry = st.TurnStartEntry;
+pub const TurnEndEntry = st.TurnEndEntry;
 pub const SummaryEntry = st.SummaryEntry;
 pub const Entry = st.Entry;
 
@@ -178,6 +180,34 @@ pub const SessionManager = struct {
         return id;
     }
 
+    pub fn appendTurnStart(self: *SessionManager, turn: u64) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = TurnStartEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .turn = turn,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
+        return id;
+    }
+
+    pub fn appendTurnEnd(self: *SessionManager, turn: u64) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = TurnEndEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .turn = turn,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
+        return id;
+    }
+
     pub fn loadEntries(self: *SessionManager) ![]Entry {
         var f = try std.fs.cwd().openFile(self.session_path, .{});
         defer f.close();
@@ -253,6 +283,30 @@ pub const SessionManager = struct {
                 const tool = try dup.s(self.arena, tool0);
                 const content = try dup.s(self.arena, content0);
                 try out.append(self.arena, .{ .tool_result = .{ .id = id, .parentId = pid, .timestamp = ts, .tool = tool, .ok = ok, .content = content } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "turn_start")) {
+                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const turn = switch (obj.get("turn") orelse continue) { .integer => |x| @as(u64, @intCast(x)), else => continue };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                try out.append(self.arena, .{ .turn_start = .{ .id = id, .parentId = pid, .timestamp = ts, .turn = turn } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "turn_end")) {
+                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const turn = switch (obj.get("turn") orelse continue) { .integer => |x| @as(u64, @intCast(x)), else => continue };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                try out.append(self.arena, .{ .turn_end = .{ .id = id, .parentId = pid, .timestamp = ts, .turn = turn } });
                 continue;
             }
 
