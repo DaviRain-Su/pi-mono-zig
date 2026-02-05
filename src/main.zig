@@ -276,11 +276,11 @@ fn doCompact(
             defer base_buf.deinit(allocator);
 
             const pat_next = "## Next Steps\n1. (none)\n";
-            const rep_next = "## Next Steps\n1. Review new messages since last checkpoint\n";
+            const rep_next = if (next_items.items.len > 0) "## Next Steps\n" else "## Next Steps\n1. Review new messages since last checkpoint\n";
             const pat_inprog = "### In Progress\n- (none)\n";
-            const rep_inprog = "### In Progress\n- [ ] Review new messages since last checkpoint\n";
+            const rep_inprog = if (next_items.items.len > 0 or done_items.items.len > 0) "### In Progress\n- (none)\n" else "### In Progress\n- [ ] Review new messages since last checkpoint\n";
             const pat_done = "### Done\n- (none)\n";
-            const rep_done = "### Done\n- [x] (no completed items recorded yet)\n";
+            const rep_done = if (done_items.items.len > 0) "### Done\n" else "### Done\n- [x] (no completed items recorded yet)\n";
 
             var tmp = base0;
             // Apply at most once each.
@@ -302,6 +302,19 @@ fn doCompact(
             try base_buf.appendSlice(allocator, tmp);
 
             var base = try base_buf.toOwnedSlice(allocator);
+
+            // If we have real Done items, drop the Done "- (none)" placeholder.
+            if (done_items.items.len > 0) {
+                const pat = "### Done\n- (none)\n";
+                if (std.mem.indexOf(u8, base, pat)) |p| {
+                    var bfix = try std.ArrayList(u8).initCapacity(allocator, base.len);
+                    defer bfix.deinit(allocator);
+                    try bfix.appendSlice(allocator, base[0..p]);
+                    try bfix.appendSlice(allocator, "### Done\n");
+                    try bfix.appendSlice(allocator, base[p + pat.len ..]);
+                    base = try bfix.toOwnedSlice(allocator);
+                }
+            }
 
             // Insert heuristic Done items into "### Done" section.
             if (done_items.items.len > 0) {
