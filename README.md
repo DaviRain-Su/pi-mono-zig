@@ -28,6 +28,18 @@ zig build
 zig build run -- run --plan examples/hello.plan.json
 ```
 
+## Verify a run (artifact chain)
+
+```bash
+zig build run -- verify --run <runId>
+```
+
+This currently checks:
+- `runs/<runId>/plan.json` exists and is valid
+- `runs/<runId>/run.json` exists
+- `runs/<runId>/steps/<stepId>.json` exists for every step in the plan
+- every step artifact has `ok: true` and matching `runId`
+
 ## Example plan
 
 See `examples/hello.plan.json`.
