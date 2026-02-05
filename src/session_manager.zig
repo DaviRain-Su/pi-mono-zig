@@ -1,21 +1,12 @@
 const std = @import("std");
 const json_util = @import("json_util.zig");
+const st = @import("session_types.zig");
 
-pub const SessionHeader = struct {
-    type: []const u8 = "session",
-    version: u32 = 1,
-    id: []const u8,
-    timestamp: []const u8,
-    cwd: []const u8,
-};
-
-pub const MessageEntry = struct {
-    type: []const u8 = "message",
-    id: []const u8,
-    timestamp: []const u8,
-    role: []const u8, // user|assistant|tool
-    content: []const u8,
-};
+pub const SessionHeader = st.SessionHeader;
+pub const MessageEntry = st.MessageEntry;
+pub const ToolCallEntry = st.ToolCallEntry;
+pub const ToolResultEntry = st.ToolResultEntry;
+pub const Entry = st.Entry;
 
 pub const SessionManager = struct {
     arena: std.mem.Allocator,
@@ -44,8 +35,8 @@ pub const SessionManager = struct {
             // If empty, rewrite header
             const f = try std.fs.cwd().openFile(self.session_path, .{});
             defer f.close();
-            const st = try f.stat();
-            if (st.size > 0) return;
+            const stat = try f.stat();
+            if (stat.size > 0) return;
         } else |_| {
             // create parent dir
             if (std.fs.path.dirname(self.session_path)) |dir| {
@@ -77,12 +68,33 @@ pub const SessionManager = struct {
         try json_util.appendJsonLine(self.session_path, entry);
     }
 
-    pub fn loadMessages(self: *SessionManager) ![]MessageEntry {
+    pub fn appendToolCall(self: *SessionManager, tool: []const u8, arg: []const u8) !void {
+        const entry = ToolCallEntry{
+            .id = try self.newId(),
+            .timestamp = try nowIso(self.arena),
+            .tool = tool,
+            .arg = arg,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+    }
+
+    pub fn appendToolResult(self: *SessionManager, tool: []const u8, ok: bool, content: []const u8) !void {
+        const entry = ToolResultEntry{
+            .id = try self.newId(),
+            .timestamp = try nowIso(self.arena),
+            .tool = tool,
+            .ok = ok,
+            .content = content,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+    }
+
+    pub fn loadEntries(self: *SessionManager) ![]Entry {
         var f = try std.fs.cwd().openFile(self.session_path, .{});
         defer f.close();
         const bytes = try f.readToEndAlloc(self.arena, 64 * 1024 * 1024);
 
-        var out = try std.ArrayList(MessageEntry).initCapacity(self.arena, 0);
+        var out = try std.ArrayList(Entry).initCapacity(self.arena, 0);
         defer out.deinit(self.arena);
 
         var it = std.mem.splitScalar(u8, bytes, '\n');
@@ -94,33 +106,56 @@ pub const SessionManager = struct {
                 .object => |o| o,
                 else => continue,
             };
-            const type_v = obj.get("type") orelse continue;
-            const typ = switch (type_v) {
-                .string => |s| s,
-                else => continue,
-            };
-            if (!std.mem.eql(u8, typ, "message")) continue;
-
-            const id = switch (obj.get("id") orelse continue) {
-                .string => |s| s,
-                else => continue,
-            };
-            const ts = switch (obj.get("timestamp") orelse continue) {
-                .string => |s| s,
-                else => continue,
-            };
-            const role = switch (obj.get("role") orelse continue) {
-                .string => |s| s,
-                else => continue,
-            };
-            const content = switch (obj.get("content") orelse continue) {
+            const typ = switch (obj.get("type") orelse continue) {
                 .string => |s| s,
                 else => continue,
             };
 
-            try out.append(self.arena, .{ .id = id, .timestamp = ts, .role = role, .content = content });
+            if (std.mem.eql(u8, typ, "message")) {
+                const id = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const ts = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const role = switch (obj.get("role") orelse continue) { .string => |s| s, else => continue };
+                const content = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+                try out.append(self.arena, .{ .message = .{ .id = id, .timestamp = ts, .role = role, .content = content } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "tool_call")) {
+                const id = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const ts = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const tool = switch (obj.get("tool") orelse continue) { .string => |s| s, else => continue };
+                const arg = switch (obj.get("arg") orelse continue) { .string => |s| s, else => continue };
+                try out.append(self.arena, .{ .tool_call = .{ .id = id, .timestamp = ts, .tool = tool, .arg = arg } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "tool_result")) {
+                const id = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
+                const ts = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
+                const tool = switch (obj.get("tool") orelse continue) { .string => |s| s, else => continue };
+                const ok = switch (obj.get("ok") orelse continue) { .bool => |b| b, else => continue };
+                const content = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+                try out.append(self.arena, .{ .tool_result = .{ .id = id, .timestamp = ts, .tool = tool, .ok = ok, .content = content } });
+                continue;
+            }
+
+            // ignore unknown types for forward compatibility
         }
 
+        return try out.toOwnedSlice(self.arena);
+    }
+
+    pub fn loadMessages(self: *SessionManager) ![]MessageEntry {
+        // compatibility helper for existing code
+        const entries = try self.loadEntries();
+        var out = try std.ArrayList(MessageEntry).initCapacity(self.arena, 0);
+        defer out.deinit(self.arena);
+        for (entries) |e| {
+            switch (e) {
+                .message => |m| try out.append(self.arena, m),
+                else => {},
+            }
+        }
         return try out.toOwnedSlice(self.arena);
     }
 };

@@ -38,6 +38,12 @@ zig build run -- verify --run <runId>
 
 This is a *minimal* AgentLoop clone (uses a deterministic mock model).
 
+JSONL entries are now structured (not just plain messages):
+- `type: session`
+- `type: message`
+- `type: tool_call`
+- `type: tool_result`
+
 ```bash
 # creates/extends a JSONL session
 zig build run -- chat --session /tmp/pi-session.jsonl

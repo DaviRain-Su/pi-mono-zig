@@ -21,13 +21,13 @@ pub const AgentLoop = struct {
     }
 
     pub fn step(self: *AgentLoop) !bool {
-        // Load full message list (MVP). Later we can incrementally track.
-        const msgs = try self.session_mgr.loadMessages();
+        // Load full entry list (MVP). Later we can incrementally track.
+        const entries = try self.session_mgr.loadEntries();
 
         self.turn += 1;
         self.bus.emit(.{ .turn_start = .{ .turn = self.turn } });
 
-        const out = try mock_model.next(self.arena, msgs);
+        const out = try mock_model.next(self.arena, entries);
         switch (out) {
             .final_text => |t| {
                 try self.session_mgr.appendMessage("assistant", t);
@@ -36,26 +36,20 @@ pub const AgentLoop = struct {
                 return true;
             },
             .tool_call => |c| {
-                // record tool call as assistant message (MVP)
-                const call_line = try std.fmt.allocPrint(self.arena, "tool_call {s}: {s}", .{ c.tool, c.arg });
-                try self.session_mgr.appendMessage("assistant", call_line);
-                self.bus.emit(.{ .message_append = .{ .role = "assistant", .content = call_line } });
-
+                // record tool call entry
+                try self.session_mgr.appendToolCall(c.tool, c.arg);
                 self.bus.emit(.{ .tool_execution_start = .{ .tool = c.tool, .arg = c.arg } });
 
                 const res = self.tools_reg.execute(c) catch |e| {
-                    const err_line = try std.fmt.allocPrint(self.arena, "tool_error {s}: {s}", .{ c.tool, @errorName(e) });
-                    try self.session_mgr.appendMessage("tool", err_line);
+                    const err_line = try std.fmt.allocPrint(self.arena, "{s}", .{@errorName(e)});
+                    try self.session_mgr.appendToolResult(c.tool, false, err_line);
                     self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = false, .content = err_line } });
-                    self.bus.emit(.{ .message_append = .{ .role = "tool", .content = err_line } });
                     self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                     return false;
                 };
 
-                const res_line = try std.fmt.allocPrint(self.arena, "tool_result {s}: {s}", .{ c.tool, res.content });
-                try self.session_mgr.appendMessage("tool", res_line);
+                try self.session_mgr.appendToolResult(c.tool, true, res.content);
                 self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = true, .content = res.content } });
-                self.bus.emit(.{ .message_append = .{ .role = "tool", .content = res_line } });
 
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                 return false; // not done, need another model step

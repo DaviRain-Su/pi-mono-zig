@@ -138,9 +138,14 @@ pub fn main() !void {
 
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
-        const msgs = try sm.loadMessages();
-        for (msgs) |m| {
-            std.debug.print("[{s}] {s}\n", .{ m.role, m.content });
+        const entries = try sm.loadEntries();
+        for (entries) |e| {
+            switch (e) {
+                .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
+                .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
+                .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
+                .session => |_| {},
+            }
         }
         return;
     }
