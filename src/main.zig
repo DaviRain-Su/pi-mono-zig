@@ -19,7 +19,7 @@ fn usage() void {
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
         \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME]\n\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME] [--structured]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -53,6 +53,17 @@ fn tokensEstFromChars(chars: usize) usize {
     return (chars + 3) / 4;
 }
 
+fn tokensEstForEntry(e: st.Entry) usize {
+    return switch (e) {
+        .message => |m| tokensEstFromChars(m.content.len),
+        // tool call/results tend to be denser / more verbose
+        .tool_call => |tc| tokensEstFromChars(tc.arg.len) + 8,
+        .tool_result => |tr| tokensEstFromChars(tr.content.len) + 8,
+        .summary => |s| tokensEstFromChars(s.content.len),
+        else => 0,
+    };
+}
+
 fn doCompact(
     allocator: std.mem.Allocator,
     sm: *session.SessionManager,
@@ -62,6 +73,7 @@ fn doCompact(
     prefix: []const u8,
     reason: ?[]const u8,
     stats_total_chars: ?usize,
+    stats_total_tokens_est: ?usize,
     stats_threshold_chars: ?usize,
     stats_threshold_tokens_est: ?usize,
 ) !struct { dryRun: bool, summaryText: []const u8, summaryId: ?[]const u8 } {
@@ -110,7 +122,7 @@ fn doCompact(
         sum_text,
         reason,
         stats_total_chars,
-        if (stats_total_chars) |tc| tokensEstFromChars(tc) else null,
+        stats_total_tokens_est,
         keep_last,
         stats_threshold_chars,
         stats_threshold_tokens_est,
@@ -373,6 +385,7 @@ pub fn main() !void {
         var keep_last: usize = 8;
         var dry_run = false;
         var label: ?[]const u8 = null;
+        var structured = false;
 
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
@@ -384,6 +397,8 @@ pub fn main() !void {
                 dry_run = true;
             } else if (std.mem.eql(u8, a, "--label")) {
                 label = args.next() orelse return error.MissingLabel;
+            } else if (std.mem.eql(u8, a, "--structured")) {
+                structured = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -400,14 +415,20 @@ pub fn main() !void {
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
 
+        const prefix = if (structured)
+            "SUMMARY (structured):\nGoals:\n- (unknown)\nDecisions:\n- (unknown)\nProgress:\n"
+        else
+            "SUMMARY (naive):\n";
+
         const res = try doCompact(
             allocator,
             &sm,
             keep_last,
             dry_run,
             label,
-            "SUMMARY (naive):\n",
+            prefix,
             "manual",
+            null,
             null,
             null,
             null,
@@ -744,18 +765,18 @@ pub fn main() !void {
             }
 
             if (auto_compact) {
-                // naive context size estimate: sum of message contents on current leaf path
+                // naive context size estimate on current leaf path
                 const chain = try sm.buildContextEntries();
                 var total: usize = 0;
+                var total_tokens_est: usize = 0;
                 for (chain) |e| {
                     switch (e) {
                         .message => |m| total += m.content.len,
                         .summary => |s| total += s.content.len,
                         else => {},
                     }
+                    total_tokens_est += tokensEstForEntry(e);
                 }
-
-                const total_tokens_est = tokensEstFromChars(total);
 
                 if (total > max_chars or total_tokens_est > max_tokens_est) {
                     const res = try doCompact(
@@ -767,6 +788,7 @@ pub fn main() !void {
                         "AUTO_COMPACT (naive):\n",
                         if (total > max_chars) "auto_chars" else "auto_tokens",
                         total,
+                        total_tokens_est,
                         max_chars,
                         max_tokens_est,
                     );
