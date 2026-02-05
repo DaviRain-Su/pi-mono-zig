@@ -379,6 +379,103 @@ fn doCompact(
                 }
             }
 
+            // TS-ish: keep "In Progress" aligned with new Next Steps, and migrate completed items.
+            // - Add new next-items as "- [ ] ..." under In Progress.
+            // - Remove any In Progress lines that match done items.
+            {
+                const h = "### In Progress\n";
+                if (std.mem.indexOf(u8, base, h)) |hp| {
+                    const insert_pos = hp + h.len;
+                    const tail = base[insert_pos..];
+                    const next_hdr = std.mem.indexOf(u8, tail, "\n### Blocked\n") orelse tail.len;
+                    const section = tail[0..next_hdr];
+
+                    var new_sec = try std.ArrayList(u8).initCapacity(allocator, 0);
+                    // NOTE: arena allocator; no deinit needed.
+
+                    // Keep existing lines but drop "- (none)" and any done-matching lines.
+                    var it_lines = std.mem.splitScalar(u8, section, '\n');
+                    while (it_lines.next()) |ln| {
+                        if (ln.len == 0) continue;
+                        if (std.mem.eql(u8, ln, "- (none)")) continue;
+
+                        var drop = false;
+                        for (done_items.items) |dit| {
+                            // naive match: line contains done text
+                            if (std.mem.indexOf(u8, ln, dit) != null) {
+                                drop = true;
+                                break;
+                            }
+                        }
+                        if (drop) continue;
+
+                        try new_sec.appendSlice(allocator, ln);
+                        try new_sec.appendSlice(allocator, "\n");
+                    }
+
+                    // Append next items as checklist entries if not already present.
+                    var added: usize = 0;
+                    for (next_items.items) |nit| {
+                        if (added >= MAX_NEW_NEXT) break;
+                        if (std.mem.indexOf(u8, new_sec.items, nit) != null) continue;
+                        var is_done = false;
+                        for (done_items.items) |dit| {
+                            if (std.mem.indexOf(u8, nit, dit) != null or std.mem.indexOf(u8, dit, nit) != null) {
+                                is_done = true;
+                                break;
+                            }
+                        }
+                        if (is_done) continue;
+                        try new_sec.appendSlice(allocator, "- [ ] ");
+                        try new_sec.appendSlice(allocator, nit);
+                        try new_sec.appendSlice(allocator, "\n");
+                        added += 1;
+                    }
+
+                    if (new_sec.items.len == 0) {
+                        try new_sec.appendSlice(allocator, "- (none)\n");
+                    }
+
+                    var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
+                    defer b2.deinit(allocator);
+                    try b2.appendSlice(allocator, base[0..insert_pos]);
+                    try b2.appendSlice(allocator, new_sec.items);
+                    try b2.appendSlice(allocator, base[insert_pos + next_hdr ..]);
+                    base = try b2.toOwnedSlice(allocator);
+                }
+            }
+
+            // If Next Steps ended up empty, keep a small placeholder for readability.
+            {
+                const h = "## Next Steps\n";
+                const h2 = "\n## Critical Context\n";
+                if (std.mem.indexOf(u8, base, h)) |hp| {
+                    const content_start = hp + h.len;
+                    const tail = base[content_start..];
+                    const end_rel = std.mem.indexOf(u8, tail, h2) orelse tail.len;
+                    const content = tail[0..end_rel];
+
+                    var only_ws = true;
+                    var k: usize = 0;
+                    while (k < content.len) : (k += 1) {
+                        const c = content[k];
+                        if (!(c == ' ' or c == '\n' or c == '\r' or c == '\t')) {
+                            only_ws = false;
+                            break;
+                        }
+                    }
+
+                    if (only_ws) {
+                        var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 32);
+                        defer b2.deinit(allocator);
+                        try b2.appendSlice(allocator, base[0..content_start]);
+                        try b2.appendSlice(allocator, "1. (none)\n");
+                        try b2.appendSlice(allocator, base[content_start + end_rel ..]);
+                        base = try b2.toOwnedSlice(allocator);
+                    }
+                }
+            }
+
             // Find insertion point: after "## Critical Context\n" heading.
             const needle = "## Critical Context\n";
             const pos_opt = std.mem.indexOf(u8, base, needle);
