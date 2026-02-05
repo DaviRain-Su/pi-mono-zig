@@ -93,13 +93,26 @@ fn doCompact(
     var start: usize = if (n > keep_last) n - keep_last else 0;
 
     // TS-ish compaction cut alignment:
-    // Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
-    // Minimal rule: if cut lands on a tool_result, move it back until it lands on a non-tool_result.
+    // 1) Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
+    // 2) Prefer to start the tail at a user message (turn boundary heuristic).
     while (start > 0) {
         const e = nodes.items[start];
         switch (e) {
             .tool_result => start -= 1,
             else => break,
+        }
+    }
+
+    // Turn-boundary heuristic: move start backwards until it lands on a user message.
+    // This keeps tool_call/tool_result + assistant messages together more often (TS-like behavior).
+    while (start > 0) {
+        const e = nodes.items[start];
+        switch (e) {
+            .message => |m| {
+                if (std.mem.eql(u8, m.role, "user")) break;
+                start -= 1;
+            },
+            else => start -= 1,
         }
     }
 
