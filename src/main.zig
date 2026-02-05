@@ -19,7 +19,7 @@ fn usage() void {
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
         \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME] [--structured (md|json)]\n\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -76,6 +76,7 @@ fn doCompact(
     stats_total_tokens_est: ?usize,
     stats_threshold_chars: ?usize,
     stats_threshold_tokens_est: ?usize,
+    update_summary: bool,
 ) !struct { dryRun: bool, summaryText: []const u8, summaryId: ?[]const u8 } {
     const chain = try sm.buildContextEntries();
 
@@ -153,34 +154,100 @@ fn doCompact(
         try sum_buf.appendSlice(allocator, written);
     } else {
         // TS-aligned markdown structured summary (matches SUMMARIZATION_PROMPT format)
-        // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes prior message snippets.
-        try sum_buf.appendSlice(allocator,
-            "## Goal\n(unknown)\n\n" ++
-            "## Constraints & Preferences\n- (none)\n\n" ++
-            "## Progress\n### Done\n- (none)\n\n### In Progress\n- (none)\n\n### Blocked\n- (none)\n\n" ++
-            "## Key Decisions\n- (none)\n\n" ++
-            "## Next Steps\n1. (none)\n\n" ++
-            "## Critical Context\n");
 
-        var i: usize = 0;
-        while (i < start) : (i += 1) {
-            const e = nodes.items[i];
-            switch (e) {
-                .message => |m| {
-                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
-                        const preview = if (m.content.len > 120) m.content[0..120] else m.content;
-                        try sum_buf.appendSlice(allocator, "- ");
-                        try sum_buf.appendSlice(allocator, m.role);
-                        try sum_buf.appendSlice(allocator, ": ");
-                        try sum_buf.appendSlice(allocator, preview);
-                        try sum_buf.appendSlice(allocator, "\n");
-                    }
-                },
-                else => {},
+        // If update_summary is enabled and we have a previous md summary in the summarized prefix,
+        // merge new info into that summary (naive: only appends to Critical Context).
+        var prev_summary: ?[]const u8 = null;
+        var prev_idx: ?usize = null;
+        if (update_summary) {
+            var k: usize = start;
+            while (k > 0) : (k -= 1) {
+                const e = nodes.items[k - 1];
+                switch (e) {
+                    .summary => |s| {
+                        if (std.mem.eql(u8, s.format, "md")) {
+                            prev_summary = s.content;
+                            prev_idx = k - 1;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
             }
         }
-        if (start == 0) {
-            try sum_buf.appendSlice(allocator, "- (none)\n");
+
+        if (prev_summary == null) {
+            // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
+            try sum_buf.appendSlice(allocator,
+                "## Goal\n(unknown)\n\n" ++
+                "## Constraints & Preferences\n- (none)\n\n" ++
+                "## Progress\n### Done\n- (none)\n\n### In Progress\n- (none)\n\n### Blocked\n- (none)\n\n" ++
+                "## Key Decisions\n- (none)\n\n" ++
+                "## Next Steps\n1. (none)\n\n" ++
+                "## Critical Context\n");
+
+            var i: usize = 0;
+            while (i < start) : (i += 1) {
+                const e = nodes.items[i];
+                switch (e) {
+                    .message => |m| {
+                        if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                            const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+                            try sum_buf.appendSlice(allocator, "- ");
+                            try sum_buf.appendSlice(allocator, m.role);
+                            try sum_buf.appendSlice(allocator, ": ");
+                            try sum_buf.appendSlice(allocator, preview);
+                            try sum_buf.appendSlice(allocator, "\n");
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (start == 0) {
+                try sum_buf.appendSlice(allocator, "- (none)\n");
+            }
+        } else {
+            // Merge mode
+            const base = prev_summary.?;
+            // Find insertion point: after "## Critical Context\n" heading.
+            const needle = "## Critical Context\n";
+            const pos_opt = std.mem.indexOf(u8, base, needle);
+            if (pos_opt == null) {
+                // fallback: just append
+                try sum_buf.appendSlice(allocator, base);
+                try sum_buf.appendSlice(allocator, "\n## Critical Context\n");
+            } else {
+                const pos = pos_opt.? + needle.len;
+                try sum_buf.appendSlice(allocator, base[0..pos]);
+
+                // If the critical context currently has "- (none)", drop it.
+                const rest = base[pos..];
+                if (std.mem.startsWith(u8, rest, "- (none)\n")) {
+                    try sum_buf.appendSlice(allocator, rest[9..]);
+                } else {
+                    try sum_buf.appendSlice(allocator, rest);
+                }
+            }
+
+            // Append new message snippets after previous summary node up to start.
+            const from_i: usize = (prev_idx orelse 0) + 1;
+            var i: usize = from_i;
+            while (i < start) : (i += 1) {
+                const e = nodes.items[i];
+                switch (e) {
+                    .message => |m| {
+                        if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                            const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+                            try sum_buf.appendSlice(allocator, "- ");
+                            try sum_buf.appendSlice(allocator, m.role);
+                            try sum_buf.appendSlice(allocator, ": ");
+                            try sum_buf.appendSlice(allocator, preview);
+                            try sum_buf.appendSlice(allocator, "\n");
+                        }
+                    },
+                    else => {},
+                }
+            }
         }
     }
 
@@ -461,6 +528,7 @@ pub fn main() !void {
         var label: ?[]const u8 = null;
         var structured = false;
         var structured_format: []const u8 = "md"; // md|json
+        var update_summary = false;
 
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
@@ -485,6 +553,8 @@ pub fn main() !void {
                 } else {
                     structured_format = "md";
                 }
+            } else if (std.mem.eql(u8, a, "--update")) {
+                update_summary = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -508,11 +578,12 @@ pub fn main() !void {
             dry_run,
             label,
             if (structured and std.mem.eql(u8, structured_format, "json")) "SUMMARY_JSON" else if (structured) "SUMMARY_MD" else "SUMMARY (naive):\n",
-            "manual",
+            if (update_summary) "manual_update" else "manual",
             null,
             null,
             null,
             null,
+            update_summary,
         );
 
         if (res.dryRun) {
@@ -901,6 +972,7 @@ pub fn main() !void {
                         total_tokens_est,
                         max_chars,
                         max_tokens_est,
+                        false,
                     );
                     std.debug.print(
                         "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (keep_last={d}) summaryId={s}\n",
