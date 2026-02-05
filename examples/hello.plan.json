@@ -1,0 +1,24 @@
+{
+  "schema": "pi.plan.v1",
+  "workflow": "hello",
+  "steps": [
+    {
+      "id": "s1",
+      "tool": "echo",
+      "params": { "text": "hello from pi-mono-zig" },
+      "dependsOn": []
+    },
+    {
+      "id": "s2",
+      "tool": "sleep_ms",
+      "params": { "ms": 250 },
+      "dependsOn": ["s1"]
+    },
+    {
+      "id": "s3",
+      "tool": "echo",
+      "params": { "text": "done" },
+      "dependsOn": ["s2"]
+    }
+  ]
+}
