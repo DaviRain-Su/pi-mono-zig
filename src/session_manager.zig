@@ -105,6 +105,7 @@ pub const SessionManager = struct {
         self: *SessionManager,
         content: []const u8,
         reason: ?[]const u8,
+        format: []const u8,
         totalChars: ?usize,
         totalTokensEst: ?usize,
         keepLast: ?usize,
@@ -118,6 +119,7 @@ pub const SessionManager = struct {
             .parentId = pid,
             .timestamp = try nowIso(self.arena),
             .reason = reason,
+            .format = format,
             .content = content,
             .totalChars = totalChars,
             .totalTokensEst = totalTokensEst,
@@ -281,6 +283,7 @@ pub const SessionManager = struct {
                 const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
                 const reason0 = if (obj.get("reason")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const format0 = if (obj.get("format")) |v| switch (v) { .string => |s| s, else => "text" } else "text";
                 const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
 
                 const totalChars0 = if (obj.get("totalChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
@@ -293,6 +296,7 @@ pub const SessionManager = struct {
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const reason = try dup.os(self.arena, reason0);
+                const format = try dup.s(self.arena, format0);
                 const content = try dup.s(self.arena, content0);
 
                 try out.append(self.arena, .{ .summary = .{
@@ -300,6 +304,7 @@ pub const SessionManager = struct {
                     .parentId = pid,
                     .timestamp = ts,
                     .reason = reason,
+                    .format = format,
                     .content = content,
                     .totalChars = totalChars0,
                     .totalTokensEst = totalTokensEst0,

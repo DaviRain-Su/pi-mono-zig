@@ -59,7 +59,10 @@ pub const SummaryEntry = struct {
     /// Why this summary was created (manual|auto_chars|auto_tokens|...)
     reason: ?[]const u8 = null,
 
-    /// Human readable summary text
+    /// "text" (legacy) or "json" (structured)
+    format: []const u8 = "text",
+
+    /// Summary payload. If format=json, this is a JSON string.
     content: []const u8,
 
     /// Optional stats snapshots for debugging/verification

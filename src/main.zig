@@ -93,23 +93,64 @@ fn doCompact(
 
     var sum_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer sum_buf.deinit(allocator);
-    try sum_buf.appendSlice(allocator, prefix);
 
-    var i: usize = 0;
-    while (i < start) : (i += 1) {
-        const e = nodes.items[i];
-        switch (e) {
-            .message => |m| {
-                if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
-                    const preview = if (m.content.len > 80) m.content[0..80] else m.content;
-                    try sum_buf.appendSlice(allocator, m.role);
-                    try sum_buf.appendSlice(allocator, ": ");
-                    try sum_buf.appendSlice(allocator, preview);
-                    try sum_buf.appendSlice(allocator, "\n");
-                }
-            },
-            else => {},
+    const want_json = std.mem.eql(u8, prefix, "SUMMARY_JSON");
+
+    if (!want_json) {
+        try sum_buf.appendSlice(allocator, prefix);
+
+        var i: usize = 0;
+        while (i < start) : (i += 1) {
+            const e = nodes.items[i];
+            switch (e) {
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                        const preview = if (m.content.len > 80) m.content[0..80] else m.content;
+                        try sum_buf.appendSlice(allocator, m.role);
+                        try sum_buf.appendSlice(allocator, ": ");
+                        try sum_buf.appendSlice(allocator, preview);
+                        try sum_buf.appendSlice(allocator, "\n");
+                    }
+                },
+                else => {},
+            }
         }
+    } else {
+        // Structured JSON summary (TS-style fields)
+        // This is still naive: we only fill progress with recent lines.
+        var progress = try std.ArrayList(u8).initCapacity(allocator, 0);
+        defer progress.deinit(allocator);
+        var i: usize = 0;
+        while (i < start) : (i += 1) {
+            const e = nodes.items[i];
+            switch (e) {
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
+                        const preview = if (m.content.len > 80) m.content[0..80] else m.content;
+                        try progress.appendSlice(allocator, m.role);
+                        try progress.appendSlice(allocator, ": ");
+                        try progress.appendSlice(allocator, preview);
+                        try progress.appendSlice(allocator, "\n");
+                    }
+                },
+                else => {},
+            }
+        }
+        const progress_s = try progress.toOwnedSlice(allocator);
+
+        const payload = .{
+            .schema = "pi.summary.v1",
+            .goals = [_][]const u8{},
+            .decisions = [_][]const u8{},
+            .progress = progress_s,
+            .open_questions = [_][]const u8{},
+            .next_steps = [_][]const u8{},
+        };
+
+        // Write JSON to sum_buf
+        const written = try std.json.Stringify.valueAlloc(allocator, payload, .{ .whitespace = .indent_2 });
+        try sum_buf.appendSlice(allocator, written);
+        // NOTE: we'll mark summary.format="json" when persisting.
     }
 
     const sum_text = try sum_buf.toOwnedSlice(allocator);
@@ -121,6 +162,7 @@ fn doCompact(
     const summary_id = try sm.appendSummary(
         sum_text,
         reason,
+        if (want_json) "json" else "text",
         stats_total_chars,
         stats_total_tokens_est,
         keep_last,
@@ -148,6 +190,7 @@ fn doCompact(
                 _ = try sm.appendSummary(
                     s.content,
                     s.reason,
+                    s.format,
                     s.totalChars,
                     s.totalTokensEst,
                     s.keepLast,
@@ -315,8 +358,8 @@ pub fn main() !void {
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
                     .summary => |s| std.debug.print(
-                        "summary {s} parent={s}\nreason={s}\nkeepLast={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
-                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.keepLast, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
+                        "summary {s} parent={s}\nreason={s}\nformat={s}\nkeepLast={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.keepLast, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
                     ),
                     else => {},
                 }
@@ -415,18 +458,13 @@ pub fn main() !void {
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
 
-        const prefix = if (structured)
-            "SUMMARY (structured):\nGoals:\n- (unknown)\nDecisions:\n- (unknown)\nProgress:\n"
-        else
-            "SUMMARY (naive):\n";
-
         const res = try doCompact(
             allocator,
             &sm,
             keep_last,
             dry_run,
             label,
-            prefix,
+            if (structured) "SUMMARY_JSON" else "SUMMARY (naive):\n",
             "manual",
             null,
             null,
