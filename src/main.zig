@@ -55,7 +55,7 @@ fn tokensEstFromChars(chars: usize) usize {
 
 fn tokensEstForEntry(e: st.Entry) usize {
     return switch (e) {
-        .message => |m| tokensEstFromChars(m.content.len),
+        .message => |m| m.tokensEst orelse tokensEstFromChars(m.content.len),
         // tool call/results tend to be denser / more verbose
         .tool_call => |tc| tokensEstFromChars(tc.arg.len) + 8,
         .tool_result => |tr| tokensEstFromChars(tr.content.len) + 8,

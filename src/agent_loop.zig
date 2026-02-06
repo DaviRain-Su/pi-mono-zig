@@ -48,7 +48,9 @@ pub const AgentLoop = struct {
         const out = try mock_model.next(self.arena, entries);
         switch (out) {
             .final_text => |t| {
-                _ = try self.session_mgr.appendMessage("assistant", t);
+                // Best-effort usage estimate for sizing.
+                const tokens_est = (t.len + 3) / 4;
+                _ = try self.session_mgr.appendMessageWithTokensEst("assistant", t, tokens_est);
                 self.bus.emit(.{ .message_append = .{ .role = "assistant", .content = t } });
                 _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "final");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });

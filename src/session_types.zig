@@ -15,6 +15,9 @@ pub const MessageEntry = struct {
     timestamp: []const u8,
     role: []const u8, // user|assistant|tool
     content: []const u8,
+
+    /// Optional per-entry usage estimate (best-effort). When present, sizing prefers this.
+    tokensEst: ?usize = null,
 };
 
 pub const ToolCallEntry = struct {

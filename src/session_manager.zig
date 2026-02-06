@@ -137,6 +137,10 @@ pub const SessionManager = struct {
     }
 
     pub fn appendMessage(self: *SessionManager, role: []const u8, content: []const u8) ![]const u8 {
+        return try self.appendMessageWithTokensEst(role, content, null);
+    }
+
+    pub fn appendMessageWithTokensEst(self: *SessionManager, role: []const u8, content: []const u8, tokens_est: ?usize) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = MessageEntry{
@@ -145,6 +149,7 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .role = role,
             .content = content,
+            .tokensEst = tokens_est,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -254,12 +259,13 @@ pub const SessionManager = struct {
                 const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
                 const role0 = switch (obj.get("role") orelse continue) { .string => |s| s, else => continue };
                 const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const role = try dup.s(self.arena, role0);
                 const content = try dup.s(self.arena, content0);
-                try out.append(self.arena, .{ .message = .{ .id = id, .parentId = pid, .timestamp = ts, .role = role, .content = content } });
+                try out.append(self.arena, .{ .message = .{ .id = id, .parentId = pid, .timestamp = ts, .role = role, .content = content, .tokensEst = tokens_est0 } });
                 continue;
             }
 
