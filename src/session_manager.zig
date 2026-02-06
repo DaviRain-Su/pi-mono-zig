@@ -153,6 +153,78 @@ pub const SessionManager = struct {
         return false;
     }
 
+    fn normalizeMessageRole(role: []const u8) []const u8 {
+        if (std.mem.eql(u8, role, "toolResult")) return "tool";
+        if (std.mem.eql(u8, role, "branchSummary")) return "user";
+        if (std.mem.eql(u8, role, "compactionSummary")) return "user";
+        if (std.mem.eql(u8, role, "custom")) return "user";
+        if (std.mem.eql(u8, role, "bashExecution")) return "user";
+        return role;
+    }
+
+    fn extractTextFromContentValue(allocator: std.mem.Allocator, v: std.json.Value) ![]const u8 {
+        switch (v) {
+            .string => |s| return try allocator.dupe(u8, s),
+            .array => |a| {
+                var out = try std.ArrayList(u8).initCapacity(allocator, 0);
+                defer out.deinit(allocator);
+
+                var wrote_any = false;
+                for (a.items) |it| {
+                    var chunk: ?[]const u8 = null;
+                    switch (it) {
+                        .string => |s| chunk = s,
+                        .object => |o| {
+                            const tpe = if (o.get("type")) |tv| switch (tv) {
+                                .string => |s| s,
+                                else => "",
+                            } else "";
+
+                            if (o.get("text")) |tv| switch (tv) {
+                                .string => |s| chunk = s,
+                                else => {},
+                            };
+
+                            if (chunk == null) {
+                                if (o.get("content")) |cv| switch (cv) {
+                                    .string => |s| chunk = s,
+                                    else => {},
+                                };
+                            }
+
+                            if (chunk == null and
+                                (std.mem.eql(u8, tpe, "image") or
+                                    std.mem.eql(u8, tpe, "input_image") or
+                                    std.mem.eql(u8, tpe, "image_url")))
+                            {
+                                chunk = "[image]";
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (chunk) |c| {
+                        if (c.len == 0) continue;
+                        if (wrote_any) try out.appendSlice(allocator, "\n");
+                        try out.appendSlice(allocator, c);
+                        wrote_any = true;
+                    }
+                }
+
+                if (!wrote_any) return try allocator.dupe(u8, "[non-text content]");
+                return try out.toOwnedSlice(allocator);
+            },
+            .object => |o| {
+                if (o.get("text")) |tv| switch (tv) {
+                    .string => |s| return try allocator.dupe(u8, s),
+                    else => {},
+                };
+                return try allocator.dupe(u8, "[object content]");
+            },
+            else => return try allocator.dupe(u8, "[non-text content]"),
+        }
+    }
+
     pub fn branchTo(self: *SessionManager, targetId: ?[]const u8) !void {
         if (targetId) |tid| {
             if (!try self.hasEntryId(tid)) {
@@ -452,14 +524,23 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
-                const role0 = switch (obj.get("role") orelse continue) {
+                const msg_obj = if (obj.get("message")) |mv| switch (mv) {
+                    .object => |o| @as(?std.json.ObjectMap, o),
+                    else => null,
+                } else null;
+
+                const role0 = if (obj.get("role")) |v| switch (v) {
                     .string => |s| s,
                     else => continue,
-                };
-                const content0 = switch (obj.get("content") orelse continue) {
+                } else if (msg_obj) |mo| switch (mo.get("role") orelse continue) {
                     .string => |s| s,
                     else => continue,
-                };
+                } else continue;
+                const role_norm0 = normalizeMessageRole(role0);
+
+                const content_val = if (obj.get("content")) |v| v else if (msg_obj) |mo| (mo.get("content") orelse continue) else continue;
+                const content = try extractTextFromContentValue(self.arena, content_val);
+
                 const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) {
                     .integer => |x| @as(?usize, @intCast(x)),
                     else => null,
@@ -467,12 +548,23 @@ pub const SessionManager = struct {
                 const usage_total_tokens0 = if (obj.get("usageTotalTokens")) |v| switch (v) {
                     .integer => |x| @as(?usize, @intCast(x)),
                     else => null,
+                } else if (msg_obj) |mo| blk: {
+                    const usage_v = mo.get("usage") orelse break :blk null;
+                    switch (usage_v) {
+                        .object => |uobj| {
+                            const tt_v = uobj.get("totalTokens") orelse break :blk null;
+                            switch (tt_v) {
+                                .integer => |x| break :blk @as(?usize, @intCast(x)),
+                                else => break :blk null,
+                            }
+                        },
+                        else => break :blk null,
+                    }
                 } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
-                const role = try dup.s(self.arena, role0);
-                const content = try dup.s(self.arena, content0);
+                const role = try dup.s(self.arena, role_norm0);
                 try out.append(self.arena, .{ .message = .{
                     .id = id,
                     .parentId = pid,
@@ -714,10 +806,7 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
-                const content0 = if (obj.get("content")) |v| switch (v) {
-                    .string => |s| s,
-                    else => "[non-string custom_message content]",
-                } else continue;
+                const content_v = obj.get("content") orelse continue;
                 const display0 = if (obj.get("display")) |v| switch (v) {
                     .bool => |b| b,
                     else => true,
@@ -727,7 +816,7 @@ pub const SessionManager = struct {
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const custom_type = try dup.s(self.arena, custom_type0);
-                const content = try dup.s(self.arena, content0);
+                const content = try extractTextFromContentValue(self.arena, content_v);
 
                 try out.append(self.arena, .{ .custom_message = .{
                     .id = id,

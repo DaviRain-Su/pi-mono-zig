@@ -48,6 +48,8 @@ JSONL entries are now structured (not just plain messages):
 - `type: custom` / `type: session_info` (parsed and preserved for TS session compatibility)
 - `type: leaf` (tracks current leaf for branching)
 
+`type: message` supports both zig-native flat fields (`role/content`) and TS nested shape (`message.role/message.content`).
+
 ```bash
 # creates/extends a JSONL session
 zig build run -- chat --session /tmp/pi-session.jsonl
