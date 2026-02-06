@@ -13,7 +13,7 @@ fn usage() void {
         \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
-        \\  pi-mono-zig replay --session <path.jsonl>\n\
+        \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl>\n\
@@ -1196,9 +1196,12 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, cmd, "replay")) {
         var session_path: ?[]const u8 = null;
+        var show_turns = false;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--show-turns")) {
+                show_turns = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -1216,8 +1219,16 @@ pub fn main() !void {
         const entries = try sm.buildContextEntries();
         for (entries) |e| {
             switch (e) {
-                .turn_start => |t| std.debug.print("[turn_start] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" }),
-                .turn_end => |t| std.debug.print("[turn_end] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" }),
+                .turn_start => |t| {
+                    if (show_turns) {
+                        std.debug.print("[turn_start] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" });
+                    }
+                },
+                .turn_end => |t| {
+                    if (show_turns) {
+                        std.debug.print("[turn_end] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" });
+                    }
+                },
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
