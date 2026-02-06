@@ -2239,9 +2239,29 @@ pub fn main() !void {
             if (auto_compact) {
                 // TS-like: size estimate on business-only context (ignore structural entries)
                 const chain = try sm.buildContextEntries();
+
+                // TS parity: only size the "boundary" since the most recent summary.
+                // This prevents old history (already summarized) from continuously re-triggering.
+                var boundary_from: usize = 0;
+                {
+                    var k: usize = chain.len;
+                    while (k > 0) : (k -= 1) {
+                        const e = chain[k - 1];
+                        switch (e) {
+                            .summary => {
+                                boundary_from = k; // start *after* the summary
+                                break;
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
                 var total: usize = 0;
                 var total_tokens_est: usize = 0;
-                for (chain) |e| {
+                var idx: usize = boundary_from;
+                while (idx < chain.len) : (idx += 1) {
+                    const e = chain[idx];
                     switch (e) {
                         .message => |m| total += m.content.len,
                         .summary => |s| total += s.content.len,
