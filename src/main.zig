@@ -357,10 +357,9 @@ fn doCompact(
     };
 
     // Infer file ops from the portion we are summarizing (boundary_from..summarize_end).
-    // NOTE: summarize_end is set later for md; for now, use a conservative default of `start`.
-    const fileops_end_default: usize = start;
+    const summarize_end_common: usize = if (split_turn) split_history_end else start;
     var fi: usize = boundary_from;
-    while (fi < fileops_end_default) : (fi += 1) {
+    while (fi < summarize_end_common) : (fi += 1) {
         const e = nodes.items[fi];
         switch (e) {
             .tool_call => |tc| {
@@ -1213,25 +1212,6 @@ fn doCompact(
         }
 
         const summarize_end: usize = if (split_turn) split_history_end else start;
-
-        // Re-scan file ops for the precise md summary window.
-        read_files_out.clearRetainingCapacity();
-        modified_files_out.clearRetainingCapacity();
-        seen_rf.clearRetainingCapacity();
-        seen_mf.clearRetainingCapacity();
-        var fi2: usize = boundary_from;
-        while (fi2 < summarize_end) : (fi2 += 1) {
-            const e = nodes.items[fi2];
-            switch (e) {
-                .tool_call => |tc| {
-                    if (std.mem.eql(u8, tc.tool, "shell")) {
-                        // reuse helper
-                        FileOps.scanShell(allocator, tc.arg, &read_files_out, &modified_files_out, &seen_rf, &seen_mf);
-                    }
-                },
-                else => {},
-            }
-        }
 
         if (prev_summary == null) {
             // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
