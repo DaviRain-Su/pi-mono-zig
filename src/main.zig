@@ -201,6 +201,13 @@ fn doCompact(
             in_progress: []const []const u8,
             blocked: []const []const u8, // human-readable blocked reasons
         };
+        const BlockedTask = struct {
+            task: []const u8,
+            tool: ?[]const u8 = null,
+            arg: ?[]const u8 = null,
+            err: ?[]const u8 = null,
+        };
+
         const Payload = struct {
             schema: []const u8,
             goal: []const u8,
@@ -209,7 +216,7 @@ fn doCompact(
             key_decisions: []const []const u8,
             next_steps: []const []const u8,
             critical_context: []const []const u8,
-            blocked_tasks: []const []const u8, // tasks to treat as blocked (used for migration)
+            blocked_tasks: []const BlockedTask, // structured blocked tasks (used for migration)
             raw: []const u8,
         };
 
@@ -238,7 +245,7 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v2" } else "pi.summary.v2";
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v3" } else "pi.summary.v3";
                             const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
@@ -311,11 +318,31 @@ fn doCompact(
                             const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "" } else "";
 
                             const bt_val = if (obj.get("blocked_tasks")) |v| v else null;
-                            var bt_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            var bt_list = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
                             if (bt_val) |bv| {
                                 switch (bv) {
                                     .array => |a| for (a.items) |it| {
-                                        if (it == .string) try bt_list.append(allocator, try dupStr.dup(allocator, it.string));
+                                        switch (it) {
+                                            .string => {
+                                                // v2 compatibility: blocked_tasks: ["sh: ...", ...]
+                                                try bt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
+                                            },
+                                            .object => |o| {
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                if (task0.len == 0) continue;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const err0 = if (o.get("err")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+
+                                                try bt_list.append(allocator, .{
+                                                    .task = try dupStr.dup(allocator, task0),
+                                                    .tool = if (tool0) |t| try dupStr.dup(allocator, t) else null,
+                                                    .arg = if (arg0) |t| try dupStr.dup(allocator, t) else null,
+                                                    .err = if (err0) |t| try dupStr.dup(allocator, t) else null,
+                                                });
+                                            },
+                                            else => {},
+                                        }
                                     },
                                     else => {},
                                 }
@@ -361,7 +388,7 @@ fn doCompact(
         defer new_decisions.deinit(allocator);
         var new_blocked = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer new_blocked.deinit(allocator);
-        var new_blocked_tasks = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        var new_blocked_tasks = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
         defer new_blocked_tasks.deinit(allocator);
 
         var i: usize = from_i;
@@ -399,10 +426,10 @@ fn doCompact(
                         if (arg_opt) |a| {
                             if (std.mem.eql(u8, tr.tool, "shell")) {
                                 const task = try std.fmt.allocPrint(allocator, "sh: {s}", .{a});
-                                try new_blocked_tasks.append(allocator, task);
+                                try new_blocked_tasks.append(allocator, .{ .task = task, .tool = tr.tool, .arg = a, .err = preview });
                             } else if (std.mem.eql(u8, tr.tool, "echo")) {
                                 const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{a});
-                                try new_blocked_tasks.append(allocator, task);
+                                try new_blocked_tasks.append(allocator, .{ .task = task, .tool = tr.tool, .arg = a, .err = preview });
                             }
                         }
                     }
@@ -478,7 +505,7 @@ fn doCompact(
         }
 
         const base = prev_payload orelse Payload{
-            .schema = "pi.summary.v2",
+            .schema = "pi.summary.v3",
             .goal = "(unknown)",
             .constraints = &.{},
             .progress = .{ .done = &.{}, .in_progress = &.{}, .blocked = &.{} },
@@ -540,7 +567,7 @@ fn doCompact(
         defer dec_out.deinit(allocator);
         var blocked_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer blocked_out.deinit(allocator);
-        var blocked_tasks_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        var blocked_tasks_out = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
         defer blocked_tasks_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
@@ -550,7 +577,7 @@ fn doCompact(
         for (base.constraints) |it| try cons_seen.put(it, true);
         for (base.key_decisions) |it| try dec_seen.put(it, true);
         for (base.progress.blocked) |it| try blocked_seen.put(it, true);
-        for (base.blocked_tasks) |it| try blocked_task_seen.put(it, true);
+        // blocked_task_seen is seeded below when copying base.blocked_tasks
 
         // Start with base lists (capped).
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
@@ -565,7 +592,13 @@ fn doCompact(
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, base.constraints, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, base.key_decisions, 20);
         try Merge.uniqueAppend(allocator, &blocked_out, &blocked_seen, base.progress.blocked, 20);
-        try Merge.uniqueAppend(allocator, &blocked_tasks_out, &blocked_task_seen, base.blocked_tasks, 20);
+        // blocked_tasks: merge by .task key
+        for (base.blocked_tasks) |bt| {
+            if (blocked_tasks_out.items.len >= 20) break;
+            if (blocked_task_seen.contains(bt.task)) continue;
+            try blocked_task_seen.put(bt.task, true);
+            try blocked_tasks_out.append(allocator, bt);
+        }
 
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
@@ -573,7 +606,12 @@ fn doCompact(
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, new_constraints.items, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, new_decisions.items, 20);
         try Merge.uniqueAppend(allocator, &blocked_out, &blocked_seen, new_blocked.items, 20);
-        try Merge.uniqueAppend(allocator, &blocked_tasks_out, &blocked_task_seen, new_blocked_tasks.items, 20);
+        for (new_blocked_tasks.items) |bt| {
+            if (blocked_tasks_out.items.len >= 20) break;
+            if (blocked_task_seen.contains(bt.task)) continue;
+            try blocked_task_seen.put(bt.task, true);
+            try blocked_tasks_out.append(allocator, bt);
+        }
 
         // Sync in_progress with next steps: add items not in done.
         for (new_next.items) |it| {
