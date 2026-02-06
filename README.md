@@ -91,6 +91,9 @@ zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run
 # - appends new snippets into Critical Context
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --structured md --update
 
+# Keep last N complete turn-groups (TS-like) instead of last N entries
+zig build run -- compact --session /tmp/pi-session.jsonl --keep-last-groups 2 --structured md
+
 # structured summary (json)
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run --structured json
 

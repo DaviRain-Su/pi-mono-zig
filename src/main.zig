@@ -12,14 +12,14 @@ fn usage() void {
         \\Usage:\n\
         \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
-        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N]\n\
+        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
         \\  pi-mono-zig replay --session <path.jsonl>\n\
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
         \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--keep-last-groups N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -70,6 +70,7 @@ fn doCompact(
     allocator: std.mem.Allocator,
     sm: *session.SessionManager,
     keep_last: usize,
+    keep_last_groups: ?usize,
     dry_run: bool,
     label: ?[]const u8,
     prefix: []const u8,
@@ -92,7 +93,36 @@ fn doCompact(
     }
 
     const n = nodes.items.len;
+
+    // Choose cut start.
     var start: usize = if (n > keep_last) n - keep_last else 0;
+    if (keep_last_groups) |kg| {
+        // Keep the last N complete turn-groups (best-effort).
+        // We find the boundary end-of-group that precedes the kept groups.
+        // Example: kg=1 => keep last group => boundary is the END of the previous group (count == kg+1).
+        var count: usize = 0;
+        var idx: usize = n;
+        while (idx > 0) : (idx -= 1) {
+            const e = nodes.items[idx - 1];
+            switch (e) {
+                .turn_end => |te| {
+                    if (te.phase) |ph| {
+                        if (std.mem.eql(u8, ph, "final") or std.mem.eql(u8, ph, "error")) {
+                            count += 1;
+                            if (count == kg + 1) {
+                                start = idx; // start AFTER the previous group's end
+                                break;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        // If there aren't enough groups to skip, keep everything.
+        if (count <= kg) start = 0;
+        if (start > n) start = n;
+    }
 
     // TS-ish compaction cut alignment:
     // 1) Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
@@ -849,6 +879,7 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "compact")) {
         var session_path: ?[]const u8 = null;
         var keep_last: usize = 8;
+        var keep_last_groups: ?usize = null;
         var dry_run = false;
         var label: ?[]const u8 = null;
         var structured = false;
@@ -861,6 +892,9 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--keep-last")) {
                 const s = args.next() orelse return error.MissingKeepLast;
                 keep_last = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--keep-last-groups")) {
+                const s = args.next() orelse return error.MissingKeepLast;
+                keep_last_groups = try std.fmt.parseInt(usize, s, 10);
             } else if (std.mem.eql(u8, a, "--dry-run")) {
                 dry_run = true;
             } else if (std.mem.eql(u8, a, "--label")) {
@@ -900,6 +934,7 @@ pub fn main() !void {
             allocator,
             &sm,
             keep_last,
+            keep_last_groups,
             dry_run,
             label,
             if (structured and std.mem.eql(u8, structured_format, "json")) "SUMMARY_JSON" else if (structured) "SUMMARY_MD" else "SUMMARY (naive):\n",
@@ -1198,6 +1233,7 @@ pub fn main() !void {
         var max_chars: usize = 8_000;
         var max_tokens_est: usize = 2_000;
         var keep_last: usize = 8;
+        var keep_last_groups: ?usize = null;
 
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
@@ -1215,6 +1251,9 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--keep-last")) {
                 const s = args.next() orelse return error.MissingKeepLast;
                 keep_last = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--keep-last-groups")) {
+                const s = args.next() orelse return error.MissingKeepLast;
+                keep_last_groups = try std.fmt.parseInt(usize, s, 10);
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -1291,6 +1330,7 @@ pub fn main() !void {
                         allocator,
                         &sm,
                         keep_last,
+                        keep_last_groups,
                         false,
                         "AUTO_COMPACT",
                         "AUTO_COMPACT (naive):\n",
