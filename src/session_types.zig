@@ -94,6 +94,11 @@ pub const SummaryEntry = struct {
     /// Summary payload. If format=json, this is a JSON string.
     content: []const u8,
 
+    /// Best-effort file ops (TS-style compaction details). Stored on the entry, and may also
+    /// be rendered into the content for markdown summaries.
+    readFiles: ?[]const []const u8 = null,
+    modifiedFiles: ?[]const []const u8 = null,
+
     /// Optional stats snapshots for debugging/verification
     totalChars: ?usize = null,
     totalTokensEst: ?usize = null,

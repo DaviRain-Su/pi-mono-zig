@@ -264,6 +264,114 @@ fn doCompact(
     const want_json = std.mem.eql(u8, prefix, "SUMMARY_JSON");
     const want_md = std.mem.eql(u8, prefix, "SUMMARY_MD");
 
+    // TS-style file ops tracking (best-effort). We infer these from tool_call(shell) args.
+    var read_files_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer read_files_out.deinit(allocator);
+    var modified_files_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer modified_files_out.deinit(allocator);
+    var seen_rf = std.StringHashMap(bool).init(allocator);
+    defer seen_rf.deinit();
+    var seen_mf = std.StringHashMap(bool).init(allocator);
+    defer seen_mf.deinit();
+
+    const FileOps = struct {
+        fn trimToken(tok0: []const u8) []const u8 {
+            var tok = tok0;
+            tok = std.mem.trim(u8, tok, " \t\r\n");
+            tok = std.mem.trim(u8, tok, "\"'");
+            return tok;
+        }
+
+        fn looksLikePath(tok: []const u8) bool {
+            if (tok.len == 0) return false;
+            if (tok[0] == '-') return false;
+            if (std.mem.indexOfScalar(u8, tok, '|') != null) return false;
+            if (std.mem.indexOfScalar(u8, tok, ';') != null) return false;
+            if (std.mem.indexOfScalar(u8, tok, '&') != null) return false;
+            if (std.mem.indexOfScalar(u8, tok, '$') != null) return false;
+            if (std.mem.indexOf(u8, tok, "..") != null and tok.len <= 2) return false;
+
+            if (std.mem.indexOfScalar(u8, tok, '/') != null) return true;
+            // common file extensions
+            const exts = [_][]const u8{ ".zig", ".md", ".json", ".txt", ".service", ".ts", ".js", ".mjs", ".yaml", ".yml" };
+            for (exts) |e| if (std.mem.endsWith(u8, tok, e)) return true;
+            return false;
+        }
+
+        fn addUnique(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayList([]const u8),
+            seen: *std.StringHashMap(bool),
+            tok: []const u8,
+            cap: usize,
+        ) void {
+            if (tok.len == 0) return;
+            if (list.items.len >= cap) return;
+            if (seen.contains(tok)) return;
+            seen.put(tok, true) catch return;
+            list.append(alloc, tok) catch return;
+        }
+
+        fn scanShell(
+            alloc: std.mem.Allocator,
+            arg: []const u8,
+            rf: *std.ArrayList([]const u8),
+            mf: *std.ArrayList([]const u8),
+            seen_rf_map: *std.StringHashMap(bool),
+            seen_mf_map: *std.StringHashMap(bool),
+        ) void {
+            const is_modify = (std.mem.indexOf(u8, arg, ">") != null) or
+                (std.mem.indexOf(u8, arg, "sed -i") != null) or
+                (std.mem.indexOf(u8, arg, "perl -pi") != null) or
+                (std.mem.indexOf(u8, arg, "apply") != null) or
+                (std.mem.indexOf(u8, arg, "git commit") != null) or
+                (std.mem.indexOf(u8, arg, "git add") != null) or
+                (std.mem.indexOf(u8, arg, "mv ") != null) or
+                (std.mem.indexOf(u8, arg, "cp ") != null) or
+                (std.mem.indexOf(u8, arg, "touch ") != null);
+
+            const is_read = (std.mem.indexOf(u8, arg, "cat ") != null) or
+                (std.mem.indexOf(u8, arg, "sed -n") != null) or
+                (std.mem.indexOf(u8, arg, "rg ") != null) or
+                (std.mem.indexOf(u8, arg, "grep ") != null) or
+                (std.mem.indexOf(u8, arg, "head ") != null) or
+                (std.mem.indexOf(u8, arg, "tail ") != null) or
+                (std.mem.indexOf(u8, arg, "less ") != null);
+
+            // Tokenize and collect path-like tokens.
+            var it = std.mem.tokenizeAny(u8, arg, " \t\r\n");
+            while (it.next()) |t0| {
+                const t = trimToken(t0);
+                if (!looksLikePath(t)) continue;
+                const duped = alloc.dupe(u8, t) catch continue;
+                if (is_modify) {
+                    addUnique(alloc, mf, seen_mf_map, duped, 200);
+                } else if (is_read) {
+                    addUnique(alloc, rf, seen_rf_map, duped, 200);
+                } else {
+                    // Unknown intent: treat as read by default.
+                    addUnique(alloc, rf, seen_rf_map, duped, 200);
+                }
+            }
+        }
+    };
+
+    // Infer file ops from the portion we are summarizing (boundary_from..summarize_end).
+    // NOTE: summarize_end is set later for md; for now, use a conservative default of `start`.
+    const fileops_end_default: usize = start;
+    var fi: usize = boundary_from;
+    while (fi < fileops_end_default) : (fi += 1) {
+        const e = nodes.items[fi];
+        switch (e) {
+            .tool_call => |tc| {
+                if (std.mem.eql(u8, tc.tool, "shell")) {
+                    FileOps.scanShell(allocator, tc.arg, &read_files_out, &modified_files_out, &seen_rf, &seen_mf);
+                }
+            },
+            else => {},
+        }
+    }
+
     if (!want_json and !want_md) {
         try sum_buf.appendSlice(allocator, prefix);
 
@@ -1070,6 +1178,25 @@ fn doCompact(
 
         const summarize_end: usize = if (split_turn) split_history_end else start;
 
+        // Re-scan file ops for the precise md summary window.
+        read_files_out.clearRetainingCapacity();
+        modified_files_out.clearRetainingCapacity();
+        seen_rf.clearRetainingCapacity();
+        seen_mf.clearRetainingCapacity();
+        var fi2: usize = boundary_from;
+        while (fi2 < summarize_end) : (fi2 += 1) {
+            const e = nodes.items[fi2];
+            switch (e) {
+                .tool_call => |tc| {
+                    if (std.mem.eql(u8, tc.tool, "shell")) {
+                        // reuse helper
+                        FileOps.scanShell(allocator, tc.arg, &read_files_out, &modified_files_out, &seen_rf, &seen_mf);
+                    }
+                },
+                else => {},
+            }
+        }
+
         if (prev_summary == null) {
             // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
             try sum_buf.appendSlice(allocator,
@@ -1494,16 +1621,41 @@ fn doCompact(
         try sum_buf.appendSlice(allocator, "This turn was too large to keep in full. The kept suffix continues after this cutpoint.\n");
     }
 
+    if (want_md) {
+        // TS-style compaction details: append file operations.
+        if (read_files_out.items.len > 0) {
+            try sum_buf.appendSlice(allocator, "\n\n<read-files>\n");
+            for (read_files_out.items) |p| {
+                try sum_buf.appendSlice(allocator, p);
+                try sum_buf.appendSlice(allocator, "\n");
+            }
+            try sum_buf.appendSlice(allocator, "</read-files>\n");
+        }
+        if (modified_files_out.items.len > 0) {
+            try sum_buf.appendSlice(allocator, "\n<modified-files>\n");
+            for (modified_files_out.items) |p| {
+                try sum_buf.appendSlice(allocator, p);
+                try sum_buf.appendSlice(allocator, "\n");
+            }
+            try sum_buf.appendSlice(allocator, "</modified-files>\n");
+        }
+    }
+
     const sum_text = try sum_buf.toOwnedSlice(allocator);
 
     if (dry_run) {
         return .{ .dryRun = true, .summaryText = sum_text, .summaryId = null };
     }
 
-    const summary_id = try sm.appendSummary(
+    const rf_slice = if (read_files_out.items.len > 0) try read_files_out.toOwnedSlice(allocator) else null;
+    const mf_slice = if (modified_files_out.items.len > 0) try modified_files_out.toOwnedSlice(allocator) else null;
+
+    const summary_id = try sm.appendSummaryWithFiles(
         sum_text,
         reason,
         if (want_json) "json" else if (want_md) "md" else "text",
+        rf_slice,
+        mf_slice,
         stats_total_chars,
         stats_total_tokens_est,
         keep_last,

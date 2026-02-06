@@ -115,6 +115,35 @@ pub const SessionManager = struct {
         thresholdChars: ?usize,
         thresholdTokensEst: ?usize,
     ) ![]const u8 {
+        return try self.appendSummaryWithFiles(
+            content,
+            reason,
+            format,
+            null,
+            null,
+            totalChars,
+            totalTokensEst,
+            keepLast,
+            keepLastGroups,
+            thresholdChars,
+            thresholdTokensEst,
+        );
+    }
+
+    pub fn appendSummaryWithFiles(
+        self: *SessionManager,
+        content: []const u8,
+        reason: ?[]const u8,
+        format: []const u8,
+        readFiles: ?[]const []const u8,
+        modifiedFiles: ?[]const []const u8,
+        totalChars: ?usize,
+        totalTokensEst: ?usize,
+        keepLast: ?usize,
+        keepLastGroups: ?usize,
+        thresholdChars: ?usize,
+        thresholdTokensEst: ?usize,
+    ) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = SummaryEntry{
@@ -124,6 +153,8 @@ pub const SessionManager = struct {
             .reason = reason,
             .format = format,
             .content = content,
+            .readFiles = readFiles,
+            .modifiedFiles = modifiedFiles,
             .totalChars = totalChars,
             .totalTokensEst = totalTokensEst,
             .keepLast = keepLast,
@@ -378,6 +409,9 @@ pub const SessionManager = struct {
                 const format0 = if (obj.get("format")) |v| switch (v) { .string => |s| s, else => "text" } else "text";
                 const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
 
+                const readFiles0 = if (obj.get("readFiles")) |v| v else null;
+                const modifiedFiles0 = if (obj.get("modifiedFiles")) |v| v else null;
+
                 const totalChars0 = if (obj.get("totalChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const totalTokensEst0 = if (obj.get("totalTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const keepLast0 = if (obj.get("keepLast")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
@@ -392,6 +426,23 @@ pub const SessionManager = struct {
                 const format = try dup.s(self.arena, format0);
                 const content = try dup.s(self.arena, content0);
 
+                var rf_list = try std.ArrayList([]const u8).initCapacity(self.arena, 0);
+                defer rf_list.deinit(self.arena);
+                if (readFiles0) |rv| switch (rv) {
+                    .array => |a| for (a.items) |v_it| if (v_it == .string) try rf_list.append(self.arena, try dup.s(self.arena, v_it.string)),
+                    else => {},
+                };
+
+                var mf_list = try std.ArrayList([]const u8).initCapacity(self.arena, 0);
+                defer mf_list.deinit(self.arena);
+                if (modifiedFiles0) |mv| switch (mv) {
+                    .array => |a| for (a.items) |v_it| if (v_it == .string) try mf_list.append(self.arena, try dup.s(self.arena, v_it.string)),
+                    else => {},
+                };
+
+                const rf_slice = if (rf_list.items.len > 0) try rf_list.toOwnedSlice(self.arena) else null;
+                const mf_slice = if (mf_list.items.len > 0) try mf_list.toOwnedSlice(self.arena) else null;
+
                 try out.append(self.arena, .{ .summary = .{
                     .id = id,
                     .parentId = pid,
@@ -399,6 +450,8 @@ pub const SessionManager = struct {
                     .reason = reason,
                     .format = format,
                     .content = content,
+                    .readFiles = rf_slice,
+                    .modifiedFiles = mf_slice,
                     .totalChars = totalChars0,
                     .totalTokensEst = totalTokensEst0,
                     .keepLast = keepLast0,
