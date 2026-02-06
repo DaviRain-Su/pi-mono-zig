@@ -6,6 +6,12 @@ pub const SessionHeader = st.SessionHeader;
 pub const MessageEntry = st.MessageEntry;
 pub const ToolCallEntry = st.ToolCallEntry;
 pub const ToolResultEntry = st.ToolResultEntry;
+pub const ThinkingLevelChangeEntry = st.ThinkingLevelChangeEntry;
+pub const ModelChangeEntry = st.ModelChangeEntry;
+pub const BranchSummaryEntry = st.BranchSummaryEntry;
+pub const CustomEntry = st.CustomEntry;
+pub const CustomMessageEntry = st.CustomMessageEntry;
+pub const SessionInfoEntry = st.SessionInfoEntry;
 pub const LeafEntry = st.LeafEntry;
 pub const LabelEntry = st.LabelEntry;
 pub const TurnStartEntry = st.TurnStartEntry;
@@ -63,23 +69,71 @@ pub const SessionManager = struct {
         try json_util.writeJsonLine(self.session_path, header);
     }
 
-    fn currentLeafId(self: *SessionManager) !?[]const u8 {
-        const entries = try self.loadEntries();
-        var leaf: ?[]const u8 = null;
+    const LeafResolution = struct {
+        saw_explicit_leaf: bool,
+        explicit_leaf_target: ?[]const u8,
+        selected_leaf: ?[]const u8,
+    };
+
+    fn resolveLeaf(entries: []const Entry) LeafResolution {
+        var saw_leaf = false;
+        var explicit_leaf: ?[]const u8 = null;
+        var last_node: ?[]const u8 = null;
+
         for (entries) |e| {
             switch (e) {
-                .leaf => |l| leaf = l.targetId,
+                .leaf => |l| {
+                    saw_leaf = true;
+                    explicit_leaf = l.targetId;
+                },
                 else => {},
             }
+            if (st.idOf(e)) |id| {
+                last_node = id;
+            }
         }
-        if (leaf) |id| return id;
 
-        // If no explicit leaf, use last node entry id if any.
-        var last: ?[]const u8 = null;
-        for (entries) |e| {
-            if (st.idOf(e)) |id| last = id;
+        if (!saw_leaf) {
+            return .{
+                .saw_explicit_leaf = false,
+                .explicit_leaf_target = null,
+                .selected_leaf = last_node,
+            };
         }
-        return last;
+
+        if (explicit_leaf == null) {
+            // Explicit root navigation (leaf=null): context should be empty and appends should start at root.
+            return .{
+                .saw_explicit_leaf = true,
+                .explicit_leaf_target = null,
+                .selected_leaf = null,
+            };
+        }
+
+        const wanted = explicit_leaf.?;
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                if (std.mem.eql(u8, id, wanted)) {
+                    return .{
+                        .saw_explicit_leaf = true,
+                        .explicit_leaf_target = wanted,
+                        .selected_leaf = wanted,
+                    };
+                }
+            }
+        }
+
+        // Corrupt/unknown explicit leaf id: fall back to last node (TS behavior).
+        return .{
+            .saw_explicit_leaf = true,
+            .explicit_leaf_target = wanted,
+            .selected_leaf = last_node,
+        };
+    }
+
+    fn currentLeafId(self: *SessionManager) !?[]const u8 {
+        const entries = try self.loadEntries();
+        return resolveLeaf(entries).selected_leaf;
     }
 
     fn setLeaf(self: *SessionManager, target: ?[]const u8) !void {
@@ -87,8 +141,29 @@ pub const SessionManager = struct {
         try json_util.appendJsonLine(self.session_path, entry);
     }
 
+    fn hasEntryId(self: *SessionManager, target_id: []const u8) !bool {
+        const entries = try self.loadEntries();
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                if (std.mem.eql(u8, id, target_id)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     pub fn branchTo(self: *SessionManager, targetId: ?[]const u8) !void {
+        if (targetId) |tid| {
+            if (!try self.hasEntryId(tid)) {
+                return error.EntryNotFound;
+            }
+        }
         try self.setLeaf(targetId);
+    }
+
+    pub fn leafId(self: *SessionManager) !?[]const u8 {
+        return try self.currentLeafId();
     }
 
     pub fn setLabel(self: *SessionManager, targetId: []const u8, label: ?[]const u8) ![]const u8 {
@@ -155,8 +230,9 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .reason = reason,
             .format = format,
-            .content = content,
+            .summary = content,
             .firstKeptEntryId = firstKeptEntryId,
+            .tokensBefore = totalTokensEst,
             .readFiles = readFiles,
             .modifiedFiles = modifiedFiles,
             .totalChars = totalChars,
@@ -176,6 +252,25 @@ pub const SessionManager = struct {
     }
 
     pub fn appendMessageWithTokensEst(self: *SessionManager, role: []const u8, content: []const u8, tokens_est: ?usize) ![]const u8 {
+        return try self.appendMessageWithMeta(role, content, tokens_est, null);
+    }
+
+    pub fn appendMessageWithUsage(
+        self: *SessionManager,
+        role: []const u8,
+        content: []const u8,
+        usage_total_tokens: ?usize,
+    ) ![]const u8 {
+        return try self.appendMessageWithMeta(role, content, null, usage_total_tokens);
+    }
+
+    pub fn appendMessageWithMeta(
+        self: *SessionManager,
+        role: []const u8,
+        content: []const u8,
+        tokens_est: ?usize,
+        usage_total_tokens: ?usize,
+    ) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = MessageEntry{
@@ -185,6 +280,7 @@ pub const SessionManager = struct {
             .role = role,
             .content = content,
             .tokensEst = tokens_est,
+            .usageTotalTokens = usage_total_tokens,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -226,6 +322,51 @@ pub const SessionManager = struct {
             .ok = ok,
             .content = content,
             .tokensEst = tokens_est,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
+        return id;
+    }
+
+    pub fn appendThinkingLevelChange(self: *SessionManager, thinking_level: []const u8) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = ThinkingLevelChangeEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .thinkingLevel = thinking_level,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
+        return id;
+    }
+
+    pub fn appendModelChange(self: *SessionManager, provider: []const u8, model_id: []const u8) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = ModelChangeEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .provider = provider,
+            .modelId = model_id,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
+        return id;
+    }
+
+    pub fn appendBranchSummary(self: *SessionManager, from_id: []const u8, summary: []const u8) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = BranchSummaryEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .fromId = from_id,
+            .summary = summary,
+            .fromHook = null,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -299,28 +440,76 @@ pub const SessionManager = struct {
             };
 
             if (std.mem.eql(u8, typ, "message")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const role0 = switch (obj.get("role") orelse continue) { .string => |s| s, else => continue };
-                const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
-                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const role0 = switch (obj.get("role") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const content0 = switch (obj.get("content") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const usage_total_tokens0 = if (obj.get("usageTotalTokens")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const role = try dup.s(self.arena, role0);
                 const content = try dup.s(self.arena, content0);
-                try out.append(self.arena, .{ .message = .{ .id = id, .parentId = pid, .timestamp = ts, .role = role, .content = content, .tokensEst = tokens_est0 } });
+                try out.append(self.arena, .{ .message = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .role = role,
+                    .content = content,
+                    .tokensEst = tokens_est0,
+                    .usageTotalTokens = usage_total_tokens0,
+                } });
                 continue;
             }
 
             if (std.mem.eql(u8, typ, "tool_call")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const tool0 = switch (obj.get("tool") orelse continue) { .string => |s| s, else => continue };
-                const arg0 = switch (obj.get("arg") orelse continue) { .string => |s| s, else => continue };
-                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const tool0 = switch (obj.get("tool") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const arg0 = switch (obj.get("arg") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -331,13 +520,37 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "tool_result")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const tool0 = switch (obj.get("tool") orelse continue) { .string => |s| s, else => continue };
-                const ok = switch (obj.get("ok") orelse continue) { .bool => |b| b, else => continue };
-                const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
-                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const tool0 = switch (obj.get("tool") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const ok = switch (obj.get("ok") orelse continue) {
+                    .bool => |b| b,
+                    else => continue,
+                };
+                const content0 = if (obj.get("summary")) |v| switch (v) {
+                    .string => |s| s,
+                    else => continue,
+                } else if (obj.get("content")) |v| switch (v) {
+                    .string => |s| s,
+                    else => continue,
+                } else continue;
+                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -347,14 +560,247 @@ pub const SessionManager = struct {
                 continue;
             }
 
+            if (std.mem.eql(u8, typ, "thinking_level_change")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const lvl0 = switch (obj.get("thinkingLevel") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const lvl = try dup.s(self.arena, lvl0);
+                try out.append(self.arena, .{ .thinking_level_change = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .thinkingLevel = lvl,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "model_change")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const provider0 = switch (obj.get("provider") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const model_id0 = switch (obj.get("modelId") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const provider = try dup.s(self.arena, provider0);
+                const model_id = try dup.s(self.arena, model_id0);
+                try out.append(self.arena, .{ .model_change = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .provider = provider,
+                    .modelId = model_id,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "branch_summary")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const from0 = switch (obj.get("fromId") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const summary0 = switch (obj.get("summary") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const from_hook0 = if (obj.get("fromHook")) |v| switch (v) {
+                    .bool => |b| @as(?bool, b),
+                    else => null,
+                } else null;
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const from = try dup.s(self.arena, from0);
+                const summary = try dup.s(self.arena, summary0);
+                try out.append(self.arena, .{ .branch_summary = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .fromId = from,
+                    .summary = summary,
+                    .fromHook = from_hook0,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "custom")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const custom_type0 = switch (obj.get("customType") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const custom_type = try dup.s(self.arena, custom_type0);
+                try out.append(self.arena, .{ .custom = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .customType = custom_type,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "custom_message")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const custom_type0 = switch (obj.get("customType") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const content0 = if (obj.get("content")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "[non-string custom_message content]",
+                } else continue;
+                const display0 = if (obj.get("display")) |v| switch (v) {
+                    .bool => |b| b,
+                    else => true,
+                } else true;
+
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const custom_type = try dup.s(self.arena, custom_type0);
+                const content = try dup.s(self.arena, content0);
+
+                try out.append(self.arena, .{ .custom_message = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .customType = custom_type,
+                    .content = content,
+                    .display = display0,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "session_info")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const name0 = if (obj.get("name")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const name = try dup.os(self.arena, name0);
+
+                try out.append(self.arena, .{ .session_info = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .name = name,
+                } });
+                continue;
+            }
+
             if (std.mem.eql(u8, typ, "turn_start")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const turn = switch (obj.get("turn") orelse continue) { .integer => |x| @as(u64, @intCast(x)), else => continue };
-                const um0 = if (obj.get("userMessageId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const tg0 = if (obj.get("turnGroupId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ph0 = if (obj.get("phase")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const turn = switch (obj.get("turn") orelse continue) {
+                    .integer => |x| @as(u64, @intCast(x)),
+                    else => continue,
+                };
+                const um0 = if (obj.get("userMessageId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const tg0 = if (obj.get("turnGroupId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ph0 = if (obj.get("phase")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -366,13 +812,34 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "turn_end")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const turn = switch (obj.get("turn") orelse continue) { .integer => |x| @as(u64, @intCast(x)), else => continue };
-                const um0 = if (obj.get("userMessageId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const tg0 = if (obj.get("turnGroupId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ph0 = if (obj.get("phase")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const turn = switch (obj.get("turn") orelse continue) {
+                    .integer => |x| @as(u64, @intCast(x)),
+                    else => continue,
+                };
+                const um0 = if (obj.get("userMessageId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const tg0 = if (obj.get("turnGroupId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ph0 = if (obj.get("phase")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -384,8 +851,14 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "leaf")) {
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const tid0 = if (obj.get("targetId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const tid0 = if (obj.get("targetId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
                 const ts = try dup.s(self.arena, ts0);
                 const tid = try dup.os(self.arena, tid0);
                 try out.append(self.arena, .{ .leaf = .{ .timestamp = ts, .targetId = tid } });
@@ -393,10 +866,22 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "label")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const target0 = switch (obj.get("targetId") orelse continue) { .string => |s| s, else => continue };
-                const label0 = if (obj.get("label")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const target0 = switch (obj.get("targetId") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const label0 = if (obj.get("label")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const ts = try dup.s(self.arena, ts0);
                 const targetId = try dup.s(self.arena, target0);
@@ -405,24 +890,82 @@ pub const SessionManager = struct {
                 continue;
             }
 
-            if (std.mem.eql(u8, typ, "summary")) {
-                const id0 = switch (obj.get("id") orelse continue) { .string => |s| s, else => continue };
-                const pid0 = if (obj.get("parentId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
-                const reason0 = if (obj.get("reason")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
-                const format0 = if (obj.get("format")) |v| switch (v) { .string => |s| s, else => "text" } else "text";
-                const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
-                const firstKeptEntryId0 = if (obj.get("firstKeptEntryId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+            if (std.mem.eql(u8, typ, "summary") or std.mem.eql(u8, typ, "compaction")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const reason0 = if (obj.get("reason")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const format0 = if (obj.get("format")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "text",
+                } else "text";
+                const content0 = if (obj.get("summary")) |v| switch (v) {
+                    .string => |s| s,
+                    else => continue,
+                } else if (obj.get("content")) |v| switch (v) {
+                    .string => |s| s,
+                    else => continue,
+                } else continue;
+                const firstKeptEntryId0 = if (obj.get("firstKeptEntryId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const tokensBefore0 = if (obj.get("tokensBefore")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const fromHook0 = if (obj.get("fromHook")) |v| switch (v) {
+                    .bool => |b| @as(?bool, b),
+                    else => null,
+                } else null;
 
-                const readFiles0 = if (obj.get("readFiles")) |v| v else null;
-                const modifiedFiles0 = if (obj.get("modifiedFiles")) |v| v else null;
+                const details_obj = if (obj.get("details")) |dv| switch (dv) {
+                    .object => |o| @as(?std.json.ObjectMap, o),
+                    else => null,
+                } else null;
 
-                const totalChars0 = if (obj.get("totalChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
-                const totalTokensEst0 = if (obj.get("totalTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
-                const keepLast0 = if (obj.get("keepLast")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
-                const keepLastGroups0 = if (obj.get("keepLastGroups")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
-                const thresholdChars0 = if (obj.get("thresholdChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
-                const thresholdTokensEst0 = if (obj.get("thresholdTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const readFiles0 = if (obj.get("readFiles")) |v| v else if (details_obj) |dobj| dobj.get("readFiles") else null;
+                const modifiedFiles0 = if (obj.get("modifiedFiles")) |v| v else if (details_obj) |dobj| dobj.get("modifiedFiles") else null;
+
+                const totalChars0 = if (obj.get("totalChars")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const totalTokensEst0 = if (obj.get("totalTokensEst")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const keepLast0 = if (obj.get("keepLast")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const keepLastGroups0 = if (obj.get("keepLastGroups")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const thresholdChars0 = if (obj.get("thresholdChars")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const thresholdTokensEst0 = if (obj.get("thresholdTokensEst")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+
+                const totalTokensEstResolved = totalTokensEst0 orelse tokensBefore0;
+                const tokensBeforeResolved = tokensBefore0 orelse totalTokensEst0;
 
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
@@ -455,12 +998,14 @@ pub const SessionManager = struct {
                     .timestamp = ts,
                     .reason = reason,
                     .format = format,
-                    .content = content,
+                    .summary = content,
                     .firstKeptEntryId = first_kept_entry_id,
+                    .tokensBefore = tokensBeforeResolved,
+                    .fromHook = fromHook0,
                     .readFiles = rf_slice,
                     .modifiedFiles = mf_slice,
                     .totalChars = totalChars0,
-                    .totalTokensEst = totalTokensEst0,
+                    .totalTokensEst = totalTokensEstResolved,
                     .keepLast = keepLast0,
                     .keepLastGroups = keepLastGroups0,
                     .thresholdChars = thresholdChars0,
@@ -491,7 +1036,15 @@ pub const SessionManager = struct {
 
     fn isBusinessEntry(e: Entry) bool {
         return switch (e) {
-            .message, .tool_call, .tool_result, .summary => true,
+            .message,
+            .tool_call,
+            .tool_result,
+            .summary,
+            .branch_summary,
+            .custom_message,
+            .model_change,
+            .thinking_level_change,
+            => true,
             else => false,
         };
     }
@@ -507,26 +1060,16 @@ pub const SessionManager = struct {
     fn buildContextEntriesMode(self: *SessionManager, include_structural: bool) ![]Entry {
         const entries = try self.loadEntries();
 
-        // Find leaf
-        var leaf: ?[]const u8 = null;
-        for (entries) |e| {
-            switch (e) {
-                .leaf => |l| leaf = l.targetId,
-                else => {},
-            }
+        const leaf_resolution = resolveLeaf(entries);
+
+        // Explicit root navigation (leaf=null) -> no context.
+        if (leaf_resolution.saw_explicit_leaf and leaf_resolution.explicit_leaf_target == null) {
+            return try self.arena.alloc(Entry, 0);
         }
+
+        const leaf = leaf_resolution.selected_leaf;
         if (leaf == null) {
-            // no explicit leaf => return all non-session entries (filtered by mode)
-            var out_all = try std.ArrayList(Entry).initCapacity(self.arena, entries.len);
-            defer out_all.deinit(self.arena);
-            for (entries) |e| {
-                if (!include_structural and !isBusinessEntry(e)) continue;
-                switch (e) {
-                    .session, .leaf => {},
-                    else => try out_all.append(self.arena, e),
-                }
-            }
-            return try out_all.toOwnedSlice(self.arena);
+            return try self.arena.alloc(Entry, 0);
         }
 
         // Build id -> entry map for node entries
