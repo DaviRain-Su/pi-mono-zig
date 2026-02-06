@@ -215,6 +215,12 @@ fn doCompact(
             result: ?[]const u8 = null,
         };
 
+        const NextStepTask = struct {
+            task: []const u8,
+            why: ?[]const u8 = null,
+            priority: ?u32 = null,
+        };
+
         const InProgressTask = struct {
             task: []const u8,
             source: ?[]const u8 = null, // e.g. "next_steps"
@@ -226,11 +232,12 @@ fn doCompact(
             constraints: []const []const u8,
             progress: Progress,
             key_decisions: []const []const u8,
-            next_steps: []const []const u8,
+            next_steps: []const []const u8, // derived view (kept for compatibility)
             critical_context: []const []const u8,
             blocked_tasks: []const BlockedTask, // structured blocked tasks (used for migration)
             done_tasks: []const DoneTask, // structured done tasks (used for migration)
             in_progress_tasks: []const InProgressTask, // structured in-progress tasks (used for migration)
+            next_step_tasks: []const NextStepTask, // structured next steps (source-of-truth)
             raw: []const u8,
         };
 
@@ -259,7 +266,7 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v5" } else "pi.summary.v5";
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v6" } else "pi.summary.v6";
                             const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
@@ -434,6 +441,37 @@ fn doCompact(
                                 }
                             }
 
+                            // next_step_tasks
+                            const nst_val = if (obj.get("next_step_tasks")) |v| v else null;
+                            var nst_list = try std.ArrayList(NextStepTask).initCapacity(allocator, 0);
+                            if (nst_val) |nv| {
+                                switch (nv) {
+                                    .array => |a| for (a.items) |it| {
+                                        switch (it) {
+                                            .string => try nst_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
+                                            .object => |o| {
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                if (task0.len == 0) continue;
+                                                const why0 = if (o.get("why")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const pr0 = if (o.get("priority")) |v| switch (v) { .integer => |x| @as(?u32, @intCast(x)), else => null } else null;
+                                                try nst_list.append(allocator, .{
+                                                    .task = try dupStr.dup(allocator, task0),
+                                                    .why = if (why0) |t| try dupStr.dup(allocator, t) else null,
+                                                    .priority = pr0,
+                                                });
+                                            },
+                                            else => {},
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            } else {
+                                // compatibility: infer from next_steps strings
+                                for (ns_list.items) |s0| {
+                                    try nst_list.append(allocator, .{ .task = try dupStr.dup(allocator, s0) });
+                                }
+                            }
+
                             prev_payload = Payload{
                                 .schema = schema,
                                 .goal = goal,
@@ -449,6 +487,7 @@ fn doCompact(
                                 .blocked_tasks = try bt_list.toOwnedSlice(allocator),
                                 .done_tasks = try dt_list.toOwnedSlice(allocator),
                                 .in_progress_tasks = try ipt_list.toOwnedSlice(allocator),
+                                .next_step_tasks = try nst_list.toOwnedSlice(allocator),
                                 .raw = raw,
                             };
                             break;
@@ -606,7 +645,7 @@ fn doCompact(
         }
 
         const base = prev_payload orelse Payload{
-            .schema = "pi.summary.v5",
+            .schema = "pi.summary.v6",
             .goal = "(unknown)",
             .constraints = &.{},
             .progress = .{ .done = &.{}, .in_progress = &.{}, .blocked = &.{} },
@@ -616,6 +655,7 @@ fn doCompact(
             .blocked_tasks = &.{},
             .done_tasks = &.{},
             .in_progress_tasks = &.{},
+            .next_step_tasks = &.{},
             .raw = "",
         };
 
@@ -643,6 +683,8 @@ fn doCompact(
 
         var next_seen = std.StringHashMap(bool).init(allocator);
         defer next_seen.deinit();
+        var next_task_seen = std.StringHashMap(bool).init(allocator);
+        defer next_task_seen.deinit();
         var done_seen = std.StringHashMap(bool).init(allocator);
         defer done_seen.deinit();
         var done_task_seen = std.StringHashMap(bool).init(allocator);
@@ -680,9 +722,12 @@ fn doCompact(
         defer done_tasks_out.deinit(allocator);
         var ip_tasks_out = try std.ArrayList(InProgressTask).initCapacity(allocator, 0);
         defer ip_tasks_out.deinit(allocator);
+        var next_tasks_out = try std.ArrayList(NextStepTask).initCapacity(allocator, 0);
+        defer next_tasks_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
         for (base.next_steps) |it| try next_seen.put(it, true);
+        for (base.next_step_tasks) |t| try next_task_seen.put(t.task, true);
         for (base.progress.done) |it| try done_seen.put(it, true);
         for (base.critical_context) |it| try ctx_seen.put(it, true);
         for (base.constraints) |it| try cons_seen.put(it, true);
@@ -693,6 +738,14 @@ fn doCompact(
 
         // Start with base lists (capped).
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
+        // next_step_tasks: merge by .task
+        for (base.next_step_tasks) |nt| {
+            if (next_tasks_out.items.len >= MAX_NEXT) break;
+            if (next_task_seen.contains(nt.task)) continue;
+            try next_task_seen.put(nt.task, true);
+            try next_tasks_out.append(allocator, nt);
+        }
+
         try Merge.uniqueAppend(allocator, &done_out, &done_seen, base.progress.done, MAX_DONE);
         // In progress: keep base, but drop anything that is now done.
         for (base.progress.in_progress) |it| {
@@ -730,6 +783,14 @@ fn doCompact(
 
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
+        // Also build structured next_step_tasks from new_next.
+        for (new_next.items) |it| {
+            if (next_tasks_out.items.len >= MAX_NEXT) break;
+            if (next_task_seen.contains(it)) continue;
+            try next_task_seen.put(it, true);
+            try next_tasks_out.append(allocator, .{ .task = it, .why = null, .priority = null });
+        }
+
         try Merge.uniqueAppend(allocator, &done_out, &done_seen, new_done.items, MAX_DONE);
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, new_constraints.items, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, new_decisions.items, 20);
@@ -748,8 +809,9 @@ fn doCompact(
             try done_tasks_out.append(allocator, dt);
         }
 
-        // Generate in_progress_tasks from new next steps (source=next_steps)
-        for (new_next.items) |it| {
+        // Generate in_progress_tasks from structured next steps (source=next_steps)
+        for (next_tasks_out.items) |nt| {
+            const it = nt.task;
             if (ip_tasks_out.items.len >= 20) break;
             if (done_task_seen.contains(it) or blocked_task_seen.contains(it)) continue;
             if (ip_task_seen.contains(it)) continue;
@@ -802,13 +864,20 @@ fn doCompact(
         // NOTE: done-ness/blocked-ness are driven by done_tasks/blocked_tasks.
         {
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, next_out.items.len);
+            var filtered_tasks = try std.ArrayList(NextStepTask).initCapacity(allocator, next_tasks_out.items.len);
             for (next_out.items) |it| {
                 if (done_task_seen.contains(it)) continue;
                 if (blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
-            // NOTE: arena allocator; we intentionally don't deinit old list.
+            for (next_tasks_out.items) |nt| {
+                if (done_task_seen.contains(nt.task)) continue;
+                if (blocked_task_seen.contains(nt.task)) continue;
+                if (filtered_tasks.items.len >= MAX_NEXT) break;
+                try filtered_tasks.append(allocator, nt);
+            }
             next_out = filtered;
+            next_tasks_out = filtered_tasks;
         }
 
         // Also drop done/blocked items from in_progress.
@@ -879,6 +948,7 @@ fn doCompact(
             .blocked_tasks = try blocked_tasks_out.toOwnedSlice(allocator),
             .done_tasks = try done_tasks_out.toOwnedSlice(allocator),
             .in_progress_tasks = try ip_tasks_out.toOwnedSlice(allocator),
+            .next_step_tasks = try next_tasks_out.toOwnedSlice(allocator),
             .raw = try raw_out.toOwnedSlice(allocator),
         };
 
