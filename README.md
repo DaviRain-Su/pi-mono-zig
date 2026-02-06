@@ -94,6 +94,9 @@ zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --structu
 # Keep last N complete turn-groups (TS-like) instead of last N entries
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last-groups 2 --structured md
 
+# Record thresholds in the summary stats (manual compaction)
+zig build run -- compact --session /tmp/pi-session.jsonl --keep-last-groups 2 --structured md --max-chars 8000 --max-tokens-est 2000
+
 # structured summary (json)
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run --structured json
 

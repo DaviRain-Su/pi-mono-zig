@@ -19,7 +19,7 @@ fn usage() void {
         \\  pi-mono-zig list --session <path.jsonl>\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
         \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--keep-last-groups N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--keep-last-groups N] [--max-chars N] [--max-tokens-est N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
@@ -882,6 +882,8 @@ pub fn main() !void {
         var session_path: ?[]const u8 = null;
         var keep_last: usize = 8;
         var keep_last_groups: ?usize = null;
+        var max_chars: ?usize = null;
+        var max_tokens_est: ?usize = null;
         var dry_run = false;
         var label: ?[]const u8 = null;
         var structured = false;
@@ -897,6 +899,12 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--keep-last-groups")) {
                 const s = args.next() orelse return error.MissingKeepLast;
                 keep_last_groups = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--max-chars")) {
+                const s = args.next() orelse return error.MissingMaxChars;
+                max_chars = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--max-tokens-est")) {
+                const s = args.next() orelse return error.MissingMaxTokensEst;
+                max_tokens_est = try std.fmt.parseInt(usize, s, 10);
             } else if (std.mem.eql(u8, a, "--dry-run")) {
                 dry_run = true;
             } else if (std.mem.eql(u8, a, "--label")) {
@@ -956,8 +964,8 @@ pub fn main() !void {
             if (update_summary) "manual_update" else "manual",
             total_chars,
             total_tokens_est,
-            null,
-            null,
+            max_chars,
+            max_tokens_est,
             update_summary,
         );
 
