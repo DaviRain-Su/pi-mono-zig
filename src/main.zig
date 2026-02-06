@@ -1706,6 +1706,7 @@ fn doCompact(
     }
 
     const sum_text = try sum_buf.toOwnedSlice(allocator);
+    const first_kept_entry_id: ?[]const u8 = if (start < n) st.idOf(nodes.items[start]) else null;
 
     if (dry_run) {
         return .{ .dryRun = true, .summaryText = sum_text, .summaryId = null };
@@ -1718,6 +1719,7 @@ fn doCompact(
         sum_text,
         reason,
         if (want_json) "json" else if (want_md) "md" else "text",
+        first_kept_entry_id,
         rf_slice,
         mf_slice,
         stats_total_chars,
@@ -1729,42 +1731,6 @@ fn doCompact(
     );
     if (label) |lab| {
         _ = try sm.setLabel(summary_id, lab);
-    }
-
-    var j: usize = start;
-    while (j < n) : (j += 1) {
-        const e = nodes.items[j];
-        switch (e) {
-            .turn_start => |t| {
-                _ = try sm.appendTurnStart(t.turn, t.userMessageId, t.turnGroupId, t.phase);
-            },
-            .turn_end => |t| {
-                _ = try sm.appendTurnEnd(t.turn, t.userMessageId, t.turnGroupId, t.phase);
-            },
-            .message => |m| {
-                _ = try sm.appendMessage(m.role, m.content);
-            },
-            .tool_call => |tc| {
-                _ = try sm.appendToolCall(tc.tool, tc.arg);
-            },
-            .tool_result => |tr| {
-                _ = try sm.appendToolResult(tr.tool, tr.ok, tr.content);
-            },
-            .summary => |s| {
-                _ = try sm.appendSummary(
-                    s.content,
-                    s.reason,
-                    s.format,
-                    s.totalChars,
-                    s.totalTokensEst,
-                    s.keepLast,
-                    s.keepLastGroups,
-                    s.thresholdChars,
-                    s.thresholdTokensEst,
-                );
-            },
-            else => {},
-        }
     }
 
     return .{ .dryRun = false, .summaryText = sum_text, .summaryId = summary_id };
@@ -1923,8 +1889,8 @@ pub fn main() !void {
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
                     .summary => |s| std.debug.print(
-                        "summary {s} parent={s}\nreason={s}\nformat={s}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
-                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.keepLast, s.keepLastGroups, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
+                        "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.firstKeptEntryId orelse "(null)", s.keepLast, s.keepLastGroups, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
                     ),
                     else => {},
                 }

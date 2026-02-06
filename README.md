@@ -77,7 +77,7 @@ zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>
 # show full session tree ("*" marks current leaf path)
 zig build run -- tree --session /tmp/pi-session.jsonl
 
-# compact current leaf path into a summary + keep last N nodes
+# compact current leaf path (TS-style summary marker + keep-last boundary)
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8
 
 # preview compaction summary without writing
@@ -101,7 +101,7 @@ zig build run -- compact --session /tmp/pi-session.jsonl --keep-last-groups 2 --
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run --structured json
 
 # auto-compact while chatting (naive char-count threshold)
-# (now calls the same compaction logic: summary + keep-last tail clone)
+# (uses the same TS-style compaction logic as manual compact)
 zig build run -- chat --session /tmp/pi-session.jsonl --auto-compact --max-chars 8000 --keep-last 8
 ```
 

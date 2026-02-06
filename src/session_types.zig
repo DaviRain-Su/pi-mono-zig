@@ -94,6 +94,10 @@ pub const SummaryEntry = struct {
     /// Summary payload. If format=json, this is a JSON string.
     content: []const u8,
 
+    /// TS-style compaction marker: first kept entry in the historical prefix.
+    /// If null, this summary is treated as legacy (pre-marker format).
+    firstKeptEntryId: ?[]const u8 = null,
+
     /// Best-effort file ops (TS-style compaction details). Stored on the entry, and may also
     /// be rendered into the content for markdown summaries.
     readFiles: ?[]const []const u8 = null,

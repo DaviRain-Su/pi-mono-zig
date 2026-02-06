@@ -108,6 +108,7 @@ pub const SessionManager = struct {
         content: []const u8,
         reason: ?[]const u8,
         format: []const u8,
+        firstKeptEntryId: ?[]const u8,
         totalChars: ?usize,
         totalTokensEst: ?usize,
         keepLast: ?usize,
@@ -119,6 +120,7 @@ pub const SessionManager = struct {
             content,
             reason,
             format,
+            firstKeptEntryId,
             null,
             null,
             totalChars,
@@ -135,6 +137,7 @@ pub const SessionManager = struct {
         content: []const u8,
         reason: ?[]const u8,
         format: []const u8,
+        firstKeptEntryId: ?[]const u8,
         readFiles: ?[]const []const u8,
         modifiedFiles: ?[]const []const u8,
         totalChars: ?usize,
@@ -153,6 +156,7 @@ pub const SessionManager = struct {
             .reason = reason,
             .format = format,
             .content = content,
+            .firstKeptEntryId = firstKeptEntryId,
             .readFiles = readFiles,
             .modifiedFiles = modifiedFiles,
             .totalChars = totalChars,
@@ -408,6 +412,7 @@ pub const SessionManager = struct {
                 const reason0 = if (obj.get("reason")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const format0 = if (obj.get("format")) |v| switch (v) { .string => |s| s, else => "text" } else "text";
                 const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+                const firstKeptEntryId0 = if (obj.get("firstKeptEntryId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
 
                 const readFiles0 = if (obj.get("readFiles")) |v| v else null;
                 const modifiedFiles0 = if (obj.get("modifiedFiles")) |v| v else null;
@@ -425,6 +430,7 @@ pub const SessionManager = struct {
                 const reason = try dup.os(self.arena, reason0);
                 const format = try dup.s(self.arena, format0);
                 const content = try dup.s(self.arena, content0);
+                const first_kept_entry_id = try dup.os(self.arena, firstKeptEntryId0);
 
                 var rf_list = try std.ArrayList([]const u8).initCapacity(self.arena, 0);
                 defer rf_list.deinit(self.arena);
@@ -450,6 +456,7 @@ pub const SessionManager = struct {
                     .reason = reason,
                     .format = format,
                     .content = content,
+                    .firstKeptEntryId = first_kept_entry_id,
                     .readFiles = rf_slice,
                     .modifiedFiles = mf_slice,
                     .totalChars = totalChars0,
@@ -542,15 +549,75 @@ pub const SessionManager = struct {
             cur = st.parentIdOf(e);
         }
 
-        // Reverse to root->leaf (filtered by mode)
-        var out = try std.ArrayList(Entry).initCapacity(self.arena, path.items.len);
-        defer out.deinit(self.arena);
+        // Reverse to root->leaf first.
+        var root_path = try std.ArrayList(Entry).initCapacity(self.arena, path.items.len);
+        defer root_path.deinit(self.arena);
         var i: usize = path.items.len;
         while (i > 0) : (i -= 1) {
-            const e = path.items[i - 1];
+            try root_path.append(self.arena, path.items[i - 1]);
+        }
+
+        // Fast path: no summary node in branch => regular filtered projection.
+        var latest_summary_idx: ?usize = null;
+        var latest_first_kept: ?[]const u8 = null;
+        var k: usize = root_path.items.len;
+        while (k > 0) : (k -= 1) {
+            const e = root_path.items[k - 1];
+            switch (e) {
+                .summary => |s| {
+                    latest_summary_idx = k - 1;
+                    latest_first_kept = s.firstKeptEntryId;
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        var out = try std.ArrayList(Entry).initCapacity(self.arena, root_path.items.len);
+        defer out.deinit(self.arena);
+
+        if (latest_summary_idx == null) {
+            for (root_path.items) |e| {
+                if (!include_structural and !isBusinessEntry(e)) continue;
+                try out.append(self.arena, e);
+            }
+            return try out.toOwnedSlice(self.arena);
+        }
+
+        const si = latest_summary_idx.?;
+        const summary_entry = root_path.items[si];
+        if (include_structural or isBusinessEntry(summary_entry)) {
+            try out.append(self.arena, summary_entry);
+        }
+
+        // TS-style compaction view:
+        // - with firstKeptEntryId: summary + kept pre-summary tail + post-summary suffix
+        // - legacy (no firstKeptEntryId): summary + post-summary suffix only
+        if (latest_first_kept) |first_kept_id| {
+            var found: bool = false;
+            var pre_i: usize = 0;
+            while (pre_i < si) : (pre_i += 1) {
+                const e = root_path.items[pre_i];
+                if (!found) {
+                    if (st.idOf(e)) |eid| {
+                        if (std.mem.eql(u8, eid, first_kept_id)) {
+                            found = true;
+                        }
+                    }
+                }
+                if (!found) continue;
+                if (!include_structural and !isBusinessEntry(e)) continue;
+                try out.append(self.arena, e);
+            }
+        }
+
+        var post_i: usize = si + 1;
+        while (post_i < root_path.items.len) : (post_i += 1) {
+            const e = root_path.items[post_i];
             if (!include_structural and !isBusinessEntry(e)) continue;
             try out.append(self.arena, e);
         }
+
         return try out.toOwnedSlice(self.arena);
     }
 };
