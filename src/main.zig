@@ -199,7 +199,7 @@ fn doCompact(
         const Progress = struct {
             done: []const []const u8,
             in_progress: []const []const u8,
-            blocked: []const []const u8,
+            blocked: []const []const u8, // human-readable blocked reasons
         };
         const Payload = struct {
             schema: []const u8,
@@ -209,6 +209,7 @@ fn doCompact(
             key_decisions: []const []const u8,
             next_steps: []const []const u8,
             critical_context: []const []const u8,
+            blocked_tasks: []const []const u8, // tasks to treat as blocked (used for migration)
             raw: []const u8,
         };
 
@@ -237,7 +238,7 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v1" } else "pi.summary.v1";
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v2" } else "pi.summary.v2";
                             const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
@@ -309,6 +310,17 @@ fn doCompact(
 
                             const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "" } else "";
 
+                            const bt_val = if (obj.get("blocked_tasks")) |v| v else null;
+                            var bt_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            if (bt_val) |bv| {
+                                switch (bv) {
+                                    .array => |a| for (a.items) |it| {
+                                        if (it == .string) try bt_list.append(allocator, try dupStr.dup(allocator, it.string));
+                                    },
+                                    else => {},
+                                }
+                            }
+
                             prev_payload = Payload{
                                 .schema = schema,
                                 .goal = goal,
@@ -321,6 +333,7 @@ fn doCompact(
                                 .key_decisions = try kd_list.toOwnedSlice(allocator),
                                 .next_steps = try ns_list.toOwnedSlice(allocator),
                                 .critical_context = try cc_list.toOwnedSlice(allocator),
+                                .blocked_tasks = try bt_list.toOwnedSlice(allocator),
                                 .raw = raw,
                             };
                             break;
@@ -348,6 +361,8 @@ fn doCompact(
         defer new_decisions.deinit(allocator);
         var new_blocked = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer new_blocked.deinit(allocator);
+        var new_blocked_tasks = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_blocked_tasks.deinit(allocator);
 
         var i: usize = from_i;
         while (i < start) : (i += 1) {
@@ -384,10 +399,10 @@ fn doCompact(
                         if (arg_opt) |a| {
                             if (std.mem.eql(u8, tr.tool, "shell")) {
                                 const task = try std.fmt.allocPrint(allocator, "sh: {s}", .{a});
-                                try new_blocked.append(allocator, task);
+                                try new_blocked_tasks.append(allocator, task);
                             } else if (std.mem.eql(u8, tr.tool, "echo")) {
                                 const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{a});
-                                try new_blocked.append(allocator, task);
+                                try new_blocked_tasks.append(allocator, task);
                             }
                         }
                     }
@@ -463,13 +478,14 @@ fn doCompact(
         }
 
         const base = prev_payload orelse Payload{
-            .schema = "pi.summary.v1",
+            .schema = "pi.summary.v2",
             .goal = "(unknown)",
             .constraints = &.{},
             .progress = .{ .done = &.{}, .in_progress = &.{}, .blocked = &.{} },
             .key_decisions = &.{},
             .next_steps = &.{},
             .critical_context = &.{},
+            .blocked_tasks = &.{},
             .raw = "",
         };
 
@@ -507,6 +523,8 @@ fn doCompact(
         defer dec_seen.deinit();
         var blocked_seen = std.StringHashMap(bool).init(allocator);
         defer blocked_seen.deinit();
+        var blocked_task_seen = std.StringHashMap(bool).init(allocator);
+        defer blocked_task_seen.deinit();
 
         var next_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer next_out.deinit(allocator);
@@ -522,6 +540,8 @@ fn doCompact(
         defer dec_out.deinit(allocator);
         var blocked_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer blocked_out.deinit(allocator);
+        var blocked_tasks_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer blocked_tasks_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
         for (base.next_steps) |it| try next_seen.put(it, true);
@@ -530,6 +550,7 @@ fn doCompact(
         for (base.constraints) |it| try cons_seen.put(it, true);
         for (base.key_decisions) |it| try dec_seen.put(it, true);
         for (base.progress.blocked) |it| try blocked_seen.put(it, true);
+        for (base.blocked_tasks) |it| try blocked_task_seen.put(it, true);
 
         // Start with base lists (capped).
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
@@ -544,6 +565,7 @@ fn doCompact(
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, base.constraints, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, base.key_decisions, 20);
         try Merge.uniqueAppend(allocator, &blocked_out, &blocked_seen, base.progress.blocked, 20);
+        try Merge.uniqueAppend(allocator, &blocked_tasks_out, &blocked_task_seen, base.blocked_tasks, 20);
 
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
@@ -551,6 +573,7 @@ fn doCompact(
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, new_constraints.items, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, new_decisions.items, 20);
         try Merge.uniqueAppend(allocator, &blocked_out, &blocked_seen, new_blocked.items, 20);
+        try Merge.uniqueAppend(allocator, &blocked_tasks_out, &blocked_task_seen, new_blocked_tasks.items, 20);
 
         // Sync in_progress with next steps: add items not in done.
         for (new_next.items) |it| {
@@ -582,7 +605,7 @@ fn doCompact(
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, next_out.items.len);
             for (next_out.items) |it| {
                 if (done_seen.contains(it)) continue;
-                if (blocked_seen.contains(it)) continue;
+                if (blocked_seen.contains(it) or blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
             // NOTE: arena allocator; we intentionally don't deinit old list.
@@ -594,7 +617,7 @@ fn doCompact(
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, ip_out.items.len);
             for (ip_out.items) |it| {
                 if (done_seen.contains(it)) continue;
-                if (blocked_seen.contains(it)) continue;
+                if (blocked_seen.contains(it) or blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
             ip_out = filtered;
@@ -636,6 +659,7 @@ fn doCompact(
             .key_decisions = try dec_out.toOwnedSlice(allocator),
             .next_steps = try next_out.toOwnedSlice(allocator),
             .critical_context = try ctx_out.toOwnedSlice(allocator),
+            .blocked_tasks = try blocked_tasks_out.toOwnedSlice(allocator),
             .raw = try raw_out.toOwnedSlice(allocator),
         };
 
