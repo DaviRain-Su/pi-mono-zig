@@ -328,7 +328,8 @@ fn doCompact(
                 (std.mem.indexOf(u8, arg, "git add") != null) or
                 (std.mem.indexOf(u8, arg, "mv ") != null) or
                 (std.mem.indexOf(u8, arg, "cp ") != null) or
-                (std.mem.indexOf(u8, arg, "touch ") != null);
+                (std.mem.indexOf(u8, arg, "touch ") != null) or
+                (std.mem.indexOf(u8, arg, "tee ") != null);
 
             const is_read = (std.mem.indexOf(u8, arg, "cat ") != null) or
                 (std.mem.indexOf(u8, arg, "sed -n") != null) or
@@ -336,13 +337,60 @@ fn doCompact(
                 (std.mem.indexOf(u8, arg, "grep ") != null) or
                 (std.mem.indexOf(u8, arg, "head ") != null) or
                 (std.mem.indexOf(u8, arg, "tail ") != null) or
-                (std.mem.indexOf(u8, arg, "less ") != null);
+                (std.mem.indexOf(u8, arg, "less ") != null) or
+                (std.mem.indexOf(u8, arg, "git show") != null) or
+                (std.mem.indexOf(u8, arg, "git diff") != null) or
+                (std.mem.indexOf(u8, arg, "git status") != null);
+
+            // Prefer explicit "redirection" targets if present.
+            //   cmd > out.txt
+            //   cmd >> out.txt
+            //   ... | tee out.txt
+            // This is intentionally shallow parsing (no quoting/escaping rules).
+            {
+                if (std.mem.indexOfScalar(u8, arg, '>')) |pos| {
+                    // take token immediately after the last '>'
+                    var last = pos;
+                    var j: usize = pos + 1;
+                    while (j < arg.len) : (j += 1) {
+                        if (arg[j] == '>') last = j;
+                    }
+                    const rhs = arg[last + 1 ..];
+                    var it2 = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
+                    if (it2.next()) |t0| {
+                        const t = trimToken(t0);
+                        if (looksLikePath(t)) {
+                            const duped = alloc.dupe(u8, t) catch return;
+                            addUnique(alloc, mf, seen_mf_map, duped, 200);
+                        }
+                    }
+                }
+
+                if (std.mem.indexOf(u8, arg, "tee ")) |pos2| {
+                    const rhs = arg[pos2 + 4 ..];
+                    var it3 = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
+                    // skip tee options like -a
+                    while (it3.next()) |t0| {
+                        const t = trimToken(t0);
+                        if (t.len == 0) continue;
+                        if (t[0] == '-') continue;
+                        if (!looksLikePath(t)) break;
+                        const duped = alloc.dupe(u8, t) catch break;
+                        addUnique(alloc, mf, seen_mf_map, duped, 200);
+                        break;
+                    }
+                }
+            }
 
             // Tokenize and collect path-like tokens.
             var it = std.mem.tokenizeAny(u8, arg, " \t\r\n");
             while (it.next()) |t0| {
                 const t = trimToken(t0);
                 if (!looksLikePath(t)) continue;
+
+                // Skip obvious executables and git subcommands.
+                if (std.mem.eql(u8, t, "git") or std.mem.eql(u8, t, "rg") or std.mem.eql(u8, t, "grep") or std.mem.eql(u8, t, "sed") or std.mem.eql(u8, t, "cat") or std.mem.eql(u8, t, "sh")) continue;
+
                 const duped = alloc.dupe(u8, t) catch continue;
                 if (is_modify) {
                     addUnique(alloc, mf, seen_mf_map, duped, 200);
