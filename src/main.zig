@@ -192,10 +192,6 @@ fn doCompact(
     // as much tail as intended without splitting a turn-group), we allow a cut INSIDE the turn.
     // This matches TS's "split-turn" mode (prefix summarized separately).
     const start_intended: usize = start_initial;
-    var split_turn: bool = false;
-    var split_history_end: usize = start; // history summarized by the main structured summary
-    var split_prefix_start: usize = start; // prefix-of-turn summarized by special block
-    var split_prefix_end: usize = start; // == cutpoint
 
     if (start == boundary_from and start_intended > boundary_from) {
         // Allow cutting inside a turn. Use the intended boundary (with the same tool_result guard).
@@ -208,32 +204,57 @@ fn doCompact(
             }
         }
         if (start < boundary_from) start = boundary_from;
+    }
 
-        // Find the turn_start that begins the turn containing this cut (stop at boundary_from).
-        var ts_idx: ?usize = null;
+    // General TS behavior: if the cutpoint lands mid-turn, summarize the turn prefix separately.
+    var split_turn: bool = false;
+    var split_history_end: usize = start; // history summarized by the main structured summary
+    var split_prefix_start: usize = start; // prefix-of-turn summarized by special block
+    var split_prefix_end: usize = start; // == cutpoint
+
+    // Find the most recent complete group end (turn_end final/error) before `start`.
+    var last_group_end: ?usize = null;
+    {
+        var k: usize = start;
+        while (k > boundary_from) : (k -= 1) {
+            const e = nodes.items[k - 1];
+            switch (e) {
+                .turn_end => |te| {
+                    if (te.phase) |ph| {
+                        if (std.mem.eql(u8, ph, "final") or std.mem.eql(u8, ph, "error")) {
+                            last_group_end = k - 1;
+                            break;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Find the most recent turn_start before `start`.
+    var last_turn_start: ?usize = null;
+    {
         var k: usize = start;
         while (k > boundary_from) : (k -= 1) {
             const e = nodes.items[k - 1];
             switch (e) {
                 .turn_start => {
-                    ts_idx = k - 1;
-                    break;
-                },
-                .turn_end => {
-                    // If we hit a previous turn_end before a turn_start, we are already at a boundary.
+                    last_turn_start = k - 1;
                     break;
                 },
                 else => {},
             }
         }
+    }
 
-        if (ts_idx) |t0| {
-            if (t0 < start) {
-                split_turn = true;
-                split_history_end = t0;
-                split_prefix_start = t0;
-                split_prefix_end = start;
-            }
+    if (last_turn_start) |ts_i| {
+        const is_mid_turn = (last_group_end == null) or (last_group_end.? < ts_i);
+        if (is_mid_turn and ts_i < start) {
+            split_turn = true;
+            split_history_end = ts_i;
+            split_prefix_start = ts_i;
+            split_prefix_end = start;
         }
     }
 
