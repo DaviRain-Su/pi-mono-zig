@@ -1349,10 +1349,11 @@ pub fn main() !void {
                 }
 
                 if (total > max_chars or total_tokens_est > max_tokens_est) {
+                    const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
                     const res = try doCompact(
                         allocator,
                         &sm,
-                        keep_last,
+                        effective_keep_last,
                         keep_last_groups,
                         false,
                         "AUTO_COMPACT",
@@ -1364,9 +1365,10 @@ pub fn main() !void {
                         max_tokens_est,
                         false,
                     );
+                    const mode = if (keep_last_groups != null) "groups" else "entries";
                     std.debug.print(
-                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (keep_last={d} keep_last_groups={any}) summaryId={s}\n",
-                        .{ total, max_chars, total_tokens_est, max_tokens_est, keep_last, keep_last_groups, res.summaryId.? },
+                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}\n",
+                        .{ total, max_chars, total_tokens_est, max_tokens_est, mode, keep_last, keep_last_groups, res.summaryId.? },
                     );
                 }
             }
