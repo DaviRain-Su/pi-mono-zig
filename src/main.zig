@@ -128,7 +128,7 @@ fn doCompact(
     // TS-ish compaction cut alignment:
     // 1) Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
     // 2) Prefer to start the tail at a user message (turn boundary heuristic).
-    while (start > 0) {
+    while (start > 0 and start < n) {
         const e = nodes.items[start];
         switch (e) {
             .tool_result => start -= 1,
@@ -194,39 +194,289 @@ fn doCompact(
             }
         }
     } else if (want_json) {
-        // Structured JSON summary (simple fields)
-        var progress = try std.ArrayList(u8).initCapacity(allocator, 0);
-        defer progress.deinit(allocator);
-        var i: usize = 0;
+        // Structured JSON summary (TS-ish): can also update/merge a previous JSON summary.
+
+        const Progress = struct {
+            done: []const []const u8,
+            in_progress: []const []const u8,
+            blocked: []const []const u8,
+        };
+        const Payload = struct {
+            schema: []const u8,
+            goal: []const u8,
+            constraints: []const []const u8,
+            progress: Progress,
+            key_decisions: []const []const u8,
+            next_steps: []const []const u8,
+            critical_context: []const []const u8,
+            raw: []const u8,
+        };
+
+        // Find previous json summary if update_summary is enabled.
+        var prev_payload: ?Payload = null;
+        var prev_idx: ?usize = null;
+        if (update_summary) {
+            var k: usize = start;
+            while (k > 0) : (k -= 1) {
+                const e = nodes.items[k - 1];
+                switch (e) {
+                    .summary => |s| {
+                        if (std.mem.eql(u8, s.format, "json")) {
+                            prev_idx = k - 1;
+                            // Parse payload; if invalid, fall back to fresh.
+                            const parsed = std.json.parseFromSlice(std.json.Value, allocator, s.content, .{}) catch break;
+                            defer parsed.deinit();
+                            const obj = switch (parsed.value) {
+                                .object => |o| o,
+                                else => break,
+                            };
+
+                            const dupStr = struct {
+                                fn dup(a: std.mem.Allocator, t: []const u8) ![]const u8 {
+                                    return try a.dupe(u8, t);
+                                }
+                            };
+
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v1" } else "pi.summary.v1";
+                            const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
+
+                            const constraints_val = if (obj.get("constraints")) |v| v else null;
+                            var constraints_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            if (constraints_val) |cv| {
+                                switch (cv) {
+                                    .array => |a| for (a.items) |it| {
+                                        if (it == .string) try constraints_list.append(allocator, try dupStr.dup(allocator, it.string));
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            const kd_val = if (obj.get("key_decisions")) |v| v else null;
+                            var kd_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            if (kd_val) |kv| {
+                                switch (kv) {
+                                    .array => |a| for (a.items) |it| {
+                                        if (it == .string) try kd_list.append(allocator, try dupStr.dup(allocator, it.string));
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            const ns_val = if (obj.get("next_steps")) |v| v else null;
+                            var ns_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            if (ns_val) |nv| {
+                                switch (nv) {
+                                    .array => |a| for (a.items) |it| {
+                                        if (it == .string) try ns_list.append(allocator, try dupStr.dup(allocator, it.string));
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            const cc_val = if (obj.get("critical_context")) |v| v else null;
+                            var cc_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            if (cc_val) |cv| {
+                                switch (cv) {
+                                    .array => |a| for (a.items) |it| {
+                                        if (it == .string) try cc_list.append(allocator, try dupStr.dup(allocator, it.string));
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            var done_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            var ip_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            var blocked_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+                            if (obj.get("progress")) |pv| {
+                                switch (pv) {
+                                    .object => |po| {
+                                        if (po.get("done")) |dv| switch (dv) {
+                                            .array => |a| for (a.items) |it| if (it == .string) try done_list.append(allocator, try dupStr.dup(allocator, it.string)),
+                                            else => {},
+                                        };
+                                        if (po.get("in_progress")) |iv| switch (iv) {
+                                            .array => |a| for (a.items) |it| if (it == .string) try ip_list.append(allocator, try dupStr.dup(allocator, it.string)),
+                                            else => {},
+                                        };
+                                        if (po.get("blocked")) |bv| switch (bv) {
+                                            .array => |a| for (a.items) |it| if (it == .string) try blocked_list.append(allocator, try dupStr.dup(allocator, it.string)),
+                                            else => {},
+                                        };
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "" } else "";
+
+                            prev_payload = Payload{
+                                .schema = schema,
+                                .goal = goal,
+                                .constraints = try constraints_list.toOwnedSlice(allocator),
+                                .progress = .{
+                                    .done = try done_list.toOwnedSlice(allocator),
+                                    .in_progress = try ip_list.toOwnedSlice(allocator),
+                                    .blocked = try blocked_list.toOwnedSlice(allocator),
+                                },
+                                .key_decisions = try kd_list.toOwnedSlice(allocator),
+                                .next_steps = try ns_list.toOwnedSlice(allocator),
+                                .critical_context = try cc_list.toOwnedSlice(allocator),
+                                .raw = raw,
+                            };
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Collect NEW info since previous summary (or from 0 if none).
+        const from_i: usize = (prev_idx orelse @as(usize, 0)) + 1;
+
+        var new_raw_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
+        defer new_raw_buf.deinit(allocator);
+        var new_next = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_next.deinit(allocator);
+        var new_done = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_done.deinit(allocator);
+        var new_ctx = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_ctx.deinit(allocator);
+
+        var i: usize = from_i;
         while (i < start) : (i += 1) {
             const e = nodes.items[i];
             switch (e) {
                 .message => |m| {
-                    if (std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant")) {
-                        const preview = if (m.content.len > 80) m.content[0..80] else m.content;
-                        try progress.appendSlice(allocator, m.role);
-                        try progress.appendSlice(allocator, ": ");
-                        try progress.appendSlice(allocator, preview);
-                        try progress.appendSlice(allocator, "\n");
+                    if (!(std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant"))) continue;
+                    const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+
+                    // raw snippet
+                    try new_raw_buf.appendSlice(allocator, m.role);
+                    try new_raw_buf.appendSlice(allocator, ": ");
+                    try new_raw_buf.appendSlice(allocator, preview);
+                    try new_raw_buf.appendSlice(allocator, "\n");
+
+                    // ctx line
+                    const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ m.role, preview });
+                    try new_ctx.append(allocator, line);
+
+                    if (std.mem.eql(u8, m.role, "user")) {
+                        const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
+                        try new_next.append(allocator, item);
+                    } else {
+                        if (std.mem.startsWith(u8, m.content, "ack:")) {
+                            const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
+                            try new_done.append(allocator, item);
+                        }
                     }
                 },
                 else => {},
             }
         }
-        const progress_s = try progress.toOwnedSlice(allocator);
 
-        const payload = .{
+        const base = prev_payload orelse Payload{
             .schema = "pi.summary.v1",
             .goal = "(unknown)",
-            .constraints = [_][]const u8{},
-            .progress = .{ .done = [_][]const u8{}, .in_progress = [_][]const u8{}, .blocked = [_][]const u8{} },
-            .key_decisions = [_][]const u8{},
-            .next_steps = [_][]const u8{},
-            .critical_context = [_][]const u8{},
-            .raw = progress_s,
+            .constraints = &.{},
+            .progress = .{ .done = &.{}, .in_progress = &.{}, .blocked = &.{} },
+            .key_decisions = &.{},
+            .next_steps = &.{},
+            .critical_context = &.{},
+            .raw = "",
         };
 
-        const written = try std.json.Stringify.valueAlloc(allocator, payload, .{ .whitespace = .indent_2 });
+        const MAX_NEXT: usize = 10;
+        const MAX_DONE: usize = 10;
+        const MAX_CTX: usize = 20;
+
+        // Merge helper: append unique with cap.
+        const Merge = struct {
+            fn uniqueAppend(
+                alloc: std.mem.Allocator,
+                dst: *std.ArrayList([]const u8),
+                seen: *std.StringHashMap(bool),
+                items: []const []const u8,
+                cap: usize,
+            ) !void {
+                for (items) |it| {
+                    if (dst.items.len >= cap) break;
+                    if (seen.contains(it)) continue;
+                    try seen.put(it, true);
+                    try dst.append(alloc, it);
+                }
+            }
+        };
+
+        var next_seen = std.StringHashMap(bool).init(allocator);
+        defer next_seen.deinit();
+        var done_seen = std.StringHashMap(bool).init(allocator);
+        defer done_seen.deinit();
+        var ctx_seen = std.StringHashMap(bool).init(allocator);
+        defer ctx_seen.deinit();
+
+        var next_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer next_out.deinit(allocator);
+        var done_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer done_out.deinit(allocator);
+        var ip_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer ip_out.deinit(allocator);
+        var ctx_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer ctx_out.deinit(allocator);
+
+        // Seed seen maps with base items so we don't duplicate.
+        for (base.next_steps) |it| try next_seen.put(it, true);
+        for (base.progress.done) |it| try done_seen.put(it, true);
+        for (base.critical_context) |it| try ctx_seen.put(it, true);
+
+        // Start with base lists (capped).
+        try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
+        try Merge.uniqueAppend(allocator, &done_out, &done_seen, base.progress.done, MAX_DONE);
+        // In progress: keep base, but drop anything that is now done.
+        for (base.progress.in_progress) |it| {
+            if (ip_out.items.len >= MAX_NEXT) break;
+            if (done_seen.contains(it)) continue;
+            try ip_out.append(allocator, it);
+        }
+        try Merge.uniqueAppend(allocator, &ctx_out, &ctx_seen, base.critical_context, MAX_CTX);
+
+        // Append new items.
+        try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
+        try Merge.uniqueAppend(allocator, &done_out, &done_seen, new_done.items, MAX_DONE);
+        // Sync in_progress with next steps: add checklist-ish items not in done.
+        for (new_next.items) |it| {
+            if (ip_out.items.len >= MAX_NEXT) break;
+            if (done_seen.contains(it)) continue;
+            if (std.mem.indexOf(u8, it, "(none)") != null) continue;
+            // naive de-dup
+            var already = false;
+            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) { already = true; break; };
+            if (already) continue;
+            try ip_out.append(allocator, it);
+        }
+        try Merge.uniqueAppend(allocator, &ctx_out, &ctx_seen, new_ctx.items, MAX_CTX);
+
+        // Raw: append new snippets to previous raw.
+        var raw_out = try std.ArrayList(u8).initCapacity(allocator, base.raw.len + new_raw_buf.items.len + 16);
+        defer raw_out.deinit(allocator);
+        if (base.raw.len > 0) {
+            try raw_out.appendSlice(allocator, base.raw);
+            if (!std.mem.endsWith(u8, base.raw, "\n")) try raw_out.appendSlice(allocator, "\n");
+        }
+        try raw_out.appendSlice(allocator, new_raw_buf.items);
+
+        const merged = Payload{
+            .schema = base.schema,
+            .goal = base.goal,
+            .constraints = base.constraints,
+            .progress = .{ .done = try done_out.toOwnedSlice(allocator), .in_progress = try ip_out.toOwnedSlice(allocator), .blocked = base.progress.blocked },
+            .key_decisions = base.key_decisions,
+            .next_steps = try next_out.toOwnedSlice(allocator),
+            .critical_context = try ctx_out.toOwnedSlice(allocator),
+            .raw = try raw_out.toOwnedSlice(allocator),
+        };
+
+        const written = try std.json.Stringify.valueAlloc(allocator, merged, .{ .whitespace = .indent_2 });
         try sum_buf.appendSlice(allocator, written);
     } else {
         // TS-aligned markdown structured summary (matches SUMMARIZATION_PROMPT format)
