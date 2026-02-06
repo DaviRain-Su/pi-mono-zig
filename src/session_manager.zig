@@ -157,6 +157,10 @@ pub const SessionManager = struct {
     }
 
     pub fn appendToolCall(self: *SessionManager, tool: []const u8, arg: []const u8) ![]const u8 {
+        return try self.appendToolCallWithTokensEst(tool, arg, null);
+    }
+
+    pub fn appendToolCallWithTokensEst(self: *SessionManager, tool: []const u8, arg: []const u8, tokens_est: ?usize) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = ToolCallEntry{
@@ -165,6 +169,7 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .tool = tool,
             .arg = arg,
+            .tokensEst = tokens_est,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -172,6 +177,10 @@ pub const SessionManager = struct {
     }
 
     pub fn appendToolResult(self: *SessionManager, tool: []const u8, ok: bool, content: []const u8) ![]const u8 {
+        return try self.appendToolResultWithTokensEst(tool, ok, content, null);
+    }
+
+    pub fn appendToolResultWithTokensEst(self: *SessionManager, tool: []const u8, ok: bool, content: []const u8, tokens_est: ?usize) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = ToolResultEntry{
@@ -181,6 +190,7 @@ pub const SessionManager = struct {
             .tool = tool,
             .ok = ok,
             .content = content,
+            .tokensEst = tokens_est,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -275,12 +285,13 @@ pub const SessionManager = struct {
                 const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
                 const tool0 = switch (obj.get("tool") orelse continue) { .string => |s| s, else => continue };
                 const arg0 = switch (obj.get("arg") orelse continue) { .string => |s| s, else => continue };
+                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const tool = try dup.s(self.arena, tool0);
                 const arg = try dup.s(self.arena, arg0);
-                try out.append(self.arena, .{ .tool_call = .{ .id = id, .parentId = pid, .timestamp = ts, .tool = tool, .arg = arg } });
+                try out.append(self.arena, .{ .tool_call = .{ .id = id, .parentId = pid, .timestamp = ts, .tool = tool, .arg = arg, .tokensEst = tokens_est0 } });
                 continue;
             }
 
@@ -291,12 +302,13 @@ pub const SessionManager = struct {
                 const tool0 = switch (obj.get("tool") orelse continue) { .string => |s| s, else => continue };
                 const ok = switch (obj.get("ok") orelse continue) { .bool => |b| b, else => continue };
                 const content0 = switch (obj.get("content") orelse continue) { .string => |s| s, else => continue };
+                const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const tool = try dup.s(self.arena, tool0);
                 const content = try dup.s(self.arena, content0);
-                try out.append(self.arena, .{ .tool_result = .{ .id = id, .parentId = pid, .timestamp = ts, .tool = tool, .ok = ok, .content = content } });
+                try out.append(self.arena, .{ .tool_result = .{ .id = id, .parentId = pid, .timestamp = ts, .tool = tool, .ok = ok, .content = content, .tokensEst = tokens_est0 } });
                 continue;
             }
 

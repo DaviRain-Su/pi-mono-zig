@@ -57,8 +57,8 @@ fn tokensEstForEntry(e: st.Entry) usize {
     return switch (e) {
         .message => |m| m.tokensEst orelse tokensEstFromChars(m.content.len),
         // tool call/results tend to be denser / more verbose
-        .tool_call => |tc| tokensEstFromChars(tc.arg.len) + 8,
-        .tool_result => |tr| tokensEstFromChars(tr.content.len) + 8,
+        .tool_call => |tc| tc.tokensEst orelse (tokensEstFromChars(tc.arg.len) + 8),
+        .tool_result => |tr| tr.tokensEst orelse (tokensEstFromChars(tr.content.len) + 8),
         .turn_start => 2,
         .turn_end => 2,
         .summary => |s| tokensEstFromChars(s.content.len),
@@ -2287,7 +2287,7 @@ pub fn main() !void {
             const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
             if (line.len == 0) continue;
 
-            _ = try sm.appendMessage("user", line);
+            _ = try sm.appendMessageWithTokensEst("user", line, (line.len + 3) / 4);
 
             // Run model/tools until it returns a final_text (step() -> true)
             while (true) {

@@ -27,6 +27,8 @@ pub const ToolCallEntry = struct {
     timestamp: []const u8,
     tool: []const u8,
     arg: []const u8,
+
+    tokensEst: ?usize = null,
 };
 
 pub const ToolResultEntry = struct {
@@ -37,6 +39,8 @@ pub const ToolResultEntry = struct {
     tool: []const u8,
     ok: bool,
     content: []const u8,
+
+    tokensEst: ?usize = null,
 };
 
 pub const LeafEntry = struct {

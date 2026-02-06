@@ -57,20 +57,23 @@ pub const AgentLoop = struct {
                 return true;
             },
             .tool_call => |c| {
-                // record tool call entry
-                _ = try self.session_mgr.appendToolCall(c.tool, c.arg);
+                // record tool call entry (best-effort tokens)
+                const tc_tokens = (c.arg.len + 3) / 4 + 8;
+                _ = try self.session_mgr.appendToolCallWithTokensEst(c.tool, c.arg, tc_tokens);
                 self.bus.emit(.{ .tool_execution_start = .{ .tool = c.tool, .arg = c.arg } });
 
                 const res = self.tools_reg.execute(c) catch |e| {
                     const err_line = try std.fmt.allocPrint(self.arena, "{s}", .{@errorName(e)});
-                    _ = try self.session_mgr.appendToolResult(c.tool, false, err_line);
+                    const tr_tokens = (err_line.len + 3) / 4 + 8;
+                    _ = try self.session_mgr.appendToolResultWithTokensEst(c.tool, false, err_line, tr_tokens);
                     self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = false, .content = err_line } });
                     _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "error");
                     self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                     return false;
                 };
 
-                _ = try self.session_mgr.appendToolResult(c.tool, true, res.content);
+                const tr_tokens = (res.content.len + 3) / 4 + 8;
+                _ = try self.session_mgr.appendToolResultWithTokensEst(c.tool, true, res.content, tr_tokens);
                 self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = true, .content = res.content } });
 
                 _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "tool");
