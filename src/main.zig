@@ -342,6 +342,10 @@ fn doCompact(
         defer new_done.deinit(allocator);
         var new_ctx = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer new_ctx.deinit(allocator);
+        var new_constraints = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_constraints.deinit(allocator);
+        var new_decisions = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_decisions.deinit(allocator);
 
         var i: usize = from_i;
         while (i < start) : (i += 1) {
@@ -364,10 +368,25 @@ fn doCompact(
                     if (std.mem.eql(u8, m.role, "user")) {
                         const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
                         try new_next.append(allocator, item);
+
+                        // Heuristic constraints extraction
+                        if (std.mem.startsWith(u8, m.content, "constraint:") or std.mem.startsWith(u8, m.content, "constraints:")) {
+                            const body = std.mem.trimLeft(u8, m.content, "constraint:s ");
+                            if (body.len > 0) try new_constraints.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
+                        }
+                        if (std.mem.startsWith(u8, m.content, "pref:") or std.mem.startsWith(u8, m.content, "preference:")) {
+                            const body = std.mem.trimLeft(u8, m.content, "preference:pf ");
+                            if (body.len > 0) try new_constraints.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
+                        }
                     } else {
                         if (std.mem.startsWith(u8, m.content, "ack:")) {
                             const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
                             try new_done.append(allocator, item);
+                        }
+                        // Heuristic decision extraction
+                        if (std.mem.startsWith(u8, m.content, "decision:") or std.mem.startsWith(u8, m.content, "decided:")) {
+                            const body = std.mem.trimLeft(u8, m.content, "decision:d ");
+                            if (body.len > 0) try new_decisions.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
                         }
                     }
                 },
@@ -414,6 +433,10 @@ fn doCompact(
         defer done_seen.deinit();
         var ctx_seen = std.StringHashMap(bool).init(allocator);
         defer ctx_seen.deinit();
+        var cons_seen = std.StringHashMap(bool).init(allocator);
+        defer cons_seen.deinit();
+        var dec_seen = std.StringHashMap(bool).init(allocator);
+        defer dec_seen.deinit();
 
         var next_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer next_out.deinit(allocator);
@@ -423,11 +446,17 @@ fn doCompact(
         defer ip_out.deinit(allocator);
         var ctx_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer ctx_out.deinit(allocator);
+        var cons_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer cons_out.deinit(allocator);
+        var dec_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer dec_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
         for (base.next_steps) |it| try next_seen.put(it, true);
         for (base.progress.done) |it| try done_seen.put(it, true);
         for (base.critical_context) |it| try ctx_seen.put(it, true);
+        for (base.constraints) |it| try cons_seen.put(it, true);
+        for (base.key_decisions) |it| try dec_seen.put(it, true);
 
         // Start with base lists (capped).
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
@@ -439,11 +468,16 @@ fn doCompact(
             try ip_out.append(allocator, it);
         }
         try Merge.uniqueAppend(allocator, &ctx_out, &ctx_seen, base.critical_context, MAX_CTX);
+        try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, base.constraints, 20);
+        try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, base.key_decisions, 20);
 
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
         try Merge.uniqueAppend(allocator, &done_out, &done_seen, new_done.items, MAX_DONE);
-        // Sync in_progress with next steps: add checklist-ish items not in done.
+        try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, new_constraints.items, 20);
+        try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, new_decisions.items, 20);
+
+        // Sync in_progress with next steps: add items not in done.
         for (new_next.items) |it| {
             if (ip_out.items.len >= MAX_NEXT) break;
             if (done_seen.contains(it)) continue;
@@ -456,6 +490,39 @@ fn doCompact(
         }
         try Merge.uniqueAppend(allocator, &ctx_out, &ctx_seen, new_ctx.items, MAX_CTX);
 
+        // Heuristic: mark related user tasks as done based on ack: tool_result echo: <arg>
+        // This lets us drop "echo: <arg>" from next_steps/in_progress.
+        for (done_out.items) |d| {
+            const prefix_echo = "ack: tool_result echo:";
+            if (std.mem.startsWith(u8, d, prefix_echo)) {
+                const arg = std.mem.trimLeft(u8, d[prefix_echo.len..], " ");
+                const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{arg});
+                // do not cap; it just enriches done_seen
+                _ = done_seen.put(task, true) catch {};
+            }
+        }
+
+        // Post-process: remove next_steps that are already done.
+        {
+            var filtered = try std.ArrayList([]const u8).initCapacity(allocator, next_out.items.len);
+            for (next_out.items) |it| {
+                if (done_seen.contains(it)) continue;
+                try filtered.append(allocator, it);
+            }
+            // NOTE: arena allocator; we intentionally don't deinit old list.
+            next_out = filtered;
+        }
+
+        // Also drop done items from in_progress.
+        {
+            var filtered = try std.ArrayList([]const u8).initCapacity(allocator, ip_out.items.len);
+            for (ip_out.items) |it| {
+                if (done_seen.contains(it)) continue;
+                try filtered.append(allocator, it);
+            }
+            ip_out = filtered;
+        }
+
         // Raw: append new snippets to previous raw.
         var raw_out = try std.ArrayList(u8).initCapacity(allocator, base.raw.len + new_raw_buf.items.len + 16);
         defer raw_out.deinit(allocator);
@@ -465,12 +532,31 @@ fn doCompact(
         }
         try raw_out.appendSlice(allocator, new_raw_buf.items);
 
+        // Goal heuristic: if still unknown, use earliest user message in this summarized window.
+        var goal_out = base.goal;
+        if (std.mem.eql(u8, goal_out, "(unknown)")) {
+            var gi: usize = 0;
+            while (gi < start) : (gi += 1) {
+                const e = nodes.items[gi];
+                switch (e) {
+                    .message => |m| {
+                        if (std.mem.eql(u8, m.role, "user")) {
+                            const preview = if (m.content.len > 120) m.content[0..120] else m.content;
+                            goal_out = preview;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
         const merged = Payload{
             .schema = base.schema,
-            .goal = base.goal,
-            .constraints = base.constraints,
+            .goal = goal_out,
+            .constraints = try cons_out.toOwnedSlice(allocator),
             .progress = .{ .done = try done_out.toOwnedSlice(allocator), .in_progress = try ip_out.toOwnedSlice(allocator), .blocked = base.progress.blocked },
-            .key_decisions = base.key_decisions,
+            .key_decisions = try dec_out.toOwnedSlice(allocator),
             .next_steps = try next_out.toOwnedSlice(allocator),
             .critical_context = try ctx_out.toOwnedSlice(allocator),
             .raw = try raw_out.toOwnedSlice(allocator),
