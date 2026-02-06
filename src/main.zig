@@ -639,11 +639,12 @@ fn doCompact(
         }
 
         // Post-process: remove next_steps that are already done/blocked.
+        // NOTE: blocked-ness is driven by blocked_tasks (not by blocked reason strings).
         {
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, next_out.items.len);
             for (next_out.items) |it| {
                 if (done_seen.contains(it)) continue;
-                if (blocked_seen.contains(it) or blocked_task_seen.contains(it)) continue;
+                if (blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
             // NOTE: arena allocator; we intentionally don't deinit old list.
@@ -655,7 +656,7 @@ fn doCompact(
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, ip_out.items.len);
             for (ip_out.items) |it| {
                 if (done_seen.contains(it)) continue;
-                if (blocked_seen.contains(it) or blocked_task_seen.contains(it)) continue;
+                if (blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
             ip_out = filtered;
@@ -685,6 +686,24 @@ fn doCompact(
                         }
                     },
                     else => {},
+                }
+            }
+        }
+
+        // Ensure progress.blocked contains a readable reason for each blocked task (if we know tool/arg/err).
+        for (blocked_tasks_out.items) |bt| {
+            if (bt.tool != null and bt.err != null) {
+                const tool = bt.tool.?;
+                const err = bt.err.?;
+                const arg = bt.arg orelse "";
+                const blocked_reason = if (arg.len > 0)
+                    try std.fmt.allocPrint(allocator, "{s}({s}): {s}", .{ tool, arg, err })
+                else
+                    try std.fmt.allocPrint(allocator, "{s}: {s}", .{ tool, err });
+
+                if (!blocked_seen.contains(blocked_reason) and blocked_out.items.len < 20) {
+                    try blocked_seen.put(blocked_reason, true);
+                    try blocked_out.append(allocator, blocked_reason);
                 }
             }
         }
