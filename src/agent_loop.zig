@@ -21,8 +21,8 @@ pub const AgentLoop = struct {
     }
 
     pub fn step(self: *AgentLoop) !bool {
-        // Load full entry list (MVP). Later we can incrementally track.
-        const entries = try self.session_mgr.loadEntries();
+        // TS-like: use business-only context for model decisions (structural entries are excluded).
+        const entries = try self.session_mgr.buildContextEntries();
 
         // Find the latest user message id to associate with this turn.
         const user_mid = blk: {

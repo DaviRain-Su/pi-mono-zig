@@ -15,7 +15,9 @@ pub const ModelOutput = union(enum) {
 ///   - "sh:" => tool_call shell
 ///   - else => final ok
 pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
-    // Find last significant entry (skip structural entries that shouldn't affect decisions)
+    // NOTE: caller should already provide a business-only context (no turn/leaf/label).
+    // We still defensively skip structural entries for forward compatibility.
+    // Find last significant entry
     var last_sig: ?st.Entry = null;
     var j: usize = entries.len;
     while (j > 0) : (j -= 1) {
