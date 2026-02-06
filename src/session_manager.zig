@@ -411,7 +411,22 @@ pub const SessionManager = struct {
         return try out.toOwnedSlice(self.arena);
     }
 
+    fn isBusinessEntry(e: Entry) bool {
+        return switch (e) {
+            .message, .tool_call, .tool_result, .summary => true,
+            else => false,
+        };
+    }
+
     pub fn buildContextEntries(self: *SessionManager) ![]Entry {
+        return try self.buildContextEntriesMode(false);
+    }
+
+    pub fn buildContextEntriesVerbose(self: *SessionManager) ![]Entry {
+        return try self.buildContextEntriesMode(true);
+    }
+
+    fn buildContextEntriesMode(self: *SessionManager, include_structural: bool) ![]Entry {
         const entries = try self.loadEntries();
 
         // Find leaf
@@ -423,10 +438,11 @@ pub const SessionManager = struct {
             }
         }
         if (leaf == null) {
-            // no explicit leaf => return all non-session entries
+            // no explicit leaf => return all non-session entries (filtered by mode)
             var out_all = try std.ArrayList(Entry).initCapacity(self.arena, entries.len);
             defer out_all.deinit(self.arena);
             for (entries) |e| {
+                if (!include_structural and !isBusinessEntry(e)) continue;
                 switch (e) {
                     .session, .leaf => {},
                     else => try out_all.append(self.arena, e),
@@ -455,12 +471,14 @@ pub const SessionManager = struct {
             cur = st.parentIdOf(e);
         }
 
-        // Reverse to root->leaf
+        // Reverse to root->leaf (filtered by mode)
         var out = try std.ArrayList(Entry).initCapacity(self.arena, path.items.len);
         defer out.deinit(self.arena);
         var i: usize = path.items.len;
         while (i > 0) : (i -= 1) {
-            try out.append(self.arena, path.items[i - 1]);
+            const e = path.items[i - 1];
+            if (!include_structural and !isBusinessEntry(e)) continue;
+            try out.append(self.arena, e);
         }
         return try out.toOwnedSlice(self.arena);
     }

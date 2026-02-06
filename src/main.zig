@@ -81,7 +81,8 @@ fn doCompact(
     stats_threshold_tokens_est: ?usize,
     update_summary: bool,
 ) !struct { dryRun: bool, summaryText: []const u8, summaryId: ?[]const u8 } {
-    const chain = try sm.buildContextEntries();
+    // Use verbose context for compaction so we can see turn boundaries.
+    const chain = try sm.buildContextEntriesVerbose();
 
     var nodes = try std.ArrayList(st.Entry).initCapacity(allocator, chain.len);
     defer nodes.deinit(allocator);
@@ -864,7 +865,7 @@ pub fn main() !void {
             }
         }
 
-        const entries = try sm.buildContextEntries();
+        const entries = if (show_turns) try sm.buildContextEntriesVerbose() else try sm.buildContextEntries();
         var idx: usize = 0;
         for (entries) |e| {
             idx += 1;
@@ -1245,7 +1246,7 @@ pub fn main() !void {
 
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
-        const entries = try sm.buildContextEntries();
+        const entries = if (show_turns) try sm.buildContextEntriesVerbose() else try sm.buildContextEntries();
         for (entries) |e| {
             switch (e) {
                 .turn_start => |t| {
