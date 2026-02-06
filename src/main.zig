@@ -356,8 +356,40 @@ fn doCompact(
                 .tool_result => |tr| {
                     if (!tr.ok) {
                         const preview = if (tr.content.len > 120) tr.content[0..120] else tr.content;
-                        const item = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ tr.tool, preview });
+
+                        // Try to associate with the most recent tool_call arg for this tool in the same window.
+                        var arg_opt: ?[]const u8 = null;
+                        var back: usize = i;
+                        while (back > from_i) : (back -= 1) {
+                            const be = nodes.items[back - 1];
+                            switch (be) {
+                                .tool_call => |tc| {
+                                    if (std.mem.eql(u8, tc.tool, tr.tool)) {
+                                        arg_opt = tc.arg;
+                                        break;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+
+                        const item = if (arg_opt) |a|
+                            try std.fmt.allocPrint(allocator, "{s}({s}): {s}", .{ tr.tool, a, preview })
+                        else
+                            try std.fmt.allocPrint(allocator, "{s}: {s}", .{ tr.tool, preview });
+
                         try new_blocked.append(allocator, item);
+
+                        // Also mark the originating user task as blocked (so it can be removed from next/in_progress).
+                        if (arg_opt) |a| {
+                            if (std.mem.eql(u8, tr.tool, "shell")) {
+                                const task = try std.fmt.allocPrint(allocator, "sh: {s}", .{a});
+                                try new_blocked.append(allocator, task);
+                            } else if (std.mem.eql(u8, tr.tool, "echo")) {
+                                const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{a});
+                                try new_blocked.append(allocator, task);
+                            }
+                        }
                     }
                 },
                 .message => |m| {
@@ -399,9 +431,30 @@ fn doCompact(
                         }
 
                         // Heuristic blocked extraction
+                        // Avoid duplicating tool_result errors already captured.
                         if (std.mem.startsWith(u8, m.content, "error:")) {
                             const body = std.mem.trimLeft(u8, m.content, "error: ");
-                            if (body.len > 0) try new_blocked.append(allocator, try std.fmt.allocPrint(allocator, "assistant_error: {s}", .{body}));
+                            if (body.len > 0) {
+                                // If body looks like "tool_result <tool>: <err>", try to match existing "<tool>(...): <err>" or "<tool>: <err>".
+                                var duplicate = false;
+                                const tr_prefix = "tool_result ";
+                                if (std.mem.startsWith(u8, body, tr_prefix)) {
+                                    const rest = body[tr_prefix.len..];
+                                    if (std.mem.indexOf(u8, rest, ":")) |col| {
+                                        const tool = std.mem.trim(u8, rest[0..col], " ");
+                                        const err = std.mem.trim(u8, rest[col + 1 ..], " ");
+                                        for (new_blocked.items) |bi| {
+                                            if (std.mem.startsWith(u8, bi, tool) and std.mem.indexOf(u8, bi, err) != null) {
+                                                duplicate = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!duplicate) {
+                                    try new_blocked.append(allocator, try std.fmt.allocPrint(allocator, "assistant_error: {s}", .{body}));
+                                }
+                            }
                         }
                     }
                 },
