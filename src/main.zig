@@ -372,6 +372,42 @@ fn doCompact(
         }
     }
 
+    // TS parity: inherit file ops from the most recent previous summary.
+    // This matches TS compaction details carry-forward behavior.
+    {
+        var k: usize = boundary_from;
+        var prev: ?st.SummaryEntry = null;
+        while (k > 0) : (k -= 1) {
+            const e = nodes.items[k - 1];
+            switch (e) {
+                .summary => |s| {
+                    prev = s;
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        if (prev) |ps| {
+            if (ps.readFiles) |rf0| {
+                for (rf0) |p| {
+                    if (read_files_out.items.len >= 200) break;
+                    if (seen_rf.contains(p)) continue;
+                    try seen_rf.put(p, true);
+                    try read_files_out.append(allocator, p);
+                }
+            }
+            if (ps.modifiedFiles) |mf0| {
+                for (mf0) |p| {
+                    if (modified_files_out.items.len >= 200) break;
+                    if (seen_mf.contains(p)) continue;
+                    try seen_mf.put(p, true);
+                    try modified_files_out.append(allocator, p);
+                }
+            }
+        }
+    }
+
     if (!want_json and !want_md) {
         try sum_buf.appendSlice(allocator, prefix);
 
