@@ -346,11 +346,20 @@ fn doCompact(
         defer new_constraints.deinit(allocator);
         var new_decisions = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer new_decisions.deinit(allocator);
+        var new_blocked = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer new_blocked.deinit(allocator);
 
         var i: usize = from_i;
         while (i < start) : (i += 1) {
             const e = nodes.items[i];
             switch (e) {
+                .tool_result => |tr| {
+                    if (!tr.ok) {
+                        const preview = if (tr.content.len > 120) tr.content[0..120] else tr.content;
+                        const item = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ tr.tool, preview });
+                        try new_blocked.append(allocator, item);
+                    }
+                },
                 .message => |m| {
                     if (!(std.mem.eql(u8, m.role, "user") or std.mem.eql(u8, m.role, "assistant"))) continue;
                     const preview = if (m.content.len > 120) m.content[0..120] else m.content;
@@ -387,6 +396,12 @@ fn doCompact(
                         if (std.mem.startsWith(u8, m.content, "decision:") or std.mem.startsWith(u8, m.content, "decided:")) {
                             const body = std.mem.trimLeft(u8, m.content, "decision:d ");
                             if (body.len > 0) try new_decisions.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
+                        }
+
+                        // Heuristic blocked extraction
+                        if (std.mem.startsWith(u8, m.content, "error:")) {
+                            const body = std.mem.trimLeft(u8, m.content, "error: ");
+                            if (body.len > 0) try new_blocked.append(allocator, try std.fmt.allocPrint(allocator, "assistant_error: {s}", .{body}));
                         }
                     }
                 },
@@ -437,6 +452,8 @@ fn doCompact(
         defer cons_seen.deinit();
         var dec_seen = std.StringHashMap(bool).init(allocator);
         defer dec_seen.deinit();
+        var blocked_seen = std.StringHashMap(bool).init(allocator);
+        defer blocked_seen.deinit();
 
         var next_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer next_out.deinit(allocator);
@@ -450,6 +467,8 @@ fn doCompact(
         defer cons_out.deinit(allocator);
         var dec_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
         defer dec_out.deinit(allocator);
+        var blocked_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        defer blocked_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
         for (base.next_steps) |it| try next_seen.put(it, true);
@@ -457,6 +476,7 @@ fn doCompact(
         for (base.critical_context) |it| try ctx_seen.put(it, true);
         for (base.constraints) |it| try cons_seen.put(it, true);
         for (base.key_decisions) |it| try dec_seen.put(it, true);
+        for (base.progress.blocked) |it| try blocked_seen.put(it, true);
 
         // Start with base lists (capped).
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
@@ -470,12 +490,14 @@ fn doCompact(
         try Merge.uniqueAppend(allocator, &ctx_out, &ctx_seen, base.critical_context, MAX_CTX);
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, base.constraints, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, base.key_decisions, 20);
+        try Merge.uniqueAppend(allocator, &blocked_out, &blocked_seen, base.progress.blocked, 20);
 
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
         try Merge.uniqueAppend(allocator, &done_out, &done_seen, new_done.items, MAX_DONE);
         try Merge.uniqueAppend(allocator, &cons_out, &cons_seen, new_constraints.items, 20);
         try Merge.uniqueAppend(allocator, &dec_out, &dec_seen, new_decisions.items, 20);
+        try Merge.uniqueAppend(allocator, &blocked_out, &blocked_seen, new_blocked.items, 20);
 
         // Sync in_progress with next steps: add items not in done.
         for (new_next.items) |it| {
@@ -502,22 +524,24 @@ fn doCompact(
             }
         }
 
-        // Post-process: remove next_steps that are already done.
+        // Post-process: remove next_steps that are already done/blocked.
         {
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, next_out.items.len);
             for (next_out.items) |it| {
                 if (done_seen.contains(it)) continue;
+                if (blocked_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
             // NOTE: arena allocator; we intentionally don't deinit old list.
             next_out = filtered;
         }
 
-        // Also drop done items from in_progress.
+        // Also drop done/blocked items from in_progress.
         {
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, ip_out.items.len);
             for (ip_out.items) |it| {
                 if (done_seen.contains(it)) continue;
+                if (blocked_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
             ip_out = filtered;
@@ -555,7 +579,7 @@ fn doCompact(
             .schema = base.schema,
             .goal = goal_out,
             .constraints = try cons_out.toOwnedSlice(allocator),
-            .progress = .{ .done = try done_out.toOwnedSlice(allocator), .in_progress = try ip_out.toOwnedSlice(allocator), .blocked = base.progress.blocked },
+            .progress = .{ .done = try done_out.toOwnedSlice(allocator), .in_progress = try ip_out.toOwnedSlice(allocator), .blocked = try blocked_out.toOwnedSlice(allocator) },
             .key_decisions = try dec_out.toOwnedSlice(allocator),
             .next_steps = try next_out.toOwnedSlice(allocator),
             .critical_context = try ctx_out.toOwnedSlice(allocator),
