@@ -20,6 +20,17 @@ pub const AgentLoop = struct {
         return .{ .arena = arena, .session_mgr = session_mgr, .tools_reg = tools_reg, .bus = bus };
     }
 
+    fn tokensEstForContextEntry(e: session.Entry) usize {
+        return switch (e) {
+            .message => |m| m.tokensEst orelse ((m.content.len + 3) / 4),
+            .tool_call => |tc| tc.tokensEst orelse (((tc.arg.len + 3) / 4) + 8),
+            .tool_result => |tr| tr.tokensEst orelse (((tr.content.len + 3) / 4) + 8),
+            .branch_summary => |b| (b.summary.len + 3) / 4,
+            .summary => |s| (s.content.len + 3) / 4,
+            else => 0,
+        };
+    }
+
     pub fn step(self: *AgentLoop) !bool {
         // TS-like: use business-only context for model decisions (structural entries are excluded).
         const entries = try self.session_mgr.buildContextEntries();
@@ -50,7 +61,11 @@ pub const AgentLoop = struct {
             .final_text => |t| {
                 // Best-effort usage estimate for sizing.
                 const tokens_est = (t.len + 3) / 4;
-                _ = try self.session_mgr.appendMessageWithTokensEst("assistant", t, tokens_est);
+                var usage_total_tokens: usize = tokens_est;
+                for (entries) |e| {
+                    usage_total_tokens += tokensEstForContextEntry(e);
+                }
+                _ = try self.session_mgr.appendMessageWithMeta("assistant", t, tokens_est, usage_total_tokens);
                 self.bus.emit(.{ .message_append = .{ .role = "assistant", .content = t } });
                 _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "final");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });

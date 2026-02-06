@@ -68,8 +68,15 @@ zig build run -- label --session /tmp/pi-session.jsonl --to <entryId> --label RO
 # branch leaf to an earlier node
 zig build run -- branch --session /tmp/pi-session.jsonl --to <entryId>
 
+# branch and append a branch_summary node (auto summary if --summary omitted)
+zig build run -- branch-with-summary --session /tmp/pi-session.jsonl --to <entryId>
+
 # replay follows current leaf (root -> leaf path)
 zig build run -- replay --session /tmp/pi-session.jsonl
+
+# persist context state entries (TS-style)
+zig build run -- set-model --session /tmp/pi-session.jsonl --provider anthropic --model claude-sonnet-4-5
+zig build run -- set-thinking --session /tmp/pi-session.jsonl --level high
 
 # show full details for one entry
 zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>

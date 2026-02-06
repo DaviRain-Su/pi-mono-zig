@@ -15,6 +15,9 @@ fn usage() void {
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
         \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
+        \\  pi-mono-zig branch-with-summary --session <path.jsonl> --to <entryId> [--summary <text>]\n\
+        \\  pi-mono-zig set-model --session <path.jsonl> --provider <name> --model <id>\n\
+        \\  pi-mono-zig set-thinking --session <path.jsonl> --level <name>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
@@ -59,11 +62,166 @@ fn tokensEstForEntry(e: st.Entry) usize {
         // tool call/results tend to be denser / more verbose
         .tool_call => |tc| tc.tokensEst orelse (tokensEstFromChars(tc.arg.len) + 8),
         .tool_result => |tr| tr.tokensEst orelse (tokensEstFromChars(tr.content.len) + 8),
+        .branch_summary => |b| tokensEstFromChars(b.summary.len),
         .turn_start => 2,
         .turn_end => 2,
+        .thinking_level_change, .model_change => 0,
         .summary => |s| tokensEstFromChars(s.content.len),
         else => 0,
     };
+}
+
+const BoundaryTokenEstimate = struct {
+    tokens: usize,
+    usageTokens: usize,
+    trailingTokens: usize,
+    lastUsageIndex: ?usize,
+};
+
+fn estimateBoundaryTokens(entries: []const st.Entry, boundary_from: usize) BoundaryTokenEstimate {
+    var last_usage_idx: ?usize = null;
+    var usage_tokens: usize = 0;
+
+    var i: usize = boundary_from;
+    while (i < entries.len) : (i += 1) {
+        const e = entries[i];
+        switch (e) {
+            .message => |m| {
+                if (std.mem.eql(u8, m.role, "assistant")) {
+                    if (m.usageTotalTokens) |u| {
+                        last_usage_idx = i;
+                        usage_tokens = u;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (last_usage_idx == null) {
+        var est: usize = 0;
+        i = boundary_from;
+        while (i < entries.len) : (i += 1) {
+            est += tokensEstForEntry(entries[i]);
+        }
+        return .{
+            .tokens = est,
+            .usageTokens = 0,
+            .trailingTokens = est,
+            .lastUsageIndex = null,
+        };
+    }
+
+    var trailing: usize = 0;
+    i = last_usage_idx.? + 1;
+    while (i < entries.len) : (i += 1) {
+        trailing += tokensEstForEntry(entries[i]);
+    }
+
+    return .{
+        .tokens = usage_tokens + trailing,
+        .usageTokens = usage_tokens,
+        .trailingTokens = trailing,
+        .lastUsageIndex = last_usage_idx,
+    };
+}
+
+fn buildAutoBranchSummary(
+    allocator: std.mem.Allocator,
+    sm: *session.SessionManager,
+    old_leaf: ?[]const u8,
+    target: ?[]const u8,
+) ![]const u8 {
+    var by_id = std.StringHashMap(st.Entry).init(allocator);
+    defer by_id.deinit();
+
+    const entries = try sm.loadEntries();
+    for (entries) |e| {
+        if (st.idOf(e)) |id| {
+            try by_id.put(id, e);
+        }
+    }
+
+    var target_ancestors = std.StringHashMap(bool).init(allocator);
+    defer target_ancestors.deinit();
+    var cur_t = target;
+    while (cur_t) |cid| {
+        try target_ancestors.put(cid, true);
+        const e = by_id.get(cid) orelse break;
+        cur_t = st.parentIdOf(e);
+    }
+
+    var abandoned = try std.ArrayList(st.Entry).initCapacity(allocator, 0);
+    defer abandoned.deinit(allocator);
+    var cur = old_leaf;
+    while (cur) |cid| {
+        if (target_ancestors.contains(cid)) break;
+        const e = by_id.get(cid) orelse break;
+        try abandoned.append(allocator, e);
+        cur = st.parentIdOf(e);
+    }
+
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "## Goal\n");
+    try out.appendSlice(allocator, "Branch from ");
+    try out.appendSlice(allocator, old_leaf orelse "root");
+    try out.appendSlice(allocator, " to ");
+    try out.appendSlice(allocator, target orelse "root");
+    try out.appendSlice(allocator, ".\n\n");
+
+    try out.appendSlice(allocator, "## Progress\n");
+    if (abandoned.items.len == 0) {
+        try out.appendSlice(allocator, "- (none)\n");
+    } else {
+        var written: usize = 0;
+        var i: usize = abandoned.items.len;
+        while (i > 0 and written < 8) : (i -= 1) {
+            const e = abandoned.items[i - 1];
+            switch (e) {
+                .message => |m| {
+                    const preview = if (m.content.len > 80) m.content[0..80] else m.content;
+                    try out.appendSlice(allocator, "- ");
+                    try out.appendSlice(allocator, m.role);
+                    try out.appendSlice(allocator, ": ");
+                    try out.appendSlice(allocator, preview);
+                    try out.appendSlice(allocator, "\n");
+                    written += 1;
+                },
+                .tool_call => |tc| {
+                    try out.appendSlice(allocator, "- tool_call ");
+                    try out.appendSlice(allocator, tc.tool);
+                    try out.appendSlice(allocator, "\n");
+                    written += 1;
+                },
+                .tool_result => |tr| {
+                    try out.appendSlice(allocator, "- tool_result ");
+                    try out.appendSlice(allocator, tr.tool);
+                    try out.appendSlice(allocator, ": ");
+                    try out.appendSlice(allocator, if (tr.ok) "ok" else "error");
+                    try out.appendSlice(allocator, "\n");
+                    written += 1;
+                },
+                .summary => {
+                    try out.appendSlice(allocator, "- (had compacted history)\n");
+                    written += 1;
+                },
+                .branch_summary => {
+                    try out.appendSlice(allocator, "- (had previous branch summary)\n");
+                    written += 1;
+                },
+                else => {},
+            }
+        }
+        if (written == 0) {
+            try out.appendSlice(allocator, "- (none)\n");
+        }
+    }
+
+    try out.appendSlice(allocator, "\n## Next Steps\n");
+    try out.appendSlice(allocator, "1. Continue from the selected branch point using this summary as context.\n");
+
+    return try out.toOwnedSlice(allocator);
 }
 
 fn doCompact(
@@ -547,8 +705,14 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v6" } else "pi.summary.v6";
-                            const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
+                            const schema = if (obj.get("schema")) |v| switch (v) {
+                                .string => |t| try dupStr.dup(allocator, t),
+                                else => "pi.summary.v6",
+                            } else "pi.summary.v6";
+                            const goal = if (obj.get("goal")) |v| switch (v) {
+                                .string => |t| try dupStr.dup(allocator, t),
+                                else => "(unknown)",
+                            } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
                             var constraints_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
@@ -617,7 +781,10 @@ fn doCompact(
                                 }
                             }
 
-                            const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "" } else "";
+                            const raw = if (obj.get("raw")) |v| switch (v) {
+                                .string => |t| try dupStr.dup(allocator, t),
+                                else => "",
+                            } else "";
 
                             const bt_val = if (obj.get("blocked_tasks")) |v| v else null;
                             var bt_list = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
@@ -630,11 +797,23 @@ fn doCompact(
                                                 try bt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
                                             },
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const err0 = if (o.get("err")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const err0 = if (o.get("err")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
 
                                                 try bt_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
@@ -661,11 +840,23 @@ fn doCompact(
                                                 try dt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
                                             },
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const res0 = if (o.get("result")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const res0 = if (o.get("result")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
                                                 try dt_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
                                                     .tool = if (tool0) |t| try dupStr.dup(allocator, t) else null,
@@ -705,9 +896,15 @@ fn doCompact(
                                         switch (it) {
                                             .string => try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const src0 = if (o.get("source")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const src0 = if (o.get("source")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
                                                 try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, task0), .source = if (src0) |t| try dupStr.dup(allocator, t) else null });
                                             },
                                             else => {},
@@ -731,10 +928,19 @@ fn doCompact(
                                         switch (it) {
                                             .string => try nst_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const why0 = if (o.get("why")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const pr0 = if (o.get("priority")) |v| switch (v) { .integer => |x| @as(?u32, @intCast(x)), else => null } else null;
+                                                const why0 = if (o.get("why")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const pr0 = if (o.get("priority")) |v| switch (v) {
+                                                    .integer => |x| @as(?u32, @intCast(x)),
+                                                    else => null,
+                                                } else null;
                                                 try nst_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
                                                     .why = if (why0) |t| try dupStr.dup(allocator, t) else null,
@@ -1107,7 +1313,10 @@ fn doCompact(
             if (std.mem.indexOf(u8, it, "(none)") != null) continue;
             // naive de-dup
             var already = false;
-            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) { already = true; break; };
+            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) {
+                already = true;
+                break;
+            };
             if (already) continue;
             try ip_out.append(allocator, it);
         }
@@ -1263,8 +1472,7 @@ fn doCompact(
 
         if (prev_summary == null) {
             // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
-            try sum_buf.appendSlice(allocator,
-                "## Goal\n(unknown)\n\n" ++
+            try sum_buf.appendSlice(allocator, "## Goal\n(unknown)\n\n" ++
                 "## Constraints & Preferences\n- (none)\n\n" ++
                 "## Progress\n### Done\n- (none)\n\n### In Progress\n- (none)\n\n### Blocked\n- (none)\n\n" ++
                 "## Key Decisions\n- (none)\n\n" ++
@@ -1411,7 +1619,7 @@ fn doCompact(
 
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
-                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
+                    try b2.appendSlice(allocator, base[0 .. insert_pos + next_hdr]);
 
                     var added: usize = 0;
                     for (done_items.items) |it| {
@@ -1447,7 +1655,7 @@ fn doCompact(
 
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
-                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
+                    try b2.appendSlice(allocator, base[0 .. insert_pos + next_hdr]);
 
                     var added: usize = 0;
                     for (next_items.items) |it| {
@@ -1888,6 +2096,9 @@ pub fn main() !void {
                     .message => |m| std.debug.print("message {s} parent={s}\nrole={s}\ncontent={s}\n", .{ m.id, m.parentId orelse "(null)", m.role, m.content }),
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
+                    .branch_summary => |b| std.debug.print("branch_summary {s} parent={s}\nfromId={s}\nsummary=\n{s}\n", .{ b.id, b.parentId orelse "(null)", b.fromId, b.summary }),
+                    .thinking_level_change => |t| std.debug.print("thinking_level_change {s} parent={s}\nlevel={s}\n", .{ t.id, t.parentId orelse "(null)", t.thinkingLevel }),
+                    .model_change => |m| std.debug.print("model_change {s} parent={s}\nprovider={s}\nmodelId={s}\n", .{ m.id, m.parentId orelse "(null)", m.provider, m.modelId }),
                     .summary => |s| std.debug.print(
                         "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
                         .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.firstKeptEntryId orelse "(null)", s.keepLast, s.keepLastGroups, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
@@ -1956,6 +2167,10 @@ pub fn main() !void {
                     .message => |m| std.debug.print("{d}. {s} message {s} {s}\n", .{ idx, eid, m.role, if (lab.len > 0) lab else "" }),
                     .tool_call => |tc| std.debug.print("{d}. {s} tool_call {s} arg={s} {s}\n", .{ idx, eid, tc.tool, tc.arg, if (lab.len > 0) lab else "" }),
                     .tool_result => |tr| std.debug.print("{d}. {s} tool_result {s} ok={any} {s}\n", .{ idx, eid, tr.tool, tr.ok, if (lab.len > 0) lab else "" }),
+                    .branch_summary => |b| std.debug.print("{d}. {s} branch_summary from={s} {s}\n", .{ idx, eid, b.fromId, if (lab.len > 0) lab else "" }),
+                    .thinking_level_change => |t| std.debug.print("{d}. {s} thinking_level_change {s} {s}\n", .{ idx, eid, t.thinkingLevel, if (lab.len > 0) lab else "" }),
+                    .model_change => |m| std.debug.print("{d}. {s} model_change {s}/{s} {s}\n", .{ idx, eid, m.provider, m.modelId, if (lab.len > 0) lab else "" }),
+                    .summary => std.debug.print("{d}. {s} summary {s}\n", .{ idx, eid, if (lab.len > 0) lab else "" }),
                     else => {},
                 }
             }
@@ -2044,7 +2259,6 @@ pub fn main() !void {
         }
 
         var total_chars: usize = 0;
-        var total_tokens_est: usize = 0;
         var idx: usize = boundary_from;
         while (idx < chain.len) : (idx += 1) {
             const e = chain[idx];
@@ -2053,8 +2267,9 @@ pub fn main() !void {
                 .summary => |s| total_chars += s.content.len,
                 else => {},
             }
-            total_tokens_est += tokensEstForEntry(e);
         }
+        const token_est = estimateBoundaryTokens(chain, boundary_from);
+        const total_tokens_est = token_est.tokens;
 
         const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
         const mode = if (keep_last_groups != null) "groups" else "entries";
@@ -2267,6 +2482,28 @@ pub fn main() !void {
                             std.debug.print("{s} {s} summary \"{s}\"\n", .{ mark, id, preview });
                         }
                     },
+                    .branch_summary => |b| {
+                        const preview = if (b.summary.len > 40) b.summary[0..40] else b.summary;
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} branch_summary from={s} \"{s}\" [{s}]\n", .{ mark, id, b.fromId, preview, lab });
+                        } else {
+                            std.debug.print("{s} {s} branch_summary from={s} \"{s}\"\n", .{ mark, id, b.fromId, preview });
+                        }
+                    },
+                    .thinking_level_change => |t| {
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} thinking_level_change {s} [{s}]\n", .{ mark, id, t.thinkingLevel, lab });
+                        } else {
+                            std.debug.print("{s} {s} thinking_level_change {s}\n", .{ mark, id, t.thinkingLevel });
+                        }
+                    },
+                    .model_change => |m| {
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} model_change {s}/{s} [{s}]\n", .{ mark, id, m.provider, m.modelId, lab });
+                        } else {
+                            std.debug.print("{s} {s} model_change {s}/{s}\n", .{ mark, id, m.provider, m.modelId });
+                        }
+                    },
                     else => {},
                 }
 
@@ -2317,6 +2554,109 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "branch-with-summary")) {
+        var session_path: ?[]const u8 = null;
+        var to_id: ?[]const u8 = null;
+        var summary_text: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--to")) {
+                to_id = args.next() orelse return error.MissingTo;
+            } else if (std.mem.eql(u8, a, "--summary")) {
+                summary_text = args.next() orelse return error.MissingLabel;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        const old_leaf = try sm.leafId();
+        const summary = summary_text orelse try buildAutoBranchSummary(allocator, &sm, old_leaf, to_id);
+        try sm.branchTo(to_id);
+        const from_id = old_leaf orelse "root";
+        const sid = try sm.appendBranchSummary(from_id, summary);
+        std.debug.print("ok: true\nbranch: {s} -> {s}\nbranchSummaryId: {s}\n", .{ sp, to_id orelse "(null)", sid });
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "set-model")) {
+        var session_path: ?[]const u8 = null;
+        var provider: ?[]const u8 = null;
+        var model_id: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--provider")) {
+                provider = args.next() orelse return error.MissingLabel;
+            } else if (std.mem.eql(u8, a, "--model")) {
+                model_id = args.next() orelse return error.MissingId;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+        const p = provider orelse {
+            usage();
+            return;
+        };
+        const mid = model_id orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        const id = try sm.appendModelChange(p, mid);
+        std.debug.print("ok: true\nmodelChangeId: {s}\nprovider: {s}\nmodel: {s}\n", .{ id, p, mid });
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "set-thinking")) {
+        var session_path: ?[]const u8 = null;
+        var level: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--level")) {
+                level = args.next() orelse return error.MissingLabel;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+        const lv = level orelse {
+            usage();
+            return;
+        };
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        const id = try sm.appendThinkingLevelChange(lv);
+        std.debug.print("ok: true\nthinkingLevelChangeId: {s}\nlevel: {s}\n", .{ id, lv });
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "replay")) {
         var session_path: ?[]const u8 = null;
         var show_turns = false;
@@ -2355,6 +2695,9 @@ pub fn main() !void {
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
+                .branch_summary => |b| std.debug.print("[branch_summary] from={s}\n{s}\n", .{ b.fromId, b.summary }),
+                .thinking_level_change => |t| std.debug.print("[thinking_level_change] {s}\n", .{t.thinkingLevel}),
+                .model_change => |m| std.debug.print("[model_change] {s}/{s}\n", .{ m.provider, m.modelId }),
                 .summary => |s| {
                     if (std.mem.eql(u8, s.format, "json")) {
                         // Pretty render JSON summary (brief)
@@ -2370,14 +2713,23 @@ pub fn main() !void {
                                 break;
                             },
                         };
-                        const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| t, else => "" } else "";
-                        const next_steps = if (obj.get("next_steps")) |v| switch (v) { .array => |a| a.items, else => &.{} } else &.{};
+                        const raw = if (obj.get("raw")) |v| switch (v) {
+                            .string => |t| t,
+                            else => "",
+                        } else "";
+                        const next_steps = if (obj.get("next_steps")) |v| switch (v) {
+                            .array => |a| a.items,
+                            else => &.{},
+                        } else &.{};
 
                         std.debug.print("[summary] raw:\n{s}\n", .{raw});
                         if (next_steps.len > 0) {
                             std.debug.print("[summary] next_steps:\n", .{});
                             for (next_steps) |it| {
-                                const s2 = switch (it) { .string => |t| t, else => "" };
+                                const s2 = switch (it) {
+                                    .string => |t| t,
+                                    else => "",
+                                };
                                 if (s2.len > 0) std.debug.print("- {s}\n", .{s2});
                             }
                         }
@@ -2499,7 +2851,6 @@ pub fn main() !void {
                 }
 
                 var total: usize = 0;
-                var total_tokens_est: usize = 0;
                 var idx: usize = boundary_from;
                 while (idx < chain.len) : (idx += 1) {
                     const e = chain[idx];
@@ -2508,8 +2859,9 @@ pub fn main() !void {
                         .summary => |s| total += s.content.len,
                         else => {},
                     }
-                    total_tokens_est += tokensEstForEntry(e);
                 }
+                const token_est = estimateBoundaryTokens(chain, boundary_from);
+                const total_tokens_est = token_est.tokens;
 
                 if (total > max_chars or total_tokens_est > max_tokens_est) {
                     const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
@@ -2530,8 +2882,8 @@ pub fn main() !void {
                     );
                     const mode = if (keep_last_groups != null) "groups" else "entries";
                     std.debug.print(
-                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}\n",
-                        .{ total, max_chars, total_tokens_est, max_tokens_est, mode, keep_last, keep_last_groups, res.summaryId.? },
+                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} usage={d} trailing={d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}\n",
+                        .{ total, max_chars, total_tokens_est, max_tokens_est, token_est.usageTokens, token_est.trailingTokens, mode, keep_last, keep_last_groups, res.summaryId.? },
                     );
                 }
             }

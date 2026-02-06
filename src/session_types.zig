@@ -18,6 +18,10 @@ pub const MessageEntry = struct {
 
     /// Optional per-entry usage estimate (best-effort). When present, sizing prefers this.
     tokensEst: ?usize = null,
+
+    /// Optional context-usage snapshot (TS-style totalTokens from assistant usage).
+    /// When present on assistant messages, compaction sizing can do usage+trailing estimation.
+    usageTotalTokens: ?usize = null,
 };
 
 pub const ToolCallEntry = struct {
@@ -41,6 +45,32 @@ pub const ToolResultEntry = struct {
     content: []const u8,
 
     tokensEst: ?usize = null,
+};
+
+pub const ThinkingLevelChangeEntry = struct {
+    type: []const u8 = "thinking_level_change",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    thinkingLevel: []const u8,
+};
+
+pub const ModelChangeEntry = struct {
+    type: []const u8 = "model_change",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    provider: []const u8,
+    modelId: []const u8,
+};
+
+pub const BranchSummaryEntry = struct {
+    type: []const u8 = "branch_summary",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    fromId: []const u8,
+    summary: []const u8,
 };
 
 pub const LeafEntry = struct {
@@ -117,6 +147,9 @@ pub const Entry = union(enum) {
     message: MessageEntry,
     tool_call: ToolCallEntry,
     tool_result: ToolResultEntry,
+    thinking_level_change: ThinkingLevelChangeEntry,
+    model_change: ModelChangeEntry,
+    branch_summary: BranchSummaryEntry,
     turn_start: TurnStartEntry,
     turn_end: TurnEndEntry,
     summary: SummaryEntry,
@@ -143,6 +176,9 @@ pub fn idOf(e: Entry) ?[]const u8 {
         .message => |m| m.id,
         .tool_call => |t| t.id,
         .tool_result => |t| t.id,
+        .thinking_level_change => |t| t.id,
+        .model_change => |m| m.id,
+        .branch_summary => |b| b.id,
         .turn_start => |t| t.id,
         .turn_end => |t| t.id,
         .summary => |s| s.id,
@@ -155,6 +191,9 @@ pub fn parentIdOf(e: Entry) ?[]const u8 {
         .message => |m| m.parentId,
         .tool_call => |t| t.parentId,
         .tool_result => |t| t.parentId,
+        .thinking_level_change => |t| t.parentId,
+        .model_change => |m| m.parentId,
+        .branch_summary => |b| b.parentId,
         .turn_start => |t| t.parentId,
         .turn_end => |t| t.parentId,
         .summary => |s| s.parentId,

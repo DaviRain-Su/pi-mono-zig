@@ -23,7 +23,7 @@ pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
     while (j > 0) : (j -= 1) {
         const e = entries[j - 1];
         switch (e) {
-            .session, .leaf, .label, .turn_start, .turn_end => continue,
+            .session, .leaf, .label, .turn_start, .turn_end, .thinking_level_change, .model_change => continue,
             else => {
                 last_sig = e;
                 break;
