@@ -953,10 +953,13 @@ pub fn main() !void {
             total_tokens_est += tokensEstForEntry(e);
         }
 
+        const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
+        const mode = if (keep_last_groups != null) "groups" else "entries";
+
         const res = try doCompact(
             allocator,
             &sm,
-            keep_last,
+            effective_keep_last,
             keep_last_groups,
             dry_run,
             label,
@@ -970,11 +973,17 @@ pub fn main() !void {
         );
 
         if (res.dryRun) {
-            std.debug.print("ok: true\ndryRun: true\nsummaryPreview:\n{s}\n", .{res.summaryText});
+            std.debug.print(
+                "ok: true\ndryRun: true\nmode: {s}\nkeep_last: {d}\nkeep_last_groups: {any}\nsummaryPreview:\n{s}\n",
+                .{ mode, keep_last, keep_last_groups, res.summaryText },
+            );
             return;
         }
 
-        std.debug.print("ok: true\ncompacted: {s}\nsummaryId: {s}\n", .{ sp, res.summaryId.? });
+        std.debug.print(
+            "ok: true\nmode: {s}\nkeep_last: {d}\nkeep_last_groups: {any}\ncompacted: {s}\nsummaryId: {s}\n",
+            .{ mode, keep_last, keep_last_groups, sp, res.summaryId.? },
+        );
         return;
     }
 
