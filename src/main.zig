@@ -208,6 +208,13 @@ fn doCompact(
             err: ?[]const u8 = null,
         };
 
+        const DoneTask = struct {
+            task: []const u8,
+            tool: ?[]const u8 = null,
+            arg: ?[]const u8 = null,
+            result: ?[]const u8 = null,
+        };
+
         const Payload = struct {
             schema: []const u8,
             goal: []const u8,
@@ -217,6 +224,7 @@ fn doCompact(
             next_steps: []const []const u8,
             critical_context: []const []const u8,
             blocked_tasks: []const BlockedTask, // structured blocked tasks (used for migration)
+            done_tasks: []const DoneTask, // structured done tasks (used for migration)
             raw: []const u8,
         };
 
@@ -245,7 +253,7 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v3" } else "pi.summary.v3";
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v4" } else "pi.summary.v4";
                             const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
@@ -348,6 +356,52 @@ fn doCompact(
                                 }
                             }
 
+                            // done_tasks
+                            const dt_val = if (obj.get("done_tasks")) |v| v else null;
+                            var dt_list = try std.ArrayList(DoneTask).initCapacity(allocator, 0);
+                            if (dt_val) |dv| {
+                                switch (dv) {
+                                    .array => |a| for (a.items) |it| {
+                                        switch (it) {
+                                            .string => {
+                                                try dt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
+                                            },
+                                            .object => |o| {
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                if (task0.len == 0) continue;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const res0 = if (o.get("result")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                try dt_list.append(allocator, .{
+                                                    .task = try dupStr.dup(allocator, task0),
+                                                    .tool = if (tool0) |t| try dupStr.dup(allocator, t) else null,
+                                                    .arg = if (arg0) |t| try dupStr.dup(allocator, t) else null,
+                                                    .result = if (res0) |t| try dupStr.dup(allocator, t) else null,
+                                                });
+                                            },
+                                            else => {},
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            } else {
+                                // v1-v3 compatibility: infer done tasks from progress.done strings when possible.
+                                for (done_list.items) |ds| {
+                                    const pre = "ack: tool_result ";
+                                    if (std.mem.startsWith(u8, ds, pre)) {
+                                        const rest = ds[pre.len..];
+                                        if (std.mem.indexOf(u8, rest, ":")) |col| {
+                                            const tool = std.mem.trim(u8, rest[0..col], " ");
+                                            const arg = std.mem.trim(u8, rest[col + 1 ..], " ");
+                                            if (std.mem.eql(u8, tool, "echo")) {
+                                                const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{arg});
+                                                try dt_list.append(allocator, .{ .task = task, .tool = try dupStr.dup(allocator, tool), .arg = try dupStr.dup(allocator, arg) });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             prev_payload = Payload{
                                 .schema = schema,
                                 .goal = goal,
@@ -361,6 +415,7 @@ fn doCompact(
                                 .next_steps = try ns_list.toOwnedSlice(allocator),
                                 .critical_context = try cc_list.toOwnedSlice(allocator),
                                 .blocked_tasks = try bt_list.toOwnedSlice(allocator),
+                                .done_tasks = try dt_list.toOwnedSlice(allocator),
                                 .raw = raw,
                             };
                             break;
@@ -390,31 +445,33 @@ fn doCompact(
         defer new_blocked.deinit(allocator);
         var new_blocked_tasks = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
         defer new_blocked_tasks.deinit(allocator);
+        var new_done_tasks = try std.ArrayList(DoneTask).initCapacity(allocator, 0);
+        defer new_done_tasks.deinit(allocator);
 
         var i: usize = from_i;
         while (i < start) : (i += 1) {
             const e = nodes.items[i];
             switch (e) {
                 .tool_result => |tr| {
-                    if (!tr.ok) {
-                        const preview = if (tr.content.len > 120) tr.content[0..120] else tr.content;
+                    const preview = if (tr.content.len > 120) tr.content[0..120] else tr.content;
 
-                        // Try to associate with the most recent tool_call arg for this tool in the same window.
-                        var arg_opt: ?[]const u8 = null;
-                        var back: usize = i;
-                        while (back > from_i) : (back -= 1) {
-                            const be = nodes.items[back - 1];
-                            switch (be) {
-                                .tool_call => |tc| {
-                                    if (std.mem.eql(u8, tc.tool, tr.tool)) {
-                                        arg_opt = tc.arg;
-                                        break;
-                                    }
-                                },
-                                else => {},
-                            }
+                    // Try to associate with the most recent tool_call arg for this tool in the same window.
+                    var arg_opt: ?[]const u8 = null;
+                    var back: usize = i;
+                    while (back > from_i) : (back -= 1) {
+                        const be = nodes.items[back - 1];
+                        switch (be) {
+                            .tool_call => |tc| {
+                                if (std.mem.eql(u8, tc.tool, tr.tool)) {
+                                    arg_opt = tc.arg;
+                                    break;
+                                }
+                            },
+                            else => {},
                         }
+                    }
 
+                    if (!tr.ok) {
                         const item = if (arg_opt) |a|
                             try std.fmt.allocPrint(allocator, "{s}({s}): {s}", .{ tr.tool, a, preview })
                         else
@@ -430,6 +487,17 @@ fn doCompact(
                             } else if (std.mem.eql(u8, tr.tool, "echo")) {
                                 const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{a});
                                 try new_blocked_tasks.append(allocator, .{ .task = task, .tool = tr.tool, .arg = a, .err = preview });
+                            }
+                        }
+                    } else {
+                        // ok=true => mark as done task for migration.
+                        if (arg_opt) |a| {
+                            if (std.mem.eql(u8, tr.tool, "echo")) {
+                                const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{a});
+                                try new_done_tasks.append(allocator, .{ .task = task, .tool = tr.tool, .arg = a, .result = preview });
+                            } else if (std.mem.eql(u8, tr.tool, "shell")) {
+                                const task = try std.fmt.allocPrint(allocator, "sh: {s}", .{a});
+                                try new_done_tasks.append(allocator, .{ .task = task, .tool = tr.tool, .arg = a, .result = preview });
                             }
                         }
                     }
@@ -505,7 +573,7 @@ fn doCompact(
         }
 
         const base = prev_payload orelse Payload{
-            .schema = "pi.summary.v3",
+            .schema = "pi.summary.v4",
             .goal = "(unknown)",
             .constraints = &.{},
             .progress = .{ .done = &.{}, .in_progress = &.{}, .blocked = &.{} },
@@ -513,6 +581,7 @@ fn doCompact(
             .next_steps = &.{},
             .critical_context = &.{},
             .blocked_tasks = &.{},
+            .done_tasks = &.{},
             .raw = "",
         };
 
@@ -542,6 +611,8 @@ fn doCompact(
         defer next_seen.deinit();
         var done_seen = std.StringHashMap(bool).init(allocator);
         defer done_seen.deinit();
+        var done_task_seen = std.StringHashMap(bool).init(allocator);
+        defer done_task_seen.deinit();
         var ctx_seen = std.StringHashMap(bool).init(allocator);
         defer ctx_seen.deinit();
         var cons_seen = std.StringHashMap(bool).init(allocator);
@@ -569,6 +640,8 @@ fn doCompact(
         defer blocked_out.deinit(allocator);
         var blocked_tasks_out = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
         defer blocked_tasks_out.deinit(allocator);
+        var done_tasks_out = try std.ArrayList(DoneTask).initCapacity(allocator, 0);
+        defer done_tasks_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
         for (base.next_steps) |it| try next_seen.put(it, true);
@@ -578,6 +651,7 @@ fn doCompact(
         for (base.key_decisions) |it| try dec_seen.put(it, true);
         for (base.progress.blocked) |it| try blocked_seen.put(it, true);
         // blocked_task_seen is seeded below when copying base.blocked_tasks
+        // done_task_seen is seeded below when copying base.done_tasks
 
         // Start with base lists (capped).
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, base.next_steps, MAX_NEXT);
@@ -600,6 +674,14 @@ fn doCompact(
             try blocked_tasks_out.append(allocator, bt);
         }
 
+        // done_tasks: merge by .task key
+        for (base.done_tasks) |dt| {
+            if (done_tasks_out.items.len >= 20) break;
+            if (done_task_seen.contains(dt.task)) continue;
+            try done_task_seen.put(dt.task, true);
+            try done_tasks_out.append(allocator, dt);
+        }
+
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
         try Merge.uniqueAppend(allocator, &done_out, &done_seen, new_done.items, MAX_DONE);
@@ -611,6 +693,13 @@ fn doCompact(
             if (blocked_task_seen.contains(bt.task)) continue;
             try blocked_task_seen.put(bt.task, true);
             try blocked_tasks_out.append(allocator, bt);
+        }
+
+        for (new_done_tasks.items) |dt| {
+            if (done_tasks_out.items.len >= 20) break;
+            if (done_task_seen.contains(dt.task)) continue;
+            try done_task_seen.put(dt.task, true);
+            try done_tasks_out.append(allocator, dt);
         }
 
         // Sync in_progress with next steps: add items not in done.
@@ -633,17 +722,21 @@ fn doCompact(
             if (std.mem.startsWith(u8, d, prefix_echo)) {
                 const arg = std.mem.trimLeft(u8, d[prefix_echo.len..], " ");
                 const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{arg});
-                // do not cap; it just enriches done_seen
-                _ = done_seen.put(task, true) catch {};
+                if (!done_task_seen.contains(task)) {
+                    _ = done_task_seen.put(task, true) catch {};
+                    if (done_tasks_out.items.len < 20) {
+                        try done_tasks_out.append(allocator, .{ .task = task, .tool = "echo", .arg = arg, .result = null });
+                    }
+                }
             }
         }
 
         // Post-process: remove next_steps that are already done/blocked.
-        // NOTE: blocked-ness is driven by blocked_tasks (not by blocked reason strings).
+        // NOTE: done-ness/blocked-ness are driven by done_tasks/blocked_tasks.
         {
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, next_out.items.len);
             for (next_out.items) |it| {
-                if (done_seen.contains(it)) continue;
+                if (done_task_seen.contains(it)) continue;
                 if (blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
@@ -655,7 +748,7 @@ fn doCompact(
         {
             var filtered = try std.ArrayList([]const u8).initCapacity(allocator, ip_out.items.len);
             for (ip_out.items) |it| {
-                if (done_seen.contains(it)) continue;
+                if (done_task_seen.contains(it)) continue;
                 if (blocked_task_seen.contains(it)) continue;
                 try filtered.append(allocator, it);
             }
@@ -717,6 +810,7 @@ fn doCompact(
             .next_steps = try next_out.toOwnedSlice(allocator),
             .critical_context = try ctx_out.toOwnedSlice(allocator),
             .blocked_tasks = try blocked_tasks_out.toOwnedSlice(allocator),
+            .done_tasks = try done_tasks_out.toOwnedSlice(allocator),
             .raw = try raw_out.toOwnedSlice(allocator),
         };
 
