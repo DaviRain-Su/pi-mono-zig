@@ -39,8 +39,10 @@ pub const AgentLoop = struct {
             break :blk null;
         };
 
+        const turn_group = user_mid;
+
         self.turn += 1;
-        _ = try self.session_mgr.appendTurnStart(self.turn, user_mid, "step");
+        _ = try self.session_mgr.appendTurnStart(self.turn, user_mid, turn_group, "step");
         self.bus.emit(.{ .turn_start = .{ .turn = self.turn } });
 
         const out = try mock_model.next(self.arena, entries);
@@ -48,7 +50,7 @@ pub const AgentLoop = struct {
             .final_text => |t| {
                 _ = try self.session_mgr.appendMessage("assistant", t);
                 self.bus.emit(.{ .message_append = .{ .role = "assistant", .content = t } });
-                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, "final");
+                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "final");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                 return true;
             },
@@ -61,7 +63,7 @@ pub const AgentLoop = struct {
                     const err_line = try std.fmt.allocPrint(self.arena, "{s}", .{@errorName(e)});
                     _ = try self.session_mgr.appendToolResult(c.tool, false, err_line);
                     self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = false, .content = err_line } });
-                    _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, "error");
+                    _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "error");
                     self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                     return false;
                 };
@@ -69,7 +71,7 @@ pub const AgentLoop = struct {
                 _ = try self.session_mgr.appendToolResult(c.tool, true, res.content);
                 self.bus.emit(.{ .tool_execution_end = .{ .tool = c.tool, .ok = true, .content = res.content } });
 
-                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, "tool");
+                _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "tool");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });
                 return false; // not done, need another model step
             },

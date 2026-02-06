@@ -580,10 +580,10 @@ fn doCompact(
         const e = nodes.items[j];
         switch (e) {
             .turn_start => |t| {
-                _ = try sm.appendTurnStart(t.turn, t.userMessageId, t.phase);
+                _ = try sm.appendTurnStart(t.turn, t.userMessageId, t.turnGroupId, t.phase);
             },
             .turn_end => |t| {
-                _ = try sm.appendTurnEnd(t.turn, t.userMessageId, t.phase);
+                _ = try sm.appendTurnEnd(t.turn, t.userMessageId, t.turnGroupId, t.phase);
             },
             .message => |m| {
                 _ = try sm.appendMessage(m.role, m.content);
@@ -1134,8 +1134,8 @@ pub fn main() !void {
         const entries = try sm.buildContextEntries();
         for (entries) |e| {
             switch (e) {
-                .turn_start => |t| std.debug.print("[turn_start] {d} userMessageId={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.phase orelse "-" }),
-                .turn_end => |t| std.debug.print("[turn_end] {d} userMessageId={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.phase orelse "-" }),
+                .turn_start => |t| std.debug.print("[turn_start] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" }),
+                .turn_end => |t| std.debug.print("[turn_end] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" }),
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),

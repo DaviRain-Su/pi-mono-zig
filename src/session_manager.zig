@@ -180,7 +180,7 @@ pub const SessionManager = struct {
         return id;
     }
 
-    pub fn appendTurnStart(self: *SessionManager, turn: u64, userMessageId: ?[]const u8, phase: ?[]const u8) ![]const u8 {
+    pub fn appendTurnStart(self: *SessionManager, turn: u64, userMessageId: ?[]const u8, turnGroupId: ?[]const u8, phase: ?[]const u8) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = TurnStartEntry{
@@ -189,6 +189,7 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .turn = turn,
             .userMessageId = userMessageId,
+            .turnGroupId = turnGroupId,
             .phase = phase,
         };
         try json_util.appendJsonLine(self.session_path, entry);
@@ -196,7 +197,7 @@ pub const SessionManager = struct {
         return id;
     }
 
-    pub fn appendTurnEnd(self: *SessionManager, turn: u64, userMessageId: ?[]const u8, phase: ?[]const u8) ![]const u8 {
+    pub fn appendTurnEnd(self: *SessionManager, turn: u64, userMessageId: ?[]const u8, turnGroupId: ?[]const u8, phase: ?[]const u8) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = TurnEndEntry{
@@ -205,6 +206,7 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .turn = turn,
             .userMessageId = userMessageId,
+            .turnGroupId = turnGroupId,
             .phase = phase,
         };
         try json_util.appendJsonLine(self.session_path, entry);
@@ -296,13 +298,15 @@ pub const SessionManager = struct {
                 const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
                 const turn = switch (obj.get("turn") orelse continue) { .integer => |x| @as(u64, @intCast(x)), else => continue };
                 const um0 = if (obj.get("userMessageId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const tg0 = if (obj.get("turnGroupId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const ph0 = if (obj.get("phase")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const um = try dup.os(self.arena, um0);
+                const tg = try dup.os(self.arena, tg0);
                 const ph = try dup.os(self.arena, ph0);
-                try out.append(self.arena, .{ .turn_start = .{ .id = id, .parentId = pid, .timestamp = ts, .turn = turn, .userMessageId = um, .phase = ph } });
+                try out.append(self.arena, .{ .turn_start = .{ .id = id, .parentId = pid, .timestamp = ts, .turn = turn, .userMessageId = um, .turnGroupId = tg, .phase = ph } });
                 continue;
             }
 
@@ -312,13 +316,15 @@ pub const SessionManager = struct {
                 const ts0 = switch (obj.get("timestamp") orelse continue) { .string => |s| s, else => continue };
                 const turn = switch (obj.get("turn") orelse continue) { .integer => |x| @as(u64, @intCast(x)), else => continue };
                 const um0 = if (obj.get("userMessageId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
+                const tg0 = if (obj.get("turnGroupId")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const ph0 = if (obj.get("phase")) |v| switch (v) { .string => |s| @as(?[]const u8, s), else => null } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const um = try dup.os(self.arena, um0);
+                const tg = try dup.os(self.arena, tg0);
                 const ph = try dup.os(self.arena, ph0);
-                try out.append(self.arena, .{ .turn_end = .{ .id = id, .parentId = pid, .timestamp = ts, .turn = turn, .userMessageId = um, .phase = ph } });
+                try out.append(self.arena, .{ .turn_end = .{ .id = id, .parentId = pid, .timestamp = ts, .turn = turn, .userMessageId = um, .turnGroupId = tg, .phase = ph } });
                 continue;
             }
 

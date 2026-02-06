@@ -57,6 +57,7 @@ pub const TurnStartEntry = struct {
     timestamp: []const u8,
     turn: u64,
     userMessageId: ?[]const u8 = null,
+    turnGroupId: ?[]const u8 = null,
     phase: ?[]const u8 = null, // e.g. "step"
 };
 
@@ -67,6 +68,7 @@ pub const TurnEndEntry = struct {
     timestamp: []const u8,
     turn: u64,
     userMessageId: ?[]const u8 = null,
+    turnGroupId: ?[]const u8 = null,
     phase: ?[]const u8 = null, // e.g. "tool"|"final"|"error"
 };
 
