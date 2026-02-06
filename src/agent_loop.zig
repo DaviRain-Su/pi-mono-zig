@@ -23,10 +23,11 @@ pub const AgentLoop = struct {
     fn tokensEstForContextEntry(e: session.Entry) usize {
         return switch (e) {
             .message => |m| m.tokensEst orelse ((m.content.len + 3) / 4),
+            .custom_message => |cm| (cm.content.len + 3) / 4,
             .tool_call => |tc| tc.tokensEst orelse (((tc.arg.len + 3) / 4) + 8),
             .tool_result => |tr| tr.tokensEst orelse (((tr.content.len + 3) / 4) + 8),
             .branch_summary => |b| (b.summary.len + 3) / 4,
-            .summary => |s| (s.content.len + 3) / 4,
+            .summary => |s| (s.summary.len + 3) / 4,
             else => 0,
         };
     }
@@ -44,6 +45,7 @@ pub const AgentLoop = struct {
                     .message => |m| {
                         if (std.mem.eql(u8, m.role, "user")) break :blk m.id;
                     },
+                    .custom_message => |cm| break :blk cm.id,
                     else => {},
                 }
             }

@@ -41,8 +41,11 @@ This is a *minimal* AgentLoop clone (uses a deterministic mock model).
 JSONL entries are now structured (not just plain messages):
 - `type: session`
 - `type: message`
+- `type: custom_message` (TS extension message; included in context as user-style content)
 - `type: tool_call`
 - `type: tool_result`
+- `type: compaction` (TS-compatible summary checkpoint)
+- `type: custom` / `type: session_info` (parsed and preserved for TS session compatibility)
 - `type: leaf` (tracks current leaf for branching)
 
 ```bash

@@ -59,6 +59,7 @@ fn tokensEstFromChars(chars: usize) usize {
 fn tokensEstForEntry(e: st.Entry) usize {
     return switch (e) {
         .message => |m| m.tokensEst orelse tokensEstFromChars(m.content.len),
+        .custom_message => |cm| tokensEstFromChars(cm.content.len),
         // tool call/results tend to be denser / more verbose
         .tool_call => |tc| tc.tokensEst orelse (tokensEstFromChars(tc.arg.len) + 8),
         .tool_result => |tr| tr.tokensEst orelse (tokensEstFromChars(tr.content.len) + 8),
@@ -66,7 +67,7 @@ fn tokensEstForEntry(e: st.Entry) usize {
         .turn_start => 2,
         .turn_end => 2,
         .thinking_level_change, .model_change => 0,
-        .summary => |s| tokensEstFromChars(s.content.len),
+        .summary => |s| tokensEstFromChars(s.summary.len),
         else => 0,
     };
 }
@@ -692,7 +693,7 @@ fn doCompact(
                         if (std.mem.eql(u8, s.format, "json")) {
                             prev_idx = k - 1;
                             // Parse payload; if invalid, fall back to fresh.
-                            const parsed = std.json.parseFromSlice(std.json.Value, allocator, s.content, .{}) catch break;
+                            const parsed = std.json.parseFromSlice(std.json.Value, allocator, s.summary, .{}) catch break;
                             defer parsed.deinit();
                             const obj = switch (parsed.value) {
                                 .object => |o| o,
@@ -1127,6 +1128,19 @@ fn doCompact(
                         }
                     }
                 },
+                .custom_message => |cm| {
+                    const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
+
+                    try new_raw_buf.appendSlice(allocator, "user");
+                    try new_raw_buf.appendSlice(allocator, ": ");
+                    try new_raw_buf.appendSlice(allocator, preview);
+                    try new_raw_buf.appendSlice(allocator, "\n");
+
+                    const line = try std.fmt.allocPrint(allocator, "user: {s}", .{preview});
+                    try new_ctx.append(allocator, line);
+                    const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
+                    try new_next.append(allocator, item);
+                },
                 else => {},
             }
         }
@@ -1458,7 +1472,7 @@ fn doCompact(
                 switch (e) {
                     .summary => |s| {
                         if (std.mem.eql(u8, s.format, "md")) {
-                            prev_summary = s.content;
+                            prev_summary = s.summary;
                             prev_idx = k - 1;
                             break;
                         }
@@ -1492,6 +1506,12 @@ fn doCompact(
                             try sum_buf.appendSlice(allocator, preview);
                             try sum_buf.appendSlice(allocator, "\n");
                         }
+                    },
+                    .custom_message => |cm| {
+                        const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
+                        try sum_buf.appendSlice(allocator, "- user: ");
+                        try sum_buf.appendSlice(allocator, preview);
+                        try sum_buf.appendSlice(allocator, "\n");
                     },
                     else => {},
                 }
@@ -1537,6 +1557,11 @@ fn doCompact(
                                 try done_dyn.append(allocator, item);
                             }
                         }
+                    },
+                    .custom_message => |cm| {
+                        const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
+                        const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
+                        try next_steps_dyn.append(allocator, item);
                     },
                     else => {},
                 }
@@ -1812,6 +1837,16 @@ fn doCompact(
                             added_ctx += 1;
                         }
                     },
+                    .custom_message => |cm| {
+                        const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
+                        const line = try std.fmt.allocPrint(allocator, "- user: {s}", .{preview});
+                        if (seen_ctx.contains(line)) continue;
+                        try seen_ctx.put(line, true);
+                        if (std.mem.indexOf(u8, base, line) != null) continue;
+                        try sum_buf.appendSlice(allocator, line);
+                        try sum_buf.appendSlice(allocator, "\n");
+                        added_ctx += 1;
+                    },
                     else => {},
                 }
             }
@@ -1832,6 +1867,14 @@ fn doCompact(
                 .message => |m| {
                     if (!req_written and std.mem.eql(u8, m.role, "user")) {
                         const preview = if (m.content.len > 300) m.content[0..300] else m.content;
+                        try sum_buf.appendSlice(allocator, preview);
+                        try sum_buf.appendSlice(allocator, "\n\n");
+                        req_written = true;
+                    }
+                },
+                .custom_message => |cm| {
+                    if (!req_written) {
+                        const preview = if (cm.content.len > 300) cm.content[0..300] else cm.content;
                         try sum_buf.appendSlice(allocator, preview);
                         try sum_buf.appendSlice(allocator, "\n\n");
                         req_written = true;
@@ -2097,11 +2140,14 @@ pub fn main() !void {
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
                     .branch_summary => |b| std.debug.print("branch_summary {s} parent={s}\nfromId={s}\nsummary=\n{s}\n", .{ b.id, b.parentId orelse "(null)", b.fromId, b.summary }),
+                    .custom => |c| std.debug.print("custom {s} parent={s}\ncustomType={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType }),
+                    .custom_message => |c| std.debug.print("custom_message {s} parent={s}\ncustomType={s}\ndisplay={any}\ncontent={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType, c.display, c.content }),
+                    .session_info => |s| std.debug.print("session_info {s} parent={s}\nname={s}\n", .{ s.id, s.parentId orelse "(null)", s.name orelse "(null)" }),
                     .thinking_level_change => |t| std.debug.print("thinking_level_change {s} parent={s}\nlevel={s}\n", .{ t.id, t.parentId orelse "(null)", t.thinkingLevel }),
                     .model_change => |m| std.debug.print("model_change {s} parent={s}\nprovider={s}\nmodelId={s}\n", .{ m.id, m.parentId orelse "(null)", m.provider, m.modelId }),
                     .summary => |s| {
                         std.debug.print(
-                            "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\ntokensBefore={any}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                            "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\ntokensBefore={any}\nfromHook={any}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\nsummary=\n{s}\n",
                             .{
                                 s.id,
                                 s.parentId orelse "(null)",
@@ -2109,13 +2155,14 @@ pub fn main() !void {
                                 s.format,
                                 s.firstKeptEntryId orelse "(null)",
                                 s.tokensBefore,
+                                s.fromHook,
                                 s.keepLast,
                                 s.keepLastGroups,
                                 s.totalChars,
                                 s.totalTokensEst,
                                 s.thresholdChars,
                                 s.thresholdTokensEst,
-                                s.content,
+                                s.summary,
                             },
                         );
                         if (s.readFiles) |rf| {
@@ -2189,6 +2236,9 @@ pub fn main() !void {
                         if (show_turns) std.debug.print("{d}. {s} turn_end turn={d} phase={s} {s}\n", .{ idx, eid, t.turn, t.phase orelse "-", if (lab.len > 0) lab else "" });
                     },
                     .message => |m| std.debug.print("{d}. {s} message {s} {s}\n", .{ idx, eid, m.role, if (lab.len > 0) lab else "" }),
+                    .custom_message => |c| std.debug.print("{d}. {s} custom_message {s} display={any} {s}\n", .{ idx, eid, c.customType, c.display, if (lab.len > 0) lab else "" }),
+                    .custom => |c| std.debug.print("{d}. {s} custom {s} {s}\n", .{ idx, eid, c.customType, if (lab.len > 0) lab else "" }),
+                    .session_info => |s| std.debug.print("{d}. {s} session_info {s} {s}\n", .{ idx, eid, s.name orelse "(null)", if (lab.len > 0) lab else "" }),
                     .tool_call => |tc| std.debug.print("{d}. {s} tool_call {s} arg={s} {s}\n", .{ idx, eid, tc.tool, tc.arg, if (lab.len > 0) lab else "" }),
                     .tool_result => |tr| std.debug.print("{d}. {s} tool_result {s} ok={any} {s}\n", .{ idx, eid, tr.tool, tr.ok, if (lab.len > 0) lab else "" }),
                     .branch_summary => |b| std.debug.print("{d}. {s} branch_summary from={s} {s}\n", .{ idx, eid, b.fromId, if (lab.len > 0) lab else "" }),
@@ -2288,7 +2338,7 @@ pub fn main() !void {
             const e = chain[idx];
             switch (e) {
                 .message => |m| total_chars += m.content.len,
-                .summary => |s| total_chars += s.content.len,
+                .summary => |s| total_chars += s.summary.len,
                 else => {},
             }
         }
@@ -2477,6 +2527,28 @@ pub fn main() !void {
                             std.debug.print("{s} {s} message {s} \"{s}\"\n", .{ mark, id, m.role, preview });
                         }
                     },
+                    .custom_message => |c| {
+                        const preview = if (c.content.len > 40) c.content[0..40] else c.content;
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} custom_message {s} \"{s}\" [{s}]\n", .{ mark, id, c.customType, preview, lab });
+                        } else {
+                            std.debug.print("{s} {s} custom_message {s} \"{s}\"\n", .{ mark, id, c.customType, preview });
+                        }
+                    },
+                    .custom => |c| {
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} custom {s} [{s}]\n", .{ mark, id, c.customType, lab });
+                        } else {
+                            std.debug.print("{s} {s} custom {s}\n", .{ mark, id, c.customType });
+                        }
+                    },
+                    .session_info => |s| {
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} session_info {s} [{s}]\n", .{ mark, id, s.name orelse "(null)", lab });
+                        } else {
+                            std.debug.print("{s} {s} session_info {s}\n", .{ mark, id, s.name orelse "(null)" });
+                        }
+                    },
                     .tool_call => |tc| {
                         if (lab.len > 0) {
                             std.debug.print("{s} {s} tool_call {s} arg={s} [{s}]\n", .{ mark, id, tc.tool, tc.arg, lab });
@@ -2492,7 +2564,7 @@ pub fn main() !void {
                         }
                     },
                     .summary => |s| {
-                        const preview = if (s.content.len > 40) s.content[0..40] else s.content;
+                        const preview = if (s.summary.len > 40) s.summary[0..40] else s.summary;
                         if (lab.len > 0) {
                             std.debug.print("{s} {s} summary \"{s}\" [{s}]\n", .{ mark, id, preview, lab });
                         } else {
@@ -2720,6 +2792,9 @@ pub fn main() !void {
                     }
                 },
                 .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
+                .custom_message => |c| std.debug.print("[custom_message:{s}] {s}\n", .{ c.customType, c.content }),
+                .custom => |c| std.debug.print("[custom] {s}\n", .{c.customType}),
+                .session_info => |s| std.debug.print("[session_info] name={s}\n", .{s.name orelse "(null)"}),
                 .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
                 .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
                 .branch_summary => |b| std.debug.print("[branch_summary] from={s}\n{s}\n", .{ b.fromId, b.summary }),
@@ -2728,15 +2803,15 @@ pub fn main() !void {
                 .summary => |s| {
                     if (std.mem.eql(u8, s.format, "json")) {
                         // Pretty render JSON summary (brief)
-                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, s.content, .{}) catch {
-                            std.debug.print("[summary] (invalid json) {s}\n", .{s.content});
+                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, s.summary, .{}) catch {
+                            std.debug.print("[summary] (invalid json) {s}\n", .{s.summary});
                             break;
                         };
                         defer parsed.deinit();
                         const obj = switch (parsed.value) {
                             .object => |o| o,
                             else => {
-                                std.debug.print("[summary] {s}\n", .{s.content});
+                                std.debug.print("[summary] {s}\n", .{s.summary});
                                 break;
                             },
                         };
@@ -2761,7 +2836,7 @@ pub fn main() !void {
                             }
                         }
                     } else {
-                        std.debug.print("[summary] {s}\n", .{s.content});
+                        std.debug.print("[summary] {s}\n", .{s.summary});
                     }
                 },
                 .label => |l| std.debug.print("[label] {s} -> {s}\n", .{ l.targetId, l.label orelse "(null)" }),
@@ -2883,7 +2958,7 @@ pub fn main() !void {
                     const e = chain[idx];
                     switch (e) {
                         .message => |m| total += m.content.len,
-                        .summary => |s| total += s.content.len,
+                        .summary => |s| total += s.summary.len,
                         else => {},
                     }
                 }

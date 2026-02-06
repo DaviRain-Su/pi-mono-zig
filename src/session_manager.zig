@@ -9,6 +9,9 @@ pub const ToolResultEntry = st.ToolResultEntry;
 pub const ThinkingLevelChangeEntry = st.ThinkingLevelChangeEntry;
 pub const ModelChangeEntry = st.ModelChangeEntry;
 pub const BranchSummaryEntry = st.BranchSummaryEntry;
+pub const CustomEntry = st.CustomEntry;
+pub const CustomMessageEntry = st.CustomMessageEntry;
+pub const SessionInfoEntry = st.SessionInfoEntry;
 pub const LeafEntry = st.LeafEntry;
 pub const LabelEntry = st.LabelEntry;
 pub const TurnStartEntry = st.TurnStartEntry;
@@ -227,7 +230,7 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .reason = reason,
             .format = format,
-            .content = content,
+            .summary = content,
             .firstKeptEntryId = firstKeptEntryId,
             .tokensBefore = totalTokensEst,
             .readFiles = readFiles,
@@ -363,6 +366,7 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .fromId = from_id,
             .summary = summary,
+            .fromHook = null,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
@@ -536,10 +540,13 @@ pub const SessionManager = struct {
                     .bool => |b| b,
                     else => continue,
                 };
-                const content0 = switch (obj.get("content") orelse continue) {
+                const content0 = if (obj.get("summary")) |v| switch (v) {
                     .string => |s| s,
                     else => continue,
-                };
+                } else if (obj.get("content")) |v| switch (v) {
+                    .string => |s| s,
+                    else => continue,
+                } else continue;
                 const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) {
                     .integer => |x| @as(?usize, @intCast(x)),
                     else => null,
@@ -640,6 +647,10 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
+                const from_hook0 = if (obj.get("fromHook")) |v| switch (v) {
+                    .bool => |b| @as(?bool, b),
+                    else => null,
+                } else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -651,6 +662,112 @@ pub const SessionManager = struct {
                     .timestamp = ts,
                     .fromId = from,
                     .summary = summary,
+                    .fromHook = from_hook0,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "custom")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const custom_type0 = switch (obj.get("customType") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const custom_type = try dup.s(self.arena, custom_type0);
+                try out.append(self.arena, .{ .custom = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .customType = custom_type,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "custom_message")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const custom_type0 = switch (obj.get("customType") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const content0 = if (obj.get("content")) |v| switch (v) {
+                    .string => |s| s,
+                    else => "[non-string custom_message content]",
+                } else continue;
+                const display0 = if (obj.get("display")) |v| switch (v) {
+                    .bool => |b| b,
+                    else => true,
+                } else true;
+
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const custom_type = try dup.s(self.arena, custom_type0);
+                const content = try dup.s(self.arena, content0);
+
+                try out.append(self.arena, .{ .custom_message = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .customType = custom_type,
+                    .content = content,
+                    .display = display0,
+                } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "session_info")) {
+                const id0 = switch (obj.get("id") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const ts0 = switch (obj.get("timestamp") orelse continue) {
+                    .string => |s| s,
+                    else => continue,
+                };
+                const name0 = if (obj.get("name")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+
+                const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
+                const ts = try dup.s(self.arena, ts0);
+                const name = try dup.os(self.arena, name0);
+
+                try out.append(self.arena, .{ .session_info = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .name = name,
                 } });
                 continue;
             }
@@ -794,16 +911,23 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => "text",
                 } else "text";
-                const content0 = switch (obj.get("content") orelse continue) {
+                const content0 = if (obj.get("summary")) |v| switch (v) {
                     .string => |s| s,
                     else => continue,
-                };
+                } else if (obj.get("content")) |v| switch (v) {
+                    .string => |s| s,
+                    else => continue,
+                } else continue;
                 const firstKeptEntryId0 = if (obj.get("firstKeptEntryId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
                 const tokensBefore0 = if (obj.get("tokensBefore")) |v| switch (v) {
                     .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
+                const fromHook0 = if (obj.get("fromHook")) |v| switch (v) {
+                    .bool => |b| @as(?bool, b),
                     else => null,
                 } else null;
 
@@ -874,9 +998,10 @@ pub const SessionManager = struct {
                     .timestamp = ts,
                     .reason = reason,
                     .format = format,
-                    .content = content,
+                    .summary = content,
                     .firstKeptEntryId = first_kept_entry_id,
                     .tokensBefore = tokensBeforeResolved,
+                    .fromHook = fromHook0,
                     .readFiles = rf_slice,
                     .modifiedFiles = mf_slice,
                     .totalChars = totalChars0,
@@ -916,6 +1041,7 @@ pub const SessionManager = struct {
             .tool_result,
             .summary,
             .branch_summary,
+            .custom_message,
             .model_change,
             .thinking_level_change,
             => true,
