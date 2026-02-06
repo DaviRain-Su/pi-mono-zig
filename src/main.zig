@@ -1385,7 +1385,7 @@ pub fn main() !void {
             }
 
             if (auto_compact) {
-                // naive context size estimate on current leaf path
+                // TS-like: size estimate on business-only context (ignore structural entries)
                 const chain = try sm.buildContextEntries();
                 var total: usize = 0;
                 var total_tokens_est: usize = 0;
