@@ -168,6 +168,55 @@ fn doCompact(
         }
     }
 
+    // TS parity: split-turn handling.
+    // If our boundary-alignment forces `start` all the way back to 0, but we *intended* to keep only
+    // a tail (keep_last), we treat this as "the current/last turn is too large" and allow a cut
+    // inside the turn. We then attach a "Turn Context (split turn)" summary block.
+    const start_intended: usize = if (n > keep_last) n - keep_last else 0;
+    var split_turn: bool = false;
+    var split_history_end: usize = start; // history summarized by the main structured summary
+    var split_prefix_start: usize = start; // prefix-of-turn summarized by special block
+    var split_prefix_end: usize = start; // == cutpoint
+
+    if (start == 0 and start_intended > 0) {
+        // Allow cutting inside a turn. Use the intended boundary (with the same tool_result guard).
+        start = start_intended;
+        while (start > 0 and start < n) {
+            const e = nodes.items[start];
+            switch (e) {
+                .tool_result => start -= 1,
+                else => break,
+            }
+        }
+
+        // Find the turn_start that begins the turn containing this cut.
+        var ts_idx: ?usize = null;
+        var k: usize = start;
+        while (k > 0) : (k -= 1) {
+            const e = nodes.items[k - 1];
+            switch (e) {
+                .turn_start => {
+                    ts_idx = k - 1;
+                    break;
+                },
+                .turn_end => {
+                    // If we hit a previous turn_end before a turn_start, we are already at a boundary.
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        if (ts_idx) |t0| {
+            if (t0 < start) {
+                split_turn = true;
+                split_history_end = t0;
+                split_prefix_start = t0;
+                split_prefix_end = start;
+            }
+        }
+    }
+
     var sum_buf = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer sum_buf.deinit(allocator);
 
@@ -978,6 +1027,8 @@ fn doCompact(
             }
         }
 
+        const summarize_end: usize = if (split_turn) split_history_end else start;
+
         if (prev_summary == null) {
             // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
             try sum_buf.appendSlice(allocator,
@@ -989,7 +1040,7 @@ fn doCompact(
                 "## Critical Context\n");
 
             var i: usize = 0;
-            while (i < start) : (i += 1) {
+            while (i < summarize_end) : (i += 1) {
                 const e = nodes.items[i];
                 switch (e) {
                     .message => |m| {
@@ -1005,7 +1056,7 @@ fn doCompact(
                     else => {},
                 }
             }
-            if (start == 0) {
+            if (summarize_end == 0) {
                 try sum_buf.appendSlice(allocator, "- (none)\n");
             }
         } else {
@@ -1031,7 +1082,7 @@ fn doCompact(
 
             const from_i: usize = (prev_idx orelse 0) + 1;
             var ii: usize = from_i;
-            while (ii < start) : (ii += 1) {
+            while (ii < summarize_end) : (ii += 1) {
                 const e = nodes.items[ii];
                 switch (e) {
                     .message => |m| {
@@ -1305,7 +1356,7 @@ fn doCompact(
             var added_ctx: usize = 0;
 
             var i: usize = (prev_idx orelse 0) + 1;
-            while (i < start) : (i += 1) {
+            while (i < summarize_end) : (i += 1) {
                 if (added_ctx >= MAX_NEW_CTX) break;
                 const e = nodes.items[i];
                 switch (e) {
@@ -1325,6 +1376,81 @@ fn doCompact(
                 }
             }
         }
+    }
+
+    if (want_md and split_turn) {
+        // Attach TS-style split-turn prefix summary.
+        try sum_buf.appendSlice(allocator, "\n---\n\n**Turn Context (split turn):**\n\n");
+        try sum_buf.appendSlice(allocator, "## Original Request\n");
+
+        // Heuristic: use the first user message in the prefix as the request.
+        var req_written = false;
+        var i: usize = split_prefix_start;
+        while (i < split_prefix_end) : (i += 1) {
+            const e = nodes.items[i];
+            switch (e) {
+                .message => |m| {
+                    if (!req_written and std.mem.eql(u8, m.role, "user")) {
+                        const preview = if (m.content.len > 300) m.content[0..300] else m.content;
+                        try sum_buf.appendSlice(allocator, preview);
+                        try sum_buf.appendSlice(allocator, "\n\n");
+                        req_written = true;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (!req_written) {
+            try sum_buf.appendSlice(allocator, "(unknown)\n\n");
+        }
+
+        try sum_buf.appendSlice(allocator, "## Early Progress\n");
+        // Heuristic bullets: tool calls/results + assistant acks/errors.
+        var any_progress = false;
+        i = split_prefix_start;
+        while (i < split_prefix_end) : (i += 1) {
+            const e = nodes.items[i];
+            switch (e) {
+                .tool_call => |tc| {
+                    const preview = if (tc.arg.len > 200) tc.arg[0..200] else tc.arg;
+                    try sum_buf.appendSlice(allocator, "- tool_call ");
+                    try sum_buf.appendSlice(allocator, tc.tool);
+                    try sum_buf.appendSlice(allocator, ": ");
+                    try sum_buf.appendSlice(allocator, preview);
+                    try sum_buf.appendSlice(allocator, "\n");
+                    any_progress = true;
+                },
+                .tool_result => |tr| {
+                    const preview = if (tr.content.len > 200) tr.content[0..200] else tr.content;
+                    try sum_buf.appendSlice(allocator, "- tool_result ");
+                    try sum_buf.appendSlice(allocator, tr.tool);
+                    try sum_buf.appendSlice(allocator, ": ");
+                    try sum_buf.appendSlice(allocator, if (tr.ok) "ok" else "error");
+                    try sum_buf.appendSlice(allocator, " — ");
+                    try sum_buf.appendSlice(allocator, preview);
+                    try sum_buf.appendSlice(allocator, "\n");
+                    any_progress = true;
+                },
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "assistant")) {
+                        if (std.mem.startsWith(u8, m.content, "ack:") or std.mem.startsWith(u8, m.content, "error:")) {
+                            const preview = if (m.content.len > 200) m.content[0..200] else m.content;
+                            try sum_buf.appendSlice(allocator, "- assistant: ");
+                            try sum_buf.appendSlice(allocator, preview);
+                            try sum_buf.appendSlice(allocator, "\n");
+                            any_progress = true;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        if (!any_progress) {
+            try sum_buf.appendSlice(allocator, "- (none)\n");
+        }
+
+        try sum_buf.appendSlice(allocator, "\n## Context for Suffix\n");
+        try sum_buf.appendSlice(allocator, "This turn was too large to keep in full. The kept suffix continues after this cutpoint.\n");
     }
 
     const sum_text = try sum_buf.toOwnedSlice(allocator);
