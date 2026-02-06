@@ -91,6 +91,7 @@ pub const SummaryEntry = struct {
     totalChars: ?usize = null,
     totalTokensEst: ?usize = null,
     keepLast: ?usize = null,
+    keepLastGroups: ?usize = null,
     thresholdChars: ?usize = null,
     thresholdTokensEst: ?usize = null,
 };

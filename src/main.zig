@@ -613,6 +613,7 @@ fn doCompact(
         stats_total_chars,
         stats_total_tokens_est,
         keep_last,
+        keep_last_groups,
         stats_threshold_chars,
         stats_threshold_tokens_est,
     );
@@ -647,6 +648,7 @@ fn doCompact(
                     s.totalChars,
                     s.totalTokensEst,
                     s.keepLast,
+                    s.keepLastGroups,
                     s.thresholdChars,
                     s.thresholdTokensEst,
                 );
@@ -811,8 +813,8 @@ pub fn main() !void {
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
                     .summary => |s| std.debug.print(
-                        "summary {s} parent={s}\nreason={s}\nformat={s}\nkeepLast={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
-                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.keepLast, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
+                        "summary {s} parent={s}\nreason={s}\nformat={s}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.keepLast, s.keepLastGroups, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
                     ),
                     else => {},
                 }

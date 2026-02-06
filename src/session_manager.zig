@@ -111,6 +111,7 @@ pub const SessionManager = struct {
         totalChars: ?usize,
         totalTokensEst: ?usize,
         keepLast: ?usize,
+        keepLastGroups: ?usize,
         thresholdChars: ?usize,
         thresholdTokensEst: ?usize,
     ) ![]const u8 {
@@ -126,6 +127,7 @@ pub const SessionManager = struct {
             .totalChars = totalChars,
             .totalTokensEst = totalTokensEst,
             .keepLast = keepLast,
+            .keepLastGroups = keepLastGroups,
             .thresholdChars = thresholdChars,
             .thresholdTokensEst = thresholdTokensEst,
         };
@@ -361,6 +363,7 @@ pub const SessionManager = struct {
                 const totalChars0 = if (obj.get("totalChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const totalTokensEst0 = if (obj.get("totalTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const keepLast0 = if (obj.get("keepLast")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
+                const keepLastGroups0 = if (obj.get("keepLastGroups")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const thresholdChars0 = if (obj.get("thresholdChars")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
                 const thresholdTokensEst0 = if (obj.get("thresholdTokensEst")) |v| switch (v) { .integer => |x| @as(?usize, @intCast(x)), else => null } else null;
 
@@ -381,6 +384,7 @@ pub const SessionManager = struct {
                     .totalChars = totalChars0,
                     .totalTokensEst = totalTokensEst0,
                     .keepLast = keepLast0,
+                    .keepLastGroups = keepLastGroups0,
                     .thresholdChars = thresholdChars0,
                     .thresholdTokensEst = thresholdTokensEst0,
                 } });
