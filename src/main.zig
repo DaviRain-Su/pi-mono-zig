@@ -16,9 +16,9 @@ fn usage() void {
         \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
-        \\  pi-mono-zig list --session <path.jsonl>\n\
+        \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
-        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N]\n\
+        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N] [--show-turns]\n\
         \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--keep-last-groups N] [--max-chars N] [--max-tokens-est N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
         \\Examples:\n\
         \\  zig build run -- run --plan examples/hello.plan.json\n\
@@ -826,9 +826,12 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, cmd, "list")) {
         var session_path: ?[]const u8 = null;
+        var show_turns = false;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--show-turns")) {
+                show_turns = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -868,6 +871,12 @@ pub fn main() !void {
             if (st.idOf(e)) |eid| {
                 const lab = labels.get(eid) orelse "";
                 switch (e) {
+                    .turn_start => |t| {
+                        if (show_turns) std.debug.print("{d}. {s} turn_start turn={d} phase={s} {s}\n", .{ idx, eid, t.turn, t.phase orelse "-", if (lab.len > 0) lab else "" });
+                    },
+                    .turn_end => |t| {
+                        if (show_turns) std.debug.print("{d}. {s} turn_end turn={d} phase={s} {s}\n", .{ idx, eid, t.turn, t.phase orelse "-", if (lab.len > 0) lab else "" });
+                    },
                     .message => |m| std.debug.print("{d}. {s} message {s} {s}\n", .{ idx, eid, m.role, if (lab.len > 0) lab else "" }),
                     .tool_call => |tc| std.debug.print("{d}. {s} tool_call {s} arg={s} {s}\n", .{ idx, eid, tc.tool, tc.arg, if (lab.len > 0) lab else "" }),
                     .tool_result => |tr| std.debug.print("{d}. {s} tool_result {s} ok={any} {s}\n", .{ idx, eid, tr.tool, tr.ok, if (lab.len > 0) lab else "" }),
@@ -990,6 +999,7 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "tree")) {
         var session_path: ?[]const u8 = null;
         var max_depth: usize = 64;
+        var show_turns = false;
 
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
@@ -997,6 +1007,8 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--max-depth")) {
                 const s = args.next() orelse return error.MissingMaxDepth;
                 max_depth = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--show-turns")) {
+                show_turns = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -1101,6 +1113,7 @@ pub fn main() !void {
                 id: []const u8,
                 depth: usize,
                 maxd: usize,
+                show_turns_flag: bool,
             ) void {
                 if (depth > maxd) return;
 
@@ -1114,6 +1127,22 @@ pub fn main() !void {
                 while (i < indent) : (i += 1) std.debug.print(" ", .{});
 
                 switch (e) {
+                    .turn_start => |t| {
+                        if (!show_turns_flag) return;
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} turn_start turn={d} phase={s} [{s}]\n", .{ mark, id, t.turn, t.phase orelse "-", lab });
+                        } else {
+                            std.debug.print("{s} {s} turn_start turn={d} phase={s}\n", .{ mark, id, t.turn, t.phase orelse "-" });
+                        }
+                    },
+                    .turn_end => |t| {
+                        if (!show_turns_flag) return;
+                        if (lab.len > 0) {
+                            std.debug.print("{s} {s} turn_end turn={d} phase={s} [{s}]\n", .{ mark, id, t.turn, t.phase orelse "-", lab });
+                        } else {
+                            std.debug.print("{s} {s} turn_end turn={d} phase={s}\n", .{ mark, id, t.turn, t.phase orelse "-" });
+                        }
+                    },
                     .message => |m| {
                         const preview = if (m.content.len > 40) m.content[0..40] else m.content;
                         if (lab.len > 0) {
@@ -1152,7 +1181,7 @@ pub fn main() !void {
 
                 if (children_map.get(id)) |kids| {
                     for (kids.items) |kid| {
-                        printNode(alloc, by_id_map, children_map, labels_map, path_map, kid, depth + 1, maxd);
+                        printNode(alloc, by_id_map, children_map, labels_map, path_map, kid, depth + 1, maxd, show_turns_flag);
                     }
                 }
             }
@@ -1161,7 +1190,7 @@ pub fn main() !void {
         // roots are nodes whose parentId is null/""
         if (children.get("")) |roots| {
             for (roots.items) |rid| {
-                Printer.printNode(allocator, &by_id, &children, &labels, &on_path, rid, 0, max_depth);
+                Printer.printNode(allocator, &by_id, &children, &labels, &on_path, rid, 0, max_depth, show_turns);
             }
         }
 
