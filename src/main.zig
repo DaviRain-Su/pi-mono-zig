@@ -105,17 +105,32 @@ fn doCompact(
         }
     }
 
-    // Turn-boundary: move start backwards until it is immediately AFTER a persisted turn_end.
-    // Prefer a turn_end with phase="final" (or "error") so we cut after a complete user-turn.
-    // i.e. tail begins at the start of the next complete turn.
+    // Turn-group boundary: move start backwards until it is immediately AFTER a persisted turn_end
+    // that represents the end of a complete group (phase="final"|"error").
+    // This avoids splitting multi-step turns that share the same turnGroupId.
     while (start > 0) {
         const prev = nodes.items[start - 1];
         switch (prev) {
             .turn_end => |te| {
                 if (te.phase) |ph| {
-                    if (std.mem.eql(u8, ph, "final") or std.mem.eql(u8, ph, "error")) break;
+                    if (std.mem.eql(u8, ph, "final") or std.mem.eql(u8, ph, "error")) {
+                        // If the tail would start with the same group, keep searching backwards.
+                        const this_gid = te.turnGroupId;
+                        if (this_gid != null and start < n) {
+                            const first = nodes.items[start];
+                            switch (first) {
+                                .turn_start => |ts| {
+                                    if (ts.turnGroupId != null and std.mem.eql(u8, ts.turnGroupId.?, this_gid.?)) {
+                                        start -= 1;
+                                        continue;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                        break;
+                    }
                 }
-                // if not a complete turn end, keep searching backwards
                 start -= 1;
             },
             else => start -= 1,
