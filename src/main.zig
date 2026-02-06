@@ -215,6 +215,11 @@ fn doCompact(
             result: ?[]const u8 = null,
         };
 
+        const InProgressTask = struct {
+            task: []const u8,
+            source: ?[]const u8 = null, // e.g. "next_steps"
+        };
+
         const Payload = struct {
             schema: []const u8,
             goal: []const u8,
@@ -225,6 +230,7 @@ fn doCompact(
             critical_context: []const []const u8,
             blocked_tasks: []const BlockedTask, // structured blocked tasks (used for migration)
             done_tasks: []const DoneTask, // structured done tasks (used for migration)
+            in_progress_tasks: []const InProgressTask, // structured in-progress tasks (used for migration)
             raw: []const u8,
         };
 
@@ -253,7 +259,7 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v4" } else "pi.summary.v4";
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v5" } else "pi.summary.v5";
                             const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
@@ -402,6 +408,32 @@ fn doCompact(
                                 }
                             }
 
+                            // in_progress_tasks
+                            const ipt_val = if (obj.get("in_progress_tasks")) |v| v else null;
+                            var ipt_list = try std.ArrayList(InProgressTask).initCapacity(allocator, 0);
+                            if (ipt_val) |iv| {
+                                switch (iv) {
+                                    .array => |a| for (a.items) |it| {
+                                        switch (it) {
+                                            .string => try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
+                                            .object => |o| {
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                if (task0.len == 0) continue;
+                                                const src0 = if (o.get("source")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, task0), .source = if (src0) |t| try dupStr.dup(allocator, t) else null });
+                                            },
+                                            else => {},
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            } else {
+                                // compatibility: infer from progress.in_progress
+                                for (ip_list.items) |s0| {
+                                    try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, s0), .source = null });
+                                }
+                            }
+
                             prev_payload = Payload{
                                 .schema = schema,
                                 .goal = goal,
@@ -416,6 +448,7 @@ fn doCompact(
                                 .critical_context = try cc_list.toOwnedSlice(allocator),
                                 .blocked_tasks = try bt_list.toOwnedSlice(allocator),
                                 .done_tasks = try dt_list.toOwnedSlice(allocator),
+                                .in_progress_tasks = try ipt_list.toOwnedSlice(allocator),
                                 .raw = raw,
                             };
                             break;
@@ -573,7 +606,7 @@ fn doCompact(
         }
 
         const base = prev_payload orelse Payload{
-            .schema = "pi.summary.v4",
+            .schema = "pi.summary.v5",
             .goal = "(unknown)",
             .constraints = &.{},
             .progress = .{ .done = &.{}, .in_progress = &.{}, .blocked = &.{} },
@@ -582,6 +615,7 @@ fn doCompact(
             .critical_context = &.{},
             .blocked_tasks = &.{},
             .done_tasks = &.{},
+            .in_progress_tasks = &.{},
             .raw = "",
         };
 
@@ -613,6 +647,8 @@ fn doCompact(
         defer done_seen.deinit();
         var done_task_seen = std.StringHashMap(bool).init(allocator);
         defer done_task_seen.deinit();
+        var ip_task_seen = std.StringHashMap(bool).init(allocator);
+        defer ip_task_seen.deinit();
         var ctx_seen = std.StringHashMap(bool).init(allocator);
         defer ctx_seen.deinit();
         var cons_seen = std.StringHashMap(bool).init(allocator);
@@ -642,6 +678,8 @@ fn doCompact(
         defer blocked_tasks_out.deinit(allocator);
         var done_tasks_out = try std.ArrayList(DoneTask).initCapacity(allocator, 0);
         defer done_tasks_out.deinit(allocator);
+        var ip_tasks_out = try std.ArrayList(InProgressTask).initCapacity(allocator, 0);
+        defer ip_tasks_out.deinit(allocator);
 
         // Seed seen maps with base items so we don't duplicate.
         for (base.next_steps) |it| try next_seen.put(it, true);
@@ -682,6 +720,14 @@ fn doCompact(
             try done_tasks_out.append(allocator, dt);
         }
 
+        // in_progress_tasks: merge by .task key
+        for (base.in_progress_tasks) |ipt| {
+            if (ip_tasks_out.items.len >= 20) break;
+            if (ip_task_seen.contains(ipt.task)) continue;
+            try ip_task_seen.put(ipt.task, true);
+            try ip_tasks_out.append(allocator, ipt);
+        }
+
         // Append new items.
         try Merge.uniqueAppend(allocator, &next_out, &next_seen, new_next.items, MAX_NEXT);
         try Merge.uniqueAppend(allocator, &done_out, &done_seen, new_done.items, MAX_DONE);
@@ -702,6 +748,15 @@ fn doCompact(
             try done_tasks_out.append(allocator, dt);
         }
 
+        // Generate in_progress_tasks from new next steps (source=next_steps)
+        for (new_next.items) |it| {
+            if (ip_tasks_out.items.len >= 20) break;
+            if (done_task_seen.contains(it) or blocked_task_seen.contains(it)) continue;
+            if (ip_task_seen.contains(it)) continue;
+            try ip_task_seen.put(it, true);
+            try ip_tasks_out.append(allocator, .{ .task = it, .source = "next_steps" });
+        }
+
         // Sync in_progress with next steps: add items not in done.
         for (new_next.items) |it| {
             if (ip_out.items.len >= MAX_NEXT) break;
@@ -714,6 +769,18 @@ fn doCompact(
             try ip_out.append(allocator, it);
         }
         try Merge.uniqueAppend(allocator, &ctx_out, &ctx_seen, new_ctx.items, MAX_CTX);
+
+        // Replace progress.in_progress with the tasks list (stable + structured-source-of-truth)
+        {
+            var filtered = try std.ArrayList([]const u8).initCapacity(allocator, ip_tasks_out.items.len);
+            for (ip_tasks_out.items) |ipt| {
+                if (done_task_seen.contains(ipt.task)) continue;
+                if (blocked_task_seen.contains(ipt.task)) continue;
+                if (filtered.items.len >= MAX_NEXT) break;
+                try filtered.append(allocator, ipt.task);
+            }
+            ip_out = filtered;
+        }
 
         // Heuristic: mark related user tasks as done based on ack: tool_result echo: <arg>
         // This lets us drop "echo: <arg>" from next_steps/in_progress.
@@ -811,6 +878,7 @@ fn doCompact(
             .critical_context = try ctx_out.toOwnedSlice(allocator),
             .blocked_tasks = try blocked_tasks_out.toOwnedSlice(allocator),
             .done_tasks = try done_tasks_out.toOwnedSlice(allocator),
+            .in_progress_tasks = try ip_tasks_out.toOwnedSlice(allocator),
             .raw = try raw_out.toOwnedSlice(allocator),
         };
 
