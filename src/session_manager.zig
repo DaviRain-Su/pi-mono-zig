@@ -229,6 +229,7 @@ pub const SessionManager = struct {
             .format = format,
             .content = content,
             .firstKeptEntryId = firstKeptEntryId,
+            .tokensBefore = totalTokensEst,
             .readFiles = readFiles,
             .modifiedFiles = modifiedFiles,
             .totalChars = totalChars,
@@ -772,7 +773,7 @@ pub const SessionManager = struct {
                 continue;
             }
 
-            if (std.mem.eql(u8, typ, "summary")) {
+            if (std.mem.eql(u8, typ, "summary") or std.mem.eql(u8, typ, "compaction")) {
                 const id0 = switch (obj.get("id") orelse continue) {
                     .string => |s| s,
                     else => continue,
@@ -801,9 +802,18 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
+                const tokensBefore0 = if (obj.get("tokensBefore")) |v| switch (v) {
+                    .integer => |x| @as(?usize, @intCast(x)),
+                    else => null,
+                } else null;
 
-                const readFiles0 = if (obj.get("readFiles")) |v| v else null;
-                const modifiedFiles0 = if (obj.get("modifiedFiles")) |v| v else null;
+                const details_obj = if (obj.get("details")) |dv| switch (dv) {
+                    .object => |o| @as(?std.json.ObjectMap, o),
+                    else => null,
+                } else null;
+
+                const readFiles0 = if (obj.get("readFiles")) |v| v else if (details_obj) |dobj| dobj.get("readFiles") else null;
+                const modifiedFiles0 = if (obj.get("modifiedFiles")) |v| v else if (details_obj) |dobj| dobj.get("modifiedFiles") else null;
 
                 const totalChars0 = if (obj.get("totalChars")) |v| switch (v) {
                     .integer => |x| @as(?usize, @intCast(x)),
@@ -829,6 +839,9 @@ pub const SessionManager = struct {
                     .integer => |x| @as(?usize, @intCast(x)),
                     else => null,
                 } else null;
+
+                const totalTokensEstResolved = totalTokensEst0 orelse tokensBefore0;
+                const tokensBeforeResolved = tokensBefore0 orelse totalTokensEst0;
 
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
@@ -863,10 +876,11 @@ pub const SessionManager = struct {
                     .format = format,
                     .content = content,
                     .firstKeptEntryId = first_kept_entry_id,
+                    .tokensBefore = tokensBeforeResolved,
                     .readFiles = rf_slice,
                     .modifiedFiles = mf_slice,
                     .totalChars = totalChars0,
-                    .totalTokensEst = totalTokensEst0,
+                    .totalTokensEst = totalTokensEstResolved,
                     .keepLast = keepLast0,
                     .keepLastGroups = keepLastGroups0,
                     .thresholdChars = thresholdChars0,

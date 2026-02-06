@@ -2099,10 +2099,34 @@ pub fn main() !void {
                     .branch_summary => |b| std.debug.print("branch_summary {s} parent={s}\nfromId={s}\nsummary=\n{s}\n", .{ b.id, b.parentId orelse "(null)", b.fromId, b.summary }),
                     .thinking_level_change => |t| std.debug.print("thinking_level_change {s} parent={s}\nlevel={s}\n", .{ t.id, t.parentId orelse "(null)", t.thinkingLevel }),
                     .model_change => |m| std.debug.print("model_change {s} parent={s}\nprovider={s}\nmodelId={s}\n", .{ m.id, m.parentId orelse "(null)", m.provider, m.modelId }),
-                    .summary => |s| std.debug.print(
-                        "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
-                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.firstKeptEntryId orelse "(null)", s.keepLast, s.keepLastGroups, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
-                    ),
+                    .summary => |s| {
+                        std.debug.print(
+                            "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\ntokensBefore={any}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                            .{
+                                s.id,
+                                s.parentId orelse "(null)",
+                                s.reason orelse "(null)",
+                                s.format,
+                                s.firstKeptEntryId orelse "(null)",
+                                s.tokensBefore,
+                                s.keepLast,
+                                s.keepLastGroups,
+                                s.totalChars,
+                                s.totalTokensEst,
+                                s.thresholdChars,
+                                s.thresholdTokensEst,
+                                s.content,
+                            },
+                        );
+                        if (s.readFiles) |rf| {
+                            std.debug.print("readFiles:\n", .{});
+                            for (rf) |p| std.debug.print("- {s}\n", .{p});
+                        }
+                        if (s.modifiedFiles) |mf| {
+                            std.debug.print("modifiedFiles:\n", .{});
+                            for (mf) |p| std.debug.print("- {s}\n", .{p});
+                        }
+                    },
                     else => {},
                 }
                 return;

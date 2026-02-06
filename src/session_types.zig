@@ -110,7 +110,8 @@ pub const TurnEndEntry = struct {
 };
 
 pub const SummaryEntry = struct {
-    type: []const u8 = "summary",
+    /// TS compatibility: persisted as "compaction" (legacy sessions may contain "summary").
+    type: []const u8 = "compaction",
     id: []const u8,
     parentId: ?[]const u8 = null,
     timestamp: []const u8,
@@ -127,6 +128,10 @@ pub const SummaryEntry = struct {
     /// TS-style compaction marker: first kept entry in the historical prefix.
     /// If null, this summary is treated as legacy (pre-marker format).
     firstKeptEntryId: ?[]const u8 = null,
+
+    /// TS compaction snapshot (historical context size before compaction).
+    /// Kept alongside totalTokensEst for backward compatibility with existing zig sessions.
+    tokensBefore: ?usize = null,
 
     /// Best-effort file ops (TS-style compaction details). Stored on the entry, and may also
     /// be rendered into the content for markdown summaries.
