@@ -1365,8 +1365,8 @@ pub fn main() !void {
                         false,
                     );
                     std.debug.print(
-                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (keep_last={d}) summaryId={s}\n",
-                        .{ total, max_chars, total_tokens_est, max_tokens_est, keep_last, res.summaryId.? },
+                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (keep_last={d} keep_last_groups={any}) summaryId={s}\n",
+                        .{ total, max_chars, total_tokens_est, max_tokens_est, keep_last, keep_last_groups, res.summaryId.? },
                     );
                 }
             }
