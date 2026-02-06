@@ -1802,11 +1802,29 @@ pub fn main() !void {
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
 
-        // Stats snapshot (TS-like): compute totals for current leaf context
+        // Stats snapshot (TS-like): compute totals for current leaf context boundary since last summary.
         const chain = try sm.buildContextEntries();
+
+        var boundary_from: usize = 0;
+        {
+            var k: usize = chain.len;
+            while (k > 0) : (k -= 1) {
+                const e = chain[k - 1];
+                switch (e) {
+                    .summary => {
+                        boundary_from = k;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+        }
+
         var total_chars: usize = 0;
         var total_tokens_est: usize = 0;
-        for (chain) |e| {
+        var idx: usize = boundary_from;
+        while (idx < chain.len) : (idx += 1) {
+            const e = chain[idx];
             switch (e) {
                 .message => |m| total_chars += m.content.len,
                 .summary => |s| total_chars += s.content.len,
