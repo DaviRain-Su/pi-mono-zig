@@ -66,23 +66,71 @@ pub const SessionManager = struct {
         try json_util.writeJsonLine(self.session_path, header);
     }
 
-    fn currentLeafId(self: *SessionManager) !?[]const u8 {
-        const entries = try self.loadEntries();
-        var leaf: ?[]const u8 = null;
+    const LeafResolution = struct {
+        saw_explicit_leaf: bool,
+        explicit_leaf_target: ?[]const u8,
+        selected_leaf: ?[]const u8,
+    };
+
+    fn resolveLeaf(entries: []const Entry) LeafResolution {
+        var saw_leaf = false;
+        var explicit_leaf: ?[]const u8 = null;
+        var last_node: ?[]const u8 = null;
+
         for (entries) |e| {
             switch (e) {
-                .leaf => |l| leaf = l.targetId,
+                .leaf => |l| {
+                    saw_leaf = true;
+                    explicit_leaf = l.targetId;
+                },
                 else => {},
             }
+            if (st.idOf(e)) |id| {
+                last_node = id;
+            }
         }
-        if (leaf) |id| return id;
 
-        // If no explicit leaf, use last node entry id if any.
-        var last: ?[]const u8 = null;
-        for (entries) |e| {
-            if (st.idOf(e)) |id| last = id;
+        if (!saw_leaf) {
+            return .{
+                .saw_explicit_leaf = false,
+                .explicit_leaf_target = null,
+                .selected_leaf = last_node,
+            };
         }
-        return last;
+
+        if (explicit_leaf == null) {
+            // Explicit root navigation (leaf=null): context should be empty and appends should start at root.
+            return .{
+                .saw_explicit_leaf = true,
+                .explicit_leaf_target = null,
+                .selected_leaf = null,
+            };
+        }
+
+        const wanted = explicit_leaf.?;
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                if (std.mem.eql(u8, id, wanted)) {
+                    return .{
+                        .saw_explicit_leaf = true,
+                        .explicit_leaf_target = wanted,
+                        .selected_leaf = wanted,
+                    };
+                }
+            }
+        }
+
+        // Corrupt/unknown explicit leaf id: fall back to last node (TS behavior).
+        return .{
+            .saw_explicit_leaf = true,
+            .explicit_leaf_target = wanted,
+            .selected_leaf = last_node,
+        };
+    }
+
+    fn currentLeafId(self: *SessionManager) !?[]const u8 {
+        const entries = try self.loadEntries();
+        return resolveLeaf(entries).selected_leaf;
     }
 
     fn setLeaf(self: *SessionManager, target: ?[]const u8) !void {
@@ -90,7 +138,24 @@ pub const SessionManager = struct {
         try json_util.appendJsonLine(self.session_path, entry);
     }
 
+    fn hasEntryId(self: *SessionManager, target_id: []const u8) !bool {
+        const entries = try self.loadEntries();
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                if (std.mem.eql(u8, id, target_id)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     pub fn branchTo(self: *SessionManager, targetId: ?[]const u8) !void {
+        if (targetId) |tid| {
+            if (!try self.hasEntryId(tid)) {
+                return error.EntryNotFound;
+            }
+        }
         try self.setLeaf(targetId);
     }
 
@@ -855,26 +920,16 @@ pub const SessionManager = struct {
     fn buildContextEntriesMode(self: *SessionManager, include_structural: bool) ![]Entry {
         const entries = try self.loadEntries();
 
-        // Find leaf
-        var leaf: ?[]const u8 = null;
-        for (entries) |e| {
-            switch (e) {
-                .leaf => |l| leaf = l.targetId,
-                else => {},
-            }
+        const leaf_resolution = resolveLeaf(entries);
+
+        // Explicit root navigation (leaf=null) -> no context.
+        if (leaf_resolution.saw_explicit_leaf and leaf_resolution.explicit_leaf_target == null) {
+            return try self.arena.alloc(Entry, 0);
         }
+
+        const leaf = leaf_resolution.selected_leaf;
         if (leaf == null) {
-            // no explicit leaf => return all non-session entries (filtered by mode)
-            var out_all = try std.ArrayList(Entry).initCapacity(self.arena, entries.len);
-            defer out_all.deinit(self.arena);
-            for (entries) |e| {
-                if (!include_structural and !isBusinessEntry(e)) continue;
-                switch (e) {
-                    .session, .leaf => {},
-                    else => try out_all.append(self.arena, e),
-                }
-            }
-            return try out_all.toOwnedSlice(self.arena);
+            return try self.arena.alloc(Entry, 0);
         }
 
         // Build id -> entry map for node entries

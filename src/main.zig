@@ -14,8 +14,8 @@ fn usage() void {
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
         \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
-        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
-        \\  pi-mono-zig branch-with-summary --session <path.jsonl> --to <entryId> [--summary <text>]\n\
+        \\  pi-mono-zig branch --session <path.jsonl> [--to <entryId> | --root]\n\
+        \\  pi-mono-zig branch-with-summary --session <path.jsonl> [--to <entryId> | --root] [--summary <text>]\n\
         \\  pi-mono-zig set-model --session <path.jsonl> --provider <name> --model <id>\n\
         \\  pi-mono-zig set-thinking --session <path.jsonl> --level <name>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
@@ -2351,14 +2351,7 @@ pub fn main() !void {
             }
         }
 
-        // find leaf
-        var leaf: ?[]const u8 = null;
-        for (entries) |e| {
-            switch (e) {
-                .leaf => |l| leaf = l.targetId,
-                else => {},
-            }
-        }
+        const leaf = try sm.leafId();
 
         // build id -> entry map
         var by_id = std.StringHashMap(st.Entry).init(allocator);
@@ -2531,11 +2524,14 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "branch")) {
         var session_path: ?[]const u8 = null;
         var to_id: ?[]const u8 = null;
+        var to_root = false;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
             } else if (std.mem.eql(u8, a, "--to")) {
                 to_id = args.next() orelse return error.MissingTo;
+            } else if (std.mem.eql(u8, a, "--root")) {
+                to_root = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -2549,20 +2545,25 @@ pub fn main() !void {
         };
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
-        try sm.branchTo(to_id);
-        std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, to_id orelse "(null)" });
+        if (to_root and to_id != null) return error.InvalidBranchTarget;
+        const target_id: ?[]const u8 = if (to_root) null else (to_id orelse return error.MissingTo);
+        try sm.branchTo(target_id);
+        std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, target_id orelse "(root)" });
         return;
     }
 
     if (std.mem.eql(u8, cmd, "branch-with-summary")) {
         var session_path: ?[]const u8 = null;
         var to_id: ?[]const u8 = null;
+        var to_root = false;
         var summary_text: ?[]const u8 = null;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
             } else if (std.mem.eql(u8, a, "--to")) {
                 to_id = args.next() orelse return error.MissingTo;
+            } else if (std.mem.eql(u8, a, "--root")) {
+                to_root = true;
             } else if (std.mem.eql(u8, a, "--summary")) {
                 summary_text = args.next() orelse return error.MissingLabel;
             } else if (std.mem.eql(u8, a, "--help")) {
@@ -2579,12 +2580,14 @@ pub fn main() !void {
 
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
+        if (to_root and to_id != null) return error.InvalidBranchTarget;
+        const target_id: ?[]const u8 = if (to_root) null else (to_id orelse return error.MissingTo);
         const old_leaf = try sm.leafId();
-        const summary = summary_text orelse try buildAutoBranchSummary(allocator, &sm, old_leaf, to_id);
-        try sm.branchTo(to_id);
+        const summary = summary_text orelse try buildAutoBranchSummary(allocator, &sm, old_leaf, target_id);
+        try sm.branchTo(target_id);
         const from_id = old_leaf orelse "root";
         const sid = try sm.appendBranchSummary(from_id, summary);
-        std.debug.print("ok: true\nbranch: {s} -> {s}\nbranchSummaryId: {s}\n", .{ sp, to_id orelse "(null)", sid });
+        std.debug.print("ok: true\nbranch: {s} -> {s}\nbranchSummaryId: {s}\n", .{ sp, target_id orelse "(root)", sid });
         return;
     }
 
