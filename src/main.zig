@@ -932,6 +932,19 @@ pub fn main() !void {
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
 
+        // Stats snapshot (TS-like): compute totals for current leaf context
+        const chain = try sm.buildContextEntries();
+        var total_chars: usize = 0;
+        var total_tokens_est: usize = 0;
+        for (chain) |e| {
+            switch (e) {
+                .message => |m| total_chars += m.content.len,
+                .summary => |s| total_chars += s.content.len,
+                else => {},
+            }
+            total_tokens_est += tokensEstForEntry(e);
+        }
+
         const res = try doCompact(
             allocator,
             &sm,
@@ -941,8 +954,8 @@ pub fn main() !void {
             label,
             if (structured and std.mem.eql(u8, structured_format, "json")) "SUMMARY_JSON" else if (structured) "SUMMARY_MD" else "SUMMARY (naive):\n",
             if (update_summary) "manual_update" else "manual",
-            null,
-            null,
+            total_chars,
+            total_tokens_est,
             null,
             null,
             update_summary,
