@@ -95,15 +95,35 @@ fn doCompact(
 
     const n = nodes.items.len;
 
+    // TS parity: define a compaction "boundary" starting AFTER the most recent summary entry.
+    // We only decide cutpoints within this window (older content is already summarized).
+    var boundary_from: usize = 0;
+    {
+        var k: usize = n;
+        while (k > 0) : (k -= 1) {
+            const e = nodes.items[k - 1];
+            switch (e) {
+                .summary => {
+                    boundary_from = k;
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+
     // Choose cut start.
-    var start: usize = if (n > keep_last) n - keep_last else 0;
+    // Keep_last is interpreted relative to the full leaf context, but we never cut before boundary_from.
+    var start: usize = if (n > keep_last) n - keep_last else boundary_from;
+    if (start < boundary_from) start = boundary_from;
+    const start_initial: usize = start;
+
     if (keep_last_groups) |kg| {
-        // Keep the last N complete turn-groups (best-effort).
-        // We find the boundary end-of-group that precedes the kept groups.
+        // Keep the last N complete turn-groups (best-effort), within the boundary window.
         // Example: kg=1 => keep last group => boundary is the END of the previous group (count == kg+1).
         var count: usize = 0;
         var idx: usize = n;
-        while (idx > 0) : (idx -= 1) {
+        while (idx > boundary_from) : (idx -= 1) {
             const e = nodes.items[idx - 1];
             switch (e) {
                 .turn_end => |te| {
@@ -120,15 +140,14 @@ fn doCompact(
                 else => {},
             }
         }
-        // If there aren't enough groups to skip, keep everything.
-        if (count <= kg) start = 0;
+        // If there aren't enough groups to skip within boundary, keep everything since boundary.
+        if (count <= kg) start = boundary_from;
         if (start > n) start = n;
     }
 
     // TS-ish compaction cut alignment:
     // 1) Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
-    // 2) Prefer to start the tail at a user message (turn boundary heuristic).
-    while (start > 0 and start < n) {
+    while (start > boundary_from and start < n) {
         const e = nodes.items[start];
         switch (e) {
             .tool_result => start -= 1,
@@ -139,7 +158,7 @@ fn doCompact(
     // Turn-group boundary: move start backwards until it is immediately AFTER a persisted turn_end
     // that represents the end of a complete group (phase="final"|"error").
     // This avoids splitting multi-step turns that share the same turnGroupId.
-    while (start > 0) {
+    while (start > boundary_from) {
         const prev = nodes.items[start - 1];
         switch (prev) {
             .turn_end => |te| {
@@ -169,30 +188,31 @@ fn doCompact(
     }
 
     // TS parity: split-turn handling.
-    // If our boundary-alignment forces `start` all the way back to 0, but we *intended* to keep only
-    // a tail (keep_last), we treat this as "the current/last turn is too large" and allow a cut
-    // inside the turn. We then attach a "Turn Context (split turn)" summary block.
-    const start_intended: usize = if (n > keep_last) n - keep_last else 0;
+    // If our boundary-alignment forces `start` back to the boundary edge (meaning we can't keep
+    // as much tail as intended without splitting a turn-group), we allow a cut INSIDE the turn.
+    // This matches TS's "split-turn" mode (prefix summarized separately).
+    const start_intended: usize = start_initial;
     var split_turn: bool = false;
     var split_history_end: usize = start; // history summarized by the main structured summary
     var split_prefix_start: usize = start; // prefix-of-turn summarized by special block
     var split_prefix_end: usize = start; // == cutpoint
 
-    if (start == 0 and start_intended > 0) {
+    if (start == boundary_from and start_intended > boundary_from) {
         // Allow cutting inside a turn. Use the intended boundary (with the same tool_result guard).
         start = start_intended;
-        while (start > 0 and start < n) {
+        while (start > boundary_from and start < n) {
             const e = nodes.items[start];
             switch (e) {
                 .tool_result => start -= 1,
                 else => break,
             }
         }
+        if (start < boundary_from) start = boundary_from;
 
-        // Find the turn_start that begins the turn containing this cut.
+        // Find the turn_start that begins the turn containing this cut (stop at boundary_from).
         var ts_idx: ?usize = null;
         var k: usize = start;
-        while (k > 0) : (k -= 1) {
+        while (k > boundary_from) : (k -= 1) {
             const e = nodes.items[k - 1];
             switch (e) {
                 .turn_start => {
