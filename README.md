@@ -57,6 +57,11 @@ zig build run -- chat --session /tmp/pi-session.jsonl
 
 # replay the JSONL log
 zig build run -- replay --session /tmp/pi-session.jsonl
+
+# migrate old session JSONL to latest TS-compatible shape
+zig build run -- session-migrate --session /tmp/pi-session.jsonl --dry-run
+zig build run -- session-migrate --session /tmp/pi-session.jsonl
+zig build run -- session-migrate --session /tmp/pi-session.jsonl --out /tmp/pi-session.migrated.jsonl
 ```
 
 Try:

@@ -14,6 +14,7 @@ fn usage() void {
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
         \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
+        \\  pi-mono-zig session-migrate --session <path.jsonl> [--out <path.jsonl>] [--dry-run]\n\
         \\  pi-mono-zig branch --session <path.jsonl> [--to <entryId> | --root]\n\
         \\  pi-mono-zig branch-with-summary --session <path.jsonl> [--to <entryId> | --root] [--summary <text>]\n\
         \\  pi-mono-zig set-model --session <path.jsonl> --provider <name> --model <id>\n\
@@ -28,6 +29,315 @@ fn usage() void {
         \\  zig build run -- run --plan examples/hello.plan.json\n\
         \\  zig build run -- verify --run run_123_hello\n\n\
     , .{});
+}
+
+const SessionMigrateStats = struct {
+    totalLines: usize = 0,
+    changedLines: usize = 0,
+    parseErrors: usize = 0,
+    timestampChanged: usize = 0,
+    sessionChanged: usize = 0,
+    messageChanged: usize = 0,
+    leafChanged: usize = 0,
+    labelChanged: usize = 0,
+};
+
+fn valueAsString(v: std.json.Value) ?[]const u8 {
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn valueAsUsize(v: std.json.Value) ?usize {
+    return switch (v) {
+        .integer => |x| blk: {
+            if (x < 0) break :blk null;
+            break :blk @as(usize, @intCast(x));
+        },
+        else => null,
+    };
+}
+
+fn putStringIfMissing(obj: *std.json.ObjectMap, key: []const u8, value: ?[]const u8) !bool {
+    if (value == null) return false;
+    if (obj.get(key) != null) return false;
+    try obj.put(key, .{ .string = value.? });
+    return true;
+}
+
+fn putIntegerIfMissing(obj: *std.json.ObjectMap, key: []const u8, value: ?usize) !bool {
+    if (value == null) return false;
+    if (obj.get(key) != null) return false;
+    try obj.put(key, .{ .integer = @as(i64, @intCast(value.?)) });
+    return true;
+}
+
+fn millisToIso(allocator: std.mem.Allocator, ms: i64) ![]const u8 {
+    if (ms < 0) return error.InvalidTimestamp;
+    const secs = @as(u64, @intCast(@divTrunc(ms, 1000)));
+    const ms_part = @as(u16, @intCast(@mod(ms, 1000)));
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return try std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+            ms_part,
+        },
+    );
+}
+
+fn timestampToIsoIfMillis(allocator: std.mem.Allocator, v: std.json.Value) !?[]const u8 {
+    switch (v) {
+        .integer => |x| {
+            if (x < 0) return null;
+            return try millisToIso(allocator, x);
+        },
+        .string => |s| {
+            if (s.len == 0) return null;
+            for (s) |c| {
+                if (c < '0' or c > '9') return null;
+            }
+            const ms = std.fmt.parseInt(i64, s, 10) catch return null;
+            if (ms < 0) return null;
+            return try millisToIso(allocator, ms);
+        },
+        else => return null,
+    }
+}
+
+fn ensureUsageTotalTokens(
+    allocator: std.mem.Allocator,
+    msg_obj: *std.json.ObjectMap,
+    usage_total_tokens: ?usize,
+) !bool {
+    if (usage_total_tokens == null) return false;
+
+    if (msg_obj.getPtr("usage")) |usage_ptr| {
+        switch (usage_ptr.*) {
+            .object => |*usage_obj| {
+                if (usage_obj.get("totalTokens") != null) return false;
+                try usage_obj.put("totalTokens", .{ .integer = @as(i64, @intCast(usage_total_tokens.?)) });
+                return true;
+            },
+            else => {},
+        }
+    }
+
+    var usage_obj = std.json.ObjectMap.init(allocator);
+    try usage_obj.put("totalTokens", .{ .integer = @as(i64, @intCast(usage_total_tokens.?)) });
+    try msg_obj.put("usage", .{ .object = usage_obj });
+    return true;
+}
+
+fn migrateMessageObject(
+    allocator: std.mem.Allocator,
+    obj: *std.json.ObjectMap,
+) !bool {
+    var changed = false;
+
+    const role_top = if (obj.get("role")) |v| valueAsString(v) else null;
+    const content_top = if (obj.get("content")) |v| valueAsString(v) else null;
+    const usage_top = if (obj.get("usageTotalTokens")) |v| valueAsUsize(v) else null;
+
+    var usage_nested: ?usize = null;
+    var role_nested: ?[]const u8 = null;
+    var content_nested: ?[]const u8 = null;
+    var has_message_object = false;
+    if (obj.get("message")) |mv| switch (mv) {
+        .object => |mobj| {
+            has_message_object = true;
+            role_nested = if (mobj.get("role")) |v| valueAsString(v) else null;
+            content_nested = if (mobj.get("content")) |v| valueAsString(v) else null;
+            if (mobj.get("usage")) |uv| switch (uv) {
+                .object => |uobj| {
+                    usage_nested = if (uobj.get("totalTokens")) |tv| valueAsUsize(tv) else null;
+                },
+                else => {},
+            };
+        },
+        else => {},
+    };
+
+    const role = role_top orelse role_nested;
+    const content = content_top orelse content_nested;
+    const usage_total = usage_top orelse usage_nested;
+
+    if (try putStringIfMissing(obj, "role", role)) changed = true;
+    if (try putStringIfMissing(obj, "content", content)) changed = true;
+    if (try putIntegerIfMissing(obj, "usageTotalTokens", usage_total)) changed = true;
+
+    if (has_message_object) {
+        if (obj.get("message")) |mv| switch (mv) {
+            .object => |mobj| {
+                var msg_copy = std.json.ObjectMap.init(allocator);
+                var it2 = mobj.iterator();
+                while (it2.next()) |kv| {
+                    try msg_copy.put(kv.key_ptr.*, kv.value_ptr.*);
+                }
+
+                var msg_changed = false;
+                if (try putStringIfMissing(&msg_copy, "role", role)) msg_changed = true;
+                if (try putStringIfMissing(&msg_copy, "content", content)) msg_changed = true;
+                if (try ensureUsageTotalTokens(allocator, &msg_copy, usage_total)) msg_changed = true;
+
+                if (msg_changed) {
+                    try obj.put("message", .{ .object = msg_copy });
+                    changed = true;
+                }
+            },
+            else => {},
+        };
+    } else {
+        var msg_obj = std.json.ObjectMap.init(allocator);
+        if (role) |r| try msg_obj.put("role", .{ .string = r });
+        if (content) |c| try msg_obj.put("content", .{ .string = c });
+        _ = try ensureUsageTotalTokens(allocator, &msg_obj, usage_total);
+        try obj.put("message", .{ .object = msg_obj });
+        changed = true;
+    }
+
+    return changed;
+}
+
+fn migrateLeafObject(
+    allocator: std.mem.Allocator,
+    obj: *std.json.ObjectMap,
+    generated_counter: *usize,
+) !bool {
+    var changed = false;
+
+    const target_id = if (obj.get("targetId")) |v| valueAsString(v) else null;
+    if (obj.get("id") == null) {
+        generated_counter.* += 1;
+        const gen_id = try std.fmt.allocPrint(allocator, "leaf_migr_{d}_{d}", .{ std.time.milliTimestamp(), generated_counter.* });
+        try obj.put("id", .{ .string = gen_id });
+        changed = true;
+    }
+    if (obj.get("parentId") == null) {
+        if (target_id) |tid| {
+            try obj.put("parentId", .{ .string = tid });
+        } else {
+            try obj.put("parentId", .null);
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+fn migrateLabelObject(
+    obj: *std.json.ObjectMap,
+    last_node_id: ?[]const u8,
+) !bool {
+    if (obj.get("parentId") != null) return false;
+    if (last_node_id) |pid| {
+        try obj.put("parentId", .{ .string = pid });
+    } else {
+        try obj.put("parentId", .null);
+    }
+    return true;
+}
+
+fn migrateSessionFile(
+    allocator: std.mem.Allocator,
+    session_path: []const u8,
+    out_path: ?[]const u8,
+    dry_run: bool,
+) !SessionMigrateStats {
+    const raw = try readFileAlloc(allocator, session_path);
+    var out = try std.ArrayList(u8).initCapacity(allocator, raw.len + 1024);
+    defer out.deinit(allocator);
+
+    var stats: SessionMigrateStats = .{};
+    var last_node_id: ?[]const u8 = null;
+    var generated_counter: usize = 0;
+
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        stats.totalLines += 1;
+
+        var changed_line = false;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            stats.parseErrors += 1;
+            try out.appendSlice(allocator, line);
+            try out.append(allocator, '\n');
+            continue;
+        };
+        defer parsed.deinit();
+
+        switch (parsed.value) {
+            .object => |*obj| {
+                const typ = if (obj.get("type")) |tv| valueAsString(tv) else null;
+                if (obj.get("timestamp")) |tsv| {
+                    if (try timestampToIsoIfMillis(allocator, tsv)) |iso_ts| {
+                        try obj.put("timestamp", .{ .string = iso_ts });
+                        changed_line = true;
+                        stats.timestampChanged += 1;
+                    }
+                }
+                if (typ) |t| {
+                    if (std.mem.eql(u8, t, "session")) {
+                        const v = if (obj.get("version")) |vv| valueAsUsize(vv) else null;
+                        if (v == null or v.? < 3) {
+                            try obj.put("version", .{ .integer = 3 });
+                            changed_line = true;
+                            stats.sessionChanged += 1;
+                        }
+                    } else if (std.mem.eql(u8, t, "message")) {
+                        if (try migrateMessageObject(allocator, obj)) {
+                            changed_line = true;
+                            stats.messageChanged += 1;
+                        }
+                    } else if (std.mem.eql(u8, t, "leaf")) {
+                        if (try migrateLeafObject(allocator, obj, &generated_counter)) {
+                            changed_line = true;
+                            stats.leafChanged += 1;
+                        }
+                    } else if (std.mem.eql(u8, t, "label")) {
+                        if (try migrateLabelObject(obj, last_node_id)) {
+                            changed_line = true;
+                            stats.labelChanged += 1;
+                        }
+                    }
+
+                    if (!std.mem.eql(u8, t, "session")) {
+                        if (obj.get("id")) |idv| {
+                            if (valueAsString(idv)) |id| {
+                                last_node_id = id;
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+
+        if (changed_line) stats.changedLines += 1;
+        const json_line = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+        try out.appendSlice(allocator, json_line);
+        try out.append(allocator, '\n');
+    }
+
+    if (dry_run) return stats;
+
+    const dst = out_path orelse session_path;
+    if (out_path != null or stats.changedLines > 0) {
+        var f = try std.fs.cwd().createFile(dst, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(out.items);
+    }
+
+    return stats;
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -2812,6 +3122,50 @@ pub fn main() !void {
             const cur = try sm.latestSessionName();
             std.debug.print("ok: true\nname: {s}\n", .{cur orelse "(null)"});
         }
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "session-migrate")) {
+        var session_path: ?[]const u8 = null;
+        var out_path: ?[]const u8 = null;
+        var dry_run = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--out")) {
+                out_path = args.next() orelse return error.MissingOut;
+            } else if (std.mem.eql(u8, a, "--dry-run")) {
+                dry_run = true;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+
+        const stt = try migrateSessionFile(allocator, sp, out_path, dry_run);
+        std.debug.print(
+            "ok: true\nsession: {s}\nout: {s}\ndryRun: {any}\nchangedLines: {d}\ntotalLines: {d}\nparseErrors: {d}\nchanged: timestamp={d} session={d} message={d} leaf={d} label={d}\n",
+            .{
+                sp,
+                out_path orelse sp,
+                dry_run,
+                stt.changedLines,
+                stt.totalLines,
+                stt.parseErrors,
+                stt.timestampChanged,
+                stt.sessionChanged,
+                stt.messageChanged,
+                stt.leafChanged,
+                stt.labelChanged,
+            },
+        );
         return;
     }
 
