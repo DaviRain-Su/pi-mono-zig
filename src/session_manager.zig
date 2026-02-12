@@ -30,8 +30,28 @@ pub const SessionManager = struct {
     }
 
     fn nowIso(arena: std.mem.Allocator) ![]const u8 {
-        // good enough for MVP: unixms as string
-        return try std.fmt.allocPrint(arena, "{d}", .{std.time.milliTimestamp()});
+        const ms = std.time.milliTimestamp();
+        const secs = @as(u64, @intCast(@divTrunc(ms, 1000)));
+        const ms_part = @as(u16, @intCast(@mod(ms, 1000)));
+
+        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+        const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_seconds = epoch_seconds.getDaySeconds();
+
+        return try std.fmt.allocPrint(
+            arena,
+            "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z",
+            .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                day_seconds.getHoursIntoDay(),
+                day_seconds.getMinutesIntoHour(),
+                day_seconds.getSecondsIntoMinute(),
+                ms_part,
+            },
+        );
     }
 
     fn newId(self: *SessionManager) ![]const u8 {
@@ -137,7 +157,13 @@ pub const SessionManager = struct {
     }
 
     fn setLeaf(self: *SessionManager, target: ?[]const u8) !void {
-        const entry = LeafEntry{ .timestamp = try nowIso(self.arena), .targetId = target };
+        const id = try self.newId();
+        const entry = LeafEntry{
+            .id = id,
+            .parentId = target,
+            .timestamp = try nowIso(self.arena),
+            .targetId = target,
+        };
         try json_util.appendJsonLine(self.session_path, entry);
     }
 
@@ -225,6 +251,10 @@ pub const SessionManager = struct {
         }
     }
 
+    fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]const u8 {
+        return try std.json.Stringify.valueAlloc(allocator, v, .{});
+    }
+
     pub fn branchTo(self: *SessionManager, targetId: ?[]const u8) !void {
         if (targetId) |tid| {
             if (!try self.hasEntryId(tid)) {
@@ -239,9 +269,13 @@ pub const SessionManager = struct {
     }
 
     pub fn setLabel(self: *SessionManager, targetId: []const u8, label: ?[]const u8) ![]const u8 {
+        if (targetId.len == 0) return error.EntryNotFound;
+        if (!try self.hasEntryId(targetId)) return error.EntryNotFound;
         const id = try self.newId();
+        const pid = try self.currentLeafId();
         const entry = LabelEntry{
             .id = id,
+            .parentId = pid,
             .timestamp = try nowIso(self.arena),
             .targetId = targetId,
             .label = label,
@@ -345,12 +379,18 @@ pub const SessionManager = struct {
     ) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
+        const nested_usage: ?MessageEntry.Usage = if (usage_total_tokens) |u| .{ .totalTokens = u } else null;
         const entry = MessageEntry{
             .id = id,
             .parentId = pid,
             .timestamp = try nowIso(self.arena),
             .role = role,
             .content = content,
+            .message = .{
+                .role = role,
+                .content = content,
+                .usage = nested_usage,
+            },
             .tokensEst = tokens_est,
             .usageTotalTokens = usage_total_tokens,
         };
@@ -439,10 +479,38 @@ pub const SessionManager = struct {
             .fromId = from_id,
             .summary = summary,
             .fromHook = null,
+            .detailsJson = null,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
         return id;
+    }
+
+    pub fn appendSessionInfo(self: *SessionManager, name: ?[]const u8) ![]const u8 {
+        const pid = try self.currentLeafId();
+        const id = try self.newId();
+        const entry = SessionInfoEntry{
+            .id = id,
+            .parentId = pid,
+            .timestamp = try nowIso(self.arena),
+            .name = name,
+        };
+        try json_util.appendJsonLine(self.session_path, entry);
+        try self.setLeaf(id);
+        return id;
+    }
+
+    pub fn latestSessionName(self: *SessionManager) !?[]const u8 {
+        const entries = try self.loadEntries();
+        var i: usize = entries.len;
+        while (i > 0) : (i -= 1) {
+            const e = entries[i - 1];
+            switch (e) {
+                .session_info => |si| return si.name,
+                else => {},
+            }
+        }
+        return null;
     }
 
     pub fn appendTurnStart(self: *SessionManager, turn: u64, userMessageId: ?[]const u8, turnGroupId: ?[]const u8, phase: ?[]const u8) ![]const u8 {
@@ -632,10 +700,7 @@ pub const SessionManager = struct {
                     .bool => |b| b,
                     else => continue,
                 };
-                const content0 = if (obj.get("summary")) |v| switch (v) {
-                    .string => |s| s,
-                    else => continue,
-                } else if (obj.get("content")) |v| switch (v) {
+                const content0 = if (obj.get("content")) |v| switch (v) {
                     .string => |s| s,
                     else => continue,
                 } else continue;
@@ -743,6 +808,7 @@ pub const SessionManager = struct {
                     .bool => |b| @as(?bool, b),
                     else => null,
                 } else null;
+                const details_json0 = if (obj.get("details")) |v| try jsonValueToString(self.arena, v) else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -755,6 +821,7 @@ pub const SessionManager = struct {
                     .fromId = from,
                     .summary = summary,
                     .fromHook = from_hook0,
+                    .detailsJson = details_json0,
                 } });
                 continue;
             }
@@ -776,6 +843,7 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
+                const data_json0 = if (obj.get("data")) |v| try jsonValueToString(self.arena, v) else null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -785,6 +853,7 @@ pub const SessionManager = struct {
                     .parentId = pid,
                     .timestamp = ts,
                     .customType = custom_type,
+                    .dataJson = data_json0,
                 } });
                 continue;
             }
@@ -811,6 +880,8 @@ pub const SessionManager = struct {
                     .bool => |b| b,
                     else => true,
                 } else true;
+                const content_json0 = try jsonValueToString(self.arena, content_v);
+                const details_json0 = if (obj.get("details")) |v| try jsonValueToString(self.arena, v) else null;
 
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
@@ -825,6 +896,8 @@ pub const SessionManager = struct {
                     .customType = custom_type,
                     .content = content,
                     .display = display0,
+                    .contentJson = content_json0,
+                    .detailsJson = details_json0,
                 } });
                 continue;
             }
@@ -940,6 +1013,14 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "leaf")) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
                 const ts0 = switch (obj.get("timestamp") orelse continue) {
                     .string => |s| s,
                     else => continue,
@@ -948,9 +1029,16 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
+                const id = try dup.os(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const tid = try dup.os(self.arena, tid0);
-                try out.append(self.arena, .{ .leaf = .{ .timestamp = ts, .targetId = tid } });
+                try out.append(self.arena, .{ .leaf = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .targetId = tid,
+                } });
                 continue;
             }
 
@@ -959,6 +1047,10 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
+                const pid0 = if (obj.get("parentId")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
                 const ts0 = switch (obj.get("timestamp") orelse continue) {
                     .string => |s| s,
                     else => continue,
@@ -972,10 +1064,17 @@ pub const SessionManager = struct {
                     else => null,
                 } else null;
                 const id = try dup.s(self.arena, id0);
+                const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const targetId = try dup.s(self.arena, target0);
                 const label = try dup.os(self.arena, label0);
-                try out.append(self.arena, .{ .label = .{ .id = id, .timestamp = ts, .targetId = targetId, .label = label } });
+                try out.append(self.arena, .{ .label = .{
+                    .id = id,
+                    .parentId = pid,
+                    .timestamp = ts,
+                    .targetId = targetId,
+                    .label = label,
+                } });
                 continue;
             }
 
@@ -1019,6 +1118,7 @@ pub const SessionManager = struct {
                     .bool => |b| @as(?bool, b),
                     else => null,
                 } else null;
+                const detailsJson0 = if (obj.get("details")) |v| try jsonValueToString(self.arena, v) else null;
 
                 const details_obj = if (obj.get("details")) |dv| switch (dv) {
                     .object => |o| @as(?std.json.ObjectMap, o),
@@ -1091,6 +1191,7 @@ pub const SessionManager = struct {
                     .firstKeptEntryId = first_kept_entry_id,
                     .tokensBefore = tokensBeforeResolved,
                     .fromHook = fromHook0,
+                    .detailsJson = detailsJson0,
                     .readFiles = rf_slice,
                     .modifiedFiles = mf_slice,
                     .totalChars = totalChars0,

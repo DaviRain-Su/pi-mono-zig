@@ -49,6 +49,7 @@ JSONL entries are now structured (not just plain messages):
 - `type: leaf` (tracks current leaf for branching)
 
 `type: message` supports both zig-native flat fields (`role/content`) and TS nested shape (`message.role/message.content`).
+When writing new sessions, message entries include both shapes for cross-loading compatibility.
 
 ```bash
 # creates/extends a JSONL session
@@ -88,6 +89,9 @@ zig build run -- replay --session /tmp/pi-session.jsonl
 # persist context state entries (TS-style)
 zig build run -- set-model --session /tmp/pi-session.jsonl --provider anthropic --model claude-sonnet-4-5
 zig build run -- set-thinking --session /tmp/pi-session.jsonl --level high
+zig build run -- session-name --session /tmp/pi-session.jsonl --set "Sprint planning"
+zig build run -- session-name --session /tmp/pi-session.jsonl
+zig build run -- session-name --session /tmp/pi-session.jsonl --clear
 
 # show full details for one entry
 zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>

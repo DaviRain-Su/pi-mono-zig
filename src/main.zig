@@ -18,6 +18,7 @@ fn usage() void {
         \\  pi-mono-zig branch-with-summary --session <path.jsonl> [--to <entryId> | --root] [--summary <text>]\n\
         \\  pi-mono-zig set-model --session <path.jsonl> --provider <name> --model <id>\n\
         \\  pi-mono-zig set-thinking --session <path.jsonl> --level <name>\n\
+        \\  pi-mono-zig session-name --session <path.jsonl> [--set <name> | --clear]\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
@@ -2139,9 +2140,19 @@ pub fn main() !void {
                     .message => |m| std.debug.print("message {s} parent={s}\nrole={s}\ncontent={s}\n", .{ m.id, m.parentId orelse "(null)", m.role, m.content }),
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
-                    .branch_summary => |b| std.debug.print("branch_summary {s} parent={s}\nfromId={s}\nsummary=\n{s}\n", .{ b.id, b.parentId orelse "(null)", b.fromId, b.summary }),
-                    .custom => |c| std.debug.print("custom {s} parent={s}\ncustomType={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType }),
-                    .custom_message => |c| std.debug.print("custom_message {s} parent={s}\ncustomType={s}\ndisplay={any}\ncontent={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType, c.display, c.content }),
+                    .branch_summary => |b| {
+                        std.debug.print("branch_summary {s} parent={s}\nfromId={s}\nfromHook={any}\nsummary=\n{s}\n", .{ b.id, b.parentId orelse "(null)", b.fromId, b.fromHook, b.summary });
+                        if (b.detailsJson) |dj| std.debug.print("detailsJson=\n{s}\n", .{dj});
+                    },
+                    .custom => |c| {
+                        std.debug.print("custom {s} parent={s}\ncustomType={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType });
+                        if (c.dataJson) |dj| std.debug.print("dataJson=\n{s}\n", .{dj});
+                    },
+                    .custom_message => |c| {
+                        std.debug.print("custom_message {s} parent={s}\ncustomType={s}\ndisplay={any}\ncontent={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType, c.display, c.content });
+                        if (c.contentJson) |cj| std.debug.print("contentJson=\n{s}\n", .{cj});
+                        if (c.detailsJson) |dj| std.debug.print("detailsJson=\n{s}\n", .{dj});
+                    },
                     .session_info => |s| std.debug.print("session_info {s} parent={s}\nname={s}\n", .{ s.id, s.parentId orelse "(null)", s.name orelse "(null)" }),
                     .thinking_level_change => |t| std.debug.print("thinking_level_change {s} parent={s}\nlevel={s}\n", .{ t.id, t.parentId orelse "(null)", t.thinkingLevel }),
                     .model_change => |m| std.debug.print("model_change {s} parent={s}\nprovider={s}\nmodelId={s}\n", .{ m.id, m.parentId orelse "(null)", m.provider, m.modelId }),
@@ -2172,6 +2183,9 @@ pub fn main() !void {
                         if (s.modifiedFiles) |mf| {
                             std.debug.print("modifiedFiles:\n", .{});
                             for (mf) |p| std.debug.print("- {s}\n", .{p});
+                        }
+                        if (s.detailsJson) |dj| {
+                            std.debug.print("detailsJson=\n{s}\n", .{dj});
                         }
                     },
                     else => {},
@@ -2753,6 +2767,51 @@ pub fn main() !void {
         try sm.ensure();
         const id = try sm.appendThinkingLevelChange(lv);
         std.debug.print("ok: true\nthinkingLevelChangeId: {s}\nlevel: {s}\n", .{ id, lv });
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "session-name")) {
+        var session_path: ?[]const u8 = null;
+        var set_name: ?[]const u8 = null;
+        var clear = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--session")) {
+                session_path = args.next() orelse return error.MissingSession;
+            } else if (std.mem.eql(u8, a, "--set")) {
+                set_name = args.next() orelse return error.MissingLabel;
+            } else if (std.mem.eql(u8, a, "--clear")) {
+                clear = true;
+            } else if (std.mem.eql(u8, a, "--help")) {
+                usage();
+                return;
+            } else {
+                return error.UnknownArg;
+            }
+        }
+        const sp = session_path orelse {
+            usage();
+            return;
+        };
+        if (set_name != null and clear) return error.InvalidSessionNameAction;
+
+        var sm = session.SessionManager.init(allocator, sp, ".");
+        try sm.ensure();
+        if (set_name != null or clear) {
+            const applied_name: ?[]const u8 = if (clear) null else blk: {
+                const trimmed = std.mem.trim(u8, set_name.?, " \t\r\n");
+                if (trimmed.len == 0) return error.InvalidSessionName;
+                break :blk trimmed;
+            };
+            const id = try sm.appendSessionInfo(applied_name);
+            if (clear) {
+                std.debug.print("ok: true\nsessionInfoId: {s}\nname: (null)\n", .{id});
+            } else {
+                std.debug.print("ok: true\nsessionInfoId: {s}\nname: {s}\n", .{ id, applied_name.? });
+            }
+        } else {
+            const cur = try sm.latestSessionName();
+            std.debug.print("ok: true\nname: {s}\n", .{cur orelse "(null)"});
+        }
         return;
     }
 

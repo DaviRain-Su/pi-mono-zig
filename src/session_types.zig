@@ -2,19 +2,32 @@ const std = @import("std");
 
 pub const SessionHeader = struct {
     type: []const u8 = "session",
-    version: u32 = 1,
+    // TS CURRENT_SESSION_VERSION is 3. Writing 3 avoids destructive v1->v2 migration on TS side.
+    version: u32 = 3,
     id: []const u8,
     timestamp: []const u8,
     cwd: []const u8,
 };
 
 pub const MessageEntry = struct {
+    pub const Usage = struct {
+        totalTokens: usize,
+    };
+
+    pub const NestedMessage = struct {
+        role: []const u8,
+        content: []const u8,
+        usage: ?Usage = null,
+    };
+
     type: []const u8 = "message",
     id: []const u8,
     parentId: ?[]const u8 = null,
     timestamp: []const u8,
     role: []const u8, // user|assistant|tool
     content: []const u8,
+    /// TS-compatible nested message payload (kept in sync with top-level role/content).
+    message: ?NestedMessage = null,
 
     /// Optional per-entry usage estimate (best-effort). When present, sizing prefers this.
     tokensEst: ?usize = null,
@@ -72,6 +85,8 @@ pub const BranchSummaryEntry = struct {
     fromId: []const u8,
     summary: []const u8,
     fromHook: ?bool = null,
+    /// Raw JSON string of details (TS extension payload), if present.
+    detailsJson: ?[]const u8 = null,
 };
 
 pub const CustomEntry = struct {
@@ -80,6 +95,8 @@ pub const CustomEntry = struct {
     parentId: ?[]const u8 = null,
     timestamp: []const u8,
     customType: []const u8,
+    /// Raw JSON string of `data`, if present.
+    dataJson: ?[]const u8 = null,
 };
 
 pub const CustomMessageEntry = struct {
@@ -92,6 +109,10 @@ pub const CustomMessageEntry = struct {
     // Non-string content is represented with a marker string.
     content: []const u8,
     display: bool = true,
+    /// Raw JSON string of original `content` value.
+    contentJson: ?[]const u8 = null,
+    /// Raw JSON string of `details`, if present.
+    detailsJson: ?[]const u8 = null,
 };
 
 pub const SessionInfoEntry = struct {
@@ -104,6 +125,10 @@ pub const SessionInfoEntry = struct {
 
 pub const LeafEntry = struct {
     type: []const u8 = "leaf",
+    // TS compatibility: unknown entry types still flow through index/path building.
+    // Give leaf entries ids/parents so TS traversal remains connected.
+    id: ?[]const u8 = null,
+    parentId: ?[]const u8 = null,
     timestamp: []const u8,
     targetId: ?[]const u8,
 };
@@ -111,6 +136,8 @@ pub const LeafEntry = struct {
 pub const LabelEntry = struct {
     type: []const u8 = "label",
     id: []const u8,
+    // TS compatibility: labels are regular tree entries with parent linkage.
+    parentId: ?[]const u8 = null,
     timestamp: []const u8,
     targetId: []const u8,
     label: ?[]const u8, // if null => delete label
@@ -163,6 +190,8 @@ pub const SummaryEntry = struct {
     /// Kept alongside totalTokensEst for backward compatibility with existing zig sessions.
     tokensBefore: ?usize = null,
     fromHook: ?bool = null,
+    /// Raw JSON string of details (TS extension payload), if present.
+    detailsJson: ?[]const u8 = null,
 
     /// Best-effort file ops (TS-style compaction details). Stored on the entry, and may also
     /// be rendered into the content for markdown summaries.
