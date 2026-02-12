@@ -253,6 +253,10 @@ fn migrateSessionFile(
     out_path: ?[]const u8,
     dry_run: bool,
 ) !SessionMigrateStats {
+    var stable_arena = std.heap.ArenaAllocator.init(allocator);
+    defer stable_arena.deinit();
+    const stable_alloc = stable_arena.allocator();
+
     const raw = try readFileAlloc(allocator, session_path);
     var out = try std.ArrayList(u8).initCapacity(allocator, raw.len + 1024);
     defer out.deinit(allocator);
@@ -313,7 +317,7 @@ fn migrateSessionFile(
                     if (!std.mem.eql(u8, t, "session")) {
                         if (obj.get("id")) |idv| {
                             if (valueAsString(idv)) |id| {
-                                last_node_id = id;
+                                last_node_id = try stable_alloc.dupe(u8, id);
                             }
                         }
                     }
@@ -3543,4 +3547,163 @@ pub fn main() !void {
     const run_id = try runner.run(&plan, v);
 
     std.debug.print("ok: true\nrunId: {s}\nout: {s}/{s}\n", .{ run_id, out_dir, run_id });
+}
+
+test "session-migrate backfills core TS compatibility fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_data =
+        \\{"type":"session","version":1,"id":"s_old","timestamp":"1770000000000","cwd":"."}
+        \\{"type":"message","id":"m1","parentId":null,"timestamp":"1770000000001","role":"user","content":"hello"}
+        \\{"type":"leaf","timestamp":"1770000000002","targetId":"m1"}
+        \\{"type":"message","id":"m2","parentId":"m1","timestamp":"1770000000003","message":{"role":"assistant","content":"ok","usage":{"totalTokens":42}}}
+        \\{"type":"label","id":"l1","timestamp":"1770000000004","targetId":"m1","label":"ROOT"}
+        \\
+    ;
+
+    {
+        var f = try tmp.dir.createFile("old.jsonl", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(old_data);
+    }
+
+    const session_abs = try tmp.dir.realpathAlloc(allocator, "old.jsonl");
+
+    const dry_stats = try migrateSessionFile(allocator, session_abs, null, true);
+    try std.testing.expectEqual(@as(usize, 5), dry_stats.totalLines);
+    try std.testing.expectEqual(@as(usize, 0), dry_stats.parseErrors);
+    try std.testing.expectEqual(@as(usize, 5), dry_stats.changedLines);
+    try std.testing.expectEqual(@as(usize, 5), dry_stats.timestampChanged);
+    try std.testing.expectEqual(@as(usize, 1), dry_stats.sessionChanged);
+    try std.testing.expectEqual(@as(usize, 2), dry_stats.messageChanged);
+    try std.testing.expectEqual(@as(usize, 1), dry_stats.leafChanged);
+    try std.testing.expectEqual(@as(usize, 1), dry_stats.labelChanged);
+
+    _ = try migrateSessionFile(allocator, session_abs, null, false);
+
+    const migrated = try readFileAlloc(allocator, session_abs);
+
+    var lines = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, migrated, '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        try lines.append(allocator, ln);
+    }
+    try std.testing.expectEqual(@as(usize, 5), lines.items.len);
+
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[0], .{});
+        defer p.deinit();
+        const o = switch (p.value) {
+            .object => |obj| obj,
+            else => return error.TestUnexpectedResult,
+        };
+        const ver = if (o.get("version")) |vv| switch (vv) {
+            .integer => |x| x,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(i64, 3), ver);
+        const ts = if (o.get("timestamp")) |tv| valueAsString(tv) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOfScalar(u8, ts, 'T') != null);
+        try std.testing.expect(std.mem.endsWith(u8, ts, "Z"));
+    }
+
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[1], .{});
+        defer p.deinit();
+        const o = switch (p.value) {
+            .object => |obj| obj,
+            else => return error.TestUnexpectedResult,
+        };
+        const msgv = o.get("message") orelse return error.TestUnexpectedResult;
+        switch (msgv) {
+            .object => |mobj| {
+                const role = if (mobj.get("role")) |rv| valueAsString(rv) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+                const content = if (mobj.get("content")) |cv| valueAsString(cv) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings("user", role);
+                try std.testing.expectEqualStrings("hello", content);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[2], .{});
+        defer p.deinit();
+        const o = switch (p.value) {
+            .object => |obj| obj,
+            else => return error.TestUnexpectedResult,
+        };
+        const leaf_id = if (o.get("id")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        const leaf_pid = if (o.get("parentId")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        try std.testing.expect(leaf_id.len > 0);
+        try std.testing.expectEqualStrings("m1", leaf_pid);
+    }
+
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[3], .{});
+        defer p.deinit();
+        const o = switch (p.value) {
+            .object => |obj| obj,
+            else => return error.TestUnexpectedResult,
+        };
+        const role = if (o.get("role")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        const content = if (o.get("content")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        const utt = if (o.get("usageTotalTokens")) |v| valueAsUsize(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("assistant", role);
+        try std.testing.expectEqualStrings("ok", content);
+        try std.testing.expectEqual(@as(usize, 42), utt);
+    }
+
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, allocator, lines.items[4], .{});
+        defer p.deinit();
+        const o = switch (p.value) {
+            .object => |obj| obj,
+            else => return error.TestUnexpectedResult,
+        };
+        const label_pid = if (o.get("parentId")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("m2", label_pid);
+    }
+}
+
+test "session-migrate supports --out style non-destructive migration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_data =
+        \\{"type":"session","version":1,"id":"s_old","timestamp":"1770000000000","cwd":"."}
+        \\{"type":"message","id":"m1","parentId":null,"timestamp":"1770000000001","role":"user","content":"hello"}
+        \\
+    ;
+
+    {
+        var f = try tmp.dir.createFile("src.jsonl", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(old_data);
+    }
+    {
+        var f = try tmp.dir.createFile("out.jsonl", .{ .truncate = true });
+        defer f.close();
+    }
+
+    const src_abs = try tmp.dir.realpathAlloc(allocator, "src.jsonl");
+    const out_abs = try tmp.dir.realpathAlloc(allocator, "out.jsonl");
+
+    _ = try migrateSessionFile(allocator, src_abs, out_abs, false);
+
+    const src_after = try readFileAlloc(allocator, src_abs);
+    const out_after = try readFileAlloc(allocator, out_abs);
+
+    try std.testing.expect(std.mem.indexOf(u8, src_after, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_after, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_after, "\"message\":") != null);
 }
