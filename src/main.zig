@@ -4060,3 +4060,142 @@ test "session-migrate supports --out style non-destructive migration" {
     try std.testing.expect(std.mem.indexOf(u8, out_after, "\"version\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_after, "\"message\":") != null);
 }
+
+test "estimateBoundaryTokens uses assistant usage snapshot with trailing estimates" {
+    const entries = [_]st.Entry{
+        .{ .message = .{
+            .id = "m0",
+            .timestamp = "t0",
+            .role = "user",
+            .content = "hi",
+        } },
+        .{ .message = .{
+            .id = "m1",
+            .timestamp = "t1",
+            .role = "assistant",
+            .content = "assistant summary",
+            .usageTotalTokens = 120,
+        } },
+        .{ .tool_call = .{
+            .id = "tc1",
+            .timestamp = "t2",
+            .tool = "shell",
+            .arg = "echo hi",
+        } },
+        .{ .tool_result = .{
+            .id = "tr1",
+            .timestamp = "t3",
+            .tool = "shell",
+            .ok = true,
+            .content = "ok",
+        } },
+    };
+
+    const est = estimateBoundaryTokens(&entries, 0);
+    try std.testing.expectEqual(@as(usize, 120), est.usageTokens);
+    try std.testing.expectEqual(@as(usize, 19), est.trailingTokens); // 10 + 9
+    try std.testing.expectEqual(@as(usize, 139), est.tokens);
+    try std.testing.expectEqual(@as(?usize, 1), est.lastUsageIndex);
+
+    const est_tail = estimateBoundaryTokens(&entries, 2);
+    try std.testing.expectEqual(@as(usize, 0), est_tail.usageTokens);
+    try std.testing.expectEqual(@as(usize, 19), est_tail.trailingTokens);
+    try std.testing.expectEqual(@as(usize, 19), est_tail.tokens);
+}
+
+test "collectBranchSummaryFileOps scans shell commands and detail payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const entries = [_]st.Entry{
+        .{ .tool_call = .{
+            .id = "tc_read",
+            .timestamp = "t0",
+            .tool = "shell",
+            .arg = "cat src/main.zig",
+        } },
+        .{ .tool_call = .{
+            .id = "tc_write",
+            .timestamp = "t1",
+            .tool = "shell",
+            .arg = "echo hello > src/out.txt",
+        } },
+        .{ .summary = .{
+            .id = "s1",
+            .timestamp = "t2",
+            .summary = "old summary",
+            .readFiles = &.{ "old-read.md" },
+            .modifiedFiles = &.{ "old-mod.md" },
+            .fromHook = false,
+        } },
+        .{ .summary = .{
+            .id = "s2",
+            .timestamp = "t3",
+            .summary = "ignored summary",
+            .fromHook = true,
+            .readFiles = &.{ "ignored.md" },
+        } },
+        .{ .summary = .{
+            .id = "s3",
+            .timestamp = "t4",
+            .summary = "old summary with details",
+            .detailsJson = "{\"readFiles\":[\"old-detail-read.md\"],\"modifiedFiles\":[\"old-detail-mod.md\"]}",
+        } },
+        .{ .branch_summary = .{
+            .id = "bs1",
+            .timestamp = "t5",
+            .fromId = "from1",
+            .summary = "branch summary",
+            .detailsJson = "{\"readFiles\":[\"bs-read.txt\"],\"modifiedFiles\":[\"bs-mod.txt\"]}",
+            .fromHook = null,
+        } },
+    };
+
+    const ops = try collectBranchSummaryFileOps(allocator, &entries);
+
+    var seen_read = false;
+    var seen_old_read = false;
+    var seen_detail_read = false;
+    var seen_bs_read = false;
+    for (ops.readFiles) |path| {
+        if (std.mem.eql(u8, path, "src/main.zig")) seen_read = true;
+        if (std.mem.eql(u8, path, "old-read.md")) seen_old_read = true;
+        if (std.mem.eql(u8, path, "old-detail-read.md")) seen_detail_read = true;
+        if (std.mem.eql(u8, path, "bs-read.txt")) seen_bs_read = true;
+    }
+    try std.testing.expect(seen_read);
+    try std.testing.expect(seen_old_read);
+    try std.testing.expect(seen_detail_read);
+    try std.testing.expect(seen_bs_read);
+
+    var seen_mod = false;
+    var seen_old_mod = false;
+    var seen_bs_mod = false;
+    for (ops.modifiedFiles) |path| {
+        if (std.mem.eql(u8, path, "src/out.txt")) seen_mod = true;
+        if (std.mem.eql(u8, path, "old-mod.md")) seen_old_mod = true;
+        if (std.mem.eql(u8, path, "bs-mod.txt")) seen_bs_mod = true;
+    }
+    try std.testing.expect(seen_mod);
+    try std.testing.expect(seen_old_mod);
+    try std.testing.expect(seen_bs_mod);
+
+    const details = try branchSummaryDetailsJson(
+        allocator,
+        ops.readFiles,
+        ops.modifiedFiles,
+    ) orelse "";
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, details, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.TestUnexpectedResult,
+    };
+    const reads = switch (obj.get("readFiles") orelse return error.TestUnexpectedResult) {
+        .array => |a| a.items,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(reads.len >= 4);
+}
