@@ -523,16 +523,27 @@ const ShellFileOps = struct {
     ) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, details_json, .{}) catch return;
         defer parsed.deinit();
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => return,
-        };
 
-        if (obj.get("readFiles")) |v| switch (v) {
+        var obj: ?std.json.ObjectMap = null;
+        switch (parsed.value) {
+            .object => |o| obj = o,
+            .string => |s| {
+                var inner = std.json.parseFromSlice(std.json.Value, alloc, s, .{}) catch return;
+                defer inner.deinit();
+                switch (inner.value) {
+                    .object => |o| obj = o,
+                    else => return,
+                }
+            },
+            else => return,
+        }
+        const details_obj = obj orelse return;
+
+        if (details_obj.get("readFiles")) |v| switch (v) {
             .array => |a| appendFromArray(alloc, read_files, seen_rf, a, 200),
             else => {},
         };
-        if (obj.get("modifiedFiles")) |v| switch (v) {
+        if (details_obj.get("modifiedFiles")) |v| switch (v) {
             .array => |a| appendFromArray(alloc, modified_files, seen_mf, a, 200),
             else => {},
         };

@@ -130,3 +130,90 @@ pub const AgentLoop = struct {
         }
     }
 };
+
+test "agent loop propagates model-change metadata into assistant turns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const session_path = try std.fs.path.join(allocator, &.{ tmp_root, "agent-model.jsonl" });
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("user", "plan tasks");
+    _ = try sm.appendModelChange("openai", "gpt-4.1");
+
+    var bus = events.EventBus.init(allocator);
+    var tools_reg = tools.ToolRegistry.init(allocator);
+    var loop = AgentLoop.init(allocator, &sm, &tools_reg, &bus);
+
+    const done = try loop.step();
+    try std.testing.expect(done);
+
+    const entries = try sm.loadEntries();
+    var provider: ?[]const u8 = null;
+    var model: ?[]const u8 = null;
+    for (entries) |e| {
+        if (e == .message) {
+            const m = e.message;
+            if (std.mem.eql(u8, m.role, "assistant")) {
+                provider = m.provider;
+                model = m.model;
+            }
+        }
+    }
+
+    try std.testing.expect(provider != null);
+    try std.testing.expect(model != null);
+    try std.testing.expectEqualStrings("openai", provider.?);
+    try std.testing.expectEqualStrings("gpt-4.1", model.?);
+}
+
+test "agent loop falls back to latest assistant metadata when no model-change entry exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const session_path = try std.fs.path.join(allocator, &.{ tmp_root, "agent-assistant-meta.jsonl" });
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessageWithMeta("assistant", "prefill", null, null);
+    // attach model metadata to latest assistant context to validate fallback behavior
+    const raw = try sm.appendMessageWithMetaAndModel("assistant", "prefill", null, null, "local", "mini");
+    _ = raw;
+    _ = try sm.appendMessage("user", "next task");
+
+    var bus = events.EventBus.init(allocator);
+    var tools_reg = tools.ToolRegistry.init(allocator);
+    var loop = AgentLoop.init(allocator, &sm, &tools_reg, &bus);
+
+    const done = try loop.step();
+    try std.testing.expect(done);
+
+    const entries = try sm.loadEntries();
+    var provider: ?[]const u8 = null;
+    var model: ?[]const u8 = null;
+    for (entries) |e| {
+        if (e == .message) {
+            const m = e.message;
+            if (std.mem.eql(u8, m.role, "assistant")) {
+                provider = m.provider;
+                model = m.model;
+            }
+        }
+    }
+
+    try std.testing.expect(provider != null);
+    try std.testing.expect(model != null);
+    try std.testing.expectEqualStrings("local", provider.?);
+    try std.testing.expectEqualStrings("mini", model.?);
+}

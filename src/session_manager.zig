@@ -862,7 +862,12 @@ pub const SessionManager = struct {
                     .bool => |b| @as(?bool, b),
                     else => null,
                 } else null;
-                const details_json0 = if (obj.get("details")) |v| try jsonValueToString(self.arena, v) else null;
+                const details_json0 = if (obj.get("details")) |v|
+                    try jsonValueToString(self.arena, v)
+                else if (obj.get("detailsJson")) |v|
+                    try jsonValueToString(self.arena, v)
+                else
+                    null;
                 const id = try dup.s(self.arena, id0);
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
@@ -1172,9 +1177,17 @@ pub const SessionManager = struct {
                     .bool => |b| @as(?bool, b),
                     else => null,
                 } else null;
-                const detailsJson0 = if (obj.get("details")) |v| try jsonValueToString(self.arena, v) else null;
+                const detailsJson0 = if (obj.get("details")) |v|
+                    try jsonValueToString(self.arena, v)
+                else if (obj.get("detailsJson")) |v|
+                    try jsonValueToString(self.arena, v)
+                else
+                    null;
 
                 const details_obj = if (obj.get("details")) |dv| switch (dv) {
+                    .object => |o| @as(?std.json.ObjectMap, o),
+                    else => null,
+                } else if (obj.get("detailsJson")) |dv| switch (dv) {
                     .object => |o| @as(?std.json.ObjectMap, o),
                     else => null,
                 } else null;
@@ -1408,3 +1421,200 @@ pub const SessionManager = struct {
         return try out.toOwnedSlice(self.arena);
     }
 };
+
+test "loadEntries restores model/thinking changes and branch summary details" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const session_path = try std.fs.path.join(allocator, &.{ tmp_root, "session.jsonl" });
+    var sm = SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("user", "hi");
+    _ = try sm.appendModelChange("openai", "gpt-4.1");
+    _ = try sm.appendThinkingLevelChange("high");
+    const details = "{\"readFiles\":[\"foo.txt\"],\"modifiedFiles\":[\"bar.txt\"]}";
+    _ = try sm.appendBranchSummaryWithDetails(
+        "from-id",
+        "branch checkpoint",
+        details,
+        false,
+    );
+
+    const entries = try sm.loadEntries();
+    try std.testing.expect(entries.len > 0);
+
+    var seen_model = false;
+    var seen_thinking = false;
+    var seen_branch = false;
+    for (entries) |e| {
+        switch (e) {
+            .model_change => |m| {
+                seen_model = true;
+                try std.testing.expectEqualStrings("openai", m.provider);
+                try std.testing.expectEqualStrings("gpt-4.1", m.modelId);
+            },
+            .thinking_level_change => |t| {
+                seen_thinking = true;
+                try std.testing.expectEqualStrings("high", t.thinkingLevel);
+            },
+            .branch_summary => |b| {
+                seen_branch = true;
+                try std.testing.expectEqualStrings("from-id", b.fromId);
+                try std.testing.expectEqualStrings("branch checkpoint", b.summary);
+                try std.testing.expectEqual(@as(?bool, false), b.fromHook);
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, b.detailsJson.?, .{});
+                defer parsed.deinit();
+                switch (parsed.value) {
+                    .string => |s| try std.testing.expectEqualStrings(details, s),
+                    .object => |obj| {
+                        const expected = try std.json.parseFromSlice(std.json.Value, allocator, details, .{});
+                        defer expected.deinit();
+                        const exp_obj = switch (expected.value) {
+                            .object => |o| o,
+                            else => return,
+                        };
+                        var seen_read = false;
+                        var seen_mod = false;
+
+                        if (obj.get("readFiles")) |v| {
+                            if (exp_obj.get("readFiles")) |exp_v| {
+                                switch (v) {
+                                    .array => |got_arr| switch (exp_v) {
+                                        .array => |exp_arr| {
+                                            if (got_arr.items.len == exp_arr.items.len) {
+                                                seen_read = true;
+                                                for (got_arr.items, 0..) |it, idx| {
+                                                    switch (it) {
+                                                        .string => |got_s| switch (exp_arr.items[idx]) {
+                                                            .string => |exp_s| {
+                                                                if (!std.mem.eql(u8, got_s, exp_s)) {
+                                                                    seen_read = false;
+                                                                    break;
+                                                                }
+                                                            },
+                                                            else => {
+                                                                seen_read = false;
+                                                                break;
+                                                            },
+                                                        },
+                                                        else => {
+                                                            seen_read = false;
+                                                            break;
+                                                        },
+                                                    }
+                                                    if (!seen_read) break;
+                                                }
+                                            }
+                                        },
+                                        else => {},
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                        if (obj.get("modifiedFiles")) |v| {
+                            if (exp_obj.get("modifiedFiles")) |exp_v| {
+                                switch (v) {
+                                    .array => |got_arr| switch (exp_v) {
+                                        .array => |exp_arr| {
+                                            if (got_arr.items.len == exp_arr.items.len) {
+                                                seen_mod = true;
+                                                for (got_arr.items, 0..) |it, idx| {
+                                                    switch (it) {
+                                                        .string => |got_s| switch (exp_arr.items[idx]) {
+                                                            .string => |exp_s| {
+                                                                if (!std.mem.eql(u8, got_s, exp_s)) {
+                                                                    seen_mod = false;
+                                                                    break;
+                                                                }
+                                                            },
+                                                            else => {
+                                                                seen_mod = false;
+                                                                break;
+                                                            },
+                                                        },
+                                                        else => {
+                                                            seen_mod = false;
+                                                            break;
+                                                        },
+                                                    }
+                                                    if (!seen_mod) break;
+                                                }
+                                            }
+                                        },
+                                        else => {},
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                        try std.testing.expect(seen_read);
+                        try std.testing.expect(seen_mod);
+                    },
+                    else => return,
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(seen_model);
+    try std.testing.expect(seen_thinking);
+    try std.testing.expect(seen_branch);
+}
+
+test "buildContextEntries keeps model and thinking entries while filtering structural noise" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const session_path = try std.fs.path.join(allocator, &.{ tmp_root, "session_context.jsonl" });
+    var sm = SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("user", "hello");
+    _ = try sm.appendModelChange("openai", "gpt-4.1");
+    const thinking_id = try sm.appendThinkingLevelChange("med");
+    _ = try sm.appendTurnStart(1, null, null, "step");
+    _ = try sm.setLabel(thinking_id, "phase");
+
+    const context = try sm.buildContextEntries();
+    try std.testing.expectEqual(@as(usize, 3), context.len);
+
+    var seen_user = false;
+    var seen_model = false;
+    var seen_thinking = false;
+    for (context) |e| {
+        switch (e) {
+            .message => |m| {
+                if (std.mem.eql(u8, m.role, "user")) seen_user = true;
+            },
+            .model_change => {
+                seen_model = true;
+            },
+            .thinking_level_change => {
+                seen_thinking = true;
+            },
+            .turn_start, .label, .turn_end, .leaf, .session => {
+                try std.testing.expect(false);
+            },
+            else => {
+                try std.testing.expect(false);
+            },
+        }
+    }
+
+    try std.testing.expect(seen_user);
+    try std.testing.expect(seen_model);
+    try std.testing.expect(seen_thinking);
+}
