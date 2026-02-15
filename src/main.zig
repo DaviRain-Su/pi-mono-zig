@@ -2621,6 +2621,27 @@ fn collectEntryIds(allocator: std.mem.Allocator, entries: []const st.Entry) ![]c
     return try out.toOwnedSlice(allocator);
 }
 
+fn parentIdOfEntry(e: st.Entry) ?[]const u8 {
+    return switch (e) {
+        .session => null,
+        .message => |m| m.parentId,
+        .tool_call => |tc| tc.parentId,
+        .tool_result => |tr| tr.parentId,
+        .turn_start => |ts| ts.parentId,
+        .turn_end => |te| te.parentId,
+        .thinking_level_change => |tl| tl.parentId,
+        .model_change => |mc| mc.parentId,
+        .compaction => |c| c.parentId,
+        .branch_summary => |b| b.parentId,
+        .custom => |c| c.parentId,
+        .custom_message => |cm| cm.parentId,
+        .session_info => |si| si.parentId,
+        .leaf => null,
+        .label => null,
+        .summary => |s| s.parentId,
+    };
+}
+
 fn entryById(entries: []const st.Entry, target_id: []const u8) ?st.Entry {
     for (entries) |e| {
         if (st.idOf(e)) |eid| {
@@ -2628,6 +2649,19 @@ fn entryById(entries: []const st.Entry, target_id: []const u8) ?st.Entry {
         }
     }
     return null;
+}
+
+fn writeSessionLines(allocator: std.mem.Allocator, path: []const u8, lines: []const []const u8) !void {
+    _ = allocator;
+    const io = compatIo();
+    const cwd = compatCwd();
+    var f = try cwd.createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    var offset: usize = 0;
+    for (lines) |line| {
+        try f.writePositionalAll(io, line, offset);
+        offset += line.len;
+    }
 }
 
 test "command output: replay includes messages/tools and json summary" {
@@ -2799,6 +2833,114 @@ test "buildSessionContext converts compaction and branch/custom messages" {
     try std.testing.expect(!saw_raw_custom);
     // messages before firstKeptEntryId are trimmed by compaction window.
     try std.testing.expect(!saw_dropped);
+}
+
+test "loadEntries migrates legacy v1 entries, ids and parentId links" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "legacy_load_entries");
+    defer cleanupTempSession(session_path);
+
+    const raw_lines = [_][]const u8{
+        "{\"type\":\"session\",\"id\":\"legacy-sess\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\".\"}\n",
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":\"old user\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n",
+        "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"old asst\",\"timestamp\":\"2026-01-01T00:00:02Z\"}\n",
+        "{\"type\":\"tool_call\",\"tool\":\"bash\",\"arg\":\"-l\",\"timestamp\":\"2026-01-01T00:00:03Z\"}\n",
+        "{\"type\":\"tool_result\",\"tool\":\"bash\",\"ok\":true,\"content\":\"ok\",\"timestamp\":\"2026-01-01T00:00:04Z\"}\n",
+        "{\"type\":\"compaction\",\"summary\":\"legacy compact\",\"tokensBefore\":77,\"firstKeptEntryIndex\":2,\"timestamp\":\"2026-01-01T00:00:05Z\"}\n",
+    };
+
+    try writeSessionLines(allocator, session_path, &raw_lines);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    const entries = try sm.loadEntries();
+
+    try std.testing.expectEqual(@as(usize, 6), entries.len);
+
+    const ids = try collectEntryIds(allocator, entries);
+    try std.testing.expect(ids.len >= 5);
+
+    const session_id = switch (entries[0]) {
+        .session => |s| s.id,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const msg1_id = st.idOf(entries[1]).?;
+    const msg2_id = st.idOf(entries[2]).?;
+    const tc_id = st.idOf(entries[3]).?;
+    const tr_id = st.idOf(entries[4]).?;
+
+    // Header defaults to legacy v1 when version is absent.
+    switch (entries[0]) {
+        .session => |s| {
+            try std.testing.expectEqual(@as(u32, 1), s.version);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // First message parent is the session id.
+    try std.testing.expect(parentIdOfEntry(entries[1]) != null);
+    try std.testing.expect(std.mem.eql(u8, parentIdOfEntry(entries[1]).?, session_id));
+    // v1 entries fallback to implicit previous id when parentId is omitted.
+    try std.testing.expect(std.mem.eql(u8, parentIdOfEntry(entries[2]).?, msg1_id));
+    try std.testing.expect(std.mem.eql(u8, parentIdOfEntry(entries[3]).?, msg2_id));
+    try std.testing.expect(std.mem.eql(u8, parentIdOfEntry(entries[4]).?, tc_id));
+    try std.testing.expect(std.mem.eql(u8, parentIdOfEntry(entries[5]).?, tr_id));
+
+    switch (entries[5]) {
+        .compaction => |c| {
+            // firstKeptEntryIndex should remap from legacy index to new entry id.
+            try std.testing.expect(std.mem.eql(u8, c.firstKeptEntryId, msg2_id));
+            try std.testing.expectEqual(@as(usize, 77), c.tokensBefore);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "loadEntries migrates hookMessage role for legacy version" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const legacy_path = try makeTempSessionPath(allocator, "legacy_hook_message");
+    defer cleanupTempSession(legacy_path);
+
+    const modern_path = try makeTempSessionPath(allocator, "modern_hook_message");
+    defer cleanupTempSession(modern_path);
+
+    const legacy_lines = [_][]const u8{
+        "{\"type\":\"session\",\"version\":2,\"id\":\"sess-v2\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\".\"}\n",
+        "{\"type\":\"message\",\"role\":\"hookMessage\",\"content\":\"legacy hook\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n",
+    };
+    const modern_lines = [_][]const u8{
+        "{\"type\":\"session\",\"version\":3,\"id\":\"sess-v3\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\".\"}\n",
+        "{\"type\":\"message\",\"role\":\"hookMessage\",\"content\":\"modern hook\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n",
+    };
+
+    try writeSessionLines(allocator, legacy_path, &legacy_lines);
+    try writeSessionLines(allocator, modern_path, &modern_lines);
+
+    var sm_legacy = session.SessionManager.init(allocator, legacy_path, ".");
+    const legacy_entries = try sm_legacy.loadEntries();
+    switch (legacy_entries[1]) {
+        .message => |m| try std.testing.expect(std.mem.eql(u8, m.role, "custom")),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var sm_modern = session.SessionManager.init(allocator, modern_path, ".");
+    const modern_entries = try sm_modern.loadEntries();
+    switch (modern_entries[1]) {
+        .message => |m| try std.testing.expect(std.mem.eql(u8, m.role, "hookMessage")),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "tokensEstForEntry should use usageTotalTokens when present" {

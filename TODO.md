@@ -33,7 +33,7 @@
 ### 1.2 session header 与迁移（文件：`src/session_manager.zig` + `src/session_types.zig`）
 - [x] `SessionHeader` 加 `version`。
 - [x] 实现 `parentSession` 字段（用于 fork）支持。
-- [ ] 增加基础迁移：`v1 -> v2 -> v3`（或至少兼容旧头与旧字段）。
+- [x] 增加基础迁移：`v1 -> v2 -> v3`（或至少兼容旧头与旧字段）。
 
 ### 1.3 上下文构建（文件：`src/session_manager.zig`）
 - [x] 引入 `buildSessionContext` 近似 TS 语义：

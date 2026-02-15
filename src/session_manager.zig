@@ -407,6 +407,19 @@ pub const SessionManager = struct {
         var out = try std.ArrayList(Entry).initCapacity(self.arena, 0);
         defer out.deinit(self.arena);
 
+        const LegacyCompactionPatch = struct {
+            out_index: usize,
+            legacy_index: usize,
+        };
+
+        var legacy_index_to_id = try std.ArrayList(?[]const u8).initCapacity(self.arena, 0);
+        defer legacy_index_to_id.deinit(self.arena);
+        var legacy_prev_id: ?[]const u8 = null;
+        var pending_compaction = try std.ArrayList(LegacyCompactionPatch).initCapacity(self.arena, 0);
+        defer pending_compaction.deinit(self.arena);
+
+        var file_version: u32 = 1;
+
         var it = std.mem.splitScalar(u8, bytes_read, '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
@@ -431,11 +444,53 @@ pub const SessionManager = struct {
                 }
             };
 
-            if (std.mem.eql(u8, typ, "message")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+            const legacy_line_index: ?usize = if (file_version < 2) blk: {
+                const idx = legacy_index_to_id.items.len;
+                try legacy_index_to_id.append(self.arena, null);
+                break :blk idx;
+            } else null;
+
+            if (std.mem.eql(u8, typ, "session")) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
+                const ts0 = if (obj.get("timestamp")) |v| switch (v) {
+                    .string => |s| s,
+                    else => null,
+                } else null;
+                const cwd0 = if (obj.get("cwd")) |v| switch (v) {
+                    .string => |s| s,
+                    else => null,
+                } else null;
+                const version0: u32 = if (obj.get("version")) |v| switch (v) {
+                    .integer => |x| @as(u32, @intCast(x)),
+                    else => 1,
+                } else 1;
+                const parent_session0 = if (obj.get("parentSession")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null;
+
+                file_version = version0;
+
+                const id = try dup.os(self.arena, id0) orelse try self.newId();
+                const ts = try dup.os(self.arena, ts0) orelse try nowIso(self.arena);
+                const file_cwd = try dup.os(self.arena, cwd0) orelse ".";
+                const parent_session = try dup.os(self.arena, parent_session0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
+                try out.append(self.arena, .{ .session = .{ .id = id, .version = version0, .timestamp = ts, .cwd = file_cwd, .parentSession = parent_session } });
+                continue;
+            }
+
+            if (std.mem.eql(u8, typ, "message")) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
+                    .string => |s| s,
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -448,6 +503,8 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
                 const content0 = switch (obj.get("content") orelse continue) {
                     .string => |s| s,
                     else => continue,
@@ -472,23 +529,29 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
-                const role = try dup.s(self.arena, role0);
+                const role = if (file_version < 3 and std.mem.eql(u8, role0, "hookMessage"))
+                    "custom"
+                else
+                    role0;
+                const role_dup = try dup.s(self.arena, role);
                 const content = try dup.s(self.arena, content0);
                 const details_json = try dup.os(self.arena, details_json0);
                 const model = try dup.os(self.arena, model0);
                 const thinking = try dup.os(self.arena, thinking0);
-                try out.append(self.arena, .{ .message = .{ .id = id, .parentId = pid, .timestamp = ts, .role = role, .content = content, .tokensEst = tokens_est0, .usageTotalTokens = usage_total_tokens0, .detailsJson = details_json, .model = model, .thinking = thinking } });
+                try out.append(self.arena, .{ .message = .{ .id = id, .parentId = pid, .timestamp = ts, .role = role_dup, .content = content, .tokensEst = tokens_est0, .usageTotalTokens = usage_total_tokens0, .detailsJson = details_json, .model = model, .thinking = thinking } });
                 continue;
             }
 
             if (std.mem.eql(u8, typ, "tool_call")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -509,8 +572,12 @@ pub const SessionManager = struct {
                     .integer => |x| @as(?usize, @intCast(x)),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const tool = try dup.s(self.arena, tool0);
                 const arg = try dup.s(self.arena, arg0);
@@ -519,10 +586,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "tool_result")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -547,8 +614,12 @@ pub const SessionManager = struct {
                     .integer => |x| @as(?usize, @intCast(x)),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const tool = try dup.s(self.arena, tool0);
                 const content = try dup.s(self.arena, content0);
@@ -557,10 +628,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "turn_start")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -585,8 +656,12 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const um = try dup.os(self.arena, um0);
                 const tg = try dup.os(self.arena, tg0);
@@ -596,10 +671,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "turn_end")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -624,8 +699,12 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const um = try dup.os(self.arena, um0);
                 const tg = try dup.os(self.arena, tg0);
@@ -635,10 +714,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "thinking_level_change")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -651,8 +730,12 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const thinking = try dup.s(self.arena, thinking0);
                 try out.append(self.arena, .{ .thinking_level_change = .{ .id = id, .parentId = pid, .timestamp = ts, .thinkingLevel = thinking } });
@@ -660,10 +743,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "model_change")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -680,8 +763,12 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const provider = try dup.s(self.arena, provider0);
                 const model_id = try dup.s(self.arena, model_id0);
@@ -690,10 +777,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "compaction")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -706,10 +793,14 @@ pub const SessionManager = struct {
                     .string => |s| s,
                     else => continue,
                 };
-                const first_kept0 = switch (obj.get("firstKeptEntryId") orelse continue) {
+                const first_kept0 = if (obj.get("firstKeptEntryId")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
+                const first_kept_index0 = if (obj.get("firstKeptEntryIndex")) |v| switch (v) {
+                    .integer => |x| x,
+                    else => null,
+                } else null;
                 const tokens_before0 = switch (obj.get("tokensBefore") orelse continue) {
                     .integer => |x| x,
                     else => continue,
@@ -722,22 +813,35 @@ pub const SessionManager = struct {
                     .bool => |b| b,
                     else => false,
                 } else false;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const summary = try dup.s(self.arena, summary0);
-                const firstKept = try dup.s(self.arena, first_kept0);
-                const details = try dup.os(self.arena, details0);
+                const firstKept = try dup.s(self.arena, first_kept0 orelse "");
+                const out_index = out.items.len;
                 const tokens_before = @as(usize, @intCast(tokens_before0));
+                const details = try dup.os(self.arena, details0);
                 try out.append(self.arena, .{ .compaction = .{ .id = id, .parentId = pid, .timestamp = ts, .summary = summary, .firstKeptEntryId = firstKept, .tokensBefore = tokens_before, .details = details, .fromHook = from_hook0 } });
+                if (first_kept0 == null) {
+                    if (first_kept_index0) |idx| {
+                        if (idx >= 0) {
+                            const legacy_index = @as(usize, @intCast(idx));
+                            try pending_compaction.append(self.arena, .{ .out_index = out_index, .legacy_index = legacy_index });
+                        }
+                    }
+                }
                 continue;
             }
 
             if (std.mem.eql(u8, typ, "branch_summary")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -762,8 +866,12 @@ pub const SessionManager = struct {
                     .bool => |b| b,
                     else => false,
                 } else false;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const from_id = try dup.s(self.arena, from_id0);
                 const summary = try dup.s(self.arena, summary0);
@@ -773,10 +881,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "custom")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -793,8 +901,12 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const custom_type = try dup.s(self.arena, custom_type0);
                 const data = try dup.os(self.arena, data0);
@@ -803,10 +915,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "custom_message")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -831,8 +943,12 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const custom_type = try dup.s(self.arena, custom_type0);
                 const content = try dup.s(self.arena, content0);
@@ -842,10 +958,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "session_info")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -858,8 +974,12 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const name = try dup.os(self.arena, name0);
                 try out.append(self.arena, .{ .session_info = .{ .id = id, .parentId = pid, .timestamp = ts, .name = name } });
@@ -882,10 +1002,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "label")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const ts0 = switch (obj.get("timestamp") orelse continue) {
                     .string => |s| s,
                     else => continue,
@@ -898,7 +1018,7 @@ pub const SessionManager = struct {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
                 } else null;
-                const id = try dup.s(self.arena, id0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
                 const ts = try dup.s(self.arena, ts0);
                 const targetId = try dup.s(self.arena, target0);
                 const label = try dup.os(self.arena, label0);
@@ -907,10 +1027,10 @@ pub const SessionManager = struct {
             }
 
             if (std.mem.eql(u8, typ, "summary")) {
-                const id0 = switch (obj.get("id") orelse continue) {
+                const id0 = if (obj.get("id")) |v| switch (v) {
                     .string => |s| s,
-                    else => continue,
-                };
+                    else => null,
+                } else null;
                 const pid0 = if (obj.get("parentId")) |v| switch (v) {
                     .string => |s| @as(?[]const u8, s),
                     else => null,
@@ -957,8 +1077,12 @@ pub const SessionManager = struct {
                     else => null,
                 } else null;
 
-                const id = try dup.s(self.arena, id0);
-                const pid = try dup.os(self.arena, pid0);
+                const id = try dup.s(self.arena, if (id0) |s| s else try self.newId());
+                const pid = if (file_version < 2) (if (pid0) |p| try dup.s(self.arena, p) else legacy_prev_id) else try dup.os(self.arena, pid0);
+                if (file_version < 2) {
+                    if (legacy_line_index) |li| legacy_index_to_id.items[li] = id;
+                    legacy_prev_id = id;
+                }
                 const ts = try dup.s(self.arena, ts0);
                 const reason = try dup.os(self.arena, reason0);
                 const format = try dup.s(self.arena, format0);
@@ -982,6 +1106,19 @@ pub const SessionManager = struct {
             }
 
             // ignore unknown types for forward compatibility
+        }
+
+        if (file_version < 2) {
+            for (pending_compaction.items) |patch| {
+                if (patch.legacy_index < legacy_index_to_id.items.len) {
+                    if (legacy_index_to_id.items[patch.legacy_index]) |legacy_id| {
+                        switch (out.items[patch.out_index]) {
+                            .compaction => |*c| c.firstKeptEntryId = legacy_id,
+                            else => {},
+                        }
+                    }
+                }
+            }
         }
 
         return try out.toOwnedSlice(self.arena);
