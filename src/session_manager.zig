@@ -495,7 +495,13 @@ pub const SessionManager = struct {
         return id;
     }
 
-    pub fn appendBranchSummary(self: *SessionManager, from_id: []const u8, summary: []const u8) ![]const u8 {
+    pub fn appendBranchSummaryWithDetails(
+        self: *SessionManager,
+        from_id: []const u8,
+        summary: []const u8,
+        details_json: ?[]const u8,
+        from_hook: ?bool,
+    ) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
         const entry = BranchSummaryEntry{
@@ -504,12 +510,16 @@ pub const SessionManager = struct {
             .timestamp = try nowIso(self.arena),
             .fromId = from_id,
             .summary = summary,
-            .fromHook = null,
-            .detailsJson = null,
+            .fromHook = from_hook,
+            .detailsJson = details_json,
         };
         try json_util.appendJsonLine(self.session_path, entry);
         try self.setLeaf(id);
         return id;
+    }
+
+    pub fn appendBranchSummary(self: *SessionManager, from_id: []const u8, summary: []const u8) ![]const u8 {
+        return self.appendBranchSummaryWithDetails(from_id, summary, null, false);
     }
 
     pub fn appendSessionInfo(self: *SessionManager, name: ?[]const u8) ![]const u8 {

@@ -456,12 +456,180 @@ fn estimateBoundaryTokens(entries: []const st.Entry, boundary_from: usize) Bound
     };
 }
 
-fn buildAutoBranchSummary(
+const BranchSummaryFileOps = struct {
+    readFiles: []const []const u8,
+    modifiedFiles: []const []const u8,
+};
+
+const ShellFileOps = struct {
+    fn trimToken(tok0: []const u8) []const u8 {
+        var tok = tok0;
+        tok = std.mem.trim(u8, tok, " \t\r\n");
+        tok = std.mem.trim(u8, tok, "\"'");
+        return tok;
+    }
+
+    fn looksLikePath(tok: []const u8) bool {
+        if (tok.len == 0) return false;
+        if (tok[0] == '-') return false;
+        if (std.mem.indexOfScalar(u8, tok, '|') != null) return false;
+        if (std.mem.indexOfScalar(u8, tok, ';') != null) return false;
+        if (std.mem.indexOfScalar(u8, tok, '&') != null) return false;
+        if (std.mem.indexOfScalar(u8, tok, '$') != null) return false;
+        if (std.mem.indexOf(u8, tok, "..") != null and tok.len <= 2) return false;
+
+        if (std.mem.indexOfScalar(u8, tok, '/') != null) return true;
+        const exts = [_][]const u8{ ".zig", ".md", ".json", ".txt", ".service", ".ts", ".js", ".mjs", ".yaml", ".yml" };
+        for (exts) |e| if (std.mem.endsWith(u8, tok, e)) return true;
+        return false;
+    }
+
+    fn addUnique(
+        alloc: std.mem.Allocator,
+        list: *std.ArrayList([]const u8),
+        seen: *std.StringHashMap(bool),
+        tok: []const u8,
+        cap: usize,
+    ) void {
+        if (tok.len == 0) return;
+        if (list.items.len >= cap) return;
+        if (seen.contains(tok)) return;
+        seen.put(tok, true) catch return;
+        list.append(alloc, tok) catch return;
+    }
+
+    fn appendFromArray(
+        alloc: std.mem.Allocator,
+        list: *std.ArrayList([]const u8),
+        seen: *std.StringHashMap(bool),
+        arr: std.json.Array,
+        cap: usize,
+    ) void {
+        for (arr.items) |v_it| {
+            switch (v_it) {
+                .string => |s| addUnique(alloc, list, seen, s, cap),
+                else => {},
+            }
+        }
+    }
+
+    fn collectDetails(
+        alloc: std.mem.Allocator,
+        details_json: []const u8,
+        read_files: *std.ArrayList([]const u8),
+        modified_files: *std.ArrayList([]const u8),
+        seen_rf: *std.StringHashMap(bool),
+        seen_mf: *std.StringHashMap(bool),
+    ) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, details_json, .{}) catch return;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return,
+        };
+
+        if (obj.get("readFiles")) |v| switch (v) {
+            .array => |a| appendFromArray(alloc, read_files, seen_rf, a, 200),
+            else => {},
+        };
+        if (obj.get("modifiedFiles")) |v| switch (v) {
+            .array => |a| appendFromArray(alloc, modified_files, seen_mf, a, 200),
+            else => {},
+        };
+    }
+
+    fn scanShell(
+        alloc: std.mem.Allocator,
+        arg: []const u8,
+        rf: *std.ArrayList([]const u8),
+        mf: *std.ArrayList([]const u8),
+        seen_rf_map: *std.StringHashMap(bool),
+        seen_mf_map: *std.StringHashMap(bool),
+    ) void {
+        const is_modify = (std.mem.indexOf(u8, arg, ">") != null) or
+            (std.mem.indexOf(u8, arg, "sed -i") != null) or
+            (std.mem.indexOf(u8, arg, "perl -pi") != null) or
+            (std.mem.indexOf(u8, arg, "apply") != null) or
+            (std.mem.indexOf(u8, arg, "git commit") != null) or
+            (std.mem.indexOf(u8, arg, "git add") != null) or
+            (std.mem.indexOf(u8, arg, "mv ") != null) or
+            (std.mem.indexOf(u8, arg, "cp ") != null) or
+            (std.mem.indexOf(u8, arg, "touch ") != null) or
+            (std.mem.indexOf(u8, arg, "tee ") != null);
+
+        const is_read = (std.mem.indexOf(u8, arg, "cat ") != null) or
+            (std.mem.indexOf(u8, arg, "sed -n") != null) or
+            (std.mem.indexOf(u8, arg, "grep ") != null) or
+            (std.mem.indexOf(u8, arg, "head ") != null) or
+            (std.mem.indexOf(u8, arg, "tail ") != null) or
+            (std.mem.indexOf(u8, arg, "less ") != null) or
+            (std.mem.indexOf(u8, arg, "git show") != null) or
+            (std.mem.indexOf(u8, arg, "git diff") != null) or
+            (std.mem.indexOf(u8, arg, "git status") != null);
+
+        {
+            if (std.mem.indexOfScalar(u8, arg, '>')) |pos| {
+                var last = pos;
+                var j: usize = pos + 1;
+                while (j < arg.len) : (j += 1) {
+                    if (arg[j] == '>') last = j;
+                }
+                const rhs = arg[last + 1 ..];
+                var it2 = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
+                if (it2.next()) |t0| {
+                    const t = trimToken(t0);
+                    if (looksLikePath(t)) {
+                        addUnique(alloc, mf, seen_mf_map, t, 200);
+                    }
+                }
+            }
+
+            if (std.mem.indexOf(u8, arg, "tee ")) |pos2| {
+                const rhs = arg[pos2 + 4 ..];
+                var it3 = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
+                while (it3.next()) |t0| {
+                    const t = trimToken(t0);
+                    if (t.len == 0) continue;
+                    if (t[0] == '-') continue;
+                    if (!looksLikePath(t)) break;
+                    addUnique(alloc, mf, seen_mf_map, t, 200);
+                    break;
+                }
+            }
+        }
+
+        var it = std.mem.tokenizeAny(u8, arg, " \t\r\n");
+        while (it.next()) |t0| {
+            const t = trimToken(t0);
+            if (!looksLikePath(t)) continue;
+
+            if (std.mem.eql(u8, t, "git") or
+                std.mem.eql(u8, t, "rg") or
+                std.mem.eql(u8, t, "grep") or
+                std.mem.eql(u8, t, "sed") or
+                std.mem.eql(u8, t, "cat") or
+                std.mem.eql(u8, t, "sh"))
+            {
+                continue;
+            }
+
+            if (is_modify) {
+                addUnique(alloc, mf, seen_mf_map, t, 200);
+            } else if (is_read) {
+                addUnique(alloc, rf, seen_rf_map, t, 200);
+            } else {
+                addUnique(alloc, rf, seen_rf_map, t, 200);
+            }
+        }
+    }
+};
+
+fn collectAbandonedEntries(
     allocator: std.mem.Allocator,
     sm: *session.SessionManager,
     old_leaf: ?[]const u8,
     target: ?[]const u8,
-) ![]const u8 {
+) ![]const st.Entry {
     var by_id = std.StringHashMap(st.Entry).init(allocator);
     defer by_id.deinit();
 
@@ -474,6 +642,7 @@ fn buildAutoBranchSummary(
 
     var target_ancestors = std.StringHashMap(bool).init(allocator);
     defer target_ancestors.deinit();
+
     var cur_t = target;
     while (cur_t) |cid| {
         try target_ancestors.put(cid, true);
@@ -482,7 +651,6 @@ fn buildAutoBranchSummary(
     }
 
     var abandoned = try std.ArrayList(st.Entry).initCapacity(allocator, 0);
-    defer abandoned.deinit(allocator);
     var cur = old_leaf;
     while (cur) |cid| {
         if (target_ancestors.contains(cid)) break;
@@ -491,6 +659,149 @@ fn buildAutoBranchSummary(
         cur = st.parentIdOf(e);
     }
 
+    return try abandoned.toOwnedSlice(allocator);
+}
+
+fn collectBranchSummaryFileOps(
+    allocator: std.mem.Allocator,
+    entries: []const st.Entry,
+) !BranchSummaryFileOps {
+    var read_files_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer read_files_out.deinit(allocator);
+    var modified_files_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer modified_files_out.deinit(allocator);
+
+    var seen_rf = std.StringHashMap(bool).init(allocator);
+    defer seen_rf.deinit();
+    var seen_mf = std.StringHashMap(bool).init(allocator);
+    defer seen_mf.deinit();
+
+    for (entries) |e| {
+        switch (e) {
+            .tool_call => |tc| {
+                if (std.mem.eql(u8, tc.tool, "shell")) {
+                    ShellFileOps.scanShell(
+                        allocator,
+                        tc.arg,
+                        &read_files_out,
+                        &modified_files_out,
+                        &seen_rf,
+                        &seen_mf,
+                    );
+                }
+            },
+            .summary => |s| {
+                if (s.fromHook != true) {
+                    if (s.readFiles) |rf| {
+                        for (rf) |p| ShellFileOps.addUnique(allocator, &read_files_out, &seen_rf, p, 200);
+                    }
+                    if (s.modifiedFiles) |mf| {
+                        for (mf) |p| ShellFileOps.addUnique(allocator, &modified_files_out, &seen_mf, p, 200);
+                    }
+                    if (s.detailsJson) |dj| try ShellFileOps.collectDetails(
+                        allocator,
+                        dj,
+                        &read_files_out,
+                        &modified_files_out,
+                        &seen_rf,
+                        &seen_mf,
+                    );
+                }
+            },
+            .branch_summary => |b| {
+                if (b.fromHook != true) {
+                    if (b.detailsJson) |dj| try ShellFileOps.collectDetails(
+                        allocator,
+                        dj,
+                        &read_files_out,
+                        &modified_files_out,
+                        &seen_rf,
+                        &seen_mf,
+                    );
+                }
+            },
+            else => {},
+        }
+    }
+
+    const read_files = try read_files_out.toOwnedSlice(allocator);
+    const modified_files = try modified_files_out.toOwnedSlice(allocator);
+
+    return .{ .readFiles = read_files, .modifiedFiles = modified_files };
+}
+
+fn appendJsonEscapedString(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    try out.append(allocator, '"');
+    for (value) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0x00...0x07, 0x0b...0x0c, 0x0e...0x1f => {
+                try out.appendSlice(allocator, "\\u00");
+                var hex_buf: [2]u8 = undefined;
+                const hex = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{ch});
+                try out.appendSlice(allocator, hex);
+            },
+            else => try out.append(allocator, ch),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn appendJsonStringArray(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    values: []const []const u8,
+) !void {
+    try out.append(allocator, '[');
+    var i: usize = 0;
+    while (i < values.len) : (i += 1) {
+        if (i > 0) try out.appendSlice(allocator, ",");
+        try appendJsonEscapedString(allocator, out, values[i]);
+    }
+    try out.append(allocator, ']');
+}
+
+fn branchSummaryDetailsJson(
+    allocator: std.mem.Allocator,
+    read_files: []const []const u8,
+    modified_files: []const []const u8,
+) !?[]const u8 {
+    if (read_files.len == 0 and modified_files.len == 0) return null;
+
+    var details_out = try std.ArrayList(u8).initCapacity(allocator, 128);
+    try details_out.append(allocator, '{');
+
+    var first = true;
+    if (read_files.len > 0) {
+        if (!first) try details_out.appendSlice(allocator, ",");
+        try details_out.appendSlice(allocator, "\"readFiles\":");
+        try appendJsonStringArray(allocator, &details_out, read_files);
+        first = false;
+    }
+    if (modified_files.len > 0) {
+        if (!first) try details_out.appendSlice(allocator, ",");
+        try details_out.appendSlice(allocator, "\"modifiedFiles\":");
+        try appendJsonStringArray(allocator, &details_out, modified_files);
+    }
+
+    try details_out.append(allocator, '}');
+    return try details_out.toOwnedSlice(allocator);
+}
+
+fn buildAutoBranchSummaryFromEntries(
+    allocator: std.mem.Allocator,
+    old_leaf: ?[]const u8,
+    target: ?[]const u8,
+    abandoned: []const st.Entry,
+) ![]const u8 {
     var out = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer out.deinit(allocator);
     try out.appendSlice(allocator, "## Goal\n");
@@ -501,13 +812,13 @@ fn buildAutoBranchSummary(
     try out.appendSlice(allocator, ".\n\n");
 
     try out.appendSlice(allocator, "## Progress\n");
-    if (abandoned.items.len == 0) {
+    if (abandoned.len == 0) {
         try out.appendSlice(allocator, "- (none)\n");
     } else {
         var written: usize = 0;
-        var i: usize = abandoned.items.len;
+        var i: usize = abandoned.len;
         while (i > 0 and written < 8) : (i -= 1) {
-            const e = abandoned.items[i - 1];
+            const e = abandoned[i - 1];
             switch (e) {
                 .message => |m| {
                     const preview = if (m.content.len > 80) m.content[0..80] else m.content;
@@ -552,6 +863,16 @@ fn buildAutoBranchSummary(
     try out.appendSlice(allocator, "1. Continue from the selected branch point using this summary as context.\n");
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn buildAutoBranchSummary(
+    allocator: std.mem.Allocator,
+    sm: *session.SessionManager,
+    old_leaf: ?[]const u8,
+    target: ?[]const u8,
+) ![]const u8 {
+    const abandoned = try collectAbandonedEntries(allocator, sm, old_leaf, target);
+    return try buildAutoBranchSummaryFromEntries(allocator, old_leaf, target, abandoned);
 }
 
 fn doCompact(
@@ -3022,9 +3343,12 @@ pub fn main() !void {
         const target_id: ?[]const u8 = if (to_root) null else (to_id orelse return error.MissingTo);
         const old_leaf = try sm.leafId();
         const summary = summary_text orelse try buildAutoBranchSummary(allocator, &sm, old_leaf, target_id);
+        const abandoned = try collectAbandonedEntries(allocator, &sm, old_leaf, target_id);
+        const file_ops = try collectBranchSummaryFileOps(allocator, abandoned);
+        const details_json = try branchSummaryDetailsJson(allocator, file_ops.readFiles, file_ops.modifiedFiles);
         try sm.branchTo(target_id);
         const from_id = old_leaf orelse "root";
-        const sid = try sm.appendBranchSummary(from_id, summary);
+        const sid = try sm.appendBranchSummaryWithDetails(from_id, summary, details_json, false);
         std.debug.print("ok: true\nbranch: {s} -> {s}\nbranchSummaryId: {s}\n", .{ sp, target_id orelse "(root)", sid });
         return;
     }
