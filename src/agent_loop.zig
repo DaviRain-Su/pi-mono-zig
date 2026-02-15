@@ -21,8 +21,8 @@ pub const AgentLoop = struct {
     }
 
     pub fn step(self: *AgentLoop) !bool {
-        // TS-like: use business-only context for model decisions (structural entries are excluded).
-        const entries = try self.session_mgr.buildContextEntries();
+        // TS-like: use model context for session-building semantics (converts compaction/custom/context messages).
+        const entries = try self.session_mgr.buildSessionContext();
 
         // Find the latest user message id to associate with this turn.
         const user_mid = blk: {

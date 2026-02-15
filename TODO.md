@@ -36,12 +36,12 @@
 - [ ] 增加基础迁移：`v1 -> v2 -> v3`（或至少兼容旧头与旧字段）。
 
 ### 1.3 上下文构建（文件：`src/session_manager.zig`）
-- [ ] 引入 `buildSessionContext` 近似 TS 语义：
-  - [ ] 按 `leaf` 到根构建路径。
-  - [ ] 将 `compaction` 转为 summary message + 保留区间 messages。
-  - [ ] 将 `branch_summary` 转为可供 LLM 使用的上下文消息。
-  - [ ] 将 `custom_message` 转为上下文消息。
-  - [ ] 过滤掉 `custom`（不进上下文）。
+- [x] 引入 `buildSessionContext` 近似 TS 语义：
+  - [x] 按 `leaf` 到根构建路径。
+  - [x] 将 `compaction` 转为 summary message + 保留区间 messages。
+  - [x] 将 `branch_summary` 转为可供 LLM 使用的上下文消息。
+  - [x] 将 `custom_message` 转为上下文消息。
+  - [x] 过滤掉 `custom`（不进上下文）。
 
 ---
 

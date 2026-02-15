@@ -1016,6 +1016,17 @@ pub const SessionManager = struct {
         return try self.buildContextEntriesMode(true);
     }
 
+    /// Build context for model consumption (TS-like), converting compaction, branch_summary
+    /// and custom_message entries into message entries and dropping extension-only custom entries.
+    pub fn buildSessionContext(self: *SessionManager) ![]Entry {
+        return try self.buildSessionContextMode(false);
+    }
+
+    /// Verbose variant of model-context assembly.
+    pub fn buildSessionContextVerbose(self: *SessionManager) ![]Entry {
+        return try self.buildSessionContextMode(true);
+    }
+
     fn buildContextEntriesMode(self: *SessionManager, include_structural: bool) ![]Entry {
         const entries = try self.loadEntries();
         var leaf: ?[]const u8 = null;
@@ -1070,6 +1081,141 @@ pub const SessionManager = struct {
             if (!include_structural and !isBusinessEntry(e)) continue;
             try out.append(self.arena, e);
         }
+        return try out.toOwnedSlice(self.arena);
+    }
+
+    fn appendContextEntryMessage(
+        self: *SessionManager,
+        out: *std.ArrayList(Entry),
+        source: Entry,
+        role: []const u8,
+        content: []const u8,
+    ) !void {
+        const id = st.idOf(source) orelse "";
+        const pid = st.parentIdOf(source);
+        const ts = switch (source) {
+            .message => |m| m.timestamp,
+            .tool_call => |tc| tc.timestamp,
+            .tool_result => |tr| tr.timestamp,
+            .thinking_level_change => |l| l.timestamp,
+            .model_change => |m| m.timestamp,
+            .compaction => |c| c.timestamp,
+            .branch_summary => |b| b.timestamp,
+            .custom => |c| c.timestamp,
+            .custom_message => |c| c.timestamp,
+            .session_info => |s| s.timestamp,
+            .leaf => |l| l.timestamp,
+            .label => |l| l.timestamp,
+            .turn_start => |t| t.timestamp,
+            .turn_end => |t| t.timestamp,
+            .summary => |s| s.timestamp,
+            .session => |s| s.timestamp,
+        };
+        try out.append(self.arena, .{ .message = .{ .id = id, .parentId = pid, .timestamp = ts, .role = role, .content = content, .tokensEst = null, .usageTotalTokens = null, .detailsJson = null, .model = null, .thinking = null } });
+    }
+
+    fn appendSessionContextEntry(
+        self: *SessionManager,
+        out: *std.ArrayList(Entry),
+        source: Entry,
+        include_structural: bool,
+    ) !void {
+        switch (source) {
+            .custom => {},
+            .session, .leaf => {},
+            .custom_message => |c| {
+                try self.appendContextEntryMessage(out, source, "user", c.content);
+            },
+            .branch_summary => |b| {
+                const label = if (b.fromHook) " [fromHook]" else "";
+                const summary = try std.fmt.allocPrint(
+                    self.arena,
+                    "{s}{s}\\n\\n{s}",
+                    .{ "The following is a summary of a branch that this conversation came back from", label, b.summary },
+                );
+                try self.appendContextEntryMessage(out, source, "user", summary);
+            },
+            .compaction => {},
+            .message, .tool_call, .tool_result, .summary => {
+                if (!include_structural) {
+                    try out.append(self.arena, source);
+                } else {
+                    // structural context can also expose these directly
+                    try out.append(self.arena, source);
+                }
+            },
+            .session_info, .thinking_level_change, .model_change, .turn_start, .turn_end => {
+                if (include_structural) {
+                    try out.append(self.arena, source);
+                }
+            },
+            else => {
+                if (include_structural) {
+                    try out.append(self.arena, source);
+                }
+            },
+        }
+    }
+
+    fn buildSessionContextMode(self: *SessionManager, include_structural: bool) ![]Entry {
+        var out = try std.ArrayList(Entry).initCapacity(self.arena, 0);
+        defer out.deinit(self.arena);
+
+        const chain = try self.buildContextEntriesMode(true);
+
+        var compaction_idx: ?usize = null;
+        for (chain, 0..) |e, i| {
+            switch (e) {
+                .compaction => compaction_idx = i,
+                else => {},
+            }
+        }
+
+        if (compaction_idx == null) {
+            for (chain) |e| {
+                try self.appendSessionContextEntry(&out, e, include_structural);
+            }
+            return try out.toOwnedSlice(self.arena);
+        }
+
+        // Keep last compaction window and convert it into a summary message,
+        // then keep a bounded range from firstKeptEntryId onward.
+        const cidx = compaction_idx.?;
+        const comp = chain[cidx].compaction;
+        const compaction_prefix = if (comp.fromHook) " [fromHook]" else "";
+        const compaction_summary = try std.fmt.allocPrint(
+            self.arena,
+            "{s}{s}\\n(tokens before: {d})\\n{s}",
+            .{ "The following is a summary of the conversation history before this point", compaction_prefix, comp.tokensBefore, comp.summary },
+        );
+        try self.appendContextEntryMessage(&out, chain[cidx], "user", compaction_summary);
+
+        // Kept window starts when firstKeptEntryId is found.
+        var found = false;
+        var i: usize = 0;
+        while (i < cidx) : (i += 1) {
+            const e = chain[i];
+            if (st.idOf(e)) |eid| {
+                if (std.mem.eql(u8, eid, comp.firstKeptEntryId)) {
+                    found = true;
+                }
+            }
+            if (!found) continue;
+            switch (e) {
+                .compaction => {},
+                else => try self.appendSessionContextEntry(&out, e, include_structural),
+            }
+        }
+
+        var j: usize = cidx + 1;
+        while (j < chain.len) : (j += 1) {
+            const e = chain[j];
+            switch (e) {
+                .compaction => {},
+                else => try self.appendSessionContextEntry(&out, e, include_structural),
+            }
+        }
+
         return try out.toOwnedSlice(self.arena);
     }
 };

@@ -2721,6 +2721,86 @@ test "buildContextEntries excludes label entries from non-verbose context" {
     try std.testing.expect(has_message);
 }
 
+test "buildSessionContext converts compaction and branch/custom messages" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "session_context_compaction");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("assistant", "kept context");
+    _ = try sm.appendMessage("user", "drop me");
+    _ = try sm.appendCustom("trace", "{\"v\":1}");
+    const custom_msg_id = try sm.appendCustomMessage("note", "extension note", true, "{\"ok\":true}");
+    const keep_from = try sm.appendMessage("assistant", "pre-compact tail");
+
+    _ = try sm.appendCompaction("older context compacted", custom_msg_id, 120, "{}", false);
+
+    _ = try sm.appendMessage("user", "after compact");
+    _ = try sm.appendBranchSummary(keep_from, "summary from branch", "{\"ok\":true}", false);
+    _ = try sm.appendMessage("assistant", "final");
+
+    const ctx = try sm.buildSessionContext();
+
+    var saw_summary = false;
+    var saw_kept_tail = false;
+    var saw_after = false;
+    var saw_extension_note = false;
+    var saw_branch_summary = false;
+    var saw_dropped = false;
+    var saw_raw_custom = false;
+
+    for (ctx) |e| {
+        switch (e) {
+            .message => |m| {
+                if (std.mem.eql(u8, m.content, "drop me")) {
+                    saw_dropped = true;
+                }
+                if (std.mem.eql(u8, m.content, "pre-compact tail") and std.mem.eql(u8, m.role, "assistant")) {
+                    saw_kept_tail = true;
+                }
+                if (std.mem.eql(u8, m.content, "after compact") and std.mem.eql(u8, m.role, "user")) {
+                    saw_after = true;
+                }
+                if (std.mem.indexOf(u8, m.content, "older context compacted") != null) {
+                    saw_summary = true;
+                }
+                if (std.mem.eql(u8, m.content, "extension note")) {
+                    saw_extension_note = true;
+                }
+                if (std.mem.indexOf(u8, m.content, "summary from branch") != null) {
+                    saw_branch_summary = true;
+                }
+            },
+            .custom => {
+                saw_raw_custom = true;
+            },
+            else => {},
+        }
+    }
+
+    // Compaction summary injected as message first.
+    try std.testing.expect(saw_summary);
+    // Kept tail and messages after compaction are retained.
+    try std.testing.expect(saw_kept_tail);
+    try std.testing.expect(saw_after);
+    // custom_message is converted into message context.
+    try std.testing.expect(saw_extension_note);
+    // branch summary is converted into context message.
+    try std.testing.expect(saw_branch_summary);
+    // raw custom is never included in model context.
+    try std.testing.expect(!saw_raw_custom);
+    // messages before firstKeptEntryId are trimmed by compaction window.
+    try std.testing.expect(!saw_dropped);
+}
+
 test "tokensEstForEntry should use usageTotalTokens when present" {
     const usage_entry = st.MessageEntry{
 
