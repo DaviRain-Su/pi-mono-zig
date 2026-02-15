@@ -133,9 +133,214 @@ pub const SessionManager = struct {
         details: ?[]const u8,
         fromHook: bool,
     ) ![]const u8 {
+        const merged_details = if (fromHook)
+            details
+        else
+            try self.collectBranchSummaryDetails(targetId, details);
+
         try self.branchTo(targetId);
         const from_id = targetId orelse "root";
-        return try self.appendBranchSummary(from_id, summary, details, fromHook);
+        return try self.appendBranchSummary(from_id, summary, merged_details, fromHook);
+    }
+
+    fn collectFileOpsFromDetails(
+        self: *SessionManager,
+        details_json: []const u8,
+        read_files: *std.ArrayList([]const u8),
+        modified_files: *std.ArrayList([]const u8),
+        seen_rf: *std.StringHashMap(bool),
+        seen_mf: *std.StringHashMap(bool),
+    ) !bool {
+        const parsed = json_util.parseJson(self.arena, details_json) catch return false;
+        defer parsed.deinit();
+
+        var obj: ?std.json.ObjectMap = null;
+        switch (parsed.value) {
+            .object => |o| obj = o,
+            .string => |s| {
+                var inner = json_util.parseJson(self.arena, s) catch return false;
+                defer inner.deinit();
+                switch (inner.value) {
+                    .object => |o| obj = o,
+                    else => return false,
+                }
+            },
+            else => return false,
+        }
+
+        const o = obj orelse return false;
+        const addUnique = struct {
+            fn run(
+                allocator: std.mem.Allocator,
+                list: *std.ArrayList([]const u8),
+                seen: *std.StringHashMap(bool),
+                tok: []const u8,
+            ) void {
+                if (seen.contains(tok)) return;
+                seen.put(tok, true) catch return;
+                list.append(allocator, tok) catch return;
+            }
+        };
+
+        var recognized = false;
+        if (o.get("readFiles")) |v| {
+            switch (v) {
+                .array => |a| {
+                    recognized = true;
+                    for (a.items) |it| {
+                        if (it == .string) {
+                            addUnique.run(self.arena, read_files, seen_rf, it.string);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (o.get("modifiedFiles")) |v| {
+            switch (v) {
+                .array => |a| {
+                    recognized = true;
+                    for (a.items) |it| {
+                        if (it == .string) {
+                            addUnique.run(self.arena, modified_files, seen_mf, it.string);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return recognized;
+    }
+
+    fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+        try out.appendSlice(allocator, "\"");
+        for (value) |ch| {
+            if (ch >= 0x20 and ch != '"' and ch != '\\') {
+                try out.append(allocator, ch);
+                continue;
+            }
+
+            switch (ch) {
+                '"' => try out.appendSlice(allocator, "\\\""),
+                '\\' => try out.appendSlice(allocator, "\\\\"),
+                0x00...0x1f => {
+                    switch (ch) {
+                        '\n' => try out.appendSlice(allocator, "\\n"),
+                        '\r' => try out.appendSlice(allocator, "\\r"),
+                        '\t' => try out.appendSlice(allocator, "\\t"),
+                        0x08 => try out.appendSlice(allocator, "\\b"),
+                        0x0c => try out.appendSlice(allocator, "\\f"),
+                        else => {
+                            var hex_buf: [2]u8 = undefined;
+                            const hex = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{ch});
+                            try out.appendSlice(allocator, "\\u00");
+                            try out.appendSlice(allocator, hex);
+                        },
+                    }
+                },
+                else => {},
+            }
+        }
+        try out.appendSlice(allocator, "\"");
+    }
+
+    fn buildFileOpsDetailsJson(
+        self: *SessionManager,
+        read_files: []const []const u8,
+        modified_files: []const []const u8,
+    ) ![]const u8 {
+        var out = try std.ArrayList(u8).initCapacity(self.arena, 64);
+        defer out.deinit(self.arena);
+
+        try out.appendSlice(self.arena, "{\"readFiles\":[");
+        for (read_files, 0..) |rf, i| {
+            if (i > 0) try out.appendSlice(self.arena, ",");
+            try appendJsonEscaped(self.arena, &out, rf);
+        }
+        try out.appendSlice(self.arena, "],\"modifiedFiles\":[");
+        for (modified_files, 0..) |mf, i| {
+            if (i > 0) try out.appendSlice(self.arena, ",");
+            try appendJsonEscaped(self.arena, &out, mf);
+        }
+        try out.appendSlice(self.arena, "]}");
+        return try out.toOwnedSlice(self.arena);
+    }
+
+    fn collectBranchSummaryDetails(
+        self: *SessionManager,
+        targetId: ?[]const u8,
+        details: ?[]const u8,
+    ) !?[]const u8 {
+        const old_leaf = try self.currentLeafId();
+        if (old_leaf == null) {
+            return details;
+        }
+
+        const entries = try self.loadEntries();
+
+        var by_id = std.StringHashMap(st.Entry).init(self.arena);
+        defer by_id.deinit();
+        for (entries) |e| {
+            if (st.idOf(e)) |id| {
+                try by_id.put(id, e);
+            }
+        }
+
+        var target_ancestors = std.StringHashMap(bool).init(self.arena);
+        defer target_ancestors.deinit();
+        var cur_t = targetId;
+        while (cur_t) |cid| {
+            try target_ancestors.put(cid, true);
+            const te = by_id.get(cid) orelse break;
+            cur_t = st.parentIdOf(te);
+        }
+
+        var read_out = try std.ArrayList([]const u8).initCapacity(self.arena, 0);
+        defer read_out.deinit(self.arena);
+        var modified_out = try std.ArrayList([]const u8).initCapacity(self.arena, 0);
+        defer modified_out.deinit(self.arena);
+
+        var seen_rf = std.StringHashMap(bool).init(self.arena);
+        defer seen_rf.deinit();
+        var seen_mf = std.StringHashMap(bool).init(self.arena);
+        defer seen_mf.deinit();
+
+        var cur = old_leaf;
+        while (cur) |cid| {
+            if (target_ancestors.contains(cid)) break;
+            const e = by_id.get(cid) orelse break;
+            switch (e) {
+                .compaction => |c| {
+                    if (!c.fromHook) {
+                        if (c.details) |dj| {
+                            _ = try self.collectFileOpsFromDetails(dj, &read_out, &modified_out, &seen_rf, &seen_mf);
+                        }
+                    }
+                },
+                .branch_summary => |b| {
+                    if (!b.fromHook) {
+                        if (b.details) |dj| {
+                            _ = try self.collectFileOpsFromDetails(dj, &read_out, &modified_out, &seen_rf, &seen_mf);
+                        }
+                    }
+                },
+                else => {},
+            }
+            cur = st.parentIdOf(e);
+        }
+
+        if (details) |d| {
+            const had = try self.collectFileOpsFromDetails(d, &read_out, &modified_out, &seen_rf, &seen_mf);
+            if (!had) return d;
+        }
+
+        if (read_out.items.len == 0 and modified_out.items.len == 0) {
+            return details;
+        }
+
+        return try self.buildFileOpsDetailsJson(read_out.items, modified_out.items);
     }
 
     pub fn setLabel(self: *SessionManager, targetId: []const u8, label: ?[]const u8) ![]const u8 {

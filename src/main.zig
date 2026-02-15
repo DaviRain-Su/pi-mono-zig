@@ -369,8 +369,14 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v6" } else "pi.summary.v6";
-                            const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
+                            const schema = if (obj.get("schema")) |v| switch (v) {
+                                .string => |t| try dupStr.dup(allocator, t),
+                                else => "pi.summary.v6",
+                            } else "pi.summary.v6";
+                            const goal = if (obj.get("goal")) |v| switch (v) {
+                                .string => |t| try dupStr.dup(allocator, t),
+                                else => "(unknown)",
+                            } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
                             var constraints_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
@@ -439,7 +445,10 @@ fn doCompact(
                                 }
                             }
 
-                            const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "" } else "";
+                            const raw = if (obj.get("raw")) |v| switch (v) {
+                                .string => |t| try dupStr.dup(allocator, t),
+                                else => "",
+                            } else "";
 
                             const bt_val = if (obj.get("blocked_tasks")) |v| v else null;
                             var bt_list = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
@@ -452,11 +461,23 @@ fn doCompact(
                                                 try bt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
                                             },
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const err0 = if (o.get("err")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const err0 = if (o.get("err")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
 
                                                 try bt_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
@@ -483,11 +504,23 @@ fn doCompact(
                                                 try dt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
                                             },
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const res0 = if (o.get("result")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const res0 = if (o.get("result")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
                                                 try dt_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
                                                     .tool = if (tool0) |t| try dupStr.dup(allocator, t) else null,
@@ -527,9 +560,15 @@ fn doCompact(
                                         switch (it) {
                                             .string => try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const src0 = if (o.get("source")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const src0 = if (o.get("source")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
                                                 try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, task0), .source = if (src0) |t| try dupStr.dup(allocator, t) else null });
                                             },
                                             else => {},
@@ -553,10 +592,19 @@ fn doCompact(
                                         switch (it) {
                                             .string => try nst_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) {
+                                                    .string => |t| t,
+                                                    else => "",
+                                                } else "";
                                                 if (task0.len == 0) continue;
-                                                const why0 = if (o.get("why")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
-                                                const pr0 = if (o.get("priority")) |v| switch (v) { .integer => |x| @as(?u32, @intCast(x)), else => null } else null;
+                                                const why0 = if (o.get("why")) |v| switch (v) {
+                                                    .string => |t| @as(?[]const u8, t),
+                                                    else => null,
+                                                } else null;
+                                                const pr0 = if (o.get("priority")) |v| switch (v) {
+                                                    .integer => |x| @as(?u32, @intCast(x)),
+                                                    else => null,
+                                                } else null;
                                                 try nst_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
                                                     .why = if (why0) |t| try dupStr.dup(allocator, t) else null,
@@ -929,7 +977,10 @@ fn doCompact(
             if (std.mem.indexOf(u8, it, "(none)") != null) continue;
             // naive de-dup
             var already = false;
-            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) { already = true; break; };
+            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) {
+                already = true;
+                break;
+            };
             if (already) continue;
             try ip_out.append(allocator, it);
         }
@@ -1085,8 +1136,7 @@ fn doCompact(
 
         if (prev_summary == null) {
             // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
-            try sum_buf.appendSlice(allocator,
-                "## Goal\n(unknown)\n\n" ++
+            try sum_buf.appendSlice(allocator, "## Goal\n(unknown)\n\n" ++
                 "## Constraints & Preferences\n- (none)\n\n" ++
                 "## Progress\n### Done\n- (none)\n\n### In Progress\n- (none)\n\n### Blocked\n- (none)\n\n" ++
                 "## Key Decisions\n- (none)\n\n" ++
@@ -1233,7 +1283,7 @@ fn doCompact(
 
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
-                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
+                    try b2.appendSlice(allocator, base[0 .. insert_pos + next_hdr]);
 
                     var added: usize = 0;
                     for (done_items.items) |it| {
@@ -1269,7 +1319,7 @@ fn doCompact(
 
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
-                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
+                    try b2.appendSlice(allocator, base[0 .. insert_pos + next_hdr]);
 
                     var added: usize = 0;
                     for (next_items.items) |it| {
@@ -2762,7 +2812,7 @@ test "buildContextEntries excludes label entries from non-verbose context" {
     var sm = session.SessionManager.init(allocator, session_path, ".");
     try sm.ensure();
 
-    const msg_id = try sm.appendMessage("user", "hello") ;
+    const msg_id = try sm.appendMessage("user", "hello");
     _ = try sm.setLabel(msg_id, "checkpoint");
 
     const entries = try sm.buildContextEntries();
@@ -3014,6 +3064,52 @@ test "branchWithSummary appends branch summary and marks branch context" {
     try std.testing.expectEqual(@as(usize, 1), count_branch_summary);
 }
 
+test "branchWithSummary accumulates file-operation details from abandoned branch summaries" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "branch_summary_details_accum");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    const root_id = try sm.appendMessage("user", "start");
+    _ = try sm.appendMessage("assistant", "work before summary");
+    _ = try sm.appendBranchSummary(root_id, "prior branch", "{\"readFiles\":[\"before.rs\"],\"modifiedFiles\":[\"before_out.rs\"]}", false);
+    const mid_msg = try sm.appendMessage("assistant", "intermediate");
+    _ = try sm.appendCompaction("prior compaction", mid_msg, 120, "{\"readFiles\":[\"compact.rs\"],\"modifiedFiles\":[\"compact_out.rs\"]}", false);
+    _ = try sm.appendMessage("assistant", "current");
+
+    const summary_id = try sm.branchWithSummary(root_id, "branch resumed", null, false);
+    try std.testing.expect(summary_id.len > 0);
+
+    const entries = try sm.loadEntries();
+    var got = false;
+    var details: []const u8 = "";
+    for (entries) |e| {
+        switch (e) {
+            .branch_summary => |b| {
+                if (std.mem.eql(u8, b.id, summary_id)) {
+                    got = true;
+                    details = b.details orelse "";
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(got);
+    try std.testing.expect(details.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, details, "before.rs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "before_out.rs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "compact.rs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "compact_out.rs") != null);
+}
+
 test "loadEntries migrates legacy v1 entries, ids and parentId links" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -3124,7 +3220,6 @@ test "loadEntries migrates hookMessage role for legacy version" {
 
 test "tokensEstForEntry should use usageTotalTokens when present" {
     const usage_entry = st.MessageEntry{
-
         .id = "m1",
         .parentId = null,
         .timestamp = "ts",
