@@ -22,17 +22,17 @@
 ## 1) P0 - 会话数据模型与会话上下文（最高优先）
 
 ### 1.1 `SessionEntry` 语义对齐（文件：`src/session_types.zig`）
-- [ ] `thinking_level_change` 条目：`thinkingLevel`。
-- [ ] `model_change` 条目：`provider`、`modelId`。
-- [ ] `compaction` 条目：`firstKeptEntryId`、`tokensBefore`、`details`、`fromHook`。
-- [ ] `branch_summary` 条目：`fromId`、`details`、`fromHook`。
-- [ ] `custom` 条目：`customType`、`data`（不进 LLM 上下文）。
-- [ ] `custom_message` 条目：`customType`、`content`、`details`、`display`（可进上下文）。
-- [ ] `session_info` 条目：`name`。
+- [x] `thinking_level_change` 条目：`thinkingLevel`。
+- [x] `model_change` 条目：`provider`、`modelId`。
+- [x] `compaction` 条目：`firstKeptEntryId`、`tokensBefore`、`details`、`fromHook`。
+- [x] `branch_summary` 条目：`fromId`、`details`、`fromHook`。
+- [x] `custom` 条目：`customType`、`data`（不进 LLM 上下文）。
+- [x] `custom_message` 条目：`customType`、`content`、`details`、`display`（可进上下文）。
+- [x] `session_info` 条目：`name`。
 
 ### 1.2 session header 与迁移（文件：`src/session_manager.zig` + `src/session_types.zig`）
-- [ ] `SessionHeader` 加 `version`。
-- [ ] 实现 `parentSession` 字段（用于 fork）支持。
+- [x] `SessionHeader` 加 `version`。
+- [x] 实现 `parentSession` 字段（用于 fork）支持。
 - [ ] 增加基础迁移：`v1 -> v2 -> v3`（或至少兼容旧头与旧字段）。
 
 ### 1.3 上下文构建（文件：`src/session_manager.zig`）

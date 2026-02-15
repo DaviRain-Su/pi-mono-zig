@@ -2,10 +2,11 @@ const std = @import("std");
 
 pub const SessionHeader = struct {
     type: []const u8 = "session",
-    version: u32 = 1,
+    version: u32 = 3,
     id: []const u8,
     timestamp: []const u8,
     cwd: []const u8,
+    parentSession: ?[]const u8 = null,
 };
 
 pub const MessageEntry = struct {
@@ -53,6 +54,74 @@ pub const ToolResultEntry = struct {
     content: []const u8,
 
     tokensEst: ?usize = null,
+};
+
+pub const ThinkingLevelChangeEntry = struct {
+    type: []const u8 = "thinking_level_change",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    thinkingLevel: []const u8,
+};
+
+pub const ModelChangeEntry = struct {
+    type: []const u8 = "model_change",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    provider: []const u8,
+    modelId: []const u8,
+};
+
+pub const CompactionEntry = struct {
+    type: []const u8 = "compaction",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    summary: []const u8,
+    firstKeptEntryId: []const u8,
+    tokensBefore: usize,
+    details: ?[]const u8 = null,
+    fromHook: bool = false,
+};
+
+pub const BranchSummaryEntry = struct {
+    type: []const u8 = "branch_summary",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    fromId: []const u8,
+    summary: []const u8,
+    details: ?[]const u8 = null,
+    fromHook: bool = false,
+};
+
+pub const CustomEntry = struct {
+    type: []const u8 = "custom",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    customType: []const u8,
+    data: ?[]const u8 = null,
+};
+
+pub const SessionInfoEntry = struct {
+    type: []const u8 = "session_info",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    name: ?[]const u8 = null,
+};
+
+pub const CustomMessageEntry = struct {
+    type: []const u8 = "custom_message",
+    id: []const u8,
+    parentId: ?[]const u8 = null,
+    timestamp: []const u8,
+    customType: []const u8,
+    content: []const u8,
+    display: bool = true,
+    details: ?[]const u8 = null,
 };
 
 pub const LeafEntry = struct {
@@ -120,6 +189,13 @@ pub const Entry = union(enum) {
     message: MessageEntry,
     tool_call: ToolCallEntry,
     tool_result: ToolResultEntry,
+    thinking_level_change: ThinkingLevelChangeEntry,
+    model_change: ModelChangeEntry,
+    compaction: CompactionEntry,
+    branch_summary: BranchSummaryEntry,
+    custom: CustomEntry,
+    custom_message: CustomMessageEntry,
+    session_info: SessionInfoEntry,
     turn_start: TurnStartEntry,
     turn_end: TurnEndEntry,
     summary: SummaryEntry,
@@ -146,6 +222,13 @@ pub fn idOf(e: Entry) ?[]const u8 {
         .message => |m| m.id,
         .tool_call => |t| t.id,
         .tool_result => |t| t.id,
+        .thinking_level_change => |t| t.id,
+        .model_change => |t| t.id,
+        .compaction => |t| t.id,
+        .branch_summary => |t| t.id,
+        .custom => |t| t.id,
+        .custom_message => |t| t.id,
+        .session_info => |t| t.id,
         .turn_start => |t| t.id,
         .turn_end => |t| t.id,
         .summary => |s| s.id,
@@ -158,6 +241,13 @@ pub fn parentIdOf(e: Entry) ?[]const u8 {
         .message => |m| m.parentId,
         .tool_call => |t| t.parentId,
         .tool_result => |t| t.parentId,
+        .thinking_level_change => |t| t.parentId,
+        .model_change => |t| t.parentId,
+        .compaction => |t| t.parentId,
+        .branch_summary => |t| t.parentId,
+        .custom => |t| t.parentId,
+        .custom_message => |t| t.parentId,
+        .session_info => |t| t.parentId,
         .turn_start => |t| t.parentId,
         .turn_end => |t| t.parentId,
         .summary => |s| s.parentId,
