@@ -32,6 +32,28 @@ pub const AgentLoop = struct {
         };
     }
 
+    fn latestModelMeta(entries: []const session.Entry) struct { provider: ?[]const u8, model: ?[]const u8 } {
+        var provider: ?[]const u8 = null;
+        var model: ?[]const u8 = null;
+
+        for (entries) |e| {
+            switch (e) {
+                .model_change => |m| {
+                    provider = m.provider;
+                    model = m.modelId;
+                },
+                .message => |m| {
+                    if (!std.mem.eql(u8, m.role, "assistant")) continue;
+                    if (m.provider) |p| provider = p;
+                    if (m.model) |mid| model = mid;
+                },
+                else => {},
+            }
+        }
+
+        return .{ .provider = provider, .model = model };
+    }
+
     pub fn step(self: *AgentLoop) !bool {
         // TS-like: use business-only context for model decisions (structural entries are excluded).
         const entries = try self.session_mgr.buildContextEntries();
@@ -67,7 +89,15 @@ pub const AgentLoop = struct {
                 for (entries) |e| {
                     usage_total_tokens += tokensEstForContextEntry(e);
                 }
-                _ = try self.session_mgr.appendMessageWithMeta("assistant", t, tokens_est, usage_total_tokens);
+                const model_meta = latestModelMeta(entries);
+                _ = try self.session_mgr.appendMessageWithMetaAndModel(
+                    "assistant",
+                    t,
+                    tokens_est,
+                    usage_total_tokens,
+                    model_meta.provider,
+                    model_meta.model,
+                );
                 self.bus.emit(.{ .message_append = .{ .role = "assistant", .content = t } });
                 _ = try self.session_mgr.appendTurnEnd(self.turn, user_mid, turn_group, "final");
                 self.bus.emit(.{ .turn_end = .{ .turn = self.turn } });

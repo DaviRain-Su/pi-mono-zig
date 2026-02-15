@@ -17,6 +17,9 @@ pub const MessageEntry = struct {
     pub const NestedMessage = struct {
         role: []const u8,
         content: []const u8,
+        /// TS assistant message metadata. Preserved for cross-loader parity.
+        provider: ?[]const u8 = null,
+        model: ?[]const u8 = null,
         usage: ?Usage = null,
     };
 
@@ -28,6 +31,10 @@ pub const MessageEntry = struct {
     content: []const u8,
     /// TS-compatible nested message payload (kept in sync with top-level role/content).
     message: ?NestedMessage = null,
+
+    /// TS assistant message metadata mirror (also written inside `message`).
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
 
     /// Optional per-entry usage estimate (best-effort). When present, sizing prefers this.
     tokensEst: ?usize = null,

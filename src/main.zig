@@ -148,16 +148,22 @@ fn migrateMessageObject(
     const role_top = if (obj.get("role")) |v| valueAsString(v) else null;
     const content_top = if (obj.get("content")) |v| valueAsString(v) else null;
     const usage_top = if (obj.get("usageTotalTokens")) |v| valueAsUsize(v) else null;
+    const provider_top = if (obj.get("provider")) |v| valueAsString(v) else null;
+    const model_top = if (obj.get("model")) |v| valueAsString(v) else null;
 
     var usage_nested: ?usize = null;
     var role_nested: ?[]const u8 = null;
     var content_nested: ?[]const u8 = null;
+    var provider_nested: ?[]const u8 = null;
+    var model_nested: ?[]const u8 = null;
     var has_message_object = false;
     if (obj.get("message")) |mv| switch (mv) {
         .object => |mobj| {
             has_message_object = true;
             role_nested = if (mobj.get("role")) |v| valueAsString(v) else null;
             content_nested = if (mobj.get("content")) |v| valueAsString(v) else null;
+            provider_nested = if (mobj.get("provider")) |v| valueAsString(v) else null;
+            model_nested = if (mobj.get("model")) |v| valueAsString(v) else null;
             if (mobj.get("usage")) |uv| switch (uv) {
                 .object => |uobj| {
                     usage_nested = if (uobj.get("totalTokens")) |tv| valueAsUsize(tv) else null;
@@ -171,9 +177,13 @@ fn migrateMessageObject(
     const role = role_top orelse role_nested;
     const content = content_top orelse content_nested;
     const usage_total = usage_top orelse usage_nested;
+    const provider = provider_top orelse provider_nested;
+    const model = model_top orelse model_nested;
 
     if (try putStringIfMissing(obj, "role", role)) changed = true;
     if (try putStringIfMissing(obj, "content", content)) changed = true;
+    if (try putStringIfMissing(obj, "provider", provider)) changed = true;
+    if (try putStringIfMissing(obj, "model", model)) changed = true;
     if (try putIntegerIfMissing(obj, "usageTotalTokens", usage_total)) changed = true;
 
     if (has_message_object) {
@@ -188,6 +198,8 @@ fn migrateMessageObject(
                 var msg_changed = false;
                 if (try putStringIfMissing(&msg_copy, "role", role)) msg_changed = true;
                 if (try putStringIfMissing(&msg_copy, "content", content)) msg_changed = true;
+                if (try putStringIfMissing(&msg_copy, "provider", provider)) msg_changed = true;
+                if (try putStringIfMissing(&msg_copy, "model", model)) msg_changed = true;
                 if (try ensureUsageTotalTokens(allocator, &msg_copy, usage_total)) msg_changed = true;
 
                 if (msg_changed) {
@@ -201,6 +213,8 @@ fn migrateMessageObject(
         var msg_obj = std.json.ObjectMap.init(allocator);
         if (role) |r| try msg_obj.put("role", .{ .string = r });
         if (content) |c| try msg_obj.put("content", .{ .string = c });
+        if (provider) |p| try msg_obj.put("provider", .{ .string = p });
+        if (model) |m| try msg_obj.put("model", .{ .string = m });
         _ = try ensureUsageTotalTokens(allocator, &msg_obj, usage_total);
         try obj.put("message", .{ .object = msg_obj });
         changed = true;
@@ -3560,7 +3574,7 @@ test "session-migrate backfills core TS compatibility fields" {
         \\{"type":"session","version":1,"id":"s_old","timestamp":"1770000000000","cwd":"."}
         \\{"type":"message","id":"m1","parentId":null,"timestamp":"1770000000001","role":"user","content":"hello"}
         \\{"type":"leaf","timestamp":"1770000000002","targetId":"m1"}
-        \\{"type":"message","id":"m2","parentId":"m1","timestamp":"1770000000003","message":{"role":"assistant","content":"ok","usage":{"totalTokens":42}}}
+        \\{"type":"message","id":"m2","parentId":"m1","timestamp":"1770000000003","message":{"role":"assistant","content":"ok","provider":"openai","model":"gpt-4.1","usage":{"totalTokens":42}}}
         \\{"type":"label","id":"l1","timestamp":"1770000000004","targetId":"m1","label":"ROOT"}
         \\
     ;
@@ -3654,10 +3668,25 @@ test "session-migrate backfills core TS compatibility fields" {
         };
         const role = if (o.get("role")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
         const content = if (o.get("content")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        const provider = if (o.get("provider")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+        const model = if (o.get("model")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
         const utt = if (o.get("usageTotalTokens")) |v| valueAsUsize(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("assistant", role);
         try std.testing.expectEqualStrings("ok", content);
+        try std.testing.expectEqualStrings("openai", provider);
+        try std.testing.expectEqualStrings("gpt-4.1", model);
         try std.testing.expectEqual(@as(usize, 42), utt);
+
+        const msgv = o.get("message") orelse return error.TestUnexpectedResult;
+        switch (msgv) {
+            .object => |mobj| {
+                const nested_provider = if (mobj.get("provider")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+                const nested_model = if (mobj.get("model")) |v| valueAsString(v) orelse return error.TestUnexpectedResult else return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings("openai", nested_provider);
+                try std.testing.expectEqualStrings("gpt-4.1", nested_model);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     {

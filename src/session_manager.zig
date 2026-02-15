@@ -370,12 +370,34 @@ pub const SessionManager = struct {
         return try self.appendMessageWithMeta(role, content, null, usage_total_tokens);
     }
 
+    pub fn appendMessageWithModel(
+        self: *SessionManager,
+        role: []const u8,
+        content: []const u8,
+        provider: ?[]const u8,
+        model: ?[]const u8,
+    ) ![]const u8 {
+        return try self.appendMessageWithMetaAndModel(role, content, null, null, provider, model);
+    }
+
     pub fn appendMessageWithMeta(
         self: *SessionManager,
         role: []const u8,
         content: []const u8,
         tokens_est: ?usize,
         usage_total_tokens: ?usize,
+    ) ![]const u8 {
+        return try self.appendMessageWithMetaAndModel(role, content, tokens_est, usage_total_tokens, null, null);
+    }
+
+    pub fn appendMessageWithMetaAndModel(
+        self: *SessionManager,
+        role: []const u8,
+        content: []const u8,
+        tokens_est: ?usize,
+        usage_total_tokens: ?usize,
+        provider: ?[]const u8,
+        model: ?[]const u8,
     ) ![]const u8 {
         const pid = try self.currentLeafId();
         const id = try self.newId();
@@ -389,8 +411,12 @@ pub const SessionManager = struct {
             .message = .{
                 .role = role,
                 .content = content,
+                .provider = provider,
+                .model = model,
                 .usage = nested_usage,
             },
+            .provider = provider,
+            .model = model,
             .tokensEst = tokens_est,
             .usageTotalTokens = usage_total_tokens,
         };
@@ -608,6 +634,20 @@ pub const SessionManager = struct {
 
                 const content_val = if (obj.get("content")) |v| v else if (msg_obj) |mo| (mo.get("content") orelse continue) else continue;
                 const content = try extractTextFromContentValue(self.arena, content_val);
+                const provider0 = if (obj.get("provider")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else if (msg_obj) |mo| if (mo.get("provider")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null else null;
+                const model0 = if (obj.get("model")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else if (msg_obj) |mo| if (mo.get("model")) |v| switch (v) {
+                    .string => |s| @as(?[]const u8, s),
+                    else => null,
+                } else null else null;
 
                 const tokens_est0 = if (obj.get("tokensEst")) |v| switch (v) {
                     .integer => |x| @as(?usize, @intCast(x)),
@@ -633,12 +673,16 @@ pub const SessionManager = struct {
                 const pid = try dup.os(self.arena, pid0);
                 const ts = try dup.s(self.arena, ts0);
                 const role = try dup.s(self.arena, role_norm0);
+                const provider = try dup.os(self.arena, provider0);
+                const model = try dup.os(self.arena, model0);
                 try out.append(self.arena, .{ .message = .{
                     .id = id,
                     .parentId = pid,
                     .timestamp = ts,
                     .role = role,
                     .content = content,
+                    .provider = provider,
+                    .model = model,
                     .tokensEst = tokens_est0,
                     .usageTotalTokens = usage_total_tokens0,
                 } });
