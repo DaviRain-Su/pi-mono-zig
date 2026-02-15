@@ -30,6 +30,13 @@ pub const TurnEndEntry = st.TurnEndEntry;
 pub const SummaryEntry = st.SummaryEntry;
 pub const Entry = st.Entry;
 
+pub const SessionContextMeta = struct {
+    thinkingLevel: ?[]const u8 = null,
+    modelProvider: ?[]const u8 = null,
+    modelId: ?[]const u8 = null,
+    sessionName: ?[]const u8 = null,
+};
+
 pub const SessionManager = struct {
     arena: std.mem.Allocator,
     session_path: []const u8,
@@ -1138,6 +1145,32 @@ pub const SessionManager = struct {
         return try out.toOwnedSlice(self.arena);
     }
 
+    /// Extract active session metadata from current leaf path.
+    /// Includes latest thinking level, model/provider/modelId and session name.
+    pub fn loadContextMeta(self: *SessionManager) !SessionContextMeta {
+        var meta = SessionContextMeta{};
+        const chain = try self.buildContextEntriesMode(true);
+        for (chain) |e| {
+            switch (e) {
+                .thinking_level_change => |tc| meta.thinkingLevel = tc.thinkingLevel,
+                .model_change => |mc| {
+                    meta.modelProvider = mc.provider;
+                    meta.modelId = mc.modelId;
+                },
+                .session_info => |si| {
+                    if (si.name) |name| meta.sessionName = name;
+                },
+                .message => |m| {
+                    if (std.mem.eql(u8, m.role, "assistant") and m.model != null) {
+                        meta.modelId = m.model;
+                    }
+                },
+                else => {},
+            }
+        }
+        return meta;
+    }
+
     fn isBusinessEntry(e: Entry) bool {
         return switch (e) {
             .message, .tool_call, .tool_result, .summary => true,
@@ -1267,7 +1300,7 @@ pub const SessionManager = struct {
                 const label = if (b.fromHook) " [fromHook]" else "";
                 const summary = try std.fmt.allocPrint(
                     self.arena,
-                    "{s}{s}\\n\\n{s}",
+                    "{s}{s}:\\n\\n<summary>\\n{s}\\n</summary>",
                     .{ "The following is a summary of a branch that this conversation came back from", label, b.summary },
                 );
                 try self.appendContextEntryMessage(out, source, "user", summary);
@@ -1322,8 +1355,8 @@ pub const SessionManager = struct {
         const compaction_prefix = if (comp.fromHook) " [fromHook]" else "";
         const compaction_summary = try std.fmt.allocPrint(
             self.arena,
-            "{s}{s}\\n(tokens before: {d})\\n{s}",
-            .{ "The following is a summary of the conversation history before this point", compaction_prefix, comp.tokensBefore, comp.summary },
+            "{s}{s} (tokens before: {d}):\\n\\n<summary>\\n{s}\\n</summary>",
+            .{ "The conversation history before this point was compacted into the following summary", compaction_prefix, comp.tokensBefore, comp.summary },
         );
         try self.appendContextEntryMessage(&out, chain[cidx], "user", compaction_summary);
 

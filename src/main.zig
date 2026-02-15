@@ -2835,6 +2835,67 @@ test "buildSessionContext converts compaction and branch/custom messages" {
     try std.testing.expect(!saw_dropped);
 }
 
+test "buildSessionContext exposes latest thinking/model/session metadata" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "session_context_metadata");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendSessionInfo("legacy workspace");
+    _ = try sm.appendMessage("user", "hello");
+    _ = try sm.appendThinkingLevelChange("minimal");
+    _ = try sm.appendModelChange("providerA", "modelA");
+    _ = try sm.appendSessionInfo("current workspace");
+    _ = try sm.appendMessage("assistant", "working");
+    _ = try sm.appendThinkingLevelChange("high");
+    _ = try sm.appendModelChange("providerB", "modelB");
+
+    const ctx = try sm.buildSessionContext();
+    var saw_metadata = false;
+    for (ctx) |e| {
+        switch (e) {
+            .session_info, .thinking_level_change, .model_change => saw_metadata = true,
+            else => {},
+        }
+    }
+    // Non-verbose context should filter metadata entries.
+    try std.testing.expect(!saw_metadata);
+
+    const verbose_ctx = try sm.buildSessionContextVerbose();
+    var saw_session_info = false;
+    var saw_thinking = false;
+    var saw_model = false;
+    for (verbose_ctx) |e| {
+        switch (e) {
+            .session_info => saw_session_info = true,
+            .thinking_level_change => saw_thinking = true,
+            .model_change => saw_model = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_session_info);
+    try std.testing.expect(saw_thinking);
+    try std.testing.expect(saw_model);
+
+    const meta = try sm.loadContextMeta();
+    try std.testing.expect(meta.thinkingLevel != null);
+    try std.testing.expect(meta.modelProvider != null);
+    try std.testing.expect(meta.modelId != null);
+    try std.testing.expect(meta.sessionName != null);
+    try std.testing.expect(std.mem.eql(u8, meta.thinkingLevel.?, "high"));
+    try std.testing.expect(std.mem.eql(u8, meta.modelProvider.?, "providerB"));
+    try std.testing.expect(std.mem.eql(u8, meta.modelId.?, "modelB"));
+    try std.testing.expect(std.mem.eql(u8, meta.sessionName.?, "current workspace"));
+}
+
 test "loadEntries migrates legacy v1 entries, ids and parentId links" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
