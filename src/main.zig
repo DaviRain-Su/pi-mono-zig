@@ -8,21 +8,21 @@ const st = @import("session_types.zig");
 
 fn usage() void {
     std.debug.print(
-        \\pi-mono-zig (MVP)\n\n\
-        \\Usage:\n\
-        \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\
-        \\  pi-mono-zig verify --run <runId> [--out runs]\n\
-        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
-        \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
-        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId> [--summary <text>] [--summary-from-hook]\n\
-        \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
-        \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\
-        \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
-        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N] [--show-turns]\n\
-        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--keep-last-groups N] [--max-chars N] [--max-tokens-est N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\
-        \\Examples:\n\
-        \\  zig build run -- run --plan examples/hello.plan.json\n\
-        \\  zig build run -- verify --run run_123_hello\n\n\
+        \\pi-mono-zig (MVP)\n\n\\
+        \\Usage:\n\\
+        \\  pi-mono-zig run --plan <plan.json> [--out runs]\n\\
+        \\  pi-mono-zig verify --run <runId> [--out runs]\n\\
+        \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact [--context-window N] [--reserve-tokens N] [--keep-recent-tokens N] [--max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\\
+        \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\\
+        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId> [--summary <text>] [--summary-from-hook]\n\\
+        \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\\
+        \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\\
+        \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\\
+        \\  pi-mono-zig tree --session <path.jsonl> [--max-depth N] [--show-turns]\n\\
+        \\  pi-mono-zig compact --session <path.jsonl> [--keep-last N] [--keep-last-groups N] [--max-chars N] [--max-tokens-est N] [--context-window N] [--reserve-tokens N] [--keep-recent-tokens N] [--dry-run] [--label NAME] [--structured (md|json)] [--update]\n\n\\
+        \\Examples:\n\\
+        \\  zig build run -- run --plan examples/hello.plan.json\n\\
+        \\  zig build run -- verify --run run_123_hello\n\n\\
     , .{});
 }
 
@@ -79,11 +79,36 @@ fn tokensEstForEntry(e: st.Entry) usize {
     };
 }
 
+const AUTO_COMPACT_DEFAULT_CONTEXT_WINDOW: usize = 64 * 1024;
+const AUTO_COMPACT_DEFAULT_RESERVE_TOKENS: usize = 16_384;
+const AUTO_COMPACT_DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
+
+fn autoCompactShouldTrigger(context_tokens: usize, context_window: usize, reserve_tokens: usize) bool {
+    const budget = if (context_window > reserve_tokens) context_window - reserve_tokens else 0;
+    return context_tokens > budget;
+}
+
+fn autoCompactKeepRecentIndex(nodes: []const st.Entry, boundary_from: usize, keep_recent_tokens: usize) usize {
+    if (nodes.len <= boundary_from) return boundary_from;
+    if (keep_recent_tokens == 0) return boundary_from;
+
+    var kept: usize = 0;
+    var i: usize = nodes.len;
+    while (i > boundary_from) : (i -= 1) {
+        kept += tokensEstForEntry(nodes[i - 1]);
+        if (kept >= keep_recent_tokens) {
+            return i - 1;
+        }
+    }
+    return boundary_from;
+}
+
 fn doCompact(
     allocator: std.mem.Allocator,
     sm: *session.SessionManager,
     keep_last: usize,
     keep_last_groups: ?usize,
+    keep_recent_tokens: ?usize,
     dry_run: bool,
     label: ?[]const u8,
     prefix: []const u8,
@@ -126,10 +151,9 @@ fn doCompact(
     }
 
     // Choose cut start.
-    // Keep_last is interpreted relative to the full leaf context, but we never cut before boundary_from.
+    // keep_last is interpreted relative to the full leaf context, but we never cut before boundary_from.
     var start: usize = if (n > keep_last) n - keep_last else boundary_from;
     if (start < boundary_from) start = boundary_from;
-    const start_initial: usize = start;
 
     if (keep_last_groups) |kg| {
         // Keep the last N complete turn-groups (best-effort), within the boundary window.
@@ -156,7 +180,12 @@ fn doCompact(
         // If there aren't enough groups to skip within boundary, keep everything since boundary.
         if (count <= kg) start = boundary_from;
         if (start > n) start = n;
+    } else if (keep_recent_tokens) |krt| {
+        start = autoCompactKeepRecentIndex(nodes.items, boundary_from, krt);
+        if (start < boundary_from) start = boundary_from;
     }
+
+    const start_initial: usize = start;
 
     // TS-ish compaction cut alignment:
     // 1) Avoid starting the kept tail with a tool_result (which would split tool_call/tool_result pairs).
@@ -1865,6 +1894,9 @@ pub fn main(init: std.process.Init) !void {
         var keep_last_groups: ?usize = null;
         var max_chars: ?usize = null;
         var max_tokens_est: ?usize = null;
+        var context_window: usize = AUTO_COMPACT_DEFAULT_CONTEXT_WINDOW;
+        var reserve_tokens: usize = AUTO_COMPACT_DEFAULT_RESERVE_TOKENS;
+        var keep_recent_tokens: ?usize = null;
         var dry_run = false;
         var label: ?[]const u8 = null;
         var structured = false;
@@ -1886,6 +1918,15 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, a, "--max-tokens-est")) {
                 const s = args.next() orelse return error.MissingMaxTokensEst;
                 max_tokens_est = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--context-window")) {
+                const s = args.next() orelse return error.MissingMaxTokensEst;
+                context_window = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--reserve-tokens")) {
+                const s = args.next() orelse return error.MissingMaxTokensEst;
+                reserve_tokens = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--keep-recent-tokens")) {
+                const s = args.next() orelse return error.MissingKeepLast;
+                keep_recent_tokens = try std.fmt.parseInt(usize, s, 10);
             } else if (std.mem.eql(u8, a, "--dry-run")) {
                 dry_run = true;
             } else if (std.mem.eql(u8, a, "--label")) {
@@ -1960,6 +2001,7 @@ pub fn main(init: std.process.Init) !void {
             &sm,
             effective_keep_last,
             keep_last_groups,
+            keep_recent_tokens,
             dry_run,
             label,
             if (structured and std.mem.eql(u8, structured_format, "json")) "SUMMARY_JSON" else if (structured) "SUMMARY_MD" else "SUMMARY (naive):\n",
@@ -2273,6 +2315,10 @@ pub fn main(init: std.process.Init) !void {
         var auto_compact = false;
         var max_chars: usize = 8_000;
         var max_tokens_est: usize = 2_000;
+        var context_window: usize = AUTO_COMPACT_DEFAULT_CONTEXT_WINDOW;
+        var reserve_tokens: usize = AUTO_COMPACT_DEFAULT_RESERVE_TOKENS;
+        var keep_recent_tokens: ?usize = null;
+        var use_token_window_policy = false;
         var keep_last: usize = 8;
         var keep_last_groups: ?usize = null;
 
@@ -2289,6 +2335,18 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, a, "--max-tokens-est")) {
                 const s = args.next() orelse return error.MissingMaxTokensEst;
                 max_tokens_est = try std.fmt.parseInt(usize, s, 10);
+            } else if (std.mem.eql(u8, a, "--context-window")) {
+                const s = args.next() orelse return error.MissingMaxTokensEst;
+                context_window = try std.fmt.parseInt(usize, s, 10);
+                use_token_window_policy = true;
+            } else if (std.mem.eql(u8, a, "--reserve-tokens")) {
+                const s = args.next() orelse return error.MissingMaxTokensEst;
+                reserve_tokens = try std.fmt.parseInt(usize, s, 10);
+                use_token_window_policy = true;
+            } else if (std.mem.eql(u8, a, "--keep-recent-tokens")) {
+                const s = args.next() orelse return error.MissingKeepLast;
+                keep_recent_tokens = try std.fmt.parseInt(usize, s, 10);
+                use_token_window_policy = true;
             } else if (std.mem.eql(u8, a, "--keep-last")) {
                 const s = args.next() orelse return error.MissingKeepLast;
                 keep_last = try std.fmt.parseInt(usize, s, 10);
@@ -2389,27 +2447,52 @@ pub fn main(init: std.process.Init) !void {
                     total_tokens_est += tokensEstForEntry(e);
                 }
 
-                if (total > max_chars or total_tokens_est > max_tokens_est) {
+                var auto_keep_recent_tokens = keep_recent_tokens;
+                var threshold_chars = max_chars;
+                var threshold_tokens = max_tokens_est;
+                const should_auto_compact = if (use_token_window_policy) blk: {
+                    if (auto_keep_recent_tokens == null) {
+                        auto_keep_recent_tokens = AUTO_COMPACT_DEFAULT_KEEP_RECENT_TOKENS;
+                    }
+                    threshold_tokens = context_window;
+                    threshold_chars = if (context_window > reserve_tokens) context_window - reserve_tokens else 0;
+                    break :blk autoCompactShouldTrigger(total_tokens_est, context_window, reserve_tokens);
+                } else blk: {
+                    break :blk (total > max_chars) or (total_tokens_est > max_tokens_est);
+                };
+
+                if (should_auto_compact) {
                     const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
                     const res = try doCompact(
                         allocator,
                         &sm,
                         effective_keep_last,
                         keep_last_groups,
+                        if (use_token_window_policy) auto_keep_recent_tokens else null,
                         false,
                         "AUTO_COMPACT",
                         "AUTO_COMPACT (naive):\n",
-                        if (total > max_chars) "auto_chars" else "auto_tokens",
+                        if (use_token_window_policy) "auto_tokens" else "auto_chars",
                         total,
                         total_tokens_est,
-                        max_chars,
-                        max_tokens_est,
+                        threshold_chars,
+                        threshold_tokens,
                         false,
                     );
-                    const mode = if (keep_last_groups != null) "groups" else "entries";
+                    const mode = if (use_token_window_policy)
+                        "window"
+                    else if (keep_last_groups != null)
+                        "groups"
+                    else
+                        "entries";
+                    const compact_keep_recent = if (use_token_window_policy) (auto_keep_recent_tokens orelse AUTO_COMPACT_DEFAULT_KEEP_RECENT_TOKENS) else 0;
+                    const policy_suffix = if (use_token_window_policy)
+                        try std.fmt.allocPrint(allocator, " keepRecentTokens={d} contextWindow={d} reserveTokens={d}", .{ compact_keep_recent, context_window, reserve_tokens })
+                    else
+                        "";
                     std.debug.print(
-                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}\n",
-                        .{ total, max_chars, total_tokens_est, max_tokens_est, mode, keep_last, keep_last_groups, res.summaryId.? },
+                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}{s}\n",
+                        .{ total, threshold_chars, total_tokens_est, threshold_tokens, mode, keep_last, keep_last_groups, res.summaryId.?, policy_suffix },
                     );
                 }
             }
@@ -3249,4 +3332,44 @@ test "tokensEstForEntry should use usageTotalTokens when present" {
     try std.testing.expectEqual(@as(usize, 4), tokensEstForEntry(st.Entry{ .message = usage_entry }));
     try std.testing.expectEqual(@as(usize, 3), tokensEstForEntry(st.Entry{ .message = plain_entry }));
     try std.testing.expectEqual(@as(usize, 2), tokensEstForEntry(st.Entry{ .message = fallback_entry }));
+}
+
+test "autoCompactShouldTrigger follows contextWindow-reserveTokens" {
+    try std.testing.expect(autoCompactShouldTrigger(401, 500, 100));
+    try std.testing.expect(!autoCompactShouldTrigger(400, 500, 100));
+}
+
+test "autoCompactKeepRecentIndex keeps near keep_recent_tokens budget" {
+    const entries = [_]st.Entry{
+        .{ .message = st.MessageEntry{
+            .id = "m1",
+            .parentId = null,
+            .timestamp = "ts",
+            .role = "user",
+            .content = "short",
+            .tokensEst = 3,
+            .usageTotalTokens = null,
+        } },
+        .{ .message = st.MessageEntry{
+            .id = "m2",
+            .parentId = null,
+            .timestamp = "ts",
+            .role = "assistant",
+            .content = "medium message",
+            .tokensEst = 4,
+            .usageTotalTokens = null,
+        } },
+        .{ .message = st.MessageEntry{
+            .id = "m3",
+            .parentId = null,
+            .timestamp = "ts",
+            .role = "assistant",
+            .content = "tiny",
+            .tokensEst = 2,
+            .usageTotalTokens = null,
+        } },
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), autoCompactKeepRecentIndex(&entries, 0, 6));
+    try std.testing.expectEqual(@as(usize, 0), autoCompactKeepRecentIndex(&entries, 0, 20));
 }

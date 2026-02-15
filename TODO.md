@@ -63,8 +63,8 @@
 - [x] 与 compaction 一致处理 `details` 文件轨迹累计。
 
 ### 2.3 自动压缩触发策略（文件：`src/main.zig`）
-- [ ] 对齐 TS 的触发公式：`contextTokens > contextWindow - reserveTokens`。
-- [ ] `reserveTokens/keepRecentTokens` 配置可配置化（不必先 1:1，但要结构化）。
+- [x] 对齐 TS 的触发公式：`contextTokens > contextWindow - reserveTokens`。
+- [x] `reserveTokens/keepRecentTokens` 配置可配置化（不必先 1:1，但要结构化）。
 
 ---
 
