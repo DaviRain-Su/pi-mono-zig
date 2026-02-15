@@ -41,14 +41,9 @@ This is a *minimal* AgentLoop clone (uses a deterministic mock model).
 JSONL entries are now structured (not just plain messages):
 - `type: session`
 - `type: message`
-- `type: custom_message` (TS extension message; included in context as user-style content)
 - `type: tool_call`
 - `type: tool_result`
-- `type: compaction` (TS-compatible summary checkpoint)
-- `type: custom` / `type: session_info` (parsed and preserved for TS session compatibility)
 - `type: leaf` (tracks current leaf for branching)
-
-`type: message` supports both zig-native flat fields (`role/content`) and TS nested shape (`message.role/message.content`).
 
 ```bash
 # creates/extends a JSONL session
@@ -73,21 +68,8 @@ zig build run -- label --session /tmp/pi-session.jsonl --to <entryId> --label RO
 # branch leaf to an earlier node
 zig build run -- branch --session /tmp/pi-session.jsonl --to <entryId>
 
-# branch leaf to root (before first entry)
-zig build run -- branch --session /tmp/pi-session.jsonl --root
-
-# branch and append a branch_summary node (auto summary if --summary omitted)
-zig build run -- branch-with-summary --session /tmp/pi-session.jsonl --to <entryId>
-
-# branch to root and append a branch_summary node
-zig build run -- branch-with-summary --session /tmp/pi-session.jsonl --root
-
 # replay follows current leaf (root -> leaf path)
 zig build run -- replay --session /tmp/pi-session.jsonl
-
-# persist context state entries (TS-style)
-zig build run -- set-model --session /tmp/pi-session.jsonl --provider anthropic --model claude-sonnet-4-5
-zig build run -- set-thinking --session /tmp/pi-session.jsonl --level high
 
 # show full details for one entry
 zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>
@@ -95,7 +77,7 @@ zig build run -- show --session /tmp/pi-session.jsonl --id <entryId>
 # show full session tree ("*" marks current leaf path)
 zig build run -- tree --session /tmp/pi-session.jsonl
 
-# compact current leaf path (TS-style summary marker + keep-last boundary)
+# compact current leaf path into a summary + keep last N nodes
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8
 
 # preview compaction summary without writing
@@ -118,8 +100,8 @@ zig build run -- compact --session /tmp/pi-session.jsonl --keep-last-groups 2 --
 # structured summary (json)
 zig build run -- compact --session /tmp/pi-session.jsonl --keep-last 8 --dry-run --structured json
 
-# auto-compact while chatting (char/tokens boundary since last summary)
-# (uses the same TS-style compaction logic as manual compact, with usage+trailing estimate)
+# auto-compact while chatting (naive char-count threshold)
+# (now calls the same compaction logic: summary + keep-last tail clone)
 zig build run -- chat --session /tmp/pi-session.jsonl --auto-compact --max-chars 8000 --keep-last 8
 ```
 

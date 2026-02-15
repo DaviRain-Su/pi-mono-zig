@@ -1,5 +1,13 @@
 const std = @import("std");
 
+fn compatIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn compatCwd() std.Io.Dir {
+    return std.Io.Dir.cwd();
+}
+
 pub const Plan = struct {
     schema: []const u8,
     workflow: []const u8,
@@ -13,6 +21,18 @@ pub const Plan = struct {
     };
 };
 
+var runBaseInstant: ?std.time.Instant = null;
+
+fn nowMsNow() !i64 {
+    const now = try std.time.Instant.now();
+    const base = if (runBaseInstant) |b| b else blk: {
+        runBaseInstant = now;
+        break :blk now;
+    };
+    const ms = now.since(base) / std.time.ns_per_ms;
+    return @as(i64, @intCast(ms));
+}
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     out_dir: []const u8,
@@ -21,8 +41,8 @@ pub const Runner = struct {
         return .{ .allocator = allocator, .out_dir = out_dir };
     }
 
-    fn nowMs() i64 {
-        return std.time.milliTimestamp();
+    fn nowMs() !i64 {
+        return try nowMsNow();
     }
 
     fn safeId(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
@@ -35,17 +55,23 @@ pub const Runner = struct {
     }
 
     fn writeJsonFile(path: []const u8, value: anytype) !void {
-        var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer f.close();
-        var buf: [16 * 1024]u8 = undefined;
-        var fw = std.fs.File.Writer.init(f, &buf);
-        try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &fw.interface);
-        try fw.interface.writeByte('\n');
-        _ = try fw.interface.flush();
+        const io = compatIo();
+        const cwd = compatCwd();
+        var out = try std.Io.Writer.Allocating.initCapacity(std.heap.page_allocator, 0);
+        defer out.deinit();
+        try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &out.writer);
+        try out.writer.writeByte('\n');
+
+        var f = try cwd.createFile(io, path, .{ .truncate = true });
+        defer f.close(io);
+        const out_slice = out.writer.buffer[0..out.writer.end];
+        try f.writePositionalAll(io, out_slice, 0);
     }
 
     fn ensureDir(path: []const u8) !void {
-        std.fs.cwd().makePath(path) catch |e| switch (e) {
+        const io = compatIo();
+        const cwd = compatCwd();
+        cwd.createDirPath(io, path) catch |e| switch (e) {
             error.PathAlreadyExists => {},
             else => return e,
         };
@@ -100,7 +126,7 @@ pub const Runner = struct {
             else => return error.InvalidParams,
         };
         if (ms_i < 0 or ms_i > 60_000) return error.InvalidParams;
-        std.Thread.sleep(@as(u64, @intCast(ms_i)) * std.time.ns_per_ms);
+        try std.Io.sleep(compatIo(), std.Io.Duration.fromMilliseconds(ms_i), .awake);
         return std.json.Value{ .object = obj };
     }
 
@@ -114,7 +140,7 @@ pub const Runner = struct {
     }
 
     pub fn run(self: *Runner, plan: *const Plan, plan_json: std.json.Value) ![]const u8 {
-        const run_id = try std.fmt.allocPrint(self.allocator, "run_{d}_{s}", .{ nowMs(), plan.workflow });
+        const run_id = try std.fmt.allocPrint(self.allocator, "run_{d}_{s}", .{ try nowMsNow(), plan.workflow });
 
         const run_path = try std.fs.path.join(self.allocator, &.{ self.out_dir, run_id });
         const steps_path = try std.fs.path.join(self.allocator, &.{ run_path, "steps" });
@@ -138,11 +164,11 @@ pub const Runner = struct {
             if (next == null) return error.NoRunnableSteps;
             const step = next.?;
 
-            const started = nowMs();
+            const started = try nowMsNow();
             const output = self.runTool(step) catch |e| {
                 const sid = try safeId(self.allocator, step.id);
                 const step_file = try std.fs.path.join(self.allocator, &.{ steps_path, try std.fmt.allocPrint(self.allocator, "{s}.json", .{sid}) });
-                const finished = nowMs();
+                const finished = try nowMsNow();
                 const artifact = .{
                     .schema = "pi.step.v1",
                     .runId = run_id,
@@ -157,7 +183,7 @@ pub const Runner = struct {
                 try writeJsonFile(step_file, artifact);
                 return e;
             };
-            const finished = nowMs();
+            const finished = try nowMsNow();
 
             const sid = try safeId(self.allocator, step.id);
             const step_file = try std.fs.path.join(self.allocator, &.{ steps_path, try std.fmt.allocPrint(self.allocator, "{s}.json", .{sid}) });
@@ -183,7 +209,7 @@ pub const Runner = struct {
             .schema = "pi.run.v1",
             .runId = run_id,
             .workflow = plan.workflow,
-            .createdAtMs = nowMs(),
+            .createdAtMs = try nowMsNow(),
         };
         try writeJsonFile(run_file, run_artifact);
 

@@ -23,7 +23,7 @@ pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
     while (j > 0) : (j -= 1) {
         const e = entries[j - 1];
         switch (e) {
-            .session, .leaf, .label, .turn_start, .turn_end, .thinking_level_change, .model_change, .custom, .session_info => continue,
+            .session, .leaf, .label, .turn_start, .turn_end => continue,
             else => {
                 last_sig = e;
                 break;
@@ -51,7 +51,6 @@ pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
                 .message => |m| {
                     if (std.mem.eql(u8, m.role, "user")) break :blk m.content;
                 },
-                .custom_message => |cm| break :blk cm.content,
                 else => {},
             }
         }
@@ -59,11 +58,11 @@ pub fn next(arena: std.mem.Allocator, entries: []const st.Entry) !ModelOutput {
     } orelse return .{ .final_text = "(no user input)" };
 
     if (std.mem.startsWith(u8, text, "echo:")) {
-        const arg = std.mem.trimLeft(u8, text[5..], " ");
+        const arg = std.mem.trimStart(u8, text[5..], " ");
         return .{ .tool_call = .{ .tool = "echo", .arg = arg } };
     }
     if (std.mem.startsWith(u8, text, "sh:")) {
-        const arg = std.mem.trimLeft(u8, text[3..], " ");
+        const arg = std.mem.trimStart(u8, text[3..], " ");
         return .{ .tool_call = .{ .tool = "shell", .arg = arg } };
     }
 

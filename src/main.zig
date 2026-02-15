@@ -14,10 +14,7 @@ fn usage() void {
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
         \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
-        \\  pi-mono-zig branch --session <path.jsonl> [--to <entryId> | --root]\n\
-        \\  pi-mono-zig branch-with-summary --session <path.jsonl> [--to <entryId> | --root] [--summary <text>]\n\
-        \\  pi-mono-zig set-model --session <path.jsonl> --provider <name> --model <id>\n\
-        \\  pi-mono-zig set-thinking --session <path.jsonl> --level <name>\n\
+        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
@@ -29,11 +26,24 @@ fn usage() void {
     , .{});
 }
 
+fn compatIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn compatCwd() std.Io.Dir {
+    return std.Io.Dir.cwd();
+}
+
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
-    const stat = try f.stat();
-    return try f.readToEndAlloc(allocator, stat.size);
+    const io = compatIo();
+    const cwd = compatCwd();
+    var f = try cwd.openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    const stat = try f.length(io);
+    if (stat > std.math.maxInt(usize)) return error.OutOfMemory;
+    const bytes = try allocator.alloc(u8, @as(usize, @intCast(stat)));
+    const size = try f.readPositionalAll(io, bytes, 0);
+    return bytes[0..size];
 }
 
 fn parseJsonFile(arena: std.mem.Allocator, path: []const u8) !std.json.Parsed(std.json.Value) {
@@ -58,171 +68,15 @@ fn tokensEstFromChars(chars: usize) usize {
 
 fn tokensEstForEntry(e: st.Entry) usize {
     return switch (e) {
-        .message => |m| m.tokensEst orelse tokensEstFromChars(m.content.len),
-        .custom_message => |cm| tokensEstFromChars(cm.content.len),
+        .message => |m| m.usageTotalTokens orelse m.tokensEst orelse tokensEstFromChars(m.content.len),
         // tool call/results tend to be denser / more verbose
         .tool_call => |tc| tc.tokensEst orelse (tokensEstFromChars(tc.arg.len) + 8),
         .tool_result => |tr| tr.tokensEst orelse (tokensEstFromChars(tr.content.len) + 8),
-        .branch_summary => |b| tokensEstFromChars(b.summary.len),
         .turn_start => 2,
         .turn_end => 2,
-        .thinking_level_change, .model_change => 0,
-        .summary => |s| tokensEstFromChars(s.summary.len),
+        .summary => |s| tokensEstFromChars(s.content.len),
         else => 0,
     };
-}
-
-const BoundaryTokenEstimate = struct {
-    tokens: usize,
-    usageTokens: usize,
-    trailingTokens: usize,
-    lastUsageIndex: ?usize,
-};
-
-fn estimateBoundaryTokens(entries: []const st.Entry, boundary_from: usize) BoundaryTokenEstimate {
-    var last_usage_idx: ?usize = null;
-    var usage_tokens: usize = 0;
-
-    var i: usize = boundary_from;
-    while (i < entries.len) : (i += 1) {
-        const e = entries[i];
-        switch (e) {
-            .message => |m| {
-                if (std.mem.eql(u8, m.role, "assistant")) {
-                    if (m.usageTotalTokens) |u| {
-                        last_usage_idx = i;
-                        usage_tokens = u;
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-
-    if (last_usage_idx == null) {
-        var est: usize = 0;
-        i = boundary_from;
-        while (i < entries.len) : (i += 1) {
-            est += tokensEstForEntry(entries[i]);
-        }
-        return .{
-            .tokens = est,
-            .usageTokens = 0,
-            .trailingTokens = est,
-            .lastUsageIndex = null,
-        };
-    }
-
-    var trailing: usize = 0;
-    i = last_usage_idx.? + 1;
-    while (i < entries.len) : (i += 1) {
-        trailing += tokensEstForEntry(entries[i]);
-    }
-
-    return .{
-        .tokens = usage_tokens + trailing,
-        .usageTokens = usage_tokens,
-        .trailingTokens = trailing,
-        .lastUsageIndex = last_usage_idx,
-    };
-}
-
-fn buildAutoBranchSummary(
-    allocator: std.mem.Allocator,
-    sm: *session.SessionManager,
-    old_leaf: ?[]const u8,
-    target: ?[]const u8,
-) ![]const u8 {
-    var by_id = std.StringHashMap(st.Entry).init(allocator);
-    defer by_id.deinit();
-
-    const entries = try sm.loadEntries();
-    for (entries) |e| {
-        if (st.idOf(e)) |id| {
-            try by_id.put(id, e);
-        }
-    }
-
-    var target_ancestors = std.StringHashMap(bool).init(allocator);
-    defer target_ancestors.deinit();
-    var cur_t = target;
-    while (cur_t) |cid| {
-        try target_ancestors.put(cid, true);
-        const e = by_id.get(cid) orelse break;
-        cur_t = st.parentIdOf(e);
-    }
-
-    var abandoned = try std.ArrayList(st.Entry).initCapacity(allocator, 0);
-    defer abandoned.deinit(allocator);
-    var cur = old_leaf;
-    while (cur) |cid| {
-        if (target_ancestors.contains(cid)) break;
-        const e = by_id.get(cid) orelse break;
-        try abandoned.append(allocator, e);
-        cur = st.parentIdOf(e);
-    }
-
-    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
-    defer out.deinit(allocator);
-    try out.appendSlice(allocator, "## Goal\n");
-    try out.appendSlice(allocator, "Branch from ");
-    try out.appendSlice(allocator, old_leaf orelse "root");
-    try out.appendSlice(allocator, " to ");
-    try out.appendSlice(allocator, target orelse "root");
-    try out.appendSlice(allocator, ".\n\n");
-
-    try out.appendSlice(allocator, "## Progress\n");
-    if (abandoned.items.len == 0) {
-        try out.appendSlice(allocator, "- (none)\n");
-    } else {
-        var written: usize = 0;
-        var i: usize = abandoned.items.len;
-        while (i > 0 and written < 8) : (i -= 1) {
-            const e = abandoned.items[i - 1];
-            switch (e) {
-                .message => |m| {
-                    const preview = if (m.content.len > 80) m.content[0..80] else m.content;
-                    try out.appendSlice(allocator, "- ");
-                    try out.appendSlice(allocator, m.role);
-                    try out.appendSlice(allocator, ": ");
-                    try out.appendSlice(allocator, preview);
-                    try out.appendSlice(allocator, "\n");
-                    written += 1;
-                },
-                .tool_call => |tc| {
-                    try out.appendSlice(allocator, "- tool_call ");
-                    try out.appendSlice(allocator, tc.tool);
-                    try out.appendSlice(allocator, "\n");
-                    written += 1;
-                },
-                .tool_result => |tr| {
-                    try out.appendSlice(allocator, "- tool_result ");
-                    try out.appendSlice(allocator, tr.tool);
-                    try out.appendSlice(allocator, ": ");
-                    try out.appendSlice(allocator, if (tr.ok) "ok" else "error");
-                    try out.appendSlice(allocator, "\n");
-                    written += 1;
-                },
-                .summary => {
-                    try out.appendSlice(allocator, "- (had compacted history)\n");
-                    written += 1;
-                },
-                .branch_summary => {
-                    try out.appendSlice(allocator, "- (had previous branch summary)\n");
-                    written += 1;
-                },
-                else => {},
-            }
-        }
-        if (written == 0) {
-            try out.appendSlice(allocator, "- (none)\n");
-        }
-    }
-
-    try out.appendSlice(allocator, "\n## Next Steps\n");
-    try out.appendSlice(allocator, "1. Continue from the selected branch point using this summary as context.\n");
-
-    return try out.toOwnedSlice(allocator);
 }
 
 fn doCompact(
@@ -423,197 +277,6 @@ fn doCompact(
     const want_json = std.mem.eql(u8, prefix, "SUMMARY_JSON");
     const want_md = std.mem.eql(u8, prefix, "SUMMARY_MD");
 
-    // TS-style file ops tracking (best-effort). We infer these from tool_call(shell) args.
-    var read_files_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-    defer read_files_out.deinit(allocator);
-    var modified_files_out = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-    defer modified_files_out.deinit(allocator);
-    var seen_rf = std.StringHashMap(bool).init(allocator);
-    defer seen_rf.deinit();
-    var seen_mf = std.StringHashMap(bool).init(allocator);
-    defer seen_mf.deinit();
-
-    const FileOps = struct {
-        fn trimToken(tok0: []const u8) []const u8 {
-            var tok = tok0;
-            tok = std.mem.trim(u8, tok, " \t\r\n");
-            tok = std.mem.trim(u8, tok, "\"'");
-            return tok;
-        }
-
-        fn looksLikePath(tok: []const u8) bool {
-            if (tok.len == 0) return false;
-            if (tok[0] == '-') return false;
-            if (std.mem.indexOfScalar(u8, tok, '|') != null) return false;
-            if (std.mem.indexOfScalar(u8, tok, ';') != null) return false;
-            if (std.mem.indexOfScalar(u8, tok, '&') != null) return false;
-            if (std.mem.indexOfScalar(u8, tok, '$') != null) return false;
-            if (std.mem.indexOf(u8, tok, "..") != null and tok.len <= 2) return false;
-
-            if (std.mem.indexOfScalar(u8, tok, '/') != null) return true;
-            // common file extensions
-            const exts = [_][]const u8{ ".zig", ".md", ".json", ".txt", ".service", ".ts", ".js", ".mjs", ".yaml", ".yml" };
-            for (exts) |e| if (std.mem.endsWith(u8, tok, e)) return true;
-            return false;
-        }
-
-        fn addUnique(
-            alloc: std.mem.Allocator,
-            list: *std.ArrayList([]const u8),
-            seen: *std.StringHashMap(bool),
-            tok: []const u8,
-            cap: usize,
-        ) void {
-            if (tok.len == 0) return;
-            if (list.items.len >= cap) return;
-            if (seen.contains(tok)) return;
-            seen.put(tok, true) catch return;
-            list.append(alloc, tok) catch return;
-        }
-
-        fn scanShell(
-            alloc: std.mem.Allocator,
-            arg: []const u8,
-            rf: *std.ArrayList([]const u8),
-            mf: *std.ArrayList([]const u8),
-            seen_rf_map: *std.StringHashMap(bool),
-            seen_mf_map: *std.StringHashMap(bool),
-        ) void {
-            const is_modify = (std.mem.indexOf(u8, arg, ">") != null) or
-                (std.mem.indexOf(u8, arg, "sed -i") != null) or
-                (std.mem.indexOf(u8, arg, "perl -pi") != null) or
-                (std.mem.indexOf(u8, arg, "apply") != null) or
-                (std.mem.indexOf(u8, arg, "git commit") != null) or
-                (std.mem.indexOf(u8, arg, "git add") != null) or
-                (std.mem.indexOf(u8, arg, "mv ") != null) or
-                (std.mem.indexOf(u8, arg, "cp ") != null) or
-                (std.mem.indexOf(u8, arg, "touch ") != null) or
-                (std.mem.indexOf(u8, arg, "tee ") != null);
-
-            const is_read = (std.mem.indexOf(u8, arg, "cat ") != null) or
-                (std.mem.indexOf(u8, arg, "sed -n") != null) or
-                (std.mem.indexOf(u8, arg, "rg ") != null) or
-                (std.mem.indexOf(u8, arg, "grep ") != null) or
-                (std.mem.indexOf(u8, arg, "head ") != null) or
-                (std.mem.indexOf(u8, arg, "tail ") != null) or
-                (std.mem.indexOf(u8, arg, "less ") != null) or
-                (std.mem.indexOf(u8, arg, "git show") != null) or
-                (std.mem.indexOf(u8, arg, "git diff") != null) or
-                (std.mem.indexOf(u8, arg, "git status") != null);
-
-            // Prefer explicit "redirection" targets if present.
-            //   cmd > out.txt
-            //   cmd >> out.txt
-            //   ... | tee out.txt
-            // This is intentionally shallow parsing (no quoting/escaping rules).
-            {
-                if (std.mem.indexOfScalar(u8, arg, '>')) |pos| {
-                    // take token immediately after the last '>'
-                    var last = pos;
-                    var j: usize = pos + 1;
-                    while (j < arg.len) : (j += 1) {
-                        if (arg[j] == '>') last = j;
-                    }
-                    const rhs = arg[last + 1 ..];
-                    var it2 = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
-                    if (it2.next()) |t0| {
-                        const t = trimToken(t0);
-                        if (looksLikePath(t)) {
-                            const duped = alloc.dupe(u8, t) catch return;
-                            addUnique(alloc, mf, seen_mf_map, duped, 200);
-                        }
-                    }
-                }
-
-                if (std.mem.indexOf(u8, arg, "tee ")) |pos2| {
-                    const rhs = arg[pos2 + 4 ..];
-                    var it3 = std.mem.tokenizeAny(u8, rhs, " \t\r\n");
-                    // skip tee options like -a
-                    while (it3.next()) |t0| {
-                        const t = trimToken(t0);
-                        if (t.len == 0) continue;
-                        if (t[0] == '-') continue;
-                        if (!looksLikePath(t)) break;
-                        const duped = alloc.dupe(u8, t) catch break;
-                        addUnique(alloc, mf, seen_mf_map, duped, 200);
-                        break;
-                    }
-                }
-            }
-
-            // Tokenize and collect path-like tokens.
-            var it = std.mem.tokenizeAny(u8, arg, " \t\r\n");
-            while (it.next()) |t0| {
-                const t = trimToken(t0);
-                if (!looksLikePath(t)) continue;
-
-                // Skip obvious executables and git subcommands.
-                if (std.mem.eql(u8, t, "git") or std.mem.eql(u8, t, "rg") or std.mem.eql(u8, t, "grep") or std.mem.eql(u8, t, "sed") or std.mem.eql(u8, t, "cat") or std.mem.eql(u8, t, "sh")) continue;
-
-                const duped = alloc.dupe(u8, t) catch continue;
-                if (is_modify) {
-                    addUnique(alloc, mf, seen_mf_map, duped, 200);
-                } else if (is_read) {
-                    addUnique(alloc, rf, seen_rf_map, duped, 200);
-                } else {
-                    // Unknown intent: treat as read by default.
-                    addUnique(alloc, rf, seen_rf_map, duped, 200);
-                }
-            }
-        }
-    };
-
-    // Infer file ops from the portion we are summarizing (boundary_from..summarize_end).
-    const summarize_end_common: usize = if (split_turn) split_history_end else start;
-    var fi: usize = boundary_from;
-    while (fi < summarize_end_common) : (fi += 1) {
-        const e = nodes.items[fi];
-        switch (e) {
-            .tool_call => |tc| {
-                if (std.mem.eql(u8, tc.tool, "shell")) {
-                    FileOps.scanShell(allocator, tc.arg, &read_files_out, &modified_files_out, &seen_rf, &seen_mf);
-                }
-            },
-            else => {},
-        }
-    }
-
-    // TS parity: inherit file ops from the most recent previous summary.
-    // This matches TS compaction details carry-forward behavior.
-    {
-        var k: usize = boundary_from;
-        var prev: ?st.SummaryEntry = null;
-        while (k > 0) : (k -= 1) {
-            const e = nodes.items[k - 1];
-            switch (e) {
-                .summary => |s| {
-                    prev = s;
-                    break;
-                },
-                else => {},
-            }
-        }
-
-        if (prev) |ps| {
-            if (ps.readFiles) |rf0| {
-                for (rf0) |p| {
-                    if (read_files_out.items.len >= 200) break;
-                    if (seen_rf.contains(p)) continue;
-                    try seen_rf.put(p, true);
-                    try read_files_out.append(allocator, p);
-                }
-            }
-            if (ps.modifiedFiles) |mf0| {
-                for (mf0) |p| {
-                    if (modified_files_out.items.len >= 200) break;
-                    if (seen_mf.contains(p)) continue;
-                    try seen_mf.put(p, true);
-                    try modified_files_out.append(allocator, p);
-                }
-            }
-        }
-    }
-
     if (!want_json and !want_md) {
         try sum_buf.appendSlice(allocator, prefix);
 
@@ -693,7 +356,7 @@ fn doCompact(
                         if (std.mem.eql(u8, s.format, "json")) {
                             prev_idx = k - 1;
                             // Parse payload; if invalid, fall back to fresh.
-                            const parsed = std.json.parseFromSlice(std.json.Value, allocator, s.summary, .{}) catch break;
+                            const parsed = std.json.parseFromSlice(std.json.Value, allocator, s.content, .{}) catch break;
                             defer parsed.deinit();
                             const obj = switch (parsed.value) {
                                 .object => |o| o,
@@ -706,14 +369,8 @@ fn doCompact(
                                 }
                             };
 
-                            const schema = if (obj.get("schema")) |v| switch (v) {
-                                .string => |t| try dupStr.dup(allocator, t),
-                                else => "pi.summary.v6",
-                            } else "pi.summary.v6";
-                            const goal = if (obj.get("goal")) |v| switch (v) {
-                                .string => |t| try dupStr.dup(allocator, t),
-                                else => "(unknown)",
-                            } else "(unknown)";
+                            const schema = if (obj.get("schema")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "pi.summary.v6" } else "pi.summary.v6";
+                            const goal = if (obj.get("goal")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "(unknown)" } else "(unknown)";
 
                             const constraints_val = if (obj.get("constraints")) |v| v else null;
                             var constraints_list = try std.ArrayList([]const u8).initCapacity(allocator, 0);
@@ -782,10 +439,7 @@ fn doCompact(
                                 }
                             }
 
-                            const raw = if (obj.get("raw")) |v| switch (v) {
-                                .string => |t| try dupStr.dup(allocator, t),
-                                else => "",
-                            } else "";
+                            const raw = if (obj.get("raw")) |v| switch (v) { .string => |t| try dupStr.dup(allocator, t), else => "" } else "";
 
                             const bt_val = if (obj.get("blocked_tasks")) |v| v else null;
                             var bt_list = try std.ArrayList(BlockedTask).initCapacity(allocator, 0);
@@ -798,23 +452,11 @@ fn doCompact(
                                                 try bt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
                                             },
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) {
-                                                    .string => |t| t,
-                                                    else => "",
-                                                } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
                                                 if (task0.len == 0) continue;
-                                                const tool0 = if (o.get("tool")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
-                                                const arg0 = if (o.get("arg")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
-                                                const err0 = if (o.get("err")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const err0 = if (o.get("err")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
 
                                                 try bt_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
@@ -841,23 +483,11 @@ fn doCompact(
                                                 try dt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) });
                                             },
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) {
-                                                    .string => |t| t,
-                                                    else => "",
-                                                } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
                                                 if (task0.len == 0) continue;
-                                                const tool0 = if (o.get("tool")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
-                                                const arg0 = if (o.get("arg")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
-                                                const res0 = if (o.get("result")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
+                                                const tool0 = if (o.get("tool")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const arg0 = if (o.get("arg")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const res0 = if (o.get("result")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
                                                 try dt_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
                                                     .tool = if (tool0) |t| try dupStr.dup(allocator, t) else null,
@@ -897,15 +527,9 @@ fn doCompact(
                                         switch (it) {
                                             .string => try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) {
-                                                    .string => |t| t,
-                                                    else => "",
-                                                } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
                                                 if (task0.len == 0) continue;
-                                                const src0 = if (o.get("source")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
+                                                const src0 = if (o.get("source")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
                                                 try ipt_list.append(allocator, .{ .task = try dupStr.dup(allocator, task0), .source = if (src0) |t| try dupStr.dup(allocator, t) else null });
                                             },
                                             else => {},
@@ -929,19 +553,10 @@ fn doCompact(
                                         switch (it) {
                                             .string => try nst_list.append(allocator, .{ .task = try dupStr.dup(allocator, it.string) }),
                                             .object => |o| {
-                                                const task0 = if (o.get("task")) |v| switch (v) {
-                                                    .string => |t| t,
-                                                    else => "",
-                                                } else "";
+                                                const task0 = if (o.get("task")) |v| switch (v) { .string => |t| t, else => "" } else "";
                                                 if (task0.len == 0) continue;
-                                                const why0 = if (o.get("why")) |v| switch (v) {
-                                                    .string => |t| @as(?[]const u8, t),
-                                                    else => null,
-                                                } else null;
-                                                const pr0 = if (o.get("priority")) |v| switch (v) {
-                                                    .integer => |x| @as(?u32, @intCast(x)),
-                                                    else => null,
-                                                } else null;
+                                                const why0 = if (o.get("why")) |v| switch (v) { .string => |t| @as(?[]const u8, t), else => null } else null;
+                                                const pr0 = if (o.get("priority")) |v| switch (v) { .integer => |x| @as(?u32, @intCast(x)), else => null } else null;
                                                 try nst_list.append(allocator, .{
                                                     .task = try dupStr.dup(allocator, task0),
                                                     .why = if (why0) |t| try dupStr.dup(allocator, t) else null,
@@ -1082,11 +697,11 @@ fn doCompact(
 
                         // Heuristic constraints extraction
                         if (std.mem.startsWith(u8, m.content, "constraint:") or std.mem.startsWith(u8, m.content, "constraints:")) {
-                            const body = std.mem.trimLeft(u8, m.content, "constraint:s ");
+                            const body = std.mem.trimStart(u8, m.content, "constraint:s ");
                             if (body.len > 0) try new_constraints.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
                         }
                         if (std.mem.startsWith(u8, m.content, "pref:") or std.mem.startsWith(u8, m.content, "preference:")) {
-                            const body = std.mem.trimLeft(u8, m.content, "preference:pf ");
+                            const body = std.mem.trimStart(u8, m.content, "preference:pf ");
                             if (body.len > 0) try new_constraints.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
                         }
                     } else {
@@ -1096,14 +711,14 @@ fn doCompact(
                         }
                         // Heuristic decision extraction
                         if (std.mem.startsWith(u8, m.content, "decision:") or std.mem.startsWith(u8, m.content, "decided:")) {
-                            const body = std.mem.trimLeft(u8, m.content, "decision:d ");
+                            const body = std.mem.trimStart(u8, m.content, "decision:d ");
                             if (body.len > 0) try new_decisions.append(allocator, try std.fmt.allocPrint(allocator, "{s}", .{body}));
                         }
 
                         // Heuristic blocked extraction
                         // Avoid duplicating tool_result errors already captured.
                         if (std.mem.startsWith(u8, m.content, "error:")) {
-                            const body = std.mem.trimLeft(u8, m.content, "error: ");
+                            const body = std.mem.trimStart(u8, m.content, "error: ");
                             if (body.len > 0) {
                                 // If body looks like "tool_result <tool>: <err>", try to match existing "<tool>(...): <err>" or "<tool>: <err>".
                                 var duplicate = false;
@@ -1127,19 +742,6 @@ fn doCompact(
                             }
                         }
                     }
-                },
-                .custom_message => |cm| {
-                    const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
-
-                    try new_raw_buf.appendSlice(allocator, "user");
-                    try new_raw_buf.appendSlice(allocator, ": ");
-                    try new_raw_buf.appendSlice(allocator, preview);
-                    try new_raw_buf.appendSlice(allocator, "\n");
-
-                    const line = try std.fmt.allocPrint(allocator, "user: {s}", .{preview});
-                    try new_ctx.append(allocator, line);
-                    const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
-                    try new_next.append(allocator, item);
                 },
                 else => {},
             }
@@ -1327,10 +929,7 @@ fn doCompact(
             if (std.mem.indexOf(u8, it, "(none)") != null) continue;
             // naive de-dup
             var already = false;
-            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) {
-                already = true;
-                break;
-            };
+            for (ip_out.items) |x| if (std.mem.eql(u8, x, it)) { already = true; break; };
             if (already) continue;
             try ip_out.append(allocator, it);
         }
@@ -1353,7 +952,7 @@ fn doCompact(
         for (done_out.items) |d| {
             const prefix_echo = "ack: tool_result echo:";
             if (std.mem.startsWith(u8, d, prefix_echo)) {
-                const arg = std.mem.trimLeft(u8, d[prefix_echo.len..], " ");
+                const arg = std.mem.trimStart(u8, d[prefix_echo.len..], " ");
                 const task = try std.fmt.allocPrint(allocator, "echo: {s}", .{arg});
                 if (!done_task_seen.contains(task)) {
                     _ = done_task_seen.put(task, true) catch {};
@@ -1472,7 +1071,7 @@ fn doCompact(
                 switch (e) {
                     .summary => |s| {
                         if (std.mem.eql(u8, s.format, "md")) {
-                            prev_summary = s.summary;
+                            prev_summary = s.content;
                             prev_idx = k - 1;
                             break;
                         }
@@ -1486,7 +1085,8 @@ fn doCompact(
 
         if (prev_summary == null) {
             // Naive fill: Goal unknown, Constraints none, Progress/NextSteps empty, Critical Context includes message snippets.
-            try sum_buf.appendSlice(allocator, "## Goal\n(unknown)\n\n" ++
+            try sum_buf.appendSlice(allocator,
+                "## Goal\n(unknown)\n\n" ++
                 "## Constraints & Preferences\n- (none)\n\n" ++
                 "## Progress\n### Done\n- (none)\n\n### In Progress\n- (none)\n\n### Blocked\n- (none)\n\n" ++
                 "## Key Decisions\n- (none)\n\n" ++
@@ -1506,12 +1106,6 @@ fn doCompact(
                             try sum_buf.appendSlice(allocator, preview);
                             try sum_buf.appendSlice(allocator, "\n");
                         }
-                    },
-                    .custom_message => |cm| {
-                        const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
-                        try sum_buf.appendSlice(allocator, "- user: ");
-                        try sum_buf.appendSlice(allocator, preview);
-                        try sum_buf.appendSlice(allocator, "\n");
                     },
                     else => {},
                 }
@@ -1557,11 +1151,6 @@ fn doCompact(
                                 try done_dyn.append(allocator, item);
                             }
                         }
-                    },
-                    .custom_message => |cm| {
-                        const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
-                        const item = try std.fmt.allocPrint(allocator, "{s}", .{preview});
-                        try next_steps_dyn.append(allocator, item);
                     },
                     else => {},
                 }
@@ -1644,7 +1233,7 @@ fn doCompact(
 
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
-                    try b2.appendSlice(allocator, base[0 .. insert_pos + next_hdr]);
+                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
 
                     var added: usize = 0;
                     for (done_items.items) |it| {
@@ -1680,7 +1269,7 @@ fn doCompact(
 
                     var b2 = try std.ArrayList(u8).initCapacity(allocator, base.len + 256);
                     defer b2.deinit(allocator);
-                    try b2.appendSlice(allocator, base[0 .. insert_pos + next_hdr]);
+                    try b2.appendSlice(allocator, base[0..insert_pos + next_hdr]);
 
                     var added: usize = 0;
                     for (next_items.items) |it| {
@@ -1837,16 +1426,6 @@ fn doCompact(
                             added_ctx += 1;
                         }
                     },
-                    .custom_message => |cm| {
-                        const preview = if (cm.content.len > 120) cm.content[0..120] else cm.content;
-                        const line = try std.fmt.allocPrint(allocator, "- user: {s}", .{preview});
-                        if (seen_ctx.contains(line)) continue;
-                        try seen_ctx.put(line, true);
-                        if (std.mem.indexOf(u8, base, line) != null) continue;
-                        try sum_buf.appendSlice(allocator, line);
-                        try sum_buf.appendSlice(allocator, "\n");
-                        added_ctx += 1;
-                    },
                     else => {},
                 }
             }
@@ -1867,14 +1446,6 @@ fn doCompact(
                 .message => |m| {
                     if (!req_written and std.mem.eql(u8, m.role, "user")) {
                         const preview = if (m.content.len > 300) m.content[0..300] else m.content;
-                        try sum_buf.appendSlice(allocator, preview);
-                        try sum_buf.appendSlice(allocator, "\n\n");
-                        req_written = true;
-                    }
-                },
-                .custom_message => |cm| {
-                    if (!req_written) {
-                        const preview = if (cm.content.len > 300) cm.content[0..300] else cm.content;
                         try sum_buf.appendSlice(allocator, preview);
                         try sum_buf.appendSlice(allocator, "\n\n");
                         req_written = true;
@@ -1936,43 +1507,16 @@ fn doCompact(
         try sum_buf.appendSlice(allocator, "This turn was too large to keep in full. The kept suffix continues after this cutpoint.\n");
     }
 
-    if (want_md) {
-        // TS-style compaction details: append file operations.
-        if (read_files_out.items.len > 0) {
-            try sum_buf.appendSlice(allocator, "\n\n<read-files>\n");
-            for (read_files_out.items) |p| {
-                try sum_buf.appendSlice(allocator, p);
-                try sum_buf.appendSlice(allocator, "\n");
-            }
-            try sum_buf.appendSlice(allocator, "</read-files>\n");
-        }
-        if (modified_files_out.items.len > 0) {
-            try sum_buf.appendSlice(allocator, "\n<modified-files>\n");
-            for (modified_files_out.items) |p| {
-                try sum_buf.appendSlice(allocator, p);
-                try sum_buf.appendSlice(allocator, "\n");
-            }
-            try sum_buf.appendSlice(allocator, "</modified-files>\n");
-        }
-    }
-
     const sum_text = try sum_buf.toOwnedSlice(allocator);
-    const first_kept_entry_id: ?[]const u8 = if (start < n) st.idOf(nodes.items[start]) else null;
 
     if (dry_run) {
         return .{ .dryRun = true, .summaryText = sum_text, .summaryId = null };
     }
 
-    const rf_slice = if (read_files_out.items.len > 0) try read_files_out.toOwnedSlice(allocator) else null;
-    const mf_slice = if (modified_files_out.items.len > 0) try modified_files_out.toOwnedSlice(allocator) else null;
-
-    const summary_id = try sm.appendSummaryWithFiles(
+    const summary_id = try sm.appendSummary(
         sum_text,
         reason,
         if (want_json) "json" else if (want_md) "md" else "text",
-        first_kept_entry_id,
-        rf_slice,
-        mf_slice,
         stats_total_chars,
         stats_total_tokens_est,
         keep_last,
@@ -1984,19 +1528,57 @@ fn doCompact(
         _ = try sm.setLabel(summary_id, lab);
     }
 
+    var j: usize = start;
+    while (j < n) : (j += 1) {
+        const e = nodes.items[j];
+        switch (e) {
+            .turn_start => |t| {
+                _ = try sm.appendTurnStart(t.turn, t.userMessageId, t.turnGroupId, t.phase);
+            },
+            .turn_end => |t| {
+                _ = try sm.appendTurnEnd(t.turn, t.userMessageId, t.turnGroupId, t.phase);
+            },
+            .message => |m| {
+                _ = try sm.appendMessage(m.role, m.content);
+            },
+            .tool_call => |tc| {
+                _ = try sm.appendToolCall(tc.tool, tc.arg);
+            },
+            .tool_result => |tr| {
+                _ = try sm.appendToolResult(tr.tool, tr.ok, tr.content);
+            },
+            .summary => |s| {
+                _ = try sm.appendSummary(
+                    s.content,
+                    s.reason,
+                    s.format,
+                    s.totalChars,
+                    s.totalTokensEst,
+                    s.keepLast,
+                    s.keepLastGroups,
+                    s.thresholdChars,
+                    s.thresholdTokensEst,
+                );
+            },
+            else => {},
+        }
+    }
+
     return .{ .dryRun = false, .summaryText = sum_text, .summaryId = summary_id };
 }
 
 fn verifyRun(arena: std.mem.Allocator, out_dir: []const u8, run_id: []const u8) !void {
+    const io = compatIo();
+    const cwd = compatCwd();
     const run_path = try std.fs.path.join(arena, &.{ out_dir, run_id });
     const plan_path = try std.fs.path.join(arena, &.{ run_path, "plan.json" });
     const run_json_path = try std.fs.path.join(arena, &.{ run_path, "run.json" });
     const steps_dir = try std.fs.path.join(arena, &.{ run_path, "steps" });
 
     // Check presence
-    _ = try std.fs.cwd().statFile(plan_path);
-    _ = try std.fs.cwd().statFile(run_json_path);
-    _ = try std.fs.cwd().openDir(steps_dir, .{});
+    _ = try cwd.statFile(io, plan_path, .{});
+    _ = try cwd.statFile(io, run_json_path, .{});
+    _ = try cwd.openDir(io, steps_dir, .{});
 
     var parsed_plan = try parseJsonFile(arena, plan_path);
     defer parsed_plan.deinit();
@@ -2024,7 +1606,7 @@ fn verifyRun(arena: std.mem.Allocator, out_dir: []const u8, run_id: []const u8) 
 
         const sid = try safeId(arena, step_id);
         const step_path = try std.fs.path.join(arena, &.{ steps_dir, try std.fmt.allocPrint(arena, "{s}.json", .{sid}) });
-        _ = try std.fs.cwd().statFile(step_path);
+        _ = try cwd.statFile(io, step_path, .{});
 
         var parsed_step = try parseJsonFile(arena, step_path);
         defer parsed_step.deinit();
@@ -2049,7 +1631,7 @@ fn verifyRun(arena: std.mem.Allocator, out_dir: []const u8, run_id: []const u8) 
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -2057,13 +1639,26 @@ pub fn main() !void {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    var args = std.process.args();
-    _ = args.next();
-
-    const cmd = args.next() orelse {
+    const arg_slice = try std.process.Args.toSlice(init.minimal.args, allocator);
+    if (arg_slice.len < 2) {
         usage();
         return;
+    }
+    var arg_idx: usize = 2;
+    const cmd = arg_slice[1];
+
+    const ArgsCursor = struct {
+        args: []const []const u8,
+        idx: *usize,
+
+        fn next(self: @This()) ?[]const u8 {
+            if (self.idx.* >= self.args.len) return null;
+            const a = self.args[self.idx.*];
+            self.idx.* += 1;
+            return a;
+        }
     };
+    var args = ArgsCursor{ .args = arg_slice, .idx = &arg_idx };
 
     if (std.mem.eql(u8, cmd, "label")) {
         var session_path: ?[]const u8 = null;
@@ -2139,41 +1734,10 @@ pub fn main() !void {
                     .message => |m| std.debug.print("message {s} parent={s}\nrole={s}\ncontent={s}\n", .{ m.id, m.parentId orelse "(null)", m.role, m.content }),
                     .tool_call => |tc| std.debug.print("tool_call {s} parent={s}\ntool={s}\narg={s}\n", .{ tc.id, tc.parentId orelse "(null)", tc.tool, tc.arg }),
                     .tool_result => |tr| std.debug.print("tool_result {s} parent={s}\ntool={s} ok={any}\ncontent={s}\n", .{ tr.id, tr.parentId orelse "(null)", tr.tool, tr.ok, tr.content }),
-                    .branch_summary => |b| std.debug.print("branch_summary {s} parent={s}\nfromId={s}\nsummary=\n{s}\n", .{ b.id, b.parentId orelse "(null)", b.fromId, b.summary }),
-                    .custom => |c| std.debug.print("custom {s} parent={s}\ncustomType={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType }),
-                    .custom_message => |c| std.debug.print("custom_message {s} parent={s}\ncustomType={s}\ndisplay={any}\ncontent={s}\n", .{ c.id, c.parentId orelse "(null)", c.customType, c.display, c.content }),
-                    .session_info => |s| std.debug.print("session_info {s} parent={s}\nname={s}\n", .{ s.id, s.parentId orelse "(null)", s.name orelse "(null)" }),
-                    .thinking_level_change => |t| std.debug.print("thinking_level_change {s} parent={s}\nlevel={s}\n", .{ t.id, t.parentId orelse "(null)", t.thinkingLevel }),
-                    .model_change => |m| std.debug.print("model_change {s} parent={s}\nprovider={s}\nmodelId={s}\n", .{ m.id, m.parentId orelse "(null)", m.provider, m.modelId }),
-                    .summary => |s| {
-                        std.debug.print(
-                            "summary {s} parent={s}\nreason={s}\nformat={s}\nfirstKeptEntryId={s}\ntokensBefore={any}\nfromHook={any}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\nsummary=\n{s}\n",
-                            .{
-                                s.id,
-                                s.parentId orelse "(null)",
-                                s.reason orelse "(null)",
-                                s.format,
-                                s.firstKeptEntryId orelse "(null)",
-                                s.tokensBefore,
-                                s.fromHook,
-                                s.keepLast,
-                                s.keepLastGroups,
-                                s.totalChars,
-                                s.totalTokensEst,
-                                s.thresholdChars,
-                                s.thresholdTokensEst,
-                                s.summary,
-                            },
-                        );
-                        if (s.readFiles) |rf| {
-                            std.debug.print("readFiles:\n", .{});
-                            for (rf) |p| std.debug.print("- {s}\n", .{p});
-                        }
-                        if (s.modifiedFiles) |mf| {
-                            std.debug.print("modifiedFiles:\n", .{});
-                            for (mf) |p| std.debug.print("- {s}\n", .{p});
-                        }
-                    },
+                    .summary => |s| std.debug.print(
+                        "summary {s} parent={s}\nreason={s}\nformat={s}\nkeepLast={any} keepLastGroups={any}\nchars={any} tokens_est={any}\nthresh_chars={any} thresh_tokens_est={any}\ncontent=\n{s}\n",
+                        .{ s.id, s.parentId orelse "(null)", s.reason orelse "(null)", s.format, s.keepLast, s.keepLastGroups, s.totalChars, s.totalTokensEst, s.thresholdChars, s.thresholdTokensEst, s.content },
+                    ),
                     else => {},
                 }
                 return;
@@ -2236,15 +1800,8 @@ pub fn main() !void {
                         if (show_turns) std.debug.print("{d}. {s} turn_end turn={d} phase={s} {s}\n", .{ idx, eid, t.turn, t.phase orelse "-", if (lab.len > 0) lab else "" });
                     },
                     .message => |m| std.debug.print("{d}. {s} message {s} {s}\n", .{ idx, eid, m.role, if (lab.len > 0) lab else "" }),
-                    .custom_message => |c| std.debug.print("{d}. {s} custom_message {s} display={any} {s}\n", .{ idx, eid, c.customType, c.display, if (lab.len > 0) lab else "" }),
-                    .custom => |c| std.debug.print("{d}. {s} custom {s} {s}\n", .{ idx, eid, c.customType, if (lab.len > 0) lab else "" }),
-                    .session_info => |s| std.debug.print("{d}. {s} session_info {s} {s}\n", .{ idx, eid, s.name orelse "(null)", if (lab.len > 0) lab else "" }),
                     .tool_call => |tc| std.debug.print("{d}. {s} tool_call {s} arg={s} {s}\n", .{ idx, eid, tc.tool, tc.arg, if (lab.len > 0) lab else "" }),
                     .tool_result => |tr| std.debug.print("{d}. {s} tool_result {s} ok={any} {s}\n", .{ idx, eid, tr.tool, tr.ok, if (lab.len > 0) lab else "" }),
-                    .branch_summary => |b| std.debug.print("{d}. {s} branch_summary from={s} {s}\n", .{ idx, eid, b.fromId, if (lab.len > 0) lab else "" }),
-                    .thinking_level_change => |t| std.debug.print("{d}. {s} thinking_level_change {s} {s}\n", .{ idx, eid, t.thinkingLevel, if (lab.len > 0) lab else "" }),
-                    .model_change => |m| std.debug.print("{d}. {s} model_change {s}/{s} {s}\n", .{ idx, eid, m.provider, m.modelId, if (lab.len > 0) lab else "" }),
-                    .summary => std.debug.print("{d}. {s} summary {s}\n", .{ idx, eid, if (lab.len > 0) lab else "" }),
                     else => {},
                 }
             }
@@ -2333,17 +1890,17 @@ pub fn main() !void {
         }
 
         var total_chars: usize = 0;
+        var total_tokens_est: usize = 0;
         var idx: usize = boundary_from;
         while (idx < chain.len) : (idx += 1) {
             const e = chain[idx];
             switch (e) {
                 .message => |m| total_chars += m.content.len,
-                .summary => |s| total_chars += s.summary.len,
+                .summary => |s| total_chars += s.content.len,
                 else => {},
             }
+            total_tokens_est += tokensEstForEntry(e);
         }
-        const token_est = estimateBoundaryTokens(chain, boundary_from);
-        const total_tokens_est = token_est.tokens;
 
         const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
         const mode = if (keep_last_groups != null) "groups" else "entries";
@@ -2425,7 +1982,14 @@ pub fn main() !void {
             }
         }
 
-        const leaf = try sm.leafId();
+        // find leaf
+        var leaf: ?[]const u8 = null;
+        for (entries) |e| {
+            switch (e) {
+                .leaf => |l| leaf = l.targetId,
+                else => {},
+            }
+        }
 
         // build id -> entry map
         var by_id = std.StringHashMap(st.Entry).init(allocator);
@@ -2527,28 +2091,6 @@ pub fn main() !void {
                             std.debug.print("{s} {s} message {s} \"{s}\"\n", .{ mark, id, m.role, preview });
                         }
                     },
-                    .custom_message => |c| {
-                        const preview = if (c.content.len > 40) c.content[0..40] else c.content;
-                        if (lab.len > 0) {
-                            std.debug.print("{s} {s} custom_message {s} \"{s}\" [{s}]\n", .{ mark, id, c.customType, preview, lab });
-                        } else {
-                            std.debug.print("{s} {s} custom_message {s} \"{s}\"\n", .{ mark, id, c.customType, preview });
-                        }
-                    },
-                    .custom => |c| {
-                        if (lab.len > 0) {
-                            std.debug.print("{s} {s} custom {s} [{s}]\n", .{ mark, id, c.customType, lab });
-                        } else {
-                            std.debug.print("{s} {s} custom {s}\n", .{ mark, id, c.customType });
-                        }
-                    },
-                    .session_info => |s| {
-                        if (lab.len > 0) {
-                            std.debug.print("{s} {s} session_info {s} [{s}]\n", .{ mark, id, s.name orelse "(null)", lab });
-                        } else {
-                            std.debug.print("{s} {s} session_info {s}\n", .{ mark, id, s.name orelse "(null)" });
-                        }
-                    },
                     .tool_call => |tc| {
                         if (lab.len > 0) {
                             std.debug.print("{s} {s} tool_call {s} arg={s} [{s}]\n", .{ mark, id, tc.tool, tc.arg, lab });
@@ -2564,33 +2106,11 @@ pub fn main() !void {
                         }
                     },
                     .summary => |s| {
-                        const preview = if (s.summary.len > 40) s.summary[0..40] else s.summary;
+                        const preview = if (s.content.len > 40) s.content[0..40] else s.content;
                         if (lab.len > 0) {
                             std.debug.print("{s} {s} summary \"{s}\" [{s}]\n", .{ mark, id, preview, lab });
                         } else {
                             std.debug.print("{s} {s} summary \"{s}\"\n", .{ mark, id, preview });
-                        }
-                    },
-                    .branch_summary => |b| {
-                        const preview = if (b.summary.len > 40) b.summary[0..40] else b.summary;
-                        if (lab.len > 0) {
-                            std.debug.print("{s} {s} branch_summary from={s} \"{s}\" [{s}]\n", .{ mark, id, b.fromId, preview, lab });
-                        } else {
-                            std.debug.print("{s} {s} branch_summary from={s} \"{s}\"\n", .{ mark, id, b.fromId, preview });
-                        }
-                    },
-                    .thinking_level_change => |t| {
-                        if (lab.len > 0) {
-                            std.debug.print("{s} {s} thinking_level_change {s} [{s}]\n", .{ mark, id, t.thinkingLevel, lab });
-                        } else {
-                            std.debug.print("{s} {s} thinking_level_change {s}\n", .{ mark, id, t.thinkingLevel });
-                        }
-                    },
-                    .model_change => |m| {
-                        if (lab.len > 0) {
-                            std.debug.print("{s} {s} model_change {s}/{s} [{s}]\n", .{ mark, id, m.provider, m.modelId, lab });
-                        } else {
-                            std.debug.print("{s} {s} model_change {s}/{s}\n", .{ mark, id, m.provider, m.modelId });
                         }
                     },
                     else => {},
@@ -2620,14 +2140,11 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "branch")) {
         var session_path: ?[]const u8 = null;
         var to_id: ?[]const u8 = null;
-        var to_root = false;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
             } else if (std.mem.eql(u8, a, "--to")) {
                 to_id = args.next() orelse return error.MissingTo;
-            } else if (std.mem.eql(u8, a, "--root")) {
-                to_root = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -2641,118 +2158,8 @@ pub fn main() !void {
         };
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
-        if (to_root and to_id != null) return error.InvalidBranchTarget;
-        const target_id: ?[]const u8 = if (to_root) null else (to_id orelse return error.MissingTo);
-        try sm.branchTo(target_id);
-        std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, target_id orelse "(root)" });
-        return;
-    }
-
-    if (std.mem.eql(u8, cmd, "branch-with-summary")) {
-        var session_path: ?[]const u8 = null;
-        var to_id: ?[]const u8 = null;
-        var to_root = false;
-        var summary_text: ?[]const u8 = null;
-        while (args.next()) |a| {
-            if (std.mem.eql(u8, a, "--session")) {
-                session_path = args.next() orelse return error.MissingSession;
-            } else if (std.mem.eql(u8, a, "--to")) {
-                to_id = args.next() orelse return error.MissingTo;
-            } else if (std.mem.eql(u8, a, "--root")) {
-                to_root = true;
-            } else if (std.mem.eql(u8, a, "--summary")) {
-                summary_text = args.next() orelse return error.MissingLabel;
-            } else if (std.mem.eql(u8, a, "--help")) {
-                usage();
-                return;
-            } else {
-                return error.UnknownArg;
-            }
-        }
-        const sp = session_path orelse {
-            usage();
-            return;
-        };
-
-        var sm = session.SessionManager.init(allocator, sp, ".");
-        try sm.ensure();
-        if (to_root and to_id != null) return error.InvalidBranchTarget;
-        const target_id: ?[]const u8 = if (to_root) null else (to_id orelse return error.MissingTo);
-        const old_leaf = try sm.leafId();
-        const summary = summary_text orelse try buildAutoBranchSummary(allocator, &sm, old_leaf, target_id);
-        try sm.branchTo(target_id);
-        const from_id = old_leaf orelse "root";
-        const sid = try sm.appendBranchSummary(from_id, summary);
-        std.debug.print("ok: true\nbranch: {s} -> {s}\nbranchSummaryId: {s}\n", .{ sp, target_id orelse "(root)", sid });
-        return;
-    }
-
-    if (std.mem.eql(u8, cmd, "set-model")) {
-        var session_path: ?[]const u8 = null;
-        var provider: ?[]const u8 = null;
-        var model_id: ?[]const u8 = null;
-        while (args.next()) |a| {
-            if (std.mem.eql(u8, a, "--session")) {
-                session_path = args.next() orelse return error.MissingSession;
-            } else if (std.mem.eql(u8, a, "--provider")) {
-                provider = args.next() orelse return error.MissingLabel;
-            } else if (std.mem.eql(u8, a, "--model")) {
-                model_id = args.next() orelse return error.MissingId;
-            } else if (std.mem.eql(u8, a, "--help")) {
-                usage();
-                return;
-            } else {
-                return error.UnknownArg;
-            }
-        }
-        const sp = session_path orelse {
-            usage();
-            return;
-        };
-        const p = provider orelse {
-            usage();
-            return;
-        };
-        const mid = model_id orelse {
-            usage();
-            return;
-        };
-
-        var sm = session.SessionManager.init(allocator, sp, ".");
-        try sm.ensure();
-        const id = try sm.appendModelChange(p, mid);
-        std.debug.print("ok: true\nmodelChangeId: {s}\nprovider: {s}\nmodel: {s}\n", .{ id, p, mid });
-        return;
-    }
-
-    if (std.mem.eql(u8, cmd, "set-thinking")) {
-        var session_path: ?[]const u8 = null;
-        var level: ?[]const u8 = null;
-        while (args.next()) |a| {
-            if (std.mem.eql(u8, a, "--session")) {
-                session_path = args.next() orelse return error.MissingSession;
-            } else if (std.mem.eql(u8, a, "--level")) {
-                level = args.next() orelse return error.MissingLabel;
-            } else if (std.mem.eql(u8, a, "--help")) {
-                usage();
-                return;
-            } else {
-                return error.UnknownArg;
-            }
-        }
-        const sp = session_path orelse {
-            usage();
-            return;
-        };
-        const lv = level orelse {
-            usage();
-            return;
-        };
-
-        var sm = session.SessionManager.init(allocator, sp, ".");
-        try sm.ensure();
-        const id = try sm.appendThinkingLevelChange(lv);
-        std.debug.print("ok: true\nthinkingLevelChangeId: {s}\nlevel: {s}\n", .{ id, lv });
+        try sm.branchTo(to_id);
+        std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, to_id orelse "(null)" });
         return;
     }
 
@@ -2779,69 +2186,9 @@ pub fn main() !void {
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
         const entries = if (show_turns) try sm.buildContextEntriesVerbose() else try sm.buildContextEntries();
-        for (entries) |e| {
-            switch (e) {
-                .turn_start => |t| {
-                    if (show_turns) {
-                        std.debug.print("[turn_start] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" });
-                    }
-                },
-                .turn_end => |t| {
-                    if (show_turns) {
-                        std.debug.print("[turn_end] {d} userMessageId={s} group={s} phase={s}\n", .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" });
-                    }
-                },
-                .message => |m| std.debug.print("[{s}] {s}\n", .{ m.role, m.content }),
-                .custom_message => |c| std.debug.print("[custom_message:{s}] {s}\n", .{ c.customType, c.content }),
-                .custom => |c| std.debug.print("[custom] {s}\n", .{c.customType}),
-                .session_info => |s| std.debug.print("[session_info] name={s}\n", .{s.name orelse "(null)"}),
-                .tool_call => |tc| std.debug.print("[tool_call] {s} arg={s}\n", .{ tc.tool, tc.arg }),
-                .tool_result => |tr| std.debug.print("[tool_result] {s} ok={any} {s}\n", .{ tr.tool, tr.ok, tr.content }),
-                .branch_summary => |b| std.debug.print("[branch_summary] from={s}\n{s}\n", .{ b.fromId, b.summary }),
-                .thinking_level_change => |t| std.debug.print("[thinking_level_change] {s}\n", .{t.thinkingLevel}),
-                .model_change => |m| std.debug.print("[model_change] {s}/{s}\n", .{ m.provider, m.modelId }),
-                .summary => |s| {
-                    if (std.mem.eql(u8, s.format, "json")) {
-                        // Pretty render JSON summary (brief)
-                        var parsed = std.json.parseFromSlice(std.json.Value, allocator, s.summary, .{}) catch {
-                            std.debug.print("[summary] (invalid json) {s}\n", .{s.summary});
-                            break;
-                        };
-                        defer parsed.deinit();
-                        const obj = switch (parsed.value) {
-                            .object => |o| o,
-                            else => {
-                                std.debug.print("[summary] {s}\n", .{s.summary});
-                                break;
-                            },
-                        };
-                        const raw = if (obj.get("raw")) |v| switch (v) {
-                            .string => |t| t,
-                            else => "",
-                        } else "";
-                        const next_steps = if (obj.get("next_steps")) |v| switch (v) {
-                            .array => |a| a.items,
-                            else => &.{},
-                        } else &.{};
-
-                        std.debug.print("[summary] raw:\n{s}\n", .{raw});
-                        if (next_steps.len > 0) {
-                            std.debug.print("[summary] next_steps:\n", .{});
-                            for (next_steps) |it| {
-                                const s2 = switch (it) {
-                                    .string => |t| t,
-                                    else => "",
-                                };
-                                if (s2.len > 0) std.debug.print("- {s}\n", .{s2});
-                            }
-                        }
-                    } else {
-                        std.debug.print("[summary] {s}\n", .{s.summary});
-                    }
-                },
-                .label => |l| std.debug.print("[label] {s} -> {s}\n", .{ l.targetId, l.label orelse "(null)" }),
-                .session, .leaf => {},
-            }
+        const replay_text = try formatReplayForTest(allocator, entries, show_turns);
+        if (replay_text.len > 0) {
+            std.debug.print("{s}", .{replay_text});
         }
         return;
     }
@@ -2913,14 +2260,17 @@ pub fn main() !void {
         std.debug.print("chat session: {s}\n", .{sp});
         std.debug.print("type messages. ctrl-d to exit.\n", .{});
 
-        const stdin_file = std.fs.File.stdin();
-        var reader = std.fs.File.deprecatedReader(stdin_file);
+        const io = compatIo();
+        const stdin_file = std.Io.File.stdin();
         var buf: [4096]u8 = undefined;
+        var reader = stdin_file.reader(io, &buf);
         while (true) {
             std.debug.print("> ", .{});
-            const line_opt = try reader.readUntilDelimiterOrEof(&buf, '\n');
-            if (line_opt == null) break;
-            const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
+            const line_opt = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            const line = std.mem.trim(u8, line_opt, " \t\r\n");
             if (line.len == 0) continue;
 
             _ = try sm.appendMessageWithTokensEst("user", line, (line.len + 3) / 4);
@@ -2953,17 +2303,17 @@ pub fn main() !void {
                 }
 
                 var total: usize = 0;
+                var total_tokens_est: usize = 0;
                 var idx: usize = boundary_from;
                 while (idx < chain.len) : (idx += 1) {
                     const e = chain[idx];
                     switch (e) {
                         .message => |m| total += m.content.len,
-                        .summary => |s| total += s.summary.len,
+                        .summary => |s| total += s.content.len,
                         else => {},
                     }
+                    total_tokens_est += tokensEstForEntry(e);
                 }
-                const token_est = estimateBoundaryTokens(chain, boundary_from);
-                const total_tokens_est = token_est.tokens;
 
                 if (total > max_chars or total_tokens_est > max_tokens_est) {
                     const effective_keep_last: usize = if (keep_last_groups != null) 0 else keep_last;
@@ -2984,8 +2334,8 @@ pub fn main() !void {
                     );
                     const mode = if (keep_last_groups != null) "groups" else "entries";
                     std.debug.print(
-                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} usage={d} trailing={d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}\n",
-                        .{ total, max_chars, total_tokens_est, max_tokens_est, token_est.usageTokens, token_est.trailingTokens, mode, keep_last, keep_last_groups, res.summaryId.? },
+                        "[auto_compact] triggered chars={d}/{d} tokens_est={d}/{d} (mode={s} keep_last={d} keep_last_groups={any}) summaryId={s}\n",
+                        .{ total, max_chars, total_tokens_est, max_tokens_est, mode, keep_last, keep_last_groups, res.summaryId.? },
                     );
                 }
             }
@@ -3130,4 +2480,277 @@ pub fn main() !void {
     const run_id = try runner.run(&plan, v);
 
     std.debug.print("ok: true\nrunId: {s}\nout: {s}/{s}\n", .{ run_id, out_dir, run_id });
+}
+
+fn formatReplayEntryForTest(
+    allocator: std.mem.Allocator,
+    e: st.Entry,
+    show_turns: bool,
+) ![]const u8 {
+    switch (e) {
+        .turn_start => |t| {
+            if (!show_turns) return &.{};
+            return try std.fmt.allocPrint(
+                allocator,
+                "[turn_start] {d} userMessageId={s} group={s} phase={s}\n",
+                .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" },
+            );
+        },
+        .turn_end => |t| {
+            if (!show_turns) return &.{};
+            return try std.fmt.allocPrint(
+                allocator,
+                "[turn_end] {d} userMessageId={s} group={s} phase={s}\n",
+                .{ t.turn, t.userMessageId orelse "-", t.turnGroupId orelse "-", t.phase orelse "-" },
+            );
+        },
+        .message => |m| return try std.fmt.allocPrint(
+            allocator,
+            "[{s}] {s}\n",
+            .{ m.role, m.content },
+        ),
+        .tool_call => |tc| return try std.fmt.allocPrint(
+            allocator,
+            "[tool_call] {s} arg={s}\n",
+            .{ tc.tool, tc.arg },
+        ),
+        .tool_result => |tr| return try std.fmt.allocPrint(
+            allocator,
+            "[tool_result] {s} ok={any} {s}\n",
+            .{ tr.tool, tr.ok, tr.content },
+        ),
+        .summary => |s| {
+            if (!std.mem.eql(u8, s.format, "json")) {
+                return try std.fmt.allocPrint(allocator, "[summary] {s}\n", .{s.content});
+            }
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, s.content, .{}) catch {
+                return try std.fmt.allocPrint(allocator, "[summary] (invalid json) {s}\n", .{s.content});
+            };
+            defer parsed.deinit();
+            const obj = switch (parsed.value) {
+                .object => |o| o,
+                else => return try std.fmt.allocPrint(allocator, "[summary] {s}\n", .{s.content}),
+            };
+
+            var out = try std.ArrayList(u8).initCapacity(allocator, 0);
+            defer out.deinit(allocator);
+
+            const raw = if (obj.get("raw")) |v| switch (v) {
+                .string => |x| x,
+                else => "",
+            } else "";
+
+            try out.appendSlice(allocator, "[summary] raw:\n");
+            try out.appendSlice(allocator, raw);
+            try out.appendSlice(allocator, "\n");
+
+            const next_steps = if (obj.get("next_steps")) |v| switch (v) {
+                .array => |a| a.items,
+                else => &.{},
+            } else &.{};
+
+            if (next_steps.len > 0) {
+                try out.appendSlice(allocator, "[summary] next_steps:\n");
+                for (next_steps) |ns| {
+                    const text = switch (ns) {
+                        .string => |x| x,
+                        else => "",
+                    };
+                    if (text.len == 0) continue;
+                    try out.appendSlice(allocator, "- ");
+                    try out.appendSlice(allocator, text);
+                    try out.appendSlice(allocator, "\n");
+                }
+            }
+
+            return try out.toOwnedSlice(allocator);
+        },
+        .label => |l| {
+            return try std.fmt.allocPrint(allocator, "[label] {s} -> {s}\n", .{ l.targetId, l.label orelse "(null)" });
+        },
+        else => return &.{},
+    }
+}
+
+fn formatReplayForTest(
+    allocator: std.mem.Allocator,
+    entries: []const st.Entry,
+    show_turns: bool,
+) ![]const u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
+    defer out.deinit(allocator);
+
+    for (entries) |e| {
+        const line = try formatReplayEntryForTest(allocator, e, show_turns);
+        if (line.len > 0) try out.appendSlice(allocator, line);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+var temp_session_counter: u64 = 0;
+
+fn makeTempSessionPath(allocator: std.mem.Allocator, label: []const u8) ![]const u8 {
+    const io = compatIo();
+    const cwd = compatCwd();
+    while (true) {
+        temp_session_counter +%= 1;
+        const candidate = try std.fmt.allocPrint(allocator, ".tmp_session_{s}_{d}.jsonl", .{ label, temp_session_counter });
+        _ = cwd.statFile(io, candidate, .{}) catch |e| switch (e) {
+            error.FileNotFound => return candidate,
+            else => return e,
+        };
+    }
+}
+
+fn cleanupTempSession(path: []const u8) void {
+    const io = compatIo();
+    const cwd = compatCwd();
+    cwd.deleteFile(io, path) catch {};
+}
+
+fn collectEntryIds(allocator: std.mem.Allocator, entries: []const st.Entry) ![]const []const u8 {
+    var out = try std.ArrayList([]const u8).initCapacity(allocator, entries.len);
+    defer out.deinit(allocator);
+    for (entries) |e| {
+        if (st.idOf(e)) |eid| {
+            try out.append(allocator, eid);
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn entryById(entries: []const st.Entry, target_id: []const u8) ?st.Entry {
+    for (entries) |e| {
+        if (st.idOf(e)) |eid| {
+            if (std.mem.eql(u8, eid, target_id)) return e;
+        }
+    }
+    return null;
+}
+
+test "command output: replay includes messages/tools and json summary" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "format_replay");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("user", "ask status");
+    _ = try sm.appendMessage("assistant", "ack: understood");
+    _ = try sm.appendToolCall("echo", "hello");
+    _ = try sm.appendToolResult("echo", true, "ok: hello");
+    _ = try sm.appendSummary("{\"raw\":\"summary raw line\",\"next_steps\":[\"step-1\",\"step-2\"]}", "manual", "json", null, null, null, null, null, null);
+
+    const entries = try sm.buildContextEntriesVerbose();
+    const replay_text = try formatReplayForTest(allocator, entries, true);
+
+    const i_user = std.mem.indexOf(u8, replay_text, "[user] ask status\n") orelse return error.TestUnexpectedResult;
+    const i_asst = std.mem.indexOf(u8, replay_text, "[assistant] ack: understood\n") orelse return error.TestUnexpectedResult;
+    const i_tool_call = std.mem.indexOf(u8, replay_text, "[tool_call] echo arg=hello\n") orelse return error.TestUnexpectedResult;
+    const i_tool_result = std.mem.indexOf(u8, replay_text, "[tool_result] echo ok=true ok: hello\n") orelse return error.TestUnexpectedResult;
+    const i_summary_raw = std.mem.indexOf(u8, replay_text, "[summary] raw:\nsummary raw line\n") orelse return error.TestUnexpectedResult;
+    const i_next = std.mem.indexOf(u8, replay_text, "[summary] next_steps:\n") orelse return error.TestUnexpectedResult;
+    const i_step1 = std.mem.indexOf(u8, replay_text, "- step-1\n") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(i_user < i_asst);
+    try std.testing.expect(i_asst < i_tool_call);
+    try std.testing.expect(i_tool_call < i_tool_result);
+    try std.testing.expect(i_tool_result < i_summary_raw);
+    try std.testing.expect(i_summary_raw < i_next);
+    try std.testing.expect(i_next < i_step1);
+}
+
+test "command output: replay handles invalid json summary" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "format_replay_invalid_json");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendSummary("{bad json", "manual", "json", null, null, null, null, null, null);
+
+    const entries = try sm.buildContextEntriesVerbose();
+    const replay_text = try formatReplayForTest(allocator, entries, false);
+    try std.testing.expect(std.mem.indexOf(u8, replay_text, "(invalid json)") != null);
+}
+
+test "buildContextEntries excludes label entries from non-verbose context" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "label_context");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    const msg_id = try sm.appendMessage("user", "hello") ;
+    _ = try sm.setLabel(msg_id, "checkpoint");
+
+    const entries = try sm.buildContextEntries();
+    for (entries) |e| {
+        try std.testing.expect(e != .label);
+    }
+
+    const verbose_entries = try sm.buildContextEntriesVerbose();
+    var has_message = false;
+    for (verbose_entries) |e| {
+        try std.testing.expect(e != .label);
+        if (e == .message) has_message = true;
+    }
+    try std.testing.expect(has_message);
+}
+
+test "tokensEstForEntry should use usageTotalTokens when present" {
+    const usage_entry = st.MessageEntry{
+
+        .id = "m1",
+        .parentId = null,
+        .timestamp = "ts",
+        .role = "user",
+        .content = "abc",
+        .tokensEst = 9,
+        .usageTotalTokens = 4,
+    };
+    const plain_entry = st.MessageEntry{
+        .id = "m2",
+        .parentId = null,
+        .timestamp = "ts",
+        .role = "assistant",
+        .content = "a lot of text",
+        .tokensEst = 3,
+    };
+    const fallback_entry = st.MessageEntry{
+        .id = "m3",
+        .parentId = null,
+        .timestamp = "ts",
+        .role = "assistant",
+        .content = "abcdef",
+        .tokensEst = null,
+        .usageTotalTokens = null,
+    };
+
+    try std.testing.expectEqual(@as(usize, 4), tokensEstForEntry(st.Entry{ .message = usage_entry }));
+    try std.testing.expectEqual(@as(usize, 3), tokensEstForEntry(st.Entry{ .message = plain_entry }));
+    try std.testing.expectEqual(@as(usize, 2), tokensEstForEntry(st.Entry{ .message = fallback_entry }));
 }

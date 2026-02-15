@@ -25,15 +25,24 @@ pub const ToolRegistry = struct {
         }
         if (std.mem.eql(u8, call.tool, "shell")) {
             if (!self.allow_shell) return error.ShellDisabled;
-            // very MVP: run `sh -lc <arg>` and capture stdout
-            var child = std.process.Child.init(&.{ "sh", "-lc", call.arg }, self.arena);
-            child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Pipe;
-            try child.spawn();
-            var r = std.fs.File.deprecatedReader(child.stdout.?);
-            const out_bytes = try r.readAllAlloc(self.arena, 1024 * 1024);
-            _ = try child.wait();
-            return .{ .ok = true, .content = out_bytes };
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const result = try std.process.run(
+                self.arena,
+                io,
+                .{
+                    .argv = &.{ "sh", "-lc", call.arg },
+                    .cwd = null,
+                    .max_output_bytes = 1024 * 1024,
+                },
+            );
+            defer self.arena.free(result.stdout);
+            defer self.arena.free(result.stderr);
+
+            switch (result.term) {
+                .exited => |code| if (code != 0) return error.ShellCommandFailed,
+                else => return error.ShellCommandFailed,
+            }
+            return .{ .ok = true, .content = result.stdout };
         }
 
         return error.UnknownTool;
