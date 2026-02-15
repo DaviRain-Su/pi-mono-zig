@@ -1171,6 +1171,24 @@ pub const SessionManager = struct {
         return meta;
     }
 
+    /// Get the latest session name from the current context branch, if any.
+    pub fn getSessionName(self: *SessionManager) !?[]const u8 {
+        const chain = try self.buildContextEntriesMode(true);
+        if (chain.len == 0) return null;
+
+        var i: usize = chain.len;
+        while (i > 0) : (i -= 1) {
+            const e = chain[i - 1];
+            switch (e) {
+                .session_info => |si| {
+                    if (si.name) |n| return n;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn isBusinessEntry(e: Entry) bool {
         return switch (e) {
             .message, .tool_call, .tool_result, .summary => true,

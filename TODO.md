@@ -83,8 +83,8 @@
 - [ ] `createBranchedSession`（fork/export 分支路径）。
 
 ### 3.3 `SessionInfo` 元数据（文件：`src/session_manager.zig`）
-- [ ] 支持 `appendSessionInfo`。
-- [ ] `getSessionName` 返回最近一次名称。
+- [x] 支持 `appendSessionInfo`。
+- [x] `getSessionName` 返回最近一次名称。
 
 ### 3.4 CLI 命令对齐（文件：`src/main.zig`）
 - [ ] `--resume`、`--continue`、`--session` 查找规则（ID 前缀匹配/跨路径确认）。

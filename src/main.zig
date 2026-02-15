@@ -2896,6 +2896,44 @@ test "buildSessionContext exposes latest thinking/model/session metadata" {
     try std.testing.expect(std.mem.eql(u8, meta.sessionName.?, "current workspace"));
 }
 
+test "getSessionName returns latest session_info on current context" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "session_name_meta");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendSessionInfo("old workspace");
+    const branch_target = try sm.appendMessage("user", "hello");
+    _ = try sm.appendSessionInfo("current workspace");
+    _ = try sm.appendMessage("assistant", "ok");
+
+    const name = try sm.getSessionName();
+    try std.testing.expect(name != null);
+    try std.testing.expect(std.mem.eql(u8, name.?, "current workspace"));
+
+    // Branch back before the newer session_info; name should revert to earlier value.
+    try sm.branchTo(branch_target);
+    const branched_name = try sm.getSessionName();
+    try std.testing.expect(branched_name != null);
+    try std.testing.expect(std.mem.eql(u8, branched_name.?, "old workspace"));
+
+    // Fresh session without session_info should have no name
+    const empty_session_path = try makeTempSessionPath(allocator, "session_name_meta_empty");
+    defer cleanupTempSession(empty_session_path);
+    var sm_empty = session.SessionManager.init(allocator, empty_session_path, ".");
+    try sm_empty.ensure();
+    const empty_name = try sm_empty.getSessionName();
+    try std.testing.expect(empty_name == null);
+}
+
 test "loadEntries migrates legacy v1 entries, ids and parentId links" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
