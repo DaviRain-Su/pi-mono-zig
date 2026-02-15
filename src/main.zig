@@ -4210,3 +4210,57 @@ test "collectBranchSummaryFileOps scans shell commands and detail payloads" {
     };
     try std.testing.expect(reads.len >= 4);
 }
+
+test "collectDetails parses direct object and nested string payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var rf = try std.ArrayList([]const u8).initCapacity(allocator, 4);
+    var mf = try std.ArrayList([]const u8).initCapacity(allocator, 2);
+    var seen_rf = std.StringHashMap(bool).init(allocator);
+    var seen_mf = std.StringHashMap(bool).init(allocator);
+    defer {
+        rf.deinit(allocator);
+        mf.deinit(allocator);
+        seen_rf.deinit();
+        seen_mf.deinit();
+    }
+
+    try ShellFileOps.collectDetails(
+        allocator,
+        "{\"readFiles\":[\"a.txt\",\"b.txt\"],\"modifiedFiles\":[\"c.txt\"]}",
+        &rf,
+        &mf,
+        &seen_rf,
+        &seen_mf,
+    );
+    try std.testing.expectEqual(@as(usize, 2), rf.items.len);
+    try std.testing.expectEqual(@as(usize, 1), mf.items.len);
+    try std.testing.expect(std.mem.eql(u8, rf.items[0], "a.txt"));
+    try std.testing.expect(std.mem.eql(u8, mf.items[0], "c.txt"));
+
+    var rf2 = try std.ArrayList([]const u8).initCapacity(allocator, 2);
+    var mf2 = try std.ArrayList([]const u8).initCapacity(allocator, 2);
+    var seen_rf2 = std.StringHashMap(bool).init(allocator);
+    var seen_mf2 = std.StringHashMap(bool).init(allocator);
+    defer {
+        rf2.deinit(allocator);
+        mf2.deinit(allocator);
+        seen_rf2.deinit();
+        seen_mf2.deinit();
+    }
+
+    try ShellFileOps.collectDetails(
+        allocator,
+        "\"{\\\"readFiles\\\":[\\\"x.txt\\\"],\\\"modifiedFiles\\\":[\\\"y.txt\\\"]}\"",
+        &rf2,
+        &mf2,
+        &seen_rf2,
+        &seen_mf2,
+    );
+    try std.testing.expectEqual(@as(usize, 1), rf2.items.len);
+    try std.testing.expectEqual(@as(usize, 1), mf2.items.len);
+    try std.testing.expect(std.mem.eql(u8, rf2.items[0], "x.txt"));
+    try std.testing.expect(std.mem.eql(u8, mf2.items[0], "y.txt"));
+}
