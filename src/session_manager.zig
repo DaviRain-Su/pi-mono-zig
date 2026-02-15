@@ -125,6 +125,19 @@ pub const SessionManager = struct {
         try self.setLeaf(targetId);
     }
 
+    /// Branch + summarize the abandoned segment by appending a branch_summary entry at the new leaf.
+    pub fn branchWithSummary(
+        self: *SessionManager,
+        targetId: ?[]const u8,
+        summary: []const u8,
+        details: ?[]const u8,
+        fromHook: bool,
+    ) ![]const u8 {
+        try self.branchTo(targetId);
+        const from_id = targetId orelse "root";
+        return try self.appendBranchSummary(from_id, summary, details, fromHook);
+    }
+
     pub fn setLabel(self: *SessionManager, targetId: []const u8, label: ?[]const u8) ![]const u8 {
         const id = try self.newId();
         const entry = LabelEntry{

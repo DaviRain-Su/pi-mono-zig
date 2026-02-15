@@ -58,8 +58,8 @@
 - [ ] 若 TS token 来源可接入，优先走 `tokensBefore`/provider usage 路径；否则保持 fallback 估算。
 
 ### 2.2 Branch summary（文件：`src/session_manager.zig`、`src/main.zig`）
-- [ ] 在分支切换时支持 `branchWithSummary`。
-- [ ] 生成 `branch_summary` 并写入上下文树（含 `fromId` + 可选 `details`）。
+- [x] 在分支切换时支持 `branchWithSummary`。
+- [x] 生成 `branch_summary` 并写入上下文树（含 `fromId` + 可选 `details`）。
 - [ ] 与 compaction 一致处理 `details` 文件轨迹累计。
 
 ### 2.3 自动压缩触发策略（文件：`src/main.zig`）

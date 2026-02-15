@@ -14,7 +14,7 @@ fn usage() void {
         \\  pi-mono-zig verify --run <runId> [--out runs]\n\
         \\  pi-mono-zig chat --session <path.jsonl> [--allow-shell] [--auto-compact --max-chars N --max-tokens-est N --keep-last N --keep-last-groups N]\n\
         \\  pi-mono-zig replay --session <path.jsonl> [--show-turns]\n\
-        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId>\n\
+        \\  pi-mono-zig branch --session <path.jsonl> --to <entryId> [--summary <text>] [--summary-from-hook]\n\
         \\  pi-mono-zig label --session <path.jsonl> --to <entryId> --label <name>\n\
         \\  pi-mono-zig list --session <path.jsonl> [--show-turns]\n\
         \\  pi-mono-zig show --session <path.jsonl> --id <entryId>\n\
@@ -2140,11 +2140,26 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "branch")) {
         var session_path: ?[]const u8 = null;
         var to_id: ?[]const u8 = null;
+        var summary: ?[]const u8 = null;
+        var summary_details: ?[]const u8 = null;
+        var summary_from_hook = false;
         while (args.next()) |a| {
             if (std.mem.eql(u8, a, "--session")) {
                 session_path = args.next() orelse return error.MissingSession;
             } else if (std.mem.eql(u8, a, "--to")) {
                 to_id = args.next() orelse return error.MissingTo;
+            } else if (std.mem.eql(u8, a, "--summary")) {
+                summary = args.next() orelse {
+                    usage();
+                    return;
+                };
+            } else if (std.mem.eql(u8, a, "--summary-details")) {
+                summary_details = args.next() orelse {
+                    usage();
+                    return;
+                };
+            } else if (std.mem.eql(u8, a, "--summary-from-hook")) {
+                summary_from_hook = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 usage();
                 return;
@@ -2156,10 +2171,19 @@ pub fn main(init: std.process.Init) !void {
             usage();
             return;
         };
+        const tid = to_id orelse {
+            usage();
+            return;
+        };
         var sm = session.SessionManager.init(allocator, sp, ".");
         try sm.ensure();
-        try sm.branchTo(to_id);
-        std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, to_id orelse "(null)" });
+        if (summary) |s| {
+            const summary_id = try sm.branchWithSummary(tid, s, summary_details, summary_from_hook);
+            std.debug.print("ok: true\nbranch: {s} -> {s}\nbranch_summary: {s}\n", .{ sp, tid, summary_id });
+        } else {
+            try sm.branchTo(tid);
+            std.debug.print("ok: true\nbranch: {s} -> {s}\n", .{ sp, tid });
+        }
         return;
     }
 
@@ -2932,6 +2956,62 @@ test "getSessionName returns latest session_info on current context" {
     try sm_empty.ensure();
     const empty_name = try sm_empty.getSessionName();
     try std.testing.expect(empty_name == null);
+}
+
+test "branchWithSummary appends branch summary and marks branch context" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "branch_summary_cli");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("user", "root");
+    const branch_from = try sm.appendMessage("assistant", "to be left");
+    _ = try sm.appendMessage("assistant", "current");
+
+    const summary_id = try sm.branchWithSummary(branch_from, "branch resumed", "{\"ok\":true}", true);
+    try std.testing.expect(summary_id.len > 0);
+
+    // Latest context should include branch_summary converted into user message.
+    const ctx = try sm.buildSessionContext();
+    var saw_summary = false;
+    var saw_branch_from = false;
+    for (ctx) |e| {
+        switch (e) {
+            .message => |m| {
+                if (std.mem.indexOf(u8, m.content, "branch resumed") != null) saw_summary = true;
+                if (std.mem.eql(u8, m.content, "to be left")) saw_branch_from = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_summary);
+    try std.testing.expect(saw_branch_from);
+
+    const entries = try sm.loadEntries();
+    var found_summary = false;
+    var found_from_id = false;
+    var count_branch_summary: usize = 0;
+    for (entries) |e| {
+        switch (e) {
+            .branch_summary => |b| {
+                found_summary = true;
+                if (std.mem.eql(u8, b.fromId, branch_from)) found_from_id = true;
+                if (std.mem.eql(u8, b.id, summary_id)) count_branch_summary += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_summary);
+    try std.testing.expect(found_from_id);
+    try std.testing.expectEqual(@as(usize, 1), count_branch_summary);
 }
 
 test "loadEntries migrates legacy v1 entries, ids and parentId links" {
