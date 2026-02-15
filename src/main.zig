@@ -103,6 +103,192 @@ fn autoCompactKeepRecentIndex(nodes: []const st.Entry, boundary_from: usize, kee
     return boundary_from;
 }
 
+fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    try out.appendSlice(allocator, "\"");
+    for (value) |ch| {
+        if (ch >= 0x20 and ch != '"' and ch != '\\') {
+            try out.append(allocator, ch);
+            continue;
+        }
+
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            0x00...0x1f => {
+                switch (ch) {
+                    '\n' => try out.appendSlice(allocator, "\\n"),
+                    '\r' => try out.appendSlice(allocator, "\\r"),
+                    '\t' => try out.appendSlice(allocator, "\\t"),
+                    0x08 => try out.appendSlice(allocator, "\\b"),
+                    0x0c => try out.appendSlice(allocator, "\\f"),
+                    else => {
+                        var hex_buf: [2]u8 = undefined;
+                        const hex = try std.fmt.bufPrint(&hex_buf, "{x:0>2}", .{ch});
+                        try out.appendSlice(allocator, "\\u00");
+                        try out.appendSlice(allocator, hex);
+                    },
+                }
+            },
+            else => {},
+        }
+    }
+    try out.appendSlice(allocator, "\"");
+}
+
+fn buildCompactionDetailsJson(
+    allocator: std.mem.Allocator,
+    read_files: []const []const u8,
+    modified_files: []const []const u8,
+) ![]const u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, 64);
+    defer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"readFiles\":[");
+    for (read_files, 0..) |rf, i| {
+        if (i > 0) try out.appendSlice(allocator, ",");
+        try appendJsonEscaped(allocator, &out, rf);
+    }
+    try out.appendSlice(allocator, "],\"modifiedFiles\":[");
+    for (modified_files, 0..) |mf, i| {
+        if (i > 0) try out.appendSlice(allocator, ",");
+        try appendJsonEscaped(allocator, &out, mf);
+    }
+    try out.appendSlice(allocator, "]}");
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn collectFileOpsFromDetails(
+    allocator: std.mem.Allocator,
+    details_json: []const u8,
+    read_files: *std.ArrayList([]const u8),
+    modified_files: *std.ArrayList([]const u8),
+    seen_read: *std.StringHashMap(bool),
+    seen_modified: *std.StringHashMap(bool),
+) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, details_json, .{}) catch return false;
+    defer parsed.deinit();
+
+    var obj: ?std.json.ObjectMap = null;
+    switch (parsed.value) {
+        .object => |o| obj = o,
+        .string => |s| {
+            var inner = std.json.parseFromSlice(std.json.Value, allocator, s, .{}) catch return false;
+            defer inner.deinit();
+            switch (inner.value) {
+                .object => |o| obj = o,
+                else => return false,
+            }
+        },
+        else => return false,
+    }
+
+    const o = obj orelse return false;
+    var recognized = false;
+
+    const appendUnique = struct {
+        fn run(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayList([]const u8),
+            seen: *std.StringHashMap(bool),
+            value: []const u8,
+        ) !void {
+            if (seen.contains(value)) return;
+            try seen.put(value, true);
+            try list.append(alloc, value);
+        }
+    };
+
+    if (o.get("readFiles")) |v| {
+        switch (v) {
+            .array => |a| {
+                recognized = true;
+                for (a.items) |it| {
+                    if (it == .string) {
+                        try appendUnique.run(allocator, read_files, seen_read, it.string);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (o.get("modifiedFiles")) |v| {
+        switch (v) {
+            .array => |a| {
+                recognized = true;
+                for (a.items) |it| {
+                    if (it == .string) {
+                        try appendUnique.run(allocator, modified_files, seen_modified, it.string);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return recognized;
+}
+
+fn collectCompactionDetails(
+    allocator: std.mem.Allocator,
+    nodes: []const st.Entry,
+    boundary_from: usize,
+    start: usize,
+    prev_details: ?[]const u8,
+) !?[]const u8 {
+    var read_files = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer read_files.deinit(allocator);
+    var modified_files = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    defer modified_files.deinit(allocator);
+
+    var seen_read = std.StringHashMap(bool).init(allocator);
+    defer seen_read.deinit();
+    var seen_modified = std.StringHashMap(bool).init(allocator);
+    defer seen_modified.deinit();
+
+    var from_boundary: usize = boundary_from;
+    if (from_boundary > nodes.len) from_boundary = nodes.len;
+    var end: usize = start;
+    if (end > nodes.len) end = nodes.len;
+
+    if (prev_details) |pd| {
+        _ = try collectFileOpsFromDetails(
+            allocator,
+            pd,
+            &read_files,
+            &modified_files,
+            &seen_read,
+            &seen_modified,
+        );
+    }
+
+    var i = from_boundary;
+    while (i < end) : (i += 1) {
+        const e = nodes[i];
+        switch (e) {
+            .branch_summary => |b| {
+                if (!b.fromHook) {
+                    if (b.details) |d| {
+                        _ = try collectFileOpsFromDetails(allocator, d, &read_files, &modified_files, &seen_read, &seen_modified);
+                    }
+                }
+            },
+            .compaction => |c| {
+                if (!c.fromHook) {
+                    if (c.details) |d| {
+                        _ = try collectFileOpsFromDetails(allocator, d, &read_files, &modified_files, &seen_read, &seen_modified);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (read_files.items.len == 0 and modified_files.items.len == 0) return null;
+    return try buildCompactionDetailsJson(allocator, read_files.items, modified_files.items);
+}
+
 fn doCompact(
     allocator: std.mem.Allocator,
     sm: *session.SessionManager,
@@ -112,11 +298,11 @@ fn doCompact(
     dry_run: bool,
     label: ?[]const u8,
     prefix: []const u8,
-    reason: ?[]const u8,
-    stats_total_chars: ?usize,
+    _: ?[]const u8,
+    _: ?usize,
     stats_total_tokens_est: ?usize,
-    stats_threshold_chars: ?usize,
-    stats_threshold_tokens_est: ?usize,
+    _: ?usize,
+    _: ?usize,
     update_summary: bool,
 ) !struct { dryRun: bool, summaryText: []const u8, summaryId: ?[]const u8 } {
     // Use verbose context for compaction so we can see turn boundaries.
@@ -133,19 +319,39 @@ fn doCompact(
 
     const n = nodes.items.len;
 
-    // TS parity: define a compaction "boundary" starting AFTER the most recent summary entry.
-    // We only decide cutpoints within this window (older content is already summarized).
+    // TS parity: define a compaction boundary from the most recent previous compaction (if it has tail entries).
+    // Fallback to latest summary when no compaction is present.
     var boundary_from: usize = 0;
+    var prev_compaction_details: ?[]const u8 = null;
     {
         var k: usize = n;
         while (k > 0) : (k -= 1) {
             const e = nodes.items[k - 1];
             switch (e) {
-                .summary => {
-                    boundary_from = k;
-                    break;
+                .compaction => |c| {
+                    if (k < n) {
+                        boundary_from = k;
+                        prev_compaction_details = c.details;
+                        break;
+                    }
                 },
                 else => {},
+            }
+        }
+
+        if (boundary_from == 0) {
+            var j: usize = n;
+            while (j > 0) : (j -= 1) {
+                const e = nodes.items[j - 1];
+                switch (e) {
+                    .summary => {
+                        if (j < n) {
+                            boundary_from = j;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -1587,21 +1793,28 @@ fn doCompact(
     }
 
     const sum_text = try sum_buf.toOwnedSlice(allocator);
+    const compaction_details = try collectCompactionDetails(
+        allocator,
+        nodes.items,
+        boundary_from,
+        start,
+        prev_compaction_details,
+    );
+    if (start >= nodes.items.len) {
+        return error.InvalidData;
+    }
+    const first_kept_id = st.idOf(nodes.items[start]) orelse return error.InvalidData;
 
     if (dry_run) {
         return .{ .dryRun = true, .summaryText = sum_text, .summaryId = null };
     }
 
-    const summary_id = try sm.appendSummary(
+    const summary_id = try sm.appendCompaction(
         sum_text,
-        reason,
-        if (want_json) "json" else if (want_md) "md" else "text",
-        stats_total_chars,
-        stats_total_tokens_est,
-        keep_last,
-        keep_last_groups,
-        stats_threshold_chars,
-        stats_threshold_tokens_est,
+        first_kept_id,
+        stats_total_tokens_est orelse 0,
+        compaction_details,
+        false,
     );
     if (label) |lab| {
         _ = try sm.setLabel(summary_id, lab);
@@ -3372,4 +3585,109 @@ test "autoCompactKeepRecentIndex keeps near keep_recent_tokens budget" {
 
     try std.testing.expectEqual(@as(usize, 1), autoCompactKeepRecentIndex(&entries, 0, 6));
     try std.testing.expectEqual(@as(usize, 0), autoCompactKeepRecentIndex(&entries, 0, 20));
+}
+
+test "doCompact persists compaction entry with accumulated file-operation details" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const session_path = try makeTempSessionPath(allocator, "compact_entry_details");
+    defer cleanupTempSession(session_path);
+
+    var sm = session.SessionManager.init(allocator, session_path, ".");
+    try sm.ensure();
+
+    _ = try sm.appendMessage("assistant", "seed");
+    const anchor = try sm.appendMessage("user", "anchor");
+    _ = try sm.appendMessage("assistant", "bridge");
+    _ = try sm.appendCompaction(
+        "prior compact",
+        anchor,
+        120,
+        "{\"readFiles\":[\"old.rs\"],\"modifiedFiles\":[\"old_out.rs\"]}",
+        false,
+    );
+
+    const keep_id_source = try sm.appendMessage("assistant", "tail message");
+    _ = try sm.appendBranchSummary(
+        keep_id_source,
+        "branch kept",
+        "{\"readFiles\":[\"branch.rs\"],\"modifiedFiles\":[\"branch_out.rs\"]}",
+        false,
+    );
+    const tail_kept_id = try sm.appendToolCall("echo", "echo done");
+    _ = try sm.appendToolResult("echo", true, "done");
+
+    const res = try doCompact(
+        allocator,
+        &sm,
+        1,
+        null,
+        null,
+        false,
+        null,
+        "manual",
+        null,
+        null,
+        321,
+        null,
+        null,
+        true,
+    );
+
+    try std.testing.expect(!res.dryRun);
+    try std.testing.expect(res.summaryId != null);
+
+    const entries = try sm.loadEntries();
+    var last_compaction: ?st.Entry = null;
+    for (entries) |e| {
+        if (e == .compaction) {
+            last_compaction = e;
+        }
+    }
+
+    const compaction = if (last_compaction) |v| v.compaction else return error.InvalidData;
+    try std.testing.expectEqualStrings(tail_kept_id, compaction.firstKeptEntryId);
+    try std.testing.expectEqual(@as(usize, 321), compaction.tokensBefore);
+    try std.testing.expect(!compaction.fromHook);
+
+    const d = compaction.details orelse return error.InvalidData;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, d, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .object => |obj| {
+            var found_old = false;
+            var found_old_out = false;
+            var found_branch = false;
+            var found_branch_out = false;
+
+            if (obj.get("readFiles")) |rf| {
+                switch (rf) {
+                    .array => |a| for (a.items) |it| {
+                        if (it == .string and std.mem.eql(u8, it.string, "old.rs")) found_old = true;
+                        if (it == .string and std.mem.eql(u8, it.string, "branch.rs")) found_branch = true;
+                    },
+                    else => {},
+                }
+            }
+            if (obj.get("modifiedFiles")) |mf| {
+                switch (mf) {
+                    .array => |a| for (a.items) |it| {
+                        if (it == .string and std.mem.eql(u8, it.string, "old_out.rs")) found_old_out = true;
+                        if (it == .string and std.mem.eql(u8, it.string, "branch_out.rs")) found_branch_out = true;
+                    },
+                    else => {},
+                }
+            }
+            try std.testing.expect(found_old);
+            try std.testing.expect(found_old_out);
+            try std.testing.expect(found_branch);
+            try std.testing.expect(found_branch_out);
+        },
+        else => return error.InvalidData,
+    }
 }
