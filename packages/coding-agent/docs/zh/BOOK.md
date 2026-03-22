@@ -34,12 +34,14 @@ docs/zh/
 | 4 | [命令与快捷键](./guide/04-commands.md) | 242 | 20分钟 | 所有内置命令、快捷键、设置 |
 | 5 | [会话管理](./guide/05-sessions.md) | 312 | 25分钟 | 树形会话、分支、压缩、导航 |
 | 6 | [Skill 系统](./guide/06-skills.md) | 352 | 30分钟 | 使用 Skill、编写 Skill、最佳实践 |
-| 7 | [健康使用指南](./guide/07-healthy-usage.md) | 265 | 15分钟 | 避免 Agent Psychosis、质量优先 |
+| 7 | [健康使用指南](./guide/07-healthy-usage.md) | 302 | 15分钟 | 避免 Agent Psychosis、质量优先 |
 | 8 | [你的第一个扩展](./guide/08-first-extension.md) | 310 | 40分钟 | 从零编写、热重载、调试 |
 | 9 | [扩展 API 详解](./guide/09-extension-api.md) | 585 | 90分钟 | 工具、命令、事件、UI |
+| 10 | [提示模板](./guide/10-prompt-templates.md) | 67 | 10分钟 | 模板创建、参数、使用 ✨ |
+| 11 | [开发指南](./guide/11-development.md) | 69 | 10分钟 | 设置、Fork、测试、结构 ✨ |
 | 15 | [设计决策](./guide/15-design-decisions.md) | 313 | 30分钟 | 为什么这样设计、权衡、未来 |
 
-**小计**：10 章，约 3,141 行
+**小计**：12 章
 
 ---
 
@@ -63,26 +65,78 @@ docs/zh/
 
 ---
 
+---
+
+## ⛓️ 区块链专题 (blockchain/)
+
+围绕 `pi-mono` / `pi-worker` 与 Solana、Sui、支付协议、去中心化计算层结合的专题文档。
+
+| 文档 | 内容 |
+|------|------|
+| [专题总览](./blockchain/00-overview.md) | 这个专题解决什么问题、适合谁读、如何阅读 |
+| [专题导航](./blockchain/README.md) | 阅读顺序、主题边界、与核心文档关系 |
+| [区块链结合路线图](./blockchain/01-roadmap.md) | 务实版 / Web3-native / 研究版三条路线 |
+| [Solana / Sui 任务模型草案](./blockchain/02-task-models-solana-sui.md) | Task / Claim / Result / Escrow / Dispute 等最小对象模型 |
+| [区块链 + Agent 的 LLM 支付层设计](./blockchain/03-llm-payment-layer.md) | x402 / MMP / usage receipts / budget / settlement |
+| [pi-worker 链上任务执行时序](./blockchain/04-task-execution-flow.md) | 从任务创建到结算的完整执行流 |
+| [可验证 Artifact 设计](./blockchain/05-verifiable-artifacts.md) | 结果如何变成可承诺、可校验、可争议的 artifact |
+| [Policy 与 Guardrails 设计](./blockchain/06-policy-and-guardrails.md) | 预算、模型、工具、主网动作的边界控制 |
+| [TEE 与去中心化计算层](./blockchain/07-tee-and-decentralized-compute.md) | 为什么链本身不适合运行 worker，以及路线 2 的执行平面 |
+| [可验证 Receipts 与 Attestation](./blockchain/08-verifiable-receipts-and-attestation.md) | usage receipts、manifest、artifact、attestation 的验证链路 |
+| [Solana MVP 草案](./blockchain/09-solana-mvp-design.md) | 第一条链的最小账户模型、最小指令集与 worker 接入闭环 |
+| [Solana Program 指令设计](./blockchain/10-solana-program-instructions.md) | create/fund/claim/submit/accept/reject/settle 的协议级设计 |
+| [Solana 预算与结算设计](./blockchain/11-solana-budget-and-settlement.md) | execution budget、worker reward、refund 与 settlement 闭合方式 |
+| [Solana Worker Runtime 集成](./blockchain/12-solana-worker-runtime-integration.md) | task discovery、claim、artifact bundle、submit 与 post-submit 监控 |
+| [Solana 争议与声誉设计](./blockchain/13-solana-dispute-and-reputation.md) | dispute 状态机、reviewer 模型与 reputation 指标设计 |
+| [Solana 任务市场与 Worker 选择](./blockchain/14-solana-task-market-and-worker-selection.md) | 任务分配、资格认领、specialization 与 stake/reputation 的关系 |
+| [Solana 安全与审计清单](./blockchain/15-solana-security-and-audit-checklist.md) | 状态机、authority、结算、artifact、market 与 runtime 的审计重点 |
+| [Solana Indexer 与可观测性](./blockchain/16-solana-indexer-and-observability.md) | Task/Worker/Cost/Market 的索引、Dashboard 与告警设计 |
+| [Solana 产品推进路线图](./blockchain/17-solana-product-roadmap.md) | 从内部验证、稳定 MVP 到有限市场与开放网络的阶段推进 |
+| [Solana 实现清单](./blockchain/18-solana-implementation-checklist.md) | 协议、runtime、运营、支付层的具体实现顺序与阶段清单 |
+
+---
+
+## 💻 平台配置 (platform/)
+
+不同平台的配置指南。
+
+| 文档 | 内容 |
+|------|------|
+| [Windows 配置](./platform/windows.md) | Git Bash、Cygwin、WSL 配置 ✨ |
+| [Termux](./platform/termux.md) | Android Termux 安装与使用 ✨ |
+| [终端配置](./platform/terminal-setup.md) | Kitty、iTerm2、Ghostty、WezTerm 等终端正确配置 ✨ |
+| [tmux 配置](./platform/tmux.md) | tmux 扩展键配置 ✨ |
+
+---
+
 ## 📚 技术参考 (reference/)
 
 深度技术细节，按需查阅。
 
-| 文档 | 页数 | 内容 |
+| 文档 | 行数 | 内容 |
 |------|------|------|
 | [架构概览](./reference/architecture-overview.md) | 144 | 核心架构边界与调用链 |
 | [深度架构分析](./reference/deep-dive-architecture.md) | 1,384 | 源码级深度分析（五层架构、数据流、事件系统） |
 | [源码架构](./reference/12-source-architecture.md) | 420 | 五层架构详解、数据流、事件系统 |
 | [模型系统](./reference/13-model-system.md) | 362 | Provider、注册、路由、自定义 |
 | [嵌入与集成](./reference/14-embedding.md) | 261 | SDK、RPC、Web UI |
-| [RPC 指南](./reference/embedding-and-rpc.md) | 135 | 集成开发指南 |
-| [SDK 指南](./reference/extensions-and-sdks.md) | 223 | 扩展开发实战手册 |
-| [Provider 架构](./reference/model-provider-architecture.md) | 150 | 模型系统技术细节 |
-| [与 Bub 框架对比](./reference/comparison-bub.md) | 739 | 通过对比理解 pi-mono 设计 |
-| [与 Claude Code 对比](./reference/comparison-claude-code.md) | 623 | 与主流工具对比 |
-| [与 OpenCode 对比](./reference/comparison-opencode.md) | 884 | 与最热门的开源工具对比 |
-| [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) | 762 | pi-mono Zig 版本演进路线图 |
+| [RPC 模式](./reference/rpc.md) | 1,354 | JSON 协议完整参考 ✨ |
+| [自定义 Provider](./reference/custom-provider.md) | 596 | 注册新模型 Provider ✨ |
+| [设置参考](./reference/settings.md) | 234 | 完整设置配置表 ✨ |
+| [树形导航](./reference/tree.md) | 228 | /tree 命令详解 ✨ |
+| [会话压缩](./reference/compaction.md) | 392 | 自动压缩与分支摘要算法 ✨ |
+| [JSON 模式](./reference/json-mode.md) | 79 | 事件流输出格式 ✨ |
+| [TUI 组件](./reference/tui.md) | 887 | 自定义组件开发 ✨ |
+| [主题配置](./reference/themes.md) | 295 | 自定义 TUI 颜色 ✨ |
+| [键绑定](./reference/keybindings.md) | 173 | 所有快捷键配置 ✨ |
+| [Provider 配置](./reference/providers.md) | 195 | 订阅、API Key、云服务商 ✨ |
+| [Shell 别名](./reference/shell-aliases.md) | 13 | 启用 bash 别名 ✨ |
+| [框架对比](./reference/comparison-bub.md) | 739 | 与 Bub 框架对比 |
+| [框架对比](./reference/comparison-claude-code.md) | 623 | 与 Claude Code 对比 |
+| [框架对比](./reference/comparison-opencode.md) | 884 | 与 OpenCode 对比 |
+| [Zig 生态](./reference/zig-ecosystem-analysis.md) | 762 | Zig 版本演进路线图 |
 
-**小计**：12 个文档，约 6,087 行
+**小计**：20 个文档
 
 ---
 
@@ -118,6 +172,7 @@ cookbook/
 - 代码片段 → `cookbook/`
 - 架构理解 → `reference/`
 - 设计模式 → `patterns/`
+- 区块链专题 → `blockchain/`
 
 ---
 
@@ -125,11 +180,15 @@ cookbook/
 
 | 分类 | 文件数 | 行数 | 占比 |
 |------|--------|------|------|
-| 使用指南 | 10 | 3,141 | 39% |
-| 技术参考 | 12 | 6,087 | 52% |
-| 设计模式 | 1 | 590 | 5% |
-| 代码食谱 | 1 | 488 | 4% |
-| **总计** | **24** | **~10,500** | **100%** |
+| 使用指南 | 12 | ~3,277 | 21% |
+| 技术参考 | 18 | ~10,500 | 67% |
+| 区块链专题 | 5 | ~2,300 | 15% |
+| 设计模式 | 1 | 590 | 4% |
+| 代码食谱 | 1 | 488 | 3% |
+| 平台配置 | 4 | ~310 | ~2% |
+| **总计** | **41** | **~17,500** | **100%** |
+
+✨ = 新增翻译
 
 ---
 

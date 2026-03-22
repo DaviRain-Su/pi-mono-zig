@@ -38,18 +38,58 @@ docs/zh/
 │   ├── 07-healthy-usage.md        # 健康使用指南
 │   ├── 08-first-extension.md      # 你的第一个扩展
 │   ├── 09-extension-api.md        # 扩展 API 详解
+│   ├── 10-prompt-templates.md     # 提示模板 ✨ 新增
+│   ├── 11-development.md          # 开发指南 ✨ 新增
 │   └── 15-design-decisions.md     # 设计决策
 ├── patterns/              # 🎨 设计模式
 │   └── 10-patterns.md             # 实战模式
 ├── cookbook/              # 🍳 代码食谱
 │   └── 11-cookbook.md             # Cookbook
+├── blockchain/            # ⛓️ 区块链专题 ✨ 新目录
+│   ├── README.md                   # 专题导航
+│   ├── 00-overview.md              # 专题总览
+│   ├── 01-roadmap.md               # 区块链结合路线图
+│   ├── 02-task-models-solana-sui.md # Solana / Sui 任务模型草案
+│   ├── 03-llm-payment-layer.md     # 区块链 + Agent 的 LLM 支付层设计
+│   ├── 04-task-execution-flow.md   # pi-worker 链上任务执行时序
+│   ├── 05-verifiable-artifacts.md  # 可验证 Artifact 设计
+│   ├── 06-policy-and-guardrails.md # Policy 与 Guardrails 设计
+│   ├── 07-tee-and-decentralized-compute.md # TEE 与去中心化计算层
+│   ├── 08-verifiable-receipts-and-attestation.md # 可验证 Receipts 与 Attestation
+│   ├── 09-solana-mvp-design.md    # Solana MVP 草案
+│   ├── 10-solana-program-instructions.md # Solana Program 指令设计
+│   ├── 11-solana-budget-and-settlement.md # Solana 预算与结算设计
+│   ├── 12-solana-worker-runtime-integration.md # Solana Worker Runtime 集成
+│   ├── 13-solana-dispute-and-reputation.md # Solana 争议与声誉设计
+│   ├── 14-solana-task-market-and-worker-selection.md # Solana 任务市场与 Worker 选择
+│   ├── 15-solana-security-and-audit-checklist.md # Solana 安全与审计清单
+│   ├── 16-solana-indexer-and-observability.md # Solana Indexer 与可观测性
+│   ├── 17-solana-product-roadmap.md # Solana 产品推进路线图
+│   └── 18-solana-implementation-checklist.md # Solana 实现清单
+├── platform/              # 💻 平台配置 ✨ 新目录
+│   ├── windows.md                 # Windows 配置
+│   ├── termux.md                  # Android Termux
+│   ├── terminal-setup.md          # 终端配置
+│   └── tmux.md                    # tmux 配置
 └── reference/             # 📚 技术参考
     ├── architecture-overview.md          # 架构概览
     ├── deep-dive-architecture.md         # 深度架构分析
     ├── 12-source-architecture.md         # 源码架构
     ├── 13-model-system.md                # 模型系统
     ├── 14-embedding.md                   # 嵌入与集成
-    ├── embedding-and-rpc.md              # RPC 指南
+    ├── rpc.md                            # RPC 模式 ✨
+    ├── custom-provider.md                # 自定义 Provider ✨
+    ├── models.md                         # 自定义模型配置 ✨
+    ├── packages.md                       # Pi 包管理 ✨
+    ├── settings.md                        # 设置参考 ✨
+    ├── tree.md                            # 树形导航 ✨
+    ├── compaction.md                     # 会话压缩 ✨
+    ├── json-mode.md                      # JSON 模式 ✨
+    ├── tui.md                            # TUI 组件 ✨
+    ├── themes.md                         # 主题配置 ✨
+    ├── keybindings.md                    # 键绑定 ✨
+    ├── providers.md                      # Provider 配置 ✨
+    ├── shell-aliases.md                  # Shell 别名 ✨
     ├── extensions-and-sdks.md            # SDK 指南
     ├── model-provider-architecture.md    # Provider 架构
     ├── comparison-bub.md                 # 与 Bub 框架对比
@@ -83,10 +123,16 @@ docs/zh/
 - **代码片段**：cookbook/
 - **架构理解**：reference/
 - **设计模式**：patterns/
+- **平台配置**：platform/
 - **框架对比**：
   - [与 Bub 框架对比](./reference/comparison-bub.md)
   - [与 Claude Code 对比](./reference/comparison-claude-code.md)
   - [与 OpenCode 对比](./reference/comparison-opencode.md)
+- **区块链专题**：
+  - [专题总览](./blockchain/00-overview.md)
+  - [专题导航](./blockchain/README.md)
+  - 基础层：路线图、任务模型、支付层、执行流、artifact、guardrails、TEE、receipts
+  - Solana 主线：MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
 - **演进规划**：
   - [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) - pi-mono Zig 版本演进路线图
 
@@ -129,4 +175,4 @@ pi 遵循 **"Agent构建Agent"** 的哲学：
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2025年3月*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月*
