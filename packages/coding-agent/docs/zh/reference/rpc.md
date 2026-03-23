@@ -683,18 +683,20 @@ drwxr-xr-x ...
 }
 ```
 
-每个命令有：
+每个命令至少包含：
 - `name`：命令名称（用 `/name` 调用）
 - `description`：人类可读描述（扩展命令可选）
 - `source`：命令类型：
   - `"extension"`：通过 `pi.registerCommand()` 在扩展中注册
   - `"prompt"`：从提示模板 `.md` 文件加载
   - `"skill"`：从技能目录加载（名称以 `skill:` 为前缀）
-- `location`：加载位置（可选，扩展不存在）：
-  - `"user"`：用户级别（`~/.pi/agent/`）
-  - `"project"`：项目级别（`./.pi/agent/`）
-  - `"path"`：通过 CLI 或设置指定的显式路径
-- `path`：命令源的绝对文件路径（可选）
+- `sourceInfo`：来源元数据（最新系统中的正式来源追踪字段）
+
+某些宿主或兼容层还可能展开为更扁平的人类可读字段，例如：
+- `location`
+- `path`
+
+但从当前代码语义上，稳定字段是 `source` 与 `sourceInfo`。这也是 slash command 消歧与资源来源诊断的基础。
 
 **注意**：内置 TUI 命令（`/settings`、`/hotkeys` 等）不包含在内。它们仅在交互模式下处理，通过 `prompt` 发送不会执行。
 
@@ -721,6 +723,8 @@ drwxr-xr-x ...
 | `auto_retry_start` | 自动重试开始（瞬态错误后）|
 | `auto_retry_end` | 自动重试完成（成功或最终失败）|
 | `extension_error` | 扩展抛出错误 |
+
+注意：RPC stdout 是协议通道。宿主程序不应向 stdout 混写非协议日志，否则会破坏 JSONL framing。当前实现会接管 stdout，并通过专用输出函数写回协议对象。
 
 ### agent_start
 
@@ -940,8 +944,11 @@ Agent 完成时发出。包含此运行中生成的所有消息。
 如果对话框方法包含 `timeout` 字段，agent 端会在超时到期时自动使用默认值解析。客户端不需要跟踪超时。
 
 某些 `ExtensionUIContext` 方法在 RPC 模式下不支持或降级，因为它们需要直接 TUI 访问：
+- `select()`、`confirm()`、`input()`、`editor()` 通过子协议支持
+- `notify()`、`setStatus()`、`setWidget()`（仅字符串数组）、`setTitle()`、`setEditorText()` 为即发即忘支持
 - `custom()` 返回 `undefined`
 - `setWorkingMessage()`、`setFooter()`、`setHeader()`、`setEditorComponent()`、`setToolsExpanded()` 是空操作
+- `setWidget()` 的组件工厂形式不支持
 - `getEditorText()` 返回 `""`
 - `getToolsExpanded()` 返回 `false`
 - `pasteToEditor()` 委托给 `setEditorText()`（无粘贴/折叠处理）

@@ -1,470 +1,423 @@
 # 第9章：扩展 API 详解
 
-> 工具、命令、事件、UI
+> 工具、命令、事件、UI，以及 provider / 资源发现 / 模式差异。
 
 ---
 
 ## 9.1 ExtensionAPI 概览
 
-### 核心接口
+扩展导出一个默认函数，接收 `ExtensionAPI`：
 
 ```typescript
-interface ExtensionAPI {
-  // 工具注册
-  registerTool<T>(tool: ToolDefinition<T>): void;
-  
-  // 命令注册
-  registerCommand(name: string, options: CommandOptions): void;
-  
-  // 快捷键注册
-  registerShortcut(key: KeyId, options: ShortcutOptions): void;
-  
-  // 事件监听
-  on(event: EventType, handler: EventHandler): void;
-  
-  // Provider 注册
-  registerProvider(name: string, config: ProviderConfig): void;
-  unregisterProvider(name: string): void;
-  
-  // 消息发送
-  sendMessage(message: CustomMessage): void;
-  sendUserMessage(content: string): void;
-  appendEntry(type: string, data: unknown): void;
-  
-  // UI 相关
-  ui: ExtensionUIContext;
-  
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+
+export default function (pi: ExtensionAPI) {
+  // 工具
+  pi.registerTool({ ... });
+
+  // 命令
+  pi.registerCommand("hello", { ... });
+
+  // 快捷键
+  pi.registerShortcut("ctrl+x", { ... });
+
+  // CLI flag
+  pi.registerFlag("my-flag", { ... });
+
+  // 事件
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash") {
+      return { block: true, reason: "disabled" };
+    }
+  });
+
+  // Provider
+  pi.registerProvider("my-proxy", { ... });
+
+  // 消息与会话
+  pi.sendMessage({ customType: "note", content: "hello" });
+  pi.sendUserMessage("continue with the refactor", { deliverAs: "steer" });
+  pi.appendEntry("state", { enabled: true });
+
+  // UI
+  pi.ui.notify("Loaded", "info");
+
   // 事件总线
-  events: EventBus;
+  pi.events.emit("my-event", { ok: true });
 }
 ```
+
+`ExtensionAPI` 的核心能力可以分为：
+
+- **注册**：工具、命令、快捷键、flag、消息渲染器、provider
+- **监听**：会话、agent、turn、message、tool、input 等事件
+- **动作**：发送消息、执行命令、切换模型、切换活跃工具、压缩上下文等
+- **UI**：对话框、通知、状态栏、页脚、覆盖层、自定义编辑器
+- **通信**：扩展间事件总线 `pi.events`
 
 ---
 
-## 9.2 工具注册 (registerTool)
+## 9.2 工具注册（registerTool）
 
-### 完整定义
-
-```typescript
-interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = unknown> {
-  name: string;
-  label: string;
-  description: string;
-  parameters: TParams;
-  execute: (
-    toolCallId: string,
-    params: Static<TParams>,
-    signal: AbortSignal | undefined,
-    onUpdate?: (partial: ToolResult<TDetails>) => void,
-    ctx: ExtensionContext,
-  ) => Promise<ToolResult<TDetails>>;
-}
-```
-
-### 参数详解
-
-#### name
-
-- 必需
-- 唯一标识符
-- 小写字母、数字、连字符
-- 例如：`count-lines`, `deploy-app`
-
-#### description
-
-- 必需
-- 告诉 Agent 这个工具做什么
-- 何时使用这个工具
-- 应该具体、明确
-
-❌ 不好的描述：
-```typescript
-description: 'A tool for files'
-```
-
-✅ 好的描述：
-```typescript
-description: 'Count the number of lines in a text file. Use when you need to analyze file size or compare code volume between files.'
-```
-
-#### parameters
-
-使用 TypeBox 定义参数模式：
+### 工具定义
 
 ```typescript
-import { Type } from '@sinclair/typebox';
+import { Type } from "@sinclair/typebox";
 
-parameters: Type.Object({
-  // 必需参数
-  path: Type.String({ 
-    description: 'Path to the file' 
+pi.registerTool({
+  name: "count-lines",
+  label: "Count Lines",
+  description: "Count the number of lines in a text file",
+  parameters: Type.Object({
+    path: Type.String({ description: "Path to the file" }),
   }),
-  
-  // 可选参数
-  recursive: Type.Optional(
-    Type.Boolean({ 
-      default: false,
-      description: 'Count lines in subdirectories' 
-    })
-  ),
-  
-  // 枚举参数
-  format: Type.String({
-    enum: ['simple', 'detailed'],
-    default: 'simple',
-    description: 'Output format'
-  }),
-})
-```
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    onUpdate?.({
+      content: [{ type: "text", text: "Reading file..." }],
+    });
 
-### execute 函数
-
-#### context 对象
-
-`ctx` 参数是 `ExtensionContext`，包含当前工作目录、会话、模型、I/O 与 UI 能力。
-常用字段示例：
-
-```typescript
-const cwd = ctx.cwd;
-const model = ctx.model;
-await ctx.ui.notify('开始扫描');
-const result = await ctx.exec('rg', ['TODO', cwd]);
-```
-```
-
-#### onUpdate 回调
-
-用于流式更新进度：
-
-```typescript
-async execute(toolCallId, args, signal, onUpdate, ctx) {
-  // 开始
-  onUpdate?.({
-    content: [{ type: 'text', text: '[analyze-project] Step 1/3: starting' }],
-  });
-
-  // 步骤1
-  const step1 = await doStep1();
-  onUpdate?.({
-    content: [{ type: 'text', text: `[analyze-project] Step 1 complete: ${step1.count} items` }],
-  });
-
-  // 步骤2
-  const step2 = await doStep2();
-  onUpdate?.({
-    content: [{ type: 'text', text: '[analyze-project] Step 2 complete' }],
-  });
-
-  // 完成
-  return {
-    content: [{ type: 'text', text: 'Done!' }],
-    details: { step1, step2 },
-  };
-}
-```
-
-#### 返回值
-
-```typescript
-interface ToolResult<TDetails = unknown> {
-  // 显示给用户的文本/图片
-  content: (TextContent | ImageContent)[];
-
-  // 结构化数据（可选）
-  details: TDetails;
-}
-```
-
----
-
-## 9.3 命令注册 (registerCommand)
-
-### 基本用法
-
-```typescript
-pi.registerCommand('deploy', {
-  description: 'Deploy the application',
-  execute: async (ctx) => {
-    // 命令逻辑
+    return {
+      content: [{ type: "text", text: "42 lines" }],
+      details: { lineCount: 42 },
+    };
   },
 });
 ```
 
-### 完整选项
+### 参数说明
+
+- `name`：工具唯一名。若与内置工具同名，可覆盖内置工具
+- `label`：TUI 中显示的短名称
+- `description`：告诉模型“什么时候该用这个工具”
+- `parameters`：TypeBox schema
+- `execute()`：执行函数
+
+### execute 函数签名
 
 ```typescript
-interface CommandOptions {
-  description: string;
-  execute: (ctx: ExtensionCommandContext) => Promise<void>;
-}
+execute(
+  toolCallId,
+  params,
+  signal,
+  onUpdate,
+  ctx,
+) => Promise<ToolResult>
+```
 
-interface ExtensionCommandContext extends ExtensionContext {
-  // 等待 Agent 空闲
-  waitForIdle(): Promise<void>;
-  
-  // 新会话
-  newSession(options?: NewSessionOptions): Promise<void>;
-  
-  // 分叉
-  fork(entryId: string): Promise<void>;
-  
-  // 切换会话
-  switchSession(path: string): Promise<void>;
-  
-  // 发送消息
-  sendUserMessage(content: string): void;
-  sendMessage(message: CustomMessage): void;
+### `ctx` 常见能力
+
+`ctx` 是 `ExtensionContext`，常用字段 / 方法包括：
+
+```typescript
+const cwd = ctx.cwd;
+const model = ctx.model;
+const thinking = ctx.getThinkingLevel();
+await ctx.exec("rg", ["TODO", cwd]);
+ctx.ui.notify("Done", "info");
+```
+
+### `onUpdate` 用于流式更新
+
+```typescript
+async execute(toolCallId, args, signal, onUpdate, ctx) {
+  onUpdate?.({
+    content: [{ type: "text", text: "Step 1/3: starting" }],
+  });
+
+  const result = await doWork();
+
+  onUpdate?.({
+    content: [{ type: "text", text: "Step 2/3: complete" }],
+  });
+
+  return {
+    content: [{ type: "text", text: "Done!" }],
+    details: result,
+  };
 }
 ```
 
-### 带 UI 交互的命令
+### 返回值
 
 ```typescript
-pi.registerCommand('setup', {
-  description: 'Interactive setup wizard',
-  execute: async (ctx) => {
-    // 选择
-    const env = await ctx.ui.select(
-      'Select environment',
-      ['dev', 'staging', 'production']
-    );
-    
-    if (!env) return; // 用户取消
-    
-    // 确认
-    const confirmed = await ctx.ui.confirm(
-      'Confirm deployment?',
-      `Deploy to ${env}`
-    );
-    
+interface ToolResult<TDetails = unknown> {
+  content: (TextContent | ImageContent)[];
+  details?: TDetails;
+}
+```
+
+- `content`：显示给用户，并可作为工具结果进入上下文
+- `details`：结构化信息，供 UI、调试、渲染器使用
+
+---
+
+## 9.3 命令注册（registerCommand）
+
+这里是中文文档以前最容易漂移的地方：
+
+> **当前命令注册字段名是 `handler`，不是 `execute`。**
+
+### 真实结构
+
+```typescript
+interface RegisteredCommand {
+  name: string;
+  description?: string;
+  getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null;
+  handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+}
+```
+
+### 基本示例
+
+```typescript
+pi.registerCommand("deps", {
+  description: "Show project dependencies",
+  handler: async (args, ctx) => {
+    ctx.sendUserMessage(`Analyze dependencies ${args}`.trim());
+  },
+});
+```
+
+### 带 UI 的命令
+
+```typescript
+pi.registerCommand("setup", {
+  description: "Interactive setup wizard",
+  handler: async (args, ctx) => {
+    const env = await ctx.ui.select("Select environment", ["dev", "staging", "production"]);
+    if (!env) return;
+
+    const confirmed = await ctx.ui.confirm("Confirm deployment?", `Deploy to ${env}`);
     if (!confirmed) return;
-    
-    // 输入
-    const version = await ctx.ui.input(
-      'Version tag',
-      'v1.0.0'
-    );
-    
-    // 执行
+
+    const version = await ctx.ui.input("Version tag", "v1.0.0");
     ctx.sendUserMessage(`Deploy ${version} to ${env}`);
   },
 });
 ```
 
+### `ExtensionCommandContext` 能做什么
+
+除了普通 `ExtensionContext` 的能力，还包含：
+
+- `waitForIdle()`
+- `newSession()`
+- `fork()`
+- `switchSession()`
+- `sendUserMessage()`
+- `sendMessage()`
+
 ---
 
-## 9.4 事件监听 (on)
+## 9.4 快捷键与 CLI flag
 
-### 事件类型
-
-#### 生命周期事件
+### 快捷键
 
 ```typescript
-// Agent 开始
-pi.on('agent_start', async (event) => {
-  console.log('Agent started');
+pi.registerShortcut("ctrl+x", {
+  description: "Run custom action",
+  handler: async (ctx) => {
+    ctx.ui.notify("Triggered", "info");
+  },
+});
+```
+
+### CLI flag
+
+```typescript
+pi.registerFlag("my-flag", {
+  description: "Enable my extension mode",
+  type: "boolean",
+  default: false,
 });
 
-// Agent 结束
-pi.on('agent_end', async (event) => {
-  console.log('Agent ended');
+const value = pi.getFlag("my-flag");
+```
+
+flag 类型：
+- `boolean`
+- `string`
+
+---
+
+## 9.5 事件监听（on）
+
+### 当前可监听事件
+
+```typescript
+pi.on("resources_discover", ...)
+pi.on("session_directory", ...)
+pi.on("session_start", ...)
+pi.on("session_before_switch", ...)
+pi.on("session_switch", ...)
+pi.on("session_before_fork", ...)
+pi.on("session_fork", ...)
+pi.on("session_before_compact", ...)
+pi.on("session_compact", ...)
+pi.on("session_shutdown", ...)
+pi.on("session_before_tree", ...)
+pi.on("session_tree", ...)
+pi.on("context", ...)
+pi.on("before_provider_request", ...)
+pi.on("before_agent_start", ...)
+pi.on("agent_start", ...)
+pi.on("agent_end", ...)
+pi.on("turn_start", ...)
+pi.on("turn_end", ...)
+pi.on("message_start", ...)
+pi.on("message_update", ...)
+pi.on("message_end", ...)
+pi.on("tool_execution_start", ...)
+pi.on("tool_execution_update", ...)
+pi.on("tool_execution_end", ...)
+pi.on("model_select", ...)
+pi.on("tool_call", ...)
+pi.on("tool_result", ...)
+pi.on("user_bash", ...)
+pi.on("input", ...)
+```
+
+### 常见示例
+
+#### Agent 事件
+
+```typescript
+pi.on("agent_start", async (_event) => {
+  console.log("Agent started");
 });
 
-// 轮次开始
-pi.on('turn_start', async (event) => {
-  console.log('New turn');
-});
-
-// 轮次结束
-pi.on('turn_end', async (event) => {
-  console.log('Turn ended');
+pi.on("turn_end", async (_event) => {
+  console.log("Turn ended");
 });
 ```
 
 #### 消息事件
 
 ```typescript
-// 消息开始
-pi.on('message_start', async (event) => {
-  console.log('Message:', event.message.role);
+pi.on("message_start", async (event) => {
+  console.log("Message role:", event.message.role);
 });
 
-// 消息更新（流式）
-pi.on('message_update', async (event) => {
-  console.log('Update:', event.assistantMessageEvent.type);
-});
-
-// 消息结束
-pi.on('message_end', async (event) => {
-  console.log('Message complete');
+pi.on("message_update", async (event) => {
+  console.log("Streaming event:", event.assistantMessageEvent.type);
 });
 ```
 
 #### 工具事件
 
 ```typescript
-// 工具调用前（可拦截）
-pi.on('tool_call', async (event) => {
-  console.log('Tool:', event.toolName);
-
-  // 阻止执行
-  if (event.toolName === 'dangerous') {
+pi.on("tool_call", async (event) => {
+  if (event.toolName === "dangerous") {
     return {
       block: true,
-      reason: 'Too dangerous',
+      reason: "Too dangerous",
     };
-  }
-
-  // 仅记录
-  if (event.toolName === 'write' && event.input.path === '.env') {
-    // 不能返回 warn，改为记录或直接拒绝
-    console.warn('Modifying environment file');
   }
 });
 
-// 工具结果（可修改）
-pi.on('tool_result', async (event) => {
-  // 增强结果
-  if (event.toolName === 'read') {
+pi.on("tool_result", async (event) => {
+  if (event.toolName === "read") {
     return {
       content: [
         ...event.content,
-        { type: 'text', text: '[Extension] File loaded' },
+        { type: "text", text: "[Extension] File loaded" },
       ],
     };
   }
 });
 ```
 
-#### 会话事件
+#### 会话 / Provider 事件
 
 ```typescript
-// 会话切换前
-pi.on('session_before_switch', async (event) => {
-  // 可以通过返回 { cancel: true } 阻止切换
+pi.on("session_before_switch", async (_event) => {
   return { cancel: false };
 });
 
-// 压缩前
-pi.on('session_before_compact', async (event) => {
-  // 返回 { cancel: true } 即可阻止本次压缩
+pi.on("session_before_compact", async (event) => {
   if (event.branchEntries.length === 0) {
     return { cancel: true };
   }
-  return;
 });
 
-// Provider 请求前
-pi.on('before_provider_request', async (event) => {
-  // 修改请求：返回最终 payload 即可生效
+pi.on("before_provider_request", async (event) => {
   event.payload.headers = {
     ...event.payload.headers,
-    'X-Custom': 'value',
+    "X-Custom": "value",
   };
   return event.payload;
 });
 ```
 
-### 事件处理器返回值
+### 事件返回值的语义
 
 | 返回值 | 效果 |
 |-------|------|
-| `undefined` | 继续正常流程 |
-| `{}`/`undefined` | 继续正常流程 |
-| `{ cancel: true }` | 中断该事件流程 |
-| `payload` | 替换/修改事件载荷（如 before_provider_request） |
-| `SessionBeforeCompactResult` 中的字段（如 `compaction`）| 覆盖默认返回并继续 |
+| `undefined` | 保持默认行为 |
+| `{ block: true, reason }` | 阻止工具调用 |
+| `{ cancel: true }` | 取消会话切换 / fork / compact / tree 等流程 |
+| 修改后的 payload | 替换 provider 请求载荷 |
+| `SessionBeforeCompactResult` 等结构化返回 | 覆盖部分默认行为 |
 
 ---
 
-## 9.5 UI 上下文
+## 9.6 UI 上下文
 
 ### 对话框
 
 ```typescript
-// 选择
-const choice = await pi.ui.select(
-  'Title',
-  ['option1', 'option2', 'option3']
-);
-
-// 确认
-const confirmed = await pi.ui.confirm(
-  'Title',
-  'Message'
-);
-
-// 输入
-const text = await pi.ui.input(
-  'Title',
-  'placeholder'
-);
-
-// 编辑器
-const code = await pi.ui.editor(
-  'Edit code',
-  'initial content'
-);
+const choice = await pi.ui.select("Title", ["option1", "option2"]);
+const confirmed = await pi.ui.confirm("Title", "Message");
+const text = await pi.ui.input("Title", "placeholder");
+const code = await pi.ui.editor("Edit code", "initial content");
 ```
 
 ### 通知
 
 ```typescript
-pi.ui.notify('Operation complete', 'info');
-pi.ui.notify('Something went wrong', 'error');
-pi.ui.notify('Please check', 'warning');
+pi.ui.notify("Operation complete", "info");
+pi.ui.notify("Something went wrong", "error");
+pi.ui.notify("Please check", "warning");
 ```
 
-### 状态显示
+### 状态显示与 Widget
 
 ```typescript
-// 设置状态
-pi.ui.setStatus('my-extension', 'Processing...');
+pi.ui.setStatus("my-extension", "Processing...");
+pi.ui.setStatus("my-extension", undefined);
 
-// 清除状态
-pi.ui.setStatus('my-extension', undefined);
-
-// 工作消息
-pi.ui.setWorkingMessage('Analyzing codebase...');
-pi.ui.setWorkingMessage(); // 恢复默认
+pi.ui.setWidget("my-widget", ["Line 1", "Line 2"], { placement: "aboveEditor" });
+pi.ui.setWidget("my-widget", undefined);
 ```
 
-### 自定义组件
+### 页脚 / 标题 / 编辑器替换
 
 ```typescript
-// 设置 widget
-pi.ui.setWidget('my-widget', [
-  'Line 1',
-  'Line 2',
-  'Line 3',
-], { placement: 'aboveEditor' });
-
-// 清除 widget
-pi.ui.setWidget('my-widget', undefined);
-
-// 自定义 footer
-pi.ui.setFooter((tui, theme, data) => {
-  return new CustomFooter(tui, theme, data);
-});
+pi.ui.setFooter((tui, theme, data) => new CustomFooter(tui, theme, data));
+pi.ui.setHeader((tui, theme, data) => new CustomHeader(tui, theme, data));
+pi.ui.setEditorComponent((tui, theme, data) => new CustomEditor(tui, theme, data));
 ```
+
+复杂交互和覆盖层通常通过 `pi.ui.custom()` 构建。
 
 ---
 
-## 9.6 Provider 注册
+## 9.7 Provider 注册
 
 ### 基本用法
 
 ```typescript
-pi.registerProvider('my-proxy', {
-  baseUrl: 'https://proxy.example.com',
-  api: 'openai-completions',
-  apiKey: 'PROXY_API_KEY',
+pi.registerProvider("my-proxy", {
+  baseUrl: "https://proxy.example.com",
+  apiKey: "PROXY_API_KEY",
+  api: "openai-completions",
   models: [
     {
-      id: 'custom-model',
-      name: 'Custom Model',
+      id: "custom-model",
+      name: "Custom Model",
       reasoning: true,
-      input: ['text', 'image'],
+      input: ["text", "image"],
       contextWindow: 128000,
       maxTokens: 4096,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -473,103 +426,227 @@ pi.registerProvider('my-proxy', {
 });
 ```
 
-### 配置选项
+### ProviderConfig 要点
 
 ```typescript
 interface ProviderConfig {
-  // 基础 URL
   baseUrl?: string;
-  
-  // API 类型
-  api?: Api;
-  
-  // API Key（环境变量名或值）
   apiKey?: string;
-  
-  // 自定义 headers
-  headers?: Record<string, string>;
-  
-  // 是否添加 Authorization header
-  authHeader?: boolean;
-  
-  // 模型列表
-  models?: ProviderModelConfig[];
-  
-  // 自定义 stream handler（高级）
+  api?: Api;
   streamSimple?: StreamFunction;
+  headers?: Record<string, string>;
+  authHeader?: boolean;
+  models?: ProviderModelConfig[];
+  oauth?: {
+    name: string;
+    login(callbacks): Promise<OAuthCredentials>;
+    refreshToken(credentials): Promise<OAuthCredentials>;
+    getApiKey(credentials): string;
+    modifyModels?(models, credentials): Model[];
+  };
 }
+```
+
+### unregisterProvider
+
+```typescript
+pi.unregisterProvider("my-proxy");
+```
+
+可移除通过扩展注册的 provider，并恢复之前被覆盖的内置模型。
+
+---
+
+## 9.8 消息、会话与状态
+
+### sendMessage
+
+发送自定义消息到会话：
+
+```typescript
+pi.sendMessage(
+  {
+    customType: "build-status",
+    content: "Build started",
+    display: "Build started",
+  },
+  { deliverAs: "nextTurn" },
+);
+```
+
+可用投递方式：
+- `steer`
+- `followUp`
+- `nextTurn`
+
+### sendUserMessage
+
+```typescript
+pi.sendUserMessage("Continue with the migration", { deliverAs: "steer" });
+```
+
+### appendEntry
+
+```typescript
+pi.appendEntry("my-state", { enabled: true, lastRun: Date.now() });
+```
+
+这类条目会写入 session，用于扩展状态持久化，但不会直接发送给 LLM。
+
+### 会话元数据
+
+```typescript
+pi.setSessionName("feature-refactor");
+const name = pi.getSessionName();
+pi.setLabel(entryId, "milestone");
 ```
 
 ---
 
-## 9.7 事件总线
+## 9.9 资源来源与命令消歧
+
+这是最新代码里相对新的能力之一。
+
+pi 现在会为以下资源记录来源信息（source provenance）：
+
+- slash commands
+- prompt templates
+- skills
+- themes
+- tools
+
+这使系统能够：
+
+- 在出现重名命令时做消歧
+- 在诊断中告诉你某个命令 / 工具 / 资源来自哪里
+- 在 `getCommands()`、工具列表、资源 diagnostics 中暴露来源信息
+
+相关类型：
+
+```typescript
+interface SlashCommandInfo {
+  name: string;
+  description?: string;
+  source: "extension" | "prompt" | "skill";
+  sourceInfo: SourceInfo;
+}
+```
+
+实践建议：
+
+- 命令名尽量避免过于通用的单词
+- 有多个扩展协同时，主动做命名空间区分
+- 调试“为什么执行了错误命令”时，优先检查命令来源信息
+
+---
+
+## 9.10 事件总线
 
 ### 跨扩展通信
 
 ```typescript
-// 扩展 A：发送事件
-pi.events.emit('my-event', { data: 'value' });
+// 扩展 A
+pi.events.emit("my-event", { data: "value" });
 
-// 扩展 B：监听事件
-pi.events.on('my-event', (data) => {
-  console.log('Received:', data);
+// 扩展 B
+pi.events.on("my-event", (data) => {
+  console.log("Received:", data);
 });
 ```
 
-### 使用场景
-
-- 扩展间数据共享
-- 状态同步
-- 协作功能
+典型用途：
+- 扩展间共享状态
+- UI 协作
+- 事件广播
+- 多个扩展之间松耦合联动
 
 ---
 
-## 9.8 完整示例
+## 9.11 模式差异
+
+### Interactive 模式
+
+支持完整 TUI 能力：
+- 对话框
+- overlay
+- widget
+- footer / header
+- editor replacement
+- custom UI
+
+### RPC 模式
+
+支持一部分 UI：
+
+**支持：**
+- `select`
+- `confirm`
+- `input`
+- `editor`
+- `notify`
+- `setStatus`
+- `setTitle`
+- `setEditorText`
+- `setWidget`（仅字符串数组）
+
+**不支持或受限：**
+- `setWorkingMessage`
+- `setFooter`
+- `setHeader`
+- `setEditorComponent`
+- `ui.custom()`
+- `setWidget()` 的组件工厂形式
+- `getEditorText()` 无法同步返回宿主编辑器实际内容
+
+### Print / JSON 模式
+
+不要假设存在可交互 TUI。需要用户对话框、自定义编辑器、overlay 的扩展都应提供降级路径。
+
+---
+
+## 9.12 完整示例
 
 ```typescript
-import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
-import { Type } from '@sinclair/typebox';
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 
 export default function comprehensiveExtension(pi: ExtensionAPI) {
-  // 1. 注册工具
   pi.registerTool({
-    name: 'analyze-deps',
-    description: 'Analyze project dependencies',
+    name: "analyze-deps",
+    label: "Analyze Deps",
+    description: "Analyze project dependencies",
     parameters: Type.Object({
       depth: Type.Number({ default: 1 }),
     }),
     async execute(toolCallId, args, signal, onUpdate, ctx) {
       onUpdate?.({
-        content: [{ type: 'text', text: 'Reading package.json...' }],
+        content: [{ type: "text", text: "Reading package.json..." }],
       });
 
-      const pkg = await ctx.exec('cat', ['package.json']);
+      const pkg = await ctx.exec("cat", ["package.json"]);
       const deps = JSON.parse(pkg.stdout).dependencies || {};
 
       return {
-        content: [{ type: 'text', text: `Found ${Object.keys(deps).length} dependencies` }],
+        content: [{ type: "text", text: `Found ${Object.keys(deps).length} dependencies` }],
         details: { deps },
       };
     },
   });
-  
-  // 2. 注册命令
-  pi.registerCommand('deps', {
-    description: 'Show project dependencies',
-    execute: async (ctx) => {
-      ctx.sendUserMessage('Analyze project dependencies');
+
+  pi.registerCommand("deps", {
+    description: "Show project dependencies",
+    handler: async (args, ctx) => {
+      ctx.sendUserMessage("Analyze project dependencies");
     },
   });
-  
-  // 3. 监听事件
-  pi.on('tool_call', async (event) => {
-    if (event.toolName === 'write' && event.input.path === 'package.json') {
-      // 建议：记录并继续，或者返回 { block: true, reason } 强制阻止
+
+  pi.on("tool_call", async (event) => {
+    if (event.toolName === "write" && event.input.path === "package.json") {
+      return { block: true, reason: "package.json is protected" };
     }
   });
-  
-  // 4. 使用 UI
-  pi.ui.notify('Extension loaded', 'info');
+
+  pi.ui.notify("Extension loaded", "info");
 }
 ```
 
@@ -577,9 +654,11 @@ export default function comprehensiveExtension(pi: ExtensionAPI) {
 
 ## 本章小结
 
-- **registerTool**：定义 Agent 可调用的工具
-- **registerCommand**：创建斜杠命令
-- **pi.on**：监听和拦截事件
-- **pi.ui**：与用户交互
-- **registerProvider**：添加自定义模型
-- **pi.events**：跨扩展通信
+- `registerTool`：定义模型可调用工具
+- `registerCommand`：创建斜杠命令（字段名是 `handler`）
+- `pi.on`：监听和拦截完整生命周期事件
+- `pi.ui`：与用户交互、定制界面
+- `registerProvider`：注册或覆盖 provider
+- `sendMessage` / `sendUserMessage` / `appendEntry`：控制会话内容与扩展状态
+- `pi.events`：扩展间通信
+- 资源来源信息和命令消歧已成为正式能力，需要在大型扩展系统中考虑

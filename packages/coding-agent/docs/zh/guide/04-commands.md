@@ -33,7 +33,7 @@
 | `/settings` | 打开设置 | `/settings` |
 | `/login` | 登录 provider | `/login` |
 | `/logout` | 登出 | `/logout` |
-| `/reload` | 重新加载扩展 | `/reload` |
+| `/reload` | 重新加载键绑定、扩展、skills、prompt templates 和主题 | `/reload` |
 | `/hotkeys` | 显示快捷键 | `/hotkeys` |
 
 ### 上下文管理
@@ -63,7 +63,7 @@
 |-------|------|
 | `Ctrl+C` | 清除输入 / 取消当前操作 |
 | `Ctrl+C` (两次) | 退出 pi |
-| `Escape` | 取消 / 返回 |
+| `Escape` | 取消 / 中止；如果当前有排队消息，会恢复到编辑器 |
 | `Escape` (两次) | 打开 `/tree` |
 
 ### 模型相关
@@ -86,9 +86,11 @@
 
 | 快捷键 | 功能 |
 |-------|------|
-| `Enter` | 发送消息 |
+| `Enter` | 发送消息；当 agent 正在工作时，排队一条 steering 消息 |
+| `Alt+Enter` | 排队一条 follow-up 消息（在 agent 完成后再交付） |
 | `Shift+Enter` | 换行 |
 | `Tab` | 补全路径 |
+| `Alt+Up` | 将队列中的消息取回编辑器 |
 | `Ctrl+V` | 粘贴图片 |
 | `Ctrl+A` | 全选 |
 | `Ctrl+G` | 打开外部编辑器 |
@@ -169,42 +171,27 @@
 
 ### 启动选项
 
-```bash
-pi [options] [@files...] [messages...]
+CLI 选项较多，而且会随版本持续演进。这里仅保留中文文档中最常用、最稳定的一组：
 
-Options:
-  -c, --continue                  继续最近的会话
-  -r, --resume                    选择历史会话
-  --provider <name>                Provider 名称（默认 google）
-  --model <pattern>                模型名或模式（支持 provider/id）
-  --api-key <key>                  Provider API Key（或使用环境变量）
-  --system-prompt <text>           系统提示词
-  --append-system-prompt <text>    追加系统提示词（用于测试）
-  --mode <mode>                    输出模式: text（默认）, json, rpc
-  --print, -p                      非交互模式，执行后退出
-  --no-session                     不保存会话（临时模式）
-  --session <path>                 指定会话文件
-  --fork <path>                    从会话分叉
-  --session-dir <dir>              会话目录
-  --models <patterns>              Ctrl+P 循环模型白名单（逗号分隔）
-  --no-tools                       禁用内置工具
-  --tools <tools>                  指定启用工具（read,bash,edit,write,grep,find,ls）
-  --thinking <level>               思考级别: off/minimal/low/medium/high/xhigh
-  --extension, -e <path>           加载额外扩展（可重复）
-  --no-extensions, -ne            禁用扩展自动发现（-e 仍可用）
-  --skill <path>                   加载 skill 文件或目录
-  --prompt-template <path>         加载 prompt template（可重复）
-  --no-skills, -ns                 禁用 skills
-  --no-prompt-templates, -np       禁用 prompt template
-  --theme <path>                   加载主题（可重复）
-  --no-themes                      禁用主题自动发现
-  --export <file>                  导出会话到 HTML 后退出
-  --list-models [search]           列出可用模型
-  --verbose                        打开详细日志
-  --offline                        禁止启动时网络请求（设置 PI_OFFLINE=1）
-  --help, -h                       显示帮助
-  --version, -v                    显示版本号
+```bash
+pi -c                         # 继续最近会话
+pi -r                         # 选择历史会话
+pi --no-session               # 临时模式，不保存会话
+pi --session <path>           # 指定会话文件
+pi --fork <path|id>           # 从已有会话分叉
+pi --provider <name>          # 指定 provider
+pi --model <pattern>          # 指定模型
+pi --thinking <level>         # 设置 thinking level
+pi --mode rpc                 # RPC 模式
+pi --print                    # 非交互模式
+pi -e ./my-extension.ts       # 临时加载扩展
 ```
+
+更完整、更新更及时的参数说明，请以以下来源为准：
+
+- `packages/coding-agent/README.md`
+- `packages/coding-agent/src/cli/args.ts`
+- `pi --help`
 
 ### 示例
 
@@ -235,10 +222,23 @@ Ctrl+P          # 快速循环
 
 ### 消息队列
 
+当 agent 正在工作时，输入不会丢失，而是进入消息队列：
+
 ```
-Enter           # 发送 steering 消息（当前轮次后插入）
-Alt+Enter       # 发送 follow-up 消息（所有完成后插入）
+Enter           # 排队 steering 消息：当前 assistant turn 完成其工具调用后交付
+Alt+Enter       # 排队 follow-up 消息：等 agent 整体完成后交付
+Escape          # 中止当前运行，并把排队消息恢复到编辑器
+Alt+Up          # 将排队消息取回编辑器
 ```
+
+在 `/settings` 里可以配置：
+
+- `steeringMode`: `one-at-a-time`（默认）或 `all`
+- `followUpMode`: `one-at-a-time`（默认）或 `all`
+
+含义：
+- `one-at-a-time`：每次只交付一条排队消息
+- `all`：一次性交付所有排队消息
 
 ### 文件引用
 
