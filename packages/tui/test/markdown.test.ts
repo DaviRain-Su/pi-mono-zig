@@ -970,6 +970,67 @@ bar`,
 		});
 	});
 
+	describe("Heading with inline code", () => {
+		it("should preserve heading styling after inline code", () => {
+			const markdown = new Markdown("### Why `sourceInfo` should not be optional", 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(80);
+			const joinedOutput = lines.join("\n");
+
+			// The heading theme is bold+cyan. After the yellow inline code, the heading
+			// styling (bold+cyan) must be restored so subsequent text is styled correctly.
+			// bold = \x1b[1m, cyan = \x1b[36m, yellow = \x1b[33m
+			assert.ok(joinedOutput.includes("\x1b[33m"), "Should have yellow for inline code");
+
+			// Find the position of "should not be optional" in the raw output.
+			// It must be preceded by heading style codes (bold+cyan), not appear unstyled.
+			const afterCodeIndex = joinedOutput.indexOf("should not be optional");
+			assert.ok(afterCodeIndex > 0, "Should contain text after inline code");
+
+			// Look at the ANSI codes between the code span end and "should not be optional".
+			// There should be bold (\x1b[1m) and cyan (\x1b[36m) re-applied.
+			const precedingChunk = joinedOutput.slice(Math.max(0, afterCodeIndex - 40), afterCodeIndex);
+			assert.ok(
+				precedingChunk.includes("\x1b[1m"),
+				`Should re-apply bold before text after code: ${precedingChunk}`,
+			);
+			assert.ok(
+				precedingChunk.includes("\x1b[36m"),
+				`Should re-apply cyan before text after code: ${precedingChunk}`,
+			);
+		});
+
+		it("should preserve heading styling after inline code for h1", () => {
+			const markdown = new Markdown("# Title with `code` inside", 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(80);
+			const joinedOutput = lines.join("\n");
+
+			const afterCodeIndex = joinedOutput.indexOf("inside");
+			assert.ok(afterCodeIndex > 0, "Should contain text after inline code");
+
+			const precedingChunk = joinedOutput.slice(Math.max(0, afterCodeIndex - 40), afterCodeIndex);
+			// H1 uses heading + bold + underline
+			assert.ok(precedingChunk.includes("\x1b[1m"), `Should re-apply bold for h1: ${precedingChunk}`);
+			assert.ok(precedingChunk.includes("\x1b[36m"), `Should re-apply cyan for h1: ${precedingChunk}`);
+			assert.ok(precedingChunk.includes("\x1b[4m"), `Should re-apply underline for h1: ${precedingChunk}`);
+		});
+
+		it("should preserve heading styling after bold text", () => {
+			const markdown = new Markdown("## Heading with **bold** and more", 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(80);
+			const joinedOutput = lines.join("\n");
+
+			const afterBoldIndex = joinedOutput.indexOf("and more");
+			assert.ok(afterBoldIndex > 0, "Should contain text after bold");
+
+			const precedingChunk = joinedOutput.slice(Math.max(0, afterBoldIndex - 40), afterBoldIndex);
+			assert.ok(precedingChunk.includes("\x1b[1m"), `Should re-apply bold for h2: ${precedingChunk}`);
+			assert.ok(precedingChunk.includes("\x1b[36m"), `Should re-apply cyan for h2: ${precedingChunk}`);
+		});
+	});
+
 	describe("Links", () => {
 		it("should not duplicate URL for autolinked emails", () => {
 			const markdown = new Markdown("Contact user@example.com for help", 0, 0, defaultMarkdownTheme);

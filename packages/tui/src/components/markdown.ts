@@ -272,15 +272,24 @@ export class Markdown implements Component {
 			case "heading": {
 				const headingLevel = token.depth;
 				const headingPrefix = `${"#".repeat(headingLevel)} `;
-				const headingText = this.renderInlineTokens(token.tokens || [], styleContext);
-				let styledHeading: string;
+
+				// Build a heading-specific style context so inline tokens (codespan, bold, etc.)
+				// restore heading styling after their own ANSI resets instead of falling back to
+				// the default text style.
+				let headingStyleFn: (text: string) => string;
 				if (headingLevel === 1) {
-					styledHeading = this.theme.heading(this.theme.bold(this.theme.underline(headingText)));
-				} else if (headingLevel === 2) {
-					styledHeading = this.theme.heading(this.theme.bold(headingText));
+					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(this.theme.underline(text)));
 				} else {
-					styledHeading = this.theme.heading(this.theme.bold(headingPrefix + headingText));
+					headingStyleFn = (text: string) => this.theme.heading(this.theme.bold(text));
 				}
+
+				const headingStyleContext: InlineStyleContext = {
+					applyText: headingStyleFn,
+					stylePrefix: this.getStylePrefix(headingStyleFn),
+				};
+
+				const headingText = this.renderInlineTokens(token.tokens || [], headingStyleContext);
+				const styledHeading = headingLevel >= 3 ? headingStyleFn(headingPrefix) + headingText : headingText;
 				lines.push(styledHeading);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after headings (unless space token follows)

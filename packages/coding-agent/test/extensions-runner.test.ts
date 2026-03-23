@@ -370,32 +370,33 @@ describe("ExtensionRunner", () => {
 			expect(missing).toBeUndefined();
 		});
 
-		it("filters out commands conflict with reseved", async () => {
-			const cmdCode = (name: string) => `
+		it("filters out duplicate extension commands", async () => {
+			const cmdCode = (description: string) => `
 				export default function(pi) {
-					pi.registerCommand("${name}", {
-						description: "Test command",
+					pi.registerCommand("shared-cmd", {
+						description: "${description}",
 						handler: async () => {},
 					});
 				}
 			`;
-			fs.writeFileSync(path.join(extensionsDir, "cmd-a.ts"), cmdCode("cmd-a"));
-			fs.writeFileSync(path.join(extensionsDir, "cmd-b.ts"), cmdCode("cmd-b"));
+			fs.writeFileSync(path.join(extensionsDir, "cmd-a.ts"), cmdCode("First command"));
+			fs.writeFileSync(path.join(extensionsDir, "cmd-b.ts"), cmdCode("Second command"));
 
 			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
-			const commands = runner.getRegisteredCommands(new Set(["cmd-a"]));
+			const commands = runner.getRegisteredCommands();
 			const diagnostics = runner.getCommandDiagnostics();
 
-			expect(commands.length).toBe(1);
-			expect(commands.map((c) => c.name).sort()).toEqual(["cmd-b"]);
+			expect(commands).toHaveLength(1);
+			expect(commands[0]?.name).toBe("shared-cmd");
+			expect(commands[0]?.description).toBe("First command");
 
-			expect(diagnostics.length).toBe(1);
-			expect(diagnostics[0].path).toEqual(path.join(extensionsDir, "cmd-a.ts"));
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]?.path).toEqual(path.join(extensionsDir, "cmd-b.ts"));
 
-			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("conflicts with built-in command"));
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("conflicts with"));
 			warnSpy.mockRestore();
 		});
 	});

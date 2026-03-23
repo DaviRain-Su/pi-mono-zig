@@ -108,8 +108,8 @@ export type {
 	SessionSwitchEvent,
 	SessionTreeEvent,
 	SlashCommandInfo,
-	SlashCommandLocation,
 	SlashCommandSource,
+	SourceInfo,
 	TerminalInputHandler,
 	ToolCallEvent,
 	ToolCallEventResult,
@@ -214,6 +214,7 @@ export {
 	type Skill,
 	type SkillFrontmatter,
 } from "./core/skills.js";
+export { createSyntheticSourceInfo } from "./core/source-info.js";
 // Tools
 export {
 	type BashOperations,

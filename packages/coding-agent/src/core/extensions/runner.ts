@@ -467,27 +467,16 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	getRegisteredCommands(reserved?: Set<string>): RegisteredCommand[] {
-		this.commandDiagnostics = [];
-
+	private collectRegisteredCommands(diagnostics?: ResourceDiagnostic[]): RegisteredCommand[] {
 		const commands: RegisteredCommand[] = [];
 		const commandOwners = new Map<string, string>();
 		for (const ext of this.extensions) {
 			for (const command of ext.commands.values()) {
-				if (reserved?.has(command.name)) {
-					const message = `Extension command '${command.name}' from ${ext.path} conflicts with built-in commands. Skipping.`;
-					this.commandDiagnostics.push({ type: "warning", message, path: ext.path });
-					if (!this.hasUI()) {
-						console.warn(message);
-					}
-					continue;
-				}
-
 				const existingOwner = commandOwners.get(command.name);
 				if (existingOwner) {
 					const message = `Extension command '${command.name}' from ${ext.path} conflicts with ${existingOwner}. Skipping.`;
-					this.commandDiagnostics.push({ type: "warning", message, path: ext.path });
-					if (!this.hasUI()) {
+					diagnostics?.push({ type: "warning", message, path: ext.path });
+					if (diagnostics && !this.hasUI()) {
 						console.warn(message);
 					}
 					continue;
@@ -500,28 +489,19 @@ export class ExtensionRunner {
 		return commands;
 	}
 
+	getRegisteredCommands(): RegisteredCommand[] {
+		const diagnostics: ResourceDiagnostic[] = [];
+		const commands = this.collectRegisteredCommands(diagnostics);
+		this.commandDiagnostics = diagnostics;
+		return commands;
+	}
+
 	getCommandDiagnostics(): ResourceDiagnostic[] {
 		return this.commandDiagnostics;
 	}
 
-	getRegisteredCommandsWithPaths(): Array<{ command: RegisteredCommand; extensionPath: string }> {
-		const result: Array<{ command: RegisteredCommand; extensionPath: string }> = [];
-		for (const ext of this.extensions) {
-			for (const command of ext.commands.values()) {
-				result.push({ command, extensionPath: ext.path });
-			}
-		}
-		return result;
-	}
-
 	getCommand(name: string): RegisteredCommand | undefined {
-		for (const ext of this.extensions) {
-			const command = ext.commands.get(name);
-			if (command) {
-				return command;
-			}
-		}
-		return undefined;
+		return this.collectRegisteredCommands().find((command) => command.name === name);
 	}
 
 	/**

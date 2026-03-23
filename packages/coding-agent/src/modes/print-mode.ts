@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@mariozechner/pi-ai";
 import type { AgentSession } from "../core/agent-session.js";
+import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 
 /**
  * Options for print mode.
@@ -32,7 +33,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	if (mode === "json") {
 		const header = session.sessionManager.getHeader();
 		if (header) {
-			console.log(JSON.stringify(header));
+			writeRawStdout(`${JSON.stringify(header)}\n`);
 		}
 	}
 	// Set up extensions for print mode (no UI)
@@ -76,7 +77,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	session.subscribe((event) => {
 		// In JSON mode, output all events
 		if (mode === "json") {
-			console.log(JSON.stringify(event));
+			writeRawStdout(`${JSON.stringify(event)}\n`);
 		}
 	});
 
@@ -107,7 +108,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			// Output text content
 			for (const content of assistantMsg.content) {
 				if (content.type === "text") {
-					console.log(content.text);
+					writeRawStdout(`${content.text}\n`);
 				}
 			}
 		}
@@ -115,10 +116,5 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 
 	// Ensure stdout is fully flushed before returning
 	// This prevents race conditions where the process exits before all output is written
-	await new Promise<void>((resolve, reject) => {
-		process.stdout.write("", (err) => {
-			if (err) reject(err);
-			else resolve();
-		});
-	});
+	await flushRawStdout();
 }
