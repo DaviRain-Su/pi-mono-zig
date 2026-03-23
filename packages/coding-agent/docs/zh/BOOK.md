@@ -113,6 +113,19 @@ docs/zh/
 | [Sui 可观测性](./blockchain/sui/17-sui-indexer-and-observability.md) | Indexer、Dashboard、告警 |
 | [Sui 实现清单](./blockchain/sui/18-sui-implementation-checklist.md) | 完整实现路线图与检查清单 |
 
+### DASN 研究线 (blockchain/dasn/)
+
+| 文档 | 内容 |
+|------|------|
+| [专题导航](./blockchain/dasn/README.md) | DASN 研究线的边界、关系与推荐阅读顺序 |
+| [DASN 愿景](./blockchain/dasn/19-dasn-vision.md) | 去中心化 Agent 服务网络的角色分层与经济模型 |
+| [Agent 协议标准分析](./blockchain/dasn/20-agent-protocols-analysis.md) | ERC-8004、Vouch、Solana Registries 等协议对比 |
+| [DASN 协议整合实现](./blockchain/dasn/21-dasn-protocol-integration.md) | DASN 与现有协议栈的整合实现方向 |
+| [DASN 原型设计](./blockchain/dasn/22-dasn-prototype-design.md) | 多协议 Worker / 网络原型设计 |
+| [DASN 测试策略](./blockchain/dasn/23-dasn-testing-strategy.md) | 原型验证、测试框架与实验设计 |
+| [DASN 标准提案](./blockchain/dasn/24-dasn-standard-proposal.md) | 面向标准化推进的提案抽象 |
+| [DASN SDK 设计](./blockchain/dasn/25-dasn-sdk-design.md) | SDK 层接口、开发者体验与生态接入 |
+
 ---
 
 ## 💻 平台配置 (platform/)

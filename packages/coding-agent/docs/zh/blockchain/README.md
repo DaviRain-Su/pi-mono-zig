@@ -143,14 +143,15 @@
 - [sui/17-sui-indexer-and-observability.md](./sui/17-sui-indexer-and-observability.md)
 - [sui/18-sui-implementation-checklist.md](./sui/18-sui-implementation-checklist.md)
 
-### DASN 深度专题
-- [19-dasn-vision.md](./19-dasn-vision.md) - DASN 架构愿景与经济模型
-- [20-agent-protocols-analysis.md](./20-agent-protocols-analysis.md) - Agent 协议标准全景分析
-- [21-dasn-protocol-integration.md](./21-dasn-protocol-integration.md) - 协议整合实现
-- [22-dasn-prototype-design.md](./22-dasn-prototype-design.md) - 多协议 Worker 原型设计
-- [23-dasn-testing-strategy.md](./23-dasn-testing-strategy.md) - 测试验证策略
-- [24-dasn-standard-proposal.md](./24-dasn-standard-proposal.md) - 标准贡献提案
-- [25-dasn-sdk-design.md](./25-dasn-sdk-design.md) - SDK 构建设计
+### DASN 研究线
+- [dasn/README.md](./dasn/README.md)
+- [dasn/19-dasn-vision.md](./dasn/19-dasn-vision.md)
+- [dasn/20-agent-protocols-analysis.md](./dasn/20-agent-protocols-analysis.md)
+- [dasn/21-dasn-protocol-integration.md](./dasn/21-dasn-protocol-integration.md)
+- [dasn/22-dasn-prototype-design.md](./dasn/22-dasn-prototype-design.md)
+- [dasn/23-dasn-testing-strategy.md](./dasn/23-dasn-testing-strategy.md)
+- [dasn/24-dasn-standard-proposal.md](./dasn/24-dasn-standard-proposal.md)
+- [dasn/25-dasn-sdk-design.md](./dasn/25-dasn-sdk-design.md)
 
 ---
 
