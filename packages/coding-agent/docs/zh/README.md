@@ -40,6 +40,7 @@ docs/zh/
 │   ├── 09-extension-api.md        # 扩展 API 详解
 │   ├── 10-prompt-templates.md     # 提示模板 ✨ 新增
 │   ├── 11-development.md          # 开发指南 ✨ 新增
+│   ├── 12-troubleshooting.md      # 故障排查指南 ✨ 新增
 │   └── 15-design-decisions.md     # 设计决策
 ├── patterns/              # 🎨 设计模式
 │   └── 10-patterns.md             # 实战模式
@@ -65,7 +66,20 @@ docs/zh/
 │   ├── 15-solana-security-and-audit-checklist.md # Solana 安全与审计清单
 │   ├── 16-solana-indexer-and-observability.md # Solana Indexer 与可观测性
 │   ├── 17-solana-product-roadmap.md # Solana 产品推进路线图
-│   └── 18-solana-implementation-checklist.md # Solana 实现清单
+│   ├── 18-solana-implementation-checklist.md # Solana 实现清单
+│   └── sui/                          # 🌊 Sui 专题 ✨ 完整
+│       ├── README.md                 # Sui 专题导航
+│       ├── 00-overview.md            # Sui 总览
+│       ├── 02-task-models.md         # Sui 任务模型
+│       ├── 10-sui-mvp-design.md      # Sui MVP 设计
+│       ├── 11-sui-contract-instructions.md # 合约指令
+│       ├── 12-sui-budget-and-settlement.md # 预算结算
+│       ├── 13-sui-worker-runtime-integration.md # Worker 集成
+│       ├── 14-sui-dispute-and-reputation.md # 争议声誉
+│       ├── 15-sui-market-and-selection.md # 任务市场
+│       ├── 16-sui-security-and-audit.md # 安全审计
+│       ├── 17-sui-indexer-and-observability.md # 可观测性
+│       └── 18-sui-implementation-checklist.md # 实现清单
 ├── platform/              # 💻 平台配置 ✨ 新目录
 │   ├── windows.md                 # Windows 配置
 │   ├── termux.md                  # Android Termux
@@ -77,6 +91,7 @@ docs/zh/
     ├── 12-source-architecture.md         # 源码架构
     ├── 13-model-system.md                # 模型系统
     ├── 14-embedding.md                   # 嵌入与集成
+    ├── extensions.md                     # 扩展开发完整指南 ✨
     ├── rpc.md                            # RPC 模式 ✨
     ├── custom-provider.md                # 自定义 Provider ✨
     ├── models.md                         # 自定义模型配置 ✨
@@ -109,6 +124,8 @@ docs/zh/
 2. [架构故事](./guide/02-architecture-story.md) - 20分钟
 3. [第一个小时](./guide/03-first-hour.md) - 25分钟
 
+遇到问题？查阅 [故障排查指南](./guide/12-troubleshooting.md)
+
 ### 🛠️ 扩展开发（4小时）
 
 1. [你的第一个扩展](./guide/08-first-extension.md) - 40分钟
@@ -133,6 +150,7 @@ docs/zh/
   - [专题导航](./blockchain/README.md)
   - 基础层：路线图、任务模型、支付层、执行流、artifact、guardrails、TEE、receipts
   - Solana 主线：MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
+  - Sui 专题：[总览](./blockchain/sui/00-overview.md)、[任务模型](./blockchain/sui/02-task-models.md)、[MVP 设计](./blockchain/sui/10-sui-mvp-design.md)
 - **演进规划**：
   - [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) - pi-mono Zig 版本演进路线图
 
@@ -175,4 +193,4 @@ pi 遵循 **"Agent构建Agent"** 的哲学：
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2026年3月*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v1.3 Sui 专题完整版)*

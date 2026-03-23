@@ -2,8 +2,8 @@
 
 > 一本关于 pi 的完整技术书籍：从入门到精通，从使用到二次开发。
 
-**版本**：v1.0  
-**总页数**：约 7,500 行  
+**版本**：v1.3  
+**总页数**：约 29,100+ 行  
 **完成度**：100%
 
 ---
@@ -39,9 +39,10 @@ docs/zh/
 | 9 | [扩展 API 详解](./guide/09-extension-api.md) | 585 | 90分钟 | 工具、命令、事件、UI |
 | 10 | [提示模板](./guide/10-prompt-templates.md) | 67 | 10分钟 | 模板创建、参数、使用 ✨ |
 | 11 | [开发指南](./guide/11-development.md) | 69 | 10分钟 | 设置、Fork、测试、结构 ✨ |
+| 12 | [故障排查指南](./guide/12-troubleshooting.md) | 454 | 30分钟 | 常见问题与解决方案 ✨ |
 | 15 | [设计决策](./guide/15-design-decisions.md) | 313 | 30分钟 | 为什么这样设计、权衡、未来 |
 
-**小计**：12 章
+**小计**：13 章
 
 ---
 
@@ -94,6 +95,23 @@ docs/zh/
 | [Solana 产品推进路线图](./blockchain/17-solana-product-roadmap.md) | 从内部验证、稳定 MVP 到有限市场与开放网络的阶段推进 |
 | [Solana 实现清单](./blockchain/18-solana-implementation-checklist.md) | 协议、runtime、运营、支付层的具体实现顺序与阶段清单 |
 
+### Sui 专题 (blockchain/sui/)
+
+| 文档 | 内容 |
+|------|------|
+| [专题导航](./blockchain/sui/README.md) | Sui 专题目录与快速开始 |
+| [Sui 总览](./blockchain/sui/00-overview.md) | Sui 与 Solana 的核心差异、对象模型介绍 |
+| [Sui 任务模型](./blockchain/sui/02-task-models.md) | Task / WorkerCap / Result / Escrow / Dispute 对象设计 |
+| [Sui MVP 设计](./blockchain/sui/10-sui-mvp-design.md) | 最小可行对象模型与 Worker 接入闭环 |
+| [Sui 合约指令](./blockchain/sui/11-sui-contract-instructions.md) | Move 合约完整指令集与状态迁移 |
+| [Sui 预算结算](./blockchain/sui/12-sui-budget-and-settlement.md) | 执行预算、Worker 奖励、退款设计 |
+| [Sui Worker 集成](./blockchain/sui/13-sui-worker-runtime-integration.md) | pi-worker 与 Sui 链的完整集成 |
+| [Sui 争议声誉](./blockchain/sui/14-sui-dispute-and-reputation.md) | 争议状态机、Reviewer、声誉指标 |
+| [Sui 任务市场](./blockchain/sui/15-sui-market-and-selection.md) | 任务分配、Worker 选择、定价 |
+| [Sui 安全审计](./blockchain/sui/16-sui-security-and-audit.md) | 状态机、权限、结算、Artifact 审计 |
+| [Sui 可观测性](./blockchain/sui/17-sui-indexer-and-observability.md) | Indexer、Dashboard、告警 |
+| [Sui 实现清单](./blockchain/sui/18-sui-implementation-checklist.md) | 完整实现路线图与检查清单 |
+
 ---
 
 ## 💻 平台配置 (platform/)
@@ -118,6 +136,7 @@ docs/zh/
 | [架构概览](./reference/architecture-overview.md) | 144 | 核心架构边界与调用链 |
 | [深度架构分析](./reference/deep-dive-architecture.md) | 1,384 | 源码级深度分析（五层架构、数据流、事件系统） |
 | [源码架构](./reference/12-source-architecture.md) | 420 | 五层架构详解、数据流、事件系统 |
+| [扩展开发](./reference/extensions.md) | 2,100+ | 完整扩展 API 参考 |
 | [模型系统](./reference/13-model-system.md) | 362 | Provider、注册、路由、自定义 |
 | [嵌入与集成](./reference/14-embedding.md) | 261 | SDK、RPC、Web UI |
 | [RPC 模式](./reference/rpc.md) | 1,354 | JSON 协议完整参考 ✨ |
@@ -136,7 +155,7 @@ docs/zh/
 | [框架对比](./reference/comparison-opencode.md) | 884 | 与 OpenCode 对比 |
 | [Zig 生态](./reference/zig-ecosystem-analysis.md) | 762 | Zig 版本演进路线图 |
 
-**小计**：20 个文档
+**小计**：21 个文档
 
 ---
 
@@ -148,7 +167,8 @@ docs/zh/
 guide/
 ├── 01-what-is-pi.md        # 15分钟
 ├── 02-architecture-story.md # 20分钟
-└── 03-first-hour.md        # 25分钟
+├── 03-first-hour.md        # 25分钟
+└── 12-troubleshooting.md   # 参考查阅
 ```
 
 ### 🛠️ 扩展开发（4小时）
@@ -173,6 +193,8 @@ cookbook/
 - 架构理解 → `reference/`
 - 设计模式 → `patterns/`
 - 区块链专题 → `blockchain/`
+  - Solana 方案 → `blockchain/*.md`
+  - Sui 方案 → `blockchain/sui/*.md`
 
 ---
 
@@ -180,13 +202,13 @@ cookbook/
 
 | 分类 | 文件数 | 行数 | 占比 |
 |------|--------|------|------|
-| 使用指南 | 12 | ~3,277 | 21% |
-| 技术参考 | 18 | ~10,500 | 67% |
-| 区块链专题 | 5 | ~2,300 | 15% |
-| 设计模式 | 1 | 590 | 4% |
-| 代码食谱 | 1 | 488 | 3% |
-| 平台配置 | 4 | ~310 | ~2% |
-| **总计** | **41** | **~17,500** | **100%** |
+| 使用指南 | 13 | ~4,200 | 14% |
+| 技术参考 | 26 | ~10,300 | 35% |
+| 区块链专题 | 35 | ~18,400 | 63% |
+| 设计模式 | 1 | 590 | 2% |
+| 代码食谱 | 1 | 484 | 2% |
+| 平台配置 | 4 | ~307 | 1% |
+| **总计** | **80** | **~29,100+** | **100%** |
 
 ✨ = 新增翻译
 
@@ -194,15 +216,19 @@ cookbook/
 
 ## 核心亮点
 
-1. **第9章 扩展 API 详解** (585行) - 最详细的技术参考
-2. **第10章 实战模式** (590行) - 7个实用设计模式
-3. **深度架构分析** (1,384行) - 源码级深度分析
-4. **Zig 生态综合分析** (762行) - pi-mono Zig 版本演进路线图
-5. **与 OpenCode 对比** (884行) - 与最热门的开源工具对比
-6. **与 Claude Code 对比** (623行) - 与主流工具对比
-7. **与 Bub 框架对比** (739行) - 通过对比深入理解设计
-6. **第3章 第一个小时** (354行) - 完整的入门指南
-7. **第6章 Skill 系统** (352行) - Skill 开发完整指南
+1. **扩展开发完整指南** (2,100+行) - 最全面的扩展开发参考
+2. **Sui 专题文档** (4,900+行，11篇) - Sui 区块链集成完整方案
+3. **区块链专题** (18,400+行，35篇) - Solana + Sui 双链完整方案
+4. **第9章 扩展 API 详解** (585行) - 详细的技术参考
+5. **第10章 实战模式** (590行) - 7个实用设计模式
+6. **深度架构分析** (1,384行) - 源码级深度分析
+7. **Zig 生态综合分析** (762行) - pi-mono Zig 版本演进路线图
+8. **与 OpenCode 对比** (884行) - 与最热门的开源工具对比
+9. **与 Claude Code 对比** (623行) - 与主流工具对比
+10. **与 Bub 框架对比** (739行) - 通过对比深入理解设计
+11. **第3章 第一个小时** (354行) - 完整的入门指南
+12. **第6章 Skill 系统** (352行) - Skill 开发完整指南
+13. **故障排查指南** (454行) - 全面问题解决方案
 
 ---
 
@@ -220,4 +246,4 @@ cookbook/
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2025年3月*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v1.3 Sui 专题完整版)*

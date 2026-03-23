@@ -101,10 +101,10 @@
 
 ---
 
-## 当前专题文档结构
+## 文档列表
 
-### 总体路线与基础模型
-- [01-roadmap.md](./01-roadmap.md)
+### 基础层
+- [01-roadmap.md](./01-roadmap.md) - 区块链结合路线图
 - [02-task-models-solana-sui.md](./02-task-models-solana-sui.md)
 - [03-llm-payment-layer.md](./03-llm-payment-layer.md)
 - [04-task-execution-flow.md](./04-task-execution-flow.md)
@@ -124,6 +124,20 @@
 - [16-solana-indexer-and-observability.md](./16-solana-indexer-and-observability.md)
 - [17-solana-product-roadmap.md](./17-solana-product-roadmap.md)
 - [18-solana-implementation-checklist.md](./18-solana-implementation-checklist.md)
+
+### Sui 子专题
+- [sui/README.md](./sui/README.md)
+- [sui/00-overview.md](./sui/00-overview.md)
+- [sui/02-task-models.md](./sui/02-task-models.md)
+- [sui/10-sui-mvp-design.md](./sui/10-sui-mvp-design.md)
+- [sui/11-sui-contract-instructions.md](./sui/11-sui-contract-instructions.md)
+- [sui/12-sui-budget-and-settlement.md](./sui/12-sui-budget-and-settlement.md)
+- [sui/13-sui-worker-runtime-integration.md](./sui/13-sui-worker-runtime-integration.md)
+- [sui/14-sui-dispute-and-reputation.md](./sui/14-sui-dispute-and-reputation.md)
+- [sui/15-sui-market-and-selection.md](./sui/15-sui-market-and-selection.md)
+- [sui/16-sui-security-and-audit.md](./sui/16-sui-security-and-audit.md)
+- [sui/17-sui-indexer-and-observability.md](./sui/17-sui-indexer-and-observability.md)
+- [sui/18-sui-implementation-checklist.md](./sui/18-sui-implementation-checklist.md)
 
 ---
 
