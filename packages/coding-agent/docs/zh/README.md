@@ -41,8 +41,7 @@ docs/zh/
 │   ├── 10-prompt-templates.md     # 提示模板 ✨ 新增
 │   ├── 11-development.md          # 开发指南 ✨ 新增
 │   ├── 12-troubleshooting.md      # 故障排查指南 ✨ 新增
-│   ├── 15-design-decisions.md     # 设计决策
-│   └── 20-hackathon-winning-strategy.md # 黑客松获奖策略 ✨ 新增
+│   └── 15-design-decisions.md     # 设计决策
 ├── patterns/              # 🎨 设计模式
 │   └── 10-patterns.md             # 实战模式
 ├── cookbook/              # 🍳 代码食谱
@@ -70,19 +69,26 @@ docs/zh/
 │   │   ├── 16-solana-indexer-and-observability.md # Solana Indexer 与可观测性
 │   │   ├── 17-solana-product-roadmap.md # Solana 产品推进路线图
 │   │   └── 18-solana-implementation-checklist.md # Solana 实现清单
-│   └── sui/                          # 🌊 Sui 专题 ✨ 完整
-│       ├── README.md                 # Sui 专题导航
-│       ├── 00-overview.md            # Sui 总览
-│       ├── 02-task-models.md         # Sui 任务模型
-│       ├── 10-sui-mvp-design.md      # Sui MVP 设计
-│       ├── 11-sui-contract-instructions.md # 合约指令
-│       ├── 12-sui-budget-and-settlement.md # 预算结算
-│       ├── 13-sui-worker-runtime-integration.md # Worker 集成
-│       ├── 14-sui-dispute-and-reputation.md # 争议声誉
-│       ├── 15-sui-market-and-selection.md # 任务市场
-│       ├── 16-sui-security-and-audit.md # 安全审计
-│       ├── 17-sui-indexer-and-observability.md # 可观测性
-│       └── 18-sui-implementation-checklist.md # 实现清单
+│   ├── sui/                          # 🌊 Sui 专题 ✨ 完整
+│   │   ├── README.md                 # Sui 专题导航
+│   │   ├── 00-overview.md            # Sui 总览
+│   │   ├── 02-task-models.md         # Sui 任务模型
+│   │   ├── 10-sui-mvp-design.md      # Sui MVP 设计
+│   │   ├── 11-sui-contract-instructions.md # 合约指令
+│   │   ├── 12-sui-budget-and-settlement.md # 预算结算
+│   │   ├── 13-sui-worker-runtime-integration.md # Worker 集成
+│   │   ├── 14-sui-dispute-and-reputation.md # 争议声誉
+│   │   ├── 15-sui-market-and-selection.md # 任务市场
+│   │   ├── 16-sui-security-and-audit.md # 安全审计
+│   │   ├── 17-sui-indexer-and-observability.md # 可观测性
+│   │   └── 18-sui-implementation-checklist.md # 实现清单
+│   └── 03-dagent/                    # 🎯 dAgent X Layer 项目 ✨ 新目录
+│       ├── README.md                 # dAgent 项目导航
+│       ├── 01-foundation/            # 基础概念
+│       ├── 02-hackathon/             # 黑客松参赛
+│       ├── 03-architecture/          # 架构设计
+│       ├── 04-business/              # 商业规划
+│       └── 05-analysis/              # 对比分析
 ├── platform/              # 💻 平台配置 ✨ 新目录
 │   ├── windows.md                 # Windows 配置
 │   ├── termux.md                  # Android Termux
@@ -119,14 +125,9 @@ docs/zh/
     │   ├── 26-pi-mono-zig-vision.md      # pi-mono + Zig 愿景
     │   ├── 27-zig-pi-technical-deep-dive.md # Zig 技术深潜
     │   ├── 28-pi-mono-multi-agent-architecture.md # 多 Agent 架构
-    │   ├── 29-zig-sdk-system-layer-analysis.md # SDK / Runtime / OS 分层
-    │   └── 30-slock-ai-analysis.md       # Slock.ai 分析
+    │   └── 29-zig-sdk-system-layer-analysis.md # SDK / Runtime / OS 分层
     └── compute/                          # ☁️ Compute / Worker 基础设施研究线 ✨ 新目录
-        ├── README.md                     # 研究线导航
-        ├── 34-cloudflare-worker-vs-decentralized.md # Cloudflare vs 去中心化 Worker
-        ├── 35-decentralized-worker-deployment-guide.md # Worker 部署指南
-        ├── 36-decentralized-compute-platforms-analysis.md # 去中心化计算平台分析
-        └── 37-comprehensive-decentralized-compute-landscape.md # 计算平台全景扫描
+        └── README.md                     # 研究线导航
 ```
 
 ---
@@ -149,7 +150,6 @@ docs/zh/
 3. [实战模式](./patterns/10-patterns.md) - 60分钟
 4. [Cookbook](./cookbook/11-cookbook.md) - 参考查阅
 5. [设计决策](./guide/15-design-decisions.md) - 30分钟
-6. [黑客松获奖策略](./guide/20-hackathon-winning-strategy.md) - 参考查阅
 
 ### 📚 全面掌握（按需查阅）
 
@@ -168,7 +168,11 @@ docs/zh/
   - 基础层：路线图、任务模型、支付层、执行流、artifact、guardrails、TEE、receipts
   - Solana 主线：[专题导航](./blockchain/solana/README.md)，以及 MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
   - Sui 专题：[总览](./blockchain/sui/00-overview.md)、[任务模型](./blockchain/sui/02-task-models.md)、[MVP 设计](./blockchain/sui/10-sui-mvp-design.md)
-  - DASN 研究线：[专题导航](./blockchain/dasn/README.md)、[愿景](./blockchain/dasn/19-dasn-vision.md)、[协议分析](./blockchain/dasn/20-agent-protocols-analysis.md)、[去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md)、[稳定币支付与 Worker 部署模型](./blockchain/dasn/32-dagent-hub-economic-and-worker-model.md)、[dAgent Network 产品定义书](./blockchain/dasn/33-dagent-product-definition.md)
+  - **dAgent X Layer 项目**：[项目导航](./blockchain/03-dagent/README.md)
+    - 黑客松参赛：[获奖策略](./blockchain/03-dagent/02-hackathon/20-dagent-hackathon-strategy.md)、[比赛分析](./blockchain/03-dagent/02-hackathon/21-dagent-xlayer-hackathon.md)、[执行计划](./blockchain/03-dagent/02-hackathon/23-dagent-execution-plan.md)
+    - 架构设计：[多链架构](./blockchain/03-dagent/03-architecture/25-dagent-multi-chain.md)、[ERC-8004](./blockchain/03-dagent/03-architecture/26-dagent-erc8004-agents.md)、[Worker部署](./blockchain/03-dagent/03-architecture/35-dagent-worker-deployment.md)
+    - 商业规划：[商业计划书](./blockchain/03-dagent/04-business/27-dagent-business-plan.md)
+    - 对比分析：[竞品分析](./blockchain/03-dagent/05-analysis/30-slock-analysis.md)
 - **演进规划**：
   - [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) - pi-mono Zig 版本演进路线图
   - [Zig / Runtime / Multi-Agent 研究线导航](./reference/zig/README.md)
@@ -176,13 +180,8 @@ docs/zh/
   - [Zig 技术深潜](./reference/zig/27-zig-pi-technical-deep-dive.md)
   - [多 Agent 架构](./reference/zig/28-pi-mono-multi-agent-architecture.md)
   - [SDK / Runtime / OS 分层](./reference/zig/29-zig-sdk-system-layer-analysis.md)
-  - [Slock.ai 分析](./reference/zig/30-slock-ai-analysis.md)
 - **Compute / Worker 基础设施研究线**：
   - [研究线导航](./reference/compute/README.md)
-  - [Cloudflare Worker vs 去中心化 Worker](./reference/compute/34-cloudflare-worker-vs-decentralized.md)
-  - [去中心化 Worker 部署指南](./reference/compute/35-decentralized-worker-deployment-guide.md)
-  - [去中心化计算平台分析](./reference/compute/36-decentralized-compute-platforms-analysis.md)
-  - [去中心化计算平台全景扫描](./reference/compute/37-comprehensive-decentralized-compute-landscape.md)
 
 ---
 
@@ -223,4 +222,4 @@ pi 遵循 **"Agent构建Agent"** 的哲学：
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v2.6 dAgent X Layer 深度实现)*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v2.7 dAgent X Layer 文档重组)*
