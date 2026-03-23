@@ -40,34 +40,37 @@
 8. [可验证 Receipts 与 Attestation](./08-verifiable-receipts-and-attestation.md)
    - 看 usage receipts、manifest、artifact 和 attestation 如何形成更强验证链路
 
-9. [Solana MVP 草案](./09-solana-mvp-design.md)
+9. [Solana 专题导航](./solana/README.md)
+   - 看 Solana 主线的阅读顺序与目录
+
+10. [Solana MVP 草案](./solana/09-solana-mvp-design.md)
    - 看第一条链如何以最小账户模型跑通任务、认领、结果提交与链上结算
 
-10. [Solana Program 指令设计](./10-solana-program-instructions.md)
+11. [Solana Program 指令设计](./solana/10-solana-program-instructions.md)
    - 看最小 instruction 集、状态迁移、PDA 关系与 Program 层 guardrails
 
-11. [Solana 预算与结算设计](./11-solana-budget-and-settlement.md)
+12. [Solana 预算与结算设计](./solana/11-solana-budget-and-settlement.md)
    - 看 execution budget、worker reward、refund 与 settlement 如何闭合
 
-12. [Solana Worker Runtime 集成](./12-solana-worker-runtime-integration.md)
+13. [Solana Worker Runtime 集成](./solana/12-solana-worker-runtime-integration.md)
    - 看 `pi-worker` 如何发现任务、组织 bundle、提交结果并持续监控状态
 
-13. [Solana 争议与声誉设计](./13-solana-dispute-and-reputation.md)
+14. [Solana 争议与声誉设计](./solana/13-solana-dispute-and-reputation.md)
    - 看 dispute 如何结构化进入状态机，以及 reputation 如何从隐性印象变成显性指标
 
-14. [Solana 任务市场与 Worker 选择](./14-solana-task-market-and-worker-selection.md)
+15. [Solana 任务市场与 Worker 选择](./solana/14-solana-task-market-and-worker-selection.md)
    - 看任务如何分配，以及 capability / reputation / stake 如何影响 worker 选择
 
-15. [Solana 安全与审计清单](./15-solana-security-and-audit-checklist.md)
+16. [Solana 安全与审计清单](./solana/15-solana-security-and-audit-checklist.md)
    - 看协议、资金、结果承诺、runtime 集成与市场规则的审计重点
 
-16. [Solana Indexer 与可观测性](./16-solana-indexer-and-observability.md)
+17. [Solana Indexer 与可观测性](./solana/16-solana-indexer-and-observability.md)
    - 看链上状态、worker 运行、成本与市场健康度如何被观测、查询与告警
 
-17. [Solana 产品推进路线图](./17-solana-product-roadmap.md)
+18. [Solana 产品推进路线图](./solana/17-solana-product-roadmap.md)
    - 看从内部验证到有限开放市场、支付层增强、开放网络的阶段化推进方式
 
-18. [Solana 实现清单](./18-solana-implementation-checklist.md)
+19. [Solana 实现清单](./solana/18-solana-implementation-checklist.md)
    - 看真正开始开发时，协议、runtime、运营、支付层各自应按什么顺序落地
 
 ---
@@ -114,16 +117,17 @@
 - [08-verifiable-receipts-and-attestation.md](./08-verifiable-receipts-and-attestation.md)
 
 ### Solana 主线
-- [09-solana-mvp-design.md](./09-solana-mvp-design.md)
-- [10-solana-program-instructions.md](./10-solana-program-instructions.md)
-- [11-solana-budget-and-settlement.md](./11-solana-budget-and-settlement.md)
-- [12-solana-worker-runtime-integration.md](./12-solana-worker-runtime-integration.md)
-- [13-solana-dispute-and-reputation.md](./13-solana-dispute-and-reputation.md)
-- [14-solana-task-market-and-worker-selection.md](./14-solana-task-market-and-worker-selection.md)
-- [15-solana-security-and-audit-checklist.md](./15-solana-security-and-audit-checklist.md)
-- [16-solana-indexer-and-observability.md](./16-solana-indexer-and-observability.md)
-- [17-solana-product-roadmap.md](./17-solana-product-roadmap.md)
-- [18-solana-implementation-checklist.md](./18-solana-implementation-checklist.md)
+- [solana/README.md](./solana/README.md)
+- [solana/09-solana-mvp-design.md](./solana/09-solana-mvp-design.md)
+- [solana/10-solana-program-instructions.md](./solana/10-solana-program-instructions.md)
+- [solana/11-solana-budget-and-settlement.md](./solana/11-solana-budget-and-settlement.md)
+- [solana/12-solana-worker-runtime-integration.md](./solana/12-solana-worker-runtime-integration.md)
+- [solana/13-solana-dispute-and-reputation.md](./solana/13-solana-dispute-and-reputation.md)
+- [solana/14-solana-task-market-and-worker-selection.md](./solana/14-solana-task-market-and-worker-selection.md)
+- [solana/15-solana-security-and-audit-checklist.md](./solana/15-solana-security-and-audit-checklist.md)
+- [solana/16-solana-indexer-and-observability.md](./solana/16-solana-indexer-and-observability.md)
+- [solana/17-solana-product-roadmap.md](./solana/17-solana-product-roadmap.md)
+- [solana/18-solana-implementation-checklist.md](./solana/18-solana-implementation-checklist.md)
 
 ### Sui 子专题
 - [sui/README.md](./sui/README.md)
@@ -138,6 +142,15 @@
 - [sui/16-sui-security-and-audit.md](./sui/16-sui-security-and-audit.md)
 - [sui/17-sui-indexer-and-observability.md](./sui/17-sui-indexer-and-observability.md)
 - [sui/18-sui-implementation-checklist.md](./sui/18-sui-implementation-checklist.md)
+
+### DASN 深度专题
+- [19-dasn-vision.md](./19-dasn-vision.md) - DASN 架构愿景与经济模型
+- [20-agent-protocols-analysis.md](./20-agent-protocols-analysis.md) - Agent 协议标准全景分析
+- [21-dasn-protocol-integration.md](./21-dasn-protocol-integration.md) - 协议整合实现
+- [22-dasn-prototype-design.md](./22-dasn-prototype-design.md) - 多协议 Worker 原型设计
+- [23-dasn-testing-strategy.md](./23-dasn-testing-strategy.md) - 测试验证策略
+- [24-dasn-standard-proposal.md](./24-dasn-standard-proposal.md) - 标准贡献提案
+- [25-dasn-sdk-design.md](./25-dasn-sdk-design.md) - SDK 构建设计
 
 ---
 

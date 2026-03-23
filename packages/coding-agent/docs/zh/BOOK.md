@@ -84,16 +84,17 @@ docs/zh/
 | [Policy 与 Guardrails 设计](./blockchain/06-policy-and-guardrails.md) | 预算、模型、工具、主网动作的边界控制 |
 | [TEE 与去中心化计算层](./blockchain/07-tee-and-decentralized-compute.md) | 为什么链本身不适合运行 worker，以及路线 2 的执行平面 |
 | [可验证 Receipts 与 Attestation](./blockchain/08-verifiable-receipts-and-attestation.md) | usage receipts、manifest、artifact、attestation 的验证链路 |
-| [Solana MVP 草案](./blockchain/09-solana-mvp-design.md) | 第一条链的最小账户模型、最小指令集与 worker 接入闭环 |
-| [Solana Program 指令设计](./blockchain/10-solana-program-instructions.md) | create/fund/claim/submit/accept/reject/settle 的协议级设计 |
-| [Solana 预算与结算设计](./blockchain/11-solana-budget-and-settlement.md) | execution budget、worker reward、refund 与 settlement 闭合方式 |
-| [Solana Worker Runtime 集成](./blockchain/12-solana-worker-runtime-integration.md) | task discovery、claim、artifact bundle、submit 与 post-submit 监控 |
-| [Solana 争议与声誉设计](./blockchain/13-solana-dispute-and-reputation.md) | dispute 状态机、reviewer 模型与 reputation 指标设计 |
-| [Solana 任务市场与 Worker 选择](./blockchain/14-solana-task-market-and-worker-selection.md) | 任务分配、资格认领、specialization 与 stake/reputation 的关系 |
-| [Solana 安全与审计清单](./blockchain/15-solana-security-and-audit-checklist.md) | 状态机、authority、结算、artifact、market 与 runtime 的审计重点 |
-| [Solana Indexer 与可观测性](./blockchain/16-solana-indexer-and-observability.md) | Task/Worker/Cost/Market 的索引、Dashboard 与告警设计 |
-| [Solana 产品推进路线图](./blockchain/17-solana-product-roadmap.md) | 从内部验证、稳定 MVP 到有限市场与开放网络的阶段推进 |
-| [Solana 实现清单](./blockchain/18-solana-implementation-checklist.md) | 协议、runtime、运营、支付层的具体实现顺序与阶段清单 |
+| [Solana 专题导航](./blockchain/solana/README.md) | Solana 主线的阅读顺序与目录 |
+| [Solana MVP 草案](./blockchain/solana/09-solana-mvp-design.md) | 第一条链的最小账户模型、最小指令集与 worker 接入闭环 |
+| [Solana Program 指令设计](./blockchain/solana/10-solana-program-instructions.md) | create/fund/claim/submit/accept/reject/settle 的协议级设计 |
+| [Solana 预算与结算设计](./blockchain/solana/11-solana-budget-and-settlement.md) | execution budget、worker reward、refund 与 settlement 闭合方式 |
+| [Solana Worker Runtime 集成](./blockchain/solana/12-solana-worker-runtime-integration.md) | task discovery、claim、artifact bundle、submit 与 post-submit 监控 |
+| [Solana 争议与声誉设计](./blockchain/solana/13-solana-dispute-and-reputation.md) | dispute 状态机、reviewer 模型与 reputation 指标设计 |
+| [Solana 任务市场与 Worker 选择](./blockchain/solana/14-solana-task-market-and-worker-selection.md) | 任务分配、资格认领、specialization 与 stake/reputation 的关系 |
+| [Solana 安全与审计清单](./blockchain/solana/15-solana-security-and-audit-checklist.md) | 状态机、authority、结算、artifact、market 与 runtime 的审计重点 |
+| [Solana Indexer 与可观测性](./blockchain/solana/16-solana-indexer-and-observability.md) | Task/Worker/Cost/Market 的索引、Dashboard 与告警设计 |
+| [Solana 产品推进路线图](./blockchain/solana/17-solana-product-roadmap.md) | 从内部验证、稳定 MVP 到有限市场与开放网络的阶段推进 |
+| [Solana 实现清单](./blockchain/solana/18-solana-implementation-checklist.md) | 协议、runtime、运营、支付层的具体实现顺序与阶段清单 |
 
 ### Sui 专题 (blockchain/sui/)
 
@@ -193,7 +194,7 @@ cookbook/
 - 架构理解 → `reference/`
 - 设计模式 → `patterns/`
 - 区块链专题 → `blockchain/`
-  - Solana 方案 → `blockchain/*.md`
+  - Solana 方案 → `blockchain/solana/*.md`
   - Sui 方案 → `blockchain/sui/*.md`
 
 ---
@@ -202,13 +203,13 @@ cookbook/
 
 | 分类 | 文件数 | 行数 | 占比 |
 |------|--------|------|------|
-| 使用指南 | 13 | ~4,200 | 14% |
-| 技术参考 | 26 | ~10,300 | 35% |
-| 区块链专题 | 35 | ~18,400 | 63% |
+| 使用指南 | 13 | ~4,200 | 12% |
+| 技术参考 | 26 | ~10,300 | 30% |
+| 区块链专题 | 42 | ~23,400 | 68% |
 | 设计模式 | 1 | 590 | 2% |
-| 代码食谱 | 1 | 484 | 2% |
+| 代码食谱 | 1 | 484 | 1% |
 | 平台配置 | 4 | ~307 | 1% |
-| **总计** | **80** | **~29,100+** | **100%** |
+| **总计** | **88** | **~34,400+** | **100%** |
 
 ✨ = 新增翻译
 

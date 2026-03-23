@@ -57,16 +57,18 @@ docs/zh/
 │   ├── 06-policy-and-guardrails.md # Policy 与 Guardrails 设计
 │   ├── 07-tee-and-decentralized-compute.md # TEE 与去中心化计算层
 │   ├── 08-verifiable-receipts-and-attestation.md # 可验证 Receipts 与 Attestation
-│   ├── 09-solana-mvp-design.md    # Solana MVP 草案
-│   ├── 10-solana-program-instructions.md # Solana Program 指令设计
-│   ├── 11-solana-budget-and-settlement.md # Solana 预算与结算设计
-│   ├── 12-solana-worker-runtime-integration.md # Solana Worker Runtime 集成
-│   ├── 13-solana-dispute-and-reputation.md # Solana 争议与声誉设计
-│   ├── 14-solana-task-market-and-worker-selection.md # Solana 任务市场与 Worker 选择
-│   ├── 15-solana-security-and-audit-checklist.md # Solana 安全与审计清单
-│   ├── 16-solana-indexer-and-observability.md # Solana Indexer 与可观测性
-│   ├── 17-solana-product-roadmap.md # Solana 产品推进路线图
-│   ├── 18-solana-implementation-checklist.md # Solana 实现清单
+│   ├── solana/                       # ☀️ Solana 专题 ✨ 新目录
+│   │   ├── README.md                 # Solana 专题导航
+│   │   ├── 09-solana-mvp-design.md   # Solana MVP 草案
+│   │   ├── 10-solana-program-instructions.md # Solana Program 指令设计
+│   │   ├── 11-solana-budget-and-settlement.md # Solana 预算与结算设计
+│   │   ├── 12-solana-worker-runtime-integration.md # Solana Worker Runtime 集成
+│   │   ├── 13-solana-dispute-and-reputation.md # Solana 争议与声誉设计
+│   │   ├── 14-solana-task-market-and-worker-selection.md # Solana 任务市场与 Worker 选择
+│   │   ├── 15-solana-security-and-audit-checklist.md # Solana 安全与审计清单
+│   │   ├── 16-solana-indexer-and-observability.md # Solana Indexer 与可观测性
+│   │   ├── 17-solana-product-roadmap.md # Solana 产品推进路线图
+│   │   └── 18-solana-implementation-checklist.md # Solana 实现清单
 │   └── sui/                          # 🌊 Sui 专题 ✨ 完整
 │       ├── README.md                 # Sui 专题导航
 │       ├── 00-overview.md            # Sui 总览
@@ -149,7 +151,7 @@ docs/zh/
   - [专题总览](./blockchain/00-overview.md)
   - [专题导航](./blockchain/README.md)
   - 基础层：路线图、任务模型、支付层、执行流、artifact、guardrails、TEE、receipts
-  - Solana 主线：MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
+  - Solana 主线：[专题导航](./blockchain/solana/README.md)，以及 MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
   - Sui 专题：[总览](./blockchain/sui/00-overview.md)、[任务模型](./blockchain/sui/02-task-models.md)、[MVP 设计](./blockchain/sui/10-sui-mvp-design.md)
 - **演进规划**：
   - [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) - pi-mono Zig 版本演进路线图
@@ -193,4 +195,4 @@ pi 遵循 **"Agent构建Agent"** 的哲学：
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v1.3 Sui 专题完整版)*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v1.4 DASN 完整实现方案)*
