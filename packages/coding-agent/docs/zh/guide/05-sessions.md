@@ -66,7 +66,7 @@ pi 的会话是树形的：
 /tree
 ```
 
-或按 `Escape` 两次。
+或按 `Escape` 两次（可通过 `doubleEscapeAction` 设置更改，见 [设置参考](../reference/settings.md)）。
 
 ### 树视图界面
 

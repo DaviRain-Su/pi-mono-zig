@@ -362,9 +362,9 @@ Claude Code 的经验里，Skills 常见可分为 9 类。对 pi 而言可按是
 
 把这篇文章作为**第二层学习输入**，建议和源码同步读：
 
-1. 先看 `guide/06-skills` 了解 pi 的基本机制。
-2. 再看本文分类/原则，做你仓库的 Skill 审计。
-3. 最后对照代码真值源（`extensions/types.ts`、`extensions/runner.ts`、`slash-commands.ts`）验证行为是否对齐。
+1. 先看本文了解 pi 的基本机制。
+2. 再看上文分类/原则，做你仓库的 Skill 审计。
+3. 最后对照代码真值源（`src/core/extensions/types.ts`、`src/core/extensions/runner.ts`、`src/core/slash-commands.ts`）验证行为是否对齐。
 
 > 结论：在 pi 中，Skill 是“让模型记住你团队知识的方法”，而不是“替代工程判断的黑箱工具”。
 

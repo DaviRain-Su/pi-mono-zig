@@ -142,11 +142,19 @@ export AWS_SECRET_ACCESS_KEY=...
 # 方式三：Bearer Token
 export AWS_BEARER_TOKEN_BEDROCK=...
 
+# 方式四：ECS 任务角色
+export AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=...
+# 或
+export AWS_CONTAINER_CREDENTIALS_FULL_URI=...
+
+# 方式五：IRSA（IAM Roles for Service Accounts）
+export AWS_WEB_IDENTITY_TOKEN_FILE=...
+
 # 可选区域（默认 us-east-1）
 export AWS_REGION=us-west-2
 ```
 
-也支持 ECS 任务角色（`AWS_CONTAINER_CREDENTIALS_*`）和 IRSA（`AWS_WEB_IDENTITY_TOKEN_FILE`）。
+Bedrock 支持多种凭证来源，按优先级自动检测。
 
 ```bash
 pi --provider amazon-bedrock --model us.anthropic.claude-sonnet-4-20250514-v1:0
