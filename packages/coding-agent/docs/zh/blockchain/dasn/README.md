@@ -63,6 +63,9 @@
 8. [31-decentralized-agent-platform-design.md](./31-decentralized-agent-platform-design.md)
    - 看从协议研究走向产品化协作平台时，去中心化 Agent Hub 应如何设计
 
+9. [32-dagent-hub-economic-and-worker-model.md](./32-dagent-hub-economic-and-worker-model.md)
+   - 看稳定币支付、平台费、保险基金与 Worker 部署模型如何闭合成可运营系统
+
 ---
 
 ## 文档列表
@@ -75,6 +78,7 @@
 - [24-dasn-standard-proposal.md](./24-dasn-standard-proposal.md) - DASN 标准提案
 - [25-dasn-sdk-design.md](./25-dasn-sdk-design.md) - DASN SDK 设计
 - [31-decentralized-agent-platform-design.md](./31-decentralized-agent-platform-design.md) - 去中心化 Agent 协作平台设计
+- [32-dagent-hub-economic-and-worker-model.md](./32-dagent-hub-economic-and-worker-model.md) - 稳定币支付与 Worker 部署模型
 
 ---
 

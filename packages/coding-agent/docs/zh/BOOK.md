@@ -126,6 +126,7 @@ docs/zh/
 | [DASN 标准提案](./blockchain/dasn/24-dasn-standard-proposal.md) | 面向标准化推进的提案抽象 |
 | [DASN SDK 设计](./blockchain/dasn/25-dasn-sdk-design.md) | SDK 层接口、开发者体验与生态接入 |
 | [去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md) | 从协议研究走向协作平台产品化的整体方案 |
+| [稳定币支付与 Worker 部署模型](./blockchain/dasn/32-dagent-hub-economic-and-worker-model.md) | USDC 支付模型、平台费结构与 Worker 部署分层 |
 
 ---
 
@@ -224,12 +225,12 @@ cookbook/
 | 分类 | 文件数 | 行数 | 占比 |
 |------|--------|------|------|
 | 使用指南 | 13 | ~4,200 | 11% |
-| 技术参考 | 31 | ~14,000 | 37% |
-| 区块链专题 | 44 | ~24,900 | 65% |
+| 技术参考 | 34 | ~16,300 | 39% |
+| 区块链专题 | 45 | ~25,600 | 65% |
 | 设计模式 | 1 | 590 | 2% |
 | 代码食谱 | 1 | 484 | 1% |
 | 平台配置 | 4 | ~307 | 1% |
-| **总计** | **96** | **~39,600+** | **100%** |
+| **总计** | **99** | **~41,800+** | **100%** |
 
 ✨ = 新增翻译
 
