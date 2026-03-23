@@ -113,13 +113,19 @@ docs/zh/
     ├── comparison-claude-code.md         # 与 Claude Code 对比
     ├── comparison-opencode.md            # 与 OpenCode 对比
     ├── zig-ecosystem-analysis.md         # Zig 生态综合分析与演进规划
-    └── zig/                              # 🧠 Zig / Runtime / Multi-Agent 研究线 ✨ 新目录
+    ├── zig/                              # 🧠 Zig / Runtime / Multi-Agent 研究线 ✨ 新目录
+    │   ├── README.md                     # 研究线导航
+    │   ├── 26-pi-mono-zig-vision.md      # pi-mono + Zig 愿景
+    │   ├── 27-zig-pi-technical-deep-dive.md # Zig 技术深潜
+    │   ├── 28-pi-mono-multi-agent-architecture.md # 多 Agent 架构
+    │   ├── 29-zig-sdk-system-layer-analysis.md # SDK / Runtime / OS 分层
+    │   └── 30-slock-ai-analysis.md       # Slock.ai 分析
+    └── compute/                          # ☁️ Compute / Worker 基础设施研究线 ✨ 新目录
         ├── README.md                     # 研究线导航
-        ├── 26-pi-mono-zig-vision.md      # pi-mono + Zig 愿景
-        ├── 27-zig-pi-technical-deep-dive.md # Zig 技术深潜
-        ├── 28-pi-mono-multi-agent-architecture.md # 多 Agent 架构
-        ├── 29-zig-sdk-system-layer-analysis.md # SDK / Runtime / OS 分层
-        └── 30-slock-ai-analysis.md       # Slock.ai 分析
+        ├── 34-cloudflare-worker-vs-decentralized.md # Cloudflare vs 去中心化 Worker
+        ├── 35-decentralized-worker-deployment-guide.md # Worker 部署指南
+        ├── 36-decentralized-compute-platforms-analysis.md # 去中心化计算平台分析
+        └── 37-comprehensive-decentralized-compute-landscape.md # 计算平台全景扫描
 ```
 
 ---
@@ -169,6 +175,12 @@ docs/zh/
   - [多 Agent 架构](./reference/zig/28-pi-mono-multi-agent-architecture.md)
   - [SDK / Runtime / OS 分层](./reference/zig/29-zig-sdk-system-layer-analysis.md)
   - [Slock.ai 分析](./reference/zig/30-slock-ai-analysis.md)
+- **Compute / Worker 基础设施研究线**：
+  - [研究线导航](./reference/compute/README.md)
+  - [Cloudflare Worker vs 去中心化 Worker](./reference/compute/34-cloudflare-worker-vs-decentralized.md)
+  - [去中心化 Worker 部署指南](./reference/compute/35-decentralized-worker-deployment-guide.md)
+  - [去中心化计算平台分析](./reference/compute/36-decentralized-compute-platforms-analysis.md)
+  - [去中心化计算平台全景扫描](./reference/compute/37-comprehensive-decentralized-compute-landscape.md)
 
 ---
 

@@ -177,6 +177,11 @@ docs/zh/
 | [多 Agent 架构](./reference/zig/28-pi-mono-multi-agent-architecture.md) | - | 从单 Agent 到多 Agent 的演进 |
 | [SDK / Runtime / OS 分层](./reference/zig/29-zig-sdk-system-layer-analysis.md) | - | 系统层级定位与职责边界 |
 | [Slock.ai 分析](./reference/zig/30-slock-ai-analysis.md) | - | 外部 Agent 协作平台对比与启发 |
+| [Compute / Worker 基础设施研究线](./reference/compute/README.md) | 导航 | Worker 执行平面、部署模型与平台选型入口 |
+| [Cloudflare Worker vs 去中心化 Worker](./reference/compute/34-cloudflare-worker-vs-decentralized.md) | - | 中心化 serverless 与去中心化 Worker 的架构对比 |
+| [去中心化 Worker 部署指南](./reference/compute/35-decentralized-worker-deployment-guide.md) | - | 从个人电脑到企业级集群的部署路径 |
+| [去中心化计算平台分析](./reference/compute/36-decentralized-compute-platforms-analysis.md) | - | EigenCompute、ICP 等平台分析 |
+| [去中心化计算平台全景扫描](./reference/compute/37-comprehensive-decentralized-compute-landscape.md) | - | 多生态去中心化计算方案全景 |
 
 **小计**：21 个文档
 
