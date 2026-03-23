@@ -154,11 +154,12 @@
 - [dasn/25-dasn-sdk-design.md](./dasn/25-dasn-sdk-design.md)
 - [dasn/31-decentralized-agent-platform-design.md](./dasn/31-decentralized-agent-platform-design.md) - 去中心化 Agent 协作平台设计 (Sui/X Layer) 🆕
 - [dasn/32-dagent-hub-economic-and-worker-model.md](./dasn/32-dagent-hub-economic-and-worker-model.md) - 稳定币支付与 Worker 部署模型 🆕
+- [dasn/33-dagent-product-definition.md](./dasn/33-dagent-product-definition.md) - dAgent Network 产品定义书 (基于 pi-mono) 🆕
 
 ### 产品实现线
 - [dasn/31-decentralized-agent-platform-design.md](./dasn/31-decentralized-agent-platform-design.md) - dAgent Hub 产品完整设计 (Sui/X Layer) 🆕
 - [dasn/32-dagent-hub-economic-and-worker-model.md](./dasn/32-dagent-hub-economic-and-worker-model.md) - 稳定币支付与 Worker 部署模型 🆕
-- [33-dagent-product-definition.md](./33-dagent-product-definition.md) - dAgent Network 产品定义书 (基于 pi-mono) 🆕
+- [dasn/33-dagent-product-definition.md](./dasn/33-dagent-product-definition.md) - dAgent Network 产品定义书 (基于 pi-mono) 🆕
 
 ---
 

@@ -127,6 +127,7 @@ docs/zh/
 | [DASN SDK 设计](./blockchain/dasn/25-dasn-sdk-design.md) | SDK 层接口、开发者体验与生态接入 |
 | [去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md) | 从协议研究走向协作平台产品化的整体方案 |
 | [稳定币支付与 Worker 部署模型](./blockchain/dasn/32-dagent-hub-economic-and-worker-model.md) | USDC 支付模型、平台费结构与 Worker 部署分层 |
+| [dAgent Network 产品定义书](./blockchain/dasn/33-dagent-product-definition.md) | 产品一句话定义、核心功能、用户路径与 pi-mono 复用边界 |
 
 ---
 
@@ -224,13 +225,13 @@ cookbook/
 
 | 分类 | 文件数 | 行数 | 占比 |
 |------|--------|------|------|
-| 使用指南 | 13 | ~4,200 | 11% |
-| 技术参考 | 34 | ~16,300 | 39% |
+| 使用指南 | 14 | ~4,900 | 12% |
+| 技术参考 | 35 | ~17,300 | 40% |
 | 区块链专题 | 45 | ~25,600 | 65% |
 | 设计模式 | 1 | 590 | 2% |
 | 代码食谱 | 1 | 484 | 1% |
 | 平台配置 | 4 | ~307 | 1% |
-| **总计** | **99** | **~41,800+** | **100%** |
+| **总计** | **101** | **~43,500+** | **100%** |
 
 ✨ = 新增翻译
 

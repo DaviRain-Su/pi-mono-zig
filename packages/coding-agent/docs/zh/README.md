@@ -160,7 +160,7 @@ docs/zh/
   - 基础层：路线图、任务模型、支付层、执行流、artifact、guardrails、TEE、receipts
   - Solana 主线：[专题导航](./blockchain/solana/README.md)，以及 MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
   - Sui 专题：[总览](./blockchain/sui/00-overview.md)、[任务模型](./blockchain/sui/02-task-models.md)、[MVP 设计](./blockchain/sui/10-sui-mvp-design.md)
-  - DASN 研究线：[专题导航](./blockchain/dasn/README.md)、[愿景](./blockchain/dasn/19-dasn-vision.md)、[协议分析](./blockchain/dasn/20-agent-protocols-analysis.md)、[去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md)、[稳定币支付与 Worker 部署模型](./blockchain/dasn/32-dagent-hub-economic-and-worker-model.md)
+  - DASN 研究线：[专题导航](./blockchain/dasn/README.md)、[愿景](./blockchain/dasn/19-dasn-vision.md)、[协议分析](./blockchain/dasn/20-agent-protocols-analysis.md)、[去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md)、[稳定币支付与 Worker 部署模型](./blockchain/dasn/32-dagent-hub-economic-and-worker-model.md)、[dAgent Network 产品定义书](./blockchain/dasn/33-dagent-product-definition.md)
 - **演进规划**：
   - [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) - pi-mono Zig 版本演进路线图
   - [Zig / Runtime / Multi-Agent 研究线导航](./reference/zig/README.md)
@@ -209,4 +209,4 @@ pi 遵循 **"Agent构建Agent"** 的哲学：
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v2.2 去中心化计算平台全景)*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v2.4 黑客松获奖策略)*
