@@ -41,7 +41,8 @@ docs/zh/
 │   ├── 10-prompt-templates.md     # 提示模板 ✨ 新增
 │   ├── 11-development.md          # 开发指南 ✨ 新增
 │   ├── 12-troubleshooting.md      # 故障排查指南 ✨ 新增
-│   └── 15-design-decisions.md     # 设计决策
+│   ├── 15-design-decisions.md     # 设计决策
+│   └── 20-hackathon-winning-strategy.md # 黑客松获奖策略 ✨ 新增
 ├── patterns/              # 🎨 设计模式
 │   └── 10-patterns.md             # 实战模式
 ├── cookbook/              # 🍳 代码食谱
@@ -148,6 +149,7 @@ docs/zh/
 3. [实战模式](./patterns/10-patterns.md) - 60分钟
 4. [Cookbook](./cookbook/11-cookbook.md) - 参考查阅
 5. [设计决策](./guide/15-design-decisions.md) - 30分钟
+6. [黑客松获奖策略](./guide/20-hackathon-winning-strategy.md) - 参考查阅
 
 ### 📚 全面掌握（按需查阅）
 

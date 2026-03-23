@@ -41,8 +41,9 @@ docs/zh/
 | 11 | [开发指南](./guide/11-development.md) | 69 | 10分钟 | 设置、Fork、测试、结构 ✨ |
 | 12 | [故障排查指南](./guide/12-troubleshooting.md) | 454 | 30分钟 | 常见问题与解决方案 ✨ |
 | 15 | [设计决策](./guide/15-design-decisions.md) | 313 | 30分钟 | 为什么这样设计、权衡、未来 |
+| 20 | [黑客松获奖策略](./guide/20-hackathon-winning-strategy.md) | - | 参考查阅 | 公链黑客松评判逻辑、选链策略与展示打法 |
 
-**小计**：13 章
+**小计**：14 章
 
 ---
 
