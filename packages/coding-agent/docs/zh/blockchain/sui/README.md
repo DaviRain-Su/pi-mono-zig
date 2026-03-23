@@ -106,7 +106,7 @@ Sui 实现参考 Solana 的设计，但针对 Sui 的对象模型进行了优化
 - [Sui TypeScript SDK](https://sdk.mystenlabs.com/typescript)
 
 ### pi 相关
-- [Solana 实现](../09-solana-mvp-design.md) - 对比参考
+- [Solana 实现](../solana/09-solana-mvp-design.md) - 对比参考
 - [Worker Runtime](../../guide/08-first-extension.md) - Worker 基础
 - [扩展开发](../../reference/extensions.md) - 扩展开发指南
 

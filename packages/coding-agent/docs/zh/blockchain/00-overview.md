@@ -71,9 +71,9 @@
 
 1. [01-roadmap.md](./01-roadmap.md)
 2. [03-llm-payment-layer.md](./03-llm-payment-layer.md)
-3. [09-solana-mvp-design.md](./09-solana-mvp-design.md)
-4. [17-solana-product-roadmap.md](./17-solana-product-roadmap.md)
-5. [18-solana-implementation-checklist.md](./18-solana-implementation-checklist.md)
+3. [solana/09-solana-mvp-design.md](./solana/09-solana-mvp-design.md)
+4. [solana/17-solana-product-roadmap.md](./solana/17-solana-product-roadmap.md)
+5. [solana/18-solana-implementation-checklist.md](./solana/18-solana-implementation-checklist.md)
 
 ### 如果你想从协议角度真正落地
 
@@ -81,11 +81,11 @@
 
 1. [01-roadmap.md](./01-roadmap.md)
 2. [02-task-models-solana-sui.md](./02-task-models-solana-sui.md)
-3. [10-solana-program-instructions.md](./10-solana-program-instructions.md)
-4. [11-solana-budget-and-settlement.md](./11-solana-budget-and-settlement.md)
-5. [13-solana-dispute-and-reputation.md](./13-solana-dispute-and-reputation.md)
-6. [14-solana-task-market-and-worker-selection.md](./14-solana-task-market-and-worker-selection.md)
-7. [15-solana-security-and-audit-checklist.md](./15-solana-security-and-audit-checklist.md)
+3. [solana/10-solana-program-instructions.md](./solana/10-solana-program-instructions.md)
+4. [solana/11-solana-budget-and-settlement.md](./solana/11-solana-budget-and-settlement.md)
+5. [solana/13-solana-dispute-and-reputation.md](./solana/13-solana-dispute-and-reputation.md)
+6. [solana/14-solana-task-market-and-worker-selection.md](./solana/14-solana-task-market-and-worker-selection.md)
+7. [solana/15-solana-security-and-audit-checklist.md](./solana/15-solana-security-and-audit-checklist.md)
 
 ### 如果你更关注 runtime 和执行层
 
@@ -95,8 +95,8 @@
 2. [05-verifiable-artifacts.md](./05-verifiable-artifacts.md)
 3. [06-policy-and-guardrails.md](./06-policy-and-guardrails.md)
 4. [08-verifiable-receipts-and-attestation.md](./08-verifiable-receipts-and-attestation.md)
-5. [12-solana-worker-runtime-integration.md](./12-solana-worker-runtime-integration.md)
-6. [16-solana-indexer-and-observability.md](./16-solana-indexer-and-observability.md)
+5. [solana/12-solana-worker-runtime-integration.md](./solana/12-solana-worker-runtime-integration.md)
+6. [solana/16-solana-indexer-and-observability.md](./solana/16-solana-indexer-and-observability.md)
 
 ---
 

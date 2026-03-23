@@ -1,6 +1,6 @@
 # 开发指南
 
-更多指南见 [AGENTS.md](../../../AGENTS.md)。
+更多指南见 [AGENTS.md](../../../../../AGENTS.md)。
 
 ## 设置
 

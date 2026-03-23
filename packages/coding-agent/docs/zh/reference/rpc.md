@@ -2,7 +2,7 @@
 
 RPC 模式通过 stdin/stdout 上的 JSON 协议启用 coding agent 的无头操作。这对将 agent 嵌入其他应用程序、IDE 或自定义 UI 很有用。
 
-**Node.js/TypeScript 用户注意**：如果你在构建 Node.js 应用，考虑直接从 `@mariozechner/pi-coding-agent` 使用 `AgentSession`，而不是启动子进程。API 见 [`src/core/agent-session.ts`](../src/core/agent-session.ts)。对于基于子进程的 TypeScript 客户端，见 [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts)。
+**Node.js/TypeScript 用户注意**：如果你在构建 Node.js 应用，考虑直接从 `@mariozechner/pi-coding-agent` 使用 `AgentSession`，而不是启动子进程。API 见 [`src/core/agent-session.ts`](../../../src/core/agent-session.ts)。对于基于子进程的 TypeScript 客户端，见 [`src/modes/rpc/rpc-client.ts`](../../../src/modes/rpc/rpc-client.ts)。
 
 ## 启动 RPC 模式
 
@@ -1147,10 +1147,10 @@ Agent 完成时发出。包含此运行中生成的所有消息。
 ## 类型
 
 源文件：
-- [`packages/ai/src/types.ts`](../../ai/src/types.ts) - `Model`、`UserMessage`、`AssistantMessage`、`ToolResultMessage`
-- [`packages/agent/src/types.ts`](../../agent/src/types.ts) - `AgentMessage`、`AgentEvent`
-- [`src/core/messages.ts`](../src/core/messages.ts) - `BashExecutionMessage`
-- [`src/modes/rpc/rpc-types.ts`](../src/modes/rpc/rpc-types.ts) - RPC 命令/响应类型、扩展 UI 请求/响应类型
+- [`packages/ai/src/types.ts`](../../../../ai/src/types.ts) - `Model`、`UserMessage`、`AssistantMessage`、`ToolResultMessage`
+- [`packages/agent/src/types.ts`](../../../../agent/src/types.ts) - `AgentMessage`、`AgentEvent`
+- [`src/core/messages.ts`](../../../src/core/messages.ts) - `BashExecutionMessage`
+- [`src/modes/rpc/rpc-types.ts`](../../../src/modes/rpc/rpc-types.ts) - RPC 命令/响应类型、扩展 UI 请求/响应类型
 
 ### Model
 
@@ -1297,9 +1297,9 @@ for event in read_events():
 
 ## 示例：交互式客户端（Node.js）
 
-完整交互示例见 [`test/rpc-example.ts`](../test/rpc-example.ts)，或类型化客户端实现见 [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts)。
+完整交互示例见 [`test/rpc-example.ts`](../../../test/rpc-example.ts)，或类型化客户端实现见 [`src/modes/rpc/rpc-client.ts`](../../../src/modes/rpc/rpc-client.ts)。
 
-处理扩展 UI 协议的完整示例见 [`examples/rpc-extension-ui.ts`](../examples/rpc-extension-ui.ts)，它与 [`examples/extensions/rpc-demo.ts`](../examples/extensions/rpc-demo.ts) 扩展配对使用。
+处理扩展 UI 协议的完整示例见 [`examples/rpc-extension-ui.ts`](../../../examples/rpc-extension-ui.ts)，它与 [`examples/extensions/rpc-demo.ts`](../../../examples/extensions/rpc-demo.ts) 扩展配对使用。
 
 ```javascript
 const { spawn } = require("child_process");

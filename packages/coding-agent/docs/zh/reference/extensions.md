@@ -1,7 +1,7 @@
 
 ## 示例参考
 
-所有示例在 [examples/extensions/](../examples/extensions/)。
+所有示例在 [examples/extensions/](../../../examples/extensions/)。
 
 | 示例 | 说明 | 关键 API |
 |---------|-------------|----------|

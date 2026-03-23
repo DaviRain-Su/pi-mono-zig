@@ -153,6 +153,9 @@
 - [dasn/24-dasn-standard-proposal.md](./dasn/24-dasn-standard-proposal.md)
 - [dasn/25-dasn-sdk-design.md](./dasn/25-dasn-sdk-design.md)
 
+### 产品实现线
+- [31-decentralized-agent-platform-design.md](./31-decentralized-agent-platform-design.md) - dAgent Hub 产品完整设计 (Sui/X Layer) 🆕
+
 ---
 
 ## 与其他文档的关系

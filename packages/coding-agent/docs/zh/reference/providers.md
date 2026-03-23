@@ -183,7 +183,7 @@ export GOOGLE_CLOUD_LOCATION=us-central1
 
 **通过 models.json：** 添加 Ollama、LM Studio、vLLM 或任何支持已知 API（OpenAI Completions、OpenAI Responses、Anthropic Messages、Google Generative AI）的 provider。见 [models.md](models.md)。
 
-**通过扩展：** 对于需要自定义 API 实现或 OAuth 流程的 provider，创建扩展。见 [custom-provider.md](custom-provider.md) 和 [examples/extensions/custom-provider-gitlab-duo](../examples/extensions/custom-provider-gitlab-duo/)。
+**通过扩展：** 对于需要自定义 API 实现或 OAuth 流程的 provider，创建扩展。见 [custom-provider.md](custom-provider.md) 和 [examples/extensions/custom-provider-gitlab-duo](../../../examples/extensions/custom-provider-gitlab-duo/)。
 
 ## 解析顺序
 

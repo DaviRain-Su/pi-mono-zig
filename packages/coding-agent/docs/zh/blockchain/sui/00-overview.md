@@ -107,12 +107,12 @@ use reputation::ReputationSystem;
 ## 文档结构
 
 ### 基础层
-- [01-roadmap.md](./01-roadmap.md) - Sui 集成路线图
+- [../01-roadmap.md](../01-roadmap.md) - 区块链结合路线图
 - [02-task-models.md](./02-task-models.md) - Sui 任务模型设计
-- [03-llm-payment-layer.md](./03-llm-payment-layer.md) - LLM 支付层
-- [04-task-execution-flow.md](./04-task-execution-flow.md) - 任务执行时序
-- [05-verifiable-artifacts.md](./05-verifiable-artifacts.md) - 可验证 Artifact
-- [06-policy-and-guardrails.md](./06-policy-and-guardrails.md) - Policy 设计
+- [../03-llm-payment-layer.md](../03-llm-payment-layer.md) - LLM 支付层
+- [../04-task-execution-flow.md](../04-task-execution-flow.md) - 任务执行时序
+- [../05-verifiable-artifacts.md](../05-verifiable-artifacts.md) - 可验证 Artifact
+- [../06-policy-and-guardrails.md](../06-policy-and-guardrails.md) - Policy 设计
 
 ### Sui 主线
 - [10-sui-mvp-design.md](./10-sui-mvp-design.md) - MVP 账户/对象模型
@@ -213,7 +213,7 @@ struct Task has key {
 - **测试网**: `sui client switch --env testnet`
 
 ### pi 相关
-- [Solana 实现对比](../09-solana-mvp-design.md) - 了解 Solana 实现后再看 Sui
+- [Solana 实现对比](../solana/09-solana-mvp-design.md) - 了解 Solana 实现后再看 Sui
 - [Worker Runtime](../../guide/08-first-extension.md) - Worker 基础
 
 ---

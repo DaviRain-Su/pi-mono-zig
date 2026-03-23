@@ -435,7 +435,7 @@ public entry fun submit_result(
 
 ## 下一步
 
-- [04-task-execution-flow.md](./04-task-execution-flow.md) - 完整执行时序
+- [../04-task-execution-flow.md](../04-task-execution-flow.md) - 完整执行时序
 - [11-sui-contract-instructions.md](./11-sui-contract-instructions.md) - Move 合约完整指令集
 
 ---

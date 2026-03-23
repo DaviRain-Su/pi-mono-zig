@@ -291,5 +291,5 @@ echo $COLORTERM  # 应输出 "truecolor" 或 "24bit"
 ## 示例
 
 查看内置主题：
-- [dark.json](../src/modes/interactive/theme/dark.json)
-- [light.json](../src/modes/interactive/theme/light.json)
+- [dark.json](../../../src/modes/interactive/theme/dark.json)
+- [light.json](../../../src/modes/interactive/theme/light.json)

@@ -391,7 +391,7 @@ pi-mono 是这个网络的基石，提供了最核心的 Agent Runtime 能力。
 ## 参考
 
 - [Solana 专题](../) - 技术实现细节
-- [Sui 专题](./sui/) - 技术实现细节
+- [Sui 专题](../sui/README.md) - 技术实现细节
 - [扩展开发指南](../../reference/extensions.md) - Worker 开发
 - [Agent Psychosis](../../guide/07-healthy-usage.md) - 健康使用 Agent
 

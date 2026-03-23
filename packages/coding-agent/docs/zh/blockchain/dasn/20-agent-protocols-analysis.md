@@ -514,7 +514,7 @@ DASN 填补了**最上层**的空白：
 ### DASN 相关
 - [DASN 愿景](./19-dasn-vision.md)
 - [Solana 专题](./)
-- [Sui 专题](./sui/)
+- [Sui 专题](../sui/README.md)
 
 ---
 

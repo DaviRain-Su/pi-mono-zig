@@ -175,7 +175,7 @@ await showMenu();  // 首次显示
 await showMenu();  // "返回" = 再次调用
 ```
 
-见 [overlay-qa-tests.ts](../examples/extensions/overlay-qa-tests.ts) 获取涵盖锚点、边距、堆叠、响应式可见性和动画的完整示例。
+见 [overlay-qa-tests.ts](../../../examples/extensions/overlay-qa-tests.ts) 获取涵盖锚点、边距、堆叠、响应式可见性和动画的完整示例。
 
 ## 内置组件
 
@@ -643,7 +643,7 @@ pi.registerCommand("pick", {
 });
 ```
 
-**示例：** [preset.ts](../examples/extensions/preset.ts)、[tools.ts](../examples/extensions/tools.ts)
+**示例：** [preset.ts](../../../examples/extensions/preset.ts)、[tools.ts](../../../examples/extensions/tools.ts)
 
 ### 模式 2：带取消的异步操作（BorderedLoader）
 
@@ -675,7 +675,7 @@ pi.registerCommand("fetch", {
 });
 ```
 
-**示例：** [qna.ts](../examples/extensions/qna.ts)、[handoff.ts](../examples/extensions/handoff.ts)
+**示例：** [qna.ts](../../../examples/extensions/qna.ts)、[handoff.ts](../../../examples/extensions/handoff.ts)
 
 ### 模式 3：设置/开关（SettingsList）
 
@@ -719,7 +719,7 @@ pi.registerCommand("settings", {
 });
 ```
 
-**示例：** [tools.ts](../examples/extensions/tools.ts)
+**示例：** [tools.ts](../../../examples/extensions/tools.ts)
 
 ### 模式 4：持久状态指示器
 
@@ -733,7 +733,7 @@ ctx.ui.setStatus("my-ext", ctx.ui.theme.fg("accent", "● active"));
 ctx.ui.setStatus("my-ext", undefined);
 ```
 
-**示例：** [status-line.ts](../examples/extensions/status-line.ts)、[plan-mode.ts](../examples/extensions/plan-mode.ts)、[preset.ts](../examples/extensions/preset.ts)
+**示例：** [status-line.ts](../../../examples/extensions/status-line.ts)、[plan-mode.ts](../../../examples/extensions/plan-mode)、[preset.ts](../../../examples/extensions/preset.ts)
 
 ### 模式 5：编辑器上方/下方的小部件
 
@@ -763,7 +763,7 @@ ctx.ui.setWidget("my-widget", (_tui, theme) => {
 ctx.ui.setWidget("my-widget", undefined);
 ```
 
-**示例：** [plan-mode.ts](../examples/extensions/plan-mode.ts)
+**示例：** [plan-mode.ts](../../../examples/extensions/plan-mode)
 
 ### 模式 6：自定义页脚
 
@@ -785,7 +785,7 @@ ctx.ui.setFooter(undefined); // 恢复默认
 
 Token 统计可通过 `ctx.sessionManager.getBranch()` 和 `ctx.model` 获取。
 
-**示例：** [custom-footer.ts](../examples/extensions/custom-footer.ts)
+**示例：** [custom-footer.ts](../../../examples/extensions/custom-footer.ts)
 
 ### 模式 7：自定义编辑器（vim 模式等）
 
@@ -861,7 +861,7 @@ export default function (pi: ExtensionAPI) {
 - **工厂模式**：`setEditorComponent` 接收一个工厂函数，获取 `tui`、`theme` 和 `keybindings`
 - **传递 `undefined`** 恢复默认编辑器：`ctx.ui.setEditorComponent(undefined)`
 
-**示例：** [modal-editor.ts](../examples/extensions/modal-editor.ts)
+**示例：** [modal-editor.ts](../../../examples/extensions/modal-editor.ts)
 
 ## 关键规则
 
@@ -877,11 +877,11 @@ export default function (pi: ExtensionAPI) {
 
 ## 示例
 
-- **选择 UI**：[examples/extensions/preset.ts](../examples/extensions/preset.ts) - SelectList 配合 DynamicBorder 框架
-- **带取消的异步**：[examples/extensions/qna.ts](../examples/extensions/qna.ts) - 用于 LLM 调用的 BorderedLoader
-- **设置开关**：[examples/extensions/tools.ts](../examples/extensions/tools.ts) - 工具启用/禁用的 SettingsList
-- **状态指示器**：[examples/extensions/plan-mode.ts](../examples/extensions/plan-mode.ts) - setStatus 和 setWidget
-- **自定义页脚**：[examples/extensions/custom-footer.ts](../examples/extensions/custom-footer.ts) - 带统计的 setFooter
-- **自定义编辑器**：[examples/extensions/modal-editor.ts](../examples/extensions/modal-editor.ts) - 类 Vim 模态编辑
-- **贪吃蛇游戏**：[examples/extensions/snake.ts](../examples/extensions/snake.ts) - 完整游戏，带键盘输入、游戏循环
-- **自定义工具渲染**：[examples/extensions/todo.ts](../examples/extensions/todo.ts) - renderCall 和 renderResult
+- **选择 UI**：[examples/extensions/preset.ts](../../../examples/extensions/preset.ts) - SelectList 配合 DynamicBorder 框架
+- **带取消的异步**：[examples/extensions/qna.ts](../../../examples/extensions/qna.ts) - 用于 LLM 调用的 BorderedLoader
+- **设置开关**：[examples/extensions/tools.ts](../../../examples/extensions/tools.ts) - 工具启用/禁用的 SettingsList
+- **状态指示器**：[examples/extensions/plan-mode.ts](../../../examples/extensions/plan-mode) - setStatus 和 setWidget
+- **自定义页脚**：[examples/extensions/custom-footer.ts](../../../examples/extensions/custom-footer.ts) - 带统计的 setFooter
+- **自定义编辑器**：[examples/extensions/modal-editor.ts](../../../examples/extensions/modal-editor.ts) - 类 Vim 模态编辑
+- **贪吃蛇游戏**：[examples/extensions/snake.ts](../../../examples/extensions/snake.ts) - 完整游戏，带键盘输入、游戏循环
+- **自定义工具渲染**：[examples/extensions/todo.ts](../../../examples/extensions/todo.ts) - renderCall 和 renderResult
