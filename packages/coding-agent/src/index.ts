@@ -97,6 +97,7 @@ export type {
 	ReadToolCallEvent,
 	RegisteredCommand,
 	RegisteredTool,
+	ResolvedCommand,
 	SessionBeforeCompactEvent,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,

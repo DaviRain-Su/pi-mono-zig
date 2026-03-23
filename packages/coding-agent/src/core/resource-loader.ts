@@ -849,9 +849,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private detectExtensionConflicts(extensions: Extension[]): Array<{ path: string; message: string }> {
 		const conflicts: Array<{ path: string; message: string }> = [];
 
-		// Track which extension registered each tool, command, and flag
+		// Track which extension registered each tool and flag
 		const toolOwners = new Map<string, string>();
-		const commandOwners = new Map<string, string>();
 		const flagOwners = new Map<string, string>();
 
 		for (const ext of extensions) {
@@ -865,19 +864,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 					});
 				} else {
 					toolOwners.set(toolName, ext.path);
-				}
-			}
-
-			// Check commands
-			for (const commandName of ext.commands.keys()) {
-				const existingOwner = commandOwners.get(commandName);
-				if (existingOwner && existingOwner !== ext.path) {
-					conflicts.push({
-						path: ext.path,
-						message: `Command "/${commandName}" conflicts with ${existingOwner}`,
-					});
-				} else {
-					commandOwners.set(commandName, ext.path);
 				}
 			}
 

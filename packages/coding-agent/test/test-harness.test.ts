@@ -7,7 +7,7 @@ import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, type Harness } from "./test-harness.js";
+import { createHarness, createHarnessWithExtensions, type Harness } from "./test-harness.js";
 
 describe("test harness", () => {
 	let harness: Harness;
@@ -255,6 +255,58 @@ describe("test harness", () => {
 
 		expect(firstThinking).toBeLessThan(firstText);
 		expect(firstText).toBeLessThan(firstToolcall);
+	});
+
+	it("loads inline extension factories and disambiguates duplicate commands", async () => {
+		const calls: string[] = [];
+
+		harness = await createHarnessWithExtensions({
+			extensionFactories: [
+				{
+					path: "<alpha>",
+					factory: (pi) => {
+						pi.registerCommand("shared-cmd", {
+							description: "Alpha command",
+							handler: async (args) => {
+								calls.push(`alpha:${args}`);
+							},
+						});
+					},
+				},
+				{
+					path: "<beta>",
+					factory: (pi) => {
+						pi.registerCommand("shared-cmd", {
+							description: "Beta command",
+							handler: async (args) => {
+								calls.push(`beta:${args}`);
+							},
+						});
+					},
+				},
+			],
+		});
+
+		const runner = harness.session.extensionRunner;
+		expect(runner).toBeDefined();
+
+		const commands = runner!.getRegisteredCommands();
+		expect(
+			commands.map((command) => ({
+				name: command.name,
+				invocationName: command.invocationName,
+				description: command.description,
+				path: command.sourceInfo.path,
+			})),
+		).toEqual([
+			{ name: "shared-cmd", invocationName: "shared-cmd:1", description: "Alpha command", path: "<alpha>" },
+			{ name: "shared-cmd", invocationName: "shared-cmd:2", description: "Beta command", path: "<beta>" },
+		]);
+
+		await runner!.getCommand("shared-cmd:1")?.handler("first", runner!.createCommandContext());
+		await runner!.getCommand("shared-cmd:2")?.handler("second", runner!.createCommandContext());
+
+		expect(calls).toEqual(["alpha:first", "beta:second"]);
 	});
 
 	it("session persistence works", async () => {

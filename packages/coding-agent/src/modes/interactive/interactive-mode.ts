@@ -332,7 +332,10 @@ export class InteractiveMode {
 			.filter((command) => builtinNames.has(command.name))
 			.map((command) => ({
 				type: "warning" as const,
-				message: `Extension command '/${command.name}' conflicts with built-in interactive command. Skipping in autocomplete.`,
+				message:
+					command.invocationName === command.name
+						? `Extension command '/${command.name}' conflicts with built-in interactive command. Skipping in autocomplete.`
+						: `Extension command '/${command.name}' conflicts with built-in interactive command. Available as '/${command.invocationName}'.`,
 				path: command.sourceInfo.path,
 			}));
 	}
@@ -386,7 +389,7 @@ export class InteractiveMode {
 		const extensionCommands: SlashCommand[] = (
 			this.session.extensionRunner?.getRegisteredCommands().filter((cmd) => !builtinCommandNames.has(cmd.name)) ?? []
 		).map((cmd) => ({
-			name: cmd.name,
+			name: cmd.invocationName,
 			description: this.prefixAutocompleteDescription(cmd.description, cmd.sourceInfo),
 			getArgumentCompletions: cmd.getArgumentCompletions,
 		}));

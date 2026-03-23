@@ -967,6 +967,10 @@ export interface RegisteredCommand {
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 }
 
+export interface ResolvedCommand extends RegisteredCommand {
+	invocationName: string;
+}
+
 // ============================================================================
 // Extension API
 // ============================================================================

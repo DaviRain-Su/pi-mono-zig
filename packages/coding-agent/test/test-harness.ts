@@ -32,7 +32,12 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type { Settings } from "../src/core/settings-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
-import { createTestResourceLoader } from "./utilities.js";
+import type { ExtensionFactory, ResourceLoader } from "../src/index.js";
+import {
+	type CreateTestExtensionsResultInput,
+	createTestExtensionsResult,
+	createTestResourceLoader,
+} from "./utilities.js";
 
 // ============================================================================
 // Faux model
@@ -327,6 +332,10 @@ export interface HarnessOptions {
 	tools?: AgentTool[];
 	/** Base tools override (replaces built-in read/bash/edit/write). */
 	baseToolsOverride?: Record<string, AgentTool>;
+	/** Optional resource loader override. */
+	resourceLoader?: ResourceLoader;
+	/** Inline extensions to load into the session resource loader. */
+	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 }
 
 export interface Harness {
@@ -346,10 +355,17 @@ export interface Harness {
 	cleanup: () => void;
 }
 
-export function createHarness(options: HarnessOptions = {}): Harness {
+function createTempDir(): string {
 	const tempDir = join(tmpdir(), `pi-harness-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
+	return tempDir;
+}
 
+function createHarnessWithResourceLoader(
+	options: HarnessOptions,
+	resourceLoader: ResourceLoader,
+	tempDir: string,
+): Harness {
 	const baseModel = options.model ?? fauxModel;
 	const model: Model<any> = options.contextWindow ? { ...baseModel, contextWindow: options.contextWindow } : baseModel;
 
@@ -382,7 +398,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		settingsManager,
 		cwd: tempDir,
 		modelRegistry,
-		resourceLoader: createTestResourceLoader(),
+		resourceLoader,
 		baseToolsOverride: options.baseToolsOverride,
 	});
 
@@ -411,4 +427,20 @@ export function createHarness(options: HarnessOptions = {}): Harness {
 		tempDir,
 		cleanup,
 	};
+}
+
+export function createHarness(options: HarnessOptions = {}): Harness {
+	if (options.extensionFactories?.length) {
+		throw new Error("createHarness does not support extensionFactories. Use createHarnessWithExtensions().");
+	}
+
+	const tempDir = createTempDir();
+	return createHarnessWithResourceLoader(options, options.resourceLoader ?? createTestResourceLoader(), tempDir);
+}
+
+export async function createHarnessWithExtensions(options: HarnessOptions = {}): Promise<Harness> {
+	const tempDir = createTempDir();
+	const extensionsResult = await createTestExtensionsResult(options.extensionFactories ?? [], tempDir);
+	const resourceLoader = options.resourceLoader ?? createTestResourceLoader({ extensionsResult });
+	return createHarnessWithResourceLoader(options, resourceLoader, tempDir);
 }

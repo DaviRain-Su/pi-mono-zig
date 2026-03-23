@@ -101,6 +101,7 @@ export type {
 	// Commands
 	RegisteredCommand,
 	RegisteredTool,
+	ResolvedCommand,
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,

@@ -37,6 +37,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	RegisteredTool,
+	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
 	SessionBeforeCompactResult,
@@ -467,41 +468,53 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	private collectRegisteredCommands(diagnostics?: ResourceDiagnostic[]): RegisteredCommand[] {
+	private resolveRegisteredCommands(): ResolvedCommand[] {
 		const commands: RegisteredCommand[] = [];
-		const commandOwners = new Map<string, string>();
+		const counts = new Map<string, number>();
+
 		for (const ext of this.extensions) {
 			for (const command of ext.commands.values()) {
-				const existingOwner = commandOwners.get(command.name);
-				if (existingOwner) {
-					const message = `Extension command '${command.name}' from ${ext.path} conflicts with ${existingOwner}. Skipping.`;
-					diagnostics?.push({ type: "warning", message, path: ext.path });
-					if (diagnostics && !this.hasUI()) {
-						console.warn(message);
-					}
-					continue;
-				}
-
-				commandOwners.set(command.name, ext.path);
 				commands.push(command);
+				counts.set(command.name, (counts.get(command.name) ?? 0) + 1);
 			}
 		}
-		return commands;
+
+		const seen = new Map<string, number>();
+		const takenInvocationNames = new Set<string>();
+
+		return commands.map((command) => {
+			const occurrence = (seen.get(command.name) ?? 0) + 1;
+			seen.set(command.name, occurrence);
+
+			let invocationName = (counts.get(command.name) ?? 0) > 1 ? `${command.name}:${occurrence}` : command.name;
+
+			if (takenInvocationNames.has(invocationName)) {
+				let suffix = occurrence;
+				do {
+					suffix++;
+					invocationName = `${command.name}:${suffix}`;
+				} while (takenInvocationNames.has(invocationName));
+			}
+
+			takenInvocationNames.add(invocationName);
+			return {
+				...command,
+				invocationName,
+			};
+		});
 	}
 
-	getRegisteredCommands(): RegisteredCommand[] {
-		const diagnostics: ResourceDiagnostic[] = [];
-		const commands = this.collectRegisteredCommands(diagnostics);
-		this.commandDiagnostics = diagnostics;
-		return commands;
+	getRegisteredCommands(): ResolvedCommand[] {
+		this.commandDiagnostics = [];
+		return this.resolveRegisteredCommands();
 	}
 
 	getCommandDiagnostics(): ResourceDiagnostic[] {
 		return this.commandDiagnostics;
 	}
 
-	getCommand(name: string): RegisteredCommand | undefined {
-		return this.collectRegisteredCommands().find((command) => command.name === name);
+	getCommand(name: string): ResolvedCommand | undefined {
+		return this.resolveRegisteredCommands().find((command) => command.invocationName === name);
 	}
 
 	/**

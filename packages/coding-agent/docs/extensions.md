@@ -1089,6 +1089,8 @@ Labels persist in the session and survive restarts. Use them to mark important p
 
 Register a command.
 
+If multiple extensions register the same command name, pi keeps them all and assigns numeric invocation suffixes in load order, for example `/review:1` and `/review:2`.
+
 ```typescript
 pi.registerCommand("stats", {
   description: "Show session statistics",
@@ -1133,7 +1135,7 @@ Each entry has this shape:
 
 ```typescript
 {
-  name: string; // Command name without the leading slash
+  name: string; // Invokable command name without the leading slash. May be suffixed like "review:1"
   description?: string;
   source: "extension" | "prompt" | "skill";
   sourceInfo: {

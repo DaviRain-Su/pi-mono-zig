@@ -35,6 +35,7 @@ Examples:
 
 ### Fixed
 
+- Fixed extension command name conflicts so extensions with duplicate command names can load together. Conflicting extension commands now get numeric invocation suffixes in load order, for example `/review:1` and `/review:2` ([#1061](https://github.com/badlogic/pi-mono/issues/1061))
 - Fixed slash command source attribution for extension commands, prompt templates, and skills in autocomplete and command discovery ([#1734](https://github.com/badlogic/pi-mono/issues/1734))
 - Fixed auto-resized image handling to enforce the inline image size limit on the final base64 payload, return text-only fallbacks when resizing cannot produce a safe image, and avoid falling back to the original image in `read` and `@file` auto-resize paths ([#2055](https://github.com/badlogic/pi-mono/issues/2055))
 - Fixed `pi update` for git packages to skip destructive reset, clean, and reinstall steps when the fetched target already matches the local checkout ([#2503](https://github.com/badlogic/pi-mono/issues/2503))

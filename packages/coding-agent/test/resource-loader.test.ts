@@ -195,7 +195,7 @@ Project skill`,
 
 			const extensionsResult = loader.getExtensions();
 			expect(extensionsResult.extensions).toHaveLength(2);
-			expect(extensionsResult.errors.some((e) => e.error.includes('Command "/deploy" conflicts'))).toBe(true);
+			expect(extensionsResult.errors.some((e) => e.error.includes('Command "/deploy" conflicts'))).toBe(false);
 
 			const sessionManager = SessionManager.inMemory();
 			const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -208,12 +208,18 @@ Project skill`,
 				modelRegistry,
 			);
 
-			expect(runner.getCommand("deploy")?.description).toBe("project deploy");
+			expect(runner.getCommand("deploy:1")?.description).toBe("project deploy");
+			expect(runner.getCommand("deploy:2")?.description).toBe("user deploy");
 			expect(runner.getCommand("project-only")?.description).toBe("project only");
 			expect(runner.getCommand("user-only")?.description).toBe("user only");
 
-			const commandNames = runner.getRegisteredCommands().map((c) => c.name);
-			expect(commandNames.filter((name) => name === "deploy")).toHaveLength(1);
+			const commands = runner.getRegisteredCommands();
+			expect(commands.map((command) => command.invocationName)).toEqual([
+				"deploy:1",
+				"project-only",
+				"deploy:2",
+				"user-only",
+			]);
 		});
 
 		it("should honor overrides for auto-discovered resources", async () => {
@@ -551,7 +557,8 @@ export default function(pi: ExtensionAPI) {
 				modelRegistry,
 			);
 
-			expect(runner.getCommand("deploy")?.description).toBe("explicit command");
+			expect(runner.getCommand("deploy:1")?.description).toBe("explicit command");
+			expect(runner.getCommand("deploy:2")?.description).toBe("global command");
 			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
 		});
 	});

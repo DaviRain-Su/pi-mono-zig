@@ -2093,7 +2093,7 @@ export class AgentSession {
 	private _bindExtensionCore(runner: ExtensionRunner): void {
 		const getCommands = (): SlashCommandInfo[] => {
 			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
-				name: command.name,
+				name: command.invocationName,
 				description: command.description,
 				source: "extension",
 				sourceInfo: command.sourceInfo,

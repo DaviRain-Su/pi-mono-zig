@@ -546,7 +546,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 				for (const command of session.extensionRunner?.getRegisteredCommands() ?? []) {
 					commands.push({
-						name: command.name,
+						name: command.invocationName,
 						description: command.description,
 						source: "extension",
 						sourceInfo: command.sourceInfo,
