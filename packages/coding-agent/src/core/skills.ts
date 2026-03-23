@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "pat
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
+import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 
 /** Max name length per spec */
 const MAX_NAME_LENGTH = 64;
@@ -75,7 +76,7 @@ export interface Skill {
 	description: string;
 	filePath: string;
 	baseDir: string;
-	source: string;
+	sourceInfo: SourceInfo;
 	disableModelInvocation: boolean;
 }
 
@@ -134,6 +135,30 @@ export interface LoadSkillsFromDirOptions {
 	dir: string;
 	/** Source identifier for these skills */
 	source: string;
+}
+
+function createSkillSourceInfo(filePath: string, baseDir: string, source: string): SourceInfo {
+	switch (source) {
+		case "user":
+			return createSyntheticSourceInfo(filePath, {
+				source: "local",
+				scope: "user",
+				baseDir,
+			});
+		case "project":
+			return createSyntheticSourceInfo(filePath, {
+				source: "local",
+				scope: "project",
+				baseDir,
+			});
+		case "path":
+			return createSyntheticSourceInfo(filePath, {
+				source: "local",
+				baseDir,
+			});
+		default:
+			return createSyntheticSourceInfo(filePath, { source, baseDir });
+	}
 }
 
 /**
@@ -291,7 +316,7 @@ function loadSkillFromFile(
 				description: frontmatter.description,
 				filePath,
 				baseDir: skillDir,
-				source,
+				sourceInfo: createSkillSourceInfo(filePath, skillDir, source),
 				disableModelInvocation: frontmatter["disable-model-invocation"] === true,
 			},
 			diagnostics,

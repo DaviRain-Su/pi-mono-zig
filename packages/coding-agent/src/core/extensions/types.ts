@@ -55,6 +55,7 @@ import type {
 	SessionManager,
 } from "../session-manager.js";
 import type { SlashCommandInfo } from "../slash-commands.js";
+import type { SourceInfo } from "../source-info.js";
 import type { BashOperations } from "../tools/bash.js";
 import type { EditToolDetails } from "../tools/edit.js";
 import type {
@@ -960,9 +961,14 @@ export type MessageRenderer<T = unknown> = (
 
 export interface RegisteredCommand {
 	name: string;
+	sourceInfo: SourceInfo;
 	description?: string;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+}
+
+export interface ResolvedCommand extends RegisteredCommand {
+	invocationName: string;
 }
 
 // ============================================================================
@@ -1035,7 +1041,7 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** Register a custom command. */
-	registerCommand(name: string, options: Omit<RegisteredCommand, "name">): void;
+	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
 
 	/** Register a keyboard shortcut. */
 	registerShortcut(
@@ -1107,7 +1113,7 @@ export interface ExtensionAPI {
 	/** Get the list of currently active tool names. */
 	getActiveTools(): string[];
 
-	/** Get all configured tools with name and description. */
+	/** Get all configured tools with parameter schema and source metadata. */
 	getAllTools(): ToolInfo[];
 
 	/** Set the active tools by name. */
@@ -1274,7 +1280,7 @@ export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
 
 export interface RegisteredTool {
 	definition: ToolDefinition;
-	extensionPath: string;
+	sourceInfo: SourceInfo;
 }
 
 export interface ExtensionFlag {
@@ -1312,8 +1318,10 @@ export type GetSessionNameHandler = () => string | undefined;
 
 export type GetActiveToolsHandler = () => string[];
 
-/** Tool info with name, description, and parameter schema */
-export type ToolInfo = Pick<ToolDefinition, "name" | "description" | "parameters">;
+/** Tool info with name, description, parameter schema, and source metadata */
+export type ToolInfo = Pick<ToolDefinition, "name" | "description" | "parameters"> & {
+	sourceInfo: SourceInfo;
+};
 
 export type GetAllToolsHandler = () => ToolInfo[];
 
@@ -1414,6 +1422,7 @@ export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionAction
 export interface Extension {
 	path: string;
 	resolvedPath: string;
+	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;

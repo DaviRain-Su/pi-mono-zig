@@ -107,6 +107,45 @@ describe("DefaultPackageManager git update", () => {
 	}
 
 	describe("normal updates (no force-push)", () => {
+		it("should skip reset, clean, and install when already up to date", async () => {
+			mkdirSync(remoteDir, { recursive: true });
+			git(["init"], remoteDir);
+			git(["config", "--local", "user.email", "test@test.com"], remoteDir);
+			git(["config", "--local", "user.name", "Test"], remoteDir);
+			writeFileSync(join(remoteDir, "package.json"), JSON.stringify({ name: "test-extension", version: "1.0.0" }));
+			createCommit(remoteDir, "extension.ts", "// v1", "Initial commit");
+
+			mkdirSync(join(agentDir, "git", "github.com", "test"), { recursive: true });
+			git(["clone", remoteDir, installedDir], tempDir);
+			settingsManager.setPackages([gitSource]);
+
+			const executedCommands: string[] = [];
+			const managerWithInternals = packageManager as unknown as {
+				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
+			};
+			managerWithInternals.runCommand = async (command, args, options) => {
+				executedCommands.push(`${command} ${args.join(" ")}`);
+				if (command === "npm") {
+					return;
+				}
+				const result = spawnSync(command, args, {
+					cwd: options?.cwd,
+					encoding: "utf-8",
+				});
+				if (result.status !== 0) {
+					throw new Error(`Command failed: ${command} ${args.join(" ")}\n${result.stderr}`);
+				}
+			};
+
+			await packageManager.update();
+
+			expect(executedCommands).toContain("git fetch --prune origin");
+			expect(executedCommands).not.toContain("git reset --hard @{upstream}");
+			expect(executedCommands).not.toContain("git reset --hard origin/HEAD");
+			expect(executedCommands).not.toContain("git clean -fdx");
+			expect(executedCommands).not.toContain("npm install");
+		});
+
 		it("should update to latest commit when remote has new commits", async () => {
 			setupRemoteAndInstall();
 			expect(getFileContent(installedDir, "extension.ts")).toBe("// v1");
@@ -269,12 +308,22 @@ describe("DefaultPackageManager git update", () => {
 			const executedCommands: string[] = [];
 			const managerWithInternals = packageManager as unknown as {
 				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
+				runCommandCapture: (command: string, args: string[], options?: { cwd?: string }) => Promise<string>;
 			};
 			managerWithInternals.runCommand = async (command, args) => {
 				executedCommands.push(`${command} ${args.join(" ")}`);
 				if (command === "git" && args[0] === "reset") {
 					writeFileSync(extensionFile, "// fresh");
 				}
+			};
+			managerWithInternals.runCommandCapture = async (_command, args) => {
+				if (args[0] === "rev-parse" && args[1] === "HEAD") {
+					return "local-head";
+				}
+				if (args[0] === "rev-parse" && args[1] === "@{upstream}") {
+					return "remote-head";
+				}
+				return "";
 			};
 
 			await packageManager.resolveExtensionSources([gitSource], { temporary: true });

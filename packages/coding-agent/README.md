@@ -1,9 +1,9 @@
 <!-- OSS_WEEKEND_START -->
 # 🏖️ OSS Weekend
 
-**Issue tracker reopens Monday, March 23, 2026.**
+**Issue tracker reopens Monday, March 30, 2026.**
 
-OSS weekend runs Friday, March 20, 2026 through Monday, March 23, 2026. New issues are auto-closed during this time. For support, join [Discord](https://discord.com/invite/3cU7Bz4UPx).
+OSS weekend runs Sunday, March 22, 2026 through Monday, March 30, 2026. New issues are auto-closed during this time. For support, join [Discord](https://discord.com/invite/3cU7Bz4UPx).
 <!-- OSS_WEEKEND_END -->
 
 ---

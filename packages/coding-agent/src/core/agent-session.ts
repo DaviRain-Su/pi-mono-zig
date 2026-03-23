@@ -75,7 +75,8 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.j
 import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.js";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
-import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo, type SlashCommandLocation } from "./slash-commands.js";
+import type { SlashCommandInfo } from "./slash-commands.js";
+import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import type { BashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
@@ -201,6 +202,11 @@ export interface SessionStats {
 	cost: number;
 }
 
+interface ToolDefinitionEntry {
+	definition: ToolDefinition;
+	sourceInfo: SourceInfo;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -274,7 +280,7 @@ export class AgentSession {
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
-	private _toolDefinitions: Map<string, ToolDefinition> = new Map();
+	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
 
@@ -710,18 +716,19 @@ export class AgentSession {
 	}
 
 	/**
-	 * Get all configured tools with name, description, and parameter schema.
+	 * Get all configured tools with name, description, parameter schema, and source metadata.
 	 */
 	getAllTools(): ToolInfo[] {
-		return Array.from(this._toolDefinitions.values()).map((t) => ({
-			name: t.name,
-			description: t.description,
-			parameters: t.parameters,
+		return Array.from(this._toolDefinitions.values()).map(({ definition, sourceInfo }) => ({
+			name: definition.name,
+			description: definition.description,
+			parameters: definition.parameters,
+			sourceInfo,
 		}));
 	}
 
 	getToolDefinition(name: string): ToolDefinition | undefined {
-		return this._toolDefinitions.get(name);
+		return this._toolDefinitions.get(name)?.definition;
 	}
 
 	/**
@@ -2084,40 +2091,26 @@ export class AgentSession {
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
-		const normalizeLocation = (source: string): SlashCommandLocation | undefined => {
-			if (source === "user" || source === "project" || source === "path") {
-				return source;
-			}
-			return undefined;
-		};
-
-		const reservedBuiltins = new Set(BUILTIN_SLASH_COMMANDS.map((command) => command.name));
-
 		const getCommands = (): SlashCommandInfo[] => {
-			const extensionCommands: SlashCommandInfo[] = runner
-				.getRegisteredCommandsWithPaths()
-				.filter(({ command }) => !reservedBuiltins.has(command.name))
-				.map(({ command, extensionPath }) => ({
-					name: command.name,
-					description: command.description,
-					source: "extension",
-					path: extensionPath,
-				}));
+			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
+				name: command.invocationName,
+				description: command.description,
+				source: "extension",
+				sourceInfo: command.sourceInfo,
+			}));
 
 			const templates: SlashCommandInfo[] = this.promptTemplates.map((template) => ({
 				name: template.name,
 				description: template.description,
 				source: "prompt",
-				location: normalizeLocation(template.source),
-				path: template.filePath,
+				sourceInfo: template.sourceInfo,
 			}));
 
 			const skills: SlashCommandInfo[] = this._resourceLoader.getSkills().skills.map((skill) => ({
 				name: `skill:${skill.name}`,
 				description: skill.description,
 				source: "skill",
-				location: normalizeLocation(skill.source),
-				path: skill.filePath,
+				sourceInfo: skill.sourceInfo,
 			}));
 
 			return [...extensionCommands, ...templates, ...skills];
@@ -2211,16 +2204,30 @@ export class AgentSession {
 		const registeredTools = this._extensionRunner?.getAllRegisteredTools() ?? [];
 		const allCustomTools = [
 			...registeredTools,
-			...this._customTools.map((def) => ({ definition: def, extensionPath: "<sdk>" })),
+			...this._customTools.map((definition) => ({
+				definition,
+				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
+			})),
 		];
-		const definitionRegistry = new Map(this._baseToolDefinitions);
-		for (const { definition } of allCustomTools) {
-			definitionRegistry.set(definition.name, definition);
+		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
+			Array.from(this._baseToolDefinitions.entries()).map(([name, definition]) => [
+				name,
+				{
+					definition,
+					sourceInfo: createSyntheticSourceInfo(`<builtin:${name}>`, { source: "builtin" }),
+				},
+			]),
+		);
+		for (const tool of allCustomTools) {
+			definitionRegistry.set(tool.definition.name, {
+				definition: tool.definition,
+				sourceInfo: tool.sourceInfo,
+			});
 		}
 		this._toolDefinitions = definitionRegistry;
 		this._toolPromptSnippets = new Map(
 			Array.from(definitionRegistry.values())
-				.map((definition) => {
+				.map(({ definition }) => {
 					const snippet = this._normalizePromptSnippet(definition.promptSnippet);
 					return snippet ? ([definition.name, snippet] as const) : undefined;
 				})
@@ -2228,7 +2235,7 @@ export class AgentSession {
 		);
 		this._toolPromptGuidelines = new Map(
 			Array.from(definitionRegistry.values())
-				.map((definition) => {
+				.map(({ definition }) => {
 					const guidelines = this._normalizePromptGuidelines(definition.promptGuidelines);
 					return guidelines.length > 0 ? ([definition.name, guidelines] as const) : undefined;
 				})

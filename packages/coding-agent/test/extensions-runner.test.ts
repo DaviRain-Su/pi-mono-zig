@@ -345,9 +345,10 @@ describe("ExtensionRunner", () => {
 
 			expect(commands.length).toBe(2);
 			expect(commands.map((c) => c.name).sort()).toEqual(["cmd-a", "cmd-b"]);
+			expect(commands.map((c) => c.invocationName).sort()).toEqual(["cmd-a", "cmd-b"]);
 		});
 
-		it("gets command by name", async () => {
+		it("gets command by invocation name", async () => {
 			const cmdCode = `
 				export default function(pi) {
 					pi.registerCommand("my-cmd", {
@@ -364,39 +365,37 @@ describe("ExtensionRunner", () => {
 			const cmd = runner.getCommand("my-cmd");
 			expect(cmd).toBeDefined();
 			expect(cmd?.name).toBe("my-cmd");
+			expect(cmd?.invocationName).toBe("my-cmd");
 			expect(cmd?.description).toBe("My command");
 
 			const missing = runner.getCommand("not-exists");
 			expect(missing).toBeUndefined();
 		});
 
-		it("filters out commands conflict with reseved", async () => {
-			const cmdCode = (name: string) => `
+		it("suffixes duplicate extension commands in insertion order", async () => {
+			const cmdCode = (description: string) => `
 				export default function(pi) {
-					pi.registerCommand("${name}", {
-						description: "Test command",
+					pi.registerCommand("shared-cmd", {
+						description: "${description}",
 						handler: async () => {},
 					});
 				}
 			`;
-			fs.writeFileSync(path.join(extensionsDir, "cmd-a.ts"), cmdCode("cmd-a"));
-			fs.writeFileSync(path.join(extensionsDir, "cmd-b.ts"), cmdCode("cmd-b"));
-
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			fs.writeFileSync(path.join(extensionsDir, "cmd-a.ts"), cmdCode("First command"));
+			fs.writeFileSync(path.join(extensionsDir, "cmd-b.ts"), cmdCode("Second command"));
 
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
-			const commands = runner.getRegisteredCommands(new Set(["cmd-a"]));
+			const commands = runner.getRegisteredCommands();
 			const diagnostics = runner.getCommandDiagnostics();
 
-			expect(commands.length).toBe(1);
-			expect(commands.map((c) => c.name).sort()).toEqual(["cmd-b"]);
-
-			expect(diagnostics.length).toBe(1);
-			expect(diagnostics[0].path).toEqual(path.join(extensionsDir, "cmd-a.ts"));
-
-			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("conflicts with built-in command"));
-			warnSpy.mockRestore();
+			expect(commands).toHaveLength(2);
+			expect(commands.map((command) => command.name)).toEqual(["shared-cmd", "shared-cmd"]);
+			expect(commands.map((command) => command.invocationName)).toEqual(["shared-cmd:1", "shared-cmd:2"]);
+			expect(commands.map((command) => command.description)).toEqual(["First command", "Second command"]);
+			expect(diagnostics).toEqual([]);
+			expect(runner.getCommand("shared-cmd:1")?.description).toBe("First command");
+			expect(runner.getCommand("shared-cmd:2")?.description).toBe("Second command");
 		});
 	});
 

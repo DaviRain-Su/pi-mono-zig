@@ -2,9 +2,12 @@
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-03-23
+
 ### Fixed
 
 - Fixed `truncateToWidth()` to stream truncation for very large strings, keep contiguous prefixes, and always terminate truncated SGR styling safely ([#2447](https://github.com/badlogic/pi-mono/issues/2447))
+- Fixed markdown heading styling being lost after inline code spans within headings
 
 ## [0.61.1] - 2026-03-20
 

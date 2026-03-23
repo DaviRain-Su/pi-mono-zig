@@ -18,6 +18,7 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
+import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import type {
@@ -43,15 +44,10 @@ export type {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(session: AgentSession): Promise<never> {
-	const rawStdoutWrite = process.stdout.write.bind(process.stdout);
-	const rawStderrWrite = process.stderr.write.bind(process.stderr);
-
-	process.stdout.write = ((
-		...args: Parameters<typeof process.stdout.write>
-	): ReturnType<typeof process.stdout.write> => rawStderrWrite(...args)) as typeof process.stdout.write;
+	takeOverStdout();
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		rawStdoutWrite(serializeJsonLine(obj));
+		writeRawStdout(serializeJsonLine(obj));
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -548,35 +544,30 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			case "get_commands": {
 				const commands: RpcSlashCommand[] = [];
 
-				// Extension commands
-				for (const { command, extensionPath } of session.extensionRunner?.getRegisteredCommandsWithPaths() ?? []) {
+				for (const command of session.extensionRunner?.getRegisteredCommands() ?? []) {
 					commands.push({
-						name: command.name,
+						name: command.invocationName,
 						description: command.description,
 						source: "extension",
-						path: extensionPath,
+						sourceInfo: command.sourceInfo,
 					});
 				}
 
-				// Prompt templates (source is always "user" | "project" | "path" in coding-agent)
 				for (const template of session.promptTemplates) {
 					commands.push({
 						name: template.name,
 						description: template.description,
 						source: "prompt",
-						location: template.source as RpcSlashCommand["location"],
-						path: template.filePath,
+						sourceInfo: template.sourceInfo,
 					});
 				}
 
-				// Skills (source is always "user" | "project" | "path" in coding-agent)
 				for (const skill of session.resourceLoader.getSkills().skills) {
 					commands.push({
 						name: `skill:${skill.name}`,
 						description: skill.description,
 						source: "skill",
-						location: skill.source as RpcSlashCommand["location"],
-						path: skill.filePath,
+						sourceInfo: skill.sourceInfo,
 					});
 				}
 

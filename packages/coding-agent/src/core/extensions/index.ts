@@ -2,7 +2,8 @@
  * Extension system for lifecycle events and custom tools.
  */
 
-export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from "../slash-commands.js";
+export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.js";
+export type { SourceInfo } from "../source-info.js";
 export {
 	createExtensionRuntime,
 	discoverAndLoadExtensions,
@@ -100,6 +101,7 @@ export type {
 	// Commands
 	RegisteredCommand,
 	RegisteredTool,
+	ResolvedCommand,
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,

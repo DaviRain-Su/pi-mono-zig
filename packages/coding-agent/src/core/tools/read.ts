@@ -160,13 +160,22 @@ export function createReadToolDefinition(
 								if (autoResizeImages) {
 									// Resize image if needed before sending it back to the model.
 									const resized = await resizeImage({ type: "image", data: base64, mimeType });
-									const dimensionNote = formatDimensionNote(resized);
-									let textNote = `Read image file [${resized.mimeType}]`;
-									if (dimensionNote) textNote += `\n${dimensionNote}`;
-									content = [
-										{ type: "text", text: textNote },
-										{ type: "image", data: resized.data, mimeType: resized.mimeType },
-									];
+									if (!resized) {
+										content = [
+											{
+												type: "text",
+												text: `Read image file [${mimeType}]\n[Image omitted: could not be resized below the inline image size limit.]`,
+											},
+										];
+									} else {
+										const dimensionNote = formatDimensionNote(resized);
+										let textNote = `Read image file [${resized.mimeType}]`;
+										if (dimensionNote) textNote += `\n${dimensionNote}`;
+										content = [
+											{ type: "text", text: textNote },
+											{ type: "image", data: resized.data, mimeType: resized.mimeType },
+										];
+									}
 								} else {
 									content = [
 										{ type: "text", text: `Read image file [${mimeType}]` },
