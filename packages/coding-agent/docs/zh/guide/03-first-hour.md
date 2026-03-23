@@ -1,6 +1,6 @@
 # 第3章：第一个小时
 
-> 安装、配置、基本使用
+> 安装、认证、启动与第一轮交互。
 
 ---
 
@@ -8,21 +8,27 @@
 
 ### 必需
 
-- **Node.js**: >= 20.0.0
-- **操作系统**: macOS、Linux、或 Windows (WSL2)
-- **Chrome 浏览器**: 用于需要登录的网站（可选但推荐）
+- **Node.js**：>= 20
+- **操作系统**：macOS、Linux、或 Windows（建议 WSL2）
 
 ### 推荐
 
-- **Git**: 用于代码版本控制
-- **VS Code**: 推荐的编辑器，配合 pi 使用
-- **终端**: iTerm2 (macOS)、Windows Terminal (Windows)、或 GNOME Terminal (Linux)
+- **现代终端**：iTerm2、Ghostty、Kitty、Windows Terminal、WezTerm 等
+- **Git**：用于版本管理
+- **Chrome 或默认浏览器**：用于 `/login` 打开 OAuth 页面
+
+平台细节可继续看：
+
+- [Windows](../platform/windows.md)
+- [Termux](../platform/termux.md)
+- [tmux](../platform/tmux.md)
+- [终端设置](../platform/terminal-setup.md)
 
 ---
 
 ## 3.2 安装
 
-### 全局安装（推荐）
+### 全局安装
 
 ```bash
 npm install -g @mariozechner/pi-coding-agent
@@ -32,7 +38,6 @@ npm install -g @mariozechner/pi-coding-agent
 
 ```bash
 pi --version
-# 输出类似: 0.12.0
 ```
 
 ### 更新
@@ -47,57 +52,75 @@ npm update -g @mariozechner/pi-coding-agent
 npm uninstall -g @mariozechner/pi-coding-agent
 ```
 
+如果你只想临时试用，也可以：
+
+```bash
+npx @mariozechner/pi-coding-agent
+```
+
 ---
 
-## 3.3 首次配置
+## 3.3 首次认证与配置
 
-### 方式一：环境变量（推荐）
+pi 支持两种主流认证方式：
 
-在你的 shell 配置文件（`~/.zshrc` 或 `~/.bashrc`）中添加：
+- **API key**
+- **订阅 / OAuth 登录**（通过 `/login`）
+
+### 方式一：环境变量
+
+在 shell 配置文件中添加 API key，例如：
 
 ```bash
-# Anthropic Claude
-export ANTHROPIC_API_KEY=sk-ant-api03-...
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
 
-# 或 OpenAI
+# OpenAI
 export OPENAI_API_KEY=sk-...
 
-# 或 Google Gemini
-export GOOGLE_API_KEY=...
+# Google Gemini
+export GEMINI_API_KEY=...
 ```
 
-然后重新加载配置：
+然后重新加载 shell：
 
 ```bash
-source ~/.zshrc  # 或 ~/.bashrc
+source ~/.zshrc
 ```
 
-### 方式二：使用 /login 命令
+或：
+
+```bash
+source ~/.bashrc
+```
+
+### 方式二：使用 `/login`
 
 ```bash
 pi
 ```
 
-在 pi 中输入：
+进入交互界面后输入：
 
-```
+```text
 /login
 ```
 
-选择 provider，按提示操作：
+当前内置订阅 / OAuth 路线主要包括：
 
-```
-? Select provider: (Use arrow keys)
-❯ anthropic 
-  openai 
-  google 
-  github-copilot 
-  ...
-```
+- Anthropic Claude Pro / Max
+- OpenAI ChatGPT Plus / Pro（Codex）
+- GitHub Copilot
+- Google Gemini CLI
+- Google Antigravity
 
-### 方式三：配置文件
+### 方式三：配置默认模型
 
-创建 `~/.pi/agent/settings.json`：
+创建或编辑：
+
+- `~/.pi/agent/settings.json`
+
+示例：
 
 ```json
 {
@@ -106,87 +129,112 @@ pi
 }
 ```
 
+更完整的 provider 设置见：
+
+- [Provider 参考](../reference/providers.md)
+- [模型参考](../reference/models.md)
+
 ---
 
 ## 3.4 启动 pi
 
-### 基本启动
+### 最常见的启动方式
 
 ```bash
 # 在当前目录启动
 pi
 
-# 指定目录启动
-pi /path/to/project
+# 指定 provider / model
+pi --provider anthropic --model claude-sonnet-4
 
-# 继续上次会话
+# 继续最近会话
 pi -c
 
 # 选择历史会话
 pi -r
+
+# 不保存会话
+pi --no-session
+
+# 非交互执行
+pi -p "summarize this repository"
+
+# RPC 模式
+pi --mode rpc
 ```
 
-### 启动选项
+### 常用参数
 
-| 选项 | 说明 |
-|-----|------|
-| `-c, --continue` | 继续最近的会话 |
+| 参数 | 说明 |
+|------|------|
+| `-c, --continue` | 继续最近会话 |
 | `-r, --resume` | 选择历史会话 |
-| `--no-session` | 不保存会话（临时模式） |
-| `--session <path>` | 指定会话文件 |
-| `--fork <path>` | 从会话分叉 |
-| `--model <model>` | 指定模型 |
-| `--extension <path>` | 加载额外扩展 |
+| `--no-session` | 临时模式，不保存会话 |
+| `--session <path>` | 使用指定会话文件 |
+| `--fork <path|id>` | 从已有会话分叉 |
+| `--provider <name>` | 指定 provider |
+| `--model <pattern>` | 指定模型或模型模式 |
+| `--thinking <level>` | 设置 thinking level |
+| `--mode rpc` | RPC 模式 |
+| `--print, -p` | 非交互模式 |
+| `--extension <path>` | 临时加载扩展 |
+
+完整参数以这些来源为准：
+
+- `pi --help`
+- `packages/coding-agent/README.md`
+- `packages/coding-agent/src/cli/args.ts`
 
 ---
 
 ## 3.5 界面导览
 
-### 启动界面
+pi 的交互界面从上到下通常包括：
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  pi 0.12.0                                         │
-│  ─────────────────────────────────────────────────────  │
-│  AGENTS.md: 3 loaded                                      │
-│  Extensions: 5 loaded                                     │
-│  Skills: 12 available                                     │
-│  Prompts: 3 available                                     │
-│  ─────────────────────────────────────────────────────  │
-│  Hotkeys: Ctrl+L=model  Ctrl+P=cycle  Ctrl+O=expand     │
-│  Commands: /new /resume /tree /fork /quit              │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 消息区域
-
-显示对话历史：
-- 用户消息（白色）
-- 助手消息（绿色）
-- 工具调用（蓝色）
-- 工具结果（灰色）
-- 系统通知（黄色）
-
-### 输入框
-
-底部输入区域：
-- 显示当前工作目录
-- 边框颜色表示思考级别（灰色=off，蓝色=low，紫色=medium，红色=high）
-- 输入 `/` 显示命令补全
-- 输入 `@` 显示文件补全
-
-### 状态栏
-
-```
-~/projects/my-app  |  session: abc123  |  12k/200k tokens  |  $0.023  |  claude-sonnet-4
-```
+### 启动头部
 
 显示：
-- 当前目录
-- 会话ID
-- Token 使用量 / 上下文窗口
-- 当前成本
+
+- 常用快捷键提示
+- 已加载的 `AGENTS.md`
+- prompt templates
+- skills
+- extensions
+
+### 消息区
+
+这里会显示：
+
+- 用户消息
+- 助手回复
+- 工具调用与工具结果
+- 通知与错误
+- 扩展 UI
+
+### 编辑器
+
+你在这里输入消息。
+
+常见能力：
+
+- 输入 `/`：命令补全
+- 输入 `@`：项目文件引用
+- `Shift+Enter`：换行
+- `Ctrl+V`：粘贴图片（Windows 终端常见为 `Alt+V`）
+- 边框颜色会反映当前 thinking level
+
+### 页脚
+
+页脚通常显示：
+
+- 当前工作目录
+- 会话名
+- 总 token / cache 使用量
+- 成本
+- context 使用情况
 - 当前模型
+
+如果安装了扩展，编辑器、页脚、widget 和 overlay 也可能被扩展接管或增强。
 
 ---
 
@@ -194,23 +242,19 @@ pi -r
 
 ### 发送消息
 
-1. 在输入框输入你的需求
-2. 按 `Enter` 发送
-3. 等待 Agent 响应
+直接输入自然语言，然后按 `Enter`：
 
-示例：
-
-```
-> 帮我创建一个 React 组件，显示用户列表
+```text
+> 帮我总结这个仓库的结构
 ```
 
 ### 多行输入
 
-按 `Shift+Enter` 换行：
+按 `Shift+Enter`：
 
-```
+```text
 > 帮我创建一个函数，要求：
-  1. 接受用户ID参数
+  1. 接收用户 ID
   2. 查询数据库
   3. 返回用户信息
 ```
@@ -219,85 +263,103 @@ pi -r
 
 输入 `@` 触发文件补全：
 
-```
+```text
 > 请解释 @src/components/Button.tsx 的作用
 ```
 
 ### 执行 Bash 命令
 
-在消息中输入 `!` 执行命令：
+pi 支持两种命令前缀：
 
-```
-> 查看当前目录结构 !ls -la
+- `!command`：执行命令，并把输出发送给 LLM
+- `!!command`：执行命令，但**不**把输出发送给 LLM
+
+例如：
+
+```text
+> !ls -la
 ```
 
-或在输入框直接输入：
+```text
+> !!git status
+```
 
-```
-> !npm test
-```
+这两种方式非常适合：
+
+- 快速把目录结构送进上下文
+- 先本地确认状态，再决定是否让模型看到输出
 
 ---
 
 ## 3.7 第一个任务
 
-让我们完成一个完整任务：创建一个待办事项应用。
+下面用一个保守、现实的例子熟悉基本流程。
 
-### 步骤1：创建项目
+### 步骤 1：让 pi 先理解仓库
 
-```
-> 帮我创建一个待办事项应用，使用 React + TypeScript
-```
-
-Agent 会：
-1. 检查当前目录
-2. 创建项目结构
-3. 初始化 package.json
-4. 安装依赖
-5. 创建组件文件
-
-### 步骤2：查看结果
-
-```
-> 显示项目结构 !tree -L 2
+```text
+> 先阅读这个项目的 README，并总结目录结构
 ```
 
-### 步骤3：运行应用
+### 步骤 2：引用具体文件继续问
 
-```
-> 启动开发服务器 !npm run dev
+```text
+> 请结合 @package.json 和 @src/index.ts 解释启动入口
 ```
 
-### 步骤4：迭代改进
+### 步骤 3：让 pi 做一个小修改
 
+```text
+> 帮我把这个函数拆成两个更小的函数，并保持行为不变
 ```
-> 给待办事项添加完成状态切换功能
+
+### 步骤 4：继续追问
+
+```text
+> 解释你刚才为什么这样拆分，并列出潜在风险
 ```
+
+这个顺序比“一上来就让它搭完整应用”更适合第一小时，因为你能更快建立：
+
+- 消息输入习惯
+- 文件引用习惯
+- 命令与工具调用的心智模型
+- 会话连续追问的感觉
 
 ---
 
-## 3.8 保存和退出
+## 3.8 会话与退出
 
-### 保存会话
+### 会话保存
 
-会话自动保存到 `~/.pi/agent/sessions/`。
+默认情况下，会话会自动保存到：
+
+- `~/.pi/agent/sessions/`
 
 ### 退出
 
-```
+可以使用：
+
+```text
 /quit
 ```
 
-或按 `Ctrl+C` 两次。
+或：
+
+- `Ctrl+C` 清空编辑器
+- `Ctrl+C` 连按两次退出
 
 ### 继续会话
 
 ```bash
-# 继续最近的会话
 pi -c
-
-# 选择历史会话
 pi -r
+```
+
+如果你不想保存当前过程，可以从一开始就用：
+
+```bash
+pi --no-session
 ```
 
 ---
@@ -307,48 +369,72 @@ pi -r
 ### Q: 安装失败怎么办？
 
 ```bash
-# 检查 Node.js 版本
-node --version  # 需要 >= 20.0.0
+node --version
+```
 
-# 清理 npm 缓存
-npm cache clean --force
+确认 Node.js 版本至少为 20。
 
-# 使用 npx 临时运行
+如果只是快速试用，可以改用：
+
+```bash
 npx @mariozechner/pi-coding-agent
 ```
 
-### Q: API Key 无效？
+### Q: API key 设置了，但仍不可用？
 
-- 检查环境变量是否正确设置
-- 确认 key 没有过期
-- 检查是否有足够的额度
+先检查：
 
-### Q: 启动后没有响应？
+- 环境变量名是否正确
+- shell 是否已重新加载
+- 当前 provider 是否真的使用该 key
 
-- 检查网络连接
-- 查看 `~/.pi/agent/logs/` 中的日志
-- 尝试 `--no-session` 临时模式
+可进一步参考：
 
-### Q: 如何更新到最新版本？
+- [Provider 参考](../reference/providers.md)
+- [故障排查](./12-troubleshooting.md)
+
+### Q: `/login` 没有我想要的 provider？
+
+不是所有 provider 都走 OAuth。很多 provider 只支持 API key。
+
+### Q: 启动后没反应或很慢？
+
+优先检查：
+
+- 网络连接
+- provider 认证状态
+- 当前模型是否可用
+- 是否在一个很大的仓库里启动
+
+必要时可试：
 
 ```bash
-npm update -g @mariozechner/pi-coding-agent
+pi --no-session
+```
+
+或：
+
+```bash
+pi --verbose
 ```
 
 ---
 
 ## 3.10 下一步
 
-- 学习所有命令：[第4章：命令与快捷键](./04-commands.md)
-- 理解会话管理：[第5章：会话管理](./05-sessions.md)
-- 开始使用 Skill：[第6章：Skill 系统](./06-skills.md)
+继续阅读：
+
+- [第4章：命令与快捷键](./04-commands.md)
+- [第5章：会话管理](./05-sessions.md)
+- [第6章：Skill 系统](./06-skills.md)
+- [第9章：扩展 API](./09-extension-api.md)
 
 ---
 
 ## 本章小结
 
-- **安装**: `npm install -g @mariozechner/pi-coding-agent`
-- **配置**: 环境变量或 `/login`
-- **启动**: `pi` 或 `pi /path/to/project`
-- **界面**: 消息区、输入框、状态栏
-- **交互**: 发送消息、引用文件、执行命令
+- 安装：`npm install -g @mariozechner/pi-coding-agent`
+- 认证：环境变量或 `/login`
+- 启动：`pi`、`pi -c`、`pi -r`、`pi -p`
+- 基本交互：消息、文件引用、命令前缀 `!` / `!!`
+- 第一小时重点：先学会与现有项目协作，而不是追求一次性完成大任务

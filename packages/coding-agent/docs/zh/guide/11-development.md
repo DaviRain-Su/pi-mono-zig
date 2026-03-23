@@ -64,6 +64,16 @@ npm run check
 - 不要默认运行 `npm test` 或 `npm run build`
 - 只有在明确需要时，才从对应 package 目录运行特定测试文件
 
+### 关于根 README 中的命令
+
+根目录 `README.md` 中提到的某些命令（如 `npm test`、`npm run build`）主要面向：
+
+- 仓库维护者
+- CI/CD 流程
+- 完整构建发布
+
+对于日常开发、扩展开发、文档同步等任务，**优先遵循 `AGENTS.md`** 中的指导，而不是直接套用根 README 的全局命令。
+
 ## 项目结构
 
 ```

@@ -172,22 +172,32 @@ models: [{
   id: "custom-model",
   // ...
   compat: {
-    supportsDeveloperRole: false,      // 使用 "system" 而不是 "developer"
+    supportsDeveloperRole: false,        // 使用 "system" 而不是 "developer"
     supportsReasoningEffort: true,
-    reasoningEffortMap: {              // 将 pi-ai 级别映射到 provider 值
+    reasoningEffortMap: {                // 将 pi-ai 级别映射到 provider 值
       minimal: "default",
       low: "default",
       medium: "default",
       high: "default",
       xhigh: "default"
     },
-      maxTokensField: "max_tokens",      // 而不是 "max_completion_tokens"
-      requiresToolResultName: true,      // 工具结果需要 name 字段
-      thinkingFormat: "qwen"            // 顶层 enable_thinking: true
-    }
-  }]
+    supportsUsageInStreaming: false,     // provider 不返回流式 usage 时关闭
+    maxTokensField: "max_tokens",      // 而不是 "max_completion_tokens"
+    requiresToolResultName: true,        // 工具结果需要 name 字段
+    requiresAssistantAfterToolResult: true,
+    requiresThinkingAsText: false,
+    thinkingFormat: "qwen"              // 顶层 enable_thinking: true
+  }
 }]
 ```
+
+`thinkingFormat` 当前可用值包括：
+
+- `openai`
+- `openrouter`
+- `zai`
+- `qwen`
+- `qwen-chat-template`
 
 对于读取 `chat_template_kwargs.enable_thinking` 的本地 Qwen 兼容服务器，使用 `qwen-chat-template`。
 
@@ -589,9 +599,9 @@ interface ProviderModelConfig {
     requiresToolResultName?: boolean;
     requiresAssistantAfterToolResult?: boolean;
     requiresThinkingAsText?: boolean;
-    thinkingFormat?: "openai" | "zai" | "qwen" | "qwen-chat-template";
+    thinkingFormat?: "openai" | "openrouter" | "zai" | "qwen" | "qwen-chat-template";
   };
 }
 ```
 
-`qwen` 用于 DashScope 风格的顶层 `enable_thinking`。对于读取 `chat_template_kwargs.enable_thinking` 的本地 Qwen 兼容服务器，使用 `qwen-chat-template`。
+`qwen` 用于 DashScope 风格的顶层 `enable_thinking`。对于读取 `chat_template_kwargs.enable_thinking` 的本地 Qwen 兼容服务器，使用 `qwen-chat-template`。如果通过 OpenRouter 访问兼容端点，则可使用 `openrouter` 格式。

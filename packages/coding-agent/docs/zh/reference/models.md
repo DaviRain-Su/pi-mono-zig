@@ -270,7 +270,7 @@
 | `requiresToolResultName` | 在工具结果消息中包含 `name` |
 | `requiresAssistantAfterToolResult` | 在工具结果后的用户消息前插入助手消息 |
 | `requiresThinkingAsText` | 将思考块转换为纯文本 |
-| `thinkingFormat` | 使用 `reasoning_effort`、`zai`、`qwen` 或 `qwen-chat-template` 思考参数 |
+| `thinkingFormat` | 使用 `reasoning_effort`、`openrouter`、`zai`、`qwen` 或 `qwen-chat-template` 思考参数 |
 | `supportsStrictMode` | 在工具定义中包含 `strict` 字段 |
 | `openRouterRouting` | 传递给 OpenRouter 用于模型/provider 选择的 OpenRouter 路由配置 |
 | `vercelGatewayRouting` | 用于 provider 选择的 Vercel AI Gateway 路由配置（`only`、`order`）|

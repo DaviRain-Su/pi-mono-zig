@@ -149,10 +149,33 @@ const result = await ctx.ui.custom<string | null>(
     onHandle: (handle) => {
       // handle.setHidden(true/false) - 切换可见性
       // handle.hide() - 永久移除
+      // handle.focus() / handle.unfocus() - 焦点控制
     },
   }
 );
 ```
+
+### OverlayHandle 方法
+
+覆盖层句柄提供以下方法：
+
+| 方法 | 描述 |
+|------|------|
+| `hide()` | 永久移除覆盖层 |
+| `setHidden(hidden)` | 切换可见性（`true` 隐藏，`false` 显示）|
+| `isHidden()` | 获取当前隐藏状态 |
+| `focus()` | 聚焦覆盖层 |
+| `unfocus()` | 取消聚焦 |
+| `isFocused()` | 获取当前聚焦状态 |
+
+### 覆盖层解析顺序
+
+覆盖层定位遵循以下优先级：
+
+1. **大小**：`minWidth` 作为下限，然后是 `width` 或 `height`（数字或百分比）
+2. **位置**：`row`/`col` 绝对值 > 百分比 `row`/`col` > `anchor` 定位
+3. **边距**：`margin` 在最终位置基础上进行约束
+4. **可见性**：`visible` 回调每帧评估，可动态隐藏
 
 ### 覆盖层生命周期
 
