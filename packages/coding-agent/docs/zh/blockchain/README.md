@@ -152,9 +152,11 @@
 - [dasn/23-dasn-testing-strategy.md](./dasn/23-dasn-testing-strategy.md)
 - [dasn/24-dasn-standard-proposal.md](./dasn/24-dasn-standard-proposal.md)
 - [dasn/25-dasn-sdk-design.md](./dasn/25-dasn-sdk-design.md)
+- [dasn/31-decentralized-agent-platform-design.md](./dasn/31-decentralized-agent-platform-design.md) - 去中心化 Agent 协作平台设计 (Sui/X Layer) 🆕
 
 ### 产品实现线
-- [31-decentralized-agent-platform-design.md](./31-decentralized-agent-platform-design.md) - dAgent Hub 产品完整设计 (Sui/X Layer) 🆕
+- [dasn/31-decentralized-agent-platform-design.md](./dasn/31-decentralized-agent-platform-design.md) - dAgent Hub 产品完整设计 (Sui/X Layer) 🆕
+- [32-dagent-hub-economic-and-worker-model.md](./32-dagent-hub-economic-and-worker-model.md) - 稳定币支付与 Worker 部署模型 🆕
 
 ---
 

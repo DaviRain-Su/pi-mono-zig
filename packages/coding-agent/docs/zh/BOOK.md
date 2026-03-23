@@ -125,6 +125,7 @@ docs/zh/
 | [DASN 测试策略](./blockchain/dasn/23-dasn-testing-strategy.md) | 原型验证、测试框架与实验设计 |
 | [DASN 标准提案](./blockchain/dasn/24-dasn-standard-proposal.md) | 面向标准化推进的提案抽象 |
 | [DASN SDK 设计](./blockchain/dasn/25-dasn-sdk-design.md) | SDK 层接口、开发者体验与生态接入 |
+| [去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md) | 从协议研究走向协作平台产品化的整体方案 |
 
 ---
 
@@ -168,6 +169,12 @@ docs/zh/
 | [框架对比](./reference/comparison-claude-code.md) | 623 | 与 Claude Code 对比 |
 | [框架对比](./reference/comparison-opencode.md) | 884 | 与 OpenCode 对比 |
 | [Zig 生态](./reference/zig-ecosystem-analysis.md) | 762 | Zig 版本演进路线图 |
+| [Zig / Runtime / Multi-Agent 研究线](./reference/zig/README.md) | 导航 | Zig 化、多 Agent、SDK / Runtime 研究入口 |
+| [pi-mono + Zig 愿景](./reference/zig/26-pi-mono-zig-vision.md) | - | Zig 愿景与系统基础设施思考 |
+| [Zig 技术深潜](./reference/zig/27-zig-pi-technical-deep-dive.md) | - | 内存、零拷贝、安全隔离等技术问题 |
+| [多 Agent 架构](./reference/zig/28-pi-mono-multi-agent-architecture.md) | - | 从单 Agent 到多 Agent 的演进 |
+| [SDK / Runtime / OS 分层](./reference/zig/29-zig-sdk-system-layer-analysis.md) | - | 系统层级定位与职责边界 |
+| [Slock.ai 分析](./reference/zig/30-slock-ai-analysis.md) | - | 外部 Agent 协作平台对比与启发 |
 
 **小计**：21 个文档
 
@@ -218,11 +225,11 @@ cookbook/
 |------|--------|------|------|
 | 使用指南 | 13 | ~4,200 | 11% |
 | 技术参考 | 31 | ~14,000 | 37% |
-| 区块链专题 | 43 | ~24,300 | 64% |
+| 区块链专题 | 44 | ~24,900 | 65% |
 | 设计模式 | 1 | 590 | 2% |
 | 代码食谱 | 1 | 484 | 1% |
 | 平台配置 | 4 | ~307 | 1% |
-| **总计** | **95** | **~39,000+** | **100%** |
+| **总计** | **96** | **~39,600+** | **100%** |
 
 ✨ = 新增翻译
 

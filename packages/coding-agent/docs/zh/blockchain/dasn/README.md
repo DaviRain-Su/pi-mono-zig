@@ -60,6 +60,9 @@
 7. [25-dasn-sdk-design.md](./25-dasn-sdk-design.md)
    - 看 SDK 层如何为未来生态提供开发接口
 
+8. [31-decentralized-agent-platform-design.md](./31-decentralized-agent-platform-design.md)
+   - 看从协议研究走向产品化协作平台时，去中心化 Agent Hub 应如何设计
+
 ---
 
 ## 文档列表
@@ -71,6 +74,7 @@
 - [23-dasn-testing-strategy.md](./23-dasn-testing-strategy.md) - DASN 测试策略
 - [24-dasn-standard-proposal.md](./24-dasn-standard-proposal.md) - DASN 标准提案
 - [25-dasn-sdk-design.md](./25-dasn-sdk-design.md) - DASN SDK 设计
+- [31-decentralized-agent-platform-design.md](./31-decentralized-agent-platform-design.md) - 去中心化 Agent 协作平台设计
 
 ---
 

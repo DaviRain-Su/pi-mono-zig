@@ -112,7 +112,14 @@ docs/zh/
     ├── comparison-bub.md                 # 与 Bub 框架对比
     ├── comparison-claude-code.md         # 与 Claude Code 对比
     ├── comparison-opencode.md            # 与 OpenCode 对比
-    └── zig-ecosystem-analysis.md         # Zig 生态综合分析与演进规划
+    ├── zig-ecosystem-analysis.md         # Zig 生态综合分析与演进规划
+    └── zig/                              # 🧠 Zig / Runtime / Multi-Agent 研究线 ✨ 新目录
+        ├── README.md                     # 研究线导航
+        ├── 26-pi-mono-zig-vision.md      # pi-mono + Zig 愿景
+        ├── 27-zig-pi-technical-deep-dive.md # Zig 技术深潜
+        ├── 28-pi-mono-multi-agent-architecture.md # 多 Agent 架构
+        ├── 29-zig-sdk-system-layer-analysis.md # SDK / Runtime / OS 分层
+        └── 30-slock-ai-analysis.md       # Slock.ai 分析
 ```
 
 ---
@@ -153,9 +160,15 @@ docs/zh/
   - 基础层：路线图、任务模型、支付层、执行流、artifact、guardrails、TEE、receipts
   - Solana 主线：[专题导航](./blockchain/solana/README.md)，以及 MVP、Program 指令、预算结算、runtime 集成、dispute、market、audit、observability、product roadmap、implementation checklist
   - Sui 专题：[总览](./blockchain/sui/00-overview.md)、[任务模型](./blockchain/sui/02-task-models.md)、[MVP 设计](./blockchain/sui/10-sui-mvp-design.md)
-  - DASN 研究线：[专题导航](./blockchain/dasn/README.md)、[愿景](./blockchain/dasn/19-dasn-vision.md)、[协议分析](./blockchain/dasn/20-agent-protocols-analysis.md)
+  - DASN 研究线：[专题导航](./blockchain/dasn/README.md)、[愿景](./blockchain/dasn/19-dasn-vision.md)、[协议分析](./blockchain/dasn/20-agent-protocols-analysis.md)、[去中心化 Agent 协作平台设计](./blockchain/dasn/31-decentralized-agent-platform-design.md)
 - **演进规划**：
   - [Zig 生态综合分析](./reference/zig-ecosystem-analysis.md) - pi-mono Zig 版本演进路线图
+  - [Zig / Runtime / Multi-Agent 研究线导航](./reference/zig/README.md)
+  - [pi-mono + Zig 愿景](./reference/zig/26-pi-mono-zig-vision.md)
+  - [Zig 技术深潜](./reference/zig/27-zig-pi-technical-deep-dive.md)
+  - [多 Agent 架构](./reference/zig/28-pi-mono-multi-agent-architecture.md)
+  - [SDK / Runtime / OS 分层](./reference/zig/29-zig-sdk-system-layer-analysis.md)
+  - [Slock.ai 分析](./reference/zig/30-slock-ai-analysis.md)
 
 ---
 
@@ -196,4 +209,4 @@ pi 遵循 **"Agent构建Agent"** 的哲学：
 
 ---
 
-*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v1.8 dAgent Hub 产品设计)*
+*本书与 pi 代码库同步更新，最后更新时间：2026年3月23日 (v1.9 USDC+Worker 部署模型)*
