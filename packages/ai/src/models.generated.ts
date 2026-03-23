@@ -2578,7 +2578,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 144000,
 			maxTokens: 32000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-opus-4.5": {
@@ -2596,7 +2596,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 160000,
 			maxTokens: 32000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-opus-4.6": {
@@ -2632,7 +2632,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 216000,
 			maxTokens: 16000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-sonnet-4.5": {
@@ -2650,7 +2650,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 144000,
 			maxTokens: 32000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-sonnet-4.6": {
@@ -2763,7 +2763,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 64000,
+			contextWindow: 128000,
 			maxTokens: 16384,
 		} satisfies Model<"openai-completions">,
 		"gpt-4o": {
@@ -2782,8 +2782,8 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 64000,
-			maxTokens: 16384,
+			contextWindow: 128000,
+			maxTokens: 4096,
 		} satisfies Model<"openai-completions">,
 		"gpt-5": {
 			id: "gpt-5",
@@ -2818,7 +2818,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 264000,
 			maxTokens: 64000,
 		} satisfies Model<"openai-responses">,
 		"gpt-5.1": {
@@ -2836,7 +2836,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 264000,
 			maxTokens: 64000,
 		} satisfies Model<"openai-responses">,
 		"gpt-5.1-codex": {
@@ -2854,7 +2854,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 400000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-responses">,
 		"gpt-5.1-codex-max": {
@@ -2872,7 +2872,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 400000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-responses">,
 		"gpt-5.1-codex-mini": {
@@ -2890,7 +2890,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 128000,
+			contextWindow: 400000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-responses">,
 		"gpt-5.2": {
@@ -7293,12 +7293,12 @@ export const MODELS = {
 			input: ["text"],
 			cost: {
 				input: 0.21,
-				output: 0.78,
-				cacheRead: 0.105,
+				output: 0.7899999999999999,
+				cacheRead: 0.1300000002,
 				cacheWrite: 0,
 			},
 			contextWindow: 163840,
-			maxTokens: 65536,
+			maxTokens: 4096,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v3.2": {
 			id: "deepseek/deepseek-v3.2",
@@ -9265,12 +9265,12 @@ export const MODELS = {
 			input: ["text"],
 			cost: {
 				input: 0.03,
-				output: 0.14,
-				cacheRead: 0,
+				output: 0.11,
+				cacheRead: 0.015,
 				cacheWrite: 0,
 			},
 			contextWindow: 131072,
-			maxTokens: 4096,
+			maxTokens: 131072,
 		} satisfies Model<"openai-completions">,
 		"openai/gpt-oss-20b:free": {
 			id: "openai/gpt-oss-20b:free",
@@ -10386,9 +10386,9 @@ export const MODELS = {
 			reasoning: true,
 			input: ["text"],
 			cost: {
-				input: 0.25,
-				output: 0.85,
-				cacheRead: 0.125,
+				input: 0.3,
+				output: 1.1,
+				cacheRead: 0.15,
 				cacheWrite: 0,
 			},
 			contextWindow: 163840,
@@ -13628,9 +13628,9 @@ export const MODELS = {
 			contextWindow: 2000000,
 			maxTokens: 30000,
 		} satisfies Model<"openai-completions">,
-		"grok-4.20-beta-latest-non-reasoning": {
-			id: "grok-4.20-beta-latest-non-reasoning",
-			name: "Grok 4.20 Beta (Non-Reasoning)",
+		"grok-4.20-0309-non-reasoning": {
+			id: "grok-4.20-0309-non-reasoning",
+			name: "Grok 4.20 (Non-Reasoning)",
 			api: "openai-completions",
 			provider: "xai",
 			baseUrl: "https://api.x.ai/v1",
@@ -13645,9 +13645,9 @@ export const MODELS = {
 			contextWindow: 2000000,
 			maxTokens: 30000,
 		} satisfies Model<"openai-completions">,
-		"grok-4.20-beta-latest-reasoning": {
-			id: "grok-4.20-beta-latest-reasoning",
-			name: "Grok 4.20 Beta (Reasoning)",
+		"grok-4.20-0309-reasoning": {
+			id: "grok-4.20-0309-reasoning",
+			name: "Grok 4.20 (Reasoning)",
 			api: "openai-completions",
 			provider: "xai",
 			baseUrl: "https://api.x.ai/v1",
