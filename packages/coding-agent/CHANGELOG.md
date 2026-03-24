@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed RPC `get_session_stats` to expose `contextUsage`, so headless clients can read actual current context-window usage instead of deriving it from token totals ([#2550](https://github.com/badlogic/pi-mono/issues/2550))
+- Fixed `pi update` for git packages to fetch only the tracked target branch with `--no-tags`, reducing unrelated branch and tag noise while preserving force-push-safe updates ([#2548](https://github.com/badlogic/pi-mono/issues/2548))
+
 ## [0.62.0] - 2026-03-23
 
 ### New Features

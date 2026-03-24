@@ -494,7 +494,7 @@ Response:
 
 #### get_session_stats
 
-Get token usage and cost statistics.
+Get token usage, cost statistics, and current context window usage.
 
 ```json
 {"type": "get_session_stats"}
@@ -521,10 +521,19 @@ Response:
       "cacheWrite": 5000,
       "total": 105000
     },
-    "cost": 0.45
+    "cost": 0.45,
+    "contextUsage": {
+      "tokens": 60000,
+      "contextWindow": 200000,
+      "percent": 30
+    }
   }
 }
 ```
+
+`tokens` contains assistant usage totals for the current session state. `contextUsage` contains the actual current context-window estimate used for compaction and footer display.
+
+`contextUsage` is omitted when no model or context window is available. `contextUsage.tokens` and `contextUsage.percent` are `null` immediately after compaction until a fresh post-compaction assistant response provides valid usage data.
 
 #### export_html
 

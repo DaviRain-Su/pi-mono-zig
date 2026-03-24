@@ -139,7 +139,10 @@ describe("DefaultPackageManager git update", () => {
 
 			await packageManager.update();
 
-			expect(executedCommands).toContain("git fetch --prune origin");
+			expect(executedCommands).toContain(
+				"git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main",
+			);
+			expect(executedCommands).not.toContain("git fetch --prune origin");
 			expect(executedCommands).not.toContain("git reset --hard @{upstream}");
 			expect(executedCommands).not.toContain("git reset --hard origin/HEAD");
 			expect(executedCommands).not.toContain("git clean -fdx");
@@ -183,8 +186,26 @@ describe("DefaultPackageManager git update", () => {
 			const detachedCommit = getCurrentCommit(installedDir);
 			git(["checkout", detachedCommit], installedDir);
 
+			const executedCommands: string[] = [];
+			const managerWithInternals = packageManager as unknown as {
+				runCommand: (command: string, args: string[], options?: { cwd?: string }) => Promise<void>;
+			};
+			managerWithInternals.runCommand = async (command, args, options) => {
+				executedCommands.push(`${command} ${args.join(" ")}`);
+				const result = spawnSync(command, args, {
+					cwd: options?.cwd,
+					encoding: "utf-8",
+				});
+				if (result.status !== 0) {
+					throw new Error(`Command failed: ${command} ${args.join(" ")}\n${result.stderr}`);
+				}
+			};
+
 			await packageManager.update();
 
+			expect(executedCommands).toContain(
+				"git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main",
+			);
 			expect(getCurrentCommit(installedDir)).toBe(latestCommit);
 			expect(getFileContent(installedDir, "extension.ts")).toBe("// v3");
 		});
@@ -323,12 +344,17 @@ describe("DefaultPackageManager git update", () => {
 				if (args[0] === "rev-parse" && args[1] === "@{upstream}") {
 					return "remote-head";
 				}
+				if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
+					return "origin/main";
+				}
 				return "";
 			};
 
 			await packageManager.resolveExtensionSources([gitSource], { temporary: true });
 
-			expect(executedCommands).toContain("git fetch --prune origin");
+			expect(executedCommands).toContain(
+				"git fetch --prune --no-tags origin +refs/heads/main:refs/remotes/origin/main",
+			);
 			expect(getFileContent(cachedDir, "pi-extensions/session-breakdown.ts")).toBe("// fresh");
 		});
 
