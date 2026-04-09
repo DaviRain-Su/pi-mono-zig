@@ -1,0 +1,13 @@
+.{
+    .name = .pi_ai,
+    .version = "0.0.0",
+    .fingerprint = 0x56b645cc8186d918,
+    .minimum_zig_version = "0.16.0-dev.2261+d6b3dd25a",
+    .dependencies = .{
+        .shared = .{
+            .path = "../shared",
+        },
+    },
+    .paths = .{"src",
+    },
+}

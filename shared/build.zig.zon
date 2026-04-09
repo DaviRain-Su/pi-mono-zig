@@ -1,0 +1,8 @@
+.{
+    .name = .pi_shared,
+    .version = "0.0.0",
+    .fingerprint = 0xaedda0ad9d4523e7,
+    .minimum_zig_version = "0.16.0-dev.2261+d6b3dd25a",
+    .dependencies = .{},
+    .paths = .{"src"},
+}
