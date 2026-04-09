@@ -98,7 +98,7 @@ fn mapStopReason(reason: []const u8) ai.StopReason {
     return .err;
 }
 
-fn convertMessages(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context) !std.json.Value {
+pub fn convertMessages(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context) !std.json.Value {
     const norm_id = struct {
         fn f(id: []const u8, _m: ai.Model, _src: ai.AssistantMessage) []const u8 {
             _ = _m;
@@ -314,7 +314,7 @@ fn convertMessages(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context)
     return std.json.Value{ .array = .{ .items = contents, .capacity = contents.items.len } };
 }
 
-fn convertTools(gpa: std.mem.Allocator, tools: []const ai.Tool) !std.json.Value {
+pub fn convertTools(gpa: std.mem.Allocator, tools: []const ai.Tool) !std.json.Value {
     var declarations = std.ArrayList(std.json.Value).init(gpa);
     for (tools) |tool| {
         var obj = std.json.ObjectMap.init(gpa);
@@ -373,7 +373,7 @@ fn getGemini3ThinkingLevel(effort: ai.ThinkingLevel, model_id: []const u8) []con
     };
 }
 
-fn buildParams(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context, options: ?ai.StreamOptions) !std.json.Value {
+pub fn buildParams(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context, options: ?ai.StreamOptions) !std.json.Value {
     const contents = try convertMessages(gpa, model, context);
 
     var obj = std.json.ObjectMap.init(gpa);
@@ -604,7 +604,7 @@ fn googleThread(model: ai.Model, context: ai.Context, options: ?ai.StreamOptions
     es.end(null);
 }
 
-fn finalizeCurrentBlock(es: ai.AssistantMessageEventStream, output: *ai.AssistantMessage, block: ai.ContentBlock) void {
+pub fn finalizeCurrentBlock(es: ai.AssistantMessageEventStream, output: *ai.AssistantMessage, block: ai.ContentBlock) void {
     const idx = output.content.len - 1;
     switch (block) {
         .text => es.push(.{ .text_end = .{ .content_index = idx, .content = output.content[idx].text.text, .partial = output.* } }) catch {},
@@ -613,7 +613,7 @@ fn finalizeCurrentBlock(es: ai.AssistantMessageEventStream, output: *ai.Assistan
     }
 }
 
-fn processGoogleSseLine(gpa: std.mem.Allocator, line: []const u8, output: *ai.AssistantMessage, es: ai.AssistantMessageEventStream, model: ai.Model, current_block: *?ai.ContentBlock) void {
+pub fn processGoogleSseLine(gpa: std.mem.Allocator, line: []const u8, output: *ai.AssistantMessage, es: ai.AssistantMessageEventStream, model: ai.Model, current_block: *?ai.ContentBlock) void {
     const chunk = parseSseLine(line) orelse return;
 
     // responseId
@@ -675,7 +675,7 @@ fn processGoogleSseLine(gpa: std.mem.Allocator, line: []const u8, output: *ai.As
     }
 }
 
-fn processGooglePart(gpa: std.mem.Allocator, part_obj: std.json.ObjectMap, output: *ai.AssistantMessage, es: ai.AssistantMessageEventStream, current_block: *?ai.ContentBlock) void {
+pub fn processGooglePart(gpa: std.mem.Allocator, part_obj: std.json.ObjectMap, output: *ai.AssistantMessage, es: ai.AssistantMessageEventStream, current_block: *?ai.ContentBlock) void {
     const is_thinking = isThinkingPart(part_obj);
     const thought_sig = if (part_obj.get("thoughtSignature")) |tv| (if (tv == .string) tv.string else null) else null;
 

@@ -172,34 +172,58 @@ pub const Agent = struct {
         self.clearAllQueues();
     }
 
-    pub fn prompt(self: *Self, message: types.AgentMessage) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.is_running) return error.AlreadyRunning;
-
+    fn runPromptsLocked(self: *Self, prompts: []const types.AgentMessage) !void {
         self.is_running = true;
         self.abort_requested = false;
-
+        const prompts_copy = try self.gpa.alloc(types.AgentMessage, prompts.len);
+        @memcpy(prompts_copy, prompts);
         const context = types.AgentContext{
             .system_prompt = self.state.system_prompt,
             .messages = self.state.messages,
             .tools = if (self.state.tools.len > 0) self.state.tools else null,
         };
-        const prompts = &[_]types.AgentMessage{message};
-
         const config = self.buildLoopConfigLocked();
         const stream_fn = self.stream_fn orelse ai.streamSimple;
-
         const thread = std.Thread.spawn(.{}, struct {
             fn run(agent: *Self, p: []const types.AgentMessage, c: types.AgentContext, cfg: types.AgentLoopConfig, sf: *const fn (model: ai.Model, ctx: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream) !void {
+                defer agent.gpa.free(@constCast(p));
                 var es = try agent_loop.createAgentEventStream(agent.gpa);
                 defer es.deinit();
                 try agent_loop.agentLoop(agent.gpa, p, c, cfg, sf, &es);
                 agent.consumeEventStream(&es);
             }
-        }.run, .{ self, prompts, context, config, stream_fn }) catch return error.ThreadSpawnFailed;
+        }.run, .{ self, prompts_copy, context, config, stream_fn }) catch {
+            self.gpa.free(prompts_copy);
+            return error.ThreadSpawnFailed;
+        };
         thread.detach();
+    }
+
+    pub fn prompt(self: *Self, message: types.AgentMessage) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.is_running) return error.AlreadyRunning;
+        try self.runPromptsLocked(&[_]types.AgentMessage{message});
+    }
+
+    pub fn promptText(self: *Self, text: []const u8, images: ?[]const ai.ImageContent) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.is_running) return error.AlreadyRunning;
+
+        const timestamp = std.time.timestamp();
+        var message: types.AgentMessage = undefined;
+        if (images == null or images.?.len == 0) {
+            message = types.AgentMessage{ .user = .{ .content = .{ .text = text }, .timestamp = timestamp } };
+        } else {
+            const content = try self.gpa.alloc(ai.ContentBlock, 1 + images.?.len);
+            content[0] = .{ .text = .{ .text = text } };
+            for (images.?, 1..) |img, i| {
+                content[i] = .{ .image = img };
+            }
+            message = types.AgentMessage{ .user = .{ .content = .{ .blocks = content }, .timestamp = timestamp } };
+        }
+        try self.runPromptsLocked(&[_]types.AgentMessage{message});
     }
 
     pub fn continueRun(self: *Self) !void {
@@ -210,7 +234,23 @@ pub const Agent = struct {
         if (self.state.messages.len == 0) return error.NoMessagesToContinue;
         const last = self.state.messages[self.state.messages.len - 1];
         switch (last) {
-            .assistant => return error.CannotContinueFromAssistant,
+            .assistant => {
+                const steering = self.steering_queue.drain();
+                if (steering.len > 0) {
+                    try self.runPromptsLocked(steering);
+                    return;
+                }
+                self.gpa.free(steering);
+
+                const followUps = self.follow_up_queue.drain();
+                if (followUps.len > 0) {
+                    try self.runPromptsLocked(followUps);
+                    return;
+                }
+                self.gpa.free(followUps);
+
+                return error.CannotContinueFromAssistant;
+            },
             else => {},
         }
 
