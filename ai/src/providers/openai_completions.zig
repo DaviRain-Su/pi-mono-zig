@@ -27,6 +27,7 @@ fn buildUrl(model: ai.Model) []const u8 {
     return switch (model.provider) {
         .known => |k| switch (k) {
             .kimi_coding => "https://api.moonshot.cn/v1",
+            .mistral => "https://api.mistral.ai/v1",
             .openai => "https://api.openai.com/v1",
             else => "https://api.openai.com/v1",
         },
@@ -212,7 +213,7 @@ fn parseChunkUsage(usage_val: std.json.Value) ai.Usage {
     return usage;
 }
 
-fn streamOpenAICompletions(model: ai.Model, context: ai.Context, options: ?ai.types.StreamOptions) ai.AssistantMessageEventStream {
+pub fn streamOpenAICompletions(model: ai.Model, context: ai.Context, options: ?ai.types.StreamOptions) ai.AssistantMessageEventStream {
     const gpa = std.heap.page_allocator;
     var es = ai.createAssistantMessageEventStream(gpa) catch @panic("OOM");
 
@@ -408,7 +409,7 @@ fn streamOpenAICompletions(model: ai.Model, context: ai.Context, options: ?ai.ty
     return es;
 }
 
-fn streamSimpleOpenAICompletions(model: ai.Model, context: ai.Context, options: ?ai.types.SimpleStreamOptions) ai.AssistantMessageEventStream {
+pub fn streamSimpleOpenAICompletions(model: ai.Model, context: ai.Context, options: ?ai.types.SimpleStreamOptions) ai.AssistantMessageEventStream {
     return streamOpenAICompletions(model, context, if (options) |o| o.base else null);
 }
 

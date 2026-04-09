@@ -70,25 +70,32 @@
 ---
 
 ### Phase 2: `pi-agent-core` → `agent/` (P0)
-- [ ] **2.1 Agent Types**
+- [x] **2.1 Agent Types**
   - `AgentMessage`、`AgentTool`、`AgentState`、`AgentEvent`、`AgentContext`、`AgentLoopConfig`
   - 自定义消息扩展机制（用 Zig `union` + `tag` 模拟 declaration merging）
-- [ ] **2.2 Agent Loop (`agent-loop`)**
+- [x] **2.2 Agent Loop (`agent-loop`)**
   - `runAgentLoop` / `runAgentLoopContinue`
   - 嵌套循环：外层 follow-up、内层 turn + steering
-  - `streamAssistantResponse`（消息转换 → LLM 调用）
+  - `streamAssistantResponse`（消息转换 → LLM 调用，已对齐 pi-mono 的 partial message 同步）
   - `executeToolCalls`（支持 `sequential` / `parallel` 模式）
 - [ ] **2.3 Agent Class (`agent`)**
-  - 状态与队列管理（`steeringQueue`、`followUpQueue`）
-  - 事件订阅系统（listener + async barrier）
-  - 生命周期：`prompt()`、`continue()`、`abort()`、`reset()`、`waitForIdle()`
-  - `beforeToolCall` / `afterToolCall` hooks
+  - [x] 状态与队列管理（`steeringQueue`、`followUpQueue`）
+  - [x] 事件订阅系统（listener，已返回 `Subscription` 支持取消订阅）
+  - [x] 生命周期：`prompt()`、`continueRun()`、`abort()`、`reset()`、`waitForIdle()`
+  - [x] `beforeToolCall` / `afterToolCall` hooks
+  - [x] 增量 state 管理（`consumeEventStream` 在 `message_end` 时追加消息，不再整体替换）
+  - [ ] `prompt()` 字符串重载（`string` + `images`）
+  - [ ] `continueRun()` 的 queue drain 逻辑（assistant 后先检查 steering/followUp queue）
+  - [ ] state accessors（get/set `SystemPrompt`、`Model`、`Tools`、`ThinkingLevel`、`Messages`、`clearMessages`）
+  - [ ] `AgentOptions` 扩展（`onPayload`、`sessionId`、`thinkingBudgets`、`transport`、`maxRetryDelayMs`）
+  - [ ] `runWithLifecycle` / 错误重试 / 退避逻辑
 - [ ] **2.4 Proxy / Stream Wrapper**
   - `streamProxy` 或等价的自定义后端代理接口
-- [ ] **2.5 Tests**
+- [x] **2.5 Tests**
   - 模拟 faux provider 的事件序列断言（如 prompt → agent_start → turn_start → ... → agent_end）
   - 工具调用顺序/并行测试
   - steering / follow-up 测试
+  - continueRun 测试
 
 ---
 

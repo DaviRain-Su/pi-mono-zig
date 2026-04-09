@@ -56,6 +56,7 @@ pub const google_generative_ai_provider = @import("providers/google_generative_a
 pub const google_gemini_cli_provider = @import("providers/google_gemini_cli.zig");
 pub const openai_codex_responses_provider = @import("providers/openai_codex_responses.zig");
 pub const amazon_bedrock_provider = @import("providers/amazon_bedrock.zig");
+pub const mistral_provider = @import("providers/mistral.zig");
 pub const google_shared = @import("providers/google_shared.zig");
 
 /// Initialize the ai module: register all built-in models and API providers.
@@ -71,6 +72,7 @@ pub fn init() void {
     google_gemini_cli_provider.registerGoogleGeminiCliProvider();
     openai_codex_responses_provider.registerOpenAICodexResponsesProvider();
     amazon_bedrock_provider.registerAmazonBedrockProvider();
+    mistral_provider.registerMistralProvider();
 }
 
 test "ai root compiles" {
