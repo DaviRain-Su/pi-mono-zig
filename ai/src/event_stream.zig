@@ -1,4 +1,5 @@
 const std = @import("std");
+const shared = @import("shared");
 const types = @import("types.zig");
 
 pub const AssistantMessageEvent = union(enum) {
@@ -22,8 +23,8 @@ pub fn EventStream(comptime Event: type, comptime Result: type) type {
     return struct {
         const Self = @This();
         const Inner = struct {
-            mutex: std.Thread.Mutex = .{},
-            cond: std.Thread.Condition = .{},
+            mutex: shared.compat.Mutex = shared.compat.createMutex(),
+            cond: shared.compat.Condition = shared.compat.createCondition(),
             queue: std.ArrayList(Event) = .empty,
             done: bool = false,
             result: ?Result = null,

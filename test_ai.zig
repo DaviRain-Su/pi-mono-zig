@@ -7,10 +7,9 @@ fn currentMs() i64 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    // Register providers
-    ai.openai_completions_provider.registerOpenAICompletionsProvider();
+    ai.init();
 
-    // Register Kimi model
+    // Register custom Kimi model
     const kimi_model = ai.Model{
         .id = "kimi-latest",
         .name = "Kimi Latest",

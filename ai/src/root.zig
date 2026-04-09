@@ -5,6 +5,7 @@ pub const event_stream = @import("event_stream.zig");
 pub const api_registry = @import("api_registry.zig");
 pub const models = @import("models.zig");
 pub const validation = @import("validation.zig");
+const models_generated = @import("models.generated.zig");
 pub const simple_options = @import("simple_options.zig");
 pub const transform_messages = @import("transform_messages.zig");
 
@@ -49,6 +50,20 @@ pub const google_gemini_cli_provider = @import("providers/google_gemini_cli.zig"
 pub const openai_codex_responses_provider = @import("providers/openai_codex_responses.zig");
 pub const amazon_bedrock_provider = @import("providers/amazon_bedrock.zig");
 pub const google_shared = @import("providers/google_shared.zig");
+
+/// Initialize the ai module: register all built-in models and API providers.
+/// Must be called once before using `getModel()` or `stream()`.
+pub fn init() void {
+    models_generated.registerAllModels();
+    faux_provider.registerFauxProvider();
+    openai_completions_provider.registerOpenAICompletionsProvider();
+    anthropic_messages_provider.registerAnthropicMessagesProvider();
+    openai_responses_provider.registerOpenAIResponsesProvider();
+    google_generative_ai_provider.registerGoogleGenerativeAIProvider();
+    google_gemini_cli_provider.registerGoogleGeminiCliProvider();
+    openai_codex_responses_provider.registerOpenAICodexResponsesProvider();
+    amazon_bedrock_provider.registerAmazonBedrockProvider();
+}
 
 test "ai root compiles" {
     _ = types.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } };

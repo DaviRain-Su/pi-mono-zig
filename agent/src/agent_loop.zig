@@ -1,7 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
+const shared = @import("shared");
 const types = @import("types.zig");
 
+const ManagedList = shared.compat.ManagedList;
 const AgentEvent = types.AgentEvent;
 const AgentMessage = types.AgentMessage;
 const AgentContext = types.AgentContext;
@@ -48,9 +50,9 @@ pub fn agentLoop(
             sf: *const fn (model: ai.Model, ctx: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream,
             e: *AgentEventStream,
         ) !void {
-            var new_messages = std.ArrayList(AgentMessage).empty;
-            defer new_messages.deinit(g);
-            try new_messages.appendSlice(g, p);
+            var new_messages = ManagedList(AgentMessage).init(g);
+            defer new_messages.deinit();
+            try new_messages.appendSlice(p);
 
             var current_ctx = try copyContextWithMessages(g, c, p);
             defer g.free(current_ctx.messages);
@@ -87,11 +89,11 @@ pub fn agentLoopContinue(
             sf: *const fn (model: ai.Model, ctx: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream,
             e: *AgentEventStream,
         ) !void {
-            var new_messages = std.ArrayList(AgentMessage).empty;
-            defer new_messages.deinit(g);
+            var new_messages = ManagedList(AgentMessage).init(g);
+            defer new_messages.deinit();
 
             const continue_msg = AgentMessage{ .user = .{ .content = .{ .text = "Continue" }, .timestamp = 0 } };
-            try new_messages.append(g, continue_msg);
+            try new_messages.append(continue_msg);
 
             var current_ctx = try copyContext(g, c);
             defer g.free(current_ctx.messages);
@@ -136,7 +138,7 @@ fn pushAgentEvent(es: *AgentEventStream, event: AgentEvent) void {
 
 fn runAgentLoopInner(
     gpa: std.mem.Allocator,
-    new_messages: *std.ArrayList(AgentMessage),
+    new_messages: *ManagedList(AgentMessage),
     current_ctx: *AgentContext,
     config: AgentLoopConfig,
     stream_fn: *const fn (model: ai.Model, ctx: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream,
@@ -145,14 +147,14 @@ fn runAgentLoopInner(
     pushAgentEvent(es, .agent_start);
     pushAgentEvent(es, .turn_start);
 
-    for (new_messages.items) |prompt| {
+    for (new_messages.items()) |prompt| {
         pushAgentEvent(es, .{ .message_start = prompt });
         pushAgentEvent(es, .{ .message_end = prompt });
     }
 
     _ = try runLoop(gpa, current_ctx, new_messages, config, stream_fn, es);
 
-    const final_messages = try new_messages.toOwnedSlice(gpa);
+    const final_messages = try new_messages.toOwnedSlice();
     pushAgentEvent(es, .{ .agent_end = .{ .messages = final_messages } });
     es.end(final_messages);
 }
@@ -161,7 +163,7 @@ fn runAgentLoopInner(
 fn runLoop(
     gpa: std.mem.Allocator,
     current_ctx: *AgentContext,
-    new_messages: *std.ArrayList(AgentMessage),
+    new_messages: *ManagedList(AgentMessage),
     config: AgentLoopConfig,
     stream_fn: *const fn (model: ai.Model, ctx: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream,
     es: *AgentEventStream,
@@ -186,14 +188,14 @@ fn runLoop(
                     pushAgentEvent(es, .{ .message_start = msg });
                     pushAgentEvent(es, .{ .message_end = msg });
                     try appendMessage(gpa, &current_ctx.messages, msg);
-                    try new_messages.append(gpa, msg);
+                    try new_messages.append(msg);
                 }
                 gpa.free(to_free);
                 pending_messages = &[_]AgentMessage{};
             }
 
             const message = try streamAssistantResponse(gpa, current_ctx, config, stream_fn, es);
-            try new_messages.append(gpa, AgentMessage{ .assistant = message });
+            try new_messages.append(AgentMessage{ .assistant = message });
 
             const stop_reason = if (message.stop_reason == .err or message.stop_reason == .aborted)
                 message.stop_reason
@@ -209,21 +211,21 @@ fn runLoop(
             const tool_calls = extractToolCalls(message);
             has_more_tool_calls = tool_calls.len > 0;
 
-            var tool_results = std.ArrayList(ai.ToolResultMessage).empty;
-            defer tool_results.deinit(gpa);
+            var tool_results = ManagedList(ai.ToolResultMessage).init(gpa);
+            defer tool_results.deinit();
 
             if (has_more_tool_calls) {
                 const results = try executeToolCalls(gpa, current_ctx, message, tool_calls, config, es);
                 defer gpa.free(results);
-                try tool_results.appendSlice(gpa, results);
+                try tool_results.appendSlice(results);
 
                 for (results) |result| {
                     try appendMessage(gpa, &current_ctx.messages, .{ .tool_result = result });
-                    try new_messages.append(gpa, AgentMessage{ .tool_result = result });
+                    try new_messages.append(AgentMessage{ .tool_result = result });
                 }
             }
 
-            pushAgentEvent(es, .{ .turn_end = .{ .message = AgentMessage{ .assistant = message }, .tool_results = tool_results.items } });
+            pushAgentEvent(es, .{ .turn_end = .{ .message = AgentMessage{ .assistant = message }, .tool_results = tool_results.items() } });
             const next_steering = if (config.get_steering_messages) |f| f(config.user_ctx) else &[_]AgentMessage{};
             gpa.free(pending_messages);
             pending_messages = next_steering;
@@ -245,30 +247,30 @@ fn runLoop(
 
 fn extractToolCalls(message: ai.AssistantMessage) []const AgentToolCall {
     const gpa = std.heap.page_allocator;
-    var list = std.ArrayList(AgentToolCall).empty;
-    defer list.deinit(gpa);
+    var list = ManagedList(AgentToolCall).init(gpa);
+    defer list.deinit();
     for (message.content) |block| {
         switch (block) {
             .tool_call => |tc| {
-                list.append(gpa, tc) catch @panic("OOM");
+                list.append(tc) catch @panic("OOM");
             },
             else => {},
         }
     }
-    return list.toOwnedSlice(gpa) catch @panic("OOM");
+    return list.toOwnedSlice() catch @panic("OOM");
 }
 
 fn agentToolsToAiTools(gpa: std.mem.Allocator, tools: []const AgentTool) ![]ai.Tool {
-    var list = std.ArrayList(ai.Tool).empty;
-    defer list.deinit(gpa);
+    var list = ManagedList(ai.Tool).init(gpa);
+    defer list.deinit();
     for (tools) |tool| {
-        try list.append(gpa, .{
+        try list.append(.{
             .name = tool.name,
             .description = tool.description,
             .parameters = tool.parameters,
         });
     }
-    return list.toOwnedSlice(gpa);
+    return list.toOwnedSlice();
 }
 
 fn streamAssistantResponse(
@@ -389,8 +391,8 @@ fn executeToolCallsSequential(
     config: AgentLoopConfig,
     es: *AgentEventStream,
 ) ![]ai.ToolResultMessage {
-    var results = std.ArrayList(ai.ToolResultMessage).empty;
-    defer results.deinit(gpa);
+    var results = ManagedList(ai.ToolResultMessage).init(gpa);
+    defer results.deinit();
 
     for (tool_calls) |tool_call| {
         pushAgentEvent(es, .{ .tool_execution_start = .{
@@ -403,17 +405,17 @@ fn executeToolCallsSequential(
         switch (prepared) {
             .immediate => |imm| {
                 const result = try emitToolCallOutcome(gpa, tool_call, imm.result, imm.is_error, es);
-                try results.append(gpa, result);
+                try results.append(result);
             },
             .prepared => |prep| {
                 const executed = try executePreparedToolCall(prep);
                 const result = try finalizeExecutedToolCall(current_ctx, assistant_message, prep, executed, config, es);
-                try results.append(gpa, result);
+                try results.append(result);
             },
         }
     }
 
-    return try results.toOwnedSlice(gpa);
+    return try results.toOwnedSlice();
 }
 
 fn executeToolCallsParallel(
@@ -424,15 +426,15 @@ fn executeToolCallsParallel(
     config: AgentLoopConfig,
     es: *AgentEventStream,
 ) ![]ai.ToolResultMessage {
-    var results = std.ArrayList(ai.ToolResultMessage).empty;
-    defer results.deinit(gpa);
+    var results = ManagedList(ai.ToolResultMessage).init(gpa);
+    defer results.deinit();
 
     const Prepared = PreparedToolCall;
-    var immediates = std.ArrayList(struct { tool_call: AgentToolCall, result: AgentToolResult, is_error: bool }).empty;
-    defer immediates.deinit(gpa);
+    var immediates = ManagedList(struct { tool_call: AgentToolCall, result: AgentToolResult, is_error: bool }).init(gpa);
+    defer immediates.deinit();
 
-    var runnables = std.ArrayList(Prepared).empty;
-    defer runnables.deinit(gpa);
+    var runnables = ManagedList(Prepared).init(gpa);
+    defer runnables.deinit();
 
     for (tool_calls) |tool_call| {
         pushAgentEvent(es, .{ .tool_execution_start = .{
@@ -444,47 +446,47 @@ fn executeToolCallsParallel(
         const prepared = try prepareToolCall(current_ctx, assistant_message, tool_call, config);
         switch (prepared) {
             .immediate => |imm| {
-                try immediates.append(gpa, .{
+                try immediates.append(.{
                     .tool_call = tool_call,
                     .result = imm.result,
                     .is_error = imm.is_error,
                 });
             },
             .prepared => |prep| {
-                try runnables.append(gpa, prep);
+                try runnables.append(prep);
             },
         }
     }
 
-    var threads = std.ArrayList(std.Thread).empty;
-    defer threads.deinit(gpa);
-    var outcomes = try gpa.alloc(ExecutedToolCallOutcome, runnables.items.len);
+    var threads = ManagedList(std.Thread).init(gpa);
+    defer threads.deinit();
+    var outcomes = try gpa.alloc(ExecutedToolCallOutcome, runnables.len());
     defer gpa.free(outcomes);
 
-    for (runnables.items, 0..) |prepared, i| {
+    for (runnables.items(), 0..) |prepared, i| {
         const t = try std.Thread.spawn(.{}, struct {
             fn run(p: Prepared, out: *ExecutedToolCallOutcome) !void {
                 out.* = try executePreparedToolCall(p);
             }
         }.run, .{ prepared, &outcomes[i] });
-        try threads.append(gpa, t);
+        try threads.append(t);
     }
 
-    for (threads.items) |t| {
+    for (threads.items()) |t| {
         t.join();
     }
 
-    for (immediates.items) |imm| {
+    for (immediates.items()) |imm| {
         const result = try emitToolCallOutcome(gpa, imm.tool_call, imm.result, imm.is_error, es);
-        try results.append(gpa, result);
+        try results.append(result);
     }
 
-    for (runnables.items, 0..) |prepared, i| {
+    for (runnables.items(), 0..) |prepared, i| {
         const result = try finalizeExecutedToolCall(current_ctx, assistant_message, prepared, outcomes[i], config, es);
-        try results.append(gpa, result);
+        try results.append(result);
     }
 
-    return try results.toOwnedSlice(gpa);
+    return try results.toOwnedSlice();
 }
 
 const PreparedToolCall = struct {
@@ -767,18 +769,18 @@ test "agent event sequence" {
     defer es.deinit();
     try agentLoop(gpa, &[_]AgentMessage{prompt}, context, config, ai.streamSimple, &es);
 
-    var events = std.ArrayList(AgentEvent).empty;
-    defer events.deinit(gpa);
+    var events = ManagedList(AgentEvent).init(gpa);
+    defer events.deinit();
 
     while (true) {
         const ev = es.next() orelse break;
-        try events.append(gpa, ev);
+        try events.append(ev);
     }
 
-    try std.testing.expect(events.items.len >= 6);
-    try std.testing.expect(events.items[0] == .agent_start);
-    try std.testing.expect(events.items[1] == .turn_start);
-    try std.testing.expect(events.items[events.items.len - 1] == .agent_end);
+    try std.testing.expect(events.len() >= 6);
+    try std.testing.expect(events.items()[0] == .agent_start);
+    try std.testing.expect(events.items()[1] == .turn_start);
+    try std.testing.expect(events.items()[events.len() - 1] == .agent_end);
 
     const result = es.waitResult() orelse return error.NoResult;
     try std.testing.expectEqual(@as(usize, 2), result.len);

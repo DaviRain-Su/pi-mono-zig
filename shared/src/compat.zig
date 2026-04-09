@@ -1,16 +1,30 @@
 const std = @import("std");
 
+/// std.Thread.Mutex API may change between Zig versions (e.g. init() vs .{}).
+/// Use this alias + factory so that only one place needs to be updated.
+pub const Mutex = std.Thread.Mutex;
+pub inline fn createMutex() Mutex {
+    return .{};
+}
+
+/// std.Thread.Condition API may change between Zig versions.
+pub const Condition = std.Thread.Condition;
+pub inline fn createCondition() Condition {
+    return .{};
+}
+
 /// A wrapper around std.ArrayList that binds the allocator at initialization time.
 /// This insulates callers from std.ArrayList API churn (e.g. explicit gpa parameters).
 pub fn ManagedList(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        inner: std.ArrayList(T) = .empty,
+        // Deliberately no default field initializers: init() is the only supported path.
+        inner: std.ArrayList(T),
         gpa: std.mem.Allocator,
 
         pub fn init(gpa: std.mem.Allocator) Self {
-            return .{ .gpa = gpa };
+            return .{ .inner = .empty, .gpa = gpa };
         }
 
         pub fn deinit(self: *Self) void {
@@ -45,6 +59,19 @@ pub fn ManagedList(comptime T: type) type {
             return self.inner.items.len;
         }
     };
+}
+
+/// JSON helpers that insulate callers from std.json.Value/ObjectMap init churn.
+pub fn jsonNull() std.json.Value {
+    return .null;
+}
+
+pub fn jsonEmptyObject(gpa: std.mem.Allocator) std.json.Value {
+    return .{ .object = std.json.ObjectMap.init(gpa) };
+}
+
+pub fn jsonString(s: []const u8) std.json.Value {
+    return .{ .string = s };
 }
 
 /// Encodes the rule: "slices that escape a function must be heap-allocated".

@@ -1,7 +1,10 @@
 const std = @import("std");
 const ai = @import("ai");
+const shared = @import("shared");
 const types = @import("types.zig");
 const agent_loop = @import("agent_loop.zig");
+
+const ManagedList = shared.compat.ManagedList;
 
 pub const AgentOptions = struct {
     initial_state: ?types.AgentState = null,
@@ -25,40 +28,38 @@ pub const QueueMode = enum {
 
 pub const PendingMessageQueue = struct {
     mode: QueueMode,
-    items: std.ArrayList(types.AgentMessage),
-    gpa: std.mem.Allocator,
+    items: ManagedList(types.AgentMessage),
 
     pub fn init(gpa: std.mem.Allocator, mode: QueueMode) PendingMessageQueue {
         return .{
             .mode = mode,
-            .items = std.ArrayList(types.AgentMessage).empty,
-            .gpa = gpa,
+            .items = ManagedList(types.AgentMessage).init(gpa),
         };
     }
 
     pub fn deinit(self: *PendingMessageQueue) void {
-        self.items.deinit(self.gpa);
+        self.items.deinit();
     }
 
     pub fn enqueue(self: *PendingMessageQueue, message: types.AgentMessage) void {
-        self.items.append(self.gpa, message) catch @panic("OOM");
+        self.items.append(message) catch @panic("OOM");
     }
 
     pub fn hasItems(self: *const PendingMessageQueue) bool {
-        return self.items.items.len > 0;
+        return self.items.len() > 0;
     }
 
     pub fn drain(self: *PendingMessageQueue) []types.AgentMessage {
         if (self.mode == .all) {
-            const drained = self.items.toOwnedSlice(self.gpa) catch @panic("OOM");
+            const drained = self.items.toOwnedSlice() catch @panic("OOM");
             self.items.clearRetainingCapacity();
             return drained;
         }
-        if (self.items.items.len == 0) return &[_]types.AgentMessage{};
+        if (self.items.len() == 0) return &[_]types.AgentMessage{};
         const first = self.items.orderedRemove(0);
-        var list = std.ArrayList(types.AgentMessage).empty;
-        list.append(self.gpa, first) catch @panic("OOM");
-        return list.toOwnedSlice(self.gpa) catch @panic("OOM");
+        var list = ManagedList(types.AgentMessage).init(self.items.gpa);
+        list.append(first) catch @panic("OOM");
+        return list.toOwnedSlice() catch @panic("OOM");
     }
 
     pub fn clear(self: *PendingMessageQueue) void {
@@ -70,7 +71,7 @@ pub const Agent = struct {
     const Self = @This();
 
     state: types.AgentState,
-    listeners: std.ArrayList(*const fn (event: types.AgentEvent) void),
+    listeners: ManagedList(*const fn (event: types.AgentEvent) void),
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
     stream_fn: ?*const fn (model: ai.Model, context: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream,
@@ -81,8 +82,8 @@ pub const Agent = struct {
     gpa: std.mem.Allocator,
 
     // Lifecycle / concurrency state
-    mutex: std.Thread.Mutex = .{},
-    idle_cond: std.Thread.Condition = .{},
+    mutex: shared.compat.Mutex = shared.compat.createMutex(),
+    idle_cond: shared.compat.Condition = shared.compat.createCondition(),
     is_running: bool = false,
     abort_requested: bool = false,
 
@@ -97,7 +98,7 @@ pub const Agent = struct {
         };
         return .{
             .state = initial,
-            .listeners = std.ArrayList(*const fn (event: types.AgentEvent) void).empty,
+            .listeners = ManagedList(*const fn (event: types.AgentEvent) void).init(gpa),
             .steering_queue = PendingMessageQueue.init(gpa, options.steering_mode),
             .follow_up_queue = PendingMessageQueue.init(gpa, options.follow_up_mode),
             .stream_fn = options.stream_fn,
@@ -113,18 +114,18 @@ pub const Agent = struct {
         if (self.state.messages.len > 0) {
             self.gpa.free(self.state.messages);
         }
-        self.listeners.deinit(self.gpa);
+        self.listeners.deinit();
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
         self.state.pending_tool_calls.deinit();
     }
 
     pub fn subscribe(self: *Self, listener: *const fn (event: types.AgentEvent) void) void {
-        self.listeners.append(self.gpa, listener) catch @panic("OOM");
+        self.listeners.append(listener) catch @panic("OOM");
     }
 
     pub fn emit(self: *Self, event: types.AgentEvent) void {
-        for (self.listeners.items) |listener| {
+        for (self.listeners.items()) |listener| {
             listener(event);
         }
     }
@@ -304,15 +305,14 @@ fn followUpMessagesFromAgent(ctx: ?*anyopaque) []const types.AgentMessage {
     return self.follow_up_queue.drain();
 }
 
-var g_test_events: ?*std.ArrayList(types.AgentEvent) = null;
-var g_test_gpa: ?std.mem.Allocator = null;
-var g_test_events_mutex: std.Thread.Mutex = .{};
+var g_test_events: ?*ManagedList(types.AgentEvent) = null;
+var g_test_events_mutex: shared.compat.Mutex = shared.compat.createMutex();
 
 fn testListener(event: types.AgentEvent) void {
     g_test_events_mutex.lock();
     defer g_test_events_mutex.unlock();
     if (g_test_events) |list| {
-        list.append(g_test_gpa.?, event) catch @panic("OOM");
+        list.append(event) catch @panic("OOM");
     }
 }
 
@@ -325,17 +325,15 @@ test "agent prompt and waitForIdle" {
     const gpa = std.testing.allocator;
     setupFauxTextResponse("Hello agent");
 
-    var events = std.ArrayList(types.AgentEvent).empty;
-    defer events.deinit(gpa);
+    var events = ManagedList(types.AgentEvent).init(gpa);
+    defer events.deinit();
 
     g_test_events_mutex.lock();
     g_test_events = &events;
-    g_test_gpa = gpa;
     g_test_events_mutex.unlock();
     defer {
         g_test_events_mutex.lock();
         g_test_events = null;
-        g_test_gpa = null;
         g_test_events_mutex.unlock();
     }
 
@@ -354,7 +352,7 @@ test "agent prompt and waitForIdle" {
 
     // Check event sequence ends with agent_end
     g_test_events_mutex.lock();
-    const has_agent_end = events.items.len > 0 and switch (events.items[events.items.len - 1]) {
+    const has_agent_end = events.len() > 0 and switch (events.items()[events.len() - 1]) {
         .agent_end => true,
         else => false,
     };
@@ -446,7 +444,7 @@ test "agent steering queue consumed during loop" {
     try std.testing.expectEqualStrings("Steer me", agent.state.messages[1].user.content.text);
     try std.testing.expect(agent.state.messages[2] == .assistant);
     // Steering queue should be drained.
-    try std.testing.expectEqual(@as(usize, 0), agent.steering_queue.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), agent.steering_queue.items.len());
 }
 
 test "agent followUp queue consumed" {

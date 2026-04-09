@@ -2,7 +2,7 @@ const std = @import("std");
 const ai = @import("ai");
 
 pub fn main(init: std.process.Init) !void {
-    ai.anthropic_messages_provider.registerAnthropicMessagesProvider();
+    ai.init();
 
     const kimi_model = ai.Model{
         .id = "kimi-latest",

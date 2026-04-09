@@ -1,13 +1,13 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 
-/// A simple event stream channel built on top of std.Thread.Mutex + std.ArrayList.
-/// This is a placeholder skeleton; will evolve into a full generic event stream.
+/// A simple event stream channel built on top of compat.Mutex + std.ArrayList.
 pub fn EventStream(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: compat.Mutex = compat.createMutex(),
+        cond: compat.Condition = compat.createCondition(),
         items: std.ArrayList(T),
         closed: bool = false,
         gpa: std.mem.Allocator,
