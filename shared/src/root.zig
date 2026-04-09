@@ -12,6 +12,7 @@ pub const parseValue = json_mod.parseValue;
 pub const stringifyValue = json_mod.stringifyValue;
 
 pub const HttpClient = @import("http.zig").HttpClient;
+pub const compat = @import("compat.zig");
 
 test "basic add" {
     const std_testing = @import("std").testing;

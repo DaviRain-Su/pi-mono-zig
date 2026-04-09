@@ -57,6 +57,9 @@ pub fn EventStream(comptime Event: type, comptime Result: type) type {
             self.inner.queue.deinit(self.inner.gpa);
             const gpa = self.inner.gpa;
             gpa.destroy(self.inner);
+            // Defensive: make subsequent accidental access to self.inner fail
+            // under safety checks instead of causing silent UAF.
+            self.inner = undefined;
         }
 
         pub fn push(self: *Self, event: Event) void {
