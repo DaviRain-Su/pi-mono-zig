@@ -8,6 +8,8 @@ pub const validation = @import("validation.zig");
 const models_generated = @import("models.generated.zig");
 pub const simple_options = @import("simple_options.zig");
 pub const transform_messages = @import("transform_messages.zig");
+pub const env_api_keys = @import("env_api_keys.zig");
+pub const overflow = @import("overflow.zig");
 
 // Re-export commonly used types at root
 pub const Message = types.Message;
@@ -27,6 +29,8 @@ pub const AssistantMessageEventStream = event_stream.AssistantMessageEventStream
 pub const createAssistantMessageEventStream = event_stream.createAssistantMessageEventStream;
 pub const stream = api_registry.stream;
 pub const streamSimple = api_registry.streamSimple;
+pub const complete = api_registry.complete;
+pub const completeSimple = api_registry.completeSimple;
 pub const registerApiProvider = api_registry.registerApiProvider;
 pub const getApiProvider = api_registry.getApiProvider;
 pub const getApiProviders = api_registry.getApiProviders;
@@ -39,6 +43,8 @@ pub const calculateCost = models.calculateCost;
 pub const supportsXhigh = models.supportsXhigh;
 pub const modelsAreEqual = models.modelsAreEqual;
 pub const validateToolArguments = validation.validateToolArguments;
+pub const getEnvApiKey = env_api_keys.getEnvApiKey;
+pub const isContextOverflow = overflow.isContextOverflow;
 
 // Providers
 pub const faux_provider = @import("providers/faux.zig");

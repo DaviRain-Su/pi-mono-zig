@@ -21,49 +21,51 @@
 ## 任务清单
 
 ### Phase 0: 基础设施 (Priority: P0)
-- [ ] **0.1 初始化 Zig 项目结构**
+- [x] **0.1 初始化 Zig 项目结构**
   - 建立 `build.zig` + `build.zig.zon` 的多模块 workspace 布局
   - 各模块：`ai/`, `agent/`, `tui/`, `coding-agent/`, `mom/`, `pods/`, `shared/`
-  - 统一 `build.zig` 中导出 `zig fetch` 可用的模块
-- [ ] **0.2 公共类型与工具 (`shared/`)**
-  - JSON Schema 极简替代（无需 TypeBox，目标自足）
-  - 通用事件流通道（`std.Thread` + `std.atomic.Queue`/`Channel`）
-  - 路径/文件 helper、HTTP client wrapper（`std.http.Client`）
-  - 配置加载（环境变量 + YAML/JSON）
+- [x] **0.2 公共类型与工具 (`shared/`)**
+  - HTTP client wrapper（`std.http.Client`）
+  - SSE 安全解析、`JsonArena` 生命周期管理
+  - `compat.zig`：`ManagedList`、Mutex/Condition 抽象
 
 ---
 
 ### Phase 1: `pi-ai` → `ai/` (P0)
-- [ ] **1.1 Core Types & Streaming Abstractions**
+- [x] **1.1 Core Types & Streaming Abstractions**
   - 对齐 TS 类型：`Message`, `AssistantMessage`, `ToolResultMessage`, `Context`, `Model`, `Tool`
-  - 实现流事件枚举：`text_start`/`text_delta`/`text_end`、`toolcall_start`/`delta`/`end`、`thinking_*`、`done`、`error`
   - 构建 `EventStream` 与 `StreamFn` 抽象
-- [ ] **1.2 Provider Registry & Unified API**
+- [x] **1.2 Provider Registry & Unified API**
   - `registerApiProvider` / `getProviders` / `getModels` / `getModel`
-  - `stream()` / `complete()` / `streamSimple()` / `completeSimple()` 多态分发
-  - 环境变量 API Key 解析（对齐 README 中的环境变量表）
-- [ ] **1.3 Provider Implementations（逐个实现）**
-  | Provider | 复杂度 | 说明 |
-  |----------|--------|------|
-  | `faux` | L | 用于测试的内存 provider，先实现以利后续测试 |
-  | `anthropic-messages` | M | SSE 流 + Tool 调用 |
-  | `openai-completions` | M | OpenAI 兼容 API，含大量 `compat` 逻辑 |
-  | `openai-responses` | M | OpenAI Responses API |
-  | `google-generative-ai` | M | Gemini API |
-  | `azure-openai-responses` | L | Azure 变体 |
-  | `google-vertex` | L | Vertex AI |
-  | `mistral-conversations` | L | Mistral |
-  | `amazon-bedrock` | H | AWS 签名 v4 + Converse 流 |
-  | 其他 OAuth (Copilot, Codex, Gemini CLI) | H | 需实现 OAuth/PKCE/token 刷新 |
-- [ ] **1.4 Tool Validation**
-  - 用 Zig 实现轻量 JSON Schema validator（支持 `object`/`string`/`number`/`array`/`boolean`）
+  - `stream()` / `streamSimple()` 多态分发
+- [ ] **1.3 补齐缺失的 API**
+  - `env-api-keys.ts` 等价物（所有 provider 的环境变量 API key 映射）
+  - `complete()` / `completeSimple()` 阻塞式结果获取
+  - `wrapStream` / `wrapStreamSimple` 的 `model.api` 运行时校验
+- [ ] **1.4 Provider Implementations（补齐缺失）**
+  | Provider | 状态 | 说明 |
+  |----------|------|------|
+  | `faux` | ✅ | 测试 provider |
+  | `anthropic-messages` | ✅ | SSE 流 + Tool 调用 |
+  | `openai-completions` | ✅ | OpenAI 兼容 API |
+  | `openai-responses` | ✅ | OpenAI Responses API（含 Copilot） |
+  | `google-generative-ai` | ✅ | Gemini API |
+  | `google-gemini-cli` | ✅ | Cloud Code Assist |
+  | `openai-codex-responses` | ✅ | Codex CLI |
+  | `amazon-bedrock` | ✅ | AWS SigV4 + Event Stream |
+  | `azure-openai-responses` | ⬜ | Azure 变体 |
+  | `google-vertex` | ⬜ | Vertex AI |
+  | `mistral` | ⬜ | Mistral Conversations |
+- [x] **1.5 Tool Validation**
+  - 手写轻量 JSON Schema validator
   - `validateToolArguments` 和 `validateToolCall`
-- [ ] **1.5 Context Serialization & Cross-Provider Handoff**
-  - 消息序列化/反序列化（JSON）
-  - thinking 块自动转 `<thinking>` 标签的兼容性处理
-- [ ] **1.6 Tests**
-  - 单元测试：事件流、工具验证、faux provider
-  - 集成测试：至少覆盖 anthropic / openai / google 三家的流式对话+工具调用
+- [ ] **1.6 补齐缺失的 utils**
+  - `overflow.ts` 等价物（上下文溢出错误模式检测）
+  - `sanitize-unicode.ts` 等价物
+  - `hash.ts` 等价物
+- [x] **1.7 内置模型生成与注册**
+  - 从 TS `models.generated.ts` 自动生成 `ai/src/models.generated.zig`
+  - `ai.init()` 自动注册全部 833 个模型和 8 个 provider
 
 ---
 

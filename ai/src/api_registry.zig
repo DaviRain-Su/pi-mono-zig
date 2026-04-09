@@ -82,6 +82,39 @@ pub fn streamSimple(model: types.Model, context: types.Context, options: ?types.
     return provider.stream_simple(model, context, options);
 }
 
+/// Blocking helper: consume the entire `stream()` result.
+/// Returns the final AssistantMessage from the stream.
+pub fn complete(model: types.Model, context: types.Context, options: ?types.StreamOptions) types.AssistantMessage {
+    var es = stream(model, context, options);
+    defer es.deinit();
+    const result = es.waitResult() orelse return errorMessage(model, "Stream ended without result");
+    if (result.len == 0) return errorMessage(model, "Stream returned empty result");
+    return result[result.len - 1];
+}
+
+/// Blocking helper: consume the entire `streamSimple()` result.
+pub fn completeSimple(model: types.Model, context: types.Context, options: ?types.SimpleStreamOptions) types.AssistantMessage {
+    var es = streamSimple(model, context, options);
+    defer es.deinit();
+    const result = es.waitResult() orelse return errorMessage(model, "Stream ended without result");
+    if (result.len == 0) return errorMessage(model, "Stream returned empty result");
+    return result[result.len - 1];
+}
+
+fn errorMessage(model: types.Model, msg: []const u8) types.AssistantMessage {
+    return types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .err,
+        .error_message = msg,
+        .timestamp = 0,
+    };
+}
+
 test "register and lookup provider" {
     clearApiProviders();
     const dummy_stream: ApiStreamFunction = struct {
