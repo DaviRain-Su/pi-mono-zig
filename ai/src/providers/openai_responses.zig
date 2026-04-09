@@ -370,7 +370,7 @@ fn getApiKey(model: ai.Model, options_api_key: ?[]const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(std.heap.page_allocator, "OPENAI_API_KEY") catch null;
 }
 
-fn buildParams(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context, options: ?ai.StreamOptions) !std.json.Value {
+pub fn buildParams(gpa: std.mem.Allocator, model: ai.Model, context: ai.Context, options: ?ai.StreamOptions) !std.json.Value {
     const input = try convertResponsesMessages(gpa, model, context);
 
     var obj = std.json.ObjectMap.init(gpa);

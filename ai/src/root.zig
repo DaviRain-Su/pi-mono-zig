@@ -51,6 +51,7 @@ pub const faux_provider = @import("providers/faux.zig");
 pub const openai_completions_provider = @import("providers/openai_completions.zig");
 pub const anthropic_messages_provider = @import("providers/anthropic_messages.zig");
 pub const openai_responses_provider = @import("providers/openai_responses.zig");
+pub const azure_openai_responses_provider = @import("providers/azure_openai_responses.zig");
 pub const google_generative_ai_provider = @import("providers/google_generative_ai.zig");
 pub const google_gemini_cli_provider = @import("providers/google_gemini_cli.zig");
 pub const openai_codex_responses_provider = @import("providers/openai_codex_responses.zig");
@@ -65,6 +66,7 @@ pub fn init() void {
     openai_completions_provider.registerOpenAICompletionsProvider();
     anthropic_messages_provider.registerAnthropicMessagesProvider();
     openai_responses_provider.registerOpenAIResponsesProvider();
+    azure_openai_responses_provider.registerAzureOpenAIResponsesProvider();
     google_generative_ai_provider.registerGoogleGenerativeAIProvider();
     google_gemini_cli_provider.registerGoogleGeminiCliProvider();
     openai_codex_responses_provider.registerOpenAICodexResponsesProvider();

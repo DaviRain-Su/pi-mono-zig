@@ -120,14 +120,21 @@ pub const Agent = struct {
         self.state.pending_tool_calls.deinit();
     }
 
-    pub fn subscribe(self: *Self, listener: *const fn (event: types.AgentEvent) void) void {
-        self.listeners.append(listener) catch @panic("OOM");
-    }
+    pub const Subscription = struct {
+        agent: *Agent,
+        listener: *const fn (event: types.AgentEvent) void,
 
-    pub fn emit(self: *Self, event: types.AgentEvent) void {
-        for (self.listeners.items()) |listener| {
-            listener(event);
+        pub fn cancel(self: Subscription) void {
+            const items = self.agent.listeners.items();
+            if (std.mem.indexOfScalar(*const fn (types.AgentEvent) void, items, self.listener)) |idx| {
+                _ = self.agent.listeners.orderedRemove(idx);
+            }
         }
+    };
+
+    pub fn subscribe(self: *Self, listener: *const fn (event: types.AgentEvent) void) Subscription {
+        self.listeners.append(listener) catch @panic("OOM");
+        return .{ .agent = self, .listener = listener };
     }
 
     pub fn steer(self: *Self, message: types.AgentMessage) void {
@@ -171,27 +178,18 @@ pub const Agent = struct {
 
         if (self.is_running) return error.AlreadyRunning;
 
-        // Append prompt to internal state
-        const new_messages = try self.gpa.alloc(types.AgentMessage, self.state.messages.len + 1);
-        @memcpy(new_messages[0..self.state.messages.len], self.state.messages);
-        new_messages[self.state.messages.len] = message;
-        if (self.state.messages.len > 0) {
-            self.gpa.free(self.state.messages);
-        }
-        self.state.messages = new_messages;
         self.is_running = true;
         self.abort_requested = false;
 
-        // Build context excluding the just-added prompt (agentLoop appends prompts)
         const context = types.AgentContext{
             .system_prompt = self.state.system_prompt,
-            .messages = self.state.messages[0 .. self.state.messages.len - 1],
+            .messages = self.state.messages,
             .tools = if (self.state.tools.len > 0) self.state.tools else null,
         };
+        const prompts = &[_]types.AgentMessage{message};
 
         const config = self.buildLoopConfigLocked();
         const stream_fn = self.stream_fn orelse ai.streamSimple;
-        const prompts = self.state.messages[self.state.messages.len - 1 ..];
 
         const thread = std.Thread.spawn(.{}, struct {
             fn run(agent: *Self, p: []const types.AgentMessage, c: types.AgentContext, cfg: types.AgentLoopConfig, sf: *const fn (model: ai.Model, ctx: ai.Context, options: ?ai.SimpleStreamOptions) ai.AssistantMessageEventStream) !void {
@@ -255,6 +253,12 @@ pub const Agent = struct {
     }
 
     fn consumeEventStream(self: *Self, es: *agent_loop.AgentEventStream) void {
+        self.mutex.lock();
+        self.state.is_streaming = true;
+        self.state.streaming_message = null;
+        self.state.error_message = null;
+        self.mutex.unlock();
+
         while (true) {
             self.mutex.lock();
             const should_abort = self.abort_requested;
@@ -265,20 +269,64 @@ pub const Agent = struct {
             }
 
             const ev = es.next() orelse break;
-            self.emit(ev);
+
+            self.mutex.lock();
+            switch (ev) {
+                .message_start => |msg| {
+                    self.state.streaming_message = msg;
+                },
+                .message_update => |upd| {
+                    self.state.streaming_message = upd.message;
+                },
+                .message_end => |msg| {
+                    self.state.streaming_message = null;
+                    const new_msgs = self.gpa.alloc(types.AgentMessage, self.state.messages.len + 1) catch @panic("OOM");
+                    @memcpy(new_msgs[0..self.state.messages.len], self.state.messages);
+                    new_msgs[self.state.messages.len] = msg;
+                    if (self.state.messages.len > 0) {
+                        self.gpa.free(self.state.messages);
+                    }
+                    self.state.messages = new_msgs;
+                },
+                .tool_execution_start => |t| {
+                    self.state.pending_tool_calls.put(t.tool_call_id, {}) catch {};
+                },
+                .tool_execution_end => |t| {
+                    _ = self.state.pending_tool_calls.remove(t.tool_call_id);
+                },
+                .turn_end => |te| {
+                    if (te.message == .assistant) {
+                        const am = te.message.assistant;
+                        if (am.error_message) |em| {
+                            if (em.len > 0) {
+                                self.state.error_message = em;
+                            }
+                        }
+                    }
+                },
+                .agent_end => {
+                    self.state.streaming_message = null;
+                },
+                else => {},
+            }
+
+            for (self.listeners.items()) |listener| {
+                listener(ev);
+            }
+            self.mutex.unlock();
         }
 
-        const final = es.waitResult();
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (final) |msgs| {
-            if (self.state.messages.len > 0) {
-                self.gpa.free(self.state.messages);
-            }
-            self.state.messages = msgs;
+        const result = es.waitResult();
+        if (result) |msgs| {
+            self.gpa.free(msgs);
         }
+
+        self.mutex.lock();
+        self.state.is_streaming = false;
+        self.state.streaming_message = null;
         self.is_running = false;
         self.idle_cond.broadcast();
+        self.mutex.unlock();
     }
 
     fn buildLoopConfigLocked(self: *Self) types.AgentLoopConfig {
@@ -339,7 +387,7 @@ test "agent prompt and waitForIdle" {
 
     var agent = Agent.init(gpa, .{});
     defer agent.deinit();
-    agent.subscribe(testListener);
+    _ = agent.subscribe(testListener);
 
     const prompt = types.AgentMessage{ .user = .{ .content = .{ .text = "Hi" }, .timestamp = 0 } };
     try agent.prompt(prompt);

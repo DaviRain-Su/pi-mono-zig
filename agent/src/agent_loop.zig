@@ -92,12 +92,8 @@ pub fn agentLoopContinue(
             var new_messages = ManagedList(AgentMessage).init(g);
             defer new_messages.deinit();
 
-            const continue_msg = AgentMessage{ .user = .{ .content = .{ .text = "Continue" }, .timestamp = 0 } };
-            try new_messages.append(continue_msg);
-
             var current_ctx = try copyContext(g, c);
             defer g.free(current_ctx.messages);
-            try appendMessage(g, &current_ctx.messages, continue_msg);
 
             try runAgentLoopInner(g, &new_messages, &current_ctx, cfg, sf, e);
         }
@@ -835,7 +831,7 @@ test "agent loop continue from user message" {
     try std.testing.expect(saw_agent_end);
 
     const result = es.waitResult() orelse return error.NoResult;
-    try std.testing.expect(result.len >= 2);
+    try std.testing.expect(result.len >= 1);
     gpa.free(result);
 }
 
