@@ -38,3 +38,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+packages/ai/zig-wasm/.zig-cache/
+zig/.zig-cache/
+zig/zig-out/
