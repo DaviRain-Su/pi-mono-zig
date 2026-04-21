@@ -14,6 +14,7 @@ try {
 		format: "esm",
 		logLevel: "silent",
 		outfile: outputPath,
+		external: ["*/json-parse-wasm-node.mjs"],
 	});
 	process.exit(0);
 } catch (error) {
