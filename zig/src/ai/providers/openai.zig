@@ -2,36 +2,191 @@ const std = @import("std");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
+const event_stream = @import("../event_stream.zig");
 
 pub const OpenAIProvider = struct {
     pub const api = "openai-completions";
 
     pub fn stream(
         allocator: std.mem.Allocator,
+        io: std.Io,
         model: types.Model,
         context: types.Context,
         options: ?types.StreamOptions,
-    ) !void {
-        _ = model;
-        _ = context;
-        _ = options;
-        _ = allocator;
-        // TODO: Implement OpenAI streaming
+    ) !event_stream.AssistantMessageEventStream {
+        var event_stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+        errdefer event_stream_instance.deinit();
+
+        // Build request payload
+        const payload = try buildRequestPayload(allocator, model, context, options);
+        defer payload.deinit(allocator);
+
+        // Serialize payload to JSON
+        var json_str = std.ArrayList(u8).empty;
+        defer json_str.deinit(allocator);
+        
+        // TODO: Serialize payload to json_str
+        _ = try std.json.stringifyAlloc(allocator, payload, .{});
+
+        // Build HTTP request
+        var headers = std.StringHashMap([]const u8).empty;
+        defer headers.deinit(allocator);
+        
+        try headers.put(allocator, "Content-Type", "application/json");
+        try headers.put(allocator, "Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{options.?.api_key orelse ""}));
+        try headers.put(allocator, "Accept", "text/event-stream");
+
+        const req = http_client.HttpRequest{
+            .method = .POST,
+            .url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}),
+            .headers = headers,
+            .body = json_str.items,
+        };
+        defer allocator.free(req.url);
+
+        // Send request and process response
+        var client = try http_client.HttpClient.init(allocator);
+        defer client.deinit();
+
+        const response = try client.request(req);
+        defer response.deinit();
+
+        if (response.status != 200) {
+            event_stream_instance.end(.{
+                .role = "assistant",
+                .content = &[_]types.ContentBlock{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = types.Usage.init(),
+                .stop_reason = .error_reason,
+                .error_message = try std.fmt.allocPrint(allocator, "HTTP {d}", .{response.status}),
+                .timestamp = 0,
+            });
+            return event_stream_instance;
+        }
+
+        // Parse SSE stream
+        try parseSseStream(allocator, &event_stream_instance, response.body, model);
+
+        return event_stream_instance;
     }
 
     pub fn streamSimple(
         allocator: std.mem.Allocator,
+        io: std.Io,
         model: types.Model,
         context: types.Context,
         options: ?types.StreamOptions,
-    ) !void {
-        _ = model;
-        _ = context;
-        _ = options;
-        _ = allocator;
-        // TODO: Implement OpenAI simple streaming
+    ) !event_stream.AssistantMessageEventStream {
+        return try stream(allocator, io, model, context, options);
     }
 };
+
+fn parseSseStream(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    body: []const u8,
+    model: types.Model,
+) !void {
+    var lines = std.mem.split(u8, body, "\n");
+    
+    var output = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    stream_ptr.push(.{
+        .event_type = .start,
+    });
+
+    var current_text: ?std.ArrayList(u8) = null;
+    defer if (current_text) |*t| t.deinit(allocator);
+
+    while (lines.next()) |line| {
+        const data = parseSseLine(line) orelse continue;
+        
+        if (std.mem.eql(u8, data, "[DONE]")) {
+            break;
+        }
+
+        const chunk = try parseChunk(allocator, data);
+        defer if (chunk) |c| c.deinit(allocator);
+
+        if (chunk == null) continue;
+
+        // Extract choices from chunk
+        const choices = chunk.?.object.get("choices") orelse continue;
+        if (choices != .array or choices.array.items.len == 0) continue;
+
+        const choice = choices.array.items[0];
+        if (choice != .object) continue;
+
+        const delta = choice.object.get("delta") orelse continue;
+        if (delta != .object) continue;
+
+        // Handle text content
+        if (delta.object.get("content")) |content| {
+            if (content == .string and content.string.len > 0) {
+                if (current_text == null) {
+                    stream_ptr.push(.{
+                        .event_type = .text_start,
+                        .content_index = 0,
+                    });
+                    current_text = std.ArrayList(u8).empty;
+                }
+
+                try current_text.?.appendSlice(allocator, content.string);
+                stream_ptr.push(.{
+                    .event_type = .text_delta,
+                    .content_index = 0,
+                    .delta = content.string,
+                });
+            }
+        }
+
+        // Handle finish_reason
+        if (choice.object.get("finish_reason")) |finish_reason| {
+            if (finish_reason == .string) {
+                output.stop_reason = mapStopReason(finish_reason.string);
+            }
+        }
+    }
+
+    // Finish current text block
+    if (current_text) |text| {
+        stream_ptr.push(.{
+            .event_type = .text_end,
+            .content_index = 0,
+            .content = text.items,
+        });
+        
+        // Add text content to output
+        var content_blocks = try allocator.alloc(types.ContentBlock, 1);
+        content_blocks[0] = .{ .text = .{ .text = text.items } };
+        output.content = content_blocks;
+    }
+
+    stream_ptr.push(.{
+        .event_type = .done,
+        .message = output,
+    });
+    stream_ptr.end(output);
+}
+
+fn mapStopReason(reason: []const u8) types.StopReason {
+    if (std.mem.eql(u8, reason, "stop")) return .stop;
+    if (std.mem.eql(u8, reason, "length")) return .length;
+    if (std.mem.eql(u8, reason, "tool_calls")) return .tool_use;
+    if (std.mem.eql(u8, reason, "content_filter")) return .error_reason;
+    return .stop;
+}
 
 /// Build the request payload for OpenAI chat completions API
 pub fn buildRequestPayload(
