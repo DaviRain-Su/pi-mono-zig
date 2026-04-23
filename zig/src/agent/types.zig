@@ -19,6 +19,17 @@ pub const ToolExecutionMode = enum {
     parallel,
 };
 
+pub const BeforeToolCallResult = struct {
+    block: bool = false,
+    reason: ?[]const u8 = null,
+};
+
+pub const AfterToolCallResult = struct {
+    content: ?[]const ai.ContentBlock = null,
+    details: ?std.json.Value = null,
+    is_error: ?bool = null,
+};
+
 pub const AgentToolResult = struct {
     content: []const ai.ContentBlock,
     details: ?std.json.Value = null,
@@ -42,6 +53,34 @@ pub const ExecuteToolFn = *const fn (
     on_update_context: ?*anyopaque,
     on_update: ?AgentToolUpdateCallback,
 ) anyerror!AgentToolResult;
+
+pub const BeforeToolCallContext = struct {
+    assistant_message: ai.AssistantMessage,
+    tool_call: AgentToolCall,
+    args: *std.json.Value,
+    context: AgentContext,
+};
+
+pub const AfterToolCallContext = struct {
+    assistant_message: ai.AssistantMessage,
+    tool_call: AgentToolCall,
+    args: std.json.Value,
+    result: AgentToolResult,
+    is_error: bool,
+    context: AgentContext,
+};
+
+pub const BeforeToolCallFn = *const fn (
+    allocator: std.mem.Allocator,
+    context: BeforeToolCallContext,
+    signal: ?*const std.atomic.Value(bool),
+) anyerror!?BeforeToolCallResult;
+
+pub const AfterToolCallFn = *const fn (
+    allocator: std.mem.Allocator,
+    context: AfterToolCallContext,
+    signal: ?*const std.atomic.Value(bool),
+) anyerror!?AfterToolCallResult;
 
 pub const AgentTool = struct {
     name: []const u8,
@@ -96,6 +135,8 @@ pub const AgentLoopConfig = struct {
     session_id: ?[]const u8 = null,
     reasoning: ?ThinkingLevel = null,
     tool_execution: ToolExecutionMode = .parallel,
+    before_tool_call: ?BeforeToolCallFn = null,
+    after_tool_call: ?AfterToolCallFn = null,
     convert_to_llm: ConvertToLlmFn,
     transform_context: ?TransformContextFn = null,
 };
