@@ -129,6 +129,11 @@ pub const TransformContextFn = *const fn (
     signal: ?*const std.atomic.Value(bool),
 ) anyerror![]AgentMessage;
 
+pub const PendingMessagesFn = *const fn (
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) anyerror![]AgentMessage;
+
 pub const AgentLoopConfig = struct {
     model: ai.Model,
     api_key: ?[]const u8 = null,
@@ -139,6 +144,10 @@ pub const AgentLoopConfig = struct {
     after_tool_call: ?AfterToolCallFn = null,
     convert_to_llm: ConvertToLlmFn,
     transform_context: ?TransformContextFn = null,
+    get_steering_messages_context: ?*anyopaque = null,
+    get_steering_messages: ?PendingMessagesFn = null,
+    get_follow_up_messages_context: ?*anyopaque = null,
+    get_follow_up_messages: ?PendingMessagesFn = null,
 };
 
 pub const AgentEventType = enum {

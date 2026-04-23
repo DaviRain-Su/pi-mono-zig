@@ -12,48 +12,67 @@ pub const QueueMode = enum {
 
 pub const PendingMessageQueue = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     mode: QueueMode,
     messages: std.ArrayList(types.AgentMessage),
+    mutex: std.Io.Mutex = .init,
 
-    pub fn init(allocator: std.mem.Allocator, mode: QueueMode) PendingMessageQueue {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, mode: QueueMode) PendingMessageQueue {
         return .{
             .allocator = allocator,
+            .io = io,
             .mode = mode,
             .messages = .empty,
         };
     }
 
     pub fn deinit(self: *PendingMessageQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.messages.deinit(self.allocator);
     }
 
     pub fn enqueue(self: *PendingMessageQueue, message: types.AgentMessage) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.messages.append(self.allocator, message);
     }
 
     pub fn hasItems(self: *const PendingMessageQueue) bool {
+        @constCast(&self.mutex).lockUncancelable(self.io);
+        defer @constCast(&self.mutex).unlock(self.io);
         return self.messages.items.len > 0;
     }
 
     pub fn len(self: *const PendingMessageQueue) usize {
+        @constCast(&self.mutex).lockUncancelable(self.io);
+        defer @constCast(&self.mutex).unlock(self.io);
         return self.messages.items.len;
     }
 
     pub fn clear(self: *PendingMessageQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.messages.clearRetainingCapacity();
     }
 
     pub fn drain(self: *PendingMessageQueue, allocator: std.mem.Allocator) ![]types.AgentMessage {
-        if (self.mode == .all) {
-            defer self.clear();
-            return try allocator.dupe(types.AgentMessage, self.messages.items);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.messages.items.len == 0) {
+            return try allocator.alloc(types.AgentMessage, 0);
         }
 
-        const first = self.messages.items[0..@min(self.messages.items.len, 1)];
-        defer if (self.messages.items.len > 0) {
-            _ = self.messages.orderedRemove(0);
-        };
-        return try allocator.dupe(types.AgentMessage, first);
+        if (self.mode == .all) {
+            const drained = try allocator.dupe(types.AgentMessage, self.messages.items);
+            self.messages.clearRetainingCapacity();
+            return drained;
+        }
+
+        const first = try allocator.dupe(types.AgentMessage, self.messages.items[0..1]);
+        _ = self.messages.orderedRemove(0);
+        return first;
     }
 };
 
@@ -110,6 +129,8 @@ pub const Agent = struct {
     before_tool_call: ?types.BeforeToolCallFn,
     after_tool_call: ?types.AfterToolCallFn,
     listeners: std.ArrayList(types.AgentSubscriber),
+    active_abort_signal: ?*std.atomic.Value(bool),
+    run_state_mutex: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, options: AgentOptions) !Agent {
         var agent = Agent{
@@ -123,8 +144,8 @@ pub const Agent = struct {
             .streaming_message = null,
             .pending_tool_calls = .empty,
             .error_message = null,
-            .steering_queue = PendingMessageQueue.init(allocator, options.steering_mode),
-            .follow_up_queue = PendingMessageQueue.init(allocator, options.follow_up_mode),
+            .steering_queue = PendingMessageQueue.init(allocator, options.io, options.steering_mode),
+            .follow_up_queue = PendingMessageQueue.init(allocator, options.io, options.follow_up_mode),
             .tool_execution = options.tool_execution,
             .io = options.io,
             .stream_fn = options.stream_fn,
@@ -133,6 +154,7 @@ pub const Agent = struct {
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
             .listeners = .empty,
+            .active_abort_signal = null,
         };
         errdefer agent.deinit();
 
@@ -232,6 +254,9 @@ pub const Agent = struct {
         self.is_streaming = false;
         self.streaming_message = null;
         self.clearPendingToolCalls();
+        self.run_state_mutex.lockUncancelable(self.io);
+        defer self.run_state_mutex.unlock(self.io);
+        self.active_abort_signal = null;
     }
 
     pub fn getPendingToolCalls(self: *const Agent) []const []const u8 {
@@ -273,6 +298,15 @@ pub const Agent = struct {
 
     pub fn followUp(self: *Agent, message: types.AgentMessage) !void {
         try self.follow_up_queue.enqueue(message);
+    }
+
+    pub fn abort(self: *Agent) void {
+        self.run_state_mutex.lockUncancelable(self.io);
+        defer self.run_state_mutex.unlock(self.io);
+
+        if (self.active_abort_signal) |signal| {
+            signal.store(true, .seq_cst);
+        }
     }
 
     pub fn clearSteeringQueue(self: *Agent) void {
@@ -358,6 +392,9 @@ pub const Agent = struct {
         defer arena.deinit();
 
         self.beginRun();
+        self.run_state_mutex.lockUncancelable(self.io);
+        self.active_abort_signal = &abort_signal;
+        self.run_state_mutex.unlock(self.io);
         defer self.finishRun();
 
         const added_messages = try agent_loop.runAgentLoop(
@@ -391,6 +428,10 @@ pub const Agent = struct {
             .after_tool_call = self.after_tool_call,
             .convert_to_llm = self.convert_to_llm,
             .transform_context = self.transform_context,
+            .get_steering_messages_context = @constCast(self),
+            .get_steering_messages = drainSteeringMessages,
+            .get_follow_up_messages_context = @constCast(self),
+            .get_follow_up_messages = drainFollowUpMessages,
         };
     }
 
@@ -452,6 +493,22 @@ fn defaultConvertToLlm(
     messages: []const types.AgentMessage,
 ) ![]ai.Message {
     return try allocator.dupe(ai.Message, messages);
+}
+
+fn drainSteeringMessages(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) ![]types.AgentMessage {
+    const self: *Agent = @ptrCast(@alignCast(context.?));
+    return try self.steering_queue.drain(allocator);
+}
+
+fn drainFollowUpMessages(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) ![]types.AgentMessage {
+    const self: *Agent = @ptrCast(@alignCast(context.?));
+    return try self.follow_up_queue.drain(allocator);
 }
 
 fn userMessageWithImages(
@@ -666,7 +723,7 @@ test "pending message queue drains according to mode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var queue_all = PendingMessageQueue.init(std.testing.allocator, .all);
+    var queue_all = PendingMessageQueue.init(std.testing.allocator, std.Io.failing, .all);
     defer queue_all.deinit();
     try queue_all.enqueue(try userTextMessage(arena.allocator(), "one", 1));
     try queue_all.enqueue(try userTextMessage(arena.allocator(), "two", 2));
@@ -676,7 +733,7 @@ test "pending message queue drains according to mode" {
     try std.testing.expectEqual(@as(usize, 2), drained_all.len);
     try std.testing.expect(!queue_all.hasItems());
 
-    var queue_one = PendingMessageQueue.init(std.testing.allocator, .one_at_a_time);
+    var queue_one = PendingMessageQueue.init(std.testing.allocator, std.Io.failing, .one_at_a_time);
     defer queue_one.deinit();
     try queue_one.enqueue(try userTextMessage(arena.allocator(), "first", 1));
     try queue_one.enqueue(try userTextMessage(arena.allocator(), "second", 2));
@@ -995,6 +1052,299 @@ test "agent prompt supports AgentMessage arrays and emits prompt events for each
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[event_types.len - 3]);
     try std.testing.expectEqual(types.AgentEventType.turn_end, event_types[event_types.len - 2]);
     try std.testing.expectEqual(types.AgentEventType.agent_end, event_types[event_types.len - 1]);
+}
+
+const AbortEventCapture = struct {
+    assistant_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    tool_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_tool_error: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_agent_end: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn captureAbortEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *AbortEventCapture = @ptrCast(@alignCast(context.?));
+    switch (event.event_type) {
+        .message_update => {
+            if (event.message) |message| switch (message) {
+                .assistant => capture.assistant_started.store(true, .seq_cst),
+                else => {},
+            };
+        },
+        .tool_execution_start => {
+            capture.tool_started.store(true, .seq_cst);
+        },
+        .tool_execution_end => {
+            if (event.is_error) |is_error| {
+                if (is_error) capture.saw_tool_error.store(true, .seq_cst);
+            }
+        },
+        .agent_end => {
+            capture.saw_agent_end.store(true, .seq_cst);
+        },
+        else => {},
+    }
+}
+
+const PromptThreadRunner = struct {
+    agent: *Agent,
+    input: []const u8,
+    err: ?anyerror = null,
+};
+
+fn runPromptThread(runner: *PromptThreadRunner) void {
+    runner.agent.prompt(runner.input) catch |err| {
+        runner.err = err;
+    };
+}
+
+fn waitForAtomicTrue(flag: *const std.atomic.Value(bool)) !void {
+    var iteration: usize = 0;
+    while (iteration < 500 and !flag.load(.seq_cst)) : (iteration += 1) {
+        std.Thread.yield() catch {};
+    }
+    if (!flag.load(.seq_cst)) return error.TestTimeout;
+}
+
+var abortable_tool_started: ?*std.atomic.Value(bool) = null;
+var mid_stream_started: ?*std.atomic.Value(bool) = null;
+
+fn abortableToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    signal: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    _ = allocator;
+
+    const started = abortable_tool_started orelse return error.MissingAbortableToolObserver;
+    started.store(true, .seq_cst);
+
+    var iteration: usize = 0;
+    while (iteration < 5_000) : (iteration += 1) {
+        if (signal) |abort_signal| {
+            if (abort_signal.load(.seq_cst)) {
+                return error.ToolAborted;
+            }
+        }
+        std.Thread.yield() catch {};
+    }
+
+    return error.ToolDidNotAbort;
+}
+
+fn buildAbortToolCallMessage(allocator: std.mem.Allocator) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = try faux.fauxToolCall(allocator, "wait", .null, .{ .id = "tool-1" });
+    return faux.fauxAssistantMessage(blocks, .{
+        .stop_reason = .tool_use,
+    });
+}
+
+fn makeAssistantTextMessage(
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    text: []const u8,
+    stop_reason: ai.StopReason,
+    error_message: ?[]const u8,
+) !ai.AssistantMessage {
+    _ = allocator;
+
+    const content = try std.heap.page_allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try std.heap.page_allocator.dupe(u8, text) } };
+    return .{
+        .content = content,
+        .tool_calls = null,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = stop_reason,
+        .error_message = if (error_message) |message| try std.heap.page_allocator.dupe(u8, message) else null,
+        .timestamp = 0,
+    };
+}
+
+fn blockingAbortStreamFn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    options: ?ai.types.SimpleStreamOptions,
+) !ai.event_stream.AssistantMessageEventStream {
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    const started = mid_stream_started orelse return error.MissingMidStreamObserver;
+    started.store(true, .seq_cst);
+
+    const partial = try makeAssistantTextMessage(allocator, model, "", .stop, null);
+    stream.push(.{
+        .event_type = .start,
+        .message = partial,
+    });
+    stream.push(.{
+        .event_type = .text_start,
+        .content_index = 0,
+    });
+    stream.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "partial",
+    });
+
+    var iteration: usize = 0;
+    while (iteration < 50_000) : (iteration += 1) {
+        if (options) |stream_options| {
+            if (stream_options.signal) |signal| {
+                if (signal.load(.seq_cst)) {
+                    const aborted = try makeAssistantTextMessage(
+                        allocator,
+                        model,
+                        "partial",
+                        .aborted,
+                        "Request was aborted",
+                    );
+                    stream.push(.{
+                        .event_type = .error_event,
+                        .error_message = aborted.error_message,
+                        .message = aborted,
+                    });
+                    stream.end(aborted);
+                    return stream;
+                }
+            }
+        }
+        std.Thread.yield() catch {};
+    }
+
+    const fallback = try makeAssistantTextMessage(allocator, model, "partial", .stop, null);
+    stream.push(.{
+        .event_type = .done,
+        .message = fallback,
+    });
+    stream.end(fallback);
+    return stream;
+}
+
+test "agent abort stops an in-flight stream and clears runtime state" {
+    const model = ai.Model{
+        .id = "blocking-test",
+        .name = "Blocking Test",
+        .api = "blocking-test",
+        .provider = "blocking-test",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = model,
+        .stream_fn = blockingAbortStreamFn,
+    });
+    defer agent.deinit();
+
+    var capture = AbortEventCapture{};
+    try agent.subscribe(.{
+        .context = &capture,
+        .callback = captureAbortEvent,
+    });
+
+    mid_stream_started = &capture.assistant_started;
+    defer mid_stream_started = null;
+
+    var runner = PromptThreadRunner{
+        .agent = &agent,
+        .input = "hello",
+    };
+    const thread = try std.Thread.spawn(.{}, runPromptThread, .{&runner});
+
+    try waitForAtomicTrue(&capture.assistant_started);
+    agent.abort();
+    thread.join();
+
+    if (runner.err) |err| return err;
+
+    const messages = agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expect(!agent.isStreaming());
+    try std.testing.expect(agent.getStreamingMessage() == null);
+    try std.testing.expectEqual(@as(usize, 0), agent.getPendingToolCalls().len);
+    try std.testing.expect(capture.saw_agent_end.load(.seq_cst));
+
+    switch (messages[1]) {
+        .assistant => |assistant| {
+            try std.testing.expectEqual(ai.StopReason.aborted, assistant.stop_reason);
+            try std.testing.expectEqualStrings("Request was aborted", assistant.error_message.?);
+        },
+        else => return error.UnexpectedMessageRole,
+    }
+}
+
+test "agent abort during tool execution cancels the tool and stops the run" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = try buildAbortToolCallMessage(arena.allocator()) },
+    });
+
+    const tool = types.AgentTool{
+        .name = "wait",
+        .description = "Wait for abort",
+        .label = "Wait",
+        .parameters = .null,
+        .execute = abortableToolExecute,
+    };
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = registration.getModel(),
+        .tools = &[_]types.AgentTool{tool},
+    });
+    defer agent.deinit();
+
+    var capture = AbortEventCapture{};
+    try agent.subscribe(.{
+        .context = &capture,
+        .callback = captureAbortEvent,
+    });
+
+    abortable_tool_started = &capture.tool_started;
+    defer abortable_tool_started = null;
+
+    var runner = PromptThreadRunner{
+        .agent = &agent,
+        .input = "hello",
+    };
+    const thread = try std.Thread.spawn(.{}, runPromptThread, .{&runner});
+
+    try waitForAtomicTrue(&capture.tool_started);
+    agent.abort();
+    thread.join();
+
+    if (runner.err) |err| return err;
+
+    const messages = agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expect(!agent.isStreaming());
+    try std.testing.expect(agent.getStreamingMessage() == null);
+    try std.testing.expectEqual(@as(usize, 0), agent.getPendingToolCalls().len);
+    try std.testing.expect(capture.saw_tool_error.load(.seq_cst));
+    try std.testing.expect(capture.saw_agent_end.load(.seq_cst));
+
+    switch (messages[2]) {
+        .tool_result => |tool_result| {
+            try std.testing.expect(tool_result.is_error);
+        },
+        else => return error.UnexpectedMessageRole,
+    }
 }
 
 test "agent prompt minimal" {
