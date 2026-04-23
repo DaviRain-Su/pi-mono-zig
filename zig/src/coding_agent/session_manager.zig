@@ -55,16 +55,27 @@ pub const ModelChangeEntry = struct {
     model_id: []const u8,
 };
 
+pub const CompactionEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u32,
+    message: agent.AgentMessage,
+};
+
 pub const SessionEntry = union(enum) {
     message: SessionMessageEntry,
     thinking_level_change: ThinkingLevelChangeEntry,
     model_change: ModelChangeEntry,
+    compaction: CompactionEntry,
 
     pub fn id(self: *const SessionEntry) []const u8 {
         return switch (self.*) {
             .message => |entry| entry.id,
             .thinking_level_change => |entry| entry.id,
             .model_change => |entry| entry.id,
+            .compaction => |entry| entry.id,
         };
     }
 
@@ -73,6 +84,7 @@ pub const SessionEntry = union(enum) {
             .message => |entry| entry.parent_id,
             .thinking_level_change => |entry| entry.parent_id,
             .model_change => |entry| entry.parent_id,
+            .compaction => |entry| entry.parent_id,
         };
     }
 
@@ -81,6 +93,7 @@ pub const SessionEntry = union(enum) {
             .message => |entry| entry.timestamp,
             .thinking_level_change => |entry| entry.timestamp,
             .model_change => |entry| entry.timestamp,
+            .compaction => |entry| entry.timestamp,
         };
     }
 };
@@ -295,6 +308,39 @@ pub const SessionManager = struct {
         return self.leaf_id.?;
     }
 
+    pub fn appendCompaction(
+        self: *SessionManager,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u32,
+    ) ![]const u8 {
+        const id = try generateUniqueId(self.allocator, &self.by_id);
+        errdefer self.allocator.free(id);
+
+        const timestamp = try nowTimestamp(self.allocator, self.io);
+        errdefer self.allocator.free(timestamp);
+
+        const summary_message = try createCompactionSummaryMessage(self.allocator, summary, 0);
+        errdefer {
+            var cleanup = summary_message;
+            deinitMessage(self.allocator, &cleanup);
+        }
+
+        const entry = SessionEntry{
+            .compaction = .{
+                .id = id,
+                .parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null,
+                .timestamp = timestamp,
+                .first_kept_entry_id = try self.allocator.dupe(u8, first_kept_entry_id),
+                .tokens_before = tokens_before,
+                .message = summary_message,
+            },
+        };
+
+        try self.appendEntry(entry);
+        return self.leaf_id.?;
+    }
+
     pub fn branch(self: *SessionManager, entry_id: []const u8) !void {
         if (self.getEntry(entry_id) == null) return error.EntryNotFound;
         self.leaf_id = entry_id;
@@ -317,21 +363,12 @@ pub const SessionManager = struct {
 
         var thinking_level = agent.ThinkingLevel.off;
         var model: ?SessionModelRef = null;
+        var latest_compaction: ?*const CompactionEntry = null;
 
         for (branch_entries) |entry| {
             switch (entry.*) {
                 .message => |message_entry| {
-                    switch (message_entry.message) {
-                        .assistant => |assistant_message| {
-                            model = .{
-                                .api = assistant_message.api,
-                                .provider = assistant_message.provider,
-                                .model_id = assistant_message.model,
-                            };
-                        },
-                        else => {},
-                    }
-                    try messages.append(allocator, message_entry.message);
+                    updateModelFromMessage(&model, message_entry.message);
                 },
                 .thinking_level_change => |thinking_entry| {
                     thinking_level = thinking_entry.thinking_level;
@@ -342,6 +379,52 @@ pub const SessionManager = struct {
                         .model_id = model_entry.model_id,
                     };
                 },
+                .compaction => |*compaction_entry| {
+                    latest_compaction = compaction_entry;
+                },
+            }
+        }
+
+        if (latest_compaction) |compaction_entry| {
+            try appendVisibleMessage(&messages, compaction_entry.message, allocator);
+
+            const compaction_index = findEntryIndex(branch_entries, compaction_entry.id) orelse return error.InvalidSessionTree;
+            var found_first_kept = false;
+            var index: usize = 0;
+            while (index < compaction_index) : (index += 1) {
+                const entry = branch_entries[index];
+                if (std.mem.eql(u8, entry.id(), compaction_entry.first_kept_entry_id)) {
+                    found_first_kept = true;
+                }
+                if (found_first_kept) {
+                    switch (entry.*) {
+                        .message => |message_entry| {
+                            updateModelFromMessage(&model, message_entry.message);
+                            try appendVisibleMessage(&messages, message_entry.message, allocator);
+                        },
+                        .compaction => {},
+                        else => {},
+                    }
+                }
+            }
+
+            index = compaction_index + 1;
+            while (index < branch_entries.len) : (index += 1) {
+                switch (branch_entries[index].*) {
+                    .message => |message_entry| {
+                        updateModelFromMessage(&model, message_entry.message);
+                        try appendVisibleMessage(&messages, message_entry.message, allocator);
+                    },
+                    .compaction => {},
+                    else => {},
+                }
+            }
+        } else {
+            for (branch_entries) |entry| {
+                if (entry.* != .message) continue;
+                const message_entry = entry.message;
+                updateModelFromMessage(&model, message_entry.message);
+                try appendVisibleMessage(&messages, message_entry.message, allocator);
             }
         }
 
@@ -558,6 +641,13 @@ fn deinitEntry(allocator: std.mem.Allocator, entry: *SessionEntry) void {
             allocator.free(model_entry.provider);
             allocator.free(model_entry.model_id);
         },
+        .compaction => |*compaction_entry| {
+            allocator.free(compaction_entry.id);
+            if (compaction_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(compaction_entry.timestamp);
+            allocator.free(compaction_entry.first_kept_entry_id);
+            deinitMessage(allocator, &compaction_entry.message);
+        },
     }
 }
 
@@ -615,6 +705,69 @@ pub fn deinitMessage(allocator: std.mem.Allocator, message: *agent.AgentMessage)
             common.deinitContentBlocks(allocator, tool_result.content);
         },
     }
+}
+
+fn updateModelFromMessage(model: *?SessionModelRef, message: agent.AgentMessage) void {
+    switch (message) {
+        .assistant => |assistant_message| {
+            model.* = .{
+                .api = assistant_message.api,
+                .provider = assistant_message.provider,
+                .model_id = assistant_message.model,
+            };
+        },
+        else => {},
+    }
+}
+
+fn appendVisibleMessage(
+    messages: *std.ArrayList(agent.AgentMessage),
+    message: agent.AgentMessage,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (message) {
+        .assistant => |assistant_message| {
+            if (assistant_message.stop_reason == .error_reason) return;
+        },
+        else => {},
+    }
+    try messages.append(allocator, message);
+}
+
+fn findEntryIndex(entries: []const *const SessionEntry, id: []const u8) ?usize {
+    for (entries, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.id(), id)) return index;
+    }
+    return null;
+}
+
+fn createCompactionSummaryMessage(
+    allocator: std.mem.Allocator,
+    summary: []const u8,
+    timestamp: i64,
+) !agent.AgentMessage {
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try std.fmt.allocPrint(allocator, "[compaction]\n{s}", .{summary}) } };
+    return .{ .user = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = blocks,
+        .timestamp = timestamp,
+    } };
+}
+
+pub fn getCompactionSummary(entry: CompactionEntry) ![]const u8 {
+    return switch (entry.message) {
+        .user => |user| blk: {
+            if (user.content.len == 0 or user.content[0] != .text) return error.InvalidSessionEntry;
+            const text = user.content[0].text.text;
+            const prefix = "[compaction]\n";
+            if (std.mem.startsWith(u8, text, prefix)) {
+                break :blk text[prefix.len..];
+            }
+            break :blk text;
+        },
+        else => error.InvalidSessionEntry,
+    };
 }
 
 fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]const ai.ContentBlock {
@@ -746,6 +899,21 @@ fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.json
             var object = try baseEntryObject(allocator, "model_change", model_entry.id, model_entry.parent_id, model_entry.timestamp);
             try object.put(allocator, try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, model_entry.provider) });
             try object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model_entry.model_id) });
+            break :blk .{ .object = object };
+        },
+        .compaction => |compaction_entry| blk: {
+            var object = try baseEntryObject(allocator, "compaction", compaction_entry.id, compaction_entry.parent_id, compaction_entry.timestamp);
+            try object.put(
+                allocator,
+                try allocator.dupe(u8, "firstKeptEntryId"),
+                .{ .string = try allocator.dupe(u8, compaction_entry.first_kept_entry_id) },
+            );
+            try object.put(allocator, try allocator.dupe(u8, "tokensBefore"), .{ .integer = compaction_entry.tokens_before });
+            try object.put(
+                allocator,
+                try allocator.dupe(u8, "summary"),
+                .{ .string = try allocator.dupe(u8, try getCompactionSummary(compaction_entry)) },
+            );
             break :blk .{ .object = object };
         },
     };
@@ -927,6 +1095,18 @@ fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEntry 
             .timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp")),
             .provider = try allocator.dupe(u8, try getRequiredString(object, "provider")),
             .model_id = try allocator.dupe(u8, try getRequiredString(object, "modelId")),
+        } };
+    }
+
+    if (std.mem.eql(u8, entry_type, "compaction")) {
+        const summary = try getRequiredString(object, "summary");
+        return .{ .compaction = .{
+            .id = try allocator.dupe(u8, try getRequiredString(object, "id")),
+            .parent_id = if (getOptionalString(object, "parentId")) |parent_id| try allocator.dupe(u8, parent_id) else null,
+            .timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp")),
+            .first_kept_entry_id = try allocator.dupe(u8, try getRequiredString(object, "firstKeptEntryId")),
+            .tokens_before = @intCast(try getRequiredInteger(object, "tokensBefore")),
+            .message = try createCompactionSummaryMessage(allocator, summary, 0),
         } };
     }
 
@@ -1149,6 +1329,14 @@ fn getRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     const value = object.get(key) orelse return error.MissingField;
     return switch (value) {
         .string => |string| string,
+        else => error.InvalidField,
+    };
+}
+
+fn getRequiredInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
+    const value = object.get(key) orelse return error.MissingField;
+    return switch (value) {
+        .integer => |integer| integer,
         else => error.InvalidField,
     };
 }
