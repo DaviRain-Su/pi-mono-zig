@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     coding_agent_mod.addImport("ai", ai_mod);
+    coding_agent_mod.addImport("agent", agent_mod);
 
     const coding_agent_tests = b.addTest(.{
         .root_module = coding_agent_mod,
