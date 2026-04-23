@@ -241,6 +241,12 @@ pub const Model = struct {
     compat: ?std.json.Value = null, // OpenAICompletionsCompat or OpenAIResponsesCompat
 };
 
+pub const GoogleThinkingOptions = struct {
+    enabled: bool = false,
+    budget_tokens: ?u32 = null,
+    level: ?[]const u8 = null,
+};
+
 pub const StreamOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
@@ -261,6 +267,10 @@ pub const StreamOptions = struct {
     max_retry_delay_ms: u32 = 60000,
     /// Optional metadata to include in API requests.
     metadata: ?std.json.Value = null,
+    /// Google provider tool choice: "auto", "none", or "any".
+    google_tool_choice: ?[]const u8 = null,
+    /// Google provider thinking configuration.
+    google_thinking: ?GoogleThinkingOptions = null,
 };
 
 pub const SimpleStreamOptions = struct {
@@ -278,6 +288,8 @@ pub const SimpleStreamOptions = struct {
     signal: ?*const std.atomic.Value(bool) = null,
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?std.json.Value = null,
+    google_tool_choice: ?[]const u8 = null,
+    google_thinking: ?GoogleThinkingOptions = null,
 
     /// Convert SimpleStreamOptions to StreamOptions
     pub fn toStreamOptions(self: SimpleStreamOptions) StreamOptions {
@@ -294,6 +306,8 @@ pub const SimpleStreamOptions = struct {
             .max_retry_delay_ms = self.max_retry_delay_ms,
             .metadata = self.metadata,
             .signal = self.signal,
+            .google_tool_choice = self.google_tool_choice,
+            .google_thinking = self.google_thinking,
         };
     }
 };
