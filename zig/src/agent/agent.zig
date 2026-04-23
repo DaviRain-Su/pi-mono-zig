@@ -70,6 +70,8 @@ pub const AgentOptions = struct {
     stream_fn: ?types.StreamFn = null,
     convert_to_llm: ?types.ConvertToLlmFn = null,
     transform_context: ?types.TransformContextFn = null,
+    before_tool_call: ?types.BeforeToolCallFn = null,
+    after_tool_call: ?types.AfterToolCallFn = null,
 };
 
 pub const DEFAULT_MODEL = ai.Model{
@@ -105,6 +107,8 @@ pub const Agent = struct {
     stream_fn: ?types.StreamFn,
     convert_to_llm: types.ConvertToLlmFn,
     transform_context: ?types.TransformContextFn,
+    before_tool_call: ?types.BeforeToolCallFn,
+    after_tool_call: ?types.AfterToolCallFn,
     listeners: std.ArrayList(types.AgentSubscriber),
 
     pub fn init(allocator: std.mem.Allocator, options: AgentOptions) !Agent {
@@ -126,6 +130,8 @@ pub const Agent = struct {
             .stream_fn = options.stream_fn,
             .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlm,
             .transform_context = options.transform_context,
+            .before_tool_call = options.before_tool_call,
+            .after_tool_call = options.after_tool_call,
             .listeners = .empty,
         };
         errdefer agent.deinit();
@@ -381,6 +387,8 @@ pub const Agent = struct {
             .model = self.model,
             .reasoning = if (self.thinking_level == .off) null else self.thinking_level,
             .tool_execution = self.tool_execution,
+            .before_tool_call = self.before_tool_call,
+            .after_tool_call = self.after_tool_call,
             .convert_to_llm = self.convert_to_llm,
             .transform_context = self.transform_context,
         };
@@ -398,6 +406,16 @@ pub const Agent = struct {
                 self.streaming_message = null;
                 if (event.message) |message| {
                     try self.appendMessage(message);
+                }
+            },
+            .tool_execution_start => {
+                if (event.tool_call_id) |tool_call_id| {
+                    try self.addPendingToolCall(tool_call_id);
+                }
+            },
+            .tool_execution_end => {
+                if (event.tool_call_id) |tool_call_id| {
+                    _ = self.removePendingToolCall(tool_call_id);
                 }
             },
             .turn_end => {
