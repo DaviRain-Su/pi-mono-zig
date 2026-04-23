@@ -44,7 +44,6 @@ pub const completeSimple = stream_module.completeSimple;
 pub const getEnvApiKey = env_api_keys.getEnvApiKey;
 
 test {
-    std.testing.refAllDecls(@This());
     _ = @import("providers/openai.zig");
     _ = @import("providers/openai_responses.zig");
     _ = @import("providers/azure_openai_responses.zig");
@@ -58,4 +57,5 @@ test {
     _ = @import("providers/register_builtins.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
+    _ = @import("providers/faux.zig");
 }

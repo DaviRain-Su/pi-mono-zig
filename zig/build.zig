@@ -54,6 +54,9 @@ pub fn build(b: *std.Build) void {
     const run_agent_tests = b.addRunArtifact(agent_tests);
     test_step.dependOn(&run_agent_tests.step);
 
+    const agent_test_step = b.step("test-agent", "Run agent unit tests only");
+    agent_test_step.dependOn(&run_agent_tests.step);
+
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
