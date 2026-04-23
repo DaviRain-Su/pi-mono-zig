@@ -6,6 +6,9 @@ pub const read = @import("read.zig");
 pub const bash = @import("bash.zig");
 pub const write = @import("write.zig");
 pub const edit = @import("edit.zig");
+pub const grep = @import("grep.zig");
+pub const find = @import("find.zig");
+pub const ls = @import("ls.zig");
 
 pub const deinitContentBlocks = common.deinitContentBlocks;
 pub const makeTextContent = common.makeTextContent;
@@ -38,6 +41,21 @@ pub const EditArgs = edit.EditArgs;
 pub const EditExecutionResult = edit.EditExecutionResult;
 pub const EditTool = edit.EditTool;
 
+pub const GrepArgs = grep.GrepArgs;
+pub const GrepDetails = grep.GrepDetails;
+pub const GrepExecutionResult = grep.GrepExecutionResult;
+pub const GrepTool = grep.GrepTool;
+
+pub const FindArgs = find.FindArgs;
+pub const FindDetails = find.FindDetails;
+pub const FindExecutionResult = find.FindExecutionResult;
+pub const FindTool = find.FindTool;
+
+pub const LsArgs = ls.LsArgs;
+pub const LsDetails = ls.LsDetails;
+pub const LsExecutionResult = ls.LsExecutionResult;
+pub const LsTool = ls.LsTool;
+
 test {
     _ = @import("common.zig");
     _ = @import("truncate.zig");
@@ -45,4 +63,7 @@ test {
     _ = @import("bash.zig");
     _ = @import("write.zig");
     _ = @import("edit.zig");
+    _ = @import("grep.zig");
+    _ = @import("find.zig");
+    _ = @import("ls.zig");
 }
