@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const event_stream = @import("event_stream.zig");
+const register_builtins = @import("providers/register_builtins.zig");
 
 pub const StreamFunction = *const fn (
     allocator: std.mem.Allocator,
@@ -22,6 +23,7 @@ var initialized = false;
 pub fn init() void {
     if (initialized) return;
     registry = std.StringHashMap(ApiProvider).init(std.heap.page_allocator);
+    registerBuiltIns();
     initialized = true;
 }
 
@@ -48,6 +50,30 @@ pub fn unregister(api: types.Api) void {
 pub fn clear() void {
     init();
     registry.clearAndFree();
+}
+
+pub fn resetForTesting() void {
+    if (initialized) {
+        registry.clearAndFree();
+    }
+    register_builtins.clearProviderOverrides();
+    initialized = false;
+}
+
+pub fn resetToBuiltIns() void {
+    init();
+    registry.clearAndFree();
+    registerBuiltIns();
+}
+
+fn registerBuiltIns() void {
+    for (register_builtins.builtInProviders()) |provider| {
+        registry.put(provider.api, .{
+            .api = provider.api,
+            .stream = provider.stream,
+            .stream_simple = provider.stream_simple,
+        }) catch @panic("failed to register built-in AI provider");
+    }
 }
 
 test "registry basic operations" {
@@ -86,4 +112,37 @@ test "registry basic operations" {
 
     unregister("openai-completions");
     try std.testing.expect(get("openai-completions") == null);
+}
+
+test "built-in providers are registered on first init" {
+    resetForTesting();
+    defer clear();
+
+    try std.testing.expectEqual(register_builtins.expectedBuiltInApiCount(), getApiCount());
+
+    for (register_builtins.expectedBuiltInApis()) |api| {
+        try std.testing.expect(get(api) != null);
+    }
+}
+
+test "clear removes built-in providers" {
+    resetForTesting();
+    clear();
+
+    try std.testing.expectEqual(@as(usize, 0), getApiCount());
+    try std.testing.expect(get("openai-completions") == null);
+    try std.testing.expect(get("anthropic-messages") == null);
+}
+
+test "resetToBuiltIns restores built-in providers after clear" {
+    resetForTesting();
+    defer clear();
+
+    clear();
+    try std.testing.expectEqual(@as(usize, 0), getApiCount());
+
+    resetToBuiltIns();
+    try std.testing.expectEqual(register_builtins.expectedBuiltInApiCount(), getApiCount());
+    try std.testing.expect(get("openai-completions") != null);
+    try std.testing.expect(get("bedrock-converse-stream") != null);
 }

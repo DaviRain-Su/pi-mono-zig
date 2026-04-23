@@ -64,11 +64,11 @@ pub const AnthropicProvider = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/messages", .{model.base_url});
         defer allocator.free(url);
 
-        var headers = std.StringHashMap([]const u8).empty;
-        defer headers.deinit(allocator);
-        try headers.put(allocator, "Content-Type", "application/json");
-        try headers.put(allocator, "Accept", "text/event-stream");
-        try headers.put(allocator, "anthropic-version", "2023-06-01");
+        var headers = std.StringHashMap([]const u8).init(allocator);
+        defer headers.deinit();
+        try headers.put("Content-Type", "application/json");
+        try headers.put("Accept", "text/event-stream");
+        try headers.put("anthropic-version", "2023-06-01");
         try applyAuthHeaders(allocator, &headers, options);
         try applyDefaultAnthropicHeaders(allocator, &headers, options);
         try mergeHeaders(allocator, &headers, model.headers);
@@ -1083,9 +1083,9 @@ fn applyAuthHeaders(
 
     if (isOAuthToken(api_key)) {
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-        try headers.put(allocator, "Authorization", authorization);
+        try headers.put("Authorization", authorization);
     } else {
-        try headers.put(allocator, "x-api-key", try allocator.dupe(u8, api_key));
+        try headers.put("x-api-key", try allocator.dupe(u8, api_key));
     }
 }
 
@@ -1096,11 +1096,11 @@ fn applyDefaultAnthropicHeaders(
 ) !void {
     const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
     if (isOAuthToken(api_key)) {
-        try headers.put(allocator, "anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14");
-        try headers.put(allocator, "user-agent", try std.fmt.allocPrint(allocator, "claude-cli/{s}", .{CLAUDE_CODE_VERSION}));
-        try headers.put(allocator, "x-app", "cli");
+        try headers.put("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14");
+        try headers.put("user-agent", try std.fmt.allocPrint(allocator, "claude-cli/{s}", .{CLAUDE_CODE_VERSION}));
+        try headers.put("x-app", "cli");
     } else {
-        try headers.put(allocator, "anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+        try headers.put("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
     }
 }
 
@@ -1112,7 +1112,7 @@ fn mergeHeaders(
     if (source) |headers| {
         var iterator = headers.iterator();
         while (iterator.next()) |entry| {
-            try target.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
+            try target.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
         }
     }
 }

@@ -19,30 +19,31 @@ pub const OpenAIProvider = struct {
 
         // Build request payload
         const payload = try buildRequestPayload(allocator, model, context, options);
-        defer payload.deinit(allocator);
+        defer freeJsonValue(allocator, payload);
 
         // Serialize payload to JSON
-        var json_str = std.ArrayList(u8).init(allocator);
-        defer json_str.deinit();
+        var json_out: std.Io.Writer.Allocating = .init(allocator);
+        const json_writer = &json_out.writer;
+        defer json_out.deinit();
 
-        try std.json.Stringify.value(payload, .{}, &json_str.writer);
+        try std.json.Stringify.value(payload, .{}, json_writer);
 
         // Build HTTP request
-        var headers = std.StringHashMap([]const u8).empty;
-        defer headers.deinit(allocator);
+        var headers = std.StringHashMap([]const u8).init(allocator);
+        defer headers.deinit();
 
-        try headers.put(allocator, "Content-Type", "application/json");
+        try headers.put("Content-Type", "application/json");
         const api_key = if (options) |opts| opts.api_key orelse "" else "";
         const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(auth_header);
-        try headers.put(allocator, "Authorization", auth_header);
-        try headers.put(allocator, "Accept", "text/event-stream");
+        try headers.put("Authorization", auth_header);
+        try headers.put("Accept", "text/event-stream");
 
         const req = http_client.HttpRequest{
             .method = .POST,
             .url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}),
             .headers = headers,
-            .body = json_str.items,
+            .body = json_out.written(),
         };
         defer allocator.free(req.url);
 
