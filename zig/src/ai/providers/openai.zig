@@ -22,18 +22,20 @@ pub const OpenAIProvider = struct {
         defer payload.deinit(allocator);
 
         // Serialize payload to JSON
-        var json_str = std.ArrayList(u8).empty;
-        defer json_str.deinit(allocator);
-        
-        // TODO: Serialize payload to json_str
-        _ = try std.json.stringifyAlloc(allocator, payload, .{});
+        var json_str = std.ArrayList(u8).init(allocator);
+        defer json_str.deinit();
+
+        try std.json.Stringify.value(payload, .{}, &json_str.writer);
 
         // Build HTTP request
         var headers = std.StringHashMap([]const u8).empty;
         defer headers.deinit(allocator);
-        
+
         try headers.put(allocator, "Content-Type", "application/json");
-        try headers.put(allocator, "Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{options.?.api_key orelse ""}));
+        const api_key = if (options) |opts| opts.api_key orelse "" else "";
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+        defer allocator.free(auth_header);
+        try headers.put(allocator, "Authorization", auth_header);
         try headers.put(allocator, "Accept", "text/event-stream");
 
         const req = http_client.HttpRequest{
@@ -45,13 +47,13 @@ pub const OpenAIProvider = struct {
         defer allocator.free(req.url);
 
         // Send request and process response
-        var client = try http_client.HttpClient.init(allocator);
+        var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
 
-        const response = try client.request(req);
-        defer response.deinit();
+        var streaming = try client.requestStreaming(req);
+        defer streaming.deinit();
 
-        if (response.status != 200) {
+        if (streaming.status != 200) {
             event_stream_instance.end(.{
                 .role = "assistant",
                 .content = &[_]types.ContentBlock{},
@@ -60,14 +62,14 @@ pub const OpenAIProvider = struct {
                 .model = model.id,
                 .usage = types.Usage.init(),
                 .stop_reason = .error_reason,
-                .error_message = try std.fmt.allocPrint(allocator, "HTTP {d}", .{response.status}),
+                .error_message = try std.fmt.allocPrint(allocator, "HTTP {d}", .{streaming.status}),
                 .timestamp = 0,
             });
             return event_stream_instance;
         }
 
-        // Parse SSE stream
-        try parseSseStream(allocator, &event_stream_instance, response.body, model);
+        // Parse SSE stream incrementally from lines
+        try parseSseStreamLines(allocator, &event_stream_instance, &streaming, model);
 
         return event_stream_instance;
     }
@@ -83,14 +85,55 @@ pub const OpenAIProvider = struct {
     }
 };
 
-fn parseSseStream(
+/// Current block being streamed
+const CurrentBlock = union(enum) {
+    text: std.ArrayList(u8),
+    thinking: struct {
+        text: std.ArrayList(u8),
+        signature: ?[]const u8,
+    },
+    tool_call: struct {
+        id: std.ArrayList(u8),
+        name: std.ArrayList(u8),
+        partial_args: std.ArrayList(u8),
+    },
+};
+
+fn deinitCurrentBlock(block: *CurrentBlock, allocator: std.mem.Allocator) void {
+    switch (block.*) {
+        .text => |*t| t.deinit(allocator),
+        .thinking => |*th| {
+            th.text.deinit(allocator);
+            if (th.signature) |sig| allocator.free(sig);
+        },
+        .tool_call => |*tc| {
+            tc.id.deinit(allocator);
+            tc.name.deinit(allocator);
+            tc.partial_args.deinit(allocator);
+        },
+    }
+}
+
+/// Free allocated fields within an AssistantMessageEvent.
+/// Note: this only frees fields that are exclusively owned by this event.
+/// The `done` event's message content is shared with earlier events and should NOT be freed here.
+fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
+    if (event.delta) |d| allocator.free(d);
+    // Do NOT free event.content or event.message - they are shared with content_blocks
+    if (event.tool_call) |tc| {
+        allocator.free(tc.id);
+        allocator.free(tc.name);
+        freeJsonValue(allocator, tc.arguments);
+    }
+    if (event.error_message) |em| allocator.free(em);
+}
+
+fn parseSseStreamLines(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
-    body: []const u8,
+    streaming: *http_client.StreamingResponse,
     model: types.Model,
 ) !void {
-    var lines = std.mem.split(u8, body, "\n");
-    
     var output = types.AssistantMessage{
         .role = "assistant",
         .content = &[_]types.ContentBlock{},
@@ -106,27 +149,64 @@ fn parseSseStream(
         .event_type = .start,
     });
 
-    var current_text: ?std.ArrayList(u8) = null;
-    defer if (current_text) |*t| t.deinit(allocator);
+    var current_block: ?CurrentBlock = null;
+    defer if (current_block) |*b| deinitCurrentBlock(b, allocator);
 
-    while (lines.next()) |line| {
+    var content_blocks = std.ArrayList(types.ContentBlock).empty;
+    defer content_blocks.deinit(allocator);
+
+    while (try streaming.readLine()) |line| {
         const data = parseSseLine(line) orelse continue;
-        
+
         if (std.mem.eql(u8, data, "[DONE]")) {
             break;
         }
 
         const chunk = try parseChunk(allocator, data);
-        defer if (chunk) |c| c.deinit(allocator);
+        defer if (chunk) |*c| c.deinit();
 
         if (chunk == null) continue;
 
+        const value = chunk.?.value;
+
+        // Extract usage from chunk (may be present even without choices)
+        if (value.object.get("usage")) |usage_val| {
+            if (usage_val == .object) {
+                output.usage = parseChunkUsage(allocator, usage_val, model);
+            }
+        }
+
+        // Extract response_id from chunk
+        if (value.object.get("id")) |id_val| {
+            if (id_val == .string and output.response_id == null) {
+                output.response_id = try allocator.dupe(u8, id_val.string);
+            }
+        }
+
         // Extract choices from chunk
-        const choices = chunk.?.object.get("choices") orelse continue;
+        const choices = value.object.get("choices") orelse continue;
         if (choices != .array or choices.array.items.len == 0) continue;
 
         const choice = choices.array.items[0];
         if (choice != .object) continue;
+
+        // Handle usage in choice (some providers like Moonshot)
+        if (choice.object.get("usage")) |choice_usage| {
+            if (choice_usage == .object) {
+                output.usage = parseChunkUsage(allocator, choice_usage, model);
+            }
+        }
+
+        // Handle finish_reason
+        if (choice.object.get("finish_reason")) |finish_reason| {
+            if (finish_reason == .string) {
+                const result = mapStopReason(finish_reason.string);
+                output.stop_reason = result.stop_reason;
+                if (result.error_message) |em| {
+                    output.error_message = em;
+                }
+            }
+        }
 
         const delta = choice.object.get("delta") orelse continue;
         if (delta != .object) continue;
@@ -134,43 +214,161 @@ fn parseSseStream(
         // Handle text content
         if (delta.object.get("content")) |content| {
             if (content == .string and content.string.len > 0) {
-                if (current_text == null) {
+                if (current_block == null or current_block.? != .text) {
+                    try finishCurrentBlock(&current_block, &content_blocks, stream_ptr, allocator);
+                    current_block = CurrentBlock{ .text = std.ArrayList(u8).empty };
                     stream_ptr.push(.{
                         .event_type = .text_start,
-                        .content_index = 0,
+                        .content_index = @intCast(content_blocks.items.len),
                     });
-                    current_text = std.ArrayList(u8).empty;
                 }
 
-                try current_text.?.appendSlice(allocator, content.string);
-                stream_ptr.push(.{
-                    .event_type = .text_delta,
-                    .content_index = 0,
-                    .delta = content.string,
-                });
+                if (current_block) |*block| {
+                    if (block.* == .text) {
+                        try block.text.appendSlice(allocator, content.string);
+                        stream_ptr.push(.{
+                            .event_type = .text_delta,
+                            .content_index = @intCast(content_blocks.items.len),
+                            .delta = try allocator.dupe(u8, content.string),
+                        });
+                    }
+                }
             }
         }
 
-        // Handle finish_reason
-        if (choice.object.get("finish_reason")) |finish_reason| {
-            if (finish_reason == .string) {
-                output.stop_reason = mapStopReason(finish_reason.string);
+        // Handle reasoning/thinking content
+        const reasoning_fields = [_][]const u8{ "reasoning_content", "reasoning", "reasoning_text" };
+        var found_reasoning: ?[]const u8 = null;
+        for (reasoning_fields) |field| {
+            if (delta.object.get(field)) |rv| {
+                if (rv == .string and rv.string.len > 0) {
+                    found_reasoning = rv.string;
+                    break;
+                }
+            }
+        }
+
+        if (found_reasoning) |reasoning_text| {
+            if (current_block == null or current_block.? != .thinking) {
+                try finishCurrentBlock(&current_block, &content_blocks, stream_ptr, allocator);
+                current_block = CurrentBlock{
+                    .thinking = .{
+                        .text = std.ArrayList(u8).empty,
+                        .signature = null,
+                    },
+                };
+                stream_ptr.push(.{
+                    .event_type = .thinking_start,
+                    .content_index = @intCast(content_blocks.items.len),
+                });
+            }
+
+            if (current_block) |*block| {
+                if (block.* == .thinking) {
+                    try block.thinking.text.appendSlice(allocator, reasoning_text);
+                    stream_ptr.push(.{
+                        .event_type = .thinking_delta,
+                        .content_index = @intCast(content_blocks.items.len),
+                        .delta = try allocator.dupe(u8, reasoning_text),
+                    });
+                }
+            }
+        }
+
+        // Handle tool calls
+        if (delta.object.get("tool_calls")) |tool_calls_val| {
+            if (tool_calls_val == .array) {
+                for (tool_calls_val.array.items) |tool_call_item| {
+                    if (tool_call_item != .object) continue;
+
+                    const tc_id = if (tool_call_item.object.get("id")) |id_v|
+                        if (id_v == .string) id_v.string else null
+                    else
+                        null;
+
+                    const tc_name = if (tool_call_item.object.get("function")) |func_v| blk: {
+                        if (func_v == .object) {
+                            if (func_v.object.get("name")) |name_v| {
+                                if (name_v == .string) break :blk name_v.string;
+                            }
+                        }
+                        break :blk null;
+                    } else null;
+
+                    const tc_args = if (tool_call_item.object.get("function")) |func_v| blk: {
+                        if (func_v == .object) {
+                            if (func_v.object.get("arguments")) |args_v| {
+                                if (args_v == .string) break :blk args_v.string;
+                            }
+                        }
+                        break :blk null;
+                    } else null;
+
+                    // Check if we need to start a new tool call
+                    const need_new_block = blk: {
+                        if (current_block == null) break :blk true;
+                        if (current_block.? != .tool_call) break :blk true;
+                        if (tc_id) |id| {
+                            const current_id = std.mem.trim(u8, current_block.?.tool_call.id.items, " ");
+                            if (current_id.len > 0 and !std.mem.eql(u8, current_id, id)) break :blk true;
+                        }
+                        break :blk false;
+                    };
+
+                    if (need_new_block) {
+                        try finishCurrentBlock(&current_block, &content_blocks, stream_ptr, allocator);
+                        current_block = CurrentBlock{
+                            .tool_call = .{
+                                .id = std.ArrayList(u8).empty,
+                                .name = std.ArrayList(u8).empty,
+                                .partial_args = std.ArrayList(u8).empty,
+                            },
+                        };
+                        stream_ptr.push(.{
+                            .event_type = .toolcall_start,
+                            .content_index = @intCast(content_blocks.items.len),
+                        });
+                    }
+
+                    if (current_block) |*block| {
+                        if (block.* == .tool_call) {
+                            if (tc_id) |id| {
+                                block.tool_call.id.clearRetainingCapacity();
+                                try block.tool_call.id.appendSlice(allocator, id);
+                            }
+                            if (tc_name) |name| {
+                                block.tool_call.name.clearRetainingCapacity();
+                                try block.tool_call.name.appendSlice(allocator, name);
+                            }
+                            var delta_str: []const u8 = "";
+                            if (tc_args) |args| {
+                                try block.tool_call.partial_args.appendSlice(allocator, args);
+                                if (args.len > 0) {
+                                    delta_str = try allocator.dupe(u8, args);
+                                }
+                            }
+                            stream_ptr.push(.{
+                                .event_type = .toolcall_delta,
+                                .content_index = @intCast(content_blocks.items.len),
+                                .delta = delta_str,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Finish current text block
-    if (current_text) |text| {
-        stream_ptr.push(.{
-            .event_type = .text_end,
-            .content_index = 0,
-            .content = text.items,
-        });
-        
-        // Add text content to output
-        var content_blocks = try allocator.alloc(types.ContentBlock, 1);
-        content_blocks[0] = .{ .text = .{ .text = text.items } };
-        output.content = content_blocks;
+    // Finish any remaining block
+    try finishCurrentBlock(&current_block, &content_blocks, stream_ptr, allocator);
+
+    // Build output content from content_blocks
+    if (content_blocks.items.len > 0) {
+        const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
+        for (content_blocks.items, 0..) |block, i| {
+            blocks[i] = block;
+        }
+        output.content = blocks;
     }
 
     stream_ptr.push(.{
@@ -180,12 +378,243 @@ fn parseSseStream(
     stream_ptr.end(output);
 }
 
-fn mapStopReason(reason: []const u8) types.StopReason {
-    if (std.mem.eql(u8, reason, "stop")) return .stop;
-    if (std.mem.eql(u8, reason, "length")) return .length;
-    if (std.mem.eql(u8, reason, "tool_calls")) return .tool_use;
-    if (std.mem.eql(u8, reason, "content_filter")) return .error_reason;
-    return .stop;
+fn finishCurrentBlock(
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    allocator: std.mem.Allocator,
+) !void {
+    if (current_block.*) |*block| {
+        switch (block.*) {
+            .text => |text| {
+                const content = try allocator.dupe(u8, text.items);
+                try content_blocks.append(allocator, types.ContentBlock{ .text = .{ .text = content } });
+                stream_ptr.push(.{
+                    .event_type = .text_end,
+                    .content_index = @intCast(content_blocks.items.len - 1),
+                    .content = content,
+                });
+            },
+            .thinking => |thinking| {
+                const content = try allocator.dupe(u8, thinking.text.items);
+                try content_blocks.append(allocator, types.ContentBlock{
+                    .thinking = .{
+                        .thinking = content,
+                        .signature = if (thinking.signature) |sig| try allocator.dupe(u8, sig) else null,
+                        .redacted = false,
+                    },
+                });
+                stream_ptr.push(.{
+                    .event_type = .thinking_end,
+                    .content_index = @intCast(content_blocks.items.len - 1),
+                    .content = content,
+                });
+            },
+            .tool_call => |tc| {
+                const id = try allocator.dupe(u8, std.mem.trim(u8, tc.id.items, " "));
+                const name = try allocator.dupe(u8, std.mem.trim(u8, tc.name.items, " "));
+                const args_str = std.mem.trim(u8, tc.partial_args.items, " ");
+                const args = try parseStreamingJsonToValue(allocator, args_str);
+                try content_blocks.append(allocator, types.ContentBlock{
+                    .text = .{ .text = "" }, // Placeholder - tool calls stored separately
+                });
+                stream_ptr.push(.{
+                    .event_type = .toolcall_end,
+                    .content_index = @intCast(content_blocks.items.len - 1),
+                    .tool_call = .{
+                        .id = id,
+                        .name = name,
+                        .arguments = args,
+                    },
+                });
+            },
+        }
+        deinitCurrentBlock(block, allocator);
+        current_block.* = null;
+    }
+}
+
+fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !std.json.Value {
+    if (input.len == 0) return std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    const parsed = json_parse.parseStreamingJson(allocator, input) catch {
+        return std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    };
+    defer parsed.deinit();
+    // Need to clone the value since parsed will be deinit'd
+    return cloneJsonValue(allocator, parsed.value);
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
+    switch (value) {
+        .null => return .null,
+        .bool => |b| return .{ .bool = b },
+        .integer => |i| return .{ .integer = i },
+        .float => |f| return .{ .float = f },
+        .string => |s| return .{ .string = try allocator.dupe(u8, s) },
+        .array => |arr| {
+            var new_arr = std.json.Array.init(allocator);
+            errdefer new_arr.deinit();
+            for (arr.items) |item| {
+                try new_arr.append(try cloneJsonValue(allocator, item));
+            }
+            return .{ .array = new_arr };
+        },
+        .object => |obj| {
+            var new_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer new_obj.deinit(allocator);
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key_copy);
+                try new_obj.put(allocator, key_copy, try cloneJsonValue(allocator, entry.value_ptr.*));
+            }
+            return .{ .object = new_obj };
+        },
+        .number_string => |ns| return .{ .number_string = try allocator.dupe(u8, ns) },
+    }
+}
+
+fn parseChunkUsage(
+    allocator: std.mem.Allocator,
+    usage_val: std.json.Value,
+    model: types.Model,
+) types.Usage {
+    _ = allocator;
+    _ = model;
+
+    var usage = types.Usage.init();
+
+    if (usage_val != .object) return usage;
+
+    const prompt_tokens = if (usage_val.object.get("prompt_tokens")) |v|
+        if (v == .integer) @as(u32, @intCast(v.integer)) else @as(u32, 0)
+    else
+        @as(u32, 0);
+
+    const completion_tokens = if (usage_val.object.get("completion_tokens")) |v|
+        if (v == .integer) @as(u32, @intCast(v.integer)) else @as(u32, 0)
+    else
+        @as(u32, 0);
+
+    var cache_read_tokens: u32 = 0;
+    var cache_write_tokens: u32 = 0;
+    var reasoning_tokens: u32 = 0;
+
+    if (usage_val.object.get("prompt_tokens_details")) |details| {
+        if (details == .object) {
+            if (details.object.get("cached_tokens")) |ct| {
+                if (ct == .integer) cache_read_tokens = @as(u32, @intCast(ct.integer));
+            }
+            if (details.object.get("cache_write_tokens")) |cwt| {
+                if (cwt == .integer) cache_write_tokens = @as(u32, @intCast(cwt.integer));
+            }
+        }
+    }
+
+    if (usage_val.object.get("completion_tokens_details")) |details| {
+        if (details == .object) {
+            if (details.object.get("reasoning_tokens")) |rt| {
+                if (rt == .integer) reasoning_tokens = @as(u32, @intCast(rt.integer));
+            }
+        }
+    }
+
+    // Normalize cache read: subtract cache writes if present
+    const normalized_cache_read = if (cache_write_tokens > 0)
+        @max(@as(u32, 0), cache_read_tokens - cache_write_tokens)
+    else
+        cache_read_tokens;
+
+    const input = @max(@as(u32, 0), prompt_tokens - normalized_cache_read - cache_write_tokens);
+    const output = completion_tokens + reasoning_tokens;
+
+    usage.input = input;
+    usage.output = output;
+    usage.cache_read = normalized_cache_read;
+    usage.cache_write = cache_write_tokens;
+    usage.total_tokens = input + output + normalized_cache_read + cache_write_tokens;
+
+    return usage;
+}
+
+fn mapStopReason(reason: []const u8) struct { stop_reason: types.StopReason, error_message: ?[]const u8 } {
+    if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "end")) return .{ .stop_reason = .stop, .error_message = null };
+    if (std.mem.eql(u8, reason, "length")) return .{ .stop_reason = .length, .error_message = null };
+    if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function_call")) return .{ .stop_reason = .tool_use, .error_message = null };
+    if (std.mem.eql(u8, reason, "content_filter")) return .{ .stop_reason = .error_reason, .error_message = "Provider finish_reason: content_filter" };
+    if (std.mem.eql(u8, reason, "network_error")) return .{ .stop_reason = .error_reason, .error_message = "Provider finish_reason: network_error" };
+    return .{ .stop_reason = .error_reason, .error_message = reason };
+}
+
+/// Removes unpaired Unicode surrogate characters from text.
+/// Valid paired surrogates (proper emoji) are preserved.
+pub fn sanitizeSurrogates(text: []const u8) []const u8 {
+    // In-place filtering: scan for unpaired surrogates and remove them
+    // High surrogates: 0xD800-0xDBFF
+    // Low surrogates: 0xDC00-0xDFFF
+    // This is a simplified version that works on UTF-8 encoded text.
+    // Surrogates in UTF-8 appear as 3-byte sequences: ED A0 80-ED AF BF (high) or ED B0 80-ED BF BF (low)
+    var result = std.ArrayList(u8).empty;
+    const allocator = std.heap.page_allocator;
+
+    var i: usize = 0;
+    while (i < text.len) {
+        // Check for 3-byte UTF-8 surrogate sequence
+        if (i + 2 < text.len and text[i] == 0xED) {
+            const is_high = text[i + 1] >= 0xA0 and text[i + 1] <= 0xAF;
+            const is_low = text[i + 1] >= 0xB0 and text[i + 1] <= 0xBF;
+
+            if (is_high) {
+                // Check if followed by low surrogate
+                if (i + 5 < text.len and text[i + 3] == 0xED and text[i + 4] >= 0xB0 and text[i + 4] <= 0xBF) {
+                    // Valid pair, keep both
+                    result.appendSlice(allocator, text[i .. i + 6]) catch {};
+                    i += 6;
+                    continue;
+                }
+                // Unpaired high surrogate, skip
+                i += 3;
+                continue;
+            } else if (is_low) {
+                // Unpaired low surrogate (not preceded by high), skip
+                // Note: if we got here, the preceding bytes were not a valid high surrogate
+                i += 3;
+                continue;
+            }
+        }
+
+        // Regular byte, keep it
+        result.append(allocator, text[i]) catch {};
+        i += 1;
+    }
+
+    return result.toOwnedSlice(allocator) catch text;
+}
+
+/// Recursively free a JSON value and all its children, including ObjectMap keys.
+/// Use this only for values where ALL keys and strings were allocated by the same allocator.
+fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |s| allocator.free(s),
+        .number_string => |ns| allocator.free(ns),
+        .array => |arr| {
+            for (arr.items) |item| {
+                freeJsonValue(allocator, item);
+            }
+            var arr_mut = arr;
+            arr_mut.deinit();
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(allocator, entry.value_ptr.*);
+            }
+            var obj_mut = obj;
+            obj_mut.deinit(allocator);
+        },
+        else => {},
+    }
 }
 
 /// Build the request payload for OpenAI chat completions API
@@ -196,69 +625,316 @@ pub fn buildRequestPayload(
     options: ?types.StreamOptions,
 ) !std.json.Value {
     var messages = std.json.Array.init(allocator);
-    errdefer {
-        for (messages.items) |*item| {
-            item.deinit(allocator);
-        }
-        messages.deinit(allocator);
-    }
+    errdefer messages.deinit();
+
+    // Determine if we should use developer role for reasoning models
+    const use_developer_role = model.reasoning and !isNonStandardProvider(model);
 
     // Add system prompt if present
     if (context.system_prompt) |system| {
-        try messages.append(allocator, std.json.Value{ .object = try buildMessageObject(allocator, "system", system) });
+        const role = if (use_developer_role) "developer" else "system";
+        const sanitized = sanitizeSurrogates(system);
+        try messages.append(std.json.Value{ .object = try buildMessageObject(allocator, role, sanitized) });
     }
 
     // Add conversation messages
     for (context.messages) |msg| {
         switch (msg) {
             .user => |user_msg| {
-                const content = if (user_msg.content.len > 0)
-                    user_msg.content[0].text.text
-                else
-                    "";
-                try messages.append(allocator, std.json.Value{ .object = try buildMessageObject(allocator, "user", content) });
+                try messages.append(try buildUserMessage(allocator, model, user_msg));
             },
             .assistant => |assistant_msg| {
-                const content = if (assistant_msg.content.len > 0)
-                    assistant_msg.content[0].text.text
-                else
-                    "";
-                try messages.append(allocator, std.json.Value{ .object = try buildMessageObject(allocator, "assistant", content) });
+                try messages.append(try buildAssistantMessage(allocator, model, assistant_msg));
             },
             .tool_result => |tool_result| {
-                const content = if (tool_result.content.len > 0)
-                    tool_result.content[0].text.text
-                else
-                    "";
-                try messages.append(allocator, std.json.Value{ .object = try buildMessageObject(allocator, "tool", content) });
+                try messages.append(try buildToolResultMessage(allocator, model, tool_result));
             },
         }
     }
 
-    var payload = std.json.ObjectMap.init(allocator);
+    var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer payload.deinit(allocator);
 
-    try payload.put(allocator, "model", std.json.Value{ .string = model.id });
-    try payload.put(allocator, "messages", std.json.Value{ .array = messages });
-    try payload.put(allocator, "stream", std.json.Value{ .bool = true });
+    try payload.put(allocator, try allocator.dupe(u8, "model"), std.json.Value{ .string = try allocator.dupe(u8, model.id) });
+    try payload.put(allocator, try allocator.dupe(u8, "messages"), std.json.Value{ .array = messages });
+    try payload.put(allocator, try allocator.dupe(u8, "stream"), std.json.Value{ .bool = true });
+
+    // Add stream_options.include_usage
+    var stream_options = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer stream_options.deinit(allocator);
+    try stream_options.put(allocator, try allocator.dupe(u8, "include_usage"), std.json.Value{ .bool = true });
+    try payload.put(allocator, try allocator.dupe(u8, "stream_options"), std.json.Value{ .object = stream_options });
 
     if (options) |opts| {
         if (opts.temperature) |temp| {
-            try payload.put(allocator, "temperature", std.json.Value{ .float = temp });
+            try payload.put(allocator, try allocator.dupe(u8, "temperature"), std.json.Value{ .float = temp });
         }
         if (opts.max_tokens) |max| {
-            try payload.put(allocator, "max_tokens", std.json.Value{ .integer = @intCast(max) });
+            try payload.put(allocator, try allocator.dupe(u8, "max_tokens"), std.json.Value{ .integer = @intCast(max) });
         }
+    }
+
+    // Add tools if present
+    if (context.tools) |tools| {
+        var tools_array = std.json.Array.init(allocator);
+        errdefer tools_array.deinit();
+        for (tools) |tool| {
+            try tools_array.append(try buildToolObject(allocator, tool));
+        }
+        try payload.put(allocator, try allocator.dupe(u8, "tools"), std.json.Value{ .array = tools_array });
     }
 
     return std.json.Value{ .object = payload };
 }
 
-fn buildMessageObject(allocator: std.mem.Allocator, role: []const u8, content: []const u8) !std.json.ObjectMap {
-    var obj = std.json.ObjectMap.init(allocator);
+fn isNonStandardProvider(model: types.Model) bool {
+    const provider = model.provider;
+    const base_url = model.base_url;
+
+    if (std.mem.eql(u8, provider, "cerebras") or
+        std.mem.eql(u8, provider, "xai") or
+        std.mem.eql(u8, provider, "zai") or
+        std.mem.eql(u8, provider, "opencode"))
+    {
+        return true;
+    }
+
+    if (std.mem.indexOf(u8, base_url, "cerebras.ai") != null or
+        std.mem.indexOf(u8, base_url, "api.x.ai") != null or
+        std.mem.indexOf(u8, base_url, "chutes.ai") != null or
+        std.mem.indexOf(u8, base_url, "deepseek.com") != null or
+        std.mem.indexOf(u8, base_url, "api.z.ai") != null or
+        std.mem.indexOf(u8, base_url, "opencode.ai") != null)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+fn buildUserMessage(allocator: std.mem.Allocator, model: types.Model, user_msg: types.UserMessage) !std.json.Value {
+    // Check if message contains images
+    var has_images = false;
+    for (user_msg.content) |block| {
+        if (block == .image) {
+            has_images = true;
+            break;
+        }
+    }
+
+    // Check if model supports images
+    var model_supports_images = false;
+    for (model.input_types) |input_type| {
+        if (std.mem.eql(u8, input_type, "image")) {
+            model_supports_images = true;
+            break;
+        }
+    }
+
+    if (has_images and model_supports_images) {
+        // Build content as array of parts
+        var content_parts = std.json.Array.init(allocator);
+        errdefer content_parts.deinit();
+
+        for (user_msg.content) |block| {
+            switch (block) {
+                .text => |text| {
+                    const sanitized = sanitizeSurrogates(text.text);
+                    var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                    errdefer part.deinit(allocator);
+                    try part.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "text") });
+                    try part.put(allocator, try allocator.dupe(u8, "text"), std.json.Value{ .string = try allocator.dupe(u8, sanitized) });
+                    try content_parts.append(std.json.Value{ .object = part });
+                },
+                .image => |image| {
+                    var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                    errdefer part.deinit(allocator);
+                    try part.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "image_url") });
+
+                    const url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                    defer allocator.free(url);
+
+                    var image_url = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                    errdefer image_url.deinit(allocator);
+                    try image_url.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, url) });
+                    try part.put(allocator, try allocator.dupe(u8, "image_url"), std.json.Value{ .object = image_url });
+                    try content_parts.append(std.json.Value{ .object = part });
+                },
+                .thinking => continue, // User messages shouldn't have thinking blocks
+            }
+        }
+
+        var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        errdefer obj.deinit(allocator);
+        try obj.put(allocator, try allocator.dupe(u8, "role"), std.json.Value{ .string = try allocator.dupe(u8, "user") });
+        try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .array = content_parts });
+        return std.json.Value{ .object = obj };
+    } else {
+        // Plain text content
+        var text_parts = std.ArrayList(u8).empty;
+        defer text_parts.deinit(allocator);
+
+        for (user_msg.content) |block| {
+            switch (block) {
+                .text => |text| {
+                    if (text_parts.items.len > 0) {
+                        try text_parts.appendSlice(allocator, "\n");
+                    }
+                    try text_parts.appendSlice(allocator, text.text);
+                },
+                .image => {
+                    if (!model_supports_images) {
+                        if (text_parts.items.len > 0) {
+                            try text_parts.appendSlice(allocator, "\n");
+                        }
+                        try text_parts.appendSlice(allocator, "(image omitted: model does not support images)");
+                    }
+                },
+                .thinking => continue,
+            }
+        }
+
+        const sanitized = sanitizeSurrogates(text_parts.items);
+        return std.json.Value{ .object = try buildMessageObject(allocator, "user", sanitized) };
+    }
+}
+
+fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assistant_msg: types.AssistantMessage) !std.json.Value {
+    _ = model;
+
+    var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer obj.deinit(allocator);
-    try obj.put(allocator, "role", std.json.Value{ .string = role });
-    try obj.put(allocator, "content", std.json.Value{ .string = content });
+    try obj.put(allocator, try allocator.dupe(u8, "role"), std.json.Value{ .string = try allocator.dupe(u8, "assistant") });
+
+    // Collect text content
+    var text_parts = std.ArrayList(u8).empty;
+    defer text_parts.deinit(allocator);
+
+    for (assistant_msg.content) |block| {
+        switch (block) {
+            .text => |text| {
+                if (text_parts.items.len > 0) {
+                    try text_parts.appendSlice(allocator, "\n");
+                }
+                try text_parts.appendSlice(allocator, text.text);
+            },
+            .thinking => |thinking| {
+                if (text_parts.items.len > 0) {
+                    try text_parts.appendSlice(allocator, "\n");
+                }
+                try text_parts.appendSlice(allocator, thinking.thinking);
+            },
+            .image => continue,
+        }
+    }
+
+    const content = if (text_parts.items.len > 0) sanitizeSurrogates(text_parts.items) else "";
+    try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+
+    // Add tool_calls if present
+    if (assistant_msg.tool_calls) |tool_calls| {
+        var tc_array = std.json.Array.init(allocator);
+        errdefer tc_array.deinit();
+        for (tool_calls) |tc| {
+            var tc_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer tc_obj.deinit(allocator);
+            try tc_obj.put(allocator, try allocator.dupe(u8, "id"), std.json.Value{ .string = try allocator.dupe(u8, tc.id) });
+            try tc_obj.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "function") });
+
+            var func_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer func_obj.deinit(allocator);
+            try func_obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tc.name) });
+
+            const args_owned = try std.json.Stringify.valueAlloc(allocator, tc.arguments, .{});
+            defer allocator.free(args_owned);
+            try func_obj.put(allocator, try allocator.dupe(u8, "arguments"), std.json.Value{ .string = try allocator.dupe(u8, args_owned) });
+
+            try tc_obj.put(allocator, try allocator.dupe(u8, "function"), std.json.Value{ .object = func_obj });
+            try tc_array.append(std.json.Value{ .object = tc_obj });
+        }
+        try obj.put(allocator, try allocator.dupe(u8, "tool_calls"), std.json.Value{ .array = tc_array });
+    }
+
+    return std.json.Value{ .object = obj };
+}
+
+fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool_result: types.ToolResultMessage) !std.json.Value {
+    var text_parts = std.ArrayList(u8).empty;
+    defer text_parts.deinit(allocator);
+
+    var has_images = false;
+    for (tool_result.content) |block| {
+        switch (block) {
+            .text => |text| {
+                if (text_parts.items.len > 0) {
+                    try text_parts.appendSlice(allocator, "\n");
+                }
+                try text_parts.appendSlice(allocator, text.text);
+            },
+            .image => {
+                has_images = true;
+            },
+            .thinking => continue,
+        }
+    }
+
+    const content = if (text_parts.items.len > 0)
+        sanitizeSurrogates(text_parts.items)
+    else if (has_images)
+        "(see attached image)"
+    else
+        "";
+
+    var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, try allocator.dupe(u8, "role"), std.json.Value{ .string = try allocator.dupe(u8, "tool") });
+    try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+    try obj.put(allocator, try allocator.dupe(u8, "tool_call_id"), std.json.Value{ .string = try allocator.dupe(u8, tool_result.tool_call_id) });
+
+    // Add name if required by provider
+    if (tool_result.tool_name.len > 0) {
+        try obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tool_result.tool_name) });
+    }
+
+    // If there are images and model supports them, add as separate user message
+    var model_supports_images = false;
+    for (model.input_types) |input_type| {
+        if (std.mem.eql(u8, input_type, "image")) {
+            model_supports_images = true;
+            break;
+        }
+    }
+
+    if (has_images and model_supports_images) {
+        // This is a simplified approach - in full implementation we'd need to
+        // return multiple messages. For now, just include the text content.
+        // Images from tool results would be added in a subsequent user message.
+    }
+
+    return std.json.Value{ .object = obj };
+}
+
+fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Value {
+    var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "function") });
+
+    var func_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer func_obj.deinit(allocator);
+    try func_obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tool.name) });
+    try func_obj.put(allocator, try allocator.dupe(u8, "description"), std.json.Value{ .string = try allocator.dupe(u8, tool.description) });
+    try func_obj.put(allocator, try allocator.dupe(u8, "parameters"), tool.parameters);
+    try func_obj.put(allocator, try allocator.dupe(u8, "strict"), std.json.Value{ .bool = false });
+
+    try obj.put(allocator, try allocator.dupe(u8, "function"), std.json.Value{ .object = func_obj });
+    return std.json.Value{ .object = obj };
+}
+
+fn buildMessageObject(allocator: std.mem.Allocator, role: []const u8, content: []const u8) !std.json.ObjectMap {
+    var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, try allocator.dupe(u8, "role"), std.json.Value{ .string = try allocator.dupe(u8, role) });
+    try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
     return obj;
 }
 
@@ -272,7 +948,8 @@ pub fn parseSseLine(line: []const u8) ?[]const u8 {
 }
 
 /// Parse a streaming chunk from OpenAI
-pub fn parseChunk(allocator: std.mem.Allocator, data: []const u8) !?std.json.Value {
+/// Returns a parsed JSON value or null. Caller must call `.deinit()` on the result.
+pub fn parseChunk(allocator: std.mem.Allocator, data: []const u8) !?std.json.Parsed(std.json.Value) {
     if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) {
         return null;
     }
@@ -303,7 +980,7 @@ test "buildRequestPayload basic" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer payload.deinit(allocator);
+    defer freeJsonValue(allocator, payload);
 
     try std.testing.expect(payload == .object);
     const model_val = payload.object.get("model").?;
@@ -312,6 +989,127 @@ test "buildRequestPayload basic" {
     const messages = payload.object.get("messages").?;
     try std.testing.expect(messages == .array);
     try std.testing.expectEqual(@as(usize, 2), messages.array.items.len);
+
+    // Check stream_options.include_usage
+    const stream_options = payload.object.get("stream_options").?;
+    try std.testing.expect(stream_options == .object);
+    const include_usage = stream_options.object.get("include_usage").?;
+    try std.testing.expect(include_usage == .bool);
+    try std.testing.expect(include_usage.bool);
+}
+
+test "buildRequestPayload with developer role for reasoning model" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "o1-preview",
+        .name = "O1 Preview",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 32768,
+    };
+
+    const context = types.Context{
+        .system_prompt = "You are a reasoning assistant.",
+        .messages = &[_]types.Message{},
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    const messages = payload.object.get("messages").?;
+    try std.testing.expectEqual(@as(usize, 1), messages.array.items.len);
+
+    const first_msg = messages.array.items[0];
+    try std.testing.expect(first_msg == .object);
+    const role = first_msg.object.get("role").?;
+    try std.testing.expectEqualStrings("developer", role.string);
+}
+
+test "buildRequestPayload with tools" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    const tools = &[_]types.Tool{
+        .{
+            .name = "get_weather",
+            .description = "Get the weather for a location",
+            .parameters = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) },
+        },
+    };
+
+    const context = types.Context{
+        .system_prompt = null,
+        .messages = &[_]types.Message{},
+        .tools = tools,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    const tools_val = payload.object.get("tools").?;
+    try std.testing.expect(tools_val == .array);
+    try std.testing.expectEqual(@as(usize, 1), tools_val.array.items.len);
+
+    const tool = tools_val.array.items[0];
+    try std.testing.expect(tool == .object);
+    const tool_type = tool.object.get("type").?;
+    try std.testing.expectEqualStrings("function", tool_type.string);
+}
+
+test "buildRequestPayload with image content" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-4-vision",
+        .name = "GPT-4 Vision",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text", "image"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    const context = types.Context{
+        .system_prompt = null,
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{
+                    .{ .text = .{ .text = "What's in this image?" } },
+                    .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
+                },
+                .timestamp = 1234567890,
+            } },
+        },
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    const messages = payload.object.get("messages").?;
+    const user_msg = messages.array.items[0];
+    try std.testing.expect(user_msg == .object);
+
+    const content = user_msg.object.get("content").?;
+    try std.testing.expect(content == .array);
+    try std.testing.expectEqual(@as(usize, 2), content.array.items.len);
+
+    const image_part = content.array.items[1];
+    try std.testing.expect(image_part == .object);
+    const part_type = image_part.object.get("type").?;
+    try std.testing.expectEqualStrings("image_url", part_type.string);
 }
 
 test "parseSseLine" {
@@ -335,7 +1133,224 @@ test "parseChunk" {
     try std.testing.expect(empty == null);
 
     const valid = try parseChunk(allocator, "{\"foo\": 123}");
-    defer if (valid) |v| v.deinit(allocator);
+    defer if (valid) |*v| v.deinit();
     try std.testing.expect(valid != null);
-    try std.testing.expect(valid.? == .object);
+    try std.testing.expect(valid.?.value == .object);
+}
+
+test "mapStopReason" {
+    const r1 = mapStopReason("stop");
+    try std.testing.expectEqual(types.StopReason.stop, r1.stop_reason);
+
+    const r2 = mapStopReason("length");
+    try std.testing.expectEqual(types.StopReason.length, r2.stop_reason);
+
+    const r3 = mapStopReason("tool_calls");
+    try std.testing.expectEqual(types.StopReason.tool_use, r3.stop_reason);
+
+    const r4 = mapStopReason("content_filter");
+    try std.testing.expectEqual(types.StopReason.error_reason, r4.stop_reason);
+    try std.testing.expect(r4.error_message != null);
+
+    const r5 = mapStopReason("unknown_reason");
+    try std.testing.expectEqual(types.StopReason.error_reason, r5.stop_reason);
+}
+
+test "sanitizeSurrogates preserves valid emoji" {
+    // "🙈" in UTF-8: F0 9F 99 88 (not surrogates, it's a 4-byte sequence)
+    const text = "Hello 🙈 World";
+    const result = sanitizeSurrogates(text);
+    try std.testing.expectEqualStrings(text, result);
+}
+
+test "parseSseStream with tool calls" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(u8,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}\n" ++
+        "data: [DONE]\n"
+    );
+    // body is owned by StreamingResponse, do not free here
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model);
+
+    // Should emit start, toolcall_start, toolcall_delta, toolcall_end, done
+    const event1 = stream.next().?;
+    defer freeEvent(allocator, event1);
+    try std.testing.expectEqual(types.EventType.start, event1.event_type);
+
+    const event2 = stream.next().?;
+    defer freeEvent(allocator, event2);
+    try std.testing.expectEqual(types.EventType.toolcall_start, event2.event_type);
+
+    const event3 = stream.next().?;
+    defer freeEvent(allocator, event3);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, event3.event_type);
+
+    const event4 = stream.next().?;
+    defer freeEvent(allocator, event4);
+    try std.testing.expectEqual(types.EventType.toolcall_end, event4.event_type);
+    try std.testing.expect(event4.tool_call != null);
+    try std.testing.expectEqualStrings("get_weather", event4.tool_call.?.name);
+
+    const event5 = stream.next().?;
+    defer freeEvent(allocator, event5);
+    try std.testing.expectEqual(types.EventType.done, event5.event_type);
+}
+
+test "parseSseStream with reasoning content" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(u8,
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think...\"}}]}\n" ++
+        "data: [DONE]\n"
+    );
+    // body is owned by StreamingResponse, do not free here
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "deepseek-reasoner",
+        .name = "DeepSeek Reasoner",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model);
+
+    const event1 = stream.next().?;
+    defer freeEvent(allocator, event1);
+    try std.testing.expectEqual(types.EventType.start, event1.event_type);
+
+    const event2 = stream.next().?;
+    defer freeEvent(allocator, event2);
+    try std.testing.expectEqual(types.EventType.thinking_start, event2.event_type);
+
+    const event3 = stream.next().?;
+    defer freeEvent(allocator, event3);
+    try std.testing.expectEqual(types.EventType.thinking_delta, event3.event_type);
+    try std.testing.expectEqualStrings("Let me think...", event3.delta.?);
+
+    const event4 = stream.next().?;
+    defer freeEvent(allocator, event4);
+    try std.testing.expectEqual(types.EventType.thinking_end, event4.event_type);
+
+    const event5 = stream.next().?;
+    defer freeEvent(allocator, event5);
+    try std.testing.expectEqual(types.EventType.done, event5.event_type);
+}
+
+test "parseSseStream with usage" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(u8,
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n" ++
+        "data: [DONE]\n"
+    );
+    // body is owned by StreamingResponse, do not free here
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model);
+
+    const event1 = stream.next().?;
+    defer freeEvent(allocator, event1);
+    try std.testing.expectEqual(types.EventType.start, event1.event_type);
+
+    const event2 = stream.next().?;
+    defer freeEvent(allocator, event2);
+    try std.testing.expectEqual(types.EventType.done, event2.event_type);
+
+    const result = stream.result().?;
+    try std.testing.expectEqual(@as(u32, 10), result.usage.input);
+    try std.testing.expectEqual(@as(u32, 20), result.usage.output);
+}
+
+test "parseChunkUsage" {
+    const allocator = std.testing.allocator;
+
+    const usage_json = "{\"prompt_tokens\":100,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":20,\"cache_write_tokens\":10},\"completion_tokens_details\":{\"reasoning_tokens\":5}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, usage_json, .{});
+    defer parsed.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    const usage = parseChunkUsage(allocator, parsed.value, model);
+
+    // input = 100 - 10 (cache read after subtracting write) - 10 (cache write) = 80
+    // Wait: normalized_cache_read = 20 - 10 = 10
+    // input = 100 - 10 - 10 = 80
+    // output = 50 + 5 = 55
+    try std.testing.expectEqual(@as(u32, 80), usage.input);
+    try std.testing.expectEqual(@as(u32, 55), usage.output);
+    try std.testing.expectEqual(@as(u32, 10), usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 10), usage.cache_write);
+    try std.testing.expectEqual(@as(u32, 155), usage.total_tokens);
 }

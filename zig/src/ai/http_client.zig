@@ -10,17 +10,10 @@ pub const HttpMethod = enum {
 
 pub const HttpResponse = struct {
     status: u16,
-    headers: std.StringHashMap([]const u8),
     body: []const u8,
     allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *HttpResponse) void {
-        var it = self.headers.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.headers.deinit();
+    pub fn deinit(self: *const HttpResponse) void {
         self.allocator.free(self.body);
     }
 };
@@ -32,85 +25,68 @@ pub const HttpRequest = struct {
     body: ?[]const u8 = null,
 };
 
-/// Simple HTTP client using std.http
+/// Simple HTTP client using std.http.Client.fetch
 pub const HttpClient = struct {
     client: std.http.Client,
     allocator: std.mem.Allocator,
-    threaded: *std.Io.Threaded,
 
-    pub fn init(allocator: std.mem.Allocator) !HttpClient {
-        const threaded = try allocator.create(std.Io.Threaded);
-        threaded.* = std.Io.Threaded.init(allocator, .{});
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !HttpClient {
         return .{
-            .client = std.http.Client{ .allocator = allocator, .io = threaded.io() },
+            .client = std.http.Client{ .allocator = allocator, .io = io },
             .allocator = allocator,
-            .threaded = threaded,
         };
     }
 
     pub fn deinit(self: *HttpClient) void {
         self.client.deinit();
-        self.threaded.deinit();
-        self.allocator.destroy(self.threaded);
     }
 
     pub fn request(self: *HttpClient, req: HttpRequest) !HttpResponse {
-        const method_str = switch (req.method) {
-            .GET => "GET",
-            .POST => "POST",
-            .PUT => "PUT",
-            .DELETE => "DELETE",
-            .PATCH => "PATCH",
+        const method: std.http.Method = switch (req.method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+            .PATCH => .PATCH,
         };
 
-        const uri = try std.Uri.parse(req.url);
+        // Collect headers into http.Header array
+        var extra_headers: std.ArrayList(std.http.Header) = .empty;
+        defer extra_headers.deinit(self.allocator);
 
-        var header_buffer: [8192]u8 = undefined;
-        var http_request = try self.client.open(
-            std.http.Method.parse(method_str),
-            uri,
-            .{ .server_header_buffer = &header_buffer },
-        );
-        defer http_request.deinit();
-
-        // Add custom headers
         if (req.headers) |headers| {
             var it = headers.iterator();
             while (it.next()) |entry| {
-                http_request.headers.append(entry.key_ptr.*, entry.value_ptr.*) catch {};
+                try extra_headers.append(self.allocator, .{
+                    .name = entry.key_ptr.*,
+                    .value = entry.value_ptr.*,
+                });
             }
         }
 
-        // Set content length if body present
-        if (req.body) |body| {
-            http_request.headers.content_length = body.len;
-        }
+        // Allocating response writer
+        var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_writer.deinit();
 
-        try http_request.send();
+        const result = try self.client.fetch(.{
+            .location = .{ .url = req.url },
+            .method = method,
+            .payload = req.body,
+            .extra_headers = extra_headers.items,
+            .response_writer = &response_writer.writer,
+        });
 
-        if (req.body) |body| {
-            try http_request.writeAll(body);
-            try http_request.finish();
-        }
-
-        try http_request.wait();
-
-        const status = @intFromEnum(http_request.response.status);
-        const body = try http_request.reader().readAllAlloc(self.allocator, 10 * 1024 * 1024);
-
-        const response_headers = std.StringHashMap([]const u8).init(self.allocator);
-        // TODO: Parse response headers from request.response
+        const body_copy = try self.allocator.dupe(u8, response_writer.written());
 
         return HttpResponse{
-            .status = status,
-            .headers = response_headers,
-            .body = body,
+            .status = @intFromEnum(result.status),
+            .body = body_copy,
             .allocator = self.allocator,
         };
     }
 };
 
 test "HttpClient init/deinit" {
-    var client = try HttpClient.init(std.testing.allocator);
+    var client = try HttpClient.init(std.testing.allocator, std.testing.io);
     client.deinit();
 }
