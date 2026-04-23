@@ -1,139 +1,62 @@
 const std = @import("std");
 const ai = @import("ai/root.zig");
+const cli = @import("cli/args.zig");
+const coding_agent = @import("coding_agent/root.zig");
 const openai = @import("ai/providers/openai.zig");
 const http_client = @import("ai/http_client.zig");
-const json_parse = @import("ai/json_parse.zig");
 
 const VERSION = "0.1.0";
 
-const CliOptions = struct {
-    model: ?[]const u8 = null,
-    provider: []const u8 = "openai",
-    api_key: ?[]const u8 = null,
-    base_url: ?[]const u8 = null,
-    temperature: ?f32 = null,
-    max_tokens: ?u32 = null,
-    system_prompt: ?[]const u8 = null,
-    help: bool = false,
-    version: bool = false,
-};
-
-fn printUsage() void {
-    std.debug.print("pi - AI assistant (Zig rewrite) v{s}\n\n", .{VERSION});
-    std.debug.print("Usage: pi [options] <prompt>\n\n", .{});
-    std.debug.print("Options:\n", .{});
-    std.debug.print("  -m, --model <model>       Model ID (default depends on provider)\n", .{});
-    std.debug.print("  -p, --provider <provider> Provider: openai, kimi (default: openai)\n", .{});
-    std.debug.print("  -k, --api-key <key>       API key (or set OPENAI_API_KEY / KIMI_API_KEY env var)\n", .{});
-    std.debug.print("  -u, --base-url <url>      Base URL for API\n", .{});
-    std.debug.print("  -t, --temperature <temp>  Temperature (0.0-2.0)\n", .{});
-    std.debug.print("  --max-tokens <n>          Maximum tokens to generate\n", .{});
-    std.debug.print("  -s, --system <prompt>     System prompt\n", .{});
-    std.debug.print("  -h, --help                Show this help\n", .{});
-    std.debug.print("  -v, --version             Show version\n\n", .{});
-    std.debug.print("Example:\n", .{});
-    std.debug.print("  pi \"What is the meaning of life?\"\n", .{});
-    std.debug.print("  pi -p kimi \"Explain quantum computing\"\n", .{});
-    std.debug.print("  pi -s \"You are a poet\" \"Write a haiku about Zig\"\n", .{});
-}
-
 pub fn main(init: std.process.Init) !void {
-    // Parse args directly from init.minimal.args without heap allocation
-    var options = CliOptions{};
-    var prompt: ?[:0]const u8 = null;
-
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(init.gpa);
     var it = init.minimal.args.iterate();
-    _ = it.next(); // skip program name
-
+    _ = it.next();
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            options.help = true;
-        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            options.version = true;
-        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--model")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.model = next_arg;
-        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--provider")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.provider = next_arg;
-        } else if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--api-key")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.api_key = next_arg;
-        } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--base-url")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.base_url = next_arg;
-        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--temperature")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.temperature = std.fmt.parseFloat(f32, next_arg) catch {
-                std.debug.print("Error: Invalid temperature value\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, arg, "--max-tokens")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.max_tokens = std.fmt.parseInt(u32, next_arg, 10) catch {
-                std.debug.print("Error: Invalid max-tokens value\n", .{});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--system")) {
-            const next_arg = it.next() orelse {
-                std.debug.print("Error: Missing argument for option\n", .{});
-                printUsage();
-                std.process.exit(1);
-            };
-            options.system_prompt = next_arg;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("Unknown option: {s}\n", .{arg});
-            printUsage();
-            std.process.exit(1);
-        } else {
-            prompt = arg;
-        }
+        try argv.append(init.gpa, arg);
     }
 
+    var options = cli.parseArgs(init.gpa, argv.items) catch |err| {
+        std.debug.print("Error: {s}\n\n", .{parseErrorMessage(err)});
+        printUsage(init.gpa) catch {};
+        std.process.exit(1);
+    };
+    defer options.deinit(init.gpa);
+
     if (options.help) {
-        printUsage();
+        try printUsage(init.gpa);
         return;
     }
 
     if (options.version) {
-        std.debug.print("pi version {s}\n", .{VERSION});
+        try printVersion(init.gpa);
         return;
     }
 
-    if (prompt == null) {
-        std.debug.print("Error: No prompt provided\n", .{});
-        printUsage();
+    if (options.prompt == null) {
+        std.debug.print("Error: No prompt provided\n\n", .{});
+        printUsage(init.gpa) catch {};
         std.process.exit(1);
     }
 
+    const provider = options.provider orelse "openai";
+    const selected_tools = effectiveToolSelection(&options);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.gpa);
+    defer init.gpa.free(cwd);
+    const current_date = try currentDateString(init.gpa, init.io);
+    defer init.gpa.free(current_date);
+    const system_prompt = try coding_agent.buildSystemPrompt(init.gpa, .{
+        .cwd = cwd,
+        .current_date = current_date,
+        .custom_prompt = options.system_prompt,
+        .append_prompt = options.append_system_prompt,
+        .selected_tools = selected_tools,
+    });
+    defer init.gpa.free(system_prompt);
+
     // Determine provider defaults and API key env var
-    const is_kimi = std.mem.eql(u8, options.provider, "kimi");
+    const is_kimi = std.mem.eql(u8, provider, "kimi");
     const default_model = if (is_kimi) "moonshot-v1-8k" else "gpt-4";
-    const default_base_url = if (is_kimi) "https://api.moonshot.cn/v1" else "https://api.openai.com/v1";
     const api_key_env = if (is_kimi) "KIMI_API_KEY" else "OPENAI_API_KEY";
 
     // Get API key from env var if not provided
@@ -149,14 +72,14 @@ pub fn main(init: std.process.Init) !void {
 
     // Use default model if not specified
     const model_id = options.model orelse default_model;
-    const base_url = options.base_url orelse default_base_url;
+    const base_url = if (is_kimi) "https://api.moonshot.cn/v1" else "https://api.openai.com/v1";
 
     // Build model config
     const model = ai.Model{
         .id = model_id,
         .name = model_id,
         .api = if (is_kimi) "kimi-completions" else "openai-completions",
-        .provider = options.provider,
+        .provider = provider,
         .base_url = base_url,
         .input_types = &[_][]const u8{"text"},
         .context_window = 8192,
@@ -164,21 +87,19 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // Build context
-    const content_block = ai.ContentBlock{ .text = .{ .text = prompt.? } };
+    const content_block = ai.ContentBlock{ .text = .{ .text = options.prompt.? } };
     const now: i64 = @intCast(@divFloor(std.Io.Clock.now(.real, init.io).nanoseconds, std.time.ns_per_s));
     const user_msg = ai.Message{ .user = .{
         .content = &[_]ai.ContentBlock{content_block},
         .timestamp = now,
     } };
     const context = ai.Context{
-        .system_prompt = options.system_prompt,
+        .system_prompt = system_prompt,
         .messages = &[_]ai.Message{user_msg},
     };
 
     // Build stream options
     const stream_options = ai.StreamOptions{
-        .temperature = options.temperature,
-        .max_tokens = options.max_tokens,
         .api_key = api_key,
     };
 
@@ -186,6 +107,49 @@ pub fn main(init: std.process.Init) !void {
 
     // Perform actual streaming request
     try streamChatCompletion(init.gpa, init.io, model, context, stream_options);
+}
+
+fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
+    return switch (err) {
+        error.MissingOptionValue => "Missing value for option",
+        error.InvalidMode => "Invalid mode. Expected one of: text, json, rpc",
+        error.InvalidThinkingLevel => "Invalid thinking level. Expected one of: off, minimal, low, medium, high, xhigh",
+        error.UnknownOption => "Unknown option",
+        error.OutOfMemory => "Out of memory while parsing CLI arguments",
+    };
+}
+
+fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
+    if (options.no_tools) {
+        return options.tools orelse &[_][]const u8{};
+    }
+    return options.tools;
+}
+
+fn printUsage(allocator: std.mem.Allocator) !void {
+    const text = try cli.helpText(allocator, VERSION);
+    defer allocator.free(text);
+    std.debug.print("{s}", .{text});
+}
+
+fn printVersion(allocator: std.mem.Allocator) !void {
+    const text = try cli.versionText(allocator, VERSION);
+    defer allocator.free(text);
+    std.debug.print("{s}", .{text});
+}
+
+fn currentDateString(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    const now_seconds: u64 = @intCast(@divFloor(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = now_seconds };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}",
+        .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 },
+    );
 }
 
 /// Stream chat completion and print response to stdout
@@ -284,4 +248,21 @@ fn parseAndPrintSseStream(allocator: std.mem.Allocator, body: []const u8) !void 
     if (!first_chunk) {
         std.debug.print("\n", .{});
     }
+}
+
+test "main help text includes expected CLI options" {
+    const allocator = std.testing.allocator;
+    const help = try cli.helpText(allocator, VERSION);
+    defer allocator.free(help);
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "--model <model>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--provider <provider>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--api-key <key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--thinking <level>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--continue, -c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--session <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
 }
