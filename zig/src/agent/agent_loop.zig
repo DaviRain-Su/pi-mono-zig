@@ -84,80 +84,169 @@ pub fn runAgentLoop(
         });
     }
 
+    try runLoop(
+        allocator,
+        io,
+        &current_messages,
+        &new_messages,
+        context.system_prompt,
+        context.tools,
+        config,
+        emit_context,
+        emit,
+        signal,
+        stream_fn,
+    );
+    return try allocator.dupe(types.AgentMessage, new_messages.items);
+}
+
+fn runLoop(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    current_messages: *std.ArrayList(types.AgentMessage),
+    new_messages: *std.ArrayList(types.AgentMessage),
+    system_prompt: []const u8,
+    tools: []const types.AgentTool,
+    config: types.AgentLoopConfig,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+    signal: ?*const std.atomic.Value(bool),
+    stream_fn: ?types.StreamFn,
+) !void {
+    var first_turn = true;
+    var pending_messages = try getPendingMessages(
+        allocator,
+        config.get_steering_messages,
+        config.get_steering_messages_context,
+    );
+    defer allocator.free(pending_messages);
+
     while (true) {
-        const current_context = types.AgentContext{
-            .system_prompt = context.system_prompt,
-            .messages = current_messages.items,
-            .tools = context.tools,
-        };
+        var has_more_tool_calls = true;
 
-        const assistant = try streamAssistantResponse(
-            allocator,
-            io,
-            current_context,
-            config,
-            emit_context,
-            emit,
-            signal,
-            stream_fn,
-        );
+        while (has_more_tool_calls or pending_messages.len > 0) {
+            if (first_turn) {
+                first_turn = false;
+            } else {
+                try emit(emit_context, .{ .event_type = .turn_start });
+            }
 
-        try current_messages.append(allocator, .{ .assistant = assistant });
-        try new_messages.append(allocator, .{ .assistant = assistant });
+            if (pending_messages.len > 0) {
+                for (pending_messages) |message| {
+                    try current_messages.append(allocator, message);
+                    try new_messages.append(allocator, message);
+                    try emit(emit_context, .{
+                        .event_type = .message_start,
+                        .message = message,
+                    });
+                    try emit(emit_context, .{
+                        .event_type = .message_end,
+                        .message = message,
+                    });
+                }
 
-        var tool_results = std.ArrayList(types.ToolResultMessage).empty;
-        defer tool_results.deinit(allocator);
+                allocator.free(pending_messages);
+                pending_messages = try allocator.alloc(types.AgentMessage, 0);
+            }
 
-        if (assistant.stop_reason == .error_reason or assistant.stop_reason == .aborted) {
+            const current_context = types.AgentContext{
+                .system_prompt = system_prompt,
+                .messages = current_messages.items,
+                .tools = tools,
+            };
+
+            const assistant = try streamAssistantResponse(
+                allocator,
+                io,
+                current_context,
+                config,
+                emit_context,
+                emit,
+                signal,
+                stream_fn,
+            );
+
+            try current_messages.append(allocator, .{ .assistant = assistant });
+            try new_messages.append(allocator, .{ .assistant = assistant });
+
+            var tool_results = std.ArrayList(types.ToolResultMessage).empty;
+            defer tool_results.deinit(allocator);
+
+            if (assistant.stop_reason == .error_reason or assistant.stop_reason == .aborted) {
+                try emit(emit_context, .{
+                    .event_type = .turn_end,
+                    .message = .{ .assistant = assistant },
+                    .tool_results = tool_results.items,
+                });
+                try emit(emit_context, .{
+                    .event_type = .agent_end,
+                    .messages = new_messages.items,
+                });
+                return;
+            }
+
+            const tool_calls = assistant.tool_calls orelse &.{};
+            has_more_tool_calls = tool_calls.len > 0;
+
+            if (has_more_tool_calls) {
+                const executed_tool_results = try executeToolCalls(
+                    allocator,
+                    current_context,
+                    assistant,
+                    tool_calls,
+                    config,
+                    emit_context,
+                    emit,
+                    signal,
+                );
+                defer allocator.free(executed_tool_results);
+
+                try tool_results.appendSlice(allocator, executed_tool_results);
+                for (tool_results.items) |tool_result| {
+                    try current_messages.append(allocator, .{ .tool_result = tool_result });
+                    try new_messages.append(allocator, .{ .tool_result = tool_result });
+                }
+            }
+
             try emit(emit_context, .{
                 .event_type = .turn_end,
                 .message = .{ .assistant = assistant },
                 .tool_results = tool_results.items,
             });
-            break;
+
+            if (isAbortRequested(signal)) {
+                try emit(emit_context, .{
+                    .event_type = .agent_end,
+                    .messages = new_messages.items,
+                });
+                return;
+            }
+
+            allocator.free(pending_messages);
+            pending_messages = try getPendingMessages(
+                allocator,
+                config.get_steering_messages,
+                config.get_steering_messages_context,
+            );
         }
 
-        const tool_calls = assistant.tool_calls orelse &.{};
-        if (tool_calls.len == 0) {
-            try emit(emit_context, .{
-                .event_type = .turn_end,
-                .message = .{ .assistant = assistant },
-                .tool_results = tool_results.items,
-            });
-            break;
-        }
-
-        const executed_tool_results = try executeToolCalls(
+        allocator.free(pending_messages);
+        pending_messages = try getPendingMessages(
             allocator,
-            current_context,
-            assistant,
-            tool_calls,
-            config,
-            emit_context,
-            emit,
-            signal,
+            config.get_follow_up_messages,
+            config.get_follow_up_messages_context,
         );
-        try tool_results.appendSlice(allocator, executed_tool_results);
-
-        for (tool_results.items) |tool_result| {
-            try current_messages.append(allocator, .{ .tool_result = tool_result });
-            try new_messages.append(allocator, .{ .tool_result = tool_result });
+        if (pending_messages.len > 0) {
+            continue;
         }
 
-        try emit(emit_context, .{
-            .event_type = .turn_end,
-            .message = .{ .assistant = assistant },
-            .tool_results = tool_results.items,
-        });
-        try emit(emit_context, .{ .event_type = .turn_start });
+        break;
     }
 
     try emit(emit_context, .{
         .event_type = .agent_end,
         .messages = new_messages.items,
     });
-
-    return try allocator.dupe(types.AgentMessage, new_messages.items);
 }
 
 fn streamAssistantResponse(
@@ -190,6 +279,7 @@ fn streamAssistantResponse(
     const options = ai.types.SimpleStreamOptions{
         .api_key = config.api_key,
         .session_id = config.session_id,
+        .signal = signal,
     };
 
     const active_stream_fn = stream_fn orelse ai.streamSimple;
@@ -296,6 +386,21 @@ fn streamAssistantResponse(
         .message = .{ .assistant = final_message },
     });
     return final_message;
+}
+
+fn getPendingMessages(
+    allocator: std.mem.Allocator,
+    callback: ?types.PendingMessagesFn,
+    context: ?*anyopaque,
+) ![]types.AgentMessage {
+    if (callback) |drain_messages| {
+        return try drain_messages(allocator, context);
+    }
+    return try allocator.alloc(types.AgentMessage, 0);
+}
+
+fn isAbortRequested(signal: ?*const std.atomic.Value(bool)) bool {
+    return if (signal) |abort_signal| abort_signal.load(.seq_cst) else false;
 }
 
 fn executeToolCalls(
@@ -854,6 +959,16 @@ fn createUserMessage(text: []const u8, timestamp: i64) types.AgentMessage {
     } };
 }
 
+fn expectUserText(message: types.AgentMessage, expected: []const u8) !void {
+    switch (message) {
+        .user => |user| {
+            try std.testing.expectEqual(@as(usize, 1), user.content.len);
+            try std.testing.expectEqualStrings(expected, user.content[0].text.text);
+        },
+        else => return error.UnexpectedMessageRole,
+    }
+}
+
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return switch (value) {
         .null => .null,
@@ -1040,6 +1155,198 @@ fn overrideAfterToolCall(
         .content = content,
         .is_error = false,
     };
+}
+
+const PendingQueueTestState = struct {
+    steering_poll_count: usize = 0,
+    follow_up_poll_count: usize = 0,
+};
+
+fn drainSteeringForTest(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) ![]types.AgentMessage {
+    const state: *PendingQueueTestState = @ptrCast(@alignCast(context.?));
+    state.steering_poll_count += 1;
+    if (state.steering_poll_count == 2) {
+        const messages = try allocator.alloc(types.AgentMessage, 1);
+        messages[0] = createUserMessage("steer now", 2);
+        return messages;
+    }
+    return try allocator.alloc(types.AgentMessage, 0);
+}
+
+fn drainFollowUpsForTest(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) ![]types.AgentMessage {
+    const state: *PendingQueueTestState = @ptrCast(@alignCast(context.?));
+    state.follow_up_poll_count += 1;
+    if (state.follow_up_poll_count == 1) {
+        const messages = try allocator.alloc(types.AgentMessage, 1);
+        messages[0] = createUserMessage("follow up", 2);
+        return messages;
+    }
+    return try allocator.alloc(types.AgentMessage, 0);
+}
+
+fn drainNoMessages(
+    allocator: std.mem.Allocator,
+    _: ?*anyopaque,
+) ![]types.AgentMessage {
+    return try allocator.alloc(types.AgentMessage, 0);
+}
+
+fn steeringQueueFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+
+    switch (call_count.*) {
+        1 => {
+            try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+            try expectUserText(context.messages[0], "hello");
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText("first reply");
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        2 => {
+            try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+            try expectUserText(context.messages[0], "hello");
+            try std.testing.expectEqualStrings("first reply", context.messages[1].assistant.content[0].text.text);
+            try expectUserText(context.messages[2], "steer now");
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText("after steer");
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        else => return error.UnexpectedFactoryCallCount,
+    }
+}
+
+fn followUpQueueFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+
+    switch (call_count.*) {
+        1 => {
+            try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+            try expectUserText(context.messages[0], "hello");
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText("first reply");
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        2 => {
+            try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+            try expectUserText(context.messages[0], "hello");
+            try std.testing.expectEqualStrings("first reply", context.messages[1].assistant.content[0].text.text);
+            try expectUserText(context.messages[2], "follow up");
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText("after follow up");
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        else => return error.UnexpectedFactoryCallCount,
+    }
+}
+
+test "runAgentLoop injects steering messages before the next LLM call" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = steeringQueueFactory },
+        .{ .factory = steeringQueueFactory },
+    });
+
+    var queue_state = PendingQueueTestState{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .get_steering_messages_context = &queue_state,
+            .get_steering_messages = drainSteeringForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try expectUserText(result[0], "hello");
+    try std.testing.expectEqualStrings("first reply", result[1].assistant.content[0].text.text);
+    try expectUserText(result[2], "steer now");
+    try std.testing.expectEqualStrings("after steer", result[3].assistant.content[0].text.text);
+}
+
+test "runAgentLoop processes follow-up messages only after the agent would otherwise stop" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = followUpQueueFactory },
+        .{ .factory = followUpQueueFactory },
+    });
+
+    var queue_state = PendingQueueTestState{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .get_steering_messages_context = &queue_state,
+            .get_steering_messages = drainNoMessages,
+            .get_follow_up_messages_context = &queue_state,
+            .get_follow_up_messages = drainFollowUpsForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try expectUserText(result[0], "hello");
+    try std.testing.expectEqualStrings("first reply", result[1].assistant.content[0].text.text);
+    try expectUserText(result[2], "follow up");
+    try std.testing.expectEqualStrings("after follow up", result[3].assistant.content[0].text.text);
 }
 
 fn buildToolCallAssistantMessage(
