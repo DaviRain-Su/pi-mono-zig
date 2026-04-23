@@ -8,6 +8,7 @@ pub const event_stream = @import("event_stream.zig");
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
     pub const kimi = @import("providers/kimi.zig");
+    pub const faux = @import("providers/faux.zig");
 };
 
 // Re-export commonly used types
