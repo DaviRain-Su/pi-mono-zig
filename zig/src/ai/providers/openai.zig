@@ -1077,7 +1077,7 @@ test "buildRequestPayload with image content" {
         .api = "openai-completions",
         .provider = "openai",
         .base_url = "https://api.openai.com/v1",
-        .input_types = &[_][]const u8{"text", "image"},
+        .input_types = &[_][]const u8{ "text", "image" },
         .context_window = 8192,
         .max_tokens = 4096,
     };
@@ -1167,10 +1167,8 @@ test "parseSseStream with tool calls" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
-    const body = try allocator.dupe(u8,
-        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}\n" ++
-        "data: [DONE]\n"
-    );
+    const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}\n" ++
+        "data: [DONE]\n");
     // body is owned by StreamingResponse, do not free here
 
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
@@ -1225,10 +1223,8 @@ test "parseSseStream with reasoning content" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
-    const body = try allocator.dupe(u8,
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think...\"}}]}\n" ++
-        "data: [DONE]\n"
-    );
+    const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think...\"}}]}\n" ++
+        "data: [DONE]\n");
     // body is owned by StreamingResponse, do not free here
 
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
@@ -1281,10 +1277,8 @@ test "parseSseStream with usage" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
-    const body = try allocator.dupe(u8,
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n" ++
-        "data: [DONE]\n"
-    );
+    const body = try allocator.dupe(u8, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n" ++
+        "data: [DONE]\n");
     // body is owned by StreamingResponse, do not free here
 
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
