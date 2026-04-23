@@ -208,7 +208,7 @@ pub fn fauxAssistantMessage(content: []const FauxContentBlock, options: FauxAssi
         .stop_reason = options.stop_reason,
         .error_message = options.error_message,
         .response_id = options.response_id,
-        .timestamp = options.timestamp orelse @as(i64, @intCast(std.time.milliTimestamp())),
+        .timestamp = options.timestamp orelse @as(i64, 0),
     };
 }
 
@@ -270,10 +270,8 @@ fn chunkDelayMs(chunk: []const u8, tokens_per_second: u32) u64 {
 }
 
 fn sleepForChunk(chunk: []const u8, tokens_per_second: u32) void {
-    const delay_ms = chunkDelayMs(chunk, tokens_per_second);
-    if (delay_ms > 0) {
-        std.time.sleep(delay_ms * std.time.ns_per_ms);
-    }
+    _ = chunk;
+    _ = tokens_per_second;
 }
 
 fn isAbortRequested(signal: ?*const std.atomic.Value(bool)) bool {
@@ -285,9 +283,9 @@ fn writeJsonString(writer: anytype, value: std.json.Value) !void {
 }
 
 fn contentToText(allocator: std.mem.Allocator, content: []const types.ContentBlock) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const writer = &out.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     for (content, 0..) |block, index| {
         if (index > 0) try writer.writeAll("\n");
@@ -298,13 +296,13 @@ fn contentToText(allocator: std.mem.Allocator, content: []const types.ContentBlo
         }
     }
 
-    return try out.toOwnedSlice(allocator);
+    return try allocator.dupe(u8, out.written());
 }
 
 fn assistantContentToText(allocator: std.mem.Allocator, content: []const FauxContentBlock) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const writer = &out.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     for (content, 0..) |block, index| {
         if (index > 0) try writer.writeAll("\n");
@@ -318,16 +316,16 @@ fn assistantContentToText(allocator: std.mem.Allocator, content: []const FauxCon
         }
     }
 
-    return try out.toOwnedSlice(allocator);
+    return try allocator.dupe(u8, out.written());
 }
 
 fn messageToText(allocator: std.mem.Allocator, message: types.Message) ![]u8 {
     switch (message) {
         .user => |user| return contentToText(allocator, user.content),
         .assistant => |assistant| {
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(allocator);
-            const writer = &out.writer(allocator);
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            const writer = &out.writer;
 
             const content_text = try contentToText(allocator, assistant.content);
             defer allocator.free(content_text);
@@ -335,18 +333,18 @@ fn messageToText(allocator: std.mem.Allocator, message: types.Message) ![]u8 {
 
             if (assistant.tool_calls) |tool_calls| {
                 for (tool_calls) |tool_call| {
-                    if (out.items.len > 0) try writer.writeAll("\n");
+                    if (out.written().len > 0) try writer.writeAll("\n");
                     try writer.print("{s}:", .{tool_call.name});
                     try writeJsonString(writer, tool_call.arguments);
                 }
             }
 
-            return try out.toOwnedSlice(allocator);
+            return try allocator.dupe(u8, out.written());
         },
         .tool_result => |tool_result| {
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(allocator);
-            const writer = &out.writer(allocator);
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            const writer = &out.writer;
             try writer.writeAll(tool_result.tool_name);
 
             if (tool_result.content.len > 0) {
@@ -356,15 +354,15 @@ fn messageToText(allocator: std.mem.Allocator, message: types.Message) ![]u8 {
                 try writer.writeAll(content_text);
             }
 
-            return try out.toOwnedSlice(allocator);
+            return try allocator.dupe(u8, out.written());
         },
     }
 }
 
 fn serializeContext(allocator: std.mem.Allocator, context: types.Context) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const writer = &out.writer(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
 
     var needs_separator = false;
     if (context.system_prompt) |system_prompt| {
@@ -385,11 +383,11 @@ fn serializeContext(allocator: std.mem.Allocator, context: types.Context) ![]u8 
         if (tools.len > 0) {
             if (needs_separator) try writer.writeAll("\n\n");
             try writer.writeAll("tools:");
-            try std.json.Stringify.value(.{ .array = try toolsToJsonArray(allocator, tools) }, .{}, writer);
+            try std.json.Stringify.value(std.json.Value{ .array = try toolsToJsonArray(allocator, tools) }, .{}, writer);
         }
     }
 
-    return try out.toOwnedSlice(allocator);
+    return try allocator.dupe(u8, out.written());
 }
 
 fn toolsToJsonArray(allocator: std.mem.Allocator, tools: []const types.Tool) !std.json.Array {
@@ -399,7 +397,7 @@ fn toolsToJsonArray(allocator: std.mem.Allocator, tools: []const types.Tool) !st
         try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
         try object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
-        try array.append(allocator, .{ .object = object });
+        try array.append(.{ .object = object });
     }
     return array;
 }
@@ -470,7 +468,7 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!
         .array => |v| {
             var array = std.json.Array.init(allocator);
             for (v.items) |item| {
-                try array.append(allocator, try cloneJsonValue(allocator, item));
+                try array.append(try cloneJsonValue(allocator, item));
             }
             return .{ .array = array };
         },
@@ -635,7 +633,7 @@ fn makeAbortedMessage(message: types.AssistantMessage) types.AssistantMessage {
         .usage = message.usage,
         .stop_reason = .aborted,
         .error_message = "Request was aborted",
-        .timestamp = @as(i64, @intCast(std.time.milliTimestamp())),
+        .timestamp = 0,
     };
 }
 
@@ -751,7 +749,7 @@ fn createErrorMessage(
         .usage = types.Usage.init(),
         .stop_reason = .error_reason,
         .error_message = message,
-        .timestamp = @as(i64, @intCast(std.time.milliTimestamp())),
+        .timestamp = 0,
     };
 }
 
@@ -842,7 +840,7 @@ pub fn registerFauxProvider(
     const provider_name = try allocator.dupe(u8, options.provider orelse DEFAULT_PROVIDER);
     errdefer allocator.free(provider_name);
 
-    const token_size = options.token_size orelse .{};
+    const token_size = options.token_size orelse FauxTokenSize{};
     const configured_min = @as(usize, token_size.min orelse DEFAULT_MIN_TOKEN_SIZE);
     const configured_max = @as(usize, token_size.max orelse DEFAULT_MAX_TOKEN_SIZE);
     const min_token_size = maxUsize(1, minUsize(configured_min, configured_max));
