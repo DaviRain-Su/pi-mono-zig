@@ -1,40 +1,34 @@
 const std = @import("std");
 
 /// Parse a JSON string, handling incomplete/partial JSON gracefully.
-/// Returns a parsed JSON value or an empty object on failure.
-pub fn parseStreamingJson(allocator: std.mem.Allocator, input: ?[]const u8) !std.json.Value {
+/// Returns a parsed JSON value (caller must call `.deinit()` on the result).
+pub fn parseStreamingJson(allocator: std.mem.Allocator, input: ?[]const u8) !std.json.Parsed(std.json.Value) {
     if (input == null or input.?.len == 0) {
-        var empty_map = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        errdefer empty_map.deinit(allocator);
-        return std.json.Value{ .object = empty_map };
+        return try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
     }
 
     const trimmed = std.mem.trim(u8, input.?, " \t\r\n");
     if (trimmed.len == 0) {
-        var empty_map = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        errdefer empty_map.deinit(allocator);
-        return std.json.Value{ .object = empty_map };
+        return try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
     }
 
     // Try standard parse first
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch {
+    if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
+        return parsed;
+    } else |_| {
         // Try to find the longest valid JSON prefix
         var end_idx: usize = trimmed.len;
         while (end_idx > 0) : (end_idx -= 1) {
             const prefix = trimmed[0..end_idx];
             if (std.json.parseFromSlice(std.json.Value, allocator, prefix, .{})) |result| {
-                return result.value;
+                return result;
             } else |_| {
                 continue;
             }
         }
         // All parsing failed, return empty object
-        var empty_map = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        errdefer empty_map.deinit(allocator);
-        return std.json.Value{ .object = empty_map };
-    };
-
-    return parsed.value;
+        return try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    }
 }
 
 test "parseStreamingJson complete JSON" {
@@ -51,45 +45,27 @@ test "parseStreamingJson complete JSON" {
 test "parseStreamingJson empty string" {
     const allocator = std.testing.allocator;
     var result = try parseStreamingJson(allocator, "");
-    defer {
-        var it = result.object.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
-        result.object.deinit(allocator);
-    }
+    defer result.deinit();
 
-    try std.testing.expect(result == .object);
-    try std.testing.expectEqual(@as(usize, 0), result.object.count());
+    try std.testing.expect(result.value == .object);
+    try std.testing.expectEqual(@as(usize, 0), result.value.object.count());
 }
 
 test "parseStreamingJson null input" {
     const allocator = std.testing.allocator;
     var result = try parseStreamingJson(allocator, null);
-    defer {
-        var it = result.object.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
-        result.object.deinit(allocator);
-    }
+    defer result.deinit();
 
-    try std.testing.expect(result == .object);
-    try std.testing.expectEqual(@as(usize, 0), result.object.count());
+    try std.testing.expect(result.value == .object);
+    try std.testing.expectEqual(@as(usize, 0), result.value.object.count());
 }
 
 test "parseStreamingJson partial JSON" {
     const allocator = std.testing.allocator;
     var result = try parseStreamingJson(allocator, "{\"foo\": 123, \"bar");
-    defer {
-        var it = result.object.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
-        result.object.deinit(allocator);
-    }
+    defer result.deinit();
 
-    try std.testing.expect(result == .object);
+    try std.testing.expect(result.value == .object);
     // The result depends on how Zig's JSON parser handles partial input
     // It may return {"foo": 123} or {}
 }
