@@ -347,6 +347,16 @@ pub const Agent = struct {
         try self.listeners.append(self.allocator, subscriber);
     }
 
+    pub fn unsubscribe(self: *Agent, subscriber: types.AgentSubscriber) bool {
+        for (self.listeners.items, 0..) |listener, index| {
+            if (listener.context == subscriber.context and listener.callback == subscriber.callback) {
+                _ = self.listeners.orderedRemove(index);
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn prompt(self: *Agent, input: anytype) !void {
         const Input = @TypeOf(input);
         if (comptime isStringLike(Input)) {
@@ -1052,6 +1062,186 @@ test "agent prompt supports AgentMessage arrays and emits prompt events for each
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[event_types.len - 3]);
     try std.testing.expectEqual(types.AgentEventType.turn_end, event_types[event_types.len - 2]);
     try std.testing.expectEqual(types.AgentEventType.agent_end, event_types[event_types.len - 1]);
+}
+
+const SubscriberCapture = struct {
+    allocator: std.mem.Allocator,
+    event_types: std.ArrayList(types.AgentEventType),
+
+    fn init(allocator: std.mem.Allocator) SubscriberCapture {
+        return .{
+            .allocator = allocator,
+            .event_types = .empty,
+        };
+    }
+
+    fn deinit(self: *SubscriberCapture) void {
+        self.event_types.deinit(self.allocator);
+    }
+};
+
+fn captureSubscriberEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *SubscriberCapture = @ptrCast(@alignCast(context.?));
+    try capture.event_types.append(capture.allocator, event.event_type);
+}
+
+test "agent subscribers receive identical event sequences and can be removed dynamically" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    const first_blocks = [_]faux.FauxContentBlock{faux.fauxText("first reply")};
+    const second_blocks = [_]faux.FauxContentBlock{faux.fauxText("second reply")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(first_blocks[0..], .{}) },
+        .{ .message = faux.fauxAssistantMessage(second_blocks[0..], .{}) },
+    });
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = registration.getModel(),
+    });
+    defer agent.deinit();
+
+    var first_capture = SubscriberCapture.init(std.testing.allocator);
+    defer first_capture.deinit();
+    var second_capture = SubscriberCapture.init(std.testing.allocator);
+    defer second_capture.deinit();
+
+    const first_subscriber = types.AgentSubscriber{
+        .context = &first_capture,
+        .callback = captureSubscriberEvent,
+    };
+    const second_subscriber = types.AgentSubscriber{
+        .context = &second_capture,
+        .callback = captureSubscriberEvent,
+    };
+
+    try agent.subscribe(first_subscriber);
+    try agent.subscribe(second_subscriber);
+
+    try agent.prompt("hello");
+
+    try std.testing.expect(first_capture.event_types.items.len > 0);
+    try std.testing.expectEqual(first_capture.event_types.items.len, second_capture.event_types.items.len);
+    for (first_capture.event_types.items, second_capture.event_types.items) |lhs, rhs| {
+        try std.testing.expectEqual(lhs, rhs);
+    }
+
+    const second_count_after_first_prompt = second_capture.event_types.items.len;
+    try std.testing.expect(agent.unsubscribe(second_subscriber));
+    try std.testing.expect(!agent.unsubscribe(second_subscriber));
+
+    try agent.prompt("again");
+
+    try std.testing.expect(first_capture.event_types.items.len > second_count_after_first_prompt);
+    try std.testing.expectEqual(second_count_after_first_prompt, second_capture.event_types.items.len);
+}
+
+const HookObservation = struct {
+    transform_calls: usize = 0,
+    convert_calls: usize = 0,
+};
+
+var active_hook_observation: ?*HookObservation = null;
+
+fn transformContextForTest(
+    allocator: std.mem.Allocator,
+    messages: []const types.AgentMessage,
+    _: ?*const std.atomic.Value(bool),
+) ![]types.AgentMessage {
+    const observation = active_hook_observation orelse return error.MissingHookObservation;
+    observation.transform_calls += 1;
+
+    const transformed = try allocator.alloc(types.AgentMessage, messages.len + 1);
+    @memcpy(transformed[0..messages.len], messages);
+    transformed[messages.len] = try userTextMessage(allocator, "hooked context", 42);
+    return transformed;
+}
+
+fn prefixedUserMessage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    timestamp: i64,
+) !ai.Message {
+    const prefixed_text = try std.fmt.allocPrint(allocator, "converted: {s}", .{text});
+    return .{ .user = .{
+        .content = try allocator.dupe(ai.ContentBlock, &[_]ai.ContentBlock{
+            .{ .text = .{ .text = prefixed_text } },
+        }),
+        .timestamp = timestamp,
+    } };
+}
+
+fn convertToLlmForTest(
+    allocator: std.mem.Allocator,
+    messages: []const types.AgentMessage,
+) ![]ai.Message {
+    const observation = active_hook_observation orelse return error.MissingHookObservation;
+    observation.convert_calls += 1;
+
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try expectUserText(messages[0], "hello");
+    try expectUserText(messages[1], "hooked context");
+
+    const converted = try allocator.alloc(ai.Message, messages.len);
+    for (messages, 0..) |message, index| {
+        converted[index] = switch (message) {
+            .user => |user| try prefixedUserMessage(allocator, user.content[0].text.text, user.timestamp),
+            else => message,
+        };
+    }
+    return converted;
+}
+
+fn transformedContextFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 1), call_count.*);
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try expectUserText(context.messages[0], "converted: hello");
+    try expectUserText(context.messages[1], "converted: hooked context");
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("hooks applied");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
+test "agent applies transformContext before convertToLlm for streaming context only" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = transformedContextFactory },
+    });
+
+    var observation = HookObservation{};
+    active_hook_observation = &observation;
+    defer active_hook_observation = null;
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = registration.getModel(),
+        .transform_context = transformContextForTest,
+        .convert_to_llm = convertToLlmForTest,
+    });
+    defer agent.deinit();
+
+    try agent.prompt("hello");
+
+    try std.testing.expectEqual(@as(usize, 1), observation.transform_calls);
+    try std.testing.expectEqual(@as(usize, 1), observation.convert_calls);
+    try std.testing.expectEqual(@as(usize, 2), agent.getMessages().len);
+    try expectUserText(agent.getMessages()[0], "hello");
+    try std.testing.expectEqualStrings("hooks applied", agent.getMessages()[1].assistant.content[0].text.text);
 }
 
 const AbortEventCapture = struct {
