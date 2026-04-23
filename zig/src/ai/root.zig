@@ -9,6 +9,7 @@ pub const stream_module = @import("stream.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
+    pub const anthropic = @import("providers/anthropic.zig");
     pub const kimi = @import("providers/kimi.zig");
     pub const faux = @import("providers/faux.zig");
 };
@@ -36,6 +37,7 @@ pub const getEnvApiKey = env_api_keys.getEnvApiKey;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("providers/openai.zig");
+    _ = @import("providers/anthropic.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
 }
