@@ -307,11 +307,44 @@ pub const Agent = struct {
         try self.listeners.append(self.allocator, subscriber);
     }
 
-    pub fn prompt(self: *Agent, input: []const u8) !void {
-        if (self.is_streaming) return error.AgentAlreadyProcessing;
+    pub fn prompt(self: *Agent, input: anytype) !void {
+        const Input = @TypeOf(input);
+        if (comptime isStringLike(Input)) {
+            return self.promptTextWithImages(input, &.{});
+        }
 
-        const prompt_message = try userTextMessage(std.heap.page_allocator, input, 0);
+        if (Input == types.AgentMessage) {
+            return self.promptSingleMessage(input);
+        }
+
+        if (comptime isAgentMessageSlice(Input)) {
+            return self.runPromptMessages(input);
+        }
+
+        if (comptime isTextWithImagesPrompt(Input)) {
+            return self.promptTextWithImages(input.text, input.images);
+        }
+
+        @compileError("Agent.prompt supports string input, AgentMessage, []const AgentMessage, or a struct with .text and .images fields.");
+    }
+
+    fn promptSingleMessage(self: *Agent, message: types.AgentMessage) !void {
+        const prompts = [_]types.AgentMessage{message};
+        try self.runPromptMessages(prompts[0..]);
+    }
+
+    fn promptTextWithImages(
+        self: *Agent,
+        text: []const u8,
+        images: []const ai.ImageContent,
+    ) !void {
+        const prompt_message = try userMessageWithImages(std.heap.page_allocator, text, images, 0);
         const prompts = [_]types.AgentMessage{prompt_message};
+        try self.runPromptMessages(prompts[0..]);
+    }
+
+    fn runPromptMessages(self: *Agent, prompts: []const types.AgentMessage) !void {
+        if (self.is_streaming) return error.AgentAlreadyProcessing;
         const context = self.createContextSnapshot();
         const config = self.createLoopConfig();
         var abort_signal = std.atomic.Value(bool).init(false);
@@ -403,17 +436,66 @@ fn defaultConvertToLlm(
     return try allocator.dupe(ai.Message, messages);
 }
 
+fn userMessageWithImages(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    timestamp: i64,
+) !types.AgentMessage {
+    const content = try allocator.alloc(ai.ContentBlock, 1 + images.len);
+    content[0] = .{ .text = .{ .text = text } };
+    for (images, 0..) |image, index| {
+        content[index + 1] = .{ .image = image };
+    }
+    return .{ .user = .{
+        .content = content,
+        .timestamp = timestamp,
+    } };
+}
+
 fn userTextMessage(
     allocator: std.mem.Allocator,
     text: []const u8,
     timestamp: i64,
 ) !types.AgentMessage {
-    const content = try allocator.alloc(ai.ContentBlock, 1);
-    content[0] = .{ .text = .{ .text = text } };
-    return .{ .user = .{
-        .content = content,
-        .timestamp = timestamp,
-    } };
+    return try userMessageWithImages(allocator, text, &.{}, timestamp);
+}
+
+fn isStringLike(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => pointer.child == u8,
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| array.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        .array => |array| array.child == u8,
+        else => false,
+    };
+}
+
+fn isAgentMessageSlice(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => pointer.child == types.AgentMessage,
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| array.child == types.AgentMessage,
+                else => false,
+            },
+            else => false,
+        },
+        .array => |array| array.child == types.AgentMessage,
+        else => false,
+    };
+}
+
+fn isTextWithImagesPrompt(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasField(T, "text") and @hasField(T, "images"),
+        else => false,
+    };
 }
 
 fn makeTool(name: []const u8, label: []const u8) types.AgentTool {
@@ -695,6 +777,206 @@ test "agent prompt records transcript and clears streaming state for single-turn
     for (event_types[5 .. event_types.len - 3]) |event_type| {
         try std.testing.expectEqual(types.AgentEventType.message_update, event_type);
     }
+}
+
+fn expectUserText(message: types.AgentMessage, expected: []const u8) !void {
+    switch (message) {
+        .user => |user| {
+            try std.testing.expectEqual(@as(usize, 1), user.content.len);
+            try std.testing.expectEqualStrings(expected, user.content[0].text.text);
+        },
+        else => return error.UnexpectedMessageRole,
+    }
+}
+
+fn multiTurnFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+
+    switch (call_count.*) {
+        1 => {
+            try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+            try expectUserText(context.messages[0], "hello");
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText("First response");
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        2 => {
+            try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+            try expectUserText(context.messages[0], "hello");
+            try std.testing.expectEqualStrings("First response", context.messages[1].assistant.content[0].text.text);
+            try expectUserText(context.messages[2], "what did I say?");
+            const prior_text = context.messages[0].user.content[0].text.text;
+            const answer = try std.fmt.allocPrint(allocator, "You said: {s}", .{prior_text});
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText(answer);
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        else => unreachable,
+    }
+}
+
+test "agent prompt preserves prior transcript across multiple turns" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = multiTurnFactory },
+        .{ .factory = multiTurnFactory },
+    });
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .system_prompt = "You are helpful.",
+        .model = registration.getModel(),
+    });
+    defer agent.deinit();
+
+    try agent.prompt("hello");
+    try agent.prompt("what did I say?");
+
+    const messages = agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try expectUserText(messages[0], "hello");
+    try std.testing.expectEqualStrings("First response", messages[1].assistant.content[0].text.text);
+    try expectUserText(messages[2], "what did I say?");
+    try std.testing.expectEqualStrings("You said: hello", messages[3].assistant.content[0].text.text);
+}
+
+fn promptWithImagesFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 1), call_count.*);
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+
+    const user = context.messages[0].user;
+    try std.testing.expectEqual(@as(usize, 3), user.content.len);
+    try std.testing.expectEqualStrings("describe this", user.content[0].text.text);
+    try std.testing.expectEqualStrings("aGVsbG8=", user.content[1].image.data);
+    try std.testing.expectEqualStrings("image/png", user.content[1].image.mime_type);
+    try std.testing.expectEqualStrings("d29ybGQ=", user.content[2].image.data);
+    try std.testing.expectEqualStrings("image/jpeg", user.content[2].image.mime_type);
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("saw images");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
+test "agent prompt supports text with images" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = promptWithImagesFactory },
+    });
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = registration.getModel(),
+    });
+    defer agent.deinit();
+
+    const images = [_]ai.ImageContent{
+        .{ .data = "aGVsbG8=", .mime_type = "image/png" },
+        .{ .data = "d29ybGQ=", .mime_type = "image/jpeg" },
+    };
+
+    try agent.prompt(.{
+        .text = "describe this",
+        .images = images[0..],
+    });
+
+    const messages = agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqual(@as(usize, 3), messages[0].user.content.len);
+    try std.testing.expectEqualStrings("describe this", messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("aGVsbG8=", messages[0].user.content[1].image.data);
+    try std.testing.expectEqualStrings("d29ybGQ=", messages[0].user.content[2].image.data);
+    try std.testing.expectEqualStrings("saw images", messages[1].assistant.content[0].text.text);
+}
+
+fn promptMessageArrayFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 1), call_count.*);
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try expectUserText(context.messages[0], "first");
+    try expectUserText(context.messages[1], "second");
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("combined");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
+test "agent prompt supports AgentMessage arrays and emits prompt events for each message" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = promptMessageArrayFactory },
+    });
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = registration.getModel(),
+    });
+    defer agent.deinit();
+
+    var capture = PromptEventCapture.init(&agent, std.testing.allocator);
+    defer capture.deinit();
+    try agent.subscribe(.{
+        .context = &capture,
+        .callback = capturePromptEvent,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const prompts = [_]types.AgentMessage{
+        try userTextMessage(arena.allocator(), "first", 1),
+        try userTextMessage(arena.allocator(), "second", 2),
+    };
+
+    try agent.prompt(prompts[0..]);
+
+    const messages = agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try expectUserText(messages[0], "first");
+    try expectUserText(messages[1], "second");
+    try std.testing.expectEqualStrings("combined", messages[2].assistant.content[0].text.text);
+
+    const event_types = capture.event_types.items;
+    try std.testing.expectEqual(types.AgentEventType.agent_start, event_types[0]);
+    try std.testing.expectEqual(types.AgentEventType.turn_start, event_types[1]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[2]);
+    try std.testing.expectEqual(types.AgentEventType.message_end, event_types[3]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[4]);
+    try std.testing.expectEqual(types.AgentEventType.message_end, event_types[5]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[6]);
+    try std.testing.expectEqual(types.AgentEventType.message_end, event_types[event_types.len - 3]);
+    try std.testing.expectEqual(types.AgentEventType.turn_end, event_types[event_types.len - 2]);
+    try std.testing.expectEqual(types.AgentEventType.agent_end, event_types[event_types.len - 1]);
 }
 
 test "agent prompt minimal" {
