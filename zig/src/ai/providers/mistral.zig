@@ -146,17 +146,17 @@ pub const MistralProvider = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url});
         defer allocator.free(url);
 
-        var headers = std.StringHashMap([]const u8).empty;
-        defer headers.deinit(allocator);
-        try headers.put(allocator, "Content-Type", "application/json");
-        try headers.put(allocator, "Accept", "text/event-stream");
-        try headers.put(allocator, "Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?}));
+        var headers = std.StringHashMap([]const u8).init(allocator);
+        defer headers.deinit();
+        try headers.put("Content-Type", "application/json");
+        try headers.put("Accept", "text/event-stream");
+        try headers.put("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?}));
         try mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
             if (stream_options.session_id) |session_id| {
                 if (!headerExists(&headers, "x-affinity")) {
-                    try headers.put(allocator, "x-affinity", try allocator.dupe(u8, session_id));
+                    try headers.put("x-affinity", try allocator.dupe(u8, session_id));
                 }
             }
         }
@@ -1038,7 +1038,7 @@ fn mergeHeaders(
     if (source) |headers| {
         var iterator = headers.iterator();
         while (iterator.next()) |entry| {
-            try target.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
+            try target.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
         }
     }
 }

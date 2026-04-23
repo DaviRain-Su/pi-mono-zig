@@ -9,9 +9,16 @@ pub const stream_module = @import("stream.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
+    pub const openai_responses = @import("providers/openai_responses.zig");
+    pub const azure_openai_responses = @import("providers/azure_openai_responses.zig");
+    pub const openai_codex_responses = @import("providers/openai_codex_responses.zig");
     pub const anthropic = @import("providers/anthropic.zig");
     pub const google = @import("providers/google.zig");
+    pub const google_gemini_cli = @import("providers/google_gemini_cli.zig");
+    pub const google_vertex = @import("providers/google_vertex.zig");
     pub const mistral = @import("providers/mistral.zig");
+    pub const bedrock = @import("providers/bedrock.zig");
+    pub const register_builtins = @import("providers/register_builtins.zig");
     pub const kimi = @import("providers/kimi.zig");
     pub const faux = @import("providers/faux.zig");
 };
@@ -39,9 +46,16 @@ pub const getEnvApiKey = env_api_keys.getEnvApiKey;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("providers/openai.zig");
+    _ = @import("providers/openai_responses.zig");
+    _ = @import("providers/azure_openai_responses.zig");
+    _ = @import("providers/openai_codex_responses.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/google.zig");
+    _ = @import("providers/google_gemini_cli.zig");
+    _ = @import("providers/google_vertex.zig");
     _ = @import("providers/mistral.zig");
+    _ = @import("providers/bedrock.zig");
+    _ = @import("providers/register_builtins.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
 }

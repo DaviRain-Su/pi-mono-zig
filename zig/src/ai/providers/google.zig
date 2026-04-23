@@ -35,13 +35,13 @@ pub const GoogleProvider = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/models/{s}:streamGenerateContent?alt=sse", .{ model.base_url, model.id });
         defer allocator.free(url);
 
-        var headers = std.StringHashMap([]const u8).empty;
-        defer headers.deinit(allocator);
-        try headers.put(allocator, "Content-Type", "application/json");
-        try headers.put(allocator, "Accept", "text/event-stream");
+        var headers = std.StringHashMap([]const u8).init(allocator);
+        defer headers.deinit();
+        try headers.put("Content-Type", "application/json");
+        try headers.put("Accept", "text/event-stream");
         if (options) |stream_options| {
             if (stream_options.api_key) |api_key| {
-                try headers.put(allocator, "x-goog-api-key", try allocator.dupe(u8, api_key));
+                try headers.put("x-goog-api-key", try allocator.dupe(u8, api_key));
             }
         }
         try mergeHeaders(allocator, &headers, model.headers);
@@ -762,7 +762,7 @@ fn mergeHeaders(
     if (source) |headers| {
         var iterator = headers.iterator();
         while (iterator.next()) |entry| {
-            try target.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
+            try target.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
         }
     }
 }
