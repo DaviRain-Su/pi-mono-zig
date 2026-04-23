@@ -35,6 +35,20 @@ pub fn resolvePath(allocator: std.mem.Allocator, cwd: []const u8, path: []const 
     return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, path });
 }
 
+pub fn writeFileAbsolute(io: std.Io, absolute_path: []const u8, data: []const u8, make_path: bool) !void {
+    var atomic_file = try std.Io.Dir.createFileAtomic(.cwd(), io, absolute_path, .{
+        .make_path = make_path,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+
+    var buffer: [1024]u8 = undefined;
+    var file_writer = atomic_file.file.writer(io, &buffer);
+    try file_writer.interface.writeAll(data);
+    try file_writer.flush();
+    try atomic_file.replace(io);
+}
+
 pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return switch (value) {
         .null => .null,
