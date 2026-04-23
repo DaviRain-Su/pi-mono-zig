@@ -57,6 +57,22 @@ pub fn build(b: *std.Build) void {
     const agent_test_step = b.step("test-agent", "Run agent unit tests only");
     agent_test_step.dependOn(&run_agent_tests.step);
 
+    const coding_agent_mod = b.createModule(.{
+        .root_source_file = b.path("src/coding_agent/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    coding_agent_mod.addImport("ai", ai_mod);
+
+    const coding_agent_tests = b.addTest(.{
+        .root_module = coding_agent_mod,
+    });
+    const run_coding_agent_tests = b.addRunArtifact(coding_agent_tests);
+    test_step.dependOn(&run_coding_agent_tests.step);
+
+    const coding_agent_test_step = b.step("test-coding-agent", "Run coding-agent unit tests only");
+    coding_agent_test_step.dependOn(&run_coding_agent_tests.step);
+
     const main_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
