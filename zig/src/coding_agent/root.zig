@@ -8,6 +8,9 @@ pub const SessionManager = session_manager.SessionManager;
 pub const SessionContext = session_manager.SessionContext;
 pub const SessionTreeNode = session_manager.SessionTreeNode;
 pub const AgentSession = session.AgentSession;
+pub const CompactionSettings = session.CompactionSettings;
+pub const RetrySettings = session.RetrySettings;
+pub const CompactionResult = session.CompactionResult;
 
 test {
     _ = @import("tools/root.zig");

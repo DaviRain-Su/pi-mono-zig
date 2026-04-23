@@ -3,6 +3,24 @@ const ai = @import("ai");
 const agent = @import("agent");
 const session_manager = @import("session_manager.zig");
 
+pub const CompactionSettings = struct {
+    enabled: bool = false,
+    reserve_tokens: u32 = 4096,
+    keep_recent_tokens: u32 = 20000,
+};
+
+pub const RetrySettings = struct {
+    enabled: bool = false,
+    max_retries: u32 = 2,
+    base_delay_ms: u64 = 1000,
+};
+
+pub const CompactionResult = struct {
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u32,
+};
+
 pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -12,6 +30,10 @@ pub const AgentSession = struct {
     session_manager: *session_manager.SessionManager,
     subscriber: agent.AgentSubscriber,
     subscribed: bool,
+    compaction_settings: CompactionSettings,
+    retry_settings: RetrySettings,
+    retry_attempt: u32,
+    overflow_recovery_attempted: bool,
 
     pub const CreateOptions = struct {
         cwd: []const u8,
@@ -20,6 +42,8 @@ pub const AgentSession = struct {
         thinking_level: agent.ThinkingLevel = .off,
         tools: []const agent.AgentTool = &.{},
         session_dir: ?[]const u8 = null,
+        compaction: CompactionSettings = .{},
+        retry: RetrySettings = .{},
     };
 
     pub const OpenOptions = struct {
@@ -29,6 +53,8 @@ pub const AgentSession = struct {
         model: ?ai.Model = null,
         thinking_level: agent.ThinkingLevel = .off,
         tools: []const agent.AgentTool = &.{},
+        compaction: CompactionSettings = .{},
+        retry: RetrySettings = .{},
     };
 
     pub fn create(
@@ -44,7 +70,18 @@ pub const AgentSession = struct {
             try session_manager.SessionManager.inMemory(allocator, io, options.cwd);
         errdefer manager.deinit();
 
-        var instance = try initWithManager(allocator, io, options.cwd, options.system_prompt, options.model, options.thinking_level, options.tools, manager);
+        var instance = try initWithManager(
+            allocator,
+            io,
+            options.cwd,
+            options.system_prompt,
+            options.model,
+            options.thinking_level,
+            options.tools,
+            options.compaction,
+            options.retry,
+            manager,
+        );
         if (options.model) |model| {
             _ = try instance.session_manager.appendModelChange(model.provider, model.id);
         }
@@ -73,6 +110,8 @@ pub const AgentSession = struct {
             options.model,
             options.thinking_level,
             options.tools,
+            options.compaction,
+            options.retry,
             manager,
         );
     }
@@ -89,6 +128,11 @@ pub const AgentSession = struct {
 
     pub fn prompt(self: *AgentSession, input: anytype) !void {
         try self.agent.prompt(input);
+        try self.runPostPromptMaintenance();
+    }
+
+    pub fn compact(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
+        return try self.runCompaction(custom_instructions);
     }
 
     pub fn navigateTo(self: *AgentSession, entry_id: ?[]const u8) !void {
@@ -110,6 +154,100 @@ pub const AgentSession = struct {
         _ = try self.session_manager.appendModelChange(model.provider, model.id);
     }
 
+    fn runPostPromptMaintenance(self: *AgentSession) !void {
+        while (true) {
+            const last_assistant = findLastAssistantMessage(self.agent.getMessages()) orelse {
+                self.retry_attempt = 0;
+                self.overflow_recovery_attempted = false;
+                return;
+            };
+
+            if (last_assistant.stop_reason != .error_reason) {
+                self.retry_attempt = 0;
+                self.overflow_recovery_attempted = false;
+            }
+
+            if (try self.handleOverflowCompaction(last_assistant)) continue;
+            if (try self.handleRetryableError(last_assistant)) continue;
+
+            try self.handleThresholdCompaction(last_assistant);
+            return;
+        }
+    }
+
+    fn handleOverflowCompaction(self: *AgentSession, last_assistant: ai.AssistantMessage) !bool {
+        if (!self.compaction_settings.enabled) return false;
+        if (!isContextOverflow(last_assistant, self.agent.getModel().context_window)) return false;
+        if (self.overflow_recovery_attempted) return false;
+
+        self.overflow_recovery_attempted = true;
+        _ = removeLastAssistantError(self);
+        _ = try self.runCompaction(null);
+        try self.agent.continueRun();
+        return true;
+    }
+
+    fn handleThresholdCompaction(self: *AgentSession, last_assistant: ai.AssistantMessage) !void {
+        _ = last_assistant;
+        if (!self.compaction_settings.enabled) return;
+        const context_window = self.agent.getModel().context_window;
+        if (context_window == 0) return;
+        if (!shouldAutoCompact(estimateContextTokens(self.agent.getMessages()), context_window, self.compaction_settings)) return;
+        _ = self.runCompaction(null) catch |err| switch (err) {
+            error.NothingToCompact => return,
+            else => return err,
+        };
+    }
+
+    fn handleRetryableError(self: *AgentSession, last_assistant: ai.AssistantMessage) !bool {
+        if (!self.retry_settings.enabled) return false;
+        if (!isRetryableError(last_assistant, self.agent.getModel().context_window)) return false;
+
+        self.retry_attempt += 1;
+        if (self.retry_attempt > self.retry_settings.max_retries) {
+            self.retry_attempt = 0;
+            return false;
+        }
+
+        _ = removeLastAssistantError(self);
+        try sleepMilliseconds(self.io, exponentialBackoffMs(self.retry_settings.base_delay_ms, self.retry_attempt));
+        try self.agent.continueRun();
+        return true;
+    }
+
+    fn runCompaction(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
+        const branch_entries = try self.session_manager.getBranch(self.allocator, null);
+        defer self.allocator.free(branch_entries);
+
+        const preparation = prepareCompaction(branch_entries, self.compaction_settings.keep_recent_tokens) orelse
+            return error.NothingToCompact;
+
+        const summary = try buildCompactionSummary(
+            self.allocator,
+            branch_entries,
+            preparation.summary_start_index,
+            preparation.first_kept_entry_index,
+            custom_instructions,
+        );
+        defer self.allocator.free(summary);
+
+        const first_kept_entry_id = branch_entries[preparation.first_kept_entry_index].id();
+        const compaction_id = try self.session_manager.appendCompaction(
+            summary,
+            first_kept_entry_id,
+            preparation.tokens_before,
+        );
+        try self.reloadFromSession();
+
+        const entry = self.session_manager.getEntry(compaction_id) orelse return error.InvalidSessionTree;
+        if (entry.* != .compaction) return error.InvalidSessionTree;
+        return .{
+            .summary = try session_manager.getCompactionSummary(entry.compaction),
+            .first_kept_entry_id = entry.compaction.first_kept_entry_id,
+            .tokens_before = entry.compaction.tokens_before,
+        };
+    }
+
     fn initWithManager(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -118,6 +256,8 @@ pub const AgentSession = struct {
         model: ?ai.Model,
         thinking_level: agent.ThinkingLevel,
         tools: []const agent.AgentTool,
+        compaction_settings: CompactionSettings,
+        retry_settings: RetrySettings,
         manager: *session_manager.SessionManager,
     ) !AgentSession {
         var session_context = try manager.buildSessionContext(allocator);
@@ -151,6 +291,10 @@ pub const AgentSession = struct {
                 .callback = handleSessionManagerEvent,
             },
             .subscribed = false,
+            .compaction_settings = compaction_settings,
+            .retry_settings = retry_settings,
+            .retry_attempt = 0,
+            .overflow_recovery_attempted = false,
         };
 
         try instance.agent.subscribe(instance.subscriber);
@@ -195,6 +339,302 @@ fn handleSessionManagerEvent(context: ?*anyopaque, event: agent.AgentEvent) !voi
     if (event.message) |message| {
         _ = try manager.appendMessage(message);
     }
+}
+
+const CompactionPreparation = struct {
+    summary_start_index: usize,
+    first_kept_entry_index: usize,
+    tokens_before: u32,
+};
+
+fn findLastAssistantMessage(messages: []const agent.AgentMessage) ?ai.AssistantMessage {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        switch (messages[index]) {
+            .assistant => |assistant_message| return assistant_message,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn removeLastAssistantError(self: *AgentSession) bool {
+    const messages = self.agent.getMessages();
+    if (messages.len == 0) return false;
+    switch (messages[messages.len - 1]) {
+        .assistant => |assistant_message| {
+            if (assistant_message.stop_reason != .error_reason) return false;
+            _ = self.agent.removeLastMessage();
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn isContextOverflow(message: ai.AssistantMessage, context_window: u32) bool {
+    _ = context_window;
+    if (message.stop_reason != .error_reason) return false;
+    const error_message = message.error_message orelse return false;
+    return std.ascii.indexOfIgnoreCase(error_message, "overflow") != null or
+        std.ascii.indexOfIgnoreCase(error_message, "context length") != null or
+        std.ascii.indexOfIgnoreCase(error_message, "context window") != null or
+        std.ascii.indexOfIgnoreCase(error_message, "too long") != null;
+}
+
+fn isRetryableError(message: ai.AssistantMessage, context_window: u32) bool {
+    if (message.stop_reason != .error_reason) return false;
+    const error_message = message.error_message orelse return false;
+    if (isContextOverflow(message, context_window)) return false;
+
+    return containsIgnoreCase(error_message, "overloaded") or
+        containsIgnoreCase(error_message, "rate limit") or
+        containsIgnoreCase(error_message, "too many requests") or
+        containsIgnoreCase(error_message, "service unavailable") or
+        containsIgnoreCase(error_message, "server error") or
+        containsIgnoreCase(error_message, "internal error") or
+        containsIgnoreCase(error_message, "network error") or
+        containsIgnoreCase(error_message, "connection error") or
+        containsIgnoreCase(error_message, "connection refused") or
+        containsIgnoreCase(error_message, "connection lost") or
+        containsIgnoreCase(error_message, "socket hang up") or
+        containsIgnoreCase(error_message, "fetch failed") or
+        containsIgnoreCase(error_message, "timeout") or
+        containsIgnoreCase(error_message, "timed out") or
+        containsIgnoreCase(error_message, "429") or
+        containsIgnoreCase(error_message, "500") or
+        containsIgnoreCase(error_message, "502") or
+        containsIgnoreCase(error_message, "503") or
+        containsIgnoreCase(error_message, "504");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+}
+
+fn shouldAutoCompact(context_tokens: u32, context_window: u32, settings: CompactionSettings) bool {
+    if (!settings.enabled or context_window == 0) return false;
+    const threshold = if (context_window > settings.reserve_tokens) context_window - settings.reserve_tokens else 0;
+    return context_tokens > threshold;
+}
+
+fn estimateContextTokens(messages: []const agent.AgentMessage) u32 {
+    var total: u32 = 0;
+    for (messages) |message| {
+        total += estimateMessageTokens(message);
+    }
+    return total;
+}
+
+fn estimateMessageTokens(message: agent.AgentMessage) u32 {
+    var chars: usize = 0;
+    switch (message) {
+        .user => |user_message| {
+            for (user_message.content) |block| {
+                switch (block) {
+                    .text => |text| chars += text.text.len,
+                    .image => chars += 4800,
+                    .thinking => |thinking| chars += thinking.thinking.len,
+                }
+            }
+        },
+        .assistant => |assistant_message| {
+            if (assistant_message.stop_reason == .error_reason) return 0;
+            for (assistant_message.content) |block| {
+                switch (block) {
+                    .text => |text| chars += text.text.len,
+                    .image => chars += 4800,
+                    .thinking => |thinking| chars += thinking.thinking.len,
+                }
+            }
+            if (assistant_message.tool_calls) |tool_calls| {
+                for (tool_calls) |tool_call| {
+                    chars += tool_call.name.len;
+                    chars += jsonValueCharCount(tool_call.arguments);
+                }
+            }
+        },
+        .tool_result => |tool_result| {
+            for (tool_result.content) |block| {
+                switch (block) {
+                    .text => |text| chars += text.text.len,
+                    .image => chars += 4800,
+                    .thinking => |thinking| chars += thinking.thinking.len,
+                }
+            }
+        },
+    }
+    return @intCast((chars + 3) / 4);
+}
+
+fn jsonValueCharCount(value: std.json.Value) usize {
+    return switch (value) {
+        .null => 4,
+        .bool => |bool_value| if (bool_value) 4 else 5,
+        .integer => |integer| std.fmt.count("{}", .{integer}),
+        .float => |float_value| std.fmt.count("{d}", .{float_value}),
+        .number_string => |number_string| number_string.len,
+        .string => |string| string.len,
+        .array => |array| blk: {
+            var total: usize = 2;
+            for (array.items, 0..) |item, index| {
+                if (index > 0) total += 1;
+                total += jsonValueCharCount(item);
+            }
+            break :blk total;
+        },
+        .object => |object| blk: {
+            var total: usize = 2;
+            var iterator = object.iterator();
+            var first = true;
+            while (iterator.next()) |entry| {
+                if (!first) total += 1;
+                first = false;
+                total += entry.key_ptr.*.len + jsonValueCharCount(entry.value_ptr.*) + 1;
+            }
+            break :blk total;
+        },
+    };
+}
+
+fn prepareCompaction(
+    branch_entries: []const *const session_manager.SessionEntry,
+    keep_recent_tokens: u32,
+) ?CompactionPreparation {
+    if (branch_entries.len == 0) return null;
+
+    var latest_compaction_index: ?usize = null;
+    for (branch_entries, 0..) |entry, index| {
+        if (entry.* == .compaction) latest_compaction_index = index;
+    }
+
+    const summary_start_index = if (latest_compaction_index) |index| index + 1 else 0;
+    if (summary_start_index >= branch_entries.len) return null;
+
+    var tokens_before: u32 = 0;
+    var first_visible_index: ?usize = null;
+    for (branch_entries[summary_start_index..], summary_start_index..) |entry, index| {
+        const entry_tokens = visibleEntryTokens(entry.*);
+        if (entry_tokens == 0) continue;
+        if (first_visible_index == null) first_visible_index = index;
+        tokens_before += entry_tokens;
+    }
+
+    const first_visible = first_visible_index orelse return null;
+    if (tokens_before <= keep_recent_tokens) return null;
+
+    var kept_tokens: u32 = 0;
+    var first_kept_entry_index = first_visible;
+    var index = branch_entries.len;
+    while (index > summary_start_index) {
+        index -= 1;
+        const entry_tokens = visibleEntryTokens(branch_entries[index].*);
+        if (entry_tokens == 0) continue;
+        kept_tokens += entry_tokens;
+        first_kept_entry_index = index;
+        if (kept_tokens >= keep_recent_tokens) break;
+    }
+
+    if (first_kept_entry_index <= first_visible) return null;
+
+    return .{
+        .summary_start_index = summary_start_index,
+        .first_kept_entry_index = first_kept_entry_index,
+        .tokens_before = tokens_before,
+    };
+}
+
+fn visibleEntryTokens(entry: session_manager.SessionEntry) u32 {
+    return switch (entry) {
+        .message => |message_entry| estimateMessageTokens(message_entry.message),
+        else => 0,
+    };
+}
+
+fn buildCompactionSummary(
+    allocator: std.mem.Allocator,
+    branch_entries: []const *const session_manager.SessionEntry,
+    start_index: usize,
+    end_index: usize,
+    custom_instructions: ?[]const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    try writer.writer.writeAll("Earlier conversation summary:");
+    if (custom_instructions) |instructions| {
+        try writer.writer.print("\nFocus: {s}", .{instructions});
+    }
+
+    var wrote_line = false;
+    for (branch_entries[start_index..end_index]) |entry| {
+        if (entry.* != .message) continue;
+        switch (entry.message.message) {
+            .user => |user_message| {
+                const text = summarizeBlocks(user_message.content);
+                if (text.len == 0) continue;
+                try writer.writer.print("\n- user: {s}", .{text});
+                wrote_line = true;
+            },
+            .assistant => |assistant_message| {
+                if (assistant_message.stop_reason == .error_reason) continue;
+                const text = summarizeAssistant(assistant_message);
+                if (text.len == 0) continue;
+                try writer.writer.print("\n- assistant: {s}", .{text});
+                wrote_line = true;
+            },
+            .tool_result => |tool_result| {
+                const text = summarizeBlocks(tool_result.content);
+                if (text.len == 0) continue;
+                try writer.writer.print("\n- tool {s}: {s}", .{ tool_result.tool_name, text });
+                wrote_line = true;
+            },
+        }
+    }
+
+    if (!wrote_line) {
+        try writer.writer.writeAll("\n- Session history was compacted to keep recent context available.");
+    }
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn summarizeAssistant(message: ai.AssistantMessage) []const u8 {
+    const text = summarizeBlocks(message.content);
+    if (text.len > 0) return text;
+    if (message.tool_calls) |tool_calls| {
+        if (tool_calls.len > 0) return tool_calls[0].name;
+    }
+    return "";
+}
+
+fn summarizeBlocks(blocks: []const ai.ContentBlock) []const u8 {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| if (text.text.len > 0) return trimSummary(text.text),
+            .thinking => |thinking| if (thinking.thinking.len > 0) return trimSummary(thinking.thinking),
+            else => {},
+        }
+    }
+    return "";
+}
+
+fn trimSummary(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \n\r\t");
+    return if (trimmed.len > 120) trimmed[0..120] else trimmed;
+}
+
+fn exponentialBackoffMs(base_delay_ms: u64, attempt: u32) u64 {
+    const exponent = if (attempt == 0) 0 else attempt - 1;
+    if (exponent >= 63) return std.math.maxInt(u64);
+    const multiplier = @as(u64, 1) << @intCast(exponent);
+    const product, const overflowed = @mulWithOverflow(base_delay_ms, multiplier);
+    return if (overflowed != 0) std.math.maxInt(u64) else product;
+}
+
+fn sleepMilliseconds(io: std.Io, delay_ms: u64) !void {
+    const clamped = @min(delay_ms, @as(u64, std.math.maxInt(i64)));
+    try std.Io.sleep(io, .fromMilliseconds(@intCast(clamped)), .awake);
 }
 
 test "agent session creation keeps model system prompt and working directory" {
@@ -320,6 +760,8 @@ test "agent session navigation switches visible branch transcript" {
         model,
         .off,
         &.{},
+        .{},
+        .{},
         manager,
     );
     defer session.deinit();
@@ -331,6 +773,214 @@ test "agent session navigation switches visible branch transcript" {
     try session.navigateTo(branch_id);
     try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
     try std.testing.expectEqualStrings("branch", session.agent.getMessages()[1].assistant.content[0].text.text);
+}
+
+test "manual compaction replaces older history with a summary message" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("reply one with detail")}, .{}) },
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("reply two with detail")}, .{}) },
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("reply three with detail")}, .{}) },
+    });
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/session-project",
+        .system_prompt = "system prompt",
+        .model = registration.getModel(),
+        .compaction = .{
+            .keep_recent_tokens = 8,
+        },
+    });
+    defer session.deinit();
+
+    try session.prompt("first prompt with context");
+    try session.prompt("second prompt with context");
+    try session.prompt("third prompt with context");
+
+    const result = try session.compact("focus on earlier work");
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.summary, 1, "focus on earlier work"));
+
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 3);
+    try std.testing.expectEqualStrings("[compaction]", messages[0].user.content[0].text.text[0..12]);
+    try std.testing.expect(std.mem.containsAtLeast(u8, messages[0].user.content[0].text.text, 1, "first prompt"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, messages[messages.len - 2].user.content[0].text.text, 1, "third prompt"));
+    try std.testing.expectEqualStrings("reply three with detail", messages[messages.len - 1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), countCompactionEntries(session.session_manager.getEntries()));
+}
+
+test "auto compaction triggers when estimated context exceeds the threshold" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("assistant response one with extra text")}, .{}) },
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("assistant response two with extra text")}, .{}) },
+    });
+
+    var model = registration.getModel();
+    model.context_window = 24;
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/session-project",
+        .system_prompt = "system prompt",
+        .model = model,
+        .compaction = .{
+            .enabled = true,
+            .reserve_tokens = 5,
+            .keep_recent_tokens = 10,
+        },
+    });
+    defer session.deinit();
+
+    try session.prompt("first long prompt that fills context");
+    try session.prompt("second long prompt that crosses the threshold");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 2);
+    try std.testing.expect(messages[0] == .user);
+    try std.testing.expect(std.mem.startsWith(u8, messages[0].user.content[0].text.text, "[compaction]\n"));
+    try std.testing.expectEqualStrings("assistant response two with extra text", messages[messages.len - 1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), countCompactionEntries(session.session_manager.getEntries()));
+}
+
+test "auto compaction recovers from overflow by compacting and continuing" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("warmup reply")}, .{}) },
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "Context overflow while generating" }) },
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("recovered after compaction")}, .{}) },
+    });
+
+    var model = registration.getModel();
+    model.context_window = 32;
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/session-project",
+        .system_prompt = "system prompt",
+        .model = model,
+        .compaction = .{
+            .enabled = true,
+            .reserve_tokens = 4,
+            .keep_recent_tokens = 8,
+        },
+    });
+    defer session.deinit();
+
+    try session.prompt("warmup prompt with detail");
+    try session.prompt("second prompt that overflows");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 3);
+    try std.testing.expect(std.mem.startsWith(u8, messages[0].user.content[0].text.text, "[compaction]\n"));
+    try std.testing.expectEqualStrings("recovered after compaction", messages[messages.len - 1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), countCompactionEntries(session.session_manager.getEntries()));
+    try std.testing.expectEqual(@as(usize, 1), countAssistantMessagesWithStopReason(session.session_manager.getEntries(), .error_reason));
+}
+
+test "auto retry retries transient errors and eventually succeeds" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "connection lost" }) },
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("retry succeeded")}, .{}) },
+    });
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/session-project",
+        .system_prompt = "system prompt",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = true,
+            .max_retries = 3,
+            .base_delay_ms = 1,
+        },
+    });
+    defer session.deinit();
+
+    try session.prompt("hello retry");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("retry succeeded", messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(u32, 0), session.retry_attempt);
+    try std.testing.expectEqual(@as(usize, 2), countAssistantMessagesWithStopReason(session.session_manager.getEntries(), .error_reason));
+}
+
+test "auto retry gives up after the configured max attempts" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+    });
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/session-project",
+        .system_prompt = "system prompt",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = true,
+            .max_retries = 2,
+            .base_delay_ms = 1,
+        },
+    });
+    defer session.deinit();
+
+    try session.prompt("hello retry failure");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expect(messages[1] == .assistant);
+    try std.testing.expectEqual(ai.StopReason.error_reason, messages[1].assistant.stop_reason);
+    try std.testing.expectEqualStrings("503 service unavailable", messages[1].assistant.error_message.?);
+    try std.testing.expectEqual(@as(u32, 0), session.retry_attempt);
+    try std.testing.expectEqual(@as(usize, 3), countAssistantMessagesWithStopReason(session.session_manager.getEntries(), .error_reason));
+}
+
+fn countCompactionEntries(entries: []const session_manager.SessionEntry) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (entry == .compaction) count += 1;
+    }
+    return count;
+}
+
+fn countAssistantMessagesWithStopReason(entries: []const session_manager.SessionEntry, stop_reason: ai.StopReason) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (entry != .message) continue;
+        switch (entry.message.message) {
+            .assistant => |assistant_message| {
+                if (assistant_message.stop_reason == stop_reason) count += 1;
+            },
+            else => {},
+        }
+    }
+    return count;
 }
 
 fn makeUserMessage(text: []const u8, timestamp: i64) !agent.AgentMessage {

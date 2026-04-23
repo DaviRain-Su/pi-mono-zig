@@ -232,6 +232,11 @@ pub const Agent = struct {
         try self.messages.append(self.allocator, message);
     }
 
+    pub fn removeLastMessage(self: *Agent) ?types.AgentMessage {
+        if (self.messages.items.len == 0) return null;
+        return self.messages.pop();
+    }
+
     pub fn getStreamingMessage(self: *const Agent) ?types.AgentMessage {
         return self.streaming_message;
     }
@@ -376,6 +381,11 @@ pub const Agent = struct {
         }
 
         @compileError("Agent.prompt supports string input, AgentMessage, []const AgentMessage, or a struct with .text and .images fields.");
+    }
+
+    pub fn continueRun(self: *Agent) !void {
+        const prompts = [_]types.AgentMessage{};
+        try self.runPromptMessages(prompts[0..]);
     }
 
     fn promptSingleMessage(self: *Agent, message: types.AgentMessage) !void {
