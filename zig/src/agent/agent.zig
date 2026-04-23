@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const agent_loop = @import("agent_loop.zig");
 const types = @import("types.zig");
 
 const EMPTY_INPUT_TYPES = [_][]const u8{};
@@ -65,6 +66,10 @@ pub const AgentOptions = struct {
     steering_mode: QueueMode = .one_at_a_time,
     follow_up_mode: QueueMode = .one_at_a_time,
     tool_execution: types.ToolExecutionMode = .parallel,
+    io: std.Io = std.Io.failing,
+    stream_fn: ?types.StreamFn = null,
+    convert_to_llm: ?types.ConvertToLlmFn = null,
+    transform_context: ?types.TransformContextFn = null,
 };
 
 pub const DEFAULT_MODEL = ai.Model{
@@ -96,6 +101,11 @@ pub const Agent = struct {
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
     tool_execution: types.ToolExecutionMode,
+    io: std.Io,
+    stream_fn: ?types.StreamFn,
+    convert_to_llm: types.ConvertToLlmFn,
+    transform_context: ?types.TransformContextFn,
+    listeners: std.ArrayList(types.AgentSubscriber),
 
     pub fn init(allocator: std.mem.Allocator, options: AgentOptions) !Agent {
         var agent = Agent{
@@ -112,6 +122,11 @@ pub const Agent = struct {
             .steering_queue = PendingMessageQueue.init(allocator, options.steering_mode),
             .follow_up_queue = PendingMessageQueue.init(allocator, options.follow_up_mode),
             .tool_execution = options.tool_execution,
+            .io = options.io,
+            .stream_fn = options.stream_fn,
+            .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlm,
+            .transform_context = options.transform_context,
+            .listeners = .empty,
         };
         errdefer agent.deinit();
 
@@ -126,6 +141,7 @@ pub const Agent = struct {
         self.pending_tool_calls.deinit(self.allocator);
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
+        self.listeners.deinit(self.allocator);
     }
 
     pub fn state(self: *const Agent) types.AgentState {
@@ -286,7 +302,106 @@ pub const Agent = struct {
         self.error_message = null;
         self.clearAllQueues();
     }
+
+    pub fn subscribe(self: *Agent, subscriber: types.AgentSubscriber) !void {
+        try self.listeners.append(self.allocator, subscriber);
+    }
+
+    pub fn prompt(self: *Agent, input: []const u8) !void {
+        if (self.is_streaming) return error.AgentAlreadyProcessing;
+
+        const prompt_message = try userTextMessage(std.heap.page_allocator, input, 0);
+        const prompts = [_]types.AgentMessage{prompt_message};
+        const context = self.createContextSnapshot();
+        const config = self.createLoopConfig();
+        var abort_signal = std.atomic.Value(bool).init(false);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        self.beginRun();
+        defer self.finishRun();
+
+        const added_messages = try agent_loop.runAgentLoop(
+            arena.allocator(),
+            self.io,
+            prompts[0..],
+            context,
+            config,
+            self,
+            emitAgentEvent,
+            &abort_signal,
+            self.stream_fn,
+        );
+        _ = added_messages;
+    }
+
+    fn createContextSnapshot(self: *const Agent) types.AgentContext {
+        return .{
+            .system_prompt = self.system_prompt,
+            .messages = self.messages.items,
+            .tools = self.tools.items,
+        };
+    }
+
+    fn createLoopConfig(self: *const Agent) types.AgentLoopConfig {
+        return .{
+            .model = self.model,
+            .reasoning = if (self.thinking_level == .off) null else self.thinking_level,
+            .tool_execution = self.tool_execution,
+            .convert_to_llm = self.convert_to_llm,
+            .transform_context = self.transform_context,
+        };
+    }
+
+    fn processEvent(self: *Agent, event: types.AgentEvent) !void {
+        switch (event.event_type) {
+            .message_start => {
+                self.streaming_message = event.message;
+            },
+            .message_update => {
+                self.streaming_message = event.message;
+            },
+            .message_end => {
+                self.streaming_message = null;
+                if (event.message) |message| {
+                    try self.appendMessage(message);
+                }
+            },
+            .turn_end => {
+                if (event.message) |message| {
+                    switch (message) {
+                        .assistant => |assistant| {
+                            if (assistant.error_message) |error_message| {
+                                self.error_message = error_message;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            .agent_end => {
+                self.streaming_message = null;
+            },
+            else => {},
+        }
+
+        for (self.listeners.items) |subscriber| {
+            try subscriber.callback(subscriber.context, event);
+        }
+    }
 };
+
+fn emitAgentEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const self: *Agent = @ptrCast(@alignCast(context.?));
+    try self.processEvent(event);
+}
+
+fn defaultConvertToLlm(
+    allocator: std.mem.Allocator,
+    messages: []const types.AgentMessage,
+) ![]ai.Message {
+    return try allocator.dupe(ai.Message, messages);
+}
 
 fn userTextMessage(
     allocator: std.mem.Allocator,
@@ -471,4 +586,117 @@ test "pending message queue drains according to mode" {
     try std.testing.expectEqual(@as(usize, 1), first.len);
     try std.testing.expectEqualStrings("first", first[0].user.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), queue_one.len());
+}
+
+const PromptEventCapture = struct {
+    agent: *Agent,
+    allocator: std.mem.Allocator,
+    event_types: std.ArrayList(types.AgentEventType),
+    saw_assistant_message_start: bool = false,
+    saw_assistant_message_update: bool = false,
+    assistant_message_end_cleared_streaming: bool = false,
+
+    fn init(agent: *Agent, allocator: std.mem.Allocator) PromptEventCapture {
+        return .{
+            .agent = agent,
+            .allocator = allocator,
+            .event_types = .empty,
+        };
+    }
+
+    fn deinit(self: *PromptEventCapture) void {
+        self.event_types.deinit(self.allocator);
+    }
+};
+
+fn capturePromptEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *PromptEventCapture = @ptrCast(@alignCast(context.?));
+    try capture.event_types.append(capture.allocator, event.event_type);
+
+    switch (event.event_type) {
+        .message_start => {
+            if (event.message) |message| switch (message) {
+                .assistant => {
+                    capture.saw_assistant_message_start = true;
+                    try std.testing.expect(capture.agent.getStreamingMessage() != null);
+                    try std.testing.expect(capture.agent.isStreaming());
+                },
+                else => {},
+            };
+        },
+        .message_update => {
+            if (event.message) |message| switch (message) {
+                .assistant => {
+                    capture.saw_assistant_message_update = true;
+                    try std.testing.expect(capture.agent.getStreamingMessage() != null);
+                },
+                else => {},
+            };
+        },
+        .message_end => {
+            if (event.message) |message| switch (message) {
+                .assistant => {
+                    capture.assistant_message_end_cleared_streaming = capture.agent.getStreamingMessage() == null;
+                },
+                else => {},
+            };
+        },
+        else => {},
+    }
+}
+
+test "agent prompt records transcript and clears streaming state for single-turn text responses" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+
+    const blocks = [_]faux.FauxContentBlock{faux.fauxText("hello there")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{}) },
+    });
+
+    var agent = try Agent.init(std.testing.allocator, .{
+        .system_prompt = "You are helpful.",
+        .model = registration.getModel(),
+    });
+    defer agent.deinit();
+
+    var capture = PromptEventCapture.init(&agent, std.testing.allocator);
+    defer capture.deinit();
+    try agent.subscribe(.{
+        .context = &capture,
+        .callback = capturePromptEvent,
+    });
+
+    try agent.prompt("hello");
+
+    try std.testing.expect(capture.saw_assistant_message_start);
+    try std.testing.expect(capture.saw_assistant_message_update);
+    try std.testing.expect(capture.assistant_message_end_cleared_streaming);
+
+    try std.testing.expect(!agent.isStreaming());
+    try std.testing.expect(agent.getStreamingMessage() == null);
+    try std.testing.expectEqual(@as(usize, 2), agent.getMessages().len);
+    try std.testing.expectEqualStrings("hello", agent.getMessages()[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("hello there", agent.getMessages()[1].assistant.content[0].text.text);
+
+    const event_types = capture.event_types.items;
+    try std.testing.expectEqual(types.AgentEventType.agent_start, event_types[0]);
+    try std.testing.expectEqual(types.AgentEventType.turn_start, event_types[1]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[2]);
+    try std.testing.expectEqual(types.AgentEventType.message_end, event_types[3]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[4]);
+    try std.testing.expectEqual(types.AgentEventType.message_end, event_types[event_types.len - 3]);
+    try std.testing.expectEqual(types.AgentEventType.turn_end, event_types[event_types.len - 2]);
+    try std.testing.expectEqual(types.AgentEventType.agent_end, event_types[event_types.len - 1]);
+
+    for (event_types[5 .. event_types.len - 3]) |event_type| {
+        try std.testing.expectEqual(types.AgentEventType.message_update, event_type);
+    }
+}
+
+test "agent prompt minimal" {
+    _ = ai.providers.faux;
 }

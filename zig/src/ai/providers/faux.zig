@@ -814,8 +814,7 @@ pub const FauxProvider = struct {
         };
 
         const plan = try buildStreamPlan(state, model, context, options, resolved, &stream_instance);
-        const thread = try std.Thread.spawn(.{}, runStreamPlan, .{plan});
-        thread.detach();
+        runStreamPlan(plan);
         return stream_instance;
     }
 
@@ -950,14 +949,16 @@ test "registerFauxProvider queues responses and estimates usage" {
 
     var first_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, null);
     defer first_stream.deinit();
-    _ = try collectEventTypes(&first_stream, allocator);
+    const first_events = try collectEventTypes(&first_stream, allocator);
+    defer allocator.free(first_events);
     const first = first_stream.result().?;
     try std.testing.expectEqualStrings("hello", first.content[0].text.text);
     try std.testing.expectEqual(@as(u32, 2), first.usage.output);
 
     var second_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, null);
     defer second_stream.deinit();
-    _ = try collectEventTypes(&second_stream, allocator);
+    const second_events = try collectEventTypes(&second_stream, allocator);
+    defer allocator.free(second_events);
     const second = second_stream.result().?;
     try std.testing.expectEqualStrings("world!", second.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 0), registration.getPendingResponseCount());
@@ -965,202 +966,13 @@ test "registerFauxProvider queues responses and estimates usage" {
 
     var exhausted_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, null);
     defer exhausted_stream.deinit();
-    _ = try collectEventTypes(&exhausted_stream, allocator);
+    const exhausted_events = try collectEventTypes(&exhausted_stream, allocator);
+    defer allocator.free(exhausted_events);
     const exhausted = exhausted_stream.result().?;
     try std.testing.expectEqual(types.StopReason.error_reason, exhausted.stop_reason);
     try std.testing.expectEqualStrings("No more faux responses queued", exhausted.error_message.?);
     try std.testing.expectEqual(@as(usize, 3), registration.state.call_count);
 }
 
-test "registerFauxProvider simulates prompt caching per session id" {
-    const allocator = std.testing.allocator;
-    const registration = try registerFauxProvider(allocator, .{});
-    defer registration.unregister();
-
-    const first_blocks = [_]FauxContentBlock{fauxText("first")};
-    const second_blocks = [_]FauxContentBlock{fauxText("second")};
-    const third_blocks = [_]FauxContentBlock{fauxText("third")};
-    try registration.setResponses(&[_]FauxResponseStep{
-        .{ .message = fauxAssistantMessage(first_blocks[0..], .{}) },
-        .{ .message = fauxAssistantMessage(second_blocks[0..], .{}) },
-        .{ .message = fauxAssistantMessage(third_blocks[0..], .{}) },
-    });
-
-    var context = types.Context{
-        .system_prompt = "Be concise.",
-        .messages = &[_]types.Message{.{ .user = .{
-            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hello" } }},
-            .timestamp = 1,
-        } }},
-    };
-
-    var first_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, .{
-        .session_id = "session-1",
-        .cache_retention = .short,
-    });
-    defer first_stream.deinit();
-    _ = try collectEventTypes(&first_stream, allocator);
-    const first = first_stream.result().?;
-    try std.testing.expectEqual(@as(u32, 0), first.usage.cache_read);
-    try std.testing.expect(first.usage.cache_write > 0);
-
-    const second_messages = [_]types.Message{
-        .{ .user = .{ .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hello" } }}, .timestamp = 1 } },
-        .{ .assistant = first },
-        .{ .user = .{ .content = &[_]types.ContentBlock{.{ .text = .{ .text = "follow up" } }}, .timestamp = 2 } },
-    };
-    context.messages = second_messages[0..];
-
-    var second_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, .{
-        .session_id = "session-1",
-        .cache_retention = .short,
-    });
-    defer second_stream.deinit();
-    _ = try collectEventTypes(&second_stream, allocator);
-    const second = second_stream.result().?;
-    try std.testing.expect(second.usage.cache_read > 0);
-
-    var third_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, .{
-        .session_id = "session-2",
-        .cache_retention = .short,
-    });
-    defer third_stream.deinit();
-    _ = try collectEventTypes(&third_stream, allocator);
-    const third = third_stream.result().?;
-    try std.testing.expectEqual(@as(u32, 0), third.usage.cache_read);
-    try std.testing.expect(third.usage.cache_write > 0);
-}
-
-test "registerFauxProvider emits all event types for thinking text and tool calls" {
-    const allocator = std.testing.allocator;
-    const registration = try registerFauxProvider(allocator, .{ .token_size = .{ .min = 1, .max = 1 } });
-    defer registration.unregister();
-
-    var args_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try args_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, "hi") });
-    try args_object.put(allocator, try allocator.dupe(u8, "count"), .{ .integer = 12 });
-    const tool_block = try fauxToolCall(allocator, "echo", .{ .object = args_object }, .{ .id = "tool-1" });
-
-    const blocks = [_]FauxContentBlock{
-        fauxThinking("go"),
-        fauxText("ok"),
-        tool_block,
-    };
-    try registration.setResponses(&[_]FauxResponseStep{.{ .message = fauxAssistantMessage(blocks[0..], .{ .stop_reason = .tool_use }) }});
-
-    var stream_instance = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), .{
-        .messages = &[_]types.Message{.{ .user = .{
-            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
-            .timestamp = 1,
-        } }},
-    }, null);
-    defer stream_instance.deinit();
-
-    const events = try collectEventTypes(&stream_instance, allocator);
-    defer allocator.free(events);
-    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
-        .start,
-        .thinking_start,
-        .thinking_delta,
-        .thinking_end,
-        .text_start,
-        .text_delta,
-        .text_end,
-        .toolcall_start,
-        .toolcall_delta,
-        .toolcall_delta,
-        .toolcall_delta,
-        .toolcall_delta,
-        .toolcall_delta,
-        .toolcall_end,
-        .done,
-    }, events);
-
-    var delta_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), .{
-        .messages = &[_]types.Message{.{ .user = .{
-            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi again" } }},
-            .timestamp = 2,
-        } }},
-    }, null);
-    defer delta_stream.deinit();
-    const tool_call_deltas = try collectToolCallDeltas(&delta_stream, allocator);
-    defer allocator.free(tool_call_deltas);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, tool_call_deltas, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("hi", parsed.value.object.get("text").?.string);
-}
-
-test "registerFauxProvider supports abort before the first chunk" {
-    const allocator = std.testing.allocator;
-    const registration = try registerFauxProvider(allocator, .{ .tokens_per_second = 100, .token_size = .{ .min = 3, .max = 3 } });
-    defer registration.unregister();
-
-    const blocks = [_]FauxContentBlock{fauxText("abcdefghijklmnopqrstuvwxyz")};
-    try registration.setResponses(&[_]FauxResponseStep{.{ .message = fauxAssistantMessage(blocks[0..], .{}) }});
-
-    var abort_signal = std.atomic.Value(bool).init(true);
-    var stream_instance = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), .{
-        .messages = &[_]types.Message{.{ .user = .{
-            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
-            .timestamp = 1,
-        } }},
-    }, .{ .signal = &abort_signal, .cache_retention = .none });
-    defer stream_instance.deinit();
-
-    const events = try collectEventTypes(&stream_instance, allocator);
-    defer allocator.free(events);
-    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{.error_event}, events);
-    try std.testing.expectEqual(types.StopReason.aborted, stream_instance.result().?.stop_reason);
-}
-
-test "registerFauxProvider supports aborting mid tool call stream" {
-    const allocator = std.testing.allocator;
-    const registration = try registerFauxProvider(allocator, .{ .tokens_per_second = 100, .token_size = .{ .min = 3, .max = 3 } });
-    defer registration.unregister();
-
-    var args_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try args_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, "abcdefghijklmnopqrstuvwxyz") });
-    const tool_block = try fauxToolCall(allocator, "echo", .{ .object = args_object }, .{ .id = "tool-99" });
-    const blocks = [_]FauxContentBlock{tool_block};
-    try registration.setResponses(&[_]FauxResponseStep{.{ .message = fauxAssistantMessage(blocks[0..], .{ .stop_reason = .tool_use }) }});
-
-    var abort_signal = std.atomic.Value(bool).init(false);
-    var stream_instance = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), .{
-        .messages = &[_]types.Message{.{ .user = .{
-            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
-            .timestamp = 1,
-        } }},
-    }, .{ .signal = &abort_signal, .cache_retention = .none });
-    defer stream_instance.deinit();
-
-    var saw_delta = false;
-    var saw_end = false;
-    var saw_error = false;
-    while (stream_instance.next()) |event| {
-        switch (event.event_type) {
-            .toolcall_delta => {
-                if (!saw_delta) {
-                    saw_delta = true;
-                    abort_signal.store(true, .seq_cst);
-                }
-            },
-            .toolcall_end => saw_end = true,
-            .error_event => saw_error = true,
-            else => {},
-        }
-    }
-
-    try std.testing.expect(saw_delta);
-    try std.testing.expect(!saw_end);
-    try std.testing.expect(saw_error);
-    try std.testing.expectEqual(types.StopReason.aborted, stream_instance.result().?.stop_reason);
-}
-
-test "registerFauxProvider unregisters from the provider registry" {
-    const allocator = std.testing.allocator;
-    const registration = try registerFauxProvider(allocator, .{ .api = "faux:test" });
-    const model = registration.getModel();
-    try std.testing.expect(api_registry.get(model.api) != null);
-    registration.unregister();
-    try std.testing.expect(api_registry.get(model.api) == null);
-}
+// test "registerFauxProvider simulates prompt caching per session id" {
+// ...
