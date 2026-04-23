@@ -41,7 +41,11 @@ pub fn streamSimple(
     context: types.Context,
     options: ?types.SimpleStreamOptions,
 ) !event_stream.AssistantMessageEventStream {
-    const stream_options = if (options) |simple_options| simple_options.toStreamOptions() else null;
+    const stream_options = if (options) |simple_options| blk: {
+        var mapped = simple_options.toStreamOptions();
+        applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
+        break :blk mapped;
+    } else null;
     return try stream(allocator, io, model, context, stream_options);
 }
 
@@ -52,8 +56,28 @@ pub fn completeSimple(
     context: types.Context,
     options: ?types.SimpleStreamOptions,
 ) !types.AssistantMessage {
-    const stream_options = if (options) |simple_options| simple_options.toStreamOptions() else null;
+    const stream_options = if (options) |simple_options| blk: {
+        var mapped = simple_options.toStreamOptions();
+        applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
+        break :blk mapped;
+    } else null;
     return try complete(allocator, io, model, context, stream_options);
+}
+
+fn applyMistralSimpleOptions(
+    stream_options: *types.StreamOptions,
+    model: types.Model,
+    reasoning: ?types.ThinkingLevel,
+) void {
+    if (reasoning == null) return;
+    if (!model.reasoning) return;
+    if (!std.mem.eql(u8, model.api, "mistral-conversations")) return;
+
+    if (std.mem.eql(u8, model.id, "mistral-small-2603") or std.mem.eql(u8, model.id, "mistral-small-latest")) {
+        stream_options.mistral_reasoning_effort = "high";
+    } else {
+        stream_options.mistral_prompt_mode = "reasoning";
+    }
 }
 
 const RecordingState = struct {
@@ -62,6 +86,8 @@ const RecordingState = struct {
     saw_max_tokens: ?u32 = null,
     saw_temperature: ?f32 = null,
     saw_api_key: ?[]const u8 = null,
+    saw_mistral_prompt_mode: ?[]const u8 = null,
+    saw_mistral_reasoning_effort: ?[]const u8 = null,
     response_text: []const u8 = "recorded response",
 };
 
@@ -85,6 +111,8 @@ fn recordingStream(
         recording_state.saw_max_tokens = stream_options.max_tokens;
         recording_state.saw_temperature = stream_options.temperature;
         recording_state.saw_api_key = stream_options.api_key;
+        recording_state.saw_mistral_prompt_mode = stream_options.mistral_prompt_mode;
+        recording_state.saw_mistral_reasoning_effort = stream_options.mistral_reasoning_effort;
     }
 
     const result_allocator = std.heap.page_allocator;
@@ -200,6 +228,71 @@ test "streamSimple maps simple options and routes through stream" {
     try std.testing.expectEqual(@as(?u32, 42), recording_state.saw_max_tokens);
     try std.testing.expectEqual(@as(?f32, 0.25), recording_state.saw_temperature);
     try std.testing.expectEqualStrings("test-key", recording_state.saw_api_key.?);
+    try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
+    try std.testing.expect(recording_state.saw_mistral_reasoning_effort == null);
+}
+
+test "streamSimple maps Mistral reasoning to provider options" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "mistral-conversations",
+        .stream = recordingStream,
+        .stream_simple = recordingStreamSimple,
+    });
+
+    const medium_model = types.Model{
+        .id = "mistral-medium-latest",
+        .name = "Mistral Medium",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+
+    resetRecordingState();
+    var medium_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        medium_model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .reasoning = .medium },
+    );
+    defer medium_stream.deinit();
+    while (medium_stream.next()) |_| {}
+
+    try std.testing.expectEqualStrings("reasoning", recording_state.saw_mistral_prompt_mode.?);
+    try std.testing.expect(recording_state.saw_mistral_reasoning_effort == null);
+
+    const small_model = types.Model{
+        .id = "mistral-small-latest",
+        .name = "Mistral Small",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+
+    resetRecordingState();
+    var small_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        small_model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .reasoning = .high },
+    );
+    defer small_stream.deinit();
+    while (small_stream.next()) |_| {}
+
+    try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
+    try std.testing.expectEqualStrings("high", recording_state.saw_mistral_reasoning_effort.?);
 }
 
 test "complete returns final assistant message" {
