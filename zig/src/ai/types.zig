@@ -271,6 +271,10 @@ pub const StreamOptions = struct {
     google_tool_choice: ?[]const u8 = null,
     /// Google provider thinking configuration.
     google_thinking: ?GoogleThinkingOptions = null,
+    /// Mistral prompt mode, e.g. "reasoning".
+    mistral_prompt_mode: ?[]const u8 = null,
+    /// Mistral reasoning effort, e.g. "high".
+    mistral_reasoning_effort: ?[]const u8 = null,
 };
 
 pub const SimpleStreamOptions = struct {
@@ -290,6 +294,8 @@ pub const SimpleStreamOptions = struct {
     thinking_budgets: ?std.json.Value = null,
     google_tool_choice: ?[]const u8 = null,
     google_thinking: ?GoogleThinkingOptions = null,
+    mistral_prompt_mode: ?[]const u8 = null,
+    mistral_reasoning_effort: ?[]const u8 = null,
 
     /// Convert SimpleStreamOptions to StreamOptions
     pub fn toStreamOptions(self: SimpleStreamOptions) StreamOptions {
@@ -308,6 +314,8 @@ pub const SimpleStreamOptions = struct {
             .signal = self.signal,
             .google_tool_choice = self.google_tool_choice,
             .google_thinking = self.google_thinking,
+            .mistral_prompt_mode = self.mistral_prompt_mode,
+            .mistral_reasoning_effort = self.mistral_reasoning_effort,
         };
     }
 };

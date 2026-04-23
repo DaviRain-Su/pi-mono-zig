@@ -11,6 +11,7 @@ pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
     pub const anthropic = @import("providers/anthropic.zig");
     pub const google = @import("providers/google.zig");
+    pub const mistral = @import("providers/mistral.zig");
     pub const kimi = @import("providers/kimi.zig");
     pub const faux = @import("providers/faux.zig");
 };
@@ -40,6 +41,7 @@ test {
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/google.zig");
+    _ = @import("providers/mistral.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
 }
