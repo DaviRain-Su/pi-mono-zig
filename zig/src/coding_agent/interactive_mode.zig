@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
@@ -395,8 +396,9 @@ const ScreenComponent = struct {
             try tui.ansi.wrapTextWithAnsi(allocator, item.text, @max(width, 1), &chat_lines);
         }
 
-        const prompt_line = try formatPromptLine(allocator, self.editor.text(), width);
-        defer allocator.free(prompt_line);
+        var prompt_lines = tui.LineList.empty;
+        defer freeLinesSafe(allocator, &prompt_lines);
+        try renderPromptLines(allocator, self.editor, width, &prompt_lines);
         const footer_line = try formatFooterLine(allocator, self.state.model_label, self.state.session_label, self.state.status, width);
         defer allocator.free(footer_line);
         const hints_line = try fitLine(allocator, "Ctrl+S sessions • Ctrl+P models • Ctrl+C interrupt • Ctrl+D exit • Ctrl+L clear", width);
@@ -406,13 +408,15 @@ const ScreenComponent = struct {
         defer freeLinesSafe(allocator, &autocomplete_lines);
         try self.editor.renderAutocompleteInto(allocator, width, &autocomplete_lines);
 
-        const reserved_lines: usize = 3 + autocomplete_lines.items.len;
+        const reserved_lines: usize = prompt_lines.items.len + 2 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
         const visible_chat_start = if (chat_lines.items.len > chat_capacity) chat_lines.items.len - chat_capacity else 0;
         for (chat_lines.items[visible_chat_start..]) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
-        try tui.component.appendOwnedLine(lines, allocator, prompt_line);
+        for (prompt_lines.items) |line| {
+            try tui.component.appendOwnedLine(lines, allocator, line);
+        }
         for (autocomplete_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
@@ -452,6 +456,10 @@ const NativeTerminalBackend = struct {
     stdout_fd: std.posix.fd_t = 1,
     original_termios: ?std.posix.termios = null,
     cached_size: tui.Size = .{ .width = 80, .height = 24 },
+    previous_sigwinch: ?std.posix.Sigaction = null,
+    resize_signal_installed: bool = false,
+    read_terminal_size_fn: *const fn (context: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size = readTerminalSizeWithIoctl,
+    read_terminal_size_context: ?*anyopaque = null,
 
     fn backend(self: *NativeTerminalBackend) tui.Backend {
         return .{
@@ -470,10 +478,12 @@ const NativeTerminalBackend = struct {
         const raw = tui.terminal.makeRawMode(current);
         try std.posix.tcsetattr(self.stdin_fd, .NOW, raw);
         self.cached_size = self.readSize();
+        self.installResizeHandler();
     }
 
     fn restoreMode(ptr: *anyopaque) !void {
         const self: *NativeTerminalBackend = @ptrCast(@alignCast(ptr));
+        self.uninstallResizeHandler();
         if (self.original_termios) |term| {
             try std.posix.tcsetattr(self.stdin_fd, .NOW, term);
         }
@@ -496,6 +506,10 @@ const NativeTerminalBackend = struct {
     }
 
     fn readSize(self: *NativeTerminalBackend) tui.Size {
+        if (self.read_terminal_size_fn(self.read_terminal_size_context, self.stdout_fd)) |size| {
+            return normalizeTerminalSize(size, self.cached_size);
+        }
+
         const columns = parseEnvSize(self.env_map.get("COLUMNS")) orelse self.cached_size.width;
         const lines = parseEnvSize(self.env_map.get("LINES")) orelse self.cached_size.height;
         return .{
@@ -503,7 +517,79 @@ const NativeTerminalBackend = struct {
             .height = if (lines == 0) 24 else lines,
         };
     }
+
+    fn installResizeHandler(self: *NativeTerminalBackend) void {
+        if (!supportsResizeSignals()) return;
+
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .sigaction = handleSigwinch },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.SIGINFO | std.posix.SA.RESTART,
+        };
+
+        var previous: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.WINCH, &action, &previous);
+        self.previous_sigwinch = previous;
+        self.resize_signal_installed = true;
+        active_resize_backend = self;
+    }
+
+    fn uninstallResizeHandler(self: *NativeTerminalBackend) void {
+        if (!self.resize_signal_installed or !supportsResizeSignals()) return;
+
+        if (self.previous_sigwinch) |previous| {
+            std.posix.sigaction(.WINCH, &previous, null);
+        }
+        if (active_resize_backend == self) {
+            active_resize_backend = null;
+        }
+        self.previous_sigwinch = null;
+        self.resize_signal_installed = false;
+    }
 };
+
+var active_resize_backend: ?*NativeTerminalBackend = null;
+
+fn supportsResizeSignals() bool {
+    return switch (builtin.os.tag) {
+        .windows, .wasi, .emscripten, .freestanding => false,
+        else => true,
+    };
+}
+
+fn handleSigwinch(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
+    _ = info;
+    _ = ctx_ptr;
+    if (sig != .WINCH) return;
+    if (active_resize_backend) |backend| {
+        backend.cached_size = backend.readSize();
+    }
+}
+
+fn readTerminalSizeWithIoctl(_: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size {
+    var winsize: std.posix.winsize = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.ioctl(fd, std.posix.T.IOCGWINSZ, @intFromPtr(&winsize)))) {
+        .SUCCESS => return .{
+            .width = winsize.col,
+            .height = winsize.row,
+        },
+        .INTR => continue,
+        else => return null,
+    };
+}
+
+fn normalizeTerminalSize(size: tui.Size, fallback: tui.Size) tui.Size {
+    return .{
+        .width = if (size.width == 0)
+            if (fallback.width == 0) 80 else fallback.width
+        else
+            size.width,
+        .height = if (size.height == 0)
+            if (fallback.height == 0) 24 else fallback.height
+        else
+            size.height,
+    };
+}
 
 const PromptWorker = struct {
     session: *session_mod.AgentSession,
@@ -659,31 +745,73 @@ pub fn runInteractiveMode(
                 continue;
             }
             try input_buffer.appendSlice(allocator, read_buffer[0..bytes_read]);
-            while (tui.keys.parseKey(input_buffer.items)) |parsed| {
-                try handleInputKey(
-                    allocator,
-                    io,
-                    env_map,
-                    parsed.key,
-                    &session,
-                    &current_provider,
-                    session_dir,
-                    options,
-                    built_tools.items,
-                    &app_state,
-                    &editor,
-                    &overlay,
-                    &prompt_worker,
-                    &prompt_worker_active,
-                    subscriber,
-                    &should_exit,
-                );
-                if (parsed.consumed >= input_buffer.items.len) {
-                    input_buffer.clearRetainingCapacity();
-                    break;
+            while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
+                switch (result) {
+                    .parsed => |parsed| try dispatchInputEvent(
+                        allocator,
+                        io,
+                        env_map,
+                        parsed,
+                        &session,
+                        &current_provider,
+                        session_dir,
+                        options,
+                        built_tools.items,
+                        &app_state,
+                        &editor,
+                        &overlay,
+                        &prompt_worker,
+                        &prompt_worker_active,
+                        subscriber,
+                        &should_exit,
+                        &input_buffer,
+                    ),
+                    .need_more_bytes => break,
                 }
-                std.mem.copyForwards(u8, input_buffer.items[0 .. input_buffer.items.len - parsed.consumed], input_buffer.items[parsed.consumed..]);
-                input_buffer.items.len -= parsed.consumed;
+            }
+        } else if (tui.keys.flushInputEvent(input_buffer.items)) |parsed| {
+            try dispatchInputEvent(
+                allocator,
+                io,
+                env_map,
+                parsed,
+                &session,
+                &current_provider,
+                session_dir,
+                options,
+                built_tools.items,
+                &app_state,
+                &editor,
+                &overlay,
+                &prompt_worker,
+                &prompt_worker_active,
+                subscriber,
+                &should_exit,
+                &input_buffer,
+            );
+            while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
+                switch (result) {
+                    .parsed => |next_parsed| try dispatchInputEvent(
+                        allocator,
+                        io,
+                        env_map,
+                        next_parsed,
+                        &session,
+                        &current_provider,
+                        session_dir,
+                        options,
+                        built_tools.items,
+                        &app_state,
+                        &editor,
+                        &overlay,
+                        &prompt_worker,
+                        &prompt_worker_active,
+                        subscriber,
+                        &should_exit,
+                        &input_buffer,
+                    ),
+                    .need_more_bytes => break,
+                }
             }
         }
     }
@@ -1319,6 +1447,64 @@ fn pollForInput() !bool {
     return (try std.posix.poll(fds[0..], 50)) > 0;
 }
 
+fn dispatchInputEvent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    parsed: tui.keys.ParsedInput,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    input_buffer: *std.ArrayList(u8),
+) !void {
+    switch (parsed.event) {
+        .key => |key| try handleInputKey(
+            allocator,
+            io,
+            env_map,
+            key,
+            session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
+            app_state,
+            editor,
+            overlay,
+            prompt_worker,
+            prompt_worker_active,
+            subscriber,
+            should_exit,
+        ),
+        .paste => |content| {
+            if (overlay.* != null) {
+                consumeInputBytes(input_buffer, parsed.consumed);
+                return;
+            }
+            _ = try editor.handlePaste(content);
+        },
+    }
+    consumeInputBytes(input_buffer, parsed.consumed);
+}
+
+fn consumeInputBytes(buffer: *std.ArrayList(u8), consumed: usize) void {
+    if (consumed >= buffer.items.len) {
+        buffer.clearRetainingCapacity();
+        return;
+    }
+    std.mem.copyForwards(u8, buffer.items[0 .. buffer.items.len - consumed], buffer.items[consumed..]);
+    buffer.items.len -= consumed;
+}
+
 fn parseEnvSize(value: ?[]const u8) ?usize {
     const text = value orelse return null;
     return std.fmt.parseInt(usize, text, 10) catch null;
@@ -1332,13 +1518,37 @@ fn freeLinesSafe(allocator: std.mem.Allocator, lines: *tui.LineList) void {
     tui.component.freeLines(allocator, lines);
 }
 
-fn formatPromptLine(allocator: std.mem.Allocator, prompt: []const u8, width: usize) ![]u8 {
-    const line = if (prompt.len == 0)
-        "Input: "
-    else
-        try std.fmt.allocPrint(allocator, "Input: {s}", .{prompt});
-    defer if (!std.mem.eql(u8, line, "Input: ")) allocator.free(line);
-    return try fitLine(allocator, line, width);
+const INPUT_PROMPT_PREFIX = "Input: ";
+
+fn renderPromptLines(
+    allocator: std.mem.Allocator,
+    editor: *tui.Editor,
+    width: usize,
+    lines: *tui.LineList,
+) !void {
+    const prefix_width = tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX);
+    const editor_width = @max(@as(usize, 1), if (width > prefix_width) width - prefix_width else 1);
+
+    var editor_lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &editor_lines);
+    try editor.renderTextInto(allocator, editor_width, &editor_lines);
+
+    const continuation_prefix = try allocator.alloc(u8, prefix_width);
+    defer allocator.free(continuation_prefix);
+    @memset(continuation_prefix, ' ');
+
+    for (editor_lines.items, 0..) |editor_line, index| {
+        var builder = std.ArrayList(u8).empty;
+        errdefer builder.deinit(allocator);
+
+        try builder.appendSlice(allocator, if (index == 0) INPUT_PROMPT_PREFIX else continuation_prefix);
+        try builder.appendSlice(allocator, editor_line);
+
+        const fitted = try fitLine(allocator, builder.items, width);
+        defer allocator.free(fitted);
+        try tui.component.appendOwnedLine(lines, allocator, fitted);
+        builder.deinit(allocator);
+    }
 }
 
 fn formatFooterLine(
@@ -1361,19 +1571,13 @@ fn fitLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
     if (width == 0) return allocator.dupe(u8, "");
     if (tui.ansi.visibleWidth(text) <= width) return tui.ansi.padRightVisibleAlloc(allocator, text, width);
 
+    const limit = if (width > 1) width - 1 else 0;
+    const prefix = try tui.ansi.sliceVisibleAlloc(allocator, text, 0, limit);
+    defer allocator.free(prefix);
+
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
-
-    var visible: usize = 0;
-    var index: usize = 0;
-    const limit = if (width > 1) width - 1 else 0;
-    while (index < text.len and visible < limit) {
-        const rune_len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-        const actual_len = @min(rune_len, text.len - index);
-        try builder.appendSlice(allocator, text[index .. index + actual_len]);
-        index += actual_len;
-        visible += 1;
-    }
+    try builder.appendSlice(allocator, prefix);
     if (width > 0) try builder.append(allocator, '.');
 
     const fitted = try tui.ansi.padRightVisibleAlloc(allocator, builder.items, width);
@@ -1689,6 +1893,41 @@ test "screen renders welcome prompt footer and tool lines" {
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Model: faux-1") != null);
 }
 
+test "screen renders multi-line prompt with wrapped continuation lines" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("你好🙂abc\ndef");
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 12, &lines);
+
+    try std.testing.expect(lines.items.len >= 5);
+    var saw_input = false;
+    var saw_continuation = false;
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line, "Input: ") != null) saw_input = true;
+        if (std.mem.startsWith(u8, line, "       ") and std.mem.indexOf(u8, line, "def") != null) {
+            saw_continuation = true;
+        }
+    }
+    try std.testing.expect(saw_input);
+    try std.testing.expect(saw_continuation);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Model:") != null);
+}
+
 test "app state streams assistant updates and records tool results" {
     const allocator = std.testing.allocator;
 
@@ -1734,4 +1973,94 @@ test "app state streams assistant updates and records tool results" {
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 2].text, "Pi: partial") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Tool result bash: /tmp") != null);
+}
+
+test "native terminal backend prefers ioctl size over environment variables" {
+    const allocator = std.testing.allocator;
+
+    const TestSizeReader = struct {
+        size: tui.Size,
+
+        fn read(context: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size {
+            _ = fd;
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.size;
+        }
+    };
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COLUMNS", "40");
+    try env_map.put("LINES", "12");
+
+    var reader = TestSizeReader{
+        .size = .{ .width = 120, .height = 48 },
+    };
+    var backend = NativeTerminalBackend{
+        .env_map = &env_map,
+        .read_terminal_size_fn = TestSizeReader.read,
+        .read_terminal_size_context = &reader,
+    };
+
+    try std.testing.expectEqual(tui.Size{ .width = 120, .height = 48 }, backend.readSize());
+}
+
+test "native terminal backend falls back to environment variables when ioctl fails" {
+    const allocator = std.testing.allocator;
+
+    const FailingSizeReader = struct {
+        fn read(_: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size {
+            _ = fd;
+            return null;
+        }
+    };
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COLUMNS", "132");
+    try env_map.put("LINES", "43");
+
+    var backend = NativeTerminalBackend{
+        .env_map = &env_map,
+        .cached_size = .{ .width = 80, .height = 24 },
+        .read_terminal_size_fn = FailingSizeReader.read,
+    };
+
+    try std.testing.expectEqual(tui.Size{ .width = 132, .height = 43 }, backend.readSize());
+}
+
+test "SIGWINCH handler refreshes cached terminal size" {
+    const allocator = std.testing.allocator;
+
+    const TestSizeReader = struct {
+        size: tui.Size,
+
+        fn read(context: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size {
+            _ = fd;
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.size;
+        }
+    };
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var reader = TestSizeReader{
+        .size = .{ .width = 80, .height = 24 },
+    };
+    var backend = NativeTerminalBackend{
+        .env_map = &env_map,
+        .cached_size = .{ .width = 80, .height = 24 },
+        .read_terminal_size_fn = TestSizeReader.read,
+        .read_terminal_size_context = &reader,
+    };
+
+    active_resize_backend = &backend;
+    defer active_resize_backend = null;
+
+    reader.size = .{ .width = 101, .height = 33 };
+    var siginfo: std.posix.siginfo_t = undefined;
+    handleSigwinch(.WINCH, &siginfo, null);
+
+    try std.testing.expectEqual(tui.Size{ .width = 101, .height = 33 }, backend.cached_size);
 }
