@@ -33,6 +33,11 @@ const BlockEntry = struct {
     block: CurrentBlock,
 };
 
+const AnthropicCompat = struct {
+    supports_eager_tool_input_streaming: bool = true,
+    supports_long_cache_retention: bool = true,
+};
+
 pub const AnthropicProvider = struct {
     pub const api = "anthropic-messages";
 
@@ -69,8 +74,8 @@ pub const AnthropicProvider = struct {
         try headers.put("Content-Type", "application/json");
         try headers.put("Accept", "text/event-stream");
         try headers.put("anthropic-version", "2023-06-01");
-        try applyAuthHeaders(allocator, &headers, options);
-        try applyDefaultAnthropicHeaders(allocator, &headers, options);
+        try applyAuthHeaders(allocator, &headers, model, options);
+        try applyDefaultAnthropicHeaders(allocator, &headers, model, context, options);
         try mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
@@ -138,6 +143,7 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
+    const compat = getAnthropicCompat(model);
     var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer payload.deinit(allocator);
 
@@ -149,7 +155,7 @@ pub fn buildRequestPayload(
     );
     try payload.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
 
-    const cache_control = try buildCacheControl(allocator, model, if (options) |stream_options| stream_options.cache_retention else .short);
+    const cache_control = try buildCacheControl(allocator, compat, if (options) |stream_options| stream_options.cache_retention else .short);
     defer if (cache_control) |value| freeJsonValue(allocator, value);
 
     const is_oauth = isOAuthToken(if (options) |stream_options| stream_options.api_key orelse "" else "");
@@ -162,7 +168,7 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "messages"), messages_value);
 
     if (context.tools) |tools| {
-        const tools_value = try buildToolsValue(allocator, tools, is_oauth, cache_control);
+        const tools_value = try buildToolsValue(allocator, tools, is_oauth, compat.supports_eager_tool_input_streaming, cache_control);
         try payload.put(allocator, try allocator.dupe(u8, "tools"), tools_value);
     }
 
@@ -450,6 +456,78 @@ test "mapStopReason covers anthropic variants" {
     try std.testing.expectEqual(types.StopReason.tool_use, try mapStopReason("tool_use"));
     try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("pause_turn"));
     try std.testing.expectError(error.UnknownStopReason, mapStopReason("unexpected"));
+}
+
+test "buildRequestPayload adds eager_input_streaming by default" {
+    const allocator = std.testing.allocator;
+
+    const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    const tool_schema_value = std.json.Value{ .object = tool_schema };
+    defer freeJsonValue(allocator, tool_schema_value);
+
+    const tools = &[_]types.Tool{.{
+        .name = "todoWrite",
+        .description = "Write todos",
+        .parameters = tool_schema_value,
+    }};
+
+    const model = types.Model{
+        .id = "claude-sonnet-4-5",
+        .name = "Claude Sonnet 4.5",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .messages = &[_]types.Message{},
+        .tools = tools,
+    }, null);
+    defer freeJsonValue(allocator, payload);
+
+    const first_tool = payload.object.get("tools").?.array.items[0];
+    try std.testing.expect(first_tool == .object);
+    try std.testing.expectEqual(true, first_tool.object.get("eager_input_streaming").?.bool);
+}
+
+test "buildRequestPayload omits anthropic long cache ttl when compat disables it" {
+    const allocator = std.testing.allocator;
+
+    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try compat.put(allocator, try allocator.dupe(u8, "supportsLongCacheRetention"), .{ .bool = false });
+    const compat_value = std.json.Value{ .object = compat };
+    defer freeJsonValue(allocator, compat_value);
+
+    const model = types.Model{
+        .id = "claude-sonnet-4-5",
+        .name = "Claude Sonnet 4.5",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+        .compat = compat_value,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .system_prompt = "Cache me",
+        .messages = &[_]types.Message{},
+    }, .{
+        .cache_retention = .long,
+    });
+    defer freeJsonValue(allocator, payload);
+
+    const system = payload.object.get("system").?.array.items[0];
+    try std.testing.expect(system == .object);
+    const cache_control = system.object.get("cache_control").?;
+    try std.testing.expect(cache_control == .object);
+    try std.testing.expect(cache_control.object.get("ttl") == null);
 }
 
 fn parseSseStreamLines(
@@ -779,15 +857,30 @@ fn parseSseLine(line: []const u8) ?[]const u8 {
     return null;
 }
 
+fn getAnthropicCompat(model: types.Model) AnthropicCompat {
+    return .{
+        .supports_eager_tool_input_streaming = compatBoolField(model.compat, "supportsEagerToolInputStreaming") orelse true,
+        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse true,
+    };
+}
+
+fn compatBoolField(compat: ?std.json.Value, key: []const u8) ?bool {
+    const value = compat orelse return null;
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    if (field != .bool) return null;
+    return field.bool;
+}
+
 fn buildCacheControl(
     allocator: std.mem.Allocator,
-    model: types.Model,
+    compat: AnthropicCompat,
     retention: types.CacheRetention,
 ) !?std.json.Value {
     if (retention == .none) return null;
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "ephemeral") });
-    if (retention == .long and std.mem.indexOf(u8, model.base_url, "api.anthropic.com") != null) {
+    if (retention == .long and compat.supports_long_cache_retention) {
         try object.put(allocator, try allocator.dupe(u8, "ttl"), .{ .string = try allocator.dupe(u8, "1h") });
     }
     return .{ .object = object };
@@ -1004,6 +1097,7 @@ fn buildToolsValue(
     allocator: std.mem.Allocator,
     tools: []const types.Tool,
     is_oauth: bool,
+    supports_eager_tool_input_streaming: bool,
     cache_control: ?std.json.Value,
 ) !std.json.Value {
     var array = std.json.Array.init(allocator);
@@ -1012,6 +1106,9 @@ fn buildToolsValue(
         var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
         try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(tool.name) else tool.name) });
         try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
+        if (supports_eager_tool_input_streaming) {
+            try object.put(allocator, try allocator.dupe(u8, "eager_input_streaming"), .{ .bool = true });
+        }
 
         var schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
         try schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
@@ -1076,12 +1173,13 @@ fn applyCacheControlToBlock(allocator: std.mem.Allocator, block: *std.json.Value
 fn applyAuthHeaders(
     allocator: std.mem.Allocator,
     headers: *std.StringHashMap([]const u8),
+    model: types.Model,
     options: ?types.StreamOptions,
 ) !void {
     const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
     if (api_key.len == 0) return;
 
-    if (isOAuthToken(api_key)) {
+    if (std.mem.eql(u8, model.provider, "github-copilot") or isOAuthToken(api_key)) {
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         try headers.put("Authorization", authorization);
     } else {
@@ -1092,16 +1190,38 @@ fn applyAuthHeaders(
 fn applyDefaultAnthropicHeaders(
     allocator: std.mem.Allocator,
     headers: *std.StringHashMap([]const u8),
+    model: types.Model,
+    context: types.Context,
     options: ?types.StreamOptions,
 ) !void {
     const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
+    const use_fine_grained_tool_streaming_beta = shouldUseFineGrainedToolStreamingBeta(model, context);
+
+    if (std.mem.eql(u8, model.provider, "github-copilot")) {
+        if (use_fine_grained_tool_streaming_beta) {
+            try headers.put("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+        }
+        return;
+    }
+
     if (isOAuthToken(api_key)) {
-        try headers.put("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14");
+        if (use_fine_grained_tool_streaming_beta) {
+            try headers.put("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14");
+        } else {
+            try headers.put("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
+        }
         try headers.put("user-agent", try std.fmt.allocPrint(allocator, "claude-cli/{s}", .{CLAUDE_CODE_VERSION}));
         try headers.put("x-app", "cli");
     } else {
-        try headers.put("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+        if (use_fine_grained_tool_streaming_beta) {
+            try headers.put("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+        }
     }
+}
+
+fn shouldUseFineGrainedToolStreamingBeta(model: types.Model, context: types.Context) bool {
+    if (context.tools == null or context.tools.?.len == 0) return false;
+    return !getAnthropicCompat(model).supports_eager_tool_input_streaming;
 }
 
 fn mergeHeaders(

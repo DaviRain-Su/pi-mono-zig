@@ -1,0 +1,589 @@
+const std = @import("std");
+const types = @import("../types.zig");
+
+const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
+const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
+const SYNTHETIC_TOOL_RESULT_TEXT = "No result provided";
+
+pub const NormalizeToolCallIdFn = *const fn (
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    model: types.Model,
+    source: types.AssistantMessage,
+) anyerror![]const u8;
+
+pub fn transformMessages(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    model: types.Model,
+    normalize_tool_call_id: ?NormalizeToolCallIdFn,
+) ![]types.Message {
+    var normalized_tool_call_ids = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var iterator = normalized_tool_call_ids.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        normalized_tool_call_ids.deinit();
+    }
+
+    var first_pass = std.ArrayList(types.Message).empty;
+    defer first_pass.deinit(allocator);
+
+    for (messages) |message| {
+        switch (message) {
+            .user => |user| try first_pass.append(allocator, .{
+                .user = .{
+                    .content = try cloneUserLikeContent(allocator, user.content, modelSupportsImages(model), NON_VISION_USER_IMAGE_PLACEHOLDER),
+                    .timestamp = user.timestamp,
+                },
+            }),
+            .tool_result => |tool_result| try first_pass.append(allocator, .{
+                .tool_result = .{
+                    .tool_call_id = try cloneNormalizedToolCallId(allocator, tool_result.tool_call_id, &normalized_tool_call_ids),
+                    .tool_name = try allocator.dupe(u8, tool_result.tool_name),
+                    .content = try cloneUserLikeContent(allocator, tool_result.content, modelSupportsImages(model), NON_VISION_TOOL_IMAGE_PLACEHOLDER),
+                    .is_error = tool_result.is_error,
+                    .timestamp = tool_result.timestamp,
+                },
+            }),
+            .assistant => |assistant| try first_pass.append(allocator, .{
+                .assistant = try cloneAssistantMessage(allocator, assistant, model, normalize_tool_call_id, &normalized_tool_call_ids),
+            }),
+        }
+    }
+
+    const transformed = try first_pass.toOwnedSlice(allocator);
+    var result = std.ArrayList(types.Message).empty;
+    errdefer {
+        const owned = result.items;
+        for (owned) |message| freeMessage(allocator, message);
+        result.deinit(allocator);
+    }
+
+    var pending_tool_calls: ?[]const types.ToolCall = null;
+    var pending_timestamp: i64 = 0;
+    var existing_tool_result_ids = std.ArrayList([]const u8).empty;
+    defer existing_tool_result_ids.deinit(allocator);
+
+    for (transformed) |message| {
+        switch (message) {
+            .assistant => |assistant| {
+                try insertSyntheticToolResults(allocator, &result, pending_tool_calls, existing_tool_result_ids.items, pending_timestamp);
+                pending_tool_calls = null;
+                existing_tool_result_ids.clearRetainingCapacity();
+
+                if (assistant.stop_reason == .error_reason or assistant.stop_reason == .aborted) {
+                    freeMessage(allocator, message);
+                    continue;
+                }
+
+                try result.append(allocator, message);
+
+                if (assistant.tool_calls) |tool_calls| {
+                    if (tool_calls.len > 0) {
+                        pending_tool_calls = tool_calls;
+                        pending_timestamp = assistant.timestamp;
+                    }
+                }
+            },
+            .tool_result => |tool_result| {
+                try existing_tool_result_ids.append(allocator, tool_result.tool_call_id);
+                try result.append(allocator, message);
+            },
+            .user => {
+                try insertSyntheticToolResults(allocator, &result, pending_tool_calls, existing_tool_result_ids.items, pending_timestamp);
+                pending_tool_calls = null;
+                existing_tool_result_ids.clearRetainingCapacity();
+                try result.append(allocator, message);
+            },
+        }
+    }
+
+    try insertSyntheticToolResults(allocator, &result, pending_tool_calls, existing_tool_result_ids.items, pending_timestamp);
+    allocator.free(transformed);
+    return try result.toOwnedSlice(allocator);
+}
+
+pub fn freeMessages(allocator: std.mem.Allocator, messages: []const types.Message) void {
+    for (messages) |message| freeMessage(allocator, message);
+    allocator.free(messages);
+}
+
+fn cloneAssistantMessage(
+    allocator: std.mem.Allocator,
+    assistant: types.AssistantMessage,
+    model: types.Model,
+    normalize_tool_call_id: ?NormalizeToolCallIdFn,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
+) !types.AssistantMessage {
+    const is_same_model = std.mem.eql(u8, assistant.provider, model.provider) and
+        std.mem.eql(u8, assistant.api, model.api) and
+        std.mem.eql(u8, assistant.model, model.id);
+
+    return .{
+        .content = try cloneAssistantContent(allocator, assistant.content, is_same_model),
+        .tool_calls = try cloneToolCalls(allocator, assistant, model, is_same_model, normalize_tool_call_id, normalized_tool_call_ids),
+        .api = try allocator.dupe(u8, assistant.api),
+        .provider = try allocator.dupe(u8, assistant.provider),
+        .model = try allocator.dupe(u8, assistant.model),
+        .response_id = if (assistant.response_id) |response_id| try allocator.dupe(u8, response_id) else null,
+        .usage = assistant.usage,
+        .stop_reason = assistant.stop_reason,
+        .error_message = if (assistant.error_message) |error_message| try allocator.dupe(u8, error_message) else null,
+        .timestamp = assistant.timestamp,
+    };
+}
+
+fn cloneToolCalls(
+    allocator: std.mem.Allocator,
+    assistant: types.AssistantMessage,
+    model: types.Model,
+    is_same_model: bool,
+    normalize_tool_call_id: ?NormalizeToolCallIdFn,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
+) !?[]types.ToolCall {
+    const source_tool_calls = assistant.tool_calls orelse return null;
+    var tool_calls = std.ArrayList(types.ToolCall).empty;
+    errdefer {
+        for (tool_calls.items) |tool_call| freeToolCall(allocator, tool_call);
+        tool_calls.deinit(allocator);
+    }
+
+    for (source_tool_calls) |tool_call| {
+        var id: []const u8 = try allocator.dupe(u8, tool_call.id);
+        errdefer allocator.free(id);
+
+        if (!is_same_model) {
+            if (normalize_tool_call_id) |normalizer| {
+                const normalized_id = try normalizer(allocator, tool_call.id, model, assistant);
+                if (!std.mem.eql(u8, normalized_id, tool_call.id)) {
+                    allocator.free(id);
+                    id = normalized_id;
+                    try normalized_tool_call_ids.put(try allocator.dupe(u8, tool_call.id), try allocator.dupe(u8, normalized_id));
+                } else {
+                    allocator.free(normalized_id);
+                }
+            }
+        }
+
+        try tool_calls.append(allocator, .{
+            .id = id,
+            .name = try allocator.dupe(u8, tool_call.name),
+            .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        });
+    }
+
+    return try tool_calls.toOwnedSlice(allocator);
+}
+
+fn cloneUserLikeContent(
+    allocator: std.mem.Allocator,
+    content: []const types.ContentBlock,
+    supports_images: bool,
+    placeholder: []const u8,
+) ![]types.ContentBlock {
+    if (supports_images) return try cloneContentBlocks(allocator, content);
+
+    var blocks = std.ArrayList(types.ContentBlock).empty;
+    errdefer {
+        for (blocks.items) |block| freeContentBlock(allocator, block);
+        blocks.deinit(allocator);
+    }
+
+    var previous_was_placeholder = false;
+    for (content) |block| {
+        switch (block) {
+            .image => {
+                if (!previous_was_placeholder) {
+                    try blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, placeholder) } });
+                }
+                previous_was_placeholder = true;
+            },
+            .text => |text| {
+                try blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, text.text) } });
+                previous_was_placeholder = std.mem.eql(u8, text.text, placeholder);
+            },
+            .thinking => |thinking| {
+                try blocks.append(allocator, .{ .thinking = .{
+                    .thinking = try allocator.dupe(u8, thinking.thinking),
+                    .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+                    .redacted = thinking.redacted,
+                } });
+                previous_was_placeholder = false;
+            },
+        }
+    }
+
+    return try blocks.toOwnedSlice(allocator);
+}
+
+fn cloneAssistantContent(
+    allocator: std.mem.Allocator,
+    content: []const types.ContentBlock,
+    is_same_model: bool,
+) ![]types.ContentBlock {
+    var blocks = std.ArrayList(types.ContentBlock).empty;
+    errdefer {
+        for (blocks.items) |block| freeContentBlock(allocator, block);
+        blocks.deinit(allocator);
+    }
+
+    for (content) |block| {
+        switch (block) {
+            .thinking => |thinking| {
+                if (thinking.redacted and !is_same_model) continue;
+                if (!is_same_model) {
+                    const trimmed = std.mem.trim(u8, thinking.thinking, " \t\r\n");
+                    if (trimmed.len == 0) continue;
+                    try blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, thinking.thinking) } });
+                    continue;
+                }
+
+                if (thinking.signature != null or std.mem.trim(u8, thinking.thinking, " \t\r\n").len > 0) {
+                    try blocks.append(allocator, .{ .thinking = .{
+                        .thinking = try allocator.dupe(u8, thinking.thinking),
+                        .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+                        .redacted = thinking.redacted,
+                    } });
+                }
+            },
+            else => try blocks.append(allocator, try cloneContentBlock(allocator, block)),
+        }
+    }
+
+    return try blocks.toOwnedSlice(allocator);
+}
+
+fn cloneContentBlocks(allocator: std.mem.Allocator, content: []const types.ContentBlock) ![]types.ContentBlock {
+    var blocks = std.ArrayList(types.ContentBlock).empty;
+    errdefer {
+        for (blocks.items) |block| freeContentBlock(allocator, block);
+        blocks.deinit(allocator);
+    }
+
+    for (content) |block| try blocks.append(allocator, try cloneContentBlock(allocator, block));
+    return try blocks.toOwnedSlice(allocator);
+}
+
+fn cloneContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) !types.ContentBlock {
+    return switch (block) {
+        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text) } },
+        .image => |image| .{ .image = .{
+            .data = try allocator.dupe(u8, image.data),
+            .mime_type = try allocator.dupe(u8, image.mime_type),
+        } },
+        .thinking => |thinking| .{ .thinking = .{
+            .thinking = try allocator.dupe(u8, thinking.thinking),
+            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .redacted = thinking.redacted,
+        } },
+    };
+}
+
+fn cloneNormalizedToolCallId(
+    allocator: std.mem.Allocator,
+    original_id: []const u8,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
+) ![]const u8 {
+    if (normalized_tool_call_ids.get(original_id)) |normalized_id| {
+        return try allocator.dupe(u8, normalized_id);
+    }
+    return try allocator.dupe(u8, original_id);
+}
+
+fn insertSyntheticToolResults(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(types.Message),
+    pending_tool_calls: ?[]const types.ToolCall,
+    existing_tool_result_ids: []const []const u8,
+    pending_timestamp: i64,
+) !void {
+    const tool_calls = pending_tool_calls orelse return;
+    for (tool_calls) |tool_call| {
+        if (containsToolResult(existing_tool_result_ids, tool_call.id)) continue;
+        const content = try allocator.alloc(types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = try allocator.dupe(u8, SYNTHETIC_TOOL_RESULT_TEXT) } };
+        try result.append(allocator, .{
+            .tool_result = .{
+                .tool_call_id = try allocator.dupe(u8, tool_call.id),
+                .tool_name = try allocator.dupe(u8, tool_call.name),
+                .content = content,
+                .is_error = true,
+                .timestamp = pending_timestamp,
+            },
+        });
+    }
+}
+
+fn containsToolResult(ids: []const []const u8, candidate: []const u8) bool {
+    for (ids) |id| {
+        if (std.mem.eql(u8, id, candidate)) return true;
+    }
+    return false;
+}
+
+fn modelSupportsImages(model: types.Model) bool {
+    for (model.input_types) |input_type| {
+        if (std.mem.eql(u8, input_type, "image")) return true;
+    }
+    return false;
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |boolean| .{ .bool = boolean },
+        .integer => |integer| .{ .integer = integer },
+        .float => |float| .{ .float = float },
+        .number_string => |number_string| .{ .number_string = try allocator.dupe(u8, number_string) },
+        .string => |string| .{ .string = try allocator.dupe(u8, string) },
+        .array => |array| blk: {
+            var clone = std.json.Array.init(allocator);
+            errdefer clone.deinit();
+            for (array.items) |item| try clone.append(try cloneJsonValue(allocator, item));
+            break :blk .{ .array = clone };
+        },
+        .object => |object| blk: {
+            var clone = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer clone.deinit(allocator);
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                try clone.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
+            }
+            break :blk .{ .object = clone };
+        },
+    };
+}
+
+fn freeMessage(allocator: std.mem.Allocator, message: types.Message) void {
+    switch (message) {
+        .user => |user| {
+            freeContentBlocks(allocator, user.content);
+        },
+        .tool_result => |tool_result| {
+            allocator.free(tool_result.tool_call_id);
+            allocator.free(tool_result.tool_name);
+            freeContentBlocks(allocator, tool_result.content);
+        },
+        .assistant => |assistant| {
+            allocator.free(assistant.api);
+            allocator.free(assistant.provider);
+            allocator.free(assistant.model);
+            if (assistant.response_id) |response_id| allocator.free(response_id);
+            if (assistant.error_message) |error_message| allocator.free(error_message);
+            freeContentBlocks(allocator, assistant.content);
+            if (assistant.tool_calls) |tool_calls| {
+                for (tool_calls) |tool_call| freeToolCall(allocator, tool_call);
+                allocator.free(tool_calls);
+            }
+        },
+    }
+}
+
+fn freeContentBlocks(allocator: std.mem.Allocator, blocks: []const types.ContentBlock) void {
+    for (blocks) |block| freeContentBlock(allocator, block);
+    allocator.free(blocks);
+}
+
+fn freeContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) void {
+    switch (block) {
+        .text => |text| allocator.free(text.text),
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+        .thinking => |thinking| {
+            allocator.free(thinking.thinking);
+            if (thinking.signature) |signature| allocator.free(signature);
+        },
+    }
+}
+
+fn freeToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    freeJsonValue(allocator, tool_call.arguments);
+}
+
+fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |string| allocator.free(string),
+        .number_string => |number_string| allocator.free(number_string),
+        .array => |array| {
+            for (array.items) |item| freeJsonValue(allocator, item);
+            var mutable = array;
+            mutable.deinit();
+        },
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(allocator, entry.value_ptr.*);
+            }
+            var mutable = object;
+            mutable.deinit(allocator);
+        },
+        else => {},
+    }
+}
+
+fn normalizeToolCallIdForTest(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    model: types.Model,
+    source: types.AssistantMessage,
+) ![]const u8 {
+    _ = model;
+    _ = source;
+    return try std.fmt.allocPrint(allocator, "normalized-{s}", .{id});
+}
+
+test "transformMessages downgrades unsupported user and tool result images" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "text-only",
+        .name = "Text Only",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 32000,
+        .max_tokens = 4000,
+    };
+
+    const user_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "before" } },
+        .{ .image = .{ .data = "a", .mime_type = "image/png" } },
+        .{ .image = .{ .data = "b", .mime_type = "image/png" } },
+        .{ .text = .{ .text = "after" } },
+    };
+    const tool_content = [_]types.ContentBlock{
+        .{ .image = .{ .data = "c", .mime_type = "image/png" } },
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .user = .{ .content = &user_content, .timestamp = 1 } },
+        .{ .tool_result = .{
+            .tool_call_id = "tool-1",
+            .tool_name = "capture",
+            .content = &tool_content,
+            .timestamp = 2,
+        } },
+    }, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 2), transformed.len);
+    try std.testing.expectEqual(@as(usize, 3), transformed[0].user.content.len);
+    try std.testing.expectEqualStrings(NON_VISION_USER_IMAGE_PLACEHOLDER, transformed[0].user.content[1].text.text);
+    try std.testing.expectEqualStrings(NON_VISION_TOOL_IMAGE_PLACEHOLDER, transformed[1].tool_result.content[0].text.text);
+}
+
+test "transformMessages normalizes cross model tool call ids and matching tool results" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "mistral-large",
+        .name = "Mistral Large",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 4000,
+    };
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iterator = arguments.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = arguments;
+        owned.deinit(allocator);
+    }
+    try arguments.put(allocator, try allocator.dupe(u8, "city"), .{ .string = "Berlin" });
+
+    const assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .thinking = .{ .thinking = "Need a tool call." } }},
+        .tool_calls = &[_]types.ToolCall{.{
+            .id = "tool-call-1",
+            .name = "weather",
+            .arguments = .{ .object = arguments },
+        }},
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 3,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .assistant = assistant },
+        .{ .tool_result = .{
+            .tool_call_id = "tool-call-1",
+            .tool_name = "weather",
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "sunny" } }},
+            .timestamp = 4,
+        } },
+    }, model, normalizeToolCallIdForTest);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqualStrings("Need a tool call.", transformed[0].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[0].assistant.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[1].tool_result.tool_call_id);
+}
+
+test "transformMessages inserts synthetic tool results for orphaned calls and drops errored assistants" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "claude-sonnet",
+        .name = "Claude Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+
+    const orphaned_assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Calling tool" } }},
+        .tool_calls = &[_]types.ToolCall{.{
+            .id = "tool-1",
+            .name = "lookup",
+            .arguments = .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) },
+        }},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "claude-sonnet",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 5,
+    };
+
+    const errored_assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "partial" } }},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "claude-sonnet",
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "boom",
+        .timestamp = 6,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .assistant = orphaned_assistant },
+        .{ .user = .{ .content = &[_]types.ContentBlock{.{ .text = .{ .text = "next" } }}, .timestamp = 7 } },
+        .{ .assistant = errored_assistant },
+    }, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 3), transformed.len);
+    try std.testing.expect(transformed[0] == .assistant);
+    try std.testing.expect(transformed[1] == .tool_result);
+    try std.testing.expectEqualStrings("tool-1", transformed[1].tool_result.tool_call_id);
+    try std.testing.expect(transformed[1].tool_result.is_error);
+    try std.testing.expectEqualStrings(SYNTHETIC_TOOL_RESULT_TEXT, transformed[1].tool_result.content[0].text.text);
+    try std.testing.expect(transformed[2] == .user);
+}

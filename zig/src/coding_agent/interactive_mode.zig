@@ -402,13 +402,20 @@ const ScreenComponent = struct {
         const hints_line = try fitLine(allocator, "Ctrl+S sessions • Ctrl+P models • Ctrl+C interrupt • Ctrl+D exit • Ctrl+L clear", width);
         defer allocator.free(hints_line);
 
-        const reserved_lines: usize = 3;
+        var autocomplete_lines = tui.LineList.empty;
+        defer freeLinesSafe(allocator, &autocomplete_lines);
+        try self.editor.renderAutocompleteInto(allocator, width, &autocomplete_lines);
+
+        const reserved_lines: usize = 3 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
         const visible_chat_start = if (chat_lines.items.len > chat_capacity) chat_lines.items.len - chat_capacity else 0;
         for (chat_lines.items[visible_chat_start..]) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
         try tui.component.appendOwnedLine(lines, allocator, prompt_line);
+        for (autocomplete_lines.items) |line| {
+            try tui.component.appendOwnedLine(lines, allocator, line);
+        }
         try tui.component.appendOwnedLine(lines, allocator, footer_line);
         try tui.component.appendOwnedLine(lines, allocator, hints_line);
     }
@@ -600,6 +607,9 @@ pub fn runInteractiveMode(
 
     var editor = tui.Editor.init(allocator);
     defer editor.deinit();
+    const autocomplete_items = try loadEditorAutocompleteItems(allocator, io, options.cwd);
+    defer freeOwnedSelectItems(allocator, autocomplete_items);
+    try editor.setAutocompleteItems(autocomplete_items);
 
     var screen = ScreenComponent{
         .state = &app_state,
@@ -913,11 +923,19 @@ fn handleInputKey(
             else => {},
         },
         .escape => {
+            if (editor.isShowingAutocomplete()) {
+                _ = try editor.handleKey(key);
+                return;
+            }
             should_exit.* = true;
             if (prompt_worker_active.*) session.agent.abort();
             return;
         },
         .enter => {
+            if (editor.isShowingAutocomplete()) {
+                _ = try editor.handleKey(key);
+                return;
+            }
             if (prompt_worker_active.*) {
                 try app_state.setStatus("response in progress");
                 return;
@@ -1207,6 +1225,59 @@ fn currentSessionLabel(session: *const session_mod.AgentSession) []const u8 {
         std.fs.path.basename(path)
     else
         session.session_manager.getSessionId();
+}
+
+fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]tui.SelectItem {
+    var dir = try std.Io.Dir.openDirAbsolute(io, cwd, .{ .iterate = true });
+    defer dir.close(io);
+
+    var items = std.ArrayList(tui.SelectItem).empty;
+    errdefer {
+        freeOwnedSelectItems(allocator, items.items);
+        items.deinit(allocator);
+    }
+
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".git")) continue;
+
+        const is_directory = entry.kind == .directory;
+        const display = if (is_directory)
+            try std.fmt.allocPrint(allocator, "{s}/", .{entry.name})
+        else
+            try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(display);
+        const label = try allocator.dupe(u8, display);
+        errdefer allocator.free(label);
+        const description = try allocator.dupe(u8, if (is_directory) "directory" else "file");
+        errdefer allocator.free(description);
+
+        try items.append(allocator, .{
+            .value = display,
+            .label = label,
+            .description = description,
+        });
+    }
+
+    std.mem.sort(tui.SelectItem, items.items, {}, struct {
+        fn lessThan(_: void, lhs: tui.SelectItem, rhs: tui.SelectItem) bool {
+            const lhs_dir = std.mem.endsWith(u8, lhs.value, "/");
+            const rhs_dir = std.mem.endsWith(u8, rhs.value, "/");
+            if (lhs_dir != rhs_dir) return lhs_dir;
+            return std.mem.order(u8, lhs.label, rhs.label) == .lt;
+        }
+    }.lessThan);
+
+    return try items.toOwnedSlice(allocator);
+}
+
+fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
+    for (items) |item| {
+        allocator.free(item.value);
+        allocator.free(item.label);
+        if (item.description) |description| allocator.free(description);
+    }
+    allocator.free(items);
 }
 
 fn resolveSessionPath(
