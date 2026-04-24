@@ -1,6 +1,8 @@
 const std = @import("std");
 const api_registry = @import("api_registry.zig");
 const event_stream = @import("event_stream.zig");
+const model_registry = @import("model_registry.zig");
+const simple_options_mod = @import("shared/simple_options.zig");
 const types = @import("types.zig");
 
 const EntryFunctionError = error{
@@ -43,6 +45,7 @@ pub fn streamSimple(
 ) !event_stream.AssistantMessageEventStream {
     const stream_options = if (options) |simple_options| blk: {
         var mapped = simple_options.toStreamOptions();
+        applyResponsesSimpleOptions(&mapped, model, simple_options.reasoning);
         applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
         break :blk mapped;
     } else null;
@@ -58,6 +61,7 @@ pub fn completeSimple(
 ) !types.AssistantMessage {
     const stream_options = if (options) |simple_options| blk: {
         var mapped = simple_options.toStreamOptions();
+        applyResponsesSimpleOptions(&mapped, model, simple_options.reasoning);
         applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
         break :blk mapped;
     } else null;
@@ -80,12 +84,33 @@ fn applyMistralSimpleOptions(
     }
 }
 
+fn applyResponsesSimpleOptions(
+    stream_options: *types.StreamOptions,
+    model: types.Model,
+    reasoning: ?types.ThinkingLevel,
+) void {
+    if (reasoning == null) return;
+    if (!model.reasoning) return;
+    if (!std.mem.eql(u8, model.api, "openai-responses") and
+        !std.mem.eql(u8, model.api, "openai-codex-responses") and
+        !std.mem.eql(u8, model.api, "azure-openai-responses"))
+    {
+        return;
+    }
+
+    stream_options.responses_reasoning_effort = if (model_registry.supportsXhigh(model))
+        reasoning.?
+    else
+        simple_options_mod.clampReasoning(reasoning).?;
+}
+
 const RecordingState = struct {
     stream_calls: usize = 0,
     stream_simple_calls: usize = 0,
     saw_max_tokens: ?u32 = null,
     saw_temperature: ?f32 = null,
     saw_api_key: ?[]const u8 = null,
+    saw_responses_reasoning_effort: ?types.ThinkingLevel = null,
     saw_mistral_prompt_mode: ?[]const u8 = null,
     saw_mistral_reasoning_effort: ?[]const u8 = null,
     response_text: []const u8 = "recorded response",
@@ -111,6 +136,7 @@ fn recordingStream(
         recording_state.saw_max_tokens = stream_options.max_tokens;
         recording_state.saw_temperature = stream_options.temperature;
         recording_state.saw_api_key = stream_options.api_key;
+        recording_state.saw_responses_reasoning_effort = stream_options.responses_reasoning_effort;
         recording_state.saw_mistral_prompt_mode = stream_options.mistral_prompt_mode;
         recording_state.saw_mistral_reasoning_effort = stream_options.mistral_reasoning_effort;
     }
@@ -293,6 +319,42 @@ test "streamSimple maps Mistral reasoning to provider options" {
 
     try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
     try std.testing.expectEqualStrings("high", recording_state.saw_mistral_reasoning_effort.?);
+}
+
+test "streamSimple preserves xhigh reasoning for Codex GPT-5.5" {
+    api_registry.clear();
+    defer api_registry.clear();
+    resetRecordingState();
+
+    try api_registry.register(.{
+        .api = "openai-codex-responses",
+        .stream = recordingStream,
+        .stream_simple = recordingStreamSimple,
+    });
+
+    const model = types.Model{
+        .id = "gpt-5.5",
+        .name = "Codex GPT-5.5",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream_instance = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .reasoning = .xhigh },
+    );
+    defer stream_instance.deinit();
+
+    _ = stream_instance.next();
+    try std.testing.expectEqual(@as(?types.ThinkingLevel, .xhigh), recording_state.saw_responses_reasoning_effort);
 }
 
 test "complete returns final assistant message" {

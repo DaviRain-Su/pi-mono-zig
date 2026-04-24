@@ -202,7 +202,13 @@ pub const OpenAICompletionsCompat = struct {
 };
 
 pub const OpenAIResponsesCompat = struct {
-    // Reserved for future use
+    send_session_id_header: ?bool = null,
+    supports_long_cache_retention: ?bool = null,
+};
+
+pub const AnthropicMessagesCompat = struct {
+    supports_eager_tool_input_streaming: ?bool = null,
+    supports_long_cache_retention: ?bool = null,
 };
 
 pub const OpenRouterRouting = struct {
@@ -271,6 +277,8 @@ pub const StreamOptions = struct {
     google_tool_choice: ?[]const u8 = null,
     /// Google provider thinking configuration.
     google_thinking: ?GoogleThinkingOptions = null,
+    /// Responses API reasoning effort level.
+    responses_reasoning_effort: ?ThinkingLevel = null,
     /// Mistral prompt mode, e.g. "reasoning".
     mistral_prompt_mode: ?[]const u8 = null,
     /// Mistral reasoning effort, e.g. "high".
@@ -314,6 +322,7 @@ pub const SimpleStreamOptions = struct {
             .signal = self.signal,
             .google_tool_choice = self.google_tool_choice,
             .google_thinking = self.google_thinking,
+            .responses_reasoning_effort = null,
             .mistral_prompt_mode = self.mistral_prompt_mode,
             .mistral_reasoning_effort = self.mistral_reasoning_effort,
         };
@@ -474,4 +483,10 @@ test "Model with cost and compat" {
     try std.testing.expectEqual(@as(f64, 15.0), model.cost.cache_read);
     try std.testing.expectEqual(@as(f64, 30.0), model.cost.cache_write);
     try std.testing.expectEqual(@as(usize, 2), model.input_types.len);
+}
+
+test {
+    _ = @import("shared/simple_options.zig");
+    _ = @import("shared/transform_messages.zig");
+    _ = @import("shared/overflow.zig");
 }

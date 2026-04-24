@@ -7,8 +7,12 @@ pub const components = struct {
     pub const text = @import("components/text.zig");
     pub const box = @import("components/box.zig");
     pub const editor = @import("components/editor.zig");
+    pub const image = @import("components/image.zig");
+    pub const loader = @import("components/loader.zig");
     pub const markdown = @import("components/markdown.zig");
     pub const select_list = @import("components/select_list.zig");
+    pub const spacer = @import("components/spacer.zig");
+    pub const truncated_text = @import("components/truncated_text.zig");
 };
 
 pub const Component = component.Component;
@@ -25,9 +29,19 @@ pub const OverlayOptions = tui.OverlayOptions;
 pub const Text = components.text.Text;
 pub const Box = components.box.Box;
 pub const Editor = components.editor.Editor;
+pub const Image = components.image.Image;
+pub const ImageDimensions = components.image.ImageDimensions;
+pub const Loader = components.loader.Loader;
+pub const LoaderStyle = components.loader.LoaderStyle;
+pub const LoaderIndicatorOptions = components.loader.LoaderIndicatorOptions;
+pub const CancellableLoader = components.loader.CancellableLoader;
+pub const CancellableHandleResult = components.loader.CancellableHandleResult;
 pub const Markdown = components.markdown.Markdown;
 pub const SelectList = components.select_list.SelectList;
 pub const SelectItem = components.select_list.SelectItem;
+pub const Spacer = components.spacer.Spacer;
+pub const TruncatedText = components.truncated_text.TruncatedText;
+pub const TruncationMode = components.truncated_text.TruncationMode;
 
 test {
     _ = @import("ansi.zig");
@@ -38,6 +52,10 @@ test {
     _ = @import("components/text.zig");
     _ = @import("components/box.zig");
     _ = @import("components/editor.zig");
+    _ = @import("components/image.zig");
+    _ = @import("components/loader.zig");
     _ = @import("components/markdown.zig");
     _ = @import("components/select_list.zig");
+    _ = @import("components/spacer.zig");
+    _ = @import("components/truncated_text.zig");
 }

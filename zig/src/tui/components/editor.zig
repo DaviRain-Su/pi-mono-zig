@@ -1,7 +1,9 @@
 const std = @import("std");
+const autocomplete = @import("autocomplete.zig");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
 const keys = @import("../keys.zig");
+const select_list = @import("select_list.zig");
 
 pub const HandleResult = enum {
     handled,
@@ -21,12 +23,18 @@ pub const Editor = struct {
     cursor: usize = 0,
     padding_x: usize = 0,
     padding_y: usize = 0,
+    autocomplete_catalog: std.ArrayList(select_list.SelectItem) = .empty,
+    autocomplete_matches: []select_list.SelectItem = &.{},
+    autocomplete_list: ?select_list.SelectList = null,
+    autocomplete_max_visible: usize = 5,
 
     pub fn init(allocator: std.mem.Allocator) Editor {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Editor) void {
+        self.clearAutocomplete();
+        self.freeAutocompleteCatalog();
         self.buffer.deinit(self.allocator);
         self.* = undefined;
     }
@@ -54,34 +62,106 @@ pub const Editor = struct {
         };
     }
 
+    pub fn setAutocompleteItems(self: *Editor, items: []const select_list.SelectItem) !void {
+        self.clearAutocomplete();
+        self.freeAutocompleteCatalog();
+
+        try self.autocomplete_catalog.ensureTotalCapacity(self.allocator, items.len);
+        for (items) |item| {
+            const value = try self.allocator.dupe(u8, item.value);
+            errdefer self.allocator.free(value);
+            const label = try self.allocator.dupe(u8, item.label);
+            errdefer self.allocator.free(label);
+            const description = if (item.description) |description|
+                try self.allocator.dupe(u8, description)
+            else
+                null;
+            errdefer if (description) |owned| self.allocator.free(owned);
+
+            try self.autocomplete_catalog.append(self.allocator, .{
+                .value = value,
+                .label = label,
+                .description = description,
+            });
+        }
+    }
+
+    pub fn isShowingAutocomplete(self: *const Editor) bool {
+        return self.autocomplete_list != null;
+    }
+
+    pub fn selectedAutocompleteItem(self: *const Editor) ?select_list.SelectItem {
+        const list = self.autocomplete_list orelse return null;
+        return list.selectedItem();
+    }
+
+    pub fn renderAutocompleteInto(
+        self: *const Editor,
+        allocator: std.mem.Allocator,
+        width: usize,
+        lines: *component_mod.LineList,
+    ) std.mem.Allocator.Error!void {
+        const list = self.autocomplete_list orelse return;
+        try list.renderInto(allocator, width, lines);
+    }
+
     pub fn handleKey(self: *Editor, key: keys.Key) !HandleResult {
+        if (self.autocomplete_list) |*list| {
+            switch (key) {
+                .escape => {
+                    self.clearAutocomplete();
+                    return .handled;
+                },
+                .up, .down => {
+                    _ = list.handleKey(key);
+                    return .handled;
+                },
+                .tab, .enter => {
+                    try self.applySelectedAutocomplete();
+                    return .handled;
+                },
+                else => {},
+            }
+        }
+
         switch (key) {
             .printable => |printable| {
                 try self.insertSlice(printable.slice());
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
+            .tab => {
+                try self.refreshAutocomplete(true);
                 return .handled;
             },
             .enter => {
                 try self.insertSlice("\n");
+                self.clearAutocomplete();
                 return .handled;
             },
             .backspace => {
                 self.backspace();
+                try self.refreshAutocomplete(false);
                 return .handled;
             },
             .left => {
                 self.moveLeft();
+                try self.refreshAutocomplete(false);
                 return .handled;
             },
             .right => {
                 self.moveRight();
+                try self.refreshAutocomplete(false);
                 return .handled;
             },
             .up => {
                 self.moveVertical(-1);
+                try self.refreshAutocomplete(false);
                 return .handled;
             },
             .down => {
                 self.moveVertical(1);
+                try self.refreshAutocomplete(false);
                 return .handled;
             },
             .ctrl => |ctrl| switch (ctrl) {
@@ -133,6 +213,10 @@ pub const Editor = struct {
             }
         }
 
+        if (self.autocomplete_list) |list| {
+            try list.renderInto(allocator, effective_width, lines);
+        }
+
         for (0..self.padding_y) |_| {
             try component_mod.appendOwnedLine(lines, allocator, blank_line);
         }
@@ -158,12 +242,102 @@ pub const Editor = struct {
         self.cursor += slice.len;
     }
 
+    fn applySelectedAutocomplete(self: *Editor) !void {
+        const list = self.autocomplete_list orelse return;
+        const item = list.selectedItem() orelse {
+            self.clearAutocomplete();
+            return;
+        };
+        const range = self.currentAutocompleteRange(true) orelse {
+            self.clearAutocomplete();
+            return;
+        };
+        try self.replaceRange(range.start, range.end, item.value);
+        self.clearAutocomplete();
+    }
+
+    fn replaceRange(self: *Editor, start: usize, end: usize, replacement: []const u8) !void {
+        std.debug.assert(start <= end);
+        std.debug.assert(end <= self.buffer.items.len);
+
+        const removed_len = end - start;
+        const old_len = self.buffer.items.len;
+
+        if (replacement.len > removed_len) {
+            const growth = replacement.len - removed_len;
+            try self.buffer.ensureUnusedCapacity(self.allocator, growth);
+            self.buffer.items.len = old_len + growth;
+            std.mem.copyBackwards(u8, self.buffer.items[start + replacement.len ..], self.buffer.items[end..old_len]);
+        } else if (replacement.len < removed_len) {
+            const new_len = old_len - (removed_len - replacement.len);
+            std.mem.copyForwards(u8, self.buffer.items[start + replacement.len .. new_len], self.buffer.items[end..old_len]);
+            self.buffer.items.len = new_len;
+        }
+
+        @memcpy(self.buffer.items[start .. start + replacement.len], replacement);
+        self.cursor = start + replacement.len;
+    }
+
     fn backspace(self: *Editor) void {
         if (self.cursor == 0) return;
 
         const start = prevCodepointStart(self.buffer.items, self.cursor);
         deleteRange(&self.buffer, start, self.cursor);
         self.cursor = start;
+    }
+
+    fn refreshAutocomplete(self: *Editor, force_show_all: bool) !void {
+        self.clearAutocomplete();
+        if (self.autocomplete_catalog.items.len == 0) return;
+
+        const range = self.currentAutocompleteRange(force_show_all) orelse return;
+        const prefix = self.buffer.items[range.start..range.end];
+
+        const matches = try autocomplete.fuzzyFilterAlloc(self.allocator, self.autocomplete_catalog.items, prefix);
+        if (matches.len == 0) {
+            self.allocator.free(matches);
+            return;
+        }
+
+        self.autocomplete_matches = matches;
+        self.autocomplete_list = .{
+            .items = self.autocomplete_matches,
+            .max_visible = self.autocomplete_max_visible,
+        };
+    }
+
+    const Range = struct {
+        start: usize,
+        end: usize,
+    };
+
+    fn currentAutocompleteRange(self: *const Editor, force_show_all: bool) ?Range {
+        if (self.cursor > self.buffer.items.len) return null;
+
+        var start = self.cursor;
+        while (start > 0 and !isAutocompleteDelimiter(self.buffer.items[start - 1])) : (start -= 1) {}
+
+        if (!force_show_all and start == self.cursor) return null;
+        return .{ .start = start, .end = self.cursor };
+    }
+
+    fn clearAutocomplete(self: *Editor) void {
+        if (self.autocomplete_matches.len > 0) {
+            self.allocator.free(self.autocomplete_matches);
+        }
+        self.autocomplete_matches = &.{};
+        self.autocomplete_list = null;
+    }
+
+    fn freeAutocompleteCatalog(self: *Editor) void {
+        for (self.autocomplete_catalog.items) |item| {
+            self.allocator.free(item.value);
+            self.allocator.free(item.label);
+            if (item.description) |description| self.allocator.free(description);
+        }
+        self.autocomplete_catalog.clearRetainingCapacity();
+        self.autocomplete_catalog.deinit(self.allocator);
+        self.autocomplete_catalog = .empty;
     }
 
     fn moveLeft(self: *Editor) void {
@@ -280,6 +454,13 @@ fn indexForColumn(text: []const u8, start: usize, end: usize, target_column: usi
     return cursor;
 }
 
+fn isAutocompleteDelimiter(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r' => true,
+        else => false,
+    };
+}
+
 test "editor accepts typed characters and renders content" {
     const allocator = std.testing.allocator;
 
@@ -347,4 +528,68 @@ test "editor backspace deletes before cursor" {
 
     try std.testing.expectEqualStrings("helo", editor.text());
     try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 3 }, editor.cursorPosition());
+}
+
+test "editor shows fuzzy-ranked autocomplete suggestions as user types" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]select_list.SelectItem{
+        .{ .value = "reload", .label = "reload" },
+        .{ .value = "read", .label = "read" },
+        .{ .value = "render", .label = "render" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("r") });
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("d") });
+
+    try std.testing.expect(editor.isShowingAutocomplete());
+    try std.testing.expectEqualStrings("read", editor.selectedAutocompleteItem().?.value);
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+    try editor.renderInto(allocator, 16, &lines);
+
+    try std.testing.expect(lines.items.len >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "read") != null);
+}
+
+test "editor autocomplete navigates suggestions and applies tab selection" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]select_list.SelectItem{
+        .{ .value = "apple", .label = "apple" },
+        .{ .value = "apricot", .label = "apricot" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("a") });
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("p") });
+    _ = try editor.handleKey(.down);
+    _ = try editor.handleKey(.tab);
+
+    try std.testing.expectEqualStrings("apricot", editor.text());
+    try std.testing.expect(!editor.isShowingAutocomplete());
+}
+
+test "editor autocomplete enter confirms selection without inserting newline" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]select_list.SelectItem{
+        .{ .value = "model", .label = "model" },
+        .{ .value = "modern", .label = "modern" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("m") });
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("o") });
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("d") });
+    _ = try editor.handleKey(.down);
+    _ = try editor.handleKey(.enter);
+
+    try std.testing.expectEqualStrings("modern", editor.text());
+    try std.testing.expect(std.mem.indexOfScalar(u8, editor.text(), '\n') == null);
 }

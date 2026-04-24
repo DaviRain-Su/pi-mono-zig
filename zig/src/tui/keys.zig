@@ -20,6 +20,7 @@ pub const PrintableKey = struct {
 pub const Key = union(enum) {
     printable: PrintableKey,
     ctrl: u8,
+    tab,
     enter,
     backspace,
     escape,
@@ -43,9 +44,10 @@ pub fn parseKey(input: []const u8) ?ParseResult {
     }
 
     switch (first) {
+        0x09 => return .{ .key = .tab, .consumed = 1 },
         0x7f, 0x08 => return .{ .key = .backspace, .consumed = 1 },
         0x1b => return parseEscapeSequence(input),
-        0x01...0x07, 0x09, 0x0b, 0x0c, 0x0e...0x1a => return .{
+        0x01...0x07, 0x0b, 0x0c, 0x0e...0x1a => return .{
             .key = .{ .ctrl = @as(u8, 'a') + first - 1 },
             .consumed = 1,
         },
@@ -104,6 +106,7 @@ test "parse arrow keys from escape sequences" {
 
 test "parse enter backspace and ctrl sequences" {
     try std.testing.expectEqualDeep(ParseResult{ .key = .enter, .consumed = 1 }, parseKey("\r").?);
+    try std.testing.expectEqualDeep(ParseResult{ .key = .tab, .consumed = 1 }, parseKey("\t").?);
     try std.testing.expectEqualDeep(ParseResult{ .key = .backspace, .consumed = 1 }, parseKey("\x7f").?);
     try std.testing.expectEqualDeep(ParseResult{ .key = .{ .ctrl = 'c' }, .consumed = 1 }, parseKey("\x03").?);
     try std.testing.expectEqualDeep(ParseResult{ .key = .{ .ctrl = 'd' }, .consumed = 1 }, parseKey("\x04").?);
