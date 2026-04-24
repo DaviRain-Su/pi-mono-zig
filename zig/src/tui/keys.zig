@@ -29,6 +29,8 @@ pub const Key = union(enum) {
     down,
     left,
     right,
+    ctrl_left,
+    ctrl_right,
     home,
     end,
     insert,
@@ -219,6 +221,8 @@ fn parseCompleteCsiSequence(sequence: []const u8) ParseResult {
     if (std.mem.eql(u8, sequence, "\x1b[B")) return parsed(.down, sequence.len);
     if (std.mem.eql(u8, sequence, "\x1b[C")) return parsed(.right, sequence.len);
     if (std.mem.eql(u8, sequence, "\x1b[D")) return parsed(.left, sequence.len);
+    if (std.mem.eql(u8, sequence, "\x1b[1;5C") or std.mem.eql(u8, sequence, "\x1b[5C")) return parsed(.ctrl_right, sequence.len);
+    if (std.mem.eql(u8, sequence, "\x1b[1;5D") or std.mem.eql(u8, sequence, "\x1b[5D")) return parsed(.ctrl_left, sequence.len);
     if (std.mem.eql(u8, sequence, "\x1b[H") or std.mem.eql(u8, sequence, "\x1b[1~") or std.mem.eql(u8, sequence, "\x1b[7~")) {
         return parsed(.home, sequence.len);
     }
@@ -260,6 +264,8 @@ fn parseSs3Sequence(input: []const u8, mode: ParseMode) ParseResult {
         'B' => parsed(.down, 3),
         'C' => parsed(.right, 3),
         'D' => parsed(.left, 3),
+        'c' => parsed(.ctrl_right, 3),
+        'd' => parsed(.ctrl_left, 3),
         'H' => parsed(.home, 3),
         'F' => parsed(.end, 3),
         'P' => parsed(.f1, 3),
@@ -338,6 +344,10 @@ test "flushKey keeps incomplete UTF-8 buffered until the sequence is complete" {
 test "parse home end function and bracketed paste sequences" {
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .home, .consumed = 3 } }, parseKey("\x1bOH").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .end, .consumed = 3 } }, parseKey("\x1bOF").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_left, .consumed = 6 } }, parseKey("\x1b[1;5D").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_right, .consumed = 6 } }, parseKey("\x1b[1;5C").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_left, .consumed = 3 } }, parseKey("\x1bOd").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_right, .consumed = 3 } }, parseKey("\x1bOc").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .page_up, .consumed = 4 } }, parseKey("\x1b[5~").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f1, .consumed = 3 } }, parseKey("\x1bOP").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f12, .consumed = 5 } }, parseKey("\x1b[24~").?);
