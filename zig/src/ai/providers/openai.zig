@@ -924,7 +924,7 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Val
     errdefer func_obj.deinit(allocator);
     try func_obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tool.name) });
     try func_obj.put(allocator, try allocator.dupe(u8, "description"), std.json.Value{ .string = try allocator.dupe(u8, tool.description) });
-    try func_obj.put(allocator, try allocator.dupe(u8, "parameters"), tool.parameters);
+    try func_obj.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
     try func_obj.put(allocator, try allocator.dupe(u8, "strict"), std.json.Value{ .bool = false });
 
     try obj.put(allocator, try allocator.dupe(u8, "function"), std.json.Value{ .object = func_obj });
@@ -1043,11 +1043,15 @@ test "buildRequestPayload with tools" {
         .max_tokens = 4096,
     };
 
+    var tool_schema = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    defer freeJsonValue(allocator, tool_schema);
+    try tool_schema.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
+
     const tools = &[_]types.Tool{
         .{
             .name = "get_weather",
             .description = "Get the weather for a location",
-            .parameters = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) },
+            .parameters = tool_schema,
         },
     };
 
@@ -1057,17 +1061,23 @@ test "buildRequestPayload with tools" {
         .tools = tools,
     };
 
-    const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    {
+        const payload = try buildRequestPayload(allocator, model, context, null);
+        defer freeJsonValue(allocator, payload);
 
-    const tools_val = payload.object.get("tools").?;
-    try std.testing.expect(tools_val == .array);
-    try std.testing.expectEqual(@as(usize, 1), tools_val.array.items.len);
+        const tools_val = payload.object.get("tools").?;
+        try std.testing.expect(tools_val == .array);
+        try std.testing.expectEqual(@as(usize, 1), tools_val.array.items.len);
 
-    const tool = tools_val.array.items[0];
-    try std.testing.expect(tool == .object);
-    const tool_type = tool.object.get("type").?;
-    try std.testing.expectEqualStrings("function", tool_type.string);
+        const tool = tools_val.array.items[0];
+        try std.testing.expect(tool == .object);
+        const tool_type = tool.object.get("type").?;
+        try std.testing.expectEqualStrings("function", tool_type.string);
+    }
+
+    const schema_type = tool_schema.object.get("type").?;
+    try std.testing.expectEqualStrings("object", schema_type.string);
+    try tool_schema.object.put(allocator, try allocator.dupe(u8, "required"), .{ .array = std.json.Array.init(allocator) });
 }
 
 test "buildRequestPayload with image content" {
