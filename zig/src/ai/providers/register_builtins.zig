@@ -791,7 +791,7 @@ fn testModelForApi(api: []const u8) types.Model {
             .name = "Gemini CLI Pro",
             .api = api,
             .provider = "google-gemini-cli",
-            .base_url = "https://generativelanguage.googleapis.com/v1beta",
+            .base_url = "https://cloudcode-pa.googleapis.com",
             .reasoning = true,
             .input_types = text_and_image_input,
             .context_window = 1048576,
@@ -854,11 +854,18 @@ fn validateHandoffPayload(allocator: std.mem.Allocator, model: types.Model, cont
     }
 
     if (std.mem.eql(u8, model.api, "google-generative-ai") or
-        std.mem.eql(u8, model.api, "google-gemini-cli") or
         std.mem.eql(u8, model.api, "google-vertex"))
     {
         const payload = try google.buildRequestPayload(allocator, model, context, null);
         try expectJsonArrayField(payload, "contents");
+        return;
+    }
+
+    if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
+        const payload = try google_gemini_cli.buildRequestPayload(allocator, model, context, "project-1", null);
+        const request = payload.object.get("request") orelse return error.MissingField;
+        try std.testing.expect(request == .object);
+        try expectJsonArrayField(request, "contents");
         return;
     }
 
