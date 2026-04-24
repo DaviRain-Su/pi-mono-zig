@@ -263,6 +263,15 @@ pub const SessionManager = struct {
         return self.session_file;
     }
 
+    pub fn getSessionName(self: *const SessionManager) ?[]const u8 {
+        const session_file = self.getSessionFile() orelse return null;
+        const basename = std.fs.path.basename(session_file);
+        if (std.mem.endsWith(u8, basename, ".jsonl")) {
+            return basename[0 .. basename.len - ".jsonl".len];
+        }
+        return basename;
+    }
+
     pub fn getLeafId(self: *const SessionManager) ?[]const u8 {
         return self.leaf_id;
     }
@@ -502,6 +511,31 @@ pub const SessionManager = struct {
         }
 
         return try roots.toOwnedSlice(allocator);
+    }
+
+    pub fn exportJson(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        output_path: []const u8,
+    ) !void {
+        var entries = std.json.Array.init(allocator);
+        errdefer common.deinitJsonValue(allocator, .{ .array = entries });
+
+        for (self.entries.items) |entry| {
+            try entries.append(try entryToJsonValue(allocator, entry));
+        }
+
+        var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        errdefer common.deinitJsonValue(allocator, .{ .object = root });
+        try root.put(allocator, try allocator.dupe(u8, "header"), try headerToJsonValue(allocator, self.header));
+        try root.put(allocator, try allocator.dupe(u8, "entries"), .{ .array = entries });
+
+        const json_value = std.json.Value{ .object = root };
+        defer common.deinitJsonValue(allocator, json_value);
+        const bytes = try std.json.Stringify.valueAlloc(allocator, json_value, .{ .whitespace = .indent_2 });
+        defer allocator.free(bytes);
+        try common.writeFileAbsolute(io, output_path, bytes, true);
     }
 
     fn buildTreeNode(self: *const SessionManager, allocator: std.mem.Allocator, entry: *const SessionEntry) !SessionTreeNode {

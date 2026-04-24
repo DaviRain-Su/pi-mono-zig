@@ -62,6 +62,7 @@ pub fn resolveProviderConfig(
     provider: []const u8,
     model_override: ?[]const u8,
     api_key_override: ?[]const u8,
+    configured_api_key: ?[]const u8,
 ) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
     if (std.mem.eql(u8, provider, "faux")) {
         return try resolveFauxProvider(allocator, env_map, model_override);
@@ -74,7 +75,7 @@ pub fn resolveProviderConfig(
         null;
     errdefer if (owned_api_key) |api_key| allocator.free(api_key);
 
-    const api_key = api_key_override orelse owned_api_key orelse return error.MissingApiKey;
+    const api_key = api_key_override orelse configured_api_key orelse owned_api_key orelse return error.MissingApiKey;
     const model_id = model_override orelse descriptor.default_model_id orelse provider;
     const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(descriptor, model_id);
 
@@ -322,7 +323,7 @@ test "resolveProviderConfig uses canonical defaults from model registry" {
 
     try env_map.put("OPENAI_API_KEY", "openai-key");
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null);
+    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null, null);
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("openai-key", resolved.api_key.?);
@@ -344,7 +345,7 @@ test "resolveProviderConfig supports non-legacy built-in providers" {
 
     try env_map.put("MISTRAL_API_KEY", "mistral-key");
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "mistral", "devstral-medium-latest", null);
+    var resolved = try resolveProviderConfig(allocator, &env_map, "mistral", "devstral-medium-latest", null, null);
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("mistral-key", resolved.api_key.?);
@@ -352,6 +353,19 @@ test "resolveProviderConfig supports non-legacy built-in providers" {
     try std.testing.expectEqualStrings("Devstral Medium Latest", resolved.model.name);
     try std.testing.expectEqualStrings("mistral-conversations", resolved.model.api);
     try std.testing.expectEqualStrings("mistral", resolved.model.provider);
+}
+
+test "resolveProviderConfig uses configured api key when env is missing" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null, "configured-openai-key");
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
+    try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
 }
 
 test "listAvailableModels enumerates all built-in providers" {

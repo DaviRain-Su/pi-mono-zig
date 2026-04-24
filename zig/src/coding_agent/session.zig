@@ -228,6 +228,7 @@ pub const AgentSession = struct {
         defer self.allocator.free(branch_entries);
 
         const preparation = prepareCompaction(branch_entries, self.compaction_settings.keep_recent_tokens) orelse
+            prepareManualCompaction(branch_entries) orelse
             return error.NothingToCompact;
 
         const summary = try buildCompactionSummary(
@@ -551,6 +552,37 @@ fn prepareCompaction(
     return .{
         .summary_start_index = summary_start_index,
         .first_kept_entry_index = first_kept_entry_index,
+        .tokens_before = tokens_before,
+    };
+}
+
+fn prepareManualCompaction(branch_entries: []const *const session_manager.SessionEntry) ?CompactionPreparation {
+    if (branch_entries.len == 0) return null;
+
+    var latest_compaction_index: ?usize = null;
+    for (branch_entries, 0..) |entry, index| {
+        if (entry.* == .compaction) latest_compaction_index = index;
+    }
+
+    const summary_start_index = if (latest_compaction_index) |index| index + 1 else 0;
+    if (summary_start_index >= branch_entries.len) return null;
+
+    var visible_count: usize = 0;
+    var last_visible_index: ?usize = null;
+    var tokens_before: u32 = 0;
+    for (branch_entries[summary_start_index..], summary_start_index..) |entry, index| {
+        const entry_tokens = visibleEntryTokens(entry.*);
+        if (entry_tokens == 0) continue;
+        visible_count += 1;
+        last_visible_index = index;
+        tokens_before += entry_tokens;
+    }
+
+    if (visible_count < 2 or last_visible_index == null) return null;
+
+    return .{
+        .summary_start_index = summary_start_index,
+        .first_kept_entry_index = last_visible_index.?,
         .tokens_before = tokens_before,
     };
 }

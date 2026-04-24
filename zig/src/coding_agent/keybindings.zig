@@ -77,11 +77,11 @@ const BindingDefinition = struct {
 };
 
 const DEFINITIONS = [_]BindingDefinition{
-    .{ .action = .interrupt, .id = "app.interrupt", .defaults = &.{ "ctrl+c" } },
+    .{ .action = .interrupt, .id = "app.interrupt", .defaults = &.{"ctrl+c"} },
     .{ .action = .exit, .id = "app.exit", .defaults = &.{ "ctrl+d", "escape" } },
-    .{ .action = .clear, .id = "app.clear", .defaults = &.{ "ctrl+l" } },
-    .{ .action = .open_sessions, .id = "app.session.select", .defaults = &.{ "ctrl+s" } },
-    .{ .action = .open_models, .id = "app.model.select", .defaults = &.{ "ctrl+p" } },
+    .{ .action = .clear, .id = "app.clear", .defaults = &.{"ctrl+l"} },
+    .{ .action = .open_sessions, .id = "app.session.select", .defaults = &.{"ctrl+s"} },
+    .{ .action = .open_models, .id = "app.model.select", .defaults = &.{"ctrl+p"} },
 };
 
 pub const Keybindings = struct {

@@ -1,9 +1,34 @@
 const std = @import("std");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
+const config_mod = @import("coding_agent/config.zig");
+const context_files_mod = @import("coding_agent/context_files.zig");
+const resources_mod = @import("coding_agent/resources.zig");
 const coding_agent = @import("coding_agent/root.zig");
 
 const VERSION = "0.1.0";
+
+const PreparedCliRuntime = struct {
+    runtime_config: config_mod.RuntimeConfig,
+    resource_bundle: resources_mod.ResourceBundle,
+    context_files: []context_files_mod.ContextFile,
+    system_prompt: []u8,
+    session_dir: []u8,
+    expanded_prompt: ?[]u8,
+    provider_name: []const u8,
+    model_name: ?[]const u8,
+    thinking_level: agent.ThinkingLevel,
+
+    fn deinit(self: *PreparedCliRuntime, allocator: std.mem.Allocator) void {
+        if (self.expanded_prompt) |prompt| allocator.free(prompt);
+        allocator.free(self.session_dir);
+        allocator.free(self.system_prompt);
+        context_files_mod.deinitContextFiles(allocator, self.context_files);
+        self.resource_bundle.deinit(allocator);
+        self.runtime_config.deinit();
+        self.* = undefined;
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
@@ -64,7 +89,6 @@ pub fn runCli(
         return 1;
     }
 
-    const provider_name = options.provider orelse "openai";
     const selected_tools = effectiveToolSelection(&options);
     const cwd = if (cwd_override) |override| blk: {
         break :blk try allocator.dupe(u8, override);
@@ -75,25 +99,19 @@ pub fn runCli(
     };
     defer allocator.free(cwd);
 
-    const current_date = try currentDateString(allocator, io);
-    defer allocator.free(current_date);
-    const system_prompt = try coding_agent.buildSystemPrompt(allocator, .{
-        .cwd = cwd,
-        .current_date = current_date,
-        .custom_prompt = options.system_prompt,
-        .append_prompt = options.append_system_prompt,
-        .selected_tools = selected_tools,
-    });
-    defer allocator.free(system_prompt);
+    var prepared = try prepareCliRuntime(allocator, io, env_map, cwd, &options, selected_tools);
+    defer prepared.deinit(allocator);
+    try writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
 
     var provider_runtime = coding_agent.resolveProviderConfig(
         allocator,
         env_map,
-        provider_name,
-        options.model,
+        prepared.provider_name,
+        prepared.model_name,
         options.api_key,
+        prepared.runtime_config.lookupApiKey(prepared.provider_name),
     ) catch |err| {
-        try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, provider_name)});
+        try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, prepared.provider_name)});
         return 1;
     };
     defer provider_runtime.deinit(allocator);
@@ -108,24 +126,26 @@ pub fn runCli(
         var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, selected_tools);
         defer built_tools.deinit();
 
-        const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
-        defer allocator.free(session_dir);
-
         var session = try coding_agent.interactive_mode.openInitialSession(
             allocator,
             io,
-            session_dir,
+            prepared.session_dir,
             .{
                 .cwd = cwd,
-                .system_prompt = system_prompt,
-                .provider = provider_name,
-                .model = options.model,
+                .system_prompt = prepared.system_prompt,
+                .session_dir = prepared.session_dir,
+                .provider = prepared.provider_name,
+                .model = prepared.model_name,
                 .api_key = options.api_key,
-                .thinking = mapThinkingLevel(options.thinking),
+                .thinking = prepared.thinking_level,
                 .session = options.session,
                 .@"continue" = options.@"continue",
                 .selected_tools = selected_tools,
                 .initial_prompt = null,
+                .prompt_templates = prepared.resource_bundle.prompt_templates,
+                .keybindings = &prepared.runtime_config.keybindings,
+                .theme = prepared.resource_bundle.selectedTheme(),
+                .runtime_config = &prepared.runtime_config,
             },
             provider_runtime.model,
             provider_runtime.api_key,
@@ -148,7 +168,7 @@ pub fn runCli(
             allocator,
             io,
             &session,
-            options.prompt.?,
+            prepared.expanded_prompt.?,
             .{
                 .mode = switch (options.mode) {
                     .json => .json,
@@ -166,15 +186,20 @@ pub fn runCli(
         env_map,
         .{
             .cwd = cwd,
-            .system_prompt = system_prompt,
-            .provider = provider_name,
-            .model = options.model,
+            .system_prompt = prepared.system_prompt,
+            .session_dir = prepared.session_dir,
+            .provider = prepared.provider_name,
+            .model = prepared.model_name,
             .api_key = options.api_key,
-            .thinking = mapThinkingLevel(options.thinking),
+            .thinking = prepared.thinking_level,
             .session = options.session,
             .@"continue" = options.@"continue",
             .selected_tools = selected_tools,
-            .initial_prompt = options.prompt,
+            .initial_prompt = prepared.expanded_prompt,
+            .prompt_templates = prepared.resource_bundle.prompt_templates,
+            .keybindings = &prepared.runtime_config.keybindings,
+            .theme = prepared.resource_bundle.selectedTheme(),
+            .runtime_config = &prepared.runtime_config,
         },
         stderr,
     );
@@ -228,8 +253,94 @@ fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     try stderr.flush();
 }
 
-fn mapThinkingLevel(level: ?cli.ThinkingLevel) agent.ThinkingLevel {
-    return switch (level orelse .off) {
+fn prepareCliRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    options: *const cli.Args,
+    selected_tools: ?[]const []const u8,
+) !PreparedCliRuntime {
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, cwd);
+    errdefer runtime_config.deinit();
+
+    var resource_bundle = try resources_mod.loadResourceBundle(allocator, io, .{
+        .cwd = cwd,
+        .agent_dir = runtime_config.agent_dir,
+        .global = settingsResources(runtime_config.global_settings),
+        .project = settingsResources(runtime_config.project_settings),
+    });
+    errdefer resource_bundle.deinit(allocator);
+
+    const context_files = try context_files_mod.loadContextFiles(allocator, io, cwd);
+    errdefer context_files_mod.deinitContextFiles(allocator, context_files);
+
+    const current_date = try currentDateString(allocator, io);
+    defer allocator.free(current_date);
+
+    const provider_name = options.provider orelse runtime_config.settings.default_provider orelse "openai";
+    const model_name = options.model orelse runtime_config.settings.default_model;
+    const thinking_level = if (options.thinking) |level|
+        mapThinkingLevel(level)
+    else
+        runtime_config.settings.default_thinking_level orelse .off;
+
+    const system_prompt = try coding_agent.buildSystemPrompt(allocator, .{
+        .cwd = cwd,
+        .current_date = current_date,
+        .custom_prompt = options.system_prompt,
+        .append_prompt = options.append_system_prompt,
+        .selected_tools = selected_tools,
+        .context_files = context_files,
+        .skills = resource_bundle.skills,
+    });
+    errdefer allocator.free(system_prompt);
+
+    const session_dir = try runtime_config.effectiveSessionDir(allocator, env_map, cwd);
+    errdefer allocator.free(session_dir);
+
+    const expanded_prompt = if (options.prompt) |prompt|
+        try resources_mod.expandPromptTemplate(allocator, prompt, resource_bundle.prompt_templates)
+    else
+        null;
+    errdefer if (expanded_prompt) |value| allocator.free(value);
+
+    return .{
+        .runtime_config = runtime_config,
+        .resource_bundle = resource_bundle,
+        .context_files = context_files,
+        .system_prompt = system_prompt,
+        .session_dir = session_dir,
+        .expanded_prompt = expanded_prompt,
+        .provider_name = provider_name,
+        .model_name = model_name,
+        .thinking_level = thinking_level,
+    };
+}
+
+fn settingsResources(settings: config_mod.Settings) resources_mod.SettingsResources {
+    return .{
+        .packages = settings.packages,
+        .extensions = settings.extensions,
+        .skills = settings.skills,
+        .prompts = settings.prompts,
+        .themes = settings.themes,
+        .theme = settings.theme,
+    };
+}
+
+fn writeResourceDiagnostics(stderr: *std.Io.Writer, diagnostics: []const resources_mod.Diagnostic) !void {
+    for (diagnostics) |diagnostic| {
+        if (diagnostic.path) |path| {
+            try stderr.print("Warning: {s}: {s} ({s})\n", .{ diagnostic.kind, diagnostic.message, path });
+        } else {
+            try stderr.print("Warning: {s}: {s}\n", .{ diagnostic.kind, diagnostic.message });
+        }
+    }
+}
+
+fn mapThinkingLevel(level: cli.ThinkingLevel) agent.ThinkingLevel {
+    return switch (level) {
         .off => .off,
         .minimal => .minimal,
         .low => .low,
@@ -365,4 +476,97 @@ test "runCli persists and continues sessions across runs" {
     try std.testing.expectEqualStrings("first reply", context.messages[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings("second prompt", context.messages[2].user.content[0].text.text);
     try std.testing.expectEqualStrings("second reply", context.messages[3].assistant.content[0].text.text);
+}
+
+test "prepareCliRuntime loads defaults resources context and prompt templates" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/skills/reviewer");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/prompts");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/themes");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "defaultProvider": "faux",
+        \\  "defaultModel": "faux-1",
+        \\  "defaultThinkingLevel": "minimal",
+        \\  "sessionDir": "~/sessions"
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/settings.json",
+        .data =
+        \\{
+        \\  "theme": "night"
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/AGENTS.md",
+        .data = "Project instructions from AGENTS.md",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/skills/reviewer/SKILL.md",
+        .data =
+        \\---
+        \\description: Review code changes
+        \\---
+        \\Use the review checklist.
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/prompts/fix.md",
+        .data = "Fix $ARGUMENTS please.",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/themes/night.json",
+        .data =
+        \\{
+        \\  "name": "night",
+        \\  "tokens": {
+        \\    "assistant": { "fg": "cyan" }
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var args = try cli.parseArgs(allocator, &.{
+        "--tools",
+        "read,ls",
+        "/fix parser bug",
+    });
+    defer args.deinit(allocator);
+
+    const selected_tools = effectiveToolSelection(&args);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, selected_tools);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqualStrings("faux", prepared.provider_name);
+    try std.testing.expectEqualStrings("faux-1", prepared.model_name.?);
+    try std.testing.expectEqual(agent.ThinkingLevel.minimal, prepared.thinking_level);
+    try std.testing.expectEqualStrings("night", prepared.resource_bundle.selectedTheme().name);
+    try std.testing.expectEqualStrings("Fix parser bug please.", prepared.expanded_prompt.?);
+    try std.testing.expect(prepared.context_files.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Project instructions from AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "<available_skills>") != null);
+
+    const expected_session_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, "sessions" });
+    defer allocator.free(expected_session_dir);
+    try std.testing.expectEqualStrings(expected_session_dir, prepared.session_dir);
 }
