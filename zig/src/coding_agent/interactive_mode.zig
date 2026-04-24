@@ -3602,6 +3602,120 @@ test "app state streams assistant updates and records tool results" {
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Tool result bash: /tmp") != null);
 }
 
+test "interactive tool conversation renders tool lines and persists session entries" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const file_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "note.txt" });
+    defer allocator.free(file_path);
+    try common.writeFileAbsolute(std.testing.io, file_path, "secret note", true);
+
+    const tool_args_json = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\"}}", .{file_path});
+    defer allocator.free(tool_args_json);
+    try env_map.put("PI_FAUX_TOOL_NAME", "read");
+    try env_map.put("PI_FAUX_TOOL_ARGS_JSON", tool_args_json);
+    try env_map.put("PI_FAUX_TOOL_FINAL_RESPONSE", "The file says: secret note");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    setToolRuntime(.{
+        .cwd = root_dir,
+        .io = std.testing.io,
+    });
+    defer clearToolRuntime();
+
+    var built_tools = try buildAgentTools(allocator, &[_][]const u8{"read"});
+    defer built_tools.deinit();
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+        .tools = built_tools.items,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter(current_provider.model.id, currentSessionLabel(&session));
+
+    const subscriber = agent.AgentSubscriber{
+        .context = &state,
+        .callback = handleAppAgentEvent,
+    };
+    try session.agent.subscribe(subscriber);
+    defer _ = session.agent.unsubscribe(subscriber);
+
+    try session.prompt("what is in the file?");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 24,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 240, &lines);
+
+    var saw_user = false;
+    var saw_tool_call = false;
+    var saw_tool_result = false;
+    var saw_assistant_prefix = false;
+    var saw_final_response = false;
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line, "You: what is in the file?") != null) saw_user = true;
+        if (std.mem.indexOf(u8, line, "Tool read:") != null and std.mem.indexOf(u8, line, file_path) != null) saw_tool_call = true;
+        if (std.mem.indexOf(u8, line, "Tool result read: secret note") != null) saw_tool_result = true;
+        if (std.mem.indexOf(u8, line, ASSISTANT_PREFIX) != null) saw_assistant_prefix = true;
+        if (std.mem.indexOf(u8, line, "The file says: secret note") != null) saw_final_response = true;
+    }
+    try std.testing.expect(saw_user);
+    try std.testing.expect(saw_tool_call);
+    try std.testing.expect(saw_tool_result);
+    try std.testing.expect(saw_assistant_prefix);
+    try std.testing.expect(saw_final_response);
+
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+
+    const session_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .limited(1024 * 1024));
+    defer allocator.free(session_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, session_bytes, "\"type\":\"toolCall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session_bytes, "\"toolCallId\"") != null);
+
+    var reopened = try session_manager_mod.SessionManager.open(allocator, std.testing.io, session_file, root_dir);
+    defer reopened.deinit();
+
+    var context = try reopened.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("what is in the file?", context.messages[0].user.content[0].text.text);
+    try std.testing.expect(context.messages[1].assistant.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), context.messages[1].assistant.tool_calls.?.len);
+    try std.testing.expectEqualStrings("read", context.messages[1].assistant.tool_calls.?[0].name);
+    try std.testing.expectEqualStrings(file_path, context.messages[1].assistant.tool_calls.?[0].arguments.object.get("path").?.string);
+    try std.testing.expectEqualStrings("read", context.messages[2].tool_result.tool_name);
+    try std.testing.expectEqualStrings("secret note", context.messages[2].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("The file says: secret note", context.messages[3].assistant.content[0].text.text);
+}
+
 fn makeInteractiveTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
     if (name.len == 0) {
         const relative_root = try std.fs.path.join(allocator, &[_][]const u8{
