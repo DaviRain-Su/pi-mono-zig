@@ -3,11 +3,43 @@ const ansi = @import("ansi.zig");
 const component_mod = @import("component.zig");
 const terminal_mod = @import("terminal.zig");
 
+pub const OverlayAnchor = enum {
+    center,
+    top_left,
+    top_right,
+    bottom_left,
+    bottom_right,
+    top_center,
+    bottom_center,
+    left_center,
+    right_center,
+};
+
+pub const OverlayMargin = struct {
+    top: usize = 0,
+    right: usize = 0,
+    bottom: usize = 0,
+    left: usize = 0,
+};
+
+pub const OverlayOptions = struct {
+    width: ?usize = null,
+    max_height: ?usize = null,
+    anchor: OverlayAnchor = .center,
+    offset_x: isize = 0,
+    offset_y: isize = 0,
+    row: ?usize = null,
+    col: ?usize = null,
+    margin: OverlayMargin = .{},
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     terminal: *terminal_mod.Terminal,
     previous_lines: component_mod.LineList = .empty,
     previous_size: ?terminal_mod.Size = null,
+    overlays: std.ArrayList(OverlayEntry) = .empty,
+    next_overlay_id: usize = 1,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *terminal_mod.Terminal) Renderer {
         return .{
@@ -18,7 +50,38 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         component_mod.freeLines(self.allocator, &self.previous_lines);
+        self.overlays.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn showOverlay(self: *Renderer, component: component_mod.Component, options: OverlayOptions) !usize {
+        const id = self.next_overlay_id;
+        self.next_overlay_id += 1;
+        try self.overlays.append(self.allocator, .{
+            .id = id,
+            .component = component,
+            .options = options,
+        });
+        return id;
+    }
+
+    pub fn removeOverlay(self: *Renderer, id: usize) bool {
+        for (self.overlays.items, 0..) |entry, index| {
+            if (entry.id != id) continue;
+            _ = self.overlays.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn dismissTopOverlay(self: *Renderer) bool {
+        if (self.overlays.items.len == 0) return false;
+        _ = self.overlays.pop();
+        return true;
+    }
+
+    pub fn hasOverlays(self: *const Renderer) bool {
+        return self.overlays.items.len > 0;
     }
 
     pub fn render(self: *Renderer, root: component_mod.Component) !void {
@@ -27,6 +90,7 @@ pub const Renderer = struct {
         var new_lines = component_mod.LineList.empty;
         defer component_mod.freeLines(self.allocator, &new_lines);
         try root.renderInto(self.allocator, size.width, &new_lines);
+        try self.compositeOverlays(size, &new_lines);
 
         if (self.previous_size == null or self.previous_size.?.width != size.width or self.previous_size.?.height != size.height) {
             try self.fullRedraw(new_lines.items);
@@ -78,69 +142,224 @@ pub const Renderer = struct {
             try self.previous_lines.append(self.allocator, try self.allocator.dupe(u8, line));
         }
     }
+
+    fn compositeOverlays(self: *Renderer, size: terminal_mod.Size, lines: *component_mod.LineList) !void {
+        if (self.overlays.items.len == 0) return;
+
+        try ensureLineCapacity(self.allocator, lines, size.height, size.width);
+
+        for (self.overlays.items) |entry| {
+            const width = resolveOverlayWidth(entry.options, size.width);
+
+            var overlay_lines = component_mod.LineList.empty;
+            defer component_mod.freeLines(self.allocator, &overlay_lines);
+            try entry.component.renderInto(self.allocator, width, &overlay_lines);
+
+            const overlay_height = if (entry.options.max_height) |max_height|
+                @min(overlay_lines.items.len, max_height)
+            else
+                overlay_lines.items.len;
+            if (overlay_height == 0) continue;
+
+            const layout = resolveOverlayLayout(entry.options, width, overlay_height, size);
+            try ensureLineCapacity(self.allocator, lines, @max(size.height, layout.row + overlay_height), size.width);
+
+            for (0..overlay_height) |row_offset| {
+                const target_row = layout.row + row_offset;
+                const composed = try compositeLineAt(
+                    self.allocator,
+                    lines.items[target_row],
+                    overlay_lines.items[row_offset],
+                    layout.col,
+                    width,
+                    size.width,
+                );
+                self.allocator.free(lines.items[target_row]);
+                lines.items[target_row] = composed;
+            }
+        }
+    }
+};
+
+const OverlayEntry = struct {
+    id: usize,
+    component: component_mod.Component,
+    options: OverlayOptions,
+};
+
+const OverlayLayout = struct {
+    row: usize,
+    col: usize,
+};
+
+fn ensureLineCapacity(
+    allocator: std.mem.Allocator,
+    lines: *component_mod.LineList,
+    target_len: usize,
+    width: usize,
+) std.mem.Allocator.Error!void {
+    while (lines.items.len < target_len) {
+        const blank = try allocator.alloc(u8, width);
+        @memset(blank, ' ');
+        try lines.append(allocator, blank);
+    }
+}
+
+fn resolveOverlayWidth(options: OverlayOptions, terminal_width: usize) usize {
+    const margin = options.margin;
+    const available_width = @max(terminal_width, margin.left + margin.right + 1) - margin.left - margin.right;
+    const preferred = options.width orelse available_width;
+    return @max(@as(usize, 1), @min(preferred, available_width));
+}
+
+fn resolveOverlayLayout(
+    options: OverlayOptions,
+    overlay_width: usize,
+    overlay_height: usize,
+    size: terminal_mod.Size,
+) OverlayLayout {
+    const margin = options.margin;
+    const available_width = @max(size.width, margin.left + margin.right + 1) - margin.left - margin.right;
+    const available_height = @max(size.height, margin.top + margin.bottom + 1) - margin.top - margin.bottom;
+
+    const width = @min(overlay_width, available_width);
+    const height = @min(overlay_height, available_height);
+
+    const max_col = margin.left + available_width - width;
+    const max_row = margin.top + available_height - height;
+
+    const anchor_col = switch (options.anchor) {
+        .top_left, .left_center, .bottom_left => margin.left,
+        .top_right, .right_center, .bottom_right => max_col,
+        .center, .top_center, .bottom_center => margin.left + (available_width - width) / 2,
+    };
+    const anchor_row = switch (options.anchor) {
+        .top_left, .top_center, .top_right => margin.top,
+        .bottom_left, .bottom_center, .bottom_right => max_row,
+        .center, .left_center, .right_center => margin.top + (available_height - height) / 2,
+    };
+
+    const base_col = options.col orelse anchor_col;
+    const base_row = options.row orelse anchor_row;
+
+    return .{
+        .row = clampPosition(base_row, options.offset_y, margin.top, max_row),
+        .col = clampPosition(base_col, options.offset_x, margin.left, max_col),
+    };
+}
+
+fn clampPosition(base: usize, offset: isize, min_value: usize, max_value: usize) usize {
+    const shifted = @as(isize, @intCast(base)) + offset;
+    const clamped = std.math.clamp(shifted, @as(isize, @intCast(min_value)), @as(isize, @intCast(max_value)));
+    return @intCast(clamped);
+}
+
+fn compositeLineAt(
+    allocator: std.mem.Allocator,
+    base_line: []const u8,
+    overlay_line: []const u8,
+    start_col: usize,
+    overlay_width: usize,
+    total_width: usize,
+) std.mem.Allocator.Error![]u8 {
+    const clamped_start = @min(start_col, total_width);
+    const clamped_overlay_width = @min(overlay_width, total_width - clamped_start);
+
+    const before = try ansi.sliceVisibleAlloc(allocator, base_line, 0, clamped_start);
+    defer allocator.free(before);
+
+    const overlay = try ansi.sliceVisibleAlloc(allocator, overlay_line, 0, clamped_overlay_width);
+    defer allocator.free(overlay);
+
+    const after_start = clamped_start + clamped_overlay_width;
+    const after = try ansi.sliceVisibleAlloc(allocator, base_line, after_start, total_width - after_start);
+    defer allocator.free(after);
+
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+
+    try builder.appendSlice(allocator, before);
+    const before_width = ansi.visibleWidth(before);
+    if (before_width < clamped_start) {
+        try builder.appendNTimes(allocator, ' ', clamped_start - before_width);
+    }
+
+    try builder.appendSlice(allocator, "\x1b[0m");
+    try builder.appendSlice(allocator, overlay);
+    const overlay_visible_width = ansi.visibleWidth(overlay);
+    if (overlay_visible_width < clamped_overlay_width) {
+        try builder.appendNTimes(allocator, ' ', clamped_overlay_width - overlay_visible_width);
+    }
+
+    try builder.appendSlice(allocator, "\x1b[0m");
+    try builder.appendSlice(allocator, after);
+
+    const composed = try ansi.padRightVisibleAlloc(allocator, builder.items, total_width);
+    builder.deinit(allocator);
+    return composed;
+}
+
+const TestMockBackend = struct {
+    size: terminal_mod.Size,
+    writes: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.writes.items) |entry| alloc.free(entry);
+        self.writes.deinit(alloc);
+    }
+
+    fn backend(self: *@This()) terminal_mod.Backend {
+        return .{
+            .ptr = self,
+            .enterRawModeFn = enterRawMode,
+            .restoreModeFn = restoreMode,
+            .writeFn = write,
+            .getSizeFn = getSize,
+        };
+    }
+
+    fn enterRawMode(_: *anyopaque) !void {}
+    fn restoreMode(_: *anyopaque) !void {}
+
+    fn write(ptr: *anyopaque, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
+    }
+
+    fn getSize(ptr: *anyopaque) !terminal_mod.Size {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.size;
+    }
+};
+
+const TestStaticComponent = struct {
+    lines: []const []const u8,
+
+    fn component(self: *const @This()) component_mod.Component {
+        return .{
+            .ptr = self,
+            .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    fn renderInto(self: *const @This(), alloc: std.mem.Allocator, width: usize, lines: *component_mod.LineList) !void {
+        for (self.lines) |line| {
+            const padded = try ansi.padRightVisibleAlloc(alloc, line, width);
+            defer alloc.free(padded);
+            try component_mod.appendOwnedLine(lines, alloc, padded);
+        }
+    }
+
+    fn renderIntoOpaque(ptr: *const anyopaque, alloc: std.mem.Allocator, width: usize, lines: *component_mod.LineList) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.renderInto(alloc, width, lines);
+    }
 };
 
 test "differential renderer only redraws changed lines" {
     const allocator = std.testing.allocator;
 
-    const MockBackend = struct {
-        size: terminal_mod.Size = .{ .width = 12, .height = 4 },
-        writes: std.ArrayList([]u8) = .empty,
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            for (self.writes.items) |entry| alloc.free(entry);
-            self.writes.deinit(alloc);
-        }
-
-        fn backend(self: *@This()) terminal_mod.Backend {
-            return .{
-                .ptr = self,
-                .enterRawModeFn = enterRawMode,
-                .restoreModeFn = restoreMode,
-                .writeFn = write,
-                .getSizeFn = getSize,
-            };
-        }
-
-        fn enterRawMode(_: *anyopaque) !void {}
-        fn restoreMode(_: *anyopaque) !void {}
-
-        fn write(ptr: *anyopaque, bytes: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.writes.append(allocator, try allocator.dupe(u8, bytes));
-        }
-
-        fn getSize(ptr: *anyopaque) !terminal_mod.Size {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.size;
-        }
-    };
-
-    const StaticComponent = struct {
-        lines: []const []const u8,
-
-        fn component(self: *const @This()) component_mod.Component {
-            return .{
-                .ptr = self,
-                .renderIntoFn = renderIntoOpaque,
-            };
-        }
-
-        fn renderInto(self: *const @This(), alloc: std.mem.Allocator, width: usize, lines: *component_mod.LineList) !void {
-            for (self.lines) |line| {
-                const padded = try ansi.padRightVisibleAlloc(alloc, line, width);
-                defer alloc.free(padded);
-                try component_mod.appendOwnedLine(lines, alloc, padded);
-            }
-        }
-
-        fn renderIntoOpaque(ptr: *const anyopaque, alloc: std.mem.Allocator, width: usize, lines: *component_mod.LineList) !void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            try self.renderInto(alloc, width, lines);
-        }
-    };
-
-    var backend = MockBackend{};
+    var backend = TestMockBackend{ .size = .{ .width = 12, .height = 4 } };
     defer backend.deinit(allocator);
 
     var terminal = terminal_mod.Terminal.init(backend.backend());
@@ -150,13 +369,13 @@ test "differential renderer only redraws changed lines" {
     var renderer = Renderer.init(allocator, &terminal);
     defer renderer.deinit();
 
-    const first = StaticComponent{ .lines = &[_][]const u8{ "alpha", "bravo", "charlie" } };
+    const first = TestStaticComponent{ .lines = &[_][]const u8{ "alpha", "bravo", "charlie" } };
     try renderer.render(first.component());
 
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[2J\x1b[H") != null);
 
     const baseline_write_count = backend.writes.items.len;
-    const second = StaticComponent{ .lines = &[_][]const u8{ "alpha", "BRAVO", "charlie" } };
+    const second = TestStaticComponent{ .lines = &[_][]const u8{ "alpha", "BRAVO", "charlie" } };
     try renderer.render(second.component());
 
     try std.testing.expectEqual(baseline_write_count + 1, backend.writes.items.len);
@@ -169,64 +388,7 @@ test "differential renderer only redraws changed lines" {
 test "renderer performs a full redraw when the terminal size changes" {
     const allocator = std.testing.allocator;
 
-    const MockBackend = struct {
-        size: terminal_mod.Size = .{ .width = 10, .height = 3 },
-        writes: std.ArrayList([]u8) = .empty,
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            for (self.writes.items) |entry| alloc.free(entry);
-            self.writes.deinit(alloc);
-        }
-
-        fn backend(self: *@This()) terminal_mod.Backend {
-            return .{
-                .ptr = self,
-                .enterRawModeFn = enterRawMode,
-                .restoreModeFn = restoreMode,
-                .writeFn = write,
-                .getSizeFn = getSize,
-            };
-        }
-
-        fn enterRawMode(_: *anyopaque) !void {}
-        fn restoreMode(_: *anyopaque) !void {}
-
-        fn write(ptr: *anyopaque, bytes: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.writes.append(allocator, try allocator.dupe(u8, bytes));
-        }
-
-        fn getSize(ptr: *anyopaque) !terminal_mod.Size {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.size;
-        }
-    };
-
-    const StaticComponent = struct {
-        lines: []const []const u8,
-
-        fn component(self: *const @This()) component_mod.Component {
-            return .{
-                .ptr = self,
-                .renderIntoFn = renderIntoOpaque,
-            };
-        }
-
-        fn renderInto(self: *const @This(), alloc: std.mem.Allocator, width: usize, lines: *component_mod.LineList) !void {
-            for (self.lines) |line| {
-                const padded = try ansi.padRightVisibleAlloc(alloc, line, width);
-                defer alloc.free(padded);
-                try component_mod.appendOwnedLine(lines, alloc, padded);
-            }
-        }
-
-        fn renderIntoOpaque(ptr: *const anyopaque, alloc: std.mem.Allocator, width: usize, lines: *component_mod.LineList) !void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
-            try self.renderInto(alloc, width, lines);
-        }
-    };
-
-    var backend = MockBackend{};
+    var backend = TestMockBackend{ .size = .{ .width = 10, .height = 3 } };
     defer backend.deinit(allocator);
 
     var terminal = terminal_mod.Terminal.init(backend.backend());
@@ -236,7 +398,7 @@ test "renderer performs a full redraw when the terminal size changes" {
     var renderer = Renderer.init(allocator, &terminal);
     defer renderer.deinit();
 
-    const static_component = StaticComponent{ .lines = &[_][]const u8{ "one", "two" } };
+    const static_component = TestStaticComponent{ .lines = &[_][]const u8{ "one", "two" } };
     try renderer.render(static_component.component());
 
     const initial_write_count = backend.writes.items.len;
@@ -249,4 +411,62 @@ test "renderer performs a full redraw when the terminal size changes" {
     try std.testing.expect(std.mem.startsWith(u8, redraw, "\x1b[2J\x1b[H"));
     try std.testing.expect(std.mem.indexOf(u8, redraw, "one") != null);
     try std.testing.expect(std.mem.indexOf(u8, redraw, "two") != null);
+}
+
+test "renderer composites overlays on top of base content and can dismiss them" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 12, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const base = TestStaticComponent{ .lines = &[_][]const u8{"base layer"} };
+    const overlay = TestStaticComponent{ .lines = &[_][]const u8{"menu"} };
+    _ = try renderer.showOverlay(overlay.component(), .{ .width = 6, .anchor = .center });
+
+    try renderer.render(base.component());
+
+    try std.testing.expect(renderer.hasOverlays());
+    try std.testing.expectEqual(@as(usize, 4), renderer.previous_lines.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, renderer.previous_lines.items[1], "menu") != null);
+
+    try std.testing.expect(renderer.dismissTopOverlay());
+    try renderer.render(base.component());
+
+    try std.testing.expect(!renderer.hasOverlays());
+    try std.testing.expectEqual(@as(usize, 1), renderer.previous_lines.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, renderer.previous_lines.items[0], "menu") == null);
+}
+
+test "overlay layout is recalculated on terminal resize" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 12, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const base = TestStaticComponent{ .lines = &[_][]const u8{} };
+    const overlay = TestStaticComponent{ .lines = &[_][]const u8{"pick"} };
+    _ = try renderer.showOverlay(overlay.component(), .{ .width = 6, .anchor = .center });
+
+    try renderer.render(base.component());
+    try std.testing.expect(std.mem.startsWith(u8, renderer.previous_lines.items[1], "   \x1b[0mpick"));
+
+    backend.size = .{ .width = 16, .height = 6 };
+    try renderer.render(base.component());
+
+    try std.testing.expectEqual(@as(usize, 6), renderer.previous_lines.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, renderer.previous_lines.items[2], "     \x1b[0mpick"));
 }
