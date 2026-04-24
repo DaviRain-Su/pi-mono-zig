@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
 
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
+    mod.addImport("tui", tui_mod);
 
     // Main executable
     const exe = b.addExecutable(.{
