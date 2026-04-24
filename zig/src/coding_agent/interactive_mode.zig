@@ -3,8 +3,12 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const tui = @import("tui");
+const config_mod = @import("config.zig");
+const keybindings_mod = @import("keybindings.zig");
 const provider_config = @import("provider_config.zig");
+const resources_mod = @import("resources.zig");
 const session_mod = @import("session.zig");
+const session_advanced = @import("session_advanced.zig");
 const session_manager_mod = @import("session_manager.zig");
 const tools = @import("tools/root.zig");
 const common = @import("tools/common.zig");
@@ -27,6 +31,7 @@ pub fn clearToolRuntime() void {
 pub const RunInteractiveModeOptions = struct {
     cwd: []const u8,
     system_prompt: []const u8,
+    session_dir: []const u8,
     provider: []const u8,
     model: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
@@ -35,10 +40,16 @@ pub const RunInteractiveModeOptions = struct {
     @"continue": bool = false,
     selected_tools: ?[]const []const u8 = null,
     initial_prompt: ?[]const u8 = null,
+    prompt_templates: []const resources_mod.PromptTemplate = &.{},
+    keybindings: ?*const keybindings_mod.Keybindings = null,
+    theme: ?*const resources_mod.Theme = null,
+    runtime_config: ?*const config_mod.RuntimeConfig = null,
 };
 
 const ChatKind = enum {
     welcome,
+    info,
+    @"error",
     user,
     assistant,
     tool_call,
@@ -48,6 +59,83 @@ const ChatKind = enum {
 const ChatItem = struct {
     kind: ChatKind,
     text: []u8,
+};
+
+const SlashCommandKind = enum {
+    model,
+    session,
+    tree,
+    fork,
+    clone,
+    compact,
+    login,
+    @"resume",
+    reload,
+    @"export",
+    quit,
+};
+
+const SlashCommand = struct {
+    kind: SlashCommandKind,
+    argument: ?[]const u8 = null,
+    raw: []const u8,
+};
+
+const LiveResources = struct {
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    prompt_templates: []const resources_mod.PromptTemplate,
+    theme: ?*const resources_mod.Theme,
+    owned_runtime_config: ?config_mod.RuntimeConfig = null,
+    owned_resource_bundle: ?resources_mod.ResourceBundle = null,
+
+    fn init(options: RunInteractiveModeOptions) LiveResources {
+        return .{
+            .runtime_config = options.runtime_config,
+            .keybindings = options.keybindings,
+            .prompt_templates = options.prompt_templates,
+            .theme = options.theme,
+        };
+    }
+
+    fn deinit(self: *LiveResources, allocator: std.mem.Allocator) void {
+        if (self.owned_resource_bundle) |*bundle| {
+            bundle.deinit(allocator);
+            self.owned_resource_bundle = null;
+        }
+        if (self.owned_runtime_config) |*runtime_config| {
+            runtime_config.deinit();
+            self.owned_runtime_config = null;
+        }
+    }
+
+    fn reload(
+        self: *LiveResources,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env_map: *const std.process.Environ.Map,
+        cwd: []const u8,
+    ) ![]const resources_mod.Diagnostic {
+        var next_runtime = try config_mod.loadRuntimeConfig(allocator, io, env_map, cwd);
+        errdefer next_runtime.deinit();
+
+        var next_bundle = try resources_mod.loadResourceBundle(allocator, io, .{
+            .cwd = cwd,
+            .agent_dir = next_runtime.agent_dir,
+            .global = settingsResources(next_runtime.global_settings),
+            .project = settingsResources(next_runtime.project_settings),
+        });
+        errdefer next_bundle.deinit(allocator);
+
+        self.deinit(allocator);
+        self.owned_runtime_config = next_runtime;
+        self.owned_resource_bundle = next_bundle;
+        self.runtime_config = &self.owned_runtime_config.?;
+        self.keybindings = &self.owned_runtime_config.?.keybindings;
+        self.prompt_templates = self.owned_resource_bundle.?.prompt_templates;
+        self.theme = self.owned_resource_bundle.?.selectedTheme();
+        return self.owned_resource_bundle.?.diagnostics;
+    }
 };
 
 const AppState = struct {
@@ -100,6 +188,19 @@ const AppState = struct {
     fn setStatus(self: *AppState, text: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.replaceLabelLocked(&self.status, text);
+    }
+
+    fn appendInfo(self: *AppState, text: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.appendItemLocked(.info, text);
+    }
+
+    fn appendError(self: *AppState, text: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.appendItemLocked(.@"error", text);
         try self.replaceLabelLocked(&self.status, text);
     }
 
@@ -274,11 +375,13 @@ const AppState = struct {
 const SelectorOverlay = union(enum) {
     session: SessionOverlay,
     model: ModelOverlay,
+    tree: TreeOverlay,
 
     fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .session => |*overlay| overlay.deinit(allocator),
             .model => |*overlay| overlay.deinit(allocator),
+            .tree => |*overlay| overlay.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -287,6 +390,7 @@ const SelectorOverlay = union(enum) {
         return switch (self.*) {
             .session => "Session selector",
             .model => "Model selector",
+            .tree => "Session tree",
         };
     }
 
@@ -299,6 +403,7 @@ const SelectorOverlay = union(enum) {
         return switch (self.*) {
             .session => &self.session.list,
             .model => &self.model.list,
+            .tree => &self.tree.list,
         };
     }
 };
@@ -351,11 +456,35 @@ const ModelOverlay = struct {
     }
 };
 
+const TreeChoice = struct {
+    entry_id: []u8,
+};
+
+const TreeOverlay = struct {
+    choices: []TreeChoice,
+    items: []tui.SelectItem,
+    list: tui.SelectList,
+
+    fn deinit(self: *TreeOverlay, allocator: std.mem.Allocator) void {
+        for (self.choices) |choice| allocator.free(choice.entry_id);
+        allocator.free(self.choices);
+        for (self.items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
 const ScreenComponent = struct {
     state: *AppState,
     editor: *tui.Editor,
     height: usize = 24,
     overlay: ?*SelectorOverlay = null,
+    keybindings: ?*const keybindings_mod.Keybindings = null,
+    theme: ?*const resources_mod.Theme = null,
 
     fn component(self: *const ScreenComponent) tui.Component {
         return .{
@@ -393,15 +522,24 @@ const ScreenComponent = struct {
 
         const start_index = @min(self.state.visible_start_index, self.state.items.items.len);
         for (self.state.items.items[start_index..]) |item| {
-            try tui.ansi.wrapTextWithAnsi(allocator, item.text, @max(width, 1), &chat_lines);
+            const themed_item = try themeChatItem(allocator, self.theme, item);
+            defer allocator.free(themed_item);
+            try tui.ansi.wrapTextWithAnsi(allocator, themed_item, @max(width, 1), &chat_lines);
         }
 
         var prompt_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &prompt_lines);
         try renderPromptLines(allocator, self.editor, width, &prompt_lines);
-        const footer_line = try formatFooterLine(allocator, self.state.model_label, self.state.session_label, self.state.status, width);
+        const footer_line = try formatFooterLine(
+            allocator,
+            self.theme,
+            self.state.model_label,
+            self.state.session_label,
+            self.state.status,
+            width,
+        );
         defer allocator.free(footer_line);
-        const hints_line = try fitLine(allocator, "Ctrl+S sessions • Ctrl+P models • Ctrl+C interrupt • Ctrl+D exit • Ctrl+L clear", width);
+        const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
         defer allocator.free(hints_line);
 
         var autocomplete_lines = tui.LineList.empty;
@@ -431,9 +569,13 @@ const ScreenComponent = struct {
         lines: *tui.LineList,
         overlay: *SelectorOverlay,
     ) std.mem.Allocator.Error!void {
-        const title_line = try fitLine(allocator, overlay.title(), width);
+        const title_plain = try fitLine(allocator, overlay.title(), width);
+        defer allocator.free(title_plain);
+        const title_line = try applyThemeAlloc(allocator, self.theme, .footer, title_plain);
         defer allocator.free(title_line);
-        const hint_line = try fitLine(allocator, overlay.hint(), width);
+        const hint_plain = try fitLine(allocator, overlay.hint(), width);
+        defer allocator.free(hint_plain);
+        const hint_line = try applyThemeAlloc(allocator, self.theme, .status, hint_plain);
         defer allocator.free(hint_line);
 
         try tui.component.appendOwnedLine(lines, allocator, title_line);
@@ -638,12 +780,16 @@ pub fn runInteractiveMode(
     options: RunInteractiveModeOptions,
     stderr_writer: *std.Io.Writer,
 ) !u8 {
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
     var current_provider = provider_config.resolveProviderConfig(
         allocator,
         env_map,
         options.provider,
         options.model,
         options.api_key,
+        configuredApiKeyForProvider(live_resources.runtime_config, options.provider),
     ) catch |err| {
         try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(err, options.provider)});
         try stderr_writer.flush();
@@ -660,13 +806,10 @@ pub fn runInteractiveMode(
     var built_tools = try buildAgentTools(allocator, options.selected_tools);
     defer built_tools.deinit();
 
-    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ options.cwd, ".pi", "sessions" });
-    defer allocator.free(session_dir);
-
     var session = try openInitialSession(
         allocator,
         io,
-        session_dir,
+        options.session_dir,
         options,
         current_provider.model,
         current_provider.api_key,
@@ -707,6 +850,8 @@ pub fn runInteractiveMode(
     var screen = ScreenComponent{
         .state = &app_state,
         .editor = &editor,
+        .keybindings = live_resources.keybindings,
+        .theme = live_resources.theme,
     };
 
     var overlay: ?SelectorOverlay = null;
@@ -740,6 +885,8 @@ pub fn runInteractiveMode(
         const size = try terminal.refreshSize();
         screen.height = size.height;
         screen.overlay = if (overlay) |*value| value else null;
+        screen.keybindings = live_resources.keybindings;
+        screen.theme = live_resources.theme;
         try renderer.render(screen.component());
 
         if (should_exit and !prompt_worker_active) break;
@@ -761,7 +908,7 @@ pub fn runInteractiveMode(
                         parsed,
                         &session,
                         &current_provider,
-                        session_dir,
+                        options.session_dir,
                         options,
                         built_tools.items,
                         &app_state,
@@ -772,6 +919,7 @@ pub fn runInteractiveMode(
                         subscriber,
                         &should_exit,
                         &input_buffer,
+                        &live_resources,
                     ),
                     .need_more_bytes => break,
                 }
@@ -784,7 +932,7 @@ pub fn runInteractiveMode(
                 parsed,
                 &session,
                 &current_provider,
-                session_dir,
+                options.session_dir,
                 options,
                 built_tools.items,
                 &app_state,
@@ -795,6 +943,7 @@ pub fn runInteractiveMode(
                 subscriber,
                 &should_exit,
                 &input_buffer,
+                &live_resources,
             );
             while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
                 switch (result) {
@@ -805,7 +954,7 @@ pub fn runInteractiveMode(
                         next_parsed,
                         &session,
                         &current_provider,
-                        session_dir,
+                        options.session_dir,
                         options,
                         built_tools.items,
                         &app_state,
@@ -816,6 +965,7 @@ pub fn runInteractiveMode(
                         subscriber,
                         &should_exit,
                         &input_buffer,
+                        &live_resources,
                     ),
                     .need_more_bytes => break,
                 }
@@ -962,14 +1112,17 @@ fn handleInputKey(
     prompt_worker_active: *bool,
     subscriber: agent.AgentSubscriber,
     should_exit: *bool,
+    live_resources: *LiveResources,
 ) !void {
     if (overlay.*) |*overlay_value| {
-        switch (key) {
-            .ctrl => |ctrl| if (ctrl == 'd') {
+        if (resolveAppAction(live_resources.keybindings, key)) |action| {
+            if (action == .exit) {
                 should_exit.* = true;
                 if (prompt_worker_active.*) session.agent.abort();
                 return;
-            },
+            }
+        }
+        switch (key) {
             .escape => {
                 overlay_value.deinit(allocator);
                 overlay.* = null;
@@ -989,6 +1142,12 @@ fn handleInputKey(
             .confirmed => |index| {
                 switch (overlay_value.*) {
                     .session => |session_overlay| {
+                        if (session_overlay.choices[index].path.len == 0) {
+                            try app_state.setStatus("No sessions found");
+                            overlay_value.deinit(allocator);
+                            overlay.* = null;
+                            return;
+                        }
                         try switchSession(
                             allocator,
                             io,
@@ -997,6 +1156,7 @@ fn handleInputKey(
                             current_provider,
                             session_overlay.choices[index].path,
                             options,
+                            live_resources.runtime_config,
                             tool_items,
                             app_state,
                             subscriber,
@@ -1010,8 +1170,17 @@ fn handleInputKey(
                             current_provider,
                             model_overlay.choices[index].provider,
                             model_overlay.choices[index].model_id,
+                            options,
+                            live_resources.runtime_config,
                             app_state,
                         );
+                    },
+                    .tree => |tree_overlay| {
+                        if (tree_overlay.choices[index].entry_id.len == 0) {
+                            try app_state.setStatus("No tree entries available");
+                        } else {
+                            try navigateTree(session, tree_overlay.choices[index].entry_id, app_state);
+                        }
                     },
                 }
                 overlay_value.deinit(allocator);
@@ -1021,67 +1190,58 @@ fn handleInputKey(
         }
     }
 
+    if (key == .escape and editor.isShowingAutocomplete()) {
+        _ = try editor.handleKey(key);
+        return;
+    }
+
+    if (resolveAppAction(live_resources.keybindings, key)) |action| {
+        try handleAppAction(
+            allocator,
+            io,
+            env_map,
+            action,
+            session,
+            session_dir,
+            app_state,
+            overlay,
+            prompt_worker_active,
+            should_exit,
+        );
+        return;
+    }
+
+    if (live_resources.keybindings != null and isLegacyAppActionKey(key)) {
+        return;
+    }
+
     switch (key) {
-        .ctrl => |ctrl| switch (ctrl) {
-            'c' => {
-                if (prompt_worker_active.*) {
-                    session.agent.abort();
-                    try app_state.setStatus("interrupt requested");
-                }
-                return;
-            },
-            'd' => {
-                should_exit.* = true;
-                if (prompt_worker_active.*) session.agent.abort();
-                return;
-            },
-            'l' => {
-                app_state.clearDisplay();
-                return;
-            },
-            's' => {
-                if (prompt_worker_active.*) {
-                    try app_state.setStatus("wait for the current response to finish before switching sessions");
-                    return;
-                }
-                overlay.* = try loadSessionOverlay(allocator, io, session_dir);
-                return;
-            },
-            'p' => {
-                if (prompt_worker_active.*) {
-                    try app_state.setStatus("wait for the current response to finish before switching models");
-                    return;
-                }
-                overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
-                return;
-            },
-            else => {},
-        },
-        .escape => {
-            if (editor.isShowingAutocomplete()) {
-                _ = try editor.handleKey(key);
-                return;
-            }
-            should_exit.* = true;
-            if (prompt_worker_active.*) session.agent.abort();
-            return;
-        },
         .enter => {
             if (editor.isShowingAutocomplete()) {
                 _ = try editor.handleKey(key);
                 return;
             }
-            if (prompt_worker_active.*) {
-                try app_state.setStatus("response in progress");
-                return;
-            }
             const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
             if (trimmed.len == 0) return;
-            try prompt_worker.start(allocator, session, app_state, trimmed);
-            prompt_worker_active.* = true;
-            editor.buffer.clearRetainingCapacity();
-            editor.cursor = 0;
-            try app_state.setStatus("streaming");
+            try submitEditorText(
+                allocator,
+                io,
+                env_map,
+                trimmed,
+                session,
+                current_provider,
+                session_dir,
+                options,
+                tool_items,
+                app_state,
+                editor,
+                overlay,
+                prompt_worker,
+                prompt_worker_active,
+                subscriber,
+                should_exit,
+                live_resources,
+            );
             return;
         },
         else => {},
@@ -1103,6 +1263,204 @@ fn handleInputKey(
     }
 }
 
+fn submitEditorText(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    trimmed: []const u8,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    live_resources: *LiveResources,
+) !void {
+    if (parseSlashCommand(trimmed)) |command| {
+        try handleSlashCommand(
+            allocator,
+            io,
+            env_map,
+            command,
+            session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
+            app_state,
+            overlay,
+            prompt_worker_active,
+            subscriber,
+            should_exit,
+            live_resources,
+        );
+        clearEditor(editor);
+        return;
+    }
+
+    const expanded = try resources_mod.expandPromptTemplate(allocator, trimmed, live_resources.prompt_templates);
+    defer allocator.free(expanded);
+
+    if (trimmed.len > 0 and trimmed[0] == '/' and std.mem.eql(u8, expanded, trimmed)) {
+        const message = try std.fmt.allocPrint(allocator, "Unknown slash command: {s}", .{trimmed});
+        defer allocator.free(message);
+        clearEditor(editor);
+        try app_state.appendError(message);
+        return;
+    }
+
+    if (prompt_worker_active.*) {
+        try app_state.setStatus("response in progress");
+        return;
+    }
+
+    try prompt_worker.start(allocator, session, app_state, expanded);
+    prompt_worker_active.* = true;
+    clearEditor(editor);
+    try app_state.setStatus("streaming");
+}
+
+fn parseSlashCommand(text: []const u8) ?SlashCommand {
+    if (text.len < 2 or text[0] != '/') return null;
+
+    const space_index = std.mem.indexOfAny(u8, text, " \t\r\n");
+    const command_name = if (space_index) |index| text[1..index] else text[1..];
+    const raw_argument = if (space_index) |index|
+        std.mem.trim(u8, text[index + 1 ..], " \t\r\n")
+    else
+        "";
+    const argument = if (raw_argument.len == 0) null else raw_argument;
+
+    if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "session")) return .{ .kind = .session, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "tree")) return .{ .kind = .tree, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "fork")) return .{ .kind = .fork, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "clone")) return .{ .kind = .clone, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "compact")) return .{ .kind = .compact, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "login")) return .{ .kind = .login, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "resume")) return .{ .kind = .@"resume", .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "reload")) return .{ .kind = .reload, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "export")) return .{ .kind = .@"export", .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "quit")) return .{ .kind = .quit, .argument = argument, .raw = text };
+    return null;
+}
+
+fn clearEditor(editor: *tui.Editor) void {
+    editor.buffer.clearRetainingCapacity();
+    editor.cursor = 0;
+}
+
+fn handleSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    command: SlashCommand,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    live_resources: *LiveResources,
+) !void {
+    switch (command.kind) {
+        .model => try handleModelSlashCommand(
+            allocator,
+            env_map,
+            session,
+            current_provider,
+            command.argument,
+            options,
+            live_resources.runtime_config,
+            app_state,
+            overlay,
+        ),
+        .session => try handleSessionSlashCommand(allocator, session, app_state),
+        .tree => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before opening the session tree");
+                return;
+            }
+            overlay.* = try loadTreeOverlay(allocator, session);
+        },
+        .fork => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before forking the session");
+                return;
+            }
+            try forkCurrentSession(
+                allocator,
+                io,
+                session,
+                current_provider,
+                session_dir,
+                tool_items,
+                app_state,
+                subscriber,
+            );
+        },
+        .clone => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before cloning the session");
+                return;
+            }
+            try cloneCurrentSession(
+                allocator,
+                io,
+                session,
+                current_provider,
+                session_dir,
+                tool_items,
+                app_state,
+                subscriber,
+            );
+        },
+        .compact => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before compacting the session");
+                return;
+            }
+            try handleCompactSlashCommand(allocator, session, command.argument, app_state);
+        },
+        .login => try handleLoginSlashCommand(allocator, session, live_resources.runtime_config, app_state),
+        .@"resume" => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before switching sessions");
+                return;
+            }
+            overlay.* = try loadSessionOverlay(allocator, io, session_dir);
+        },
+        .reload => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before reloading resources");
+                return;
+            }
+            try handleReloadSlashCommand(allocator, io, env_map, options.cwd, app_state, live_resources);
+        },
+        .@"export" => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before exporting the session");
+                return;
+            }
+            try handleExportSlashCommand(allocator, io, session, command.argument, app_state);
+        },
+        .quit => {
+            should_exit.* = true;
+            if (prompt_worker_active.*) session.agent.abort();
+        },
+    }
+}
+
 fn switchSession(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1111,6 +1469,7 @@ fn switchSession(
     current_provider: *provider_config.ResolvedProviderConfig,
     session_path: []const u8,
     options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
     tool_items: []const agent.AgentTool,
     app_state: *AppState,
     subscriber: agent.AgentSubscriber,
@@ -1129,7 +1488,8 @@ fn switchSession(
         env_map,
         candidate.agent.getModel().provider,
         candidate.agent.getModel().id,
-        options.api_key,
+        overrideApiKeyForProvider(options, candidate.agent.getModel().provider),
+        configuredApiKeyForProvider(runtime_config, candidate.agent.getModel().provider),
     ) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "error: {s}", .{
             provider_config.resolveProviderErrorMessage(err, candidate.agent.getModel().provider),
@@ -1160,6 +1520,8 @@ fn switchModel(
     current_provider: *provider_config.ResolvedProviderConfig,
     provider_name: []const u8,
     model_id: []const u8,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
     app_state: *AppState,
 ) !void {
     var next_provider = provider_config.resolveProviderConfig(
@@ -1167,7 +1529,8 @@ fn switchModel(
         env_map,
         provider_name,
         model_id,
-        null,
+        overrideApiKeyForProvider(options, provider_name),
+        configuredApiKeyForProvider(runtime_config, provider_name),
     ) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "error: {s}", .{
             provider_config.resolveProviderErrorMessage(err, provider_name),
@@ -1184,6 +1547,174 @@ fn switchModel(
     session.setApiKey(next_provider.api_key);
     try app_state.setFooter(next_provider.model.id, currentSessionLabel(session));
     try app_state.setStatus("idle");
+}
+
+fn handleModelSlashCommand(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    argument: ?[]const u8,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+) !void {
+    const search = argument orelse {
+        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
+        return;
+    };
+
+    const available = try provider_config.listAvailableModels(allocator, env_map, session.agent.getModel());
+    defer allocator.free(available);
+
+    for (available) |entry| {
+        const scoped = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.provider, entry.model_id });
+        defer allocator.free(scoped);
+        if (!std.mem.eql(u8, search, entry.model_id) and
+            !std.mem.eql(u8, search, scoped) and
+            !std.mem.eql(u8, search, entry.display_name))
+        {
+            continue;
+        }
+
+        try switchModel(
+            allocator,
+            env_map,
+            session,
+            current_provider,
+            entry.provider,
+            entry.model_id,
+            options,
+            runtime_config,
+            app_state,
+        );
+        return;
+    }
+
+    const message = try std.fmt.allocPrint(allocator, "No exact model match for {s}; opening model selector", .{search});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
+}
+
+fn handleSessionSlashCommand(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+) !void {
+    const info = try formatSessionInfo(allocator, session);
+    defer allocator.free(info);
+    try app_state.appendInfo(info);
+}
+
+fn handleCompactSlashCommand(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    argument: ?[]const u8,
+    app_state: *AppState,
+) !void {
+    const result = session.compact(argument) catch |err| switch (err) {
+        error.NothingToCompact => {
+            try app_state.setStatus("Nothing to compact yet");
+            return;
+        },
+        else => return err,
+    };
+
+    const info = try std.fmt.allocPrint(
+        allocator,
+        "Compacted session history. Summary preserved {d} tokens before entry {s}.",
+        .{ result.tokens_before, result.first_kept_entry_id },
+    );
+    defer allocator.free(info);
+    try app_state.rebuildFromMessages(currentSessionLabel(session), session.agent.getModel().id, session.agent.getMessages());
+    try app_state.appendInfo(info);
+}
+
+fn handleLoginSlashCommand(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    app_state: *AppState,
+) !void {
+    const auth_path = if (runtime_config) |config|
+        try std.fs.path.join(allocator, &[_][]const u8{ config.agent_dir, "auth.json" })
+    else
+        null;
+    defer if (auth_path) |path| allocator.free(path);
+
+    const message = if (auth_path) |path|
+        try std.fmt.allocPrint(
+            allocator,
+            "Configure credentials for provider `{s}` via `--api-key`, provider environment variables, or `{s}`, then use `/reload`.",
+            .{ session.agent.getModel().provider, path },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "Configure credentials for provider `{s}` via `--api-key` or provider environment variables.",
+            .{session.agent.getModel().provider},
+        );
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+}
+
+fn handleReloadSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    app_state: *AppState,
+    live_resources: *LiveResources,
+) !void {
+    if (live_resources.runtime_config == null) {
+        try app_state.setStatus("Reload is unavailable in this session");
+        return;
+    }
+
+    const diagnostics = try live_resources.reload(allocator, io, env_map, cwd);
+    try app_state.setStatus("Reloaded keybindings, skills, prompts, and themes");
+    for (diagnostics) |diagnostic| {
+        const message = if (diagnostic.path) |path|
+            try std.fmt.allocPrint(allocator, "{s}: {s} ({s})", .{ diagnostic.kind, diagnostic.message, path })
+        else
+            try std.fmt.allocPrint(allocator, "{s}: {s}", .{ diagnostic.kind, diagnostic.message });
+        defer allocator.free(message);
+        if (std.mem.eql(u8, diagnostic.kind, "warning")) {
+            try app_state.appendError(message);
+        } else {
+            try app_state.appendInfo(message);
+        }
+    }
+}
+
+fn handleExportSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *session_mod.AgentSession,
+    argument: ?[]const u8,
+    app_state: *AppState,
+) !void {
+    const output_path = if (argument) |raw_path| normalizePathArgument(raw_path) else null;
+    const exported_path = if (output_path) |path| blk: {
+        if (std.mem.endsWith(u8, path, ".json")) {
+            break :blk try session_advanced.exportToJson(allocator, io, session, path);
+        }
+        if (std.mem.endsWith(u8, path, ".md")) {
+            break :blk try session_advanced.exportToMarkdown(allocator, io, session, path);
+        }
+        const message = try std.fmt.allocPrint(allocator, "Unsupported export path: {s}. Use .json or .md.", .{path});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        return;
+    } else try session_advanced.exportToMarkdown(allocator, io, session, null);
+    defer allocator.free(exported_path);
+
+    const message = try std.fmt.allocPrint(allocator, "Session exported to {s}", .{exported_path});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+    try app_state.setStatus("session exported");
 }
 
 fn loadSessionOverlay(
@@ -1269,6 +1800,135 @@ fn loadModelOverlay(
             },
         },
     };
+}
+
+fn loadTreeOverlay(
+    allocator: std.mem.Allocator,
+    session: *const session_mod.AgentSession,
+) !SelectorOverlay {
+    const tree = try session.session_manager.getTree(allocator);
+    defer {
+        for (tree) |*node| node.deinit(allocator);
+        allocator.free(tree);
+    }
+
+    var choice_list = std.ArrayList(TreeChoice).empty;
+    errdefer {
+        for (choice_list.items) |choice| allocator.free(choice.entry_id);
+        choice_list.deinit(allocator);
+    }
+
+    var item_list = std.ArrayList(tui.SelectItem).empty;
+    errdefer {
+        for (item_list.items) |item| {
+            allocator.free(item.value);
+            allocator.free(item.label);
+            if (item.description) |description| allocator.free(description);
+        }
+        item_list.deinit(allocator);
+    }
+
+    var selected_index: usize = 0;
+    const current_leaf_id = session.session_manager.getLeafId();
+    try appendTreeNodes(allocator, tree, 0, current_leaf_id, &choice_list, &item_list, &selected_index);
+
+    if (item_list.items.len == 0) {
+        try choice_list.append(allocator, .{ .entry_id = try allocator.dupe(u8, "") });
+        try item_list.append(allocator, .{
+            .value = try allocator.dupe(u8, "none"),
+            .label = try allocator.dupe(u8, "No tree entries"),
+            .description = null,
+        });
+    }
+
+    const choices = try choice_list.toOwnedSlice(allocator);
+    errdefer {
+        for (choices) |choice| allocator.free(choice.entry_id);
+        allocator.free(choices);
+    }
+    const items = try item_list.toOwnedSlice(allocator);
+    errdefer freeOwnedSelectItems(allocator, items);
+
+    return .{
+        .tree = .{
+            .choices = choices,
+            .items = items,
+            .list = .{
+                .items = items,
+                .selected_index = selected_index,
+                .max_visible = 12,
+            },
+        },
+    };
+}
+
+fn appendTreeNodes(
+    allocator: std.mem.Allocator,
+    nodes: []const session_manager_mod.SessionTreeNode,
+    depth: usize,
+    current_leaf_id: ?[]const u8,
+    choices: *std.ArrayList(TreeChoice),
+    items: *std.ArrayList(tui.SelectItem),
+    selected_index: *usize,
+) !void {
+    for (nodes) |node| {
+        const prefix = try indentationPrefix(allocator, depth);
+        defer allocator.free(prefix);
+        const summary = try summarizeSessionEntry(allocator, node.entry.*);
+        defer allocator.free(summary);
+        const label = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, summary });
+        defer allocator.free(label);
+
+        try choices.append(allocator, .{ .entry_id = try allocator.dupe(u8, node.entry.id()) });
+        try items.append(allocator, .{
+            .value = try allocator.dupe(u8, node.entry.id()),
+            .label = try allocator.dupe(u8, label),
+            .description = try allocator.dupe(u8, node.entry.timestamp()),
+        });
+        if (current_leaf_id) |leaf_id| {
+            if (std.mem.eql(u8, leaf_id, node.entry.id())) {
+                selected_index.* = items.items.len - 1;
+            }
+        }
+
+        try appendTreeNodes(allocator, node.children, depth + 1, current_leaf_id, choices, items, selected_index);
+    }
+}
+
+fn indentationPrefix(allocator: std.mem.Allocator, depth: usize) ![]u8 {
+    const prefix = try allocator.alloc(u8, depth * 2);
+    @memset(prefix, ' ');
+    return prefix;
+}
+
+fn summarizeSessionEntry(allocator: std.mem.Allocator, entry: session_manager_mod.SessionEntry) ![]u8 {
+    return switch (entry) {
+        .message => |message_entry| switch (message_entry.message) {
+            .user => |user_message| blk: {
+                const text = try blocksToText(allocator, user_message.content);
+                defer allocator.free(text);
+                break :blk std.fmt.allocPrint(allocator, "user: {s}", .{trimSummaryText(text)});
+            },
+            .assistant => |assistant_message| blk: {
+                const text = try formatAssistantMessage(allocator, assistant_message);
+                defer allocator.free(text);
+                break :blk allocator.dupe(u8, trimSummaryText(text));
+            },
+            .tool_result => |tool_result| blk: {
+                const text = try blocksToText(allocator, tool_result.content);
+                defer allocator.free(text);
+                break :blk std.fmt.allocPrint(allocator, "tool {s}: {s}", .{ tool_result.tool_name, trimSummaryText(text) });
+            },
+        },
+        .thinking_level_change => |thinking_entry| std.fmt.allocPrint(allocator, "thinking: {s}", .{@tagName(thinking_entry.thinking_level)}),
+        .model_change => |model_entry| std.fmt.allocPrint(allocator, "model: {s}/{s}", .{ model_entry.provider, model_entry.model_id }),
+        .compaction => |compaction_entry| std.fmt.allocPrint(allocator, "compaction: {s}", .{trimSummaryText(try session_manager_mod.getCompactionSummary(compaction_entry))}),
+    };
+}
+
+fn trimSummaryText(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return if (trimmed.len > 72) trimmed[0..72] else trimmed;
 }
 
 const SessionOverlayEntries = struct {
@@ -1360,6 +2020,171 @@ fn currentSessionLabel(session: *const session_mod.AgentSession) []const u8 {
         std.fs.path.basename(path)
     else
         session.session_manager.getSessionId();
+}
+
+fn formatSessionInfo(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) ![]u8 {
+    const stats = session_advanced.getSessionStats(session);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    try writer.writer.writeAll("Session Info\n");
+    try writer.writer.print("File: {s}\n", .{stats.session_file orelse "in-memory"});
+    try writer.writer.print("ID: {s}\n", .{stats.session_id});
+    try writer.writer.print("Model: {s}/{s}\n", .{ session.agent.getModel().provider, session.agent.getModel().id });
+    try writer.writer.print(
+        "Messages: user={d}, assistant={d}, tool_calls={d}, tool_results={d}, total={d}\n",
+        .{ stats.user_messages, stats.assistant_messages, stats.tool_calls, stats.tool_results, stats.total_messages },
+    );
+    try writer.writer.print(
+        "Tokens: input={d}, output={d}, cache_read={d}, cache_write={d}, total={d}\n",
+        .{ stats.tokens.input, stats.tokens.output, stats.tokens.cache_read, stats.tokens.cache_write, stats.tokens.total },
+    );
+    if (stats.context_usage) |usage| {
+        try writer.writer.print(
+            "Context: {d}/{d} tokens ({d:.1}%)\n",
+            .{ usage.tokens orelse 0, usage.context_window, usage.percent orelse 0 },
+        );
+    }
+    if (stats.cost > 0) {
+        try writer.writer.print("Cost: {d:.4}\n", .{stats.cost});
+    }
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn cloneCurrentSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    subscriber: agent.AgentSubscriber,
+) !void {
+    const messages = session.agent.getMessages();
+    if (messages.len == 0) {
+        try app_state.setStatus("Nothing to clone yet");
+        return;
+    }
+
+    var candidate = try createDerivedSession(
+        allocator,
+        io,
+        session,
+        current_provider,
+        session_dir,
+        tool_items,
+        messages,
+    );
+    errdefer candidate.deinit();
+
+    try replaceCurrentSession(allocator, session, &candidate, app_state, subscriber);
+    const message = try std.fmt.allocPrint(allocator, "Cloned session to {s}", .{currentSessionLabel(session)});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+}
+
+fn forkCurrentSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    subscriber: agent.AgentSubscriber,
+) !void {
+    const messages = session.agent.getMessages();
+    const last_user_index = findLastUserMessageIndex(messages) orelse {
+        try app_state.setStatus("No user messages to fork from");
+        return;
+    };
+
+    var candidate = try createDerivedSession(
+        allocator,
+        io,
+        session,
+        current_provider,
+        session_dir,
+        tool_items,
+        messages[0 .. last_user_index + 1],
+    );
+    errdefer candidate.deinit();
+
+    try replaceCurrentSession(allocator, session, &candidate, app_state, subscriber);
+    const message = try std.fmt.allocPrint(allocator, "Forked session at the latest user message into {s}", .{currentSessionLabel(session)});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+}
+
+fn createDerivedSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_session: *const session_mod.AgentSession,
+    current_provider: *const provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    tool_items: []const agent.AgentTool,
+    messages: []const agent.AgentMessage,
+) !session_mod.AgentSession {
+    var derived = try session_mod.AgentSession.create(allocator, io, .{
+        .cwd = source_session.cwd,
+        .system_prompt = source_session.system_prompt,
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .thinking_level = source_session.agent.getThinkingLevel(),
+        .tools = tool_items,
+        .session_dir = session_dir,
+    });
+    errdefer derived.deinit();
+
+    for (messages) |message| {
+        _ = try derived.session_manager.appendMessage(message);
+    }
+    try derived.agent.setMessages(messages);
+    derived.agent.setModel(current_provider.model);
+    derived.agent.setApiKey(current_provider.api_key);
+    return derived;
+}
+
+fn replaceCurrentSession(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    candidate: *session_mod.AgentSession,
+    app_state: *AppState,
+    subscriber: agent.AgentSubscriber,
+) !void {
+    _ = session.agent.unsubscribe(subscriber);
+    session.deinit();
+    session.* = candidate.*;
+    candidate.* = undefined;
+    try session.agent.subscribe(subscriber);
+    const session_label = try allocator.dupe(u8, currentSessionLabel(session));
+    defer allocator.free(session_label);
+    const model_label = try allocator.dupe(u8, session.agent.getModel().id);
+    defer allocator.free(model_label);
+    try app_state.rebuildFromMessages(session_label, model_label, session.agent.getMessages());
+    try app_state.setFooter(model_label, session_label);
+    try app_state.setStatus("idle");
+}
+
+fn navigateTree(
+    session: *session_mod.AgentSession,
+    entry_id: []const u8,
+    app_state: *AppState,
+) !void {
+    try session.navigateTo(entry_id);
+    try app_state.rebuildFromMessages(currentSessionLabel(session), session.agent.getModel().id, session.agent.getMessages());
+    try app_state.setStatus("session tree updated");
+}
+
+fn findLastUserMessageIndex(messages: []const agent.AgentMessage) ?usize {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        if (messages[index] == .user) return index;
+    }
+    return null;
 }
 
 fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]tui.SelectItem {
@@ -1472,6 +2297,7 @@ fn dispatchInputEvent(
     subscriber: agent.AgentSubscriber,
     should_exit: *bool,
     input_buffer: *std.ArrayList(u8),
+    live_resources: *LiveResources,
 ) !void {
     switch (parsed.event) {
         .key => |key| try handleInputKey(
@@ -1491,6 +2317,7 @@ fn dispatchInputEvent(
             prompt_worker_active,
             subscriber,
             should_exit,
+            live_resources,
         ),
         .paste => |content| {
             if (overlay.* != null) {
@@ -1560,6 +2387,7 @@ fn renderPromptLines(
 
 fn formatFooterLine(
     allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
     model_label: []const u8,
     session_label: []const u8,
     status: []const u8,
@@ -1571,7 +2399,178 @@ fn formatFooterLine(
         status,
     });
     defer allocator.free(line);
-    return try fitLine(allocator, line, width);
+    const fitted = try fitLine(allocator, line, width);
+    defer allocator.free(fitted);
+    return try applyThemeAlloc(allocator, theme, .footer, fitted);
+}
+
+fn formatHintsLine(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    width: usize,
+) ![]u8 {
+    const open_sessions = try actionLabel(allocator, keybindings, .open_sessions, "Ctrl+S");
+    defer allocator.free(open_sessions);
+    const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
+    defer allocator.free(open_models);
+    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Ctrl+C");
+    defer allocator.free(interrupt);
+    const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
+    defer allocator.free(exit);
+    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+L");
+    defer allocator.free(clear);
+
+    const line = try std.fmt.allocPrint(
+        allocator,
+        "{s} sessions • {s} models • {s} interrupt • {s} exit • {s} clear",
+        .{ open_sessions, open_models, interrupt, exit, clear },
+    );
+    defer allocator.free(line);
+    const fitted = try fitLine(allocator, line, width);
+    defer allocator.free(fitted);
+    return try applyThemeAlloc(allocator, theme, .status, fitted);
+}
+
+fn actionLabel(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    action: keybindings_mod.Action,
+    fallback: []const u8,
+) ![]u8 {
+    if (keybindings) |bindings| {
+        return bindings.primaryLabel(allocator, action);
+    }
+    return allocator.dupe(u8, fallback);
+}
+
+fn themeChatItem(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+) ![]u8 {
+    return try applyThemeAlloc(allocator, theme, switch (item.kind) {
+        .welcome => .welcome,
+        .info => .status,
+        .@"error" => .@"error",
+        .user => .user,
+        .assistant => .assistant,
+        .tool_call => .tool_call,
+        .tool_result => .tool_result,
+    }, item.text);
+}
+
+fn applyThemeAlloc(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    token: resources_mod.ThemeToken,
+    text: []const u8,
+) ![]u8 {
+    if (theme) |selected_theme| {
+        return selected_theme.applyAlloc(allocator, token, text);
+    }
+    return allocator.dupe(u8, text);
+}
+
+fn resolveAppAction(keybindings: ?*const keybindings_mod.Keybindings, key: tui.Key) ?keybindings_mod.Action {
+    if (keybindings) |bindings| return bindings.actionForKey(key);
+    return legacyAppActionForKey(key);
+}
+
+fn legacyAppActionForKey(key: tui.Key) ?keybindings_mod.Action {
+    return switch (key) {
+        .ctrl => |ctrl| switch (ctrl) {
+            'c' => .interrupt,
+            'd' => .exit,
+            'l' => .clear,
+            's' => .open_sessions,
+            'p' => .open_models,
+            else => null,
+        },
+        .escape => .exit,
+        else => null,
+    };
+}
+
+fn isLegacyAppActionKey(key: tui.Key) bool {
+    return legacyAppActionForKey(key) != null;
+}
+
+fn handleAppAction(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    action: keybindings_mod.Action,
+    session: *session_mod.AgentSession,
+    session_dir: []const u8,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    prompt_worker_active: *bool,
+    should_exit: *bool,
+) !void {
+    switch (action) {
+        .interrupt => {
+            if (prompt_worker_active.*) {
+                session.agent.abort();
+                try app_state.setStatus("interrupt requested");
+            }
+        },
+        .exit => {
+            should_exit.* = true;
+            if (prompt_worker_active.*) session.agent.abort();
+        },
+        .clear => app_state.clearDisplay(),
+        .open_sessions => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before switching sessions");
+                return;
+            }
+            overlay.* = try loadSessionOverlay(allocator, io, session_dir);
+        },
+        .open_models => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before switching models");
+                return;
+            }
+            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
+        },
+    }
+}
+
+fn configuredApiKeyForProvider(runtime_config: ?*const config_mod.RuntimeConfig, provider_name: []const u8) ?[]const u8 {
+    if (runtime_config) |runtime_config_value| {
+        return runtime_config_value.lookupApiKey(provider_name);
+    }
+    return null;
+}
+
+fn settingsResources(settings: config_mod.Settings) resources_mod.SettingsResources {
+    return .{
+        .packages = settings.packages,
+        .extensions = settings.extensions,
+        .skills = settings.skills,
+        .prompts = settings.prompts,
+        .themes = settings.themes,
+        .theme = settings.theme,
+    };
+}
+
+fn normalizePathArgument(argument: []const u8) []const u8 {
+    if (argument.len >= 2) {
+        const first = argument[0];
+        const last = argument[argument.len - 1];
+        if ((first == '"' and last == '"') or (first == '\'' and last == '\'')) {
+            return argument[1 .. argument.len - 1];
+        }
+    }
+    return argument;
+}
+
+fn overrideApiKeyForProvider(options: RunInteractiveModeOptions, provider_name: []const u8) ?[]const u8 {
+    if (options.api_key) |api_key| {
+        if (std.mem.eql(u8, provider_name, options.provider)) return api_key;
+    }
+    return null;
 }
 
 fn fitLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
@@ -1935,6 +2934,520 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Model:") != null);
 }
 
+test "screen renders themed output and custom keybinding hints" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+    try keybindings.setBinding(.open_sessions, &.{.{ .ctrl = 'x' }});
+
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+    theme.styles[@intFromEnum(resources_mod.ThemeToken.welcome)].fg = try allocator.dupe(u8, "green");
+    theme.styles[@intFromEnum(resources_mod.ThemeToken.footer)].fg = try allocator.dupe(u8, "cyan");
+    theme.styles[@intFromEnum(resources_mod.ThemeToken.status)].fg = try allocator.dupe(u8, "yellow");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 6,
+        .keybindings = &keybindings,
+        .theme = &theme,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 80, &lines);
+
+    var saw_ansi = false;
+    var saw_custom_hint = false;
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line, "\x1b[") != null) saw_ansi = true;
+        if (std.mem.indexOf(u8, line, "Ctrl+X sessions") != null) saw_custom_hint = true;
+    }
+
+    try std.testing.expect(saw_ansi);
+    try std.testing.expect(saw_custom_hint);
+}
+
+test "handleInputKey respects configured exit binding" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+    try keybindings.setBinding(.exit, &.{.{ .ctrl = 'q' }});
+
+    var overlay: ?SelectorOverlay = null;
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const NoopSubscriber = struct {
+        fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+    };
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = NoopSubscriber.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+        .keybindings = &keybindings,
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'q' },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+    try std.testing.expect(should_exit);
+
+    should_exit = false;
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .escape,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+    try std.testing.expect(!should_exit);
+}
+
+test "parseSlashCommand recognizes builtins and arguments" {
+    const model_command = parseSlashCommand("/model faux").?;
+    try std.testing.expectEqual(SlashCommandKind.model, model_command.kind);
+    try std.testing.expectEqualStrings("faux", model_command.argument.?);
+
+    const export_command = parseSlashCommand("/export \"/tmp/out.md\"").?;
+    try std.testing.expectEqual(SlashCommandKind.@"export", export_command.kind);
+    try std.testing.expectEqualStrings("\"/tmp/out.md\"", export_command.argument.?);
+
+    try std.testing.expect(parseSlashCommand("hello") == null);
+    try std.testing.expect(parseSlashCommand("/unknown") == null);
+}
+
+test "handleInputKey opens model overlay for slash model command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/model");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .model);
+    try std.testing.expectEqual(@as(usize, 0), editor.text().len);
+}
+
+test "handleInputKey reports unknown slash commands" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/not-a-command");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay == null);
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Unknown slash command") != null);
+}
+
+test "handleInputKey shows session stats for slash session command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var usage = ai.Usage.init();
+    usage.input = 11;
+    usage.output = 7;
+    usage.cache_read = 2;
+    usage.cache_write = 1;
+    usage.total_tokens = 21;
+    usage.cost.total = 0.42;
+
+    var user = try makeInteractiveTestUserMessage("stats prompt", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    var assistant = try makeInteractiveTestAssistantMessage("stats reply", current_provider.model, usage, 2);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    try session.agent.setMessages(&.{ user, assistant });
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/session");
+
+    var overlay: ?SelectorOverlay = null;
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    const info = state.items.items[state.items.items.len - 1].text;
+    try std.testing.expect(std.mem.indexOf(u8, info, "Messages: user=1, assistant=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "Tokens: input=11, output=7, cache_read=2, cache_write=1, total=21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info, "Context:") != null);
+}
+
+test "handleInputKey exports session transcript to explicit markdown and json paths" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const markdown_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "session export.md" });
+    defer allocator.free(markdown_path);
+    const json_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "session export.json" });
+    defer allocator.free(json_path);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var usage = ai.Usage.init();
+    usage.input = 5;
+    usage.output = 3;
+    usage.total_tokens = 8;
+
+    var user = try makeInteractiveTestUserMessage("export prompt", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    var assistant = try makeInteractiveTestAssistantMessage("export reply", current_provider.model, usage, 2);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    _ = try session.session_manager.appendMessage(user);
+    _ = try session.session_manager.appendMessage(assistant);
+    try session.agent.setMessages(&.{ user, assistant });
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var overlay: ?SelectorOverlay = null;
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    const markdown_command = try std.fmt.allocPrint(allocator, "/export \"{s}\"", .{markdown_path});
+    defer allocator.free(markdown_command);
+    _ = try editor.handlePaste(markdown_command);
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    const markdown_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, markdown_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(markdown_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "# Session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "export prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "export reply") != null);
+
+    const json_command = try std.fmt.allocPrint(allocator, "/export \"{s}\"", .{json_path});
+    defer allocator.free(json_command);
+    _ = try editor.handlePaste(json_command);
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    const json_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, json_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(json_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"header\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"entries\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"export prompt\"") != null);
+}
+
 test "app state streams assistant updates and records tool results" {
     const allocator = std.testing.allocator;
 
@@ -1980,6 +3493,64 @@ test "app state streams assistant updates and records tool results" {
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 2].text, "Pi: partial") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Tool result bash: /tmp") != null);
+}
+
+fn makeInteractiveTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
+    if (name.len == 0) {
+        const relative_root = try std.fs.path.join(allocator, &[_][]const u8{
+            ".zig-cache",
+            "tmp",
+            &tmp.sub_path,
+        });
+        defer allocator.free(relative_root);
+        return makeInteractiveAbsolutePath(allocator, relative_root);
+    }
+
+    const relative_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        name,
+    });
+    defer allocator.free(relative_path);
+    return makeInteractiveAbsolutePath(allocator, relative_path);
+}
+
+fn makeInteractiveAbsolutePath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn makeInteractiveTestUserMessage(text: []const u8, timestamp: i64) !agent.AgentMessage {
+    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, text) } };
+    return .{ .user = .{
+        .role = try std.testing.allocator.dupe(u8, "user"),
+        .content = blocks,
+        .timestamp = timestamp,
+    } };
+}
+
+fn makeInteractiveTestAssistantMessage(
+    text: []const u8,
+    model: ai.Model,
+    usage: ai.Usage,
+    timestamp: i64,
+) !agent.AgentMessage {
+    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, text) } };
+    return .{ .assistant = .{
+        .role = try std.testing.allocator.dupe(u8, "assistant"),
+        .content = blocks,
+        .tool_calls = null,
+        .api = try std.testing.allocator.dupe(u8, model.api),
+        .provider = try std.testing.allocator.dupe(u8, model.provider),
+        .model = try std.testing.allocator.dupe(u8, model.id),
+        .usage = usage,
+        .stop_reason = .stop,
+        .timestamp = timestamp,
+    } };
 }
 
 test "native terminal backend prefers ioctl size over environment variables" {
