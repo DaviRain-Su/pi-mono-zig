@@ -61,6 +61,8 @@ const ChatItem = struct {
     text: []u8,
 };
 
+const ASSISTANT_PREFIX = "Pi:";
+
 const SlashCommandKind = enum {
     model,
     session,
@@ -267,7 +269,7 @@ const AppState = struct {
             .message_start => {
                 if (event.message) |message| switch (message) {
                     .assistant => {
-                        try self.appendItemLocked(.assistant, "Pi:");
+                        try self.appendItemLocked(.assistant, "");
                         self.last_streaming_assistant_index = self.items.items.len - 1;
                         try self.replaceLabelLocked(&self.status, "streaming");
                     },
@@ -522,9 +524,7 @@ const ScreenComponent = struct {
 
         const start_index = @min(self.state.visible_start_index, self.state.items.items.len);
         for (self.state.items.items[start_index..]) |item| {
-            const themed_item = try themeChatItem(allocator, self.theme, item);
-            defer allocator.free(themed_item);
-            try tui.ansi.wrapTextWithAnsi(allocator, themed_item, @max(width, 1), &chat_lines);
+            try renderChatItemInto(allocator, @max(width, 1), self.theme, item, &chat_lines);
         }
 
         var prompt_lines = tui.LineList.empty;
@@ -2460,6 +2460,42 @@ fn themeChatItem(
     }, item.text);
 }
 
+fn renderChatItemInto(
+    allocator: std.mem.Allocator,
+    width: usize,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    lines: *tui.LineList,
+) !void {
+    switch (item.kind) {
+        .assistant => try renderAssistantChatItemInto(allocator, width, theme, item.text, lines),
+        else => {
+            const themed_item = try themeChatItem(allocator, theme, item);
+            defer allocator.free(themed_item);
+            try tui.ansi.wrapTextWithAnsi(allocator, themed_item, width, lines);
+        },
+    }
+}
+
+fn renderAssistantChatItemInto(
+    allocator: std.mem.Allocator,
+    width: usize,
+    theme: ?*const resources_mod.Theme,
+    text: []const u8,
+    lines: *tui.LineList,
+) !void {
+    const prefix = try applyThemeAlloc(allocator, theme, .assistant, ASSISTANT_PREFIX);
+    defer allocator.free(prefix);
+    try tui.ansi.wrapTextWithAnsi(allocator, prefix, width, lines);
+
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
+
+    const markdown = tui.Markdown{
+        .text = text,
+    };
+    try markdown.renderInto(allocator, width, lines);
+}
+
 fn applyThemeAlloc(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -2604,13 +2640,13 @@ fn formatAssistantMessage(allocator: std.mem.Allocator, message: ai.AssistantMes
     const body = try blocksToText(allocator, message.content);
     defer allocator.free(body);
     if (body.len > 0) {
-        return try std.fmt.allocPrint(allocator, "Pi: {s}", .{body});
+        return allocator.dupe(u8, body);
     }
     if (message.stop_reason == .error_reason) {
-        return try std.fmt.allocPrint(allocator, "Pi error: {s}", .{message.error_message orelse "unknown error"});
+        return try std.fmt.allocPrint(allocator, "Error: {s}", .{message.error_message orelse "unknown error"});
     }
     if (message.stop_reason == .aborted) {
-        return try allocator.dupe(u8, "Pi: [interrupted]");
+        return try allocator.dupe(u8, "[interrupted]");
     }
     return try allocator.dupe(u8, "");
 }
@@ -2975,6 +3011,77 @@ test "screen renders themed output and custom keybinding hints" {
 
     try std.testing.expect(saw_ansi);
     try std.testing.expect(saw_custom_hint);
+}
+
+test "screen renders assistant markdown while keeping user messages plain" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .user = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "literal **stars** [plain](https://example.com)" } }},
+            .timestamp = 1,
+        } },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .assistant = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text =
+            \\**bold** [link](https://example.com)
+            \\- list item
+            \\```zig
+            \\const value = 1;
+            \\```
+            } }},
+            .tool_calls = null,
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = ai.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 2,
+        } },
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 20,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 80, &lines);
+
+    var saw_prefix = false;
+    var saw_user_literal = false;
+    var saw_bold = false;
+    var saw_link = false;
+    var saw_list = false;
+    var saw_code = false;
+
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line, ASSISTANT_PREFIX) != null) saw_prefix = true;
+        if (std.mem.indexOf(u8, line, "You: literal **stars** [plain](https://example.com)") != null) saw_user_literal = true;
+        if (std.mem.indexOf(u8, line, "\x1b[1mbold\x1b[0m") != null) saw_bold = true;
+        if (std.mem.indexOf(u8, line, "\x1b[4m\x1b[38;5;45mlink\x1b[0m") != null) saw_link = true;
+        if (std.mem.indexOf(u8, line, "\x1b[38;5;45m• \x1b[0mlist item") != null) saw_list = true;
+        if (std.mem.indexOf(u8, line, "\x1b[48;5;236m\x1b[38;5;214mconst value = 1;\x1b[0m") != null) saw_code = true;
+    }
+
+    try std.testing.expect(saw_prefix);
+    try std.testing.expect(saw_user_literal);
+    try std.testing.expect(saw_bold);
+    try std.testing.expect(saw_link);
+    try std.testing.expect(saw_list);
+    try std.testing.expect(saw_code);
 }
 
 test "handleInputKey respects configured exit binding" {
@@ -3491,7 +3598,7 @@ test "app state streams assistant updates and records tool results" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 2].text, "Pi: partial") != null);
+    try std.testing.expectEqualStrings("partial", state.items.items[state.items.items.len - 2].text);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Tool result bash: /tmp") != null);
 }
 
