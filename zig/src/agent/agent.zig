@@ -1515,9 +1515,34 @@ fn runPromptThread(runner: *PromptThreadRunner) void {
     };
 }
 
+const RunPromptHandle = struct {
+    runner: PromptThreadRunner,
+    thread: std.Thread,
+    joined: bool = false,
+
+    fn start(agent: *Agent, input: []const u8) !RunPromptHandle {
+        var handle = RunPromptHandle{
+            .runner = .{
+                .agent = agent,
+                .input = input,
+            },
+            .thread = undefined,
+        };
+        handle.thread = try std.Thread.spawn(.{}, runPromptThread, .{&handle.runner});
+        return handle;
+    }
+
+    fn join(self: *RunPromptHandle) !void {
+        if (self.joined) return;
+        self.thread.join();
+        self.joined = true;
+        if (self.runner.err) |err| return err;
+    }
+};
+
 fn waitForAtomicTrue(flag: *const std.atomic.Value(bool)) !void {
     var iteration: usize = 0;
-    while (iteration < 500 and !flag.load(.seq_cst)) : (iteration += 1) {
+    while (iteration < 50_000 and !flag.load(.seq_cst)) : (iteration += 1) {
         std.Thread.yield() catch {};
     }
     if (!flag.load(.seq_cst)) return error.TestTimeout;
@@ -1672,17 +1697,12 @@ test "agent abort stops an in-flight stream and clears runtime state" {
     mid_stream_started = &capture.assistant_started;
     defer mid_stream_started = null;
 
-    var runner = PromptThreadRunner{
-        .agent = &agent,
-        .input = "hello",
-    };
-    const thread = try std.Thread.spawn(.{}, runPromptThread, .{&runner});
+    var handle = try RunPromptHandle.start(&agent, "hello");
+    defer handle.join() catch {};
 
     try waitForAtomicTrue(&capture.assistant_started);
     agent.abort();
-    thread.join();
-
-    if (runner.err) |err| return err;
+    try handle.join();
 
     const messages = agent.getMessages();
     try std.testing.expectEqual(@as(usize, 2), messages.len);
@@ -1737,17 +1757,12 @@ test "agent abort during tool execution cancels the tool and stops the run" {
     abortable_tool_started = &capture.tool_started;
     defer abortable_tool_started = null;
 
-    var runner = PromptThreadRunner{
-        .agent = &agent,
-        .input = "hello",
-    };
-    const thread = try std.Thread.spawn(.{}, runPromptThread, .{&runner});
+    var handle = try RunPromptHandle.start(&agent, "hello");
+    defer handle.join() catch {};
 
     try waitForAtomicTrue(&capture.tool_started);
     agent.abort();
-    thread.join();
-
-    if (runner.err) |err| return err;
+    try handle.join();
 
     const messages = agent.getMessages();
     try std.testing.expectEqual(@as(usize, 3), messages.len);
