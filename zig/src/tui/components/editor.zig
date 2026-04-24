@@ -58,7 +58,7 @@ pub const Editor = struct {
         const line_start = lineStart(self.buffer.items, self.cursor);
         return .{
             .line = lineNumber(self.buffer.items, self.cursor),
-            .column = utf8Column(self.buffer.items, line_start, self.cursor),
+            .column = displayColumn(self.buffer.items, line_start, self.cursor),
         };
     }
 
@@ -170,10 +170,31 @@ pub const Editor = struct {
                 else => return .ignored,
             },
             .escape => return .ignored,
+            else => return .ignored,
         }
     }
 
+    pub fn handlePaste(self: *Editor, pasted: []const u8) !HandleResult {
+        try self.insertSlice(pasted);
+        self.clearAutocomplete();
+        return .handled;
+    }
+
     pub fn renderInto(
+        self: *const Editor,
+        allocator: std.mem.Allocator,
+        width: usize,
+        lines: *component_mod.LineList,
+    ) std.mem.Allocator.Error!void {
+        try self.renderTextInto(allocator, width, lines);
+
+        if (self.autocomplete_list) |list| {
+            const effective_width = @max(width, 1);
+            try list.renderInto(allocator, effective_width, lines);
+        }
+    }
+
+    pub fn renderTextInto(
         self: *const Editor,
         allocator: std.mem.Allocator,
         width: usize,
@@ -190,31 +211,33 @@ pub const Editor = struct {
         }
 
         if (self.buffer.items.len == 0) {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            const rendered = try renderVisualLine(allocator, "", 0, self.padding_x, effective_width);
+            defer allocator.free(rendered);
+            try component_mod.appendOwnedLine(lines, allocator, rendered);
         } else {
             var start: usize = 0;
             while (true) {
                 const rel_end = std.mem.indexOfScalar(u8, self.buffer.items[start..], '\n');
                 const end = if (rel_end) |index| start + index else self.buffer.items.len;
-
-                const padded = try renderLine(allocator, self.buffer.items[start..end], self.padding_x, effective_width);
-                defer allocator.free(padded);
-                try component_mod.appendOwnedLine(lines, allocator, padded);
+                const cursor_offset = if (self.cursor >= start and self.cursor <= end) self.cursor - start else null;
+                try appendWrappedLogicalLine(
+                    allocator,
+                    self.buffer.items[start..end],
+                    cursor_offset,
+                    self.padding_x,
+                    effective_width,
+                    lines,
+                );
 
                 if (rel_end == null) break;
 
                 start = end + 1;
                 if (start == self.buffer.items.len) {
-                    const trailing = try renderLine(allocator, "", self.padding_x, effective_width);
-                    defer allocator.free(trailing);
-                    try component_mod.appendOwnedLine(lines, allocator, trailing);
+                    const trailing_cursor = if (self.cursor == self.buffer.items.len) @as(?usize, 0) else null;
+                    try appendWrappedLogicalLine(allocator, "", trailing_cursor, self.padding_x, effective_width, lines);
                     break;
                 }
             }
-        }
-
-        if (self.autocomplete_list) |list| {
-            try list.renderInto(allocator, effective_width, lines);
         }
 
         for (0..self.padding_y) |_| {
@@ -352,7 +375,7 @@ pub const Editor = struct {
         const content = self.buffer.items;
         const current_start = lineStart(content, self.cursor);
         const current_end = lineEnd(content, self.cursor);
-        const target_column = utf8Column(content, current_start, self.cursor);
+        const target_column = displayColumn(content, current_start, self.cursor);
 
         if (direction < 0) {
             if (current_start == 0) return;
@@ -371,12 +394,93 @@ pub const Editor = struct {
     }
 };
 
-fn renderLine(allocator: std.mem.Allocator, line: []const u8, padding_x: usize, width: usize) std.mem.Allocator.Error![]u8 {
+fn appendWrappedLogicalLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    cursor_offset: ?usize,
+    padding_x: usize,
+    width: usize,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    const content_width = @max(@as(usize, 1), if (width > padding_x) width - padding_x else 1);
+
+    if (line.len == 0) {
+        const rendered = try renderVisualLine(allocator, "", cursor_offset, padding_x, width);
+        defer allocator.free(rendered);
+        try component_mod.appendOwnedLine(lines, allocator, rendered);
+        return;
+    }
+
+    var segment_start: usize = 0;
+    var segment_width: usize = 0;
+    var cursor: usize = 0;
+
+    while (cursor < line.len) {
+        const cluster = ansi.nextDisplayCluster(line, cursor);
+        if (segment_width > 0 and segment_width + cluster.width > content_width) {
+            try appendWrappedSegment(allocator, line, segment_start, cursor, cursor_offset, padding_x, width, false, lines);
+            segment_start = cursor;
+            segment_width = 0;
+        }
+
+        segment_width += cluster.width;
+        cursor = cluster.end;
+    }
+
+    try appendWrappedSegment(allocator, line, segment_start, line.len, cursor_offset, padding_x, width, true, lines);
+}
+
+fn appendWrappedSegment(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    segment_start: usize,
+    segment_end: usize,
+    cursor_offset: ?usize,
+    padding_x: usize,
+    width: usize,
+    is_last_segment: bool,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    const segment_cursor = if (cursor_offset) |offset|
+        if (offset >= segment_start and (offset < segment_end or (is_last_segment and offset == segment_end)))
+            @as(?usize, offset - segment_start)
+        else
+            null
+    else
+        null;
+
+    const rendered = try renderVisualLine(allocator, line[segment_start..segment_end], segment_cursor, padding_x, width);
+    defer allocator.free(rendered);
+    try component_mod.appendOwnedLine(lines, allocator, rendered);
+}
+
+fn renderVisualLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    cursor_offset: ?usize,
+    padding_x: usize,
+    width: usize,
+) std.mem.Allocator.Error![]u8 {
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
 
     try builder.appendNTimes(allocator, ' ', padding_x);
-    try builder.appendSlice(allocator, line);
+
+    if (cursor_offset) |offset| {
+        const clamped = @min(offset, line.len);
+        try builder.appendSlice(allocator, line[0..clamped]);
+        if (clamped < line.len) {
+            const cluster = ansi.nextDisplayCluster(line, clamped);
+            try builder.appendSlice(allocator, "\x1b[7m");
+            try builder.appendSlice(allocator, line[clamped..cluster.end]);
+            try builder.appendSlice(allocator, "\x1b[0m");
+            try builder.appendSlice(allocator, line[cluster.end..]);
+        } else {
+            try builder.appendSlice(allocator, "\x1b[7m \x1b[0m");
+        }
+    } else {
+        try builder.appendSlice(allocator, line);
+    }
 
     const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, width);
     builder.deinit(allocator);
@@ -434,12 +538,13 @@ fn lineNumber(text: []const u8, index: usize) usize {
     return count;
 }
 
-fn utf8Column(text: []const u8, start: usize, end: usize) usize {
+fn displayColumn(text: []const u8, start: usize, end: usize) usize {
     var column: usize = 0;
     var cursor = start;
     while (cursor < @min(end, text.len)) {
-        cursor = nextCodepointEnd(text, cursor);
-        column += 1;
+        const cluster = ansi.nextDisplayCluster(text, cursor);
+        cursor = cluster.end;
+        column += cluster.width;
     }
     return column;
 }
@@ -447,9 +552,12 @@ fn utf8Column(text: []const u8, start: usize, end: usize) usize {
 fn indexForColumn(text: []const u8, start: usize, end: usize, target_column: usize) usize {
     var cursor = start;
     var column: usize = 0;
-    while (cursor < end and column < target_column) {
-        cursor = nextCodepointEnd(text, cursor);
-        column += 1;
+    while (cursor < end) {
+        const cluster = ansi.nextDisplayCluster(text, cursor);
+        if (column + cluster.width > target_column) break;
+        cursor = cluster.end;
+        column += cluster.width;
+        if (column >= target_column) break;
     }
     return cursor;
 }
@@ -470,7 +578,8 @@ test "editor accepts typed characters and renders content" {
     const inputs = [_][]const u8{ "h", "e", "l", "l", "o" };
     for (inputs) |input| {
         const parsed = keys.parseKey(input).?;
-        try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(parsed.key));
+        try std.testing.expect(parsed == .parsed);
+        try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(parsed.parsed.key));
     }
 
     try std.testing.expectEqualStrings("hello", editor.text());
@@ -481,7 +590,9 @@ test "editor accepts typed characters and renders content" {
     try editor.renderInto(allocator, 8, &lines);
 
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqualStrings("hello   ", lines.items[0]);
+    try std.testing.expectEqual(@as(usize, 8), ansi.visibleWidth(lines.items[0]));
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[7m \x1b[0m") != null);
 }
 
 test "editor cursor moves with arrow keys" {
@@ -592,4 +703,48 @@ test "editor autocomplete enter confirms selection without inserting newline" {
 
     try std.testing.expectEqualStrings("modern", editor.text());
     try std.testing.expect(std.mem.indexOfScalar(u8, editor.text(), '\n') == null);
+}
+
+test "editor inserts bracketed paste content as a single edit" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("x") });
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("hello\nworld"));
+
+    try std.testing.expectEqualStrings("xhello\nworld", editor.text());
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 5 }, editor.cursorPosition());
+}
+
+test "editor renders wrapped multi-line content and tracks wide cursor columns" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("ab你好🙂\nxy"));
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 2 }, editor.cursorPosition());
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+    try editor.renderTextInto(allocator, 6, &lines);
+
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("ab你好", lines.items[0]);
+    try std.testing.expectEqual(@as(usize, 6), ansi.visibleWidth(lines.items[1]));
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "🙂") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[2], "xy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[2], "\x1b[7m \x1b[0m") != null);
+}
+
+test "editor cursor column uses display width for wide graphemes" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("你🙂a"));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 5 }, editor.cursorPosition());
 }
