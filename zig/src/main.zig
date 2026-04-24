@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
 const config_mod = @import("coding_agent/config.zig");
@@ -745,6 +746,138 @@ test "cli executable continue resumes the latest session while preserving older 
     try std.testing.expectEqualStrings("third reply", latest_context.messages[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings("fourth prompt", latest_context.messages[2].user.content[0].text.text);
     try std.testing.expectEqualStrings("fourth reply", latest_context.messages[3].assistant.content[0].text.text);
+}
+
+test "runCli preserves context when continuing with a different provider" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+
+    ai.api_registry.resetToBuiltIns();
+    defer ai.api_registry.resetToBuiltIns();
+
+    const openai_registration = try faux.registerFauxProvider(allocator, .{
+        .api = "openai-completions",
+        .provider = "openai",
+        .models = &[_]faux.FauxModelDefinition{.{
+            .id = "gpt-5.4",
+            .name = "GPT-5.4",
+            .reasoning = true,
+        }},
+    });
+    defer openai_registration.unregister();
+
+    const openai_blocks = [_]faux.FauxContentBlock{
+        faux.fauxText("I will remember marigold."),
+    };
+    try openai_registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(openai_blocks[0..], .{}) },
+    });
+
+    const anthropic_registration = try faux.registerFauxProvider(allocator, .{
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .models = &[_]faux.FauxModelDefinition{.{
+            .id = "claude-opus-4-7",
+            .name = "Claude Opus 4.7",
+            .reasoning = true,
+        }},
+    });
+    defer anthropic_registration.unregister();
+    try anthropic_registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = struct {
+            fn respond(
+                factory_allocator: std.mem.Allocator,
+                context: ai.Context,
+                _: ?ai.types.StreamOptions,
+                call_count: *usize,
+                model: ai.Model,
+            ) !faux.FauxAssistantMessage {
+                try std.testing.expectEqual(@as(usize, 1), call_count.*);
+                try std.testing.expectEqualStrings("anthropic", model.provider);
+                try std.testing.expectEqualStrings("claude-opus-4-7", model.id);
+                try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+                try std.testing.expectEqualStrings("Remember this token: marigold", context.messages[0].user.content[0].text.text);
+                try std.testing.expectEqualStrings("I will remember marigold.", context.messages[1].assistant.content[0].text.text);
+                try std.testing.expectEqualStrings("openai", context.messages[1].assistant.provider);
+                try std.testing.expectEqualStrings("What token did I ask you to remember?", context.messages[2].user.content[0].text.text);
+
+                const blocks = try factory_allocator.alloc(faux.FauxContentBlock, 1);
+                blocks[0] = faux.fauxText("You asked me to remember marigold.");
+                return faux.fauxAssistantMessage(blocks, .{});
+            }
+        }.respond },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-multi-provider");
+    defer allocator.free(cwd);
+
+    var first_env = std.process.Environ.Map.init(allocator);
+    defer first_env.deinit();
+    try first_env.put("OPENAI_API_KEY", "test-openai-key");
+
+    var first_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stdout.deinit();
+    var first_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stderr.deinit();
+
+    const first_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &first_env,
+        &.{ "--provider", "openai", "--print", "Remember this token: marigold" },
+        cwd,
+        &first_stdout.writer,
+        &first_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), first_exit);
+    try std.testing.expectEqualStrings("I will remember marigold.\n", first_stdout.written());
+    try std.testing.expectEqualStrings("", first_stderr.written());
+
+    var second_env = std.process.Environ.Map.init(allocator);
+    defer second_env.deinit();
+    try second_env.put("ANTHROPIC_API_KEY", "test-anthropic-key");
+
+    var second_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stdout.deinit();
+    var second_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stderr.deinit();
+
+    const second_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &second_env,
+        &.{ "--provider", "anthropic", "--print", "--continue", "What token did I ask you to remember?" },
+        cwd,
+        &second_stdout.writer,
+        &second_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), second_exit);
+    try std.testing.expectEqualStrings("You asked me to remember marigold.\n", second_stdout.written());
+    try std.testing.expectEqualStrings("", second_stderr.written());
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("Remember this token: marigold", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("I will remember marigold.", context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("openai", context.messages[1].assistant.provider);
+    try std.testing.expectEqualStrings("What token did I ask you to remember?", context.messages[2].user.content[0].text.text);
+    try std.testing.expectEqualStrings("You asked me to remember marigold.", context.messages[3].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("anthropic", context.messages[3].assistant.provider);
+    try std.testing.expectEqualStrings("anthropic", context.model.?.provider);
+    try std.testing.expectEqualStrings("claude-opus-4-7", context.model.?.model_id);
 }
 
 test "prepareCliRuntime loads defaults resources context and prompt templates" {
