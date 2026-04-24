@@ -615,6 +615,138 @@ test "runCli persists and continues sessions across runs" {
     try std.testing.expectEqualStrings("second reply", context.messages[3].assistant.content[0].text.text);
 }
 
+test "cli executable continue resumes the latest session while preserving older sessions" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ project_dir, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+
+    var first = try runCliExecutable(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--print", "first prompt" },
+        &.{.{ "PI_FAUX_RESPONSE", "first reply" }},
+    );
+    defer first.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), first.exit_code);
+    try std.testing.expectEqualStrings("first reply\n", first.stdout);
+    try std.testing.expectEqualStrings("", first.stderr);
+
+    const original_session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(original_session_file);
+
+    const original_session_before_continue = try std.testing.allocator.dupe(u8, original_session_file);
+    defer std.testing.allocator.free(original_session_before_continue);
+
+    const original_bytes_before_continue = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, original_session_before_continue, allocator, .unlimited);
+    defer allocator.free(original_bytes_before_continue);
+    var original_line_count_before_continue: usize = 0;
+    for (original_bytes_before_continue) |byte| {
+        if (byte == '\n') original_line_count_before_continue += 1;
+    }
+
+    var second = try runCliExecutable(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--print", "--continue", "second prompt" },
+        &.{.{ "PI_FAUX_RESPONSE", "second reply" }},
+    );
+    defer second.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), second.exit_code);
+    try std.testing.expectEqualStrings("second reply\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
+
+    const original_session_after_continue = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(original_session_after_continue);
+    try std.testing.expectEqualStrings(original_session_before_continue, original_session_after_continue);
+
+    const original_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, original_session_after_continue, allocator, .unlimited);
+    defer allocator.free(original_bytes);
+    var original_line_count: usize = 0;
+    for (original_bytes) |byte| {
+        if (byte == '\n') original_line_count += 1;
+    }
+    try std.testing.expectEqual(original_line_count_before_continue + 2, original_line_count);
+
+    var original_manager = try coding_agent.SessionManager.open(allocator, std.testing.io, original_session_after_continue, project_dir);
+    defer original_manager.deinit();
+
+    var original_context = try original_manager.buildSessionContext(allocator);
+    defer original_context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), original_context.messages.len);
+    try std.testing.expectEqualStrings("first prompt", original_context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("first reply", original_context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("second prompt", original_context.messages[2].user.content[0].text.text);
+    try std.testing.expectEqualStrings("second reply", original_context.messages[3].assistant.content[0].text.text);
+
+    var third = try runCliExecutable(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--print", "third prompt" },
+        &.{.{ "PI_FAUX_RESPONSE", "third reply" }},
+    );
+    defer third.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), third.exit_code);
+    try std.testing.expectEqualStrings("third reply\n", third.stdout);
+    try std.testing.expectEqualStrings("", third.stderr);
+
+    const latest_session_before_continue = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(latest_session_before_continue);
+    try std.testing.expect(!std.mem.eql(u8, original_session_before_continue, latest_session_before_continue));
+
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, session_dir, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+
+    var iterator = dir.iterate();
+    var session_file_count: usize = 0;
+    while (try iterator.next(std.testing.io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        session_file_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), session_file_count);
+
+    const latest_session_path = try std.testing.allocator.dupe(u8, latest_session_before_continue);
+    defer std.testing.allocator.free(latest_session_path);
+
+    var fourth = try runCliExecutable(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--print", "--continue", "fourth prompt" },
+        &.{.{ "PI_FAUX_RESPONSE", "fourth reply" }},
+    );
+    defer fourth.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), fourth.exit_code);
+    try std.testing.expectEqualStrings("fourth reply\n", fourth.stdout);
+    try std.testing.expectEqualStrings("", fourth.stderr);
+
+    const latest_session_after_continue = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(latest_session_after_continue);
+    try std.testing.expectEqualStrings(latest_session_path, latest_session_after_continue);
+
+    var latest_manager = try coding_agent.SessionManager.open(allocator, std.testing.io, latest_session_after_continue, project_dir);
+    defer latest_manager.deinit();
+
+    var latest_context = try latest_manager.buildSessionContext(allocator);
+    defer latest_context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), latest_context.messages.len);
+    try std.testing.expectEqualStrings("third prompt", latest_context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("third reply", latest_context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("fourth prompt", latest_context.messages[2].user.content[0].text.text);
+    try std.testing.expectEqualStrings("fourth reply", latest_context.messages[3].assistant.content[0].text.text);
+}
+
 test "prepareCliRuntime loads defaults resources context and prompt templates" {
     const allocator = std.testing.allocator;
 
