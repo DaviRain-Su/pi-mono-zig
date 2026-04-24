@@ -1,13 +1,40 @@
 const std = @import("std");
-const ai = @import("ai/root.zig");
+const ai = @import("ai");
 const cli = @import("cli/args.zig");
 const coding_agent = @import("coding_agent/root.zig");
-const openai = @import("ai/providers/openai.zig");
-const http_client = @import("ai/http_client.zig");
+const faux = ai.providers.faux;
 
 const VERSION = "0.1.0";
 
+const ResolveProviderError = error{
+    MissingApiKey,
+    UnknownProvider,
+    InvalidFauxStopReason,
+    InvalidFauxTokensPerSecond,
+};
+
+const ResolvedProviderConfig = struct {
+    model: ai.Model,
+    api_key: ?[]const u8,
+    faux_registration: ?faux.FauxProviderRegistration = null,
+    faux_blocks: ?[]faux.FauxContentBlock = null,
+
+    fn deinit(self: *ResolvedProviderConfig, allocator: std.mem.Allocator) void {
+        if (self.faux_registration) |registration| registration.unregister();
+        if (self.faux_blocks) |blocks| allocator.free(blocks);
+        self.* = undefined;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(init.gpa);
     var it = init.minimal.args.iterate();
@@ -17,25 +44,35 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var options = cli.parseArgs(init.gpa, argv.items) catch |err| {
-        std.debug.print("Error: {s}\n\n", .{parseErrorMessage(err)});
-        printUsage(init.gpa) catch {};
+        stderr.print("Error: {s}\n\n", .{parseErrorMessage(err)}) catch {};
+        printUsage(init.gpa, stdout) catch {};
+        flushWriters(stdout, stderr) catch {};
         std.process.exit(1);
     };
     defer options.deinit(init.gpa);
 
     if (options.help) {
-        try printUsage(init.gpa);
+        try printUsage(init.gpa, stdout);
+        try flushWriters(stdout, stderr);
         return;
     }
 
     if (options.version) {
-        try printVersion(init.gpa);
+        try printVersion(init.gpa, stdout);
+        try flushWriters(stdout, stderr);
         return;
     }
 
     if (options.prompt == null) {
-        std.debug.print("Error: No prompt provided\n\n", .{});
-        printUsage(init.gpa) catch {};
+        try stderr.writeAll("Error: No prompt provided\n\n");
+        printUsage(init.gpa, stdout) catch {};
+        try flushWriters(stdout, stderr);
+        std.process.exit(1);
+    }
+
+    if (options.mode == .rpc) {
+        try stderr.writeAll("Error: RPC mode is not implemented in the Zig CLI\n");
+        try flushWriters(stdout, stderr);
         std.process.exit(1);
     }
 
@@ -54,39 +91,19 @@ pub fn main(init: std.process.Init) !void {
     });
     defer init.gpa.free(system_prompt);
 
-    // Determine provider defaults and API key env var
-    const is_kimi = std.mem.eql(u8, provider, "kimi");
-    const default_model = if (is_kimi) "moonshot-v1-8k" else "gpt-4";
-    const api_key_env = if (is_kimi) "KIMI_API_KEY" else "OPENAI_API_KEY";
-
-    // Get API key from env var if not provided
-    var api_key: ?[]const u8 = options.api_key;
-    if (api_key == null) {
-        api_key = init.environ_map.get(api_key_env);
-    }
-
-    if (api_key == null) {
-        std.debug.print("Error: API key required. Use -k or set {s} env var.\n", .{api_key_env});
+    var provider_config = resolveProviderConfig(
+        init.gpa,
+        init.environ_map,
+        provider,
+        options.model,
+        options.api_key,
+    ) catch |err| {
+        try stderr.print("Error: {s}\n", .{resolveProviderErrorMessage(err, provider)});
+        try flushWriters(stdout, stderr);
         std.process.exit(1);
-    }
-
-    // Use default model if not specified
-    const model_id = options.model orelse default_model;
-    const base_url = if (is_kimi) "https://api.moonshot.cn/v1" else "https://api.openai.com/v1";
-
-    // Build model config
-    const model = ai.Model{
-        .id = model_id,
-        .name = model_id,
-        .api = if (is_kimi) "kimi-completions" else "openai-completions",
-        .provider = provider,
-        .base_url = base_url,
-        .input_types = &[_][]const u8{"text"},
-        .context_window = 8192,
-        .max_tokens = 4096,
     };
+    defer provider_config.deinit(init.gpa);
 
-    // Build context
     const content_block = ai.ContentBlock{ .text = .{ .text = options.prompt.? } };
     const now: i64 = @intCast(@divFloor(std.Io.Clock.now(.real, init.io).nanoseconds, std.time.ns_per_s));
     const user_msg = ai.Message{ .user = .{
@@ -98,15 +115,25 @@ pub fn main(init: std.process.Init) !void {
         .messages = &[_]ai.Message{user_msg},
     };
 
-    // Build stream options
-    const stream_options = ai.StreamOptions{
-        .api_key = api_key,
-    };
-
-    std.debug.print("pi v{s}\n\n", .{VERSION});
-
-    // Perform actual streaming request
-    try streamChatCompletion(init.gpa, init.io, model, context, stream_options);
+    const exit_code = try coding_agent.runPrintMode(
+        init.gpa,
+        init.io,
+        provider_config.model,
+        context,
+        .{
+            .api_key = provider_config.api_key,
+        },
+        .{
+            .mode = switch (options.mode) {
+                .json => .json,
+                else => .text,
+            },
+        },
+        stdout,
+        stderr,
+    );
+    try flushWriters(stdout, stderr);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
@@ -126,16 +153,16 @@ fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
     return options.tools;
 }
 
-fn printUsage(allocator: std.mem.Allocator) !void {
+fn printUsage(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     const text = try cli.helpText(allocator, VERSION);
     defer allocator.free(text);
-    std.debug.print("{s}", .{text});
+    try stdout.writeAll(text);
 }
 
-fn printVersion(allocator: std.mem.Allocator) !void {
+fn printVersion(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     const text = try cli.versionText(allocator, VERSION);
     defer allocator.free(text);
-    std.debug.print("{s}", .{text});
+    try stdout.writeAll(text);
 }
 
 fn currentDateString(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
@@ -152,102 +179,151 @@ fn currentDateString(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     );
 }
 
-/// Stream chat completion and print response to stdout
-fn streamChatCompletion(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    context: ai.Context,
-    options: ai.StreamOptions,
-) !void {
-    // Build request payload using OpenAI provider helper
-    const payload = try openai.buildRequestPayload(allocator, model, context, options);
-
-    // Serialize payload to JSON
-    var json_out: std.Io.Writer.Allocating = .init(allocator);
-    const json_writer = &json_out.writer;
-    defer json_out.deinit();
-    try std.json.Stringify.value(payload, .{}, json_writer);
-
-    // Build HTTP request
-    var headers = std.StringHashMap([]const u8).init(allocator);
-    defer headers.deinit();
-
-    try headers.put("Content-Type", "application/json");
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{options.api_key orelse ""});
-    defer allocator.free(auth_header);
-    try headers.put("Authorization", auth_header);
-    try headers.put("Accept", "text/event-stream");
-
-    const req = http_client.HttpRequest{
-        .method = .POST,
-        .url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}),
-        .headers = headers,
-        .body = json_out.written(),
-    };
-    defer allocator.free(req.url);
-
-    // Send request
-    var client = try http_client.HttpClient.init(allocator, io);
-    defer client.deinit();
-
-    const response = try client.request(req);
-    defer response.deinit();
-
-    if (response.status != 200) {
-        std.debug.print("Error: HTTP {d}\n", .{response.status});
-        std.debug.print("{s}\n", .{response.body});
-        return error.HttpError;
-    }
-
-    // Parse SSE stream and print text chunks
-    try parseAndPrintSseStream(allocator, response.body);
+fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
+    try stdout.flush();
+    try stderr.flush();
 }
 
-/// Parse SSE stream and print text content to stdout
-fn parseAndPrintSseStream(allocator: std.mem.Allocator, body: []const u8) !void {
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    var first_chunk = true;
-
-    while (lines.next()) |line| {
-        const data = openai.parseSseLine(line) orelse continue;
-
-        if (std.mem.eql(u8, data, "[DONE]")) {
-            break;
-        }
-
-        const chunk = try openai.parseChunk(allocator, data);
-        defer if (chunk) |*c| c.deinit();
-
-        if (chunk == null) continue;
-
-        const value = chunk.?.value;
-
-        // Extract choices from chunk
-        const choices = value.object.get("choices") orelse continue;
-        if (choices != .array or choices.array.items.len == 0) continue;
-
-        const choice = choices.array.items[0];
-        if (choice != .object) continue;
-
-        const delta = choice.object.get("delta") orelse continue;
-        if (delta != .object) continue;
-
-        // Handle text content
-        if (delta.object.get("content")) |content| {
-            if (content == .string and content.string.len > 0) {
-                if (first_chunk) {
-                    std.debug.print("\n", .{});
-                    first_chunk = false;
-                }
-                std.debug.print("{s}", .{content.string});
-            }
-        }
+fn resolveProviderConfig(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    model_override: ?[]const u8,
+    api_key_override: ?[]const u8,
+) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
+    if (std.mem.eql(u8, provider, "faux")) {
+        return try resolveFauxProvider(allocator, env_map, model_override);
     }
 
-    if (!first_chunk) {
-        std.debug.print("\n", .{});
+    if (std.mem.eql(u8, provider, "openai")) {
+        return resolveOpenAiCompatibleProvider(
+            env_map,
+            "OPENAI_API_KEY",
+            "gpt-4",
+            "openai-completions",
+            provider,
+            "https://api.openai.com/v1",
+            model_override,
+            api_key_override,
+        );
     }
+
+    if (std.mem.eql(u8, provider, "kimi")) {
+        return resolveOpenAiCompatibleProvider(
+            env_map,
+            "KIMI_API_KEY",
+            "moonshot-v1-8k",
+            "kimi-completions",
+            provider,
+            "https://api.moonshot.cn/v1",
+            model_override,
+            api_key_override,
+        );
+    }
+
+    return error.UnknownProvider;
+}
+
+fn resolveOpenAiCompatibleProvider(
+    env_map: *const std.process.Environ.Map,
+    env_key: []const u8,
+    default_model: []const u8,
+    api: []const u8,
+    provider: []const u8,
+    base_url: []const u8,
+    model_override: ?[]const u8,
+    api_key_override: ?[]const u8,
+) ResolveProviderError!ResolvedProviderConfig {
+    const api_key = api_key_override orelse env_map.get(env_key) orelse return error.MissingApiKey;
+    const model_id = model_override orelse default_model;
+    return .{
+        .model = .{
+            .id = model_id,
+            .name = model_id,
+            .api = api,
+            .provider = provider,
+            .base_url = base_url,
+            .input_types = &[_][]const u8{"text"},
+            .context_window = 8192,
+            .max_tokens = 4096,
+        },
+        .api_key = api_key,
+    };
+}
+
+fn resolveFauxProvider(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    model_override: ?[]const u8,
+) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
+    const tokens_per_second = if (env_map.get("PI_FAUX_TOKENS_PER_SECOND")) |value|
+        std.fmt.parseInt(u32, value, 10) catch return error.InvalidFauxTokensPerSecond
+    else
+        null;
+
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .tokens_per_second = tokens_per_second,
+    });
+    errdefer registration.unregister();
+
+    const response_blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    errdefer allocator.free(response_blocks);
+    response_blocks[0] = faux.fauxText(env_map.get("PI_FAUX_RESPONSE") orelse "faux response");
+
+    const stop_reason = parseFauxStopReason(env_map.get("PI_FAUX_STOP_REASON") orelse "stop") orelse
+        return error.InvalidFauxStopReason;
+    const error_message = env_map.get("PI_FAUX_ERROR_MESSAGE") orelse defaultFauxErrorMessage(stop_reason);
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(response_blocks, .{
+            .stop_reason = stop_reason,
+            .error_message = error_message,
+        }) },
+    });
+
+    var model = registration.getModel();
+    if (model_override) |override| {
+        model.id = override;
+        model.name = override;
+    }
+
+    return .{
+        .model = model,
+        .api_key = null,
+        .faux_registration = registration,
+        .faux_blocks = response_blocks,
+    };
+}
+
+fn parseFauxStopReason(value: []const u8) ?ai.StopReason {
+    if (std.mem.eql(u8, value, "stop")) return .stop;
+    if (std.mem.eql(u8, value, "length")) return .length;
+    if (std.mem.eql(u8, value, "tool_use")) return .tool_use;
+    if (std.mem.eql(u8, value, "error")) return .error_reason;
+    if (std.mem.eql(u8, value, "error_reason")) return .error_reason;
+    if (std.mem.eql(u8, value, "aborted")) return .aborted;
+    return null;
+}
+
+fn defaultFauxErrorMessage(stop_reason: ai.StopReason) ?[]const u8 {
+    return switch (stop_reason) {
+        .error_reason => "Faux response failed",
+        .aborted => "Request was aborted",
+        else => null,
+    };
+}
+
+fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
+    return switch (err) {
+        error.MissingApiKey => if (std.mem.eql(u8, provider, "kimi"))
+            "API key required. Use --api-key or set KIMI_API_KEY."
+        else
+            "API key required. Use --api-key or set OPENAI_API_KEY.",
+        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, faux.",
+        error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
+        error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
+        else => @errorName(err),
+    };
 }
 
 test "main help text includes expected CLI options" {
