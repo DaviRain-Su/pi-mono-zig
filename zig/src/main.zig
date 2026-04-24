@@ -367,6 +367,76 @@ fn makeTmpPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]
     return try makeAbsoluteTestPath(allocator, relative_dir);
 }
 
+const CliExecutableResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    exit_code: u8,
+
+    fn deinit(self: *CliExecutableResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.* = undefined;
+    }
+};
+
+fn exitCodeFromTerm(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
+}
+
+fn hasAnsiEscape(text: []const u8) bool {
+    return std.mem.indexOfScalar(u8, text, '\x1b') != null;
+}
+
+fn runCliExecutable(
+    allocator: std.mem.Allocator,
+    tmp: anytype,
+    args: []const []const u8,
+    env_entries: []const struct { []const u8, []const u8 },
+) !CliExecutableResult {
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const agent_dir = try makeTmpPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const binary_path = try makeAbsoluteTestPath(allocator, "zig-out/bin/pi");
+    defer allocator.free(binary_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, binary_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    for (env_entries) |entry| {
+        try env_map.put(entry[0], entry[1]);
+    }
+
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = project_dir },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(128 * 1024),
+        .stderr_limit = .limited(128 * 1024),
+    });
+
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .exit_code = exitCodeFromTerm(result.term),
+    };
+}
+
 test "main help text includes expected CLI options" {
     const allocator = std.testing.allocator;
     const help = try cli.helpText(allocator, VERSION);
@@ -409,6 +479,73 @@ test "runCli prints faux response end to end" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("hello from cli\n", stdout_capture.writer.buffered());
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "cli executable print mode writes assistant text to stdout without interactive escape codes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var result = try runCliExecutable(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--print", "hello" },
+        &.{.{ "PI_FAUX_RESPONSE", "hello from cli binary" }},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("hello from cli binary\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expect(!hasAnsiEscape(result.stdout));
+    try std.testing.expect(!hasAnsiEscape(result.stderr));
+}
+
+test "cli executable print mode json writes valid JSON lines to stdout" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var result = try runCliExecutable(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--mode", "json", "--print", "hello" },
+        &.{.{ "PI_FAUX_RESPONSE", "json from cli binary" }},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expect(!hasAnsiEscape(result.stdout));
+
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    var line_count: usize = 0;
+    var saw_agent_start = false;
+    var saw_agent_end = false;
+    var saw_response_text = false;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        line_count += 1;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+
+        const event_type = parsed.value.object.get("event_type").?.string;
+        if (std.mem.eql(u8, event_type, "agent_start")) saw_agent_start = true;
+        if (std.mem.eql(u8, event_type, "agent_end")) saw_agent_end = true;
+        if (parsed.value.object.get("text")) |text_value| {
+            if (text_value == .string and std.mem.eql(u8, text_value.string, "json from cli binary")) {
+                saw_response_text = true;
+            }
+        }
+    }
+
+    try std.testing.expect(line_count >= 3);
+    try std.testing.expect(saw_agent_start);
+    try std.testing.expect(saw_agent_end);
+    try std.testing.expect(saw_response_text);
 }
 
 test "runCli persists and continues sessions across runs" {

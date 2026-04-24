@@ -123,6 +123,7 @@ pub fn build(b: *std.Build) void {
         .root_module = main_test_mod,
     });
     const run_main_tests = b.addRunArtifact(main_tests);
+    run_main_tests.step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_main_tests.step);
 
     const tui_tests = b.addTest(.{
