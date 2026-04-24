@@ -292,7 +292,6 @@ fn waitChildThread(state: *WaitState) void {
 
 fn killProcessGroup(pid: std.posix.pid_t) void {
     std.posix.kill(-pid, .TERM) catch {};
-    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
     std.posix.kill(-pid, .KILL) catch {};
 }
 

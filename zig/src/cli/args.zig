@@ -117,7 +117,7 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\pi - AI assistant (Zig rewrite) v{s}
         \\
         \\Usage:
-        \\  pi [options] <prompt>
+        \\  pi [options] [prompt]
         \\
         \\Options:
         \\  --model <model>                Model ID (default depends on provider)

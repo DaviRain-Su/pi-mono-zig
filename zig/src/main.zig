@@ -1,30 +1,10 @@
 const std = @import("std");
 const ai = @import("ai");
+const agent = @import("agent");
 const cli = @import("cli/args.zig");
 const coding_agent = @import("coding_agent/root.zig");
-const faux = ai.providers.faux;
 
 const VERSION = "0.1.0";
-
-const ResolveProviderError = error{
-    MissingApiKey,
-    UnknownProvider,
-    InvalidFauxStopReason,
-    InvalidFauxTokensPerSecond,
-};
-
-const ResolvedProviderConfig = struct {
-    model: ai.Model,
-    api_key: ?[]const u8,
-    faux_registration: ?faux.FauxProviderRegistration = null,
-    faux_blocks: ?[]faux.FauxContentBlock = null,
-
-    fn deinit(self: *ResolvedProviderConfig, allocator: std.mem.Allocator) void {
-        if (self.faux_registration) |registration| registration.unregister();
-        if (self.faux_blocks) |blocks| allocator.free(blocks);
-        self.* = undefined;
-    }
-};
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
@@ -63,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (options.prompt == null) {
+    if (options.print and options.prompt == null) {
         try stderr.writeAll("Error: No prompt provided\n\n");
         printUsage(init.gpa, stdout) catch {};
         try flushWriters(stdout, stderr);
@@ -76,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    const provider = options.provider orelse "openai";
+    const provider_name = options.provider orelse "openai";
     const selected_tools = effectiveToolSelection(&options);
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.gpa);
     defer init.gpa.free(cwd);
@@ -91,45 +71,69 @@ pub fn main(init: std.process.Init) !void {
     });
     defer init.gpa.free(system_prompt);
 
-    var provider_config = resolveProviderConfig(
+    var provider_runtime = coding_agent.resolveProviderConfig(
         init.gpa,
         init.environ_map,
-        provider,
+        provider_name,
         options.model,
         options.api_key,
     ) catch |err| {
-        try stderr.print("Error: {s}\n", .{resolveProviderErrorMessage(err, provider)});
+        try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, provider_name)});
         try flushWriters(stdout, stderr);
         std.process.exit(1);
     };
-    defer provider_config.deinit(init.gpa);
+    defer provider_runtime.deinit(init.gpa);
 
-    const content_block = ai.ContentBlock{ .text = .{ .text = options.prompt.? } };
-    const now: i64 = @intCast(@divFloor(std.Io.Clock.now(.real, init.io).nanoseconds, std.time.ns_per_s));
-    const user_msg = ai.Message{ .user = .{
-        .content = &[_]ai.ContentBlock{content_block},
-        .timestamp = now,
-    } };
-    const context = ai.Context{
-        .system_prompt = system_prompt,
-        .messages = &[_]ai.Message{user_msg},
-    };
+    if (options.print) {
+        const content_block = ai.ContentBlock{ .text = .{ .text = options.prompt.? } };
+        const now: i64 = @intCast(@divFloor(std.Io.Clock.now(.real, init.io).nanoseconds, std.time.ns_per_s));
+        const user_msg = ai.Message{ .user = .{
+            .content = &[_]ai.ContentBlock{content_block},
+            .timestamp = now,
+        } };
+        const context = ai.Context{
+            .system_prompt = system_prompt,
+            .messages = &[_]ai.Message{user_msg},
+        };
 
-    const exit_code = try coding_agent.runPrintMode(
+        const exit_code = try coding_agent.runPrintMode(
+            init.gpa,
+            init.io,
+            provider_runtime.model,
+            context,
+            .{
+                .api_key = provider_runtime.api_key,
+            },
+            .{
+                .mode = switch (options.mode) {
+                    .json => .json,
+                    else => .text,
+                },
+            },
+            stdout,
+            stderr,
+        );
+        try flushWriters(stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    const exit_code = try coding_agent.runInteractiveMode(
         init.gpa,
         init.io,
-        provider_config.model,
-        context,
+        init.environ_map,
         .{
-            .api_key = provider_config.api_key,
+            .cwd = cwd,
+            .system_prompt = system_prompt,
+            .provider = provider_name,
+            .model = options.model,
+            .api_key = options.api_key,
+            .thinking = mapThinkingLevel(options.thinking),
+            .session = options.session,
+            .@"continue" = options.@"continue",
+            .selected_tools = selected_tools,
+            .initial_prompt = options.prompt,
         },
-        .{
-            .mode = switch (options.mode) {
-                .json => .json,
-                else => .text,
-            },
-        },
-        stdout,
         stderr,
     );
     try flushWriters(stdout, stderr);
@@ -184,145 +188,14 @@ fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     try stderr.flush();
 }
 
-fn resolveProviderConfig(
-    allocator: std.mem.Allocator,
-    env_map: *const std.process.Environ.Map,
-    provider: []const u8,
-    model_override: ?[]const u8,
-    api_key_override: ?[]const u8,
-) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
-    if (std.mem.eql(u8, provider, "faux")) {
-        return try resolveFauxProvider(allocator, env_map, model_override);
-    }
-
-    if (std.mem.eql(u8, provider, "openai")) {
-        return resolveOpenAiCompatibleProvider(
-            env_map,
-            "OPENAI_API_KEY",
-            "gpt-4",
-            "openai-completions",
-            provider,
-            "https://api.openai.com/v1",
-            model_override,
-            api_key_override,
-        );
-    }
-
-    if (std.mem.eql(u8, provider, "kimi")) {
-        return resolveOpenAiCompatibleProvider(
-            env_map,
-            "KIMI_API_KEY",
-            "moonshot-v1-8k",
-            "kimi-completions",
-            provider,
-            "https://api.moonshot.cn/v1",
-            model_override,
-            api_key_override,
-        );
-    }
-
-    return error.UnknownProvider;
-}
-
-fn resolveOpenAiCompatibleProvider(
-    env_map: *const std.process.Environ.Map,
-    env_key: []const u8,
-    default_model: []const u8,
-    api: []const u8,
-    provider: []const u8,
-    base_url: []const u8,
-    model_override: ?[]const u8,
-    api_key_override: ?[]const u8,
-) ResolveProviderError!ResolvedProviderConfig {
-    const api_key = api_key_override orelse env_map.get(env_key) orelse return error.MissingApiKey;
-    const model_id = model_override orelse default_model;
-    return .{
-        .model = .{
-            .id = model_id,
-            .name = model_id,
-            .api = api,
-            .provider = provider,
-            .base_url = base_url,
-            .input_types = &[_][]const u8{"text"},
-            .context_window = 8192,
-            .max_tokens = 4096,
-        },
-        .api_key = api_key,
-    };
-}
-
-fn resolveFauxProvider(
-    allocator: std.mem.Allocator,
-    env_map: *const std.process.Environ.Map,
-    model_override: ?[]const u8,
-) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
-    const tokens_per_second = if (env_map.get("PI_FAUX_TOKENS_PER_SECOND")) |value|
-        std.fmt.parseInt(u32, value, 10) catch return error.InvalidFauxTokensPerSecond
-    else
-        null;
-
-    const registration = try faux.registerFauxProvider(allocator, .{
-        .tokens_per_second = tokens_per_second,
-    });
-    errdefer registration.unregister();
-
-    const response_blocks = try allocator.alloc(faux.FauxContentBlock, 1);
-    errdefer allocator.free(response_blocks);
-    response_blocks[0] = faux.fauxText(env_map.get("PI_FAUX_RESPONSE") orelse "faux response");
-
-    const stop_reason = parseFauxStopReason(env_map.get("PI_FAUX_STOP_REASON") orelse "stop") orelse
-        return error.InvalidFauxStopReason;
-    const error_message = env_map.get("PI_FAUX_ERROR_MESSAGE") orelse defaultFauxErrorMessage(stop_reason);
-
-    try registration.setResponses(&[_]faux.FauxResponseStep{
-        .{ .message = faux.fauxAssistantMessage(response_blocks, .{
-            .stop_reason = stop_reason,
-            .error_message = error_message,
-        }) },
-    });
-
-    var model = registration.getModel();
-    if (model_override) |override| {
-        model.id = override;
-        model.name = override;
-    }
-
-    return .{
-        .model = model,
-        .api_key = null,
-        .faux_registration = registration,
-        .faux_blocks = response_blocks,
-    };
-}
-
-fn parseFauxStopReason(value: []const u8) ?ai.StopReason {
-    if (std.mem.eql(u8, value, "stop")) return .stop;
-    if (std.mem.eql(u8, value, "length")) return .length;
-    if (std.mem.eql(u8, value, "tool_use")) return .tool_use;
-    if (std.mem.eql(u8, value, "error")) return .error_reason;
-    if (std.mem.eql(u8, value, "error_reason")) return .error_reason;
-    if (std.mem.eql(u8, value, "aborted")) return .aborted;
-    return null;
-}
-
-fn defaultFauxErrorMessage(stop_reason: ai.StopReason) ?[]const u8 {
-    return switch (stop_reason) {
-        .error_reason => "Faux response failed",
-        .aborted => "Request was aborted",
-        else => null,
-    };
-}
-
-fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
-    return switch (err) {
-        error.MissingApiKey => if (std.mem.eql(u8, provider, "kimi"))
-            "API key required. Use --api-key or set KIMI_API_KEY."
-        else
-            "API key required. Use --api-key or set OPENAI_API_KEY.",
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, faux.",
-        error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
-        error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
-        else => @errorName(err),
+fn mapThinkingLevel(level: ?cli.ThinkingLevel) agent.ThinkingLevel {
+    return switch (level orelse .off) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
     };
 }
 
