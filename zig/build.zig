@@ -23,6 +23,12 @@ pub fn build(b: *std.Build) void {
     });
     agent_mod.addImport("ai", ai_mod);
 
+    const tui_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
 
@@ -67,6 +73,7 @@ pub fn build(b: *std.Build) void {
     });
     coding_agent_mod.addImport("ai", ai_mod);
     coding_agent_mod.addImport("agent", agent_mod);
+    coding_agent_mod.addImport("tui", tui_mod);
 
     const coding_agent_tests = b.addTest(.{
         .root_module = coding_agent_mod,
@@ -84,10 +91,20 @@ pub fn build(b: *std.Build) void {
     });
     main_test_mod.addImport("ai", ai_mod);
     main_test_mod.addImport("agent", agent_mod);
+    main_test_mod.addImport("tui", tui_mod);
 
     const main_tests = b.addTest(.{
         .root_module = main_test_mod,
     });
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
+
+    const tui_tests = b.addTest(.{
+        .root_module = tui_mod,
+    });
+    const run_tui_tests = b.addRunArtifact(tui_tests);
+    test_step.dependOn(&run_tui_tests.step);
+
+    const tui_test_step = b.step("test-tui", "Run TUI unit tests only");
+    tui_test_step.dependOn(&run_tui_tests.step);
 }
