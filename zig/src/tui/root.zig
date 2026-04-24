@@ -7,6 +7,8 @@ pub const components = struct {
     pub const text = @import("components/text.zig");
     pub const box = @import("components/box.zig");
     pub const editor = @import("components/editor.zig");
+    pub const markdown = @import("components/markdown.zig");
+    pub const select_list = @import("components/select_list.zig");
 };
 
 pub const Component = component.Component;
@@ -17,9 +19,15 @@ pub const Terminal = terminal.Terminal;
 pub const Backend = terminal.Backend;
 pub const Size = terminal.Size;
 pub const Renderer = tui.Renderer;
+pub const OverlayAnchor = tui.OverlayAnchor;
+pub const OverlayMargin = tui.OverlayMargin;
+pub const OverlayOptions = tui.OverlayOptions;
 pub const Text = components.text.Text;
 pub const Box = components.box.Box;
 pub const Editor = components.editor.Editor;
+pub const Markdown = components.markdown.Markdown;
+pub const SelectList = components.select_list.SelectList;
+pub const SelectItem = components.select_list.SelectItem;
 
 test {
     _ = @import("ansi.zig");
@@ -30,4 +38,6 @@ test {
     _ = @import("components/text.zig");
     _ = @import("components/box.zig");
     _ = @import("components/editor.zig");
+    _ = @import("components/markdown.zig");
+    _ = @import("components/select_list.zig");
 }

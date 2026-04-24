@@ -78,6 +78,60 @@ pub fn wrapTextWithAnsi(allocator: std.mem.Allocator, text: []const u8, width: u
     }
 }
 
+pub fn sliceVisibleAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    start_col: usize,
+    width: usize,
+) std.mem.Allocator.Error![]u8 {
+    if (width == 0) return allocator.dupe(u8, "");
+
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+
+    var active_sgr = std.ArrayList(u8).empty;
+    defer active_sgr.deinit(allocator);
+
+    const end_col = start_col + width;
+    var column: usize = 0;
+    var index: usize = 0;
+    var started = false;
+
+    while (index < text.len and column < end_col) {
+        if (ansiSequenceLength(text, index)) |len| {
+            const sequence = text[index .. index + len];
+            updateActiveSgr(allocator, sequence, &active_sgr);
+            if (started) {
+                try builder.appendSlice(allocator, sequence);
+            }
+            index += len;
+            continue;
+        }
+
+        const rune_len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+        const actual_len = @min(rune_len, text.len - index);
+
+        if (column >= start_col and column < end_col) {
+            if (!started) {
+                started = true;
+                if (active_sgr.items.len > 0) {
+                    try builder.appendSlice(allocator, active_sgr.items);
+                }
+            }
+            try builder.appendSlice(allocator, text[index .. index + actual_len]);
+        }
+
+        column += 1;
+        index += actual_len;
+    }
+
+    if (started and active_sgr.items.len > 0) {
+        try builder.appendSlice(allocator, "\x1b[0m");
+    }
+
+    return builder.toOwnedSlice(allocator);
+}
+
 fn appendWrappedLine(
     allocator: std.mem.Allocator,
     lines: *LineList,
@@ -157,4 +211,13 @@ test "wrap text preserves ANSI state across wrapped lines" {
     try std.testing.expectEqualStrings("\x1b[31mhello\x1b[0m", lines.items[0]);
     try std.testing.expectEqualStrings("\x1b[31m worl\x1b[0m", lines.items[1]);
     try std.testing.expectEqualStrings("\x1b[31md\x1b[0m", lines.items[2]);
+}
+
+test "slice visible range preserves active ANSI state" {
+    const allocator = std.testing.allocator;
+
+    const slice = try sliceVisibleAlloc(allocator, "\x1b[31mhello\x1b[0m world", 1, 3);
+    defer allocator.free(slice);
+
+    try std.testing.expectEqualStrings("\x1b[31mell\x1b[0m", slice);
 }
