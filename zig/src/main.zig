@@ -53,14 +53,14 @@ pub fn runCli(
         return 0;
     }
 
-    if (options.print and options.prompt == null) {
-        try stderr.writeAll("Error: No prompt provided\n\n");
-        try printUsage(allocator, stdout);
+    if (options.mode == .rpc and options.prompt != null) {
+        try stderr.writeAll("Error: Prompt arguments are not supported in RPC mode\n");
         return 1;
     }
 
-    if (options.mode == .rpc) {
-        try stderr.writeAll("Error: RPC mode is not implemented in the Zig CLI\n");
+    if (options.print and options.prompt == null) {
+        try stderr.writeAll("Error: No prompt provided\n\n");
+        try printUsage(allocator, stdout);
         return 1;
     }
 
@@ -98,7 +98,7 @@ pub fn runCli(
     };
     defer provider_runtime.deinit(allocator);
 
-    if (options.print) {
+    if (options.print or options.mode == .rpc) {
         coding_agent.interactive_mode.setToolRuntime(.{
             .cwd = cwd,
             .io = io,
@@ -132,6 +132,17 @@ pub fn runCli(
             built_tools.items,
         );
         defer session.deinit();
+
+        if (options.mode == .rpc) {
+            return try coding_agent.runRpcMode(
+                allocator,
+                io,
+                &session,
+                .{},
+                stdout,
+                stderr,
+            );
+        }
 
         return try coding_agent.runPrintMode(
             allocator,
