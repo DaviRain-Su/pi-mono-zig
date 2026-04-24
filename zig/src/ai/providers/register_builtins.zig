@@ -8,6 +8,7 @@ const bedrock = @import("bedrock.zig");
 const google = @import("google.zig");
 const google_gemini_cli = @import("google_gemini_cli.zig");
 const google_vertex = @import("google_vertex.zig");
+const kimi = @import("kimi.zig");
 const mistral = @import("mistral.zig");
 const openai = @import("openai.zig");
 const openai_codex_responses = @import("openai_codex_responses.zig");
@@ -46,6 +47,7 @@ const BuiltInProviderError = error{
 };
 
 var openai_state = LazyProviderState{};
+var kimi_state = LazyProviderState{};
 var anthropic_state = LazyProviderState{};
 var mistral_state = LazyProviderState{};
 var openai_responses_state = LazyProviderState{};
@@ -57,6 +59,7 @@ var google_vertex_state = LazyProviderState{};
 var bedrock_state = LazyProviderState{};
 
 var openai_override: ?ProviderFns = null;
+var kimi_override: ?ProviderFns = null;
 var anthropic_override: ?ProviderFns = null;
 var mistral_override: ?ProviderFns = null;
 var openai_responses_override: ?ProviderFns = null;
@@ -70,6 +73,7 @@ var bedrock_override: ?ProviderFns = null;
 const BUILT_IN_APIS = [_]types.Api{
     "anthropic-messages",
     "openai-completions",
+    "kimi-completions",
     "mistral-conversations",
     "openai-responses",
     "azure-openai-responses",
@@ -90,6 +94,11 @@ const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
         .api = "openai-completions",
         .stream = streamOpenAI,
         .stream_simple = streamSimpleOpenAI,
+    },
+    .{
+        .api = "kimi-completions",
+        .stream = streamKimi,
+        .stream_simple = streamSimpleKimi,
     },
     .{
         .api = "mistral-conversations",
@@ -147,6 +156,7 @@ pub fn builtInProviders() []const BuiltInProvider {
 
 pub fn resetLazyState() void {
     openai_state = .{};
+    kimi_state = .{};
     anthropic_state = .{};
     mistral_state = .{};
     openai_responses_state = .{};
@@ -160,6 +170,7 @@ pub fn resetLazyState() void {
 
 pub fn clearProviderOverrides() void {
     openai_override = null;
+    kimi_override = null;
     anthropic_override = null;
     mistral_override = null;
     openai_responses_override = null;
@@ -175,6 +186,8 @@ pub fn clearProviderOverrides() void {
 pub fn setProviderOverride(api: types.Api, provider: ProviderFns) BuiltInProviderError!void {
     if (std.mem.eql(u8, api, "openai-completions")) {
         openai_override = provider;
+    } else if (std.mem.eql(u8, api, "kimi-completions")) {
+        kimi_override = provider;
     } else if (std.mem.eql(u8, api, "anthropic-messages")) {
         anthropic_override = provider;
     } else if (std.mem.eql(u8, api, "mistral-conversations")) {
@@ -201,6 +214,7 @@ pub fn setProviderOverride(api: types.Api, provider: ProviderFns) BuiltInProvide
 
 pub fn isLoaded(api: types.Api) bool {
     if (std.mem.eql(u8, api, "openai-completions")) return openai_state.provider != null;
+    if (std.mem.eql(u8, api, "kimi-completions")) return kimi_state.provider != null;
     if (std.mem.eql(u8, api, "anthropic-messages")) return anthropic_state.provider != null;
     if (std.mem.eql(u8, api, "mistral-conversations")) return mistral_state.provider != null;
     if (std.mem.eql(u8, api, "openai-responses")) return openai_responses_state.provider != null;
@@ -238,6 +252,13 @@ fn loadOpenAIProvider() ProviderFns {
     return openai_override orelse .{
         .stream = openai.OpenAIProvider.stream,
         .stream_simple = openai.OpenAIProvider.streamSimple,
+    };
+}
+
+fn loadKimiProvider() ProviderFns {
+    return kimi_override orelse .{
+        .stream = kimi.KimiProvider.stream,
+        .stream_simple = kimi.KimiProvider.streamSimple,
     };
 }
 
@@ -322,6 +343,26 @@ fn streamSimpleOpenAI(
     options: ?types.StreamOptions,
 ) !event_stream.AssistantMessageEventStream {
     return try dispatchLazy(&openai_state, loadOpenAIProvider, .stream_simple, allocator, io, model, context, options);
+}
+
+fn streamKimi(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !event_stream.AssistantMessageEventStream {
+    return try dispatchLazy(&kimi_state, loadKimiProvider, .stream, allocator, io, model, context, options);
+}
+
+fn streamSimpleKimi(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !event_stream.AssistantMessageEventStream {
+    return try dispatchLazy(&kimi_state, loadKimiProvider, .stream_simple, allocator, io, model, context, options);
 }
 
 fn streamAnthropic(
@@ -832,7 +873,7 @@ fn validateHandoffPayload(allocator: std.mem.Allocator, model: types.Model, cont
 }
 
 test "built-in api list matches TypeScript registry count" {
-    try std.testing.expectEqual(@as(usize, 10), expectedBuiltInApiCount());
+    try std.testing.expectEqual(@as(usize, 11), expectedBuiltInApiCount());
     try std.testing.expectEqual(expectedBuiltInApiCount(), expectedBuiltInApis().len);
 }
 

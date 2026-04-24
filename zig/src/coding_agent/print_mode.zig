@@ -1,6 +1,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const ai = @import("ai");
+const agent = @import("agent");
+const common = @import("tools/common.zig");
+const session_mod = @import("session.zig");
 
 pub const OutputMode = enum {
     text,
@@ -13,37 +16,14 @@ pub const RunPrintModeOptions = struct {
     install_signal_handlers: bool = true,
 };
 
-const JsonToolCall = struct {
-    id: []const u8,
-    name: []const u8,
-    arguments: std.json.Value,
-};
-
-const JsonUsage = struct {
-    input: u32,
-    output: u32,
-    cache_read: u32,
-    cache_write: u32,
-    total_tokens: u32,
-};
-
-const JsonMessage = struct {
-    api: []const u8,
-    provider: []const u8,
-    model: []const u8,
-    stop_reason: []const u8,
-    error_message: ?[]const u8 = null,
-    usage: JsonUsage,
-};
-
 const JsonEvent = struct {
     event_type: []const u8,
-    content_index: ?u32 = null,
-    delta: ?[]const u8 = null,
-    content: ?[]const u8 = null,
-    error_message: ?[]const u8 = null,
-    tool_call: ?JsonToolCall = null,
-    message: ?JsonMessage = null,
+    role: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    tool_call_id: ?[]const u8 = null,
+    is_error: ?bool = null,
+    args: ?std.json.Value = null,
 };
 
 const SignalGuard = struct {
@@ -96,12 +76,33 @@ fn handleSigint(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?
     }
 }
 
+const JsonWriterContext = struct {
+    allocator: std.mem.Allocator,
+    stdout_writer: *std.Io.Writer,
+};
+
+const AbortWatcher = struct {
+    io: std.Io,
+    signal: *std.atomic.Value(bool),
+    done: *std.atomic.Value(bool),
+    session: *session_mod.AgentSession,
+
+    fn run(self: *AbortWatcher) void {
+        while (!self.done.load(.seq_cst)) {
+            if (self.signal.load(.seq_cst)) {
+                self.session.agent.abort();
+                return;
+            }
+            std.Io.sleep(self.io, .fromMilliseconds(2), .awake) catch {};
+        }
+    }
+};
+
 pub fn runPrintMode(
     allocator: std.mem.Allocator,
     io: std.Io,
-    model: ai.Model,
-    context: ai.Context,
-    stream_options: ai.StreamOptions,
+    session: *session_mod.AgentSession,
+    prompt: []const u8,
     options: RunPrintModeOptions,
     stdout_writer: *std.Io.Writer,
     stderr_writer: *std.Io.Writer,
@@ -115,23 +116,41 @@ pub fn runPrintMode(
         SignalGuard{};
     defer signal_guard.deinit();
 
-    var effective_options = stream_options;
-    effective_options.signal = abort_signal;
+    var json_context = JsonWriterContext{
+        .allocator = allocator,
+        .stdout_writer = stdout_writer,
+    };
+    const json_subscriber = agent.AgentSubscriber{
+        .context = &json_context,
+        .callback = handleJsonAgentEvent,
+    };
+    if (options.mode == .json) {
+        try session.agent.subscribe(json_subscriber);
+    }
+    defer if (options.mode == .json) {
+        _ = session.agent.unsubscribe(json_subscriber);
+    };
 
-    var stream_instance = ai.stream(allocator, io, model, context, effective_options) catch |err| {
+    var watcher_done = std.atomic.Value(bool).init(false);
+    var watcher = AbortWatcher{
+        .io = io,
+        .signal = abort_signal,
+        .done = &watcher_done,
+        .session = session,
+    };
+    const watcher_thread = try std.Thread.spawn(.{}, AbortWatcher.run, .{&watcher});
+    defer {
+        watcher_done.store(true, .seq_cst);
+        watcher_thread.join();
+    }
+
+    session.prompt(prompt) catch |err| {
         try stderr_writer.print("Error: {s}\n", .{@errorName(err)});
         try stderr_writer.flush();
         return 1;
     };
-    defer stream_instance.deinit();
 
-    while (stream_instance.next()) |event| {
-        if (options.mode == .json) {
-            try writeJsonEventLine(allocator, stdout_writer, event);
-        }
-    }
-
-    const message = stream_instance.result() orelse {
+    const message = findLastAssistantMessage(session.agent.getMessages()) orelse {
         try stderr_writer.writeAll("Error: missing completion result\n");
         try stderr_writer.flush();
         return 1;
@@ -180,42 +199,40 @@ fn exitCodeForMessage(message: ai.AssistantMessage) u8 {
     };
 }
 
-fn writeJsonEventLine(
-    allocator: std.mem.Allocator,
-    stdout_writer: *std.Io.Writer,
-    event: ai.AssistantMessageEvent,
-) !void {
+fn handleJsonAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
+    const json_context: *JsonWriterContext = @ptrCast(@alignCast(context.?));
+    try writeJsonEventLine(json_context.allocator, json_context.stdout_writer, event);
+}
+
+fn writeJsonEventLine(allocator: std.mem.Allocator, stdout_writer: *std.Io.Writer, event: agent.AgentEvent) !void {
+    const message_snapshot = if (event.message) |message| try renderAgentMessageText(allocator, message) else null;
+    defer if (message_snapshot) |text| allocator.free(text);
+
+    const result_snapshot = if (event.result) |result| try blocksToText(allocator, result.content) else null;
+    defer if (result_snapshot) |text| allocator.free(text);
+
+    const partial_result_snapshot = if (event.partial_result) |result| try blocksToText(allocator, result.content) else null;
+    defer if (partial_result_snapshot) |text| allocator.free(text);
+
     const payload = JsonEvent{
         .event_type = @tagName(event.event_type),
-        .content_index = event.content_index,
-        .delta = event.delta,
-        .content = event.content,
-        .error_message = event.error_message,
-        .tool_call = if (event.tool_call) |tool_call| .{
-            .id = tool_call.id,
-            .name = tool_call.name,
-            .arguments = tool_call.arguments,
+        .role = if (event.message) |message| switch (message) {
+            .user => "user",
+            .assistant => "assistant",
+            .tool_result => "toolResult",
         } else null,
-        .message = if (event.message) |message| .{
-            .api = message.api,
-            .provider = message.provider,
-            .model = message.model,
-            .stop_reason = stopReasonString(message.stop_reason),
-            .error_message = message.error_message,
-            .usage = .{
-                .input = message.usage.input,
-                .output = message.usage.output,
-                .cache_read = message.usage.cache_read,
-                .cache_write = message.usage.cache_write,
-                .total_tokens = message.usage.total_tokens,
-            },
-        } else null,
+        .text = message_snapshot orelse result_snapshot orelse partial_result_snapshot,
+        .tool_name = event.tool_name,
+        .tool_call_id = event.tool_call_id,
+        .is_error = event.is_error,
+        .args = event.args,
     };
 
     const line = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(line);
 
     try stdout_writer.print("{s}\n", .{line});
+    try stdout_writer.flush();
 }
 
 fn defaultStopReasonMessage(stop_reason: ai.StopReason) []const u8 {
@@ -228,11 +245,120 @@ fn defaultStopReasonMessage(stop_reason: ai.StopReason) []const u8 {
     };
 }
 
-fn stopReasonString(stop_reason: ai.StopReason) []const u8 {
-    return switch (stop_reason) {
-        .error_reason => "error",
-        else => @tagName(stop_reason),
+fn blocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (blocks, 0..) |block, index| {
+        if (index > 0) try out.appendSlice(allocator, "\n");
+        switch (block) {
+            .text => |text| try out.appendSlice(allocator, text.text),
+            .thinking => |thinking| try out.appendSlice(allocator, thinking.thinking),
+            .image => |image| {
+                const note = try std.fmt.allocPrint(allocator, "[image:{s}:{d}]", .{ image.mime_type, image.data.len });
+                defer allocator.free(note);
+                try out.appendSlice(allocator, note);
+            },
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn renderAgentMessageText(allocator: std.mem.Allocator, message: agent.AgentMessage) ![]u8 {
+    return switch (message) {
+        .user => |user| try blocksToText(allocator, user.content),
+        .assistant => |assistant| try blocksToText(allocator, assistant.content),
+        .tool_result => |tool_result| try blocksToText(allocator, tool_result.content),
     };
+}
+
+fn findLastAssistantMessage(messages: []const agent.AgentMessage) ?ai.AssistantMessage {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        switch (messages[index]) {
+            .assistant => |assistant_message| return assistant_message,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn makeSessionDirForTmp(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
+    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        name,
+    });
+    defer allocator.free(relative_dir);
+    return try makeAbsoluteTestPath(allocator, relative_dir);
+}
+
+fn toolResponseFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 2), call_count.*);
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+    try std.testing.expect(context.messages[2] == .tool_result);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[2].tool_result.content[0].text.text, "secret note") != null);
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("The file says: secret note");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn secondProviderFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 1), call_count.*);
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+    try std.testing.expectEqualStrings("first provider reply", context.messages[1].assistant.content[0].text.text);
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("second provider saw first provider reply");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn testReadToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    params: std.json.Value,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    const object = switch (params) {
+        .object => |object| object,
+        else => return error.InvalidToolArguments,
+    };
+    const path_value = object.get("path") orelse return error.InvalidToolArguments;
+    const file_path = switch (path_value) {
+        .string => |string| string,
+        else => return error.InvalidToolArguments,
+    };
+
+    const content_text = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, file_path, allocator, .unlimited);
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = content_text } };
+    return .{ .content = blocks };
 }
 
 test "print mode text outputs assistant text to stdout" {
@@ -248,27 +374,23 @@ test "print mode text outputs assistant text to stdout" {
         .{ .message = ai.providers.faux.fauxAssistantMessage(content, .{}) },
     });
 
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
 
-    const user_content = [_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }};
-    const messages = [_]ai.Message{.{ .user = .{
-        .content = user_content[0..],
-        .timestamp = 1,
-    } }};
-    const context = ai.Context{
-        .system_prompt = "sys",
-        .messages = messages[0..],
-    };
-
     const exit_code = try runPrintMode(
         allocator,
         std.testing.io,
-        registration.getModel(),
-        context,
-        .{},
+        &session,
+        "hello",
         .{
             .mode = .text,
             .install_signal_handlers = false,
@@ -295,27 +417,23 @@ test "print mode json outputs valid JSON lines for all events" {
         .{ .message = ai.providers.faux.fauxAssistantMessage(content, .{}) },
     });
 
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
 
-    const user_content = [_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }};
-    const messages = [_]ai.Message{.{ .user = .{
-        .content = user_content[0..],
-        .timestamp = 1,
-    } }};
-    const context = ai.Context{
-        .system_prompt = "sys",
-        .messages = messages[0..],
-    };
-
     const exit_code = try runPrintMode(
         allocator,
         std.testing.io,
-        registration.getModel(),
-        context,
-        .{},
+        &session,
+        "hello",
         .{
             .mode = .json,
             .install_signal_handlers = false,
@@ -328,8 +446,8 @@ test "print mode json outputs valid JSON lines for all events" {
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 
     var lines = std.mem.splitScalar(u8, stdout_capture.writer.buffered(), '\n');
-    var saw_start = false;
-    var saw_done = false;
+    var saw_agent_start = false;
+    var saw_agent_end = false;
     var line_count: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -338,13 +456,13 @@ test "print mode json outputs valid JSON lines for all events" {
         defer parsed.deinit();
 
         const event_type = parsed.value.object.get("event_type").?.string;
-        if (std.mem.eql(u8, event_type, "start")) saw_start = true;
-        if (std.mem.eql(u8, event_type, "done")) saw_done = true;
+        if (std.mem.eql(u8, event_type, "agent_start")) saw_agent_start = true;
+        if (std.mem.eql(u8, event_type, "agent_end")) saw_agent_end = true;
     }
 
     try std.testing.expect(line_count >= 3);
-    try std.testing.expect(saw_start);
-    try std.testing.expect(saw_done);
+    try std.testing.expect(saw_agent_start);
+    try std.testing.expect(saw_agent_end);
 }
 
 test "print mode returns exit code one and writes stderr on provider error" {
@@ -363,27 +481,23 @@ test "print mode returns exit code one and writes stderr on provider error" {
         }) },
     });
 
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
 
-    const user_content = [_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }};
-    const messages = [_]ai.Message{.{ .user = .{
-        .content = user_content[0..],
-        .timestamp = 1,
-    } }};
-    const context = ai.Context{
-        .system_prompt = "sys",
-        .messages = messages[0..],
-    };
-
     const exit_code = try runPrintMode(
         allocator,
         std.testing.io,
-        registration.getModel(),
-        context,
-        .{},
+        &session,
+        "hello",
         .{
             .mode = .text,
             .install_signal_handlers = false,
@@ -413,20 +527,17 @@ test "print mode treats abort as failure" {
         .{ .message = ai.providers.faux.fauxAssistantMessage(content, .{}) },
     });
 
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
-
-    const user_content = [_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }};
-    const messages = [_]ai.Message{.{ .user = .{
-        .content = user_content[0..],
-        .timestamp = 1,
-    } }};
-    const context = ai.Context{
-        .system_prompt = "sys",
-        .messages = messages[0..],
-    };
 
     var abort_signal = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, struct {
@@ -440,9 +551,8 @@ test "print mode treats abort as failure" {
     const exit_code = try runPrintMode(
         allocator,
         std.testing.io,
-        registration.getModel(),
-        context,
-        .{},
+        &session,
+        "hello",
         .{
             .mode = .text,
             .signal = &abort_signal,
@@ -455,4 +565,185 @@ test "print mode treats abort as failure" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
     try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "Request was aborted\n") != null);
+}
+
+test "print mode executes tools end to end and prints final answer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeSessionDirForTmp(allocator, tmp, "cwd");
+    defer allocator.free(cwd);
+
+    const file_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "note.txt" });
+    defer allocator.free(file_path);
+    try common.writeFileAbsolute(std.testing.io, file_path, "secret note", true);
+
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, file_path) });
+    const args_value = std.json.Value{ .object = args };
+    defer common.deinitJsonValue(allocator, args_value);
+
+    const first_blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    first_blocks[0] = try ai.providers.faux.fauxToolCall(allocator, "read", args_value, .{ .id = "tool-1" });
+    defer {
+        switch (first_blocks[0]) {
+            .tool_call => |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                common.deinitJsonValue(allocator, tool_call.arguments);
+            },
+            else => {},
+        }
+        allocator.free(first_blocks);
+    }
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(first_blocks, .{ .stop_reason = .tool_use }) },
+        .{ .factory = toolResponseFactory },
+    });
+
+    const read_tool = agent.AgentTool{
+        .name = "read",
+        .description = "Read a file",
+        .label = "read",
+        .parameters = .null,
+        .execute = testReadToolExecute,
+    };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+        .tools = &[_]agent.AgentTool{read_tool},
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        "what is in the file?",
+        .{
+            .mode = .text,
+            .install_signal_handlers = false,
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("The file says: secret note\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "print mode preserves context when session continues with a different provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try makeSessionDirForTmp(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    const faux_a_models = [_]ai.providers.faux.FauxModelDefinition{.{
+        .id = "faux-a-1",
+        .name = "Faux A",
+    }};
+    const faux_b_models = [_]ai.providers.faux.FauxModelDefinition{.{
+        .id = "faux-b-1",
+        .name = "Faux B",
+    }};
+
+    const registration_a = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .api = "faux-a",
+        .provider = "faux-a",
+        .models = faux_a_models[0..],
+    });
+    defer registration_a.unregister();
+
+    const registration_b = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .api = "faux-b",
+        .provider = "faux-b",
+        .models = faux_b_models[0..],
+    });
+    defer registration_b.unregister();
+
+    try registration_a.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{
+            ai.providers.faux.fauxText("first provider reply"),
+        }, .{}) },
+    });
+    try registration_b.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .factory = secondProviderFactory },
+    });
+
+    var first_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration_a.getModel(),
+        .session_dir = session_dir,
+    });
+
+    var first_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stdout.deinit();
+    var first_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stderr.deinit();
+
+    const first_exit = try runPrintMode(
+        allocator,
+        std.testing.io,
+        &first_session,
+        "hello",
+        .{
+            .mode = .text,
+            .install_signal_handlers = false,
+        },
+        &first_stdout.writer,
+        &first_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), first_exit);
+
+    const session_file = try allocator.dupe(u8, first_session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    first_session.deinit();
+
+    var second_session = try session_mod.AgentSession.open(allocator, std.testing.io, .{
+        .session_file = session_file,
+        .cwd_override = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration_b.getModel(),
+    });
+    defer second_session.deinit();
+
+    var second_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stdout.deinit();
+    var second_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stderr.deinit();
+
+    const second_exit = try runPrintMode(
+        allocator,
+        std.testing.io,
+        &second_session,
+        "what did the other provider say?",
+        .{
+            .mode = .text,
+            .install_signal_handlers = false,
+        },
+        &second_stdout.writer,
+        &second_stderr.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), second_exit);
+    try std.testing.expectEqualStrings("second provider saw first provider reply\n", second_stdout.writer.buffered());
+    try std.testing.expectEqual(@as(usize, 4), second_session.agent.getMessages().len);
 }
