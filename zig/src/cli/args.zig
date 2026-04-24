@@ -40,9 +40,11 @@ pub const Args = struct {
     help: bool = false,
     version: bool = false,
     prompt: ?[]const u8 = null,
+    prompt_owned: bool = false,
 
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         if (self.tools) |tools| allocator.free(tools);
+        if (self.prompt_owned and self.prompt != null) allocator.free(self.prompt.?);
         self.* = undefined;
     }
 };
@@ -50,6 +52,9 @@ pub const Args = struct {
 pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseArgsError!Args {
     var result = Args{};
     errdefer result.deinit(allocator);
+    var prompt_builder = std.ArrayList(u8).empty;
+    var prompt_transferred = false;
+    defer if (!prompt_transferred) prompt_builder.deinit(allocator);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -90,6 +95,10 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
         } else if (std.mem.eql(u8, arg, "--tools")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
+            if (result.tools) |tools| {
+                allocator.free(tools);
+                result.tools = null;
+            }
             result.tools = try parseToolList(allocator, argv[i]);
         } else if (std.mem.eql(u8, arg, "--no-tools")) {
             result.no_tools = true;
@@ -104,8 +113,17 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else {
-            result.prompt = arg;
+            if (prompt_builder.items.len > 0) {
+                try prompt_builder.append(allocator, ' ');
+            }
+            try prompt_builder.appendSlice(allocator, arg);
         }
+    }
+
+    if (prompt_builder.items.len > 0) {
+        result.prompt = try prompt_builder.toOwnedSlice(allocator);
+        result.prompt_owned = true;
+        prompt_transferred = true;
     }
 
     return result;
@@ -232,6 +250,35 @@ test "parse args supports help and version" {
     var version_args = try parseArgs(allocator, &.{"--version"});
     defer version_args.deinit(allocator);
     try std.testing.expect(version_args.version);
+}
+
+test "parse args frees previous tool list when --tools is repeated" {
+    const allocator = std.testing.allocator;
+
+    var args = try parseArgs(allocator, &.{
+        "--tools",
+        "read,grep",
+        "--tools",
+        "ls",
+    });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), args.tools.?.len);
+    try std.testing.expectEqualStrings("ls", args.tools.?[0]);
+}
+
+test "parse args concatenates multiple positional prompts" {
+    const allocator = std.testing.allocator;
+
+    var args = try parseArgs(allocator, &.{
+        "Summarize",
+        "the",
+        "repository",
+    });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.prompt_owned);
+    try std.testing.expectEqualStrings("Summarize the repository", args.prompt.?);
 }
 
 test "parse args rejects invalid thinking level" {

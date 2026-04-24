@@ -22,7 +22,7 @@ fn currentProcessEnviron() std.process.Environ {
     };
 }
 
-fn getEnvApiKeyFromMap(
+pub fn getEnvApiKeyFromMap(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     provider: []const u8,
@@ -90,8 +90,11 @@ fn firstEnvValue(
 
 fn resolveEnvVar(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "openai")) return "OPENAI_API_KEY";
+    if (std.mem.eql(u8, provider, "openai-responses")) return "OPENAI_API_KEY";
+    if (std.mem.eql(u8, provider, "openai-codex")) return "OPENAI_API_KEY";
     if (std.mem.eql(u8, provider, "azure-openai-responses")) return "AZURE_OPENAI_API_KEY";
     if (std.mem.eql(u8, provider, "google")) return "GEMINI_API_KEY";
+    if (std.mem.eql(u8, provider, "google-gemini-cli")) return "GEMINI_API_KEY";
     if (std.mem.eql(u8, provider, "groq")) return "GROQ_API_KEY";
     if (std.mem.eql(u8, provider, "cerebras")) return "CEREBRAS_API_KEY";
     if (std.mem.eql(u8, provider, "xai")) return "XAI_API_KEY";
@@ -145,8 +148,11 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
         expected: []const u8,
     }{
         .{ .provider = "openai", .expected = "openai-key" },
+        .{ .provider = "openai-responses", .expected = "openai-key" },
+        .{ .provider = "openai-codex", .expected = "openai-key" },
         .{ .provider = "azure-openai-responses", .expected = "azure-key" },
         .{ .provider = "google", .expected = "gemini-key" },
+        .{ .provider = "google-gemini-cli", .expected = "gemini-key" },
         .{ .provider = "groq", .expected = "groq-key" },
         .{ .provider = "cerebras", .expected = "cerebras-key" },
         .{ .provider = "xai", .expected = "xai-key" },
@@ -180,9 +186,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
     try std.testing.expectEqualStrings("vertex-api-key", vertex_api_key.?);
 
     const missing_cases = [_][]const u8{
-        "google-gemini-cli",
         "google-antigravity",
-        "openai-codex",
         "faux",
         "missing-provider",
     };

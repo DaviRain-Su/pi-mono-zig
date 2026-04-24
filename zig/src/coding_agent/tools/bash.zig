@@ -171,13 +171,7 @@ pub const BashTool = struct {
 
         if (truncation_result.truncated) {
             details.truncation = truncation_result;
-            const full_output_path = try makeTempOutputPath(allocator, pid);
-            errdefer allocator.free(full_output_path);
-            try std.Io.Dir.writeFile(.cwd(), self.io, .{
-                .sub_path = full_output_path,
-                .data = output,
-            });
-            details.full_output_path = full_output_path;
+            const securely_captured = captureOutputInSecureTempFile(allocator, self.io, output) catch false;
 
             const start_line = if (details.truncation.?.output_lines > details.truncation.?.total_lines)
                 @as(usize, 1)
@@ -187,14 +181,30 @@ pub const BashTool = struct {
             const note = if (details.truncation.?.truncated_by.? == .lines)
                 try std.fmt.allocPrint(
                     allocator,
-                    "\n\n[Showing lines {d}-{d} of {d}. Full output: {s}]",
-                    .{ start_line, end_line, details.truncation.?.total_lines, full_output_path },
+                    "\n\n[Showing lines {d}-{d} of {d}. {s}]",
+                    .{
+                        start_line,
+                        end_line,
+                        details.truncation.?.total_lines,
+                        if (securely_captured)
+                            "Full output was stored in a secure temporary file and deleted after execution"
+                        else
+                            "Full output was not retained",
+                    },
                 )
             else
                 try std.fmt.allocPrint(
                     allocator,
-                    "\n\n[Showing lines {d}-{d} of {d} (50KB limit). Full output: {s}]",
-                    .{ start_line, end_line, details.truncation.?.total_lines, full_output_path },
+                    "\n\n[Showing lines {d}-{d} of {d} (50KB limit). {s}]",
+                    .{
+                        start_line,
+                        end_line,
+                        details.truncation.?.total_lines,
+                        if (securely_captured)
+                            "Full output was stored in a secure temporary file and deleted after execution"
+                        else
+                            "Full output was not retained",
+                    },
                 );
             defer allocator.free(note);
 
@@ -302,8 +312,54 @@ fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
     };
 }
 
-fn makeTempOutputPath(allocator: std.mem.Allocator, pid: std.posix.pid_t) ![]u8 {
-    return std.fmt.allocPrint(allocator, "/tmp/pi-bash-{d}.log", .{pid});
+const SecureTempFile = struct {
+    file: std.Io.File,
+    path: []u8,
+
+    fn create(allocator: std.mem.Allocator, io: std.Io) !SecureTempFile {
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            var random_bytes: [16]u8 = undefined;
+            io.random(&random_bytes);
+            const encoded = std.fmt.bytesToHex(random_bytes, .lower);
+            const path = try std.fmt.allocPrint(allocator, "/tmp/pi-bash-{s}.log", .{encoded[0..]});
+            errdefer allocator.free(path);
+
+            var file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    allocator.free(path);
+                    continue;
+                },
+                else => return err,
+            };
+            errdefer file.close(io);
+
+            try std.Io.Dir.deleteFileAbsolute(io, path);
+            return .{
+                .file = file,
+                .path = path,
+            };
+        }
+
+        return error.TemporaryFilePathCollision;
+    }
+
+    fn deinit(self: *SecureTempFile, allocator: std.mem.Allocator, io: std.Io) void {
+        self.file.close(io);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn captureOutputInSecureTempFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+) !bool {
+    var temp_file = try SecureTempFile.create(allocator, io);
+    defer temp_file.deinit(allocator, io);
+    try temp_file.file.writeStreamingAll(io, output);
+    return true;
 }
 
 fn schemaProperty(
@@ -419,7 +475,7 @@ test "bash tool times out and kills the whole process group" {
     try std.testing.expect(!(try processExists(std.testing.allocator, child_pid)));
 }
 
-test "bash tool truncates large output and persists the full log" {
+test "bash tool truncates large output without leaking a temp path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -437,12 +493,29 @@ test "bash tool truncates large output and persists the full log" {
     try std.testing.expect(result.details.?.truncation != null);
     try std.testing.expect(result.details.?.truncation.?.truncated);
     try std.testing.expectEqual(truncate.TruncatedBy.lines, result.details.?.truncation.?.truncated_by.?);
-    try std.testing.expect(result.details.?.full_output_path != null);
+    try std.testing.expect(result.details.?.full_output_path == null);
     try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "3000"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "1\n2\n3"));
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "/tmp/pi-bash-") == null);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        result.content[0].text.text,
+        1,
+        "Full output was stored in a secure temporary file and deleted after execution",
+    ));
+}
 
-    const full_output = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, result.details.?.full_output_path.?, std.testing.allocator, .unlimited);
-    defer std.testing.allocator.free(full_output);
-    try std.testing.expect(std.mem.containsAtLeast(u8, full_output, 1, "1\n2\n3"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, full_output, 1, "2998\n2999\n3000"));
+test "secure temp file is unlinked immediately after creation" {
+    var first = try SecureTempFile.create(std.testing.allocator, std.testing.io);
+    defer first.deinit(std.testing.allocator, std.testing.io);
+
+    var second = try SecureTempFile.create(std.testing.allocator, std.testing.io);
+    defer second.deinit(std.testing.allocator, std.testing.io);
+
+    try std.testing.expect(std.mem.startsWith(u8, first.path, "/tmp/pi-bash-"));
+    try std.testing.expect(!std.mem.eql(u8, first.path, second.path));
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.openFileAbsolute(std.testing.io, first.path, .{}),
+    );
 }

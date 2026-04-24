@@ -67,6 +67,19 @@ npm run check        # Lint, format, and type check
 
 > **Note:** `npm run check` requires `npm run build` to be run first. The web-ui package uses `tsc` which needs compiled `.d.ts` files from dependencies.
 
+### Zig implementation external tools
+
+The native Zig CLI under `zig/` shells out to a few external executables:
+
+- `rg` (`ripgrep`) for the coding-agent `grep` tool
+- `fd` for the coding-agent `find` tool
+
+`zig build`, `zig build test`, and the related Zig build steps verify that both tools are available on `PATH` and fail early with a clear error message if either one is missing.
+
+```bash
+brew install ripgrep fd
+```
+
 ## License
 
 MIT

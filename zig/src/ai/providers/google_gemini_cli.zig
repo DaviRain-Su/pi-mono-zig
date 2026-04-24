@@ -382,6 +382,7 @@ fn parseSseStreamLines(
                                         .event_type = if (is_thinking) .thinking_delta else .text_delta,
                                         .content_index = @intCast(content_blocks.items.len),
                                         .delta = try allocator.dupe(u8, text_value.string),
+                                        .owns_delta = true,
                                     });
                                 }
                             }
@@ -421,6 +422,7 @@ fn parseSseStreamLines(
                                         .event_type = .toolcall_delta,
                                         .content_index = @intCast(content_blocks.items.len - 1),
                                         .delta = try allocator.dupe(u8, args_json),
+                                        .owns_delta = true,
                                     });
                                     stream_ptr.push(.{
                                         .event_type = .toolcall_end,

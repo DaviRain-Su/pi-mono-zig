@@ -294,6 +294,7 @@ fn streamAssistantResponse(
     var saw_message_start = false;
 
     while (stream.next()) |event| {
+        defer event.deinitTransient(allocator);
         switch (event.event_type) {
             .start => {
                 if (event.message) |message| {
@@ -1059,6 +1060,55 @@ fn captureToolEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
 
 fn ignoreEvent(_: ?*anyopaque, _: types.AgentEvent) !void {}
 
+fn passthroughConvertToLlmForTest(
+    _: std.mem.Allocator,
+    messages: []const types.AgentMessage,
+) ![]ai.Message {
+    return @constCast(messages);
+}
+
+fn ownedDeltaStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+) !ai.event_stream.AssistantMessageEventStream {
+    const result_allocator = std.heap.page_allocator;
+    const text = try result_allocator.dupe(u8, "streamed response");
+    const content = try result_allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = text } };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    stream.push(.{ .event_type = .start });
+    stream.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = try allocator.dupe(u8, "streamed "),
+        .owns_delta = true,
+    });
+    stream.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = try allocator.dupe(u8, "response"),
+        .owns_delta = true,
+    });
+    stream.push(.{
+        .event_type = .done,
+        .message = .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = ai.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        },
+    });
+    return stream;
+}
+
 var block_execute_count: usize = 0;
 
 fn echoToolExecute(
@@ -1423,6 +1473,39 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     }
     try std.testing.expect(saw_tool_start);
     try std.testing.expect(saw_tool_end);
+}
+
+test "streamAssistantResponse frees owned streaming deltas after consumption" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:owned-delta",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    const assistant = try streamAssistantResponse(
+        std.testing.allocator,
+        std.Io.failing,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = passthroughConvertToLlmForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+        ownedDeltaStreamForAgentLoopTest,
+    );
+
+    try std.testing.expectEqualStrings("streamed response", assistant.content[0].text.text);
 }
 
 test "runAgentLoop executes multiple tool calls in parallel and emits tool results in source order" {

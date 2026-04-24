@@ -360,6 +360,7 @@ fn parseSseStreamLines(
                             .event_type = .thinking_delta,
                             .content_index = @intCast(thinking.event_index),
                             .delta = try allocator.dupe(u8, delta_value.string),
+                            .owns_delta = true,
                         });
                     },
                     else => {},
@@ -378,6 +379,7 @@ fn parseSseStreamLines(
                                 .event_type = .thinking_delta,
                                 .content_index = @intCast(thinking.event_index),
                                 .delta = try allocator.dupe(u8, "\n\n"),
+                                .owns_delta = true,
                             });
                         }
                     },
@@ -404,6 +406,7 @@ fn parseSseStreamLines(
                             .event_type = .text_delta,
                             .content_index = @intCast(text.event_index),
                             .delta = try allocator.dupe(u8, delta_value.string),
+                            .owns_delta = true,
                         });
                     },
                     else => {},
@@ -423,6 +426,7 @@ fn parseSseStreamLines(
                             .event_type = .toolcall_delta,
                             .content_index = @intCast(tool_call.event_index),
                             .delta = try allocator.dupe(u8, delta_value.string),
+                            .owns_delta = true,
                         });
                     },
                     else => {},
@@ -447,6 +451,7 @@ fn parseSseStreamLines(
                                     .event_type = .toolcall_delta,
                                     .content_index = @intCast(tool_call.event_index),
                                     .delta = try allocator.dupe(u8, delta),
+                                    .owns_delta = true,
                                 });
                             }
                         } else {

@@ -129,10 +129,7 @@ fn parseKeyWithMode(input: []const u8, mode: ParseMode) ?ParseResult {
 
     const sequence_len = std.unicode.utf8ByteSequenceLength(first) catch 1;
     if (input.len < sequence_len) {
-        return switch (mode) {
-            .buffering => .need_more_bytes,
-            .flush => parsed(.{ .printable = PrintableKey.fromSlice(input[0..input.len]) }, input.len),
-        };
+        return .need_more_bytes;
     }
 
     return parsed(.{ .printable = PrintableKey.fromSlice(input[0..sequence_len]) }, sequence_len);
@@ -329,6 +326,15 @@ test "flushKey resolves standalone escape and discards incomplete escape sequenc
     try std.testing.expectEqualDeep(ParsedKey{ .key = .unknown_escape, .consumed = 2 }, flushKey("\x1b[").?);
 }
 
+test "flushKey keeps incomplete UTF-8 buffered until the sequence is complete" {
+    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey("\xc3").?);
+    try std.testing.expect(flushKey("\xc3") == null);
+    try std.testing.expectEqualDeep(ParsedKey{
+        .key = .{ .printable = PrintableKey.fromSlice("é") },
+        .consumed = 2,
+    }, flushKey("é").?);
+}
+
 test "parse home end function and bracketed paste sequences" {
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .home, .consumed = 3 } }, parseKey("\x1bOH").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .end, .consumed = 3 } }, parseKey("\x1bOF").?);
@@ -354,4 +360,30 @@ test "parseInputEvent waits for a complete bracketed paste" {
     try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\x1b[20").?);
     try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\x1b[200~partial").?);
     try std.testing.expect(flushInputEvent("\x1b[200~partial") == null);
+}
+
+test "parseInputEvent assembles split UTF-8 codepoints across reads" {
+    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\xc3").?);
+    try std.testing.expect(flushInputEvent("\xc3") == null);
+
+    const two_byte = parseInputEvent("é").?;
+    try std.testing.expect(two_byte == .parsed);
+    try std.testing.expectEqual(@as(usize, 2), two_byte.parsed.consumed);
+    switch (two_byte.parsed.event) {
+        .key => |key| try std.testing.expectEqualDeep(Key{ .printable = PrintableKey.fromSlice("é") }, key),
+        else => return error.UnexpectedPaste,
+    }
+
+    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\xf0\x9f").?);
+    try std.testing.expect(flushInputEvent("\xf0\x9f") == null);
+    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\xf0\x9f\x99").?);
+    try std.testing.expect(flushInputEvent("\xf0\x9f\x99") == null);
+
+    const four_byte = parseInputEvent("🙂").?;
+    try std.testing.expect(four_byte == .parsed);
+    try std.testing.expectEqual(@as(usize, 4), four_byte.parsed.consumed);
+    switch (four_byte.parsed.event) {
+        .key => |key| try std.testing.expectEqualDeep(Key{ .printable = PrintableKey.fromSlice("🙂") }, key),
+        else => return error.UnexpectedPaste,
+    }
 }

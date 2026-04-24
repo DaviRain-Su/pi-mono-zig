@@ -34,11 +34,13 @@ const OwnedFauxMessage = struct {
 pub const ResolvedProviderConfig = struct {
     model: ai.Model,
     api_key: ?[]const u8,
+    owned_api_key: ?[]u8 = null,
     faux_registration: ?faux.FauxProviderRegistration = null,
     owned_faux_messages: ?[]OwnedFauxMessage = null,
 
     pub fn deinit(self: *ResolvedProviderConfig, allocator: std.mem.Allocator) void {
         if (self.faux_registration) |registration| registration.unregister();
+        if (self.owned_api_key) |api_key| allocator.free(api_key);
         if (self.owned_faux_messages) |messages| {
             for (messages) |*message| message.deinit(allocator);
             allocator.free(messages);
@@ -54,38 +56,6 @@ pub const AvailableModel = struct {
     available: bool,
 };
 
-const ProviderDescriptor = struct {
-    provider: []const u8,
-    default_model: []const u8,
-    api: []const u8,
-    base_url: []const u8,
-    env_key: ?[]const u8,
-};
-
-const PROVIDERS = [_]ProviderDescriptor{
-    .{
-        .provider = "openai",
-        .default_model = "gpt-4",
-        .api = "openai-completions",
-        .base_url = "https://api.openai.com/v1",
-        .env_key = "OPENAI_API_KEY",
-    },
-    .{
-        .provider = "kimi",
-        .default_model = "moonshot-v1-8k",
-        .api = "kimi-completions",
-        .base_url = "https://api.moonshot.cn/v1",
-        .env_key = "KIMI_API_KEY",
-    },
-    .{
-        .provider = "faux",
-        .default_model = "faux-1",
-        .api = "faux",
-        .base_url = "http://localhost:0",
-        .env_key = null,
-    },
-};
-
 pub fn resolveProviderConfig(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
@@ -97,23 +67,21 @@ pub fn resolveProviderConfig(
         return try resolveFauxProvider(allocator, env_map, model_override);
     }
 
-    const descriptor = findProvider(provider) orelse return error.UnknownProvider;
-    const api_key = api_key_override orelse (if (descriptor.env_key) |env_key| env_map.get(env_key) else null) orelse
-        return error.MissingApiKey;
-    const model_id = model_override orelse descriptor.default_model;
+    const descriptor = ai.model_registry.getProviderConfig(provider) orelse return error.UnknownProvider;
+    const owned_api_key = if (api_key_override == null)
+        try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider)
+    else
+        null;
+    errdefer if (owned_api_key) |api_key| allocator.free(api_key);
+
+    const api_key = api_key_override orelse owned_api_key orelse return error.MissingApiKey;
+    const model_id = model_override orelse descriptor.default_model_id orelse provider;
+    const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(descriptor, model_id);
 
     return .{
-        .model = .{
-            .id = model_id,
-            .name = model_id,
-            .api = descriptor.api,
-            .provider = descriptor.provider,
-            .base_url = descriptor.base_url,
-            .input_types = &[_][]const u8{"text"},
-            .context_window = 8192,
-            .max_tokens = 4096,
-        },
+        .model = model,
         .api_key = api_key,
+        .owned_api_key = owned_api_key,
     };
 }
 
@@ -125,20 +93,18 @@ pub fn listAvailableModels(
     var models = std.ArrayList(AvailableModel).empty;
     errdefer models.deinit(allocator);
 
-    for (PROVIDERS) |descriptor| {
-        const available = descriptor.env_key == null or env_map.get(descriptor.env_key.?) != null;
-        if (!available) {
-            if (current_model) |model| {
-                if (!std.mem.eql(u8, model.provider, descriptor.provider)) continue;
-            } else {
-                continue;
-            }
-        }
+    for (ai.model_registry.builtInProviderConfigs()) |descriptor| {
+        const model_id = descriptor.default_model_id orelse continue;
+        const available = try hasProviderCredentials(allocator, env_map, descriptor.provider);
+        const display_name = if (ai.model_registry.find(descriptor.provider, model_id)) |model|
+            model.name
+        else
+            model_id;
 
         try models.append(allocator, .{
             .provider = descriptor.provider,
-            .model_id = descriptor.default_model,
-            .display_name = descriptor.default_model,
+            .model_id = model_id,
+            .display_name = display_name,
             .available = available,
         });
     }
@@ -155,7 +121,7 @@ pub fn listAvailableModels(
             try models.append(allocator, .{
                 .provider = model.provider,
                 .model_id = model.id,
-                .display_name = model.id,
+                .display_name = model.name,
                 .available = true,
             });
         }
@@ -166,23 +132,13 @@ pub fn listAvailableModels(
 
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
     return switch (err) {
-        error.MissingApiKey => if (std.mem.eql(u8, provider, "kimi"))
-            "API key required. Use --api-key or set KIMI_API_KEY."
-        else
-            "API key required. Use --api-key or set OPENAI_API_KEY.",
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, faux.",
+        error.MissingApiKey => missingApiKeyMessage(provider),
+        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, google, google-gemini-cli, google-vertex, amazon-bedrock, openrouter, zai, faux.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
         error.InvalidFauxToolArguments => "Invalid PI_FAUX_TOOL_ARGS_JSON. Expected a JSON object or value.",
         else => @errorName(err),
     };
-}
-
-fn findProvider(provider: []const u8) ?ProviderDescriptor {
-    for (PROVIDERS) |descriptor| {
-        if (std.mem.eql(u8, descriptor.provider, provider)) return descriptor;
-    }
-    return null;
 }
 
 fn resolveFauxProvider(
@@ -294,4 +250,156 @@ fn defaultFauxErrorMessage(stop_reason: ai.StopReason) ?[]const u8 {
         .aborted => "Request was aborted",
         else => null,
     };
+}
+
+fn fallbackModel(descriptor: ai.model_registry.ProviderConfig, model_id: []const u8) ai.Model {
+    return .{
+        .id = model_id,
+        .name = model_id,
+        .api = descriptor.api,
+        .provider = descriptor.provider,
+        .base_url = descriptor.base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+}
+
+fn hasProviderCredentials(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+) !bool {
+    if (std.mem.eql(u8, provider, "faux")) return true;
+
+    const api_key = try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider);
+    defer if (api_key) |value| allocator.free(value);
+    return api_key != null;
+}
+
+fn missingApiKeyMessage(provider: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider, "openai") or
+        std.mem.eql(u8, provider, "openai-responses") or
+        std.mem.eql(u8, provider, "openai-codex"))
+    {
+        return "API key required. Use --api-key or set OPENAI_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "azure-openai-responses")) {
+        return "API key required. Use --api-key or set AZURE_OPENAI_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "google") or std.mem.eql(u8, provider, "google-gemini-cli")) {
+        return "API key required. Use --api-key or set GEMINI_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "google-vertex")) {
+        return "Credentials required. Use --api-key, set GOOGLE_CLOUD_API_KEY, or configure GOOGLE_APPLICATION_CREDENTIALS with GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION.";
+    }
+    if (std.mem.eql(u8, provider, "anthropic")) {
+        return "API key required. Use --api-key or set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN.";
+    }
+    if (std.mem.eql(u8, provider, "amazon-bedrock")) {
+        return "Credentials required. Use --api-key or configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or another supported AWS auth source.";
+    }
+    if (std.mem.eql(u8, provider, "mistral")) {
+        return "API key required. Use --api-key or set MISTRAL_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "openrouter")) {
+        return "API key required. Use --api-key or set OPENROUTER_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "zai")) {
+        return "API key required. Use --api-key or set ZAI_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "kimi")) {
+        return "API key required. Use --api-key or set KIMI_API_KEY.";
+    }
+    return "API credentials required. Use --api-key or configure the provider environment variables.";
+}
+
+test "resolveProviderConfig uses canonical defaults from model registry" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("OPENAI_API_KEY", "openai-key");
+
+    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("openai-key", resolved.api_key.?);
+    try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+    try std.testing.expectEqualStrings("GPT-5.4", resolved.model.name);
+    try std.testing.expectEqualStrings("openai-completions", resolved.model.api);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", resolved.model.base_url);
+    try std.testing.expectEqual(@as(u32, 400000), resolved.model.context_window);
+    try std.testing.expectEqual(@as(u32, 128000), resolved.model.max_tokens);
+    try std.testing.expectEqual(@as(usize, 2), resolved.model.input_types.len);
+    try std.testing.expectEqualStrings("image", resolved.model.input_types[1]);
+}
+
+test "resolveProviderConfig supports non-legacy built-in providers" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("MISTRAL_API_KEY", "mistral-key");
+
+    var resolved = try resolveProviderConfig(allocator, &env_map, "mistral", "devstral-medium-latest", null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("mistral-key", resolved.api_key.?);
+    try std.testing.expectEqualStrings("devstral-medium-latest", resolved.model.id);
+    try std.testing.expectEqualStrings("Devstral Medium Latest", resolved.model.name);
+    try std.testing.expectEqualStrings("mistral-conversations", resolved.model.api);
+    try std.testing.expectEqualStrings("mistral", resolved.model.provider);
+}
+
+test "listAvailableModels enumerates all built-in providers" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const current_model = ai.model_registry.find("faux", "faux-1").?;
+    const models = try listAvailableModels(allocator, &env_map, current_model);
+    defer allocator.free(models);
+
+    var found_openai = false;
+    var found_anthropic = false;
+    var found_google = false;
+    var found_vertex = false;
+    var found_bedrock = false;
+    var found_faux = false;
+
+    for (models) |entry| {
+        if (std.mem.eql(u8, entry.provider, "openai")) {
+            found_openai = true;
+            try std.testing.expectEqualStrings("gpt-5.4", entry.model_id);
+            try std.testing.expectEqualStrings("GPT-5.4", entry.display_name);
+            try std.testing.expect(!entry.available);
+        } else if (std.mem.eql(u8, entry.provider, "anthropic")) {
+            found_anthropic = true;
+            try std.testing.expectEqualStrings("claude-opus-4-7", entry.model_id);
+        } else if (std.mem.eql(u8, entry.provider, "google")) {
+            found_google = true;
+            try std.testing.expectEqualStrings("gemini-3.1-pro-preview", entry.model_id);
+        } else if (std.mem.eql(u8, entry.provider, "google-vertex")) {
+            found_vertex = true;
+            try std.testing.expect(!entry.available);
+        } else if (std.mem.eql(u8, entry.provider, "amazon-bedrock")) {
+            found_bedrock = true;
+            try std.testing.expect(!entry.available);
+        } else if (std.mem.eql(u8, entry.provider, "faux")) {
+            found_faux = true;
+            try std.testing.expect(entry.available);
+        }
+    }
+
+    try std.testing.expect(found_openai);
+    try std.testing.expect(found_anthropic);
+    try std.testing.expect(found_google);
+    try std.testing.expect(found_vertex);
+    try std.testing.expect(found_bedrock);
+    try std.testing.expect(found_faux);
+    try std.testing.expect(models.len >= 7);
 }
