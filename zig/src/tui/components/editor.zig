@@ -17,6 +17,8 @@ pub const CursorPosition = struct {
     column: usize,
 };
 
+const DEFAULT_PAGE_LINE_COUNT: usize = 5;
+
 pub const Editor = struct {
     allocator: std.mem.Allocator,
     buffer: std.ArrayList(u8) = .empty,
@@ -154,6 +156,16 @@ pub const Editor = struct {
                 try self.refreshAutocomplete(false);
                 return .handled;
             },
+            .ctrl_left => {
+                self.moveWordBackwards();
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
+            .ctrl_right => {
+                self.moveWordForwards();
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
             .up => {
                 self.moveVertical(-1);
                 try self.refreshAutocomplete(false);
@@ -164,9 +176,49 @@ pub const Editor = struct {
                 try self.refreshAutocomplete(false);
                 return .handled;
             },
+            .home => {
+                self.moveToLineStart();
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
+            .end => {
+                self.moveToLineEnd();
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
+            .delete => {
+                self.deleteForward();
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
+            .page_up => {
+                self.movePage(-1);
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
+            .page_down => {
+                self.movePage(1);
+                try self.refreshAutocomplete(false);
+                return .handled;
+            },
             .ctrl => |ctrl| switch (ctrl) {
+                'a' => {
+                    self.moveToLineStart();
+                    try self.refreshAutocomplete(false);
+                    return .handled;
+                },
                 'c' => return .interrupt,
                 'd' => return .exit,
+                'e' => {
+                    self.moveToLineEnd();
+                    try self.refreshAutocomplete(false);
+                    return .handled;
+                },
+                'k' => {
+                    self.deleteToLineEnd();
+                    try self.refreshAutocomplete(false);
+                    return .handled;
+                },
                 else => return .ignored,
             },
             .escape => return .ignored,
@@ -371,6 +423,35 @@ pub const Editor = struct {
         self.cursor = nextCodepointEnd(self.buffer.items, self.cursor);
     }
 
+    fn moveToLineStart(self: *Editor) void {
+        self.cursor = lineStart(self.buffer.items, self.cursor);
+    }
+
+    fn moveToLineEnd(self: *Editor) void {
+        self.cursor = lineEnd(self.buffer.items, self.cursor);
+    }
+
+    fn deleteForward(self: *Editor) void {
+        if (self.cursor >= self.buffer.items.len) return;
+
+        const end = nextCodepointEnd(self.buffer.items, self.cursor);
+        deleteRange(&self.buffer, self.cursor, end);
+    }
+
+    fn deleteToLineEnd(self: *Editor) void {
+        const content = self.buffer.items;
+        const current_end = lineEnd(content, self.cursor);
+
+        if (self.cursor < current_end) {
+            deleteRange(&self.buffer, self.cursor, current_end);
+            return;
+        }
+
+        if (current_end < content.len) {
+            deleteRange(&self.buffer, current_end, current_end + 1);
+        }
+    }
+
     fn moveVertical(self: *Editor, direction: i2) void {
         const content = self.buffer.items;
         const current_start = lineStart(content, self.cursor);
@@ -391,6 +472,101 @@ pub const Editor = struct {
         const next_start = current_end + 1;
         const next_end = lineEnd(content, next_start);
         self.cursor = indexForColumn(content, next_start, next_end, target_column);
+    }
+
+    fn movePage(self: *Editor, direction: i2) void {
+        const content = self.buffer.items;
+        const current_start = lineStart(content, self.cursor);
+        const target_column = displayColumn(content, current_start, self.cursor);
+
+        var target_start = current_start;
+        var remaining = DEFAULT_PAGE_LINE_COUNT;
+        while (remaining > 0) : (remaining -= 1) {
+            if (direction < 0) {
+                if (target_start == 0) break;
+
+                const previous_end = target_start - 1;
+                target_start = lineStart(content, previous_end);
+            } else {
+                const target_end = lineEnd(content, target_start);
+                if (target_end == content.len) break;
+
+                target_start = target_end + 1;
+            }
+        }
+
+        const target_end = lineEnd(content, target_start);
+        self.cursor = indexForColumn(content, target_start, target_end, target_column);
+    }
+
+    fn moveWordBackwards(self: *Editor) void {
+        const content = self.buffer.items;
+        const current_start = lineStart(content, self.cursor);
+
+        if (self.cursor == current_start) {
+            if (current_start == 0) return;
+
+            const previous_end = current_start - 1;
+            self.cursor = lineEnd(content, previous_end);
+            return;
+        }
+
+        var cursor = self.cursor;
+        while (cursor > current_start) {
+            const previous = prevCodepointStart(content, cursor);
+            if (classifySlice(content[previous..cursor]) != .whitespace) break;
+            cursor = previous;
+        }
+
+        if (cursor == current_start) {
+            self.cursor = current_start;
+            return;
+        }
+
+        var previous = prevCodepointStart(content, cursor);
+        const target_class = classifySlice(content[previous..cursor]);
+        cursor = previous;
+
+        while (cursor > current_start) {
+            previous = prevCodepointStart(content, cursor);
+            if (classifySlice(content[previous..cursor]) != target_class) break;
+            cursor = previous;
+        }
+
+        self.cursor = cursor;
+    }
+
+    fn moveWordForwards(self: *Editor) void {
+        const content = self.buffer.items;
+        const current_end = lineEnd(content, self.cursor);
+
+        if (self.cursor >= current_end) {
+            if (current_end < content.len) {
+                self.cursor = current_end + 1;
+            }
+            return;
+        }
+
+        var cursor = self.cursor;
+        while (cursor < current_end) {
+            const next = nextCodepointEnd(content, cursor);
+            if (classifySlice(content[cursor..next]) != .whitespace) break;
+            cursor = next;
+        }
+
+        if (cursor >= current_end) {
+            self.cursor = current_end;
+            return;
+        }
+
+        const target_class = classifySlice(content[cursor..nextCodepointEnd(content, cursor)]);
+        while (cursor < current_end) {
+            const next = nextCodepointEnd(content, cursor);
+            if (classifySlice(content[cursor..next]) != target_class) break;
+            cursor = next;
+        }
+
+        self.cursor = cursor;
     }
 };
 
@@ -493,6 +669,29 @@ fn deleteRange(buffer: *std.ArrayList(u8), start: usize, end: usize) void {
     const count = end - start;
     std.mem.copyForwards(u8, buffer.items[start .. buffer.items.len - count], buffer.items[end..]);
     buffer.items.len -= count;
+}
+
+const CharacterClass = enum {
+    whitespace,
+    punctuation,
+    word,
+};
+
+fn classifySlice(slice: []const u8) CharacterClass {
+    if (slice.len == 1 and isWhitespaceByte(slice[0])) return .whitespace;
+    if (slice.len == 1 and isPunctuationByte(slice[0])) return .punctuation;
+    return .word;
+}
+
+fn isWhitespaceByte(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r' => true,
+        else => false,
+    };
+}
+
+fn isPunctuationByte(byte: u8) bool {
+    return std.mem.indexOfScalar(u8, "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`", byte) != null;
 }
 
 fn prevCodepointStart(text: []const u8, index: usize) usize {
@@ -639,6 +838,116 @@ test "editor backspace deletes before cursor" {
 
     try std.testing.expectEqualStrings("helo", editor.text());
     try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 3 }, editor.cursorPosition());
+}
+
+test "editor home end and ctrl line navigation move within the current line" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("alpha\nbeta"));
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 4 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.home));
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 0 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.{ .ctrl = 'e' }));
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 4 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.left));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.left));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.{ .ctrl = 'a' }));
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 0 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.end));
+    try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 4 }, editor.cursorPosition());
+}
+
+test "editor delete removes the character under the cursor" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("hello"));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.left));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.left));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.delete));
+
+    try std.testing.expectEqualStrings("helo", editor.text());
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 3 }, editor.cursorPosition());
+}
+
+test "editor ctrl+k deletes to the end of the line" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("hello\nworld"));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.up));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.{ .ctrl = 'a' }));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.right));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.right));
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.{ .ctrl = 'k' }));
+
+    try std.testing.expectEqualStrings("he\nworld", editor.text());
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 2 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.{ .ctrl = 'k' }));
+    try std.testing.expectEqualStrings("heworld", editor.text());
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 2 }, editor.cursorPosition());
+}
+
+test "editor ctrl left and ctrl right move by word boundaries" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("one two three"));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 13 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.ctrl_left));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 8 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.ctrl_left));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 4 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.ctrl_left));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 0 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.ctrl_right));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 3 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.ctrl_right));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 7 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.ctrl_right));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 13 }, editor.cursorPosition());
+}
+
+test "editor page up and page down move across multiple lines" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(
+        HandleResult.handled,
+        try editor.handlePaste("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7"),
+    );
+    try std.testing.expectEqual(CursorPosition{ .line = 7, .column = 2 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.page_up));
+    try std.testing.expectEqual(CursorPosition{ .line = 2, .column = 2 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.page_up));
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 2 }, editor.cursorPosition());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(.page_down));
+    try std.testing.expectEqual(CursorPosition{ .line = 5, .column = 2 }, editor.cursorPosition());
 }
 
 test "editor shows fuzzy-ranked autocomplete suggestions as user types" {
