@@ -39,6 +39,7 @@ pub const AgentSession = struct {
         cwd: []const u8,
         system_prompt: []const u8 = "",
         model: ?ai.Model = null,
+        api_key: ?[]const u8 = null,
         thinking_level: agent.ThinkingLevel = .off,
         tools: []const agent.AgentTool = &.{},
         session_dir: ?[]const u8 = null,
@@ -51,6 +52,7 @@ pub const AgentSession = struct {
         cwd_override: ?[]const u8 = null,
         system_prompt: []const u8 = "",
         model: ?ai.Model = null,
+        api_key: ?[]const u8 = null,
         thinking_level: agent.ThinkingLevel = .off,
         tools: []const agent.AgentTool = &.{},
         compaction: CompactionSettings = .{},
@@ -76,6 +78,7 @@ pub const AgentSession = struct {
             options.cwd,
             options.system_prompt,
             options.model,
+            options.api_key,
             options.thinking_level,
             options.tools,
             options.compaction,
@@ -108,6 +111,7 @@ pub const AgentSession = struct {
             effective_cwd,
             options.system_prompt,
             options.model,
+            options.api_key,
             options.thinking_level,
             options.tools,
             options.compaction,
@@ -152,6 +156,10 @@ pub const AgentSession = struct {
     pub fn setModel(self: *AgentSession, model: ai.Model) !void {
         self.agent.setModel(model);
         _ = try self.session_manager.appendModelChange(model.provider, model.id);
+    }
+
+    pub fn setApiKey(self: *AgentSession, api_key: ?[]const u8) void {
+        self.agent.setApiKey(api_key);
     }
 
     fn runPostPromptMaintenance(self: *AgentSession) !void {
@@ -254,6 +262,7 @@ pub const AgentSession = struct {
         cwd: []const u8,
         system_prompt: []const u8,
         model: ?ai.Model,
+        api_key: ?[]const u8,
         thinking_level: agent.ThinkingLevel,
         tools: []const agent.AgentTool,
         compaction_settings: CompactionSettings,
@@ -272,6 +281,8 @@ pub const AgentSession = struct {
         var agent_instance = try agent.Agent.init(allocator, .{
             .system_prompt = system_prompt,
             .model = effective_model,
+            .api_key = api_key,
+            .session_id = manager.getSessionId(),
             .thinking_level = effective_thinking_level,
             .tools = tools,
             .messages = session_context.messages,
@@ -758,6 +769,7 @@ test "agent session navigation switches visible branch transcript" {
         "/tmp/project",
         "system prompt",
         model,
+        null,
         .off,
         &.{},
         .{},

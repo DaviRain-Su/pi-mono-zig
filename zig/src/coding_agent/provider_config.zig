@@ -255,7 +255,7 @@ fn buildOwnedFauxMessages(
 
         const first_blocks = try allocator.alloc(faux.FauxContentBlock, 1);
         const tool_args = try common.cloneJsonValue(allocator, parsed.value);
-        errdefer common.deinitJsonValue(allocator, tool_args);
+        defer common.deinitJsonValue(allocator, tool_args);
         first_blocks[0] = faux.fauxToolCall(allocator, tool_name, tool_args, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidFauxToolArguments,

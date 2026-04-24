@@ -1,5 +1,4 @@
 const std = @import("std");
-const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
 const coding_agent = @import("coding_agent/root.zig");
@@ -23,87 +22,122 @@ pub fn main(init: std.process.Init) !void {
         try argv.append(init.gpa, arg);
     }
 
-    var options = cli.parseArgs(init.gpa, argv.items) catch |err| {
-        stderr.print("Error: {s}\n\n", .{parseErrorMessage(err)}) catch {};
-        printUsage(init.gpa, stdout) catch {};
-        flushWriters(stdout, stderr) catch {};
-        std.process.exit(1);
+    const exit_code = try runCli(init.gpa, init.io, init.environ_map, argv.items, null, stdout, stderr);
+    try flushWriters(stdout, stderr);
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
+pub fn runCli(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    argv: []const []const u8,
+    cwd_override: ?[]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    var options = cli.parseArgs(allocator, argv) catch |err| {
+        try stderr.print("Error: {s}\n\n", .{parseErrorMessage(err)});
+        try printUsage(allocator, stdout);
+        return 1;
     };
-    defer options.deinit(init.gpa);
+    defer options.deinit(allocator);
 
     if (options.help) {
-        try printUsage(init.gpa, stdout);
-        try flushWriters(stdout, stderr);
-        return;
+        try printUsage(allocator, stdout);
+        return 0;
     }
 
     if (options.version) {
-        try printVersion(init.gpa, stdout);
-        try flushWriters(stdout, stderr);
-        return;
+        try printVersion(allocator, stdout);
+        return 0;
     }
 
     if (options.print and options.prompt == null) {
         try stderr.writeAll("Error: No prompt provided\n\n");
-        printUsage(init.gpa, stdout) catch {};
-        try flushWriters(stdout, stderr);
-        std.process.exit(1);
+        try printUsage(allocator, stdout);
+        return 1;
     }
 
     if (options.mode == .rpc) {
         try stderr.writeAll("Error: RPC mode is not implemented in the Zig CLI\n");
-        try flushWriters(stdout, stderr);
-        std.process.exit(1);
+        return 1;
     }
 
     const provider_name = options.provider orelse "openai";
     const selected_tools = effectiveToolSelection(&options);
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.gpa);
-    defer init.gpa.free(cwd);
-    const current_date = try currentDateString(init.gpa, init.io);
-    defer init.gpa.free(current_date);
-    const system_prompt = try coding_agent.buildSystemPrompt(init.gpa, .{
+    const cwd = if (cwd_override) |override| blk: {
+        break :blk try allocator.dupe(u8, override);
+    } else blk: {
+        const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(real_cwd);
+        break :blk try allocator.dupe(u8, real_cwd);
+    };
+    defer allocator.free(cwd);
+
+    const current_date = try currentDateString(allocator, io);
+    defer allocator.free(current_date);
+    const system_prompt = try coding_agent.buildSystemPrompt(allocator, .{
         .cwd = cwd,
         .current_date = current_date,
         .custom_prompt = options.system_prompt,
         .append_prompt = options.append_system_prompt,
         .selected_tools = selected_tools,
     });
-    defer init.gpa.free(system_prompt);
+    defer allocator.free(system_prompt);
 
     var provider_runtime = coding_agent.resolveProviderConfig(
-        init.gpa,
-        init.environ_map,
+        allocator,
+        env_map,
         provider_name,
         options.model,
         options.api_key,
     ) catch |err| {
         try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, provider_name)});
-        try flushWriters(stdout, stderr);
-        std.process.exit(1);
+        return 1;
     };
-    defer provider_runtime.deinit(init.gpa);
+    defer provider_runtime.deinit(allocator);
 
     if (options.print) {
-        const content_block = ai.ContentBlock{ .text = .{ .text = options.prompt.? } };
-        const now: i64 = @intCast(@divFloor(std.Io.Clock.now(.real, init.io).nanoseconds, std.time.ns_per_s));
-        const user_msg = ai.Message{ .user = .{
-            .content = &[_]ai.ContentBlock{content_block},
-            .timestamp = now,
-        } };
-        const context = ai.Context{
-            .system_prompt = system_prompt,
-            .messages = &[_]ai.Message{user_msg},
-        };
+        coding_agent.interactive_mode.setToolRuntime(.{
+            .cwd = cwd,
+            .io = io,
+        });
+        defer coding_agent.interactive_mode.clearToolRuntime();
 
-        const exit_code = try coding_agent.runPrintMode(
-            init.gpa,
-            init.io,
-            provider_runtime.model,
-            context,
+        var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, selected_tools);
+        defer built_tools.deinit();
+
+        const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+        defer allocator.free(session_dir);
+
+        var session = try coding_agent.interactive_mode.openInitialSession(
+            allocator,
+            io,
+            session_dir,
             .{
-                .api_key = provider_runtime.api_key,
+                .cwd = cwd,
+                .system_prompt = system_prompt,
+                .provider = provider_name,
+                .model = options.model,
+                .api_key = options.api_key,
+                .thinking = mapThinkingLevel(options.thinking),
+                .session = options.session,
+                .@"continue" = options.@"continue",
+                .selected_tools = selected_tools,
+                .initial_prompt = null,
             },
+            provider_runtime.model,
+            provider_runtime.api_key,
+            built_tools.items,
+        );
+        defer session.deinit();
+
+        return try coding_agent.runPrintMode(
+            allocator,
+            io,
+            &session,
+            options.prompt.?,
             .{
                 .mode = switch (options.mode) {
                     .json => .json,
@@ -113,15 +147,12 @@ pub fn main(init: std.process.Init) !void {
             stdout,
             stderr,
         );
-        try flushWriters(stdout, stderr);
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
     }
 
-    const exit_code = try coding_agent.runInteractiveMode(
-        init.gpa,
-        init.io,
-        init.environ_map,
+    return try coding_agent.runInteractiveMode(
+        allocator,
+        io,
+        env_map,
         .{
             .cwd = cwd,
             .system_prompt = system_prompt,
@@ -136,8 +167,6 @@ pub fn main(init: std.process.Init) !void {
         },
         stderr,
     );
-    try flushWriters(stdout, stderr);
-    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
@@ -199,6 +228,23 @@ fn mapThinkingLevel(level: ?cli.ThinkingLevel) agent.ThinkingLevel {
     };
 }
 
+fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn makeTmpPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
+    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        name,
+    });
+    defer allocator.free(relative_dir);
+    return try makeAbsoluteTestPath(allocator, relative_dir);
+}
+
 test "main help text includes expected CLI options" {
     const allocator = std.testing.allocator;
     const help = try cli.helpText(allocator, VERSION);
@@ -214,4 +260,98 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
+}
+
+test "runCli prints faux response end to end" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "hello from cli");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "hello" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("hello from cli\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli persists and continues sessions across runs" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-session");
+    defer allocator.free(cwd);
+
+    var first_env = std.process.Environ.Map.init(allocator);
+    defer first_env.deinit();
+    try first_env.put("PI_FAUX_RESPONSE", "first reply");
+
+    var first_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stdout.deinit();
+    var first_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stderr.deinit();
+
+    const first_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &first_env,
+        &.{ "--provider", "faux", "--print", "first prompt" },
+        cwd,
+        &first_stdout.writer,
+        &first_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), first_exit);
+
+    var second_env = std.process.Environ.Map.init(allocator);
+    defer second_env.deinit();
+    try second_env.put("PI_FAUX_RESPONSE", "second reply");
+
+    var second_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stdout.deinit();
+    var second_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stderr.deinit();
+
+    const second_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &second_env,
+        &.{ "--provider", "faux", "--print", "--continue", "second prompt" },
+        cwd,
+        &second_stdout.writer,
+        &second_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), second_exit);
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("first prompt", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("first reply", context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("second prompt", context.messages[2].user.content[0].text.text);
+    try std.testing.expectEqualStrings("second reply", context.messages[3].assistant.content[0].text.text);
 }

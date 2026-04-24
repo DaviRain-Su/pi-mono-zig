@@ -79,6 +79,8 @@ pub const PendingMessageQueue = struct {
 pub const AgentOptions = struct {
     system_prompt: []const u8 = "",
     model: ?ai.Model = null,
+    api_key: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
     thinking_level: types.ThinkingLevel = .off,
     tools: []const types.AgentTool = &.{},
     messages: []const types.AgentMessage = &.{},
@@ -112,6 +114,8 @@ pub const Agent = struct {
     allocator: std.mem.Allocator,
     system_prompt: []const u8,
     model: ai.Model,
+    api_key: ?[]const u8,
+    session_id: ?[]const u8,
     thinking_level: types.ThinkingLevel,
     tools: std.ArrayList(types.AgentTool),
     messages: std.ArrayList(types.AgentMessage),
@@ -137,6 +141,8 @@ pub const Agent = struct {
             .allocator = allocator,
             .system_prompt = options.system_prompt,
             .model = options.model orelse DEFAULT_MODEL,
+            .api_key = options.api_key,
+            .session_id = options.session_id,
             .thinking_level = options.thinking_level,
             .tools = .empty,
             .messages = .empty,
@@ -164,12 +170,14 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        self.clearOwnedMessages();
         self.tools.deinit(self.allocator);
         self.messages.deinit(self.allocator);
         self.pending_tool_calls.deinit(self.allocator);
         self.steering_queue.deinit();
         self.follow_up_queue.deinit();
         self.listeners.deinit(self.allocator);
+        if (self.error_message) |error_message| self.allocator.free(error_message);
     }
 
     pub fn state(self: *const Agent) types.AgentState {
@@ -202,6 +210,14 @@ pub const Agent = struct {
         self.model = model;
     }
 
+    pub fn getApiKey(self: *const Agent) ?[]const u8 {
+        return self.api_key;
+    }
+
+    pub fn setApiKey(self: *Agent, api_key: ?[]const u8) void {
+        self.api_key = api_key;
+    }
+
     pub fn getThinkingLevel(self: *const Agent) types.ThinkingLevel {
         return self.thinking_level;
     }
@@ -224,17 +240,21 @@ pub const Agent = struct {
     }
 
     pub fn setMessages(self: *Agent, next_messages: []const types.AgentMessage) !void {
-        self.messages.clearRetainingCapacity();
-        try self.messages.appendSlice(self.allocator, next_messages);
+        self.clearOwnedMessages();
+        for (next_messages) |message| {
+            try self.messages.append(self.allocator, try cloneMessage(self.allocator, message));
+        }
     }
 
     pub fn appendMessage(self: *Agent, message: types.AgentMessage) !void {
-        try self.messages.append(self.allocator, message);
+        try self.messages.append(self.allocator, try cloneMessage(self.allocator, message));
     }
 
-    pub fn removeLastMessage(self: *Agent) ?types.AgentMessage {
-        if (self.messages.items.len == 0) return null;
-        return self.messages.pop();
+    pub fn removeLastMessage(self: *Agent) bool {
+        if (self.messages.items.len == 0) return false;
+        var removed = self.messages.pop().?;
+        deinitMessage(self.allocator, &removed);
+        return true;
     }
 
     pub fn getStreamingMessage(self: *const Agent) ?types.AgentMessage {
@@ -252,7 +272,7 @@ pub const Agent = struct {
     pub fn beginRun(self: *Agent) void {
         self.is_streaming = true;
         self.streaming_message = null;
-        self.error_message = null;
+        self.setErrorMessage(null);
     }
 
     pub fn finishRun(self: *Agent) void {
@@ -294,7 +314,11 @@ pub const Agent = struct {
     }
 
     pub fn setErrorMessage(self: *Agent, error_message: ?[]const u8) void {
-        self.error_message = error_message;
+        if (self.error_message) |previous| self.allocator.free(previous);
+        self.error_message = if (error_message) |message|
+            self.allocator.dupe(u8, message) catch @panic("out of memory while storing agent error message")
+        else
+            null;
     }
 
     pub fn steer(self: *Agent, message: types.AgentMessage) !void {
@@ -340,11 +364,11 @@ pub const Agent = struct {
     }
 
     pub fn reset(self: *Agent) void {
-        self.messages.clearRetainingCapacity();
+        self.clearOwnedMessages();
         self.is_streaming = false;
         self.streaming_message = null;
         self.clearPendingToolCalls();
-        self.error_message = null;
+        self.setErrorMessage(null);
         self.clearAllQueues();
     }
 
@@ -442,6 +466,8 @@ pub const Agent = struct {
     fn createLoopConfig(self: *const Agent) types.AgentLoopConfig {
         return .{
             .model = self.model,
+            .api_key = self.api_key,
+            .session_id = self.session_id,
             .reasoning = if (self.thinking_level == .off) null else self.thinking_level,
             .tool_execution = self.tool_execution,
             .before_tool_call = self.before_tool_call,
@@ -453,6 +479,11 @@ pub const Agent = struct {
             .get_follow_up_messages_context = @constCast(self),
             .get_follow_up_messages = drainFollowUpMessages,
         };
+    }
+
+    fn clearOwnedMessages(self: *Agent) void {
+        for (self.messages.items) |*message| deinitMessage(self.allocator, message);
+        self.messages.clearRetainingCapacity();
     }
 
     fn processEvent(self: *Agent, event: types.AgentEvent) !void {
@@ -484,7 +515,7 @@ pub const Agent = struct {
                     switch (message) {
                         .assistant => |assistant| {
                             if (assistant.error_message) |error_message| {
-                                self.error_message = error_message;
+                                self.setErrorMessage(error_message);
                             }
                         },
                         else => {},
@@ -506,6 +537,193 @@ pub const Agent = struct {
 fn emitAgentEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     const self: *Agent = @ptrCast(@alignCast(context.?));
     try self.processEvent(event);
+}
+
+fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !types.AgentMessage {
+    return switch (message) {
+        .user => |user| .{ .user = .{
+            .role = try allocator.dupe(u8, user.role),
+            .content = try cloneContentBlocks(allocator, user.content),
+            .timestamp = user.timestamp,
+        } },
+        .assistant => |assistant| .{ .assistant = .{
+            .role = try allocator.dupe(u8, assistant.role),
+            .content = try cloneContentBlocks(allocator, assistant.content),
+            .tool_calls = if (assistant.tool_calls) |tool_calls| try cloneToolCalls(allocator, tool_calls) else null,
+            .api = try allocator.dupe(u8, assistant.api),
+            .provider = try allocator.dupe(u8, assistant.provider),
+            .model = try allocator.dupe(u8, assistant.model),
+            .response_id = if (assistant.response_id) |response_id| try allocator.dupe(u8, response_id) else null,
+            .usage = assistant.usage,
+            .stop_reason = assistant.stop_reason,
+            .error_message = if (assistant.error_message) |error_message| try allocator.dupe(u8, error_message) else null,
+            .timestamp = assistant.timestamp,
+        } },
+        .tool_result => |tool_result| .{ .tool_result = .{
+            .role = try allocator.dupe(u8, tool_result.role),
+            .tool_call_id = try allocator.dupe(u8, tool_result.tool_call_id),
+            .tool_name = try allocator.dupe(u8, tool_result.tool_name),
+            .content = try cloneContentBlocks(allocator, tool_result.content),
+            .is_error = tool_result.is_error,
+            .timestamp = tool_result.timestamp,
+        } },
+    };
+}
+
+fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage) void {
+    switch (message.*) {
+        .user => |*user| {
+            allocator.free(user.role);
+            deinitContentBlocks(allocator, user.content);
+        },
+        .assistant => |*assistant| {
+            allocator.free(assistant.role);
+            deinitContentBlocks(allocator, assistant.content);
+            if (assistant.tool_calls) |tool_calls| deinitToolCalls(allocator, tool_calls);
+            allocator.free(assistant.api);
+            allocator.free(assistant.provider);
+            allocator.free(assistant.model);
+            if (assistant.response_id) |response_id| allocator.free(response_id);
+            if (assistant.error_message) |error_message| allocator.free(error_message);
+        },
+        .tool_result => |*tool_result| {
+            allocator.free(tool_result.role);
+            allocator.free(tool_result.tool_call_id);
+            allocator.free(tool_result.tool_name);
+            deinitContentBlocks(allocator, tool_result.content);
+        },
+    }
+}
+
+fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]const ai.ContentBlock {
+    const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
+    errdefer allocator.free(cloned);
+
+    for (blocks, 0..) |block, index| {
+        cloned[index] = try cloneContentBlock(allocator, block);
+    }
+
+    return cloned;
+}
+
+fn cloneContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
+    return switch (block) {
+        .text => |text| ai.ContentBlock{ .text = .{ .text = try allocator.dupe(u8, text.text) } },
+        .image => |image| ai.ContentBlock{ .image = .{
+            .data = try allocator.dupe(u8, image.data),
+            .mime_type = try allocator.dupe(u8, image.mime_type),
+        } },
+        .thinking => |thinking| ai.ContentBlock{ .thinking = .{
+            .thinking = try allocator.dupe(u8, thinking.thinking),
+            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .redacted = thinking.redacted,
+        } },
+    };
+}
+
+fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| allocator.free(text.text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+        }
+    }
+    allocator.free(blocks);
+}
+
+fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) ![]const ai.ToolCall {
+    const cloned = try allocator.alloc(ai.ToolCall, tool_calls.len);
+    errdefer allocator.free(cloned);
+
+    for (tool_calls, 0..) |tool_call, index| {
+        cloned[index] = .{
+            .id = try allocator.dupe(u8, tool_call.id),
+            .name = try allocator.dupe(u8, tool_call.name),
+            .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        };
+    }
+
+    return cloned;
+}
+
+fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) void {
+    for (tool_calls) |tool_call| {
+        allocator.free(tool_call.id);
+        allocator.free(tool_call.name);
+        deinitJsonValue(allocator, tool_call.arguments);
+    }
+    allocator.free(tool_calls);
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |v| .{ .bool = v },
+        .integer => |v| .{ .integer = v },
+        .float => |v| .{ .float = v },
+        .number_string => |v| .{ .number_string = try allocator.dupe(u8, v) },
+        .string => |v| .{ .string = try allocator.dupe(u8, v) },
+        .array => |array| blk: {
+            var cloned_array = std.json.Array.init(allocator);
+            errdefer {
+                for (cloned_array.items) |item| deinitJsonValue(allocator, item);
+                cloned_array.deinit();
+            }
+            for (array.items) |item| {
+                try cloned_array.append(try cloneJsonValue(allocator, item));
+            }
+            break :blk .{ .array = cloned_array };
+        },
+        .object => |object| blk: {
+            var cloned_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+            errdefer {
+                var iterator = cloned_object.iterator();
+                while (iterator.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    deinitJsonValue(allocator, entry.value_ptr.*);
+                }
+                cloned_object.deinit(allocator);
+            }
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                try cloned_object.put(
+                    allocator,
+                    try allocator.dupe(u8, entry.key_ptr.*),
+                    try cloneJsonValue(allocator, entry.value_ptr.*),
+                );
+            }
+            break :blk .{ .object = cloned_object };
+        },
+    };
+}
+
+fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .null, .bool, .integer, .float => {},
+        .number_string => |v| allocator.free(v),
+        .string => |v| allocator.free(v),
+        .array => |array| {
+            for (array.items) |item| deinitJsonValue(allocator, item);
+            var array_mut = array;
+            array_mut.deinit();
+        },
+        .object => |object| {
+            var map = object;
+            var iterator = map.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                deinitJsonValue(allocator, entry.value_ptr.*);
+            }
+            map.deinit(allocator);
+        },
+    }
 }
 
 fn defaultConvertToLlm(

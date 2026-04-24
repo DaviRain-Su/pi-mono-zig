@@ -8,12 +8,20 @@ const session_manager_mod = @import("session_manager.zig");
 const tools = @import("tools/root.zig");
 const common = @import("tools/common.zig");
 
-const ToolRuntime = struct {
+pub const ToolRuntime = struct {
     cwd: []const u8,
     io: std.Io,
 };
 
 var global_tool_runtime: ?ToolRuntime = null;
+
+pub fn setToolRuntime(runtime: ToolRuntime) void {
+    global_tool_runtime = runtime;
+}
+
+pub fn clearToolRuntime() void {
+    global_tool_runtime = null;
+}
 
 pub const RunInteractiveModeOptions = struct {
     cwd: []const u8,
@@ -543,11 +551,11 @@ pub fn runInteractiveMode(
     };
     defer current_provider.deinit(allocator);
 
-    global_tool_runtime = .{
+    setToolRuntime(.{
         .cwd = options.cwd,
         .io = io,
-    };
-    defer global_tool_runtime = null;
+    });
+    defer clearToolRuntime();
 
     var built_tools = try buildAgentTools(allocator, options.selected_tools);
     defer built_tools.deinit();
@@ -561,6 +569,7 @@ pub fn runInteractiveMode(
         session_dir,
         options,
         current_provider.model,
+        current_provider.api_key,
         built_tools.items,
     );
     defer session.deinit();
@@ -672,18 +681,18 @@ pub fn runInteractiveMode(
     return 0;
 }
 
-const BuiltTools = struct {
+pub const BuiltTools = struct {
     allocator: std.mem.Allocator,
     items: []agent.AgentTool,
 
-    fn deinit(self: *BuiltTools) void {
+    pub fn deinit(self: *BuiltTools) void {
         for (self.items) |item| common.deinitJsonValue(self.allocator, item.parameters);
         self.allocator.free(self.items);
         self.* = undefined;
     }
 };
 
-fn buildAgentTools(allocator: std.mem.Allocator, selected_tools: ?[]const []const u8) !BuiltTools {
+pub fn buildAgentTools(allocator: std.mem.Allocator, selected_tools: ?[]const []const u8) !BuiltTools {
     var items = std.ArrayList(agent.AgentTool).empty;
     errdefer {
         for (items.items) |item| common.deinitJsonValue(allocator, item.parameters);
@@ -741,12 +750,13 @@ fn handleAppAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
     try app_state.handleAgentEvent(event);
 }
 
-fn openInitialSession(
+pub fn openInitialSession(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_dir: []const u8,
     options: RunInteractiveModeOptions,
     model: ai.Model,
+    api_key: ?[]const u8,
     tool_items: []const agent.AgentTool,
 ) !session_mod.AgentSession {
     const thinking_level = options.thinking;
@@ -758,6 +768,7 @@ fn openInitialSession(
             .cwd_override = options.cwd,
             .system_prompt = options.system_prompt,
             .model = model,
+            .api_key = api_key,
             .thinking_level = thinking_level,
             .tools = tool_items,
         });
@@ -771,6 +782,7 @@ fn openInitialSession(
                 .cwd_override = options.cwd,
                 .system_prompt = options.system_prompt,
                 .model = model,
+                .api_key = api_key,
                 .thinking_level = thinking_level,
                 .tools = tool_items,
             });
@@ -781,6 +793,7 @@ fn openInitialSession(
         .cwd = options.cwd,
         .system_prompt = options.system_prompt,
         .model = model,
+        .api_key = api_key,
         .thinking_level = thinking_level,
         .session_dir = session_dir,
         .tools = tool_items,
@@ -954,7 +967,7 @@ fn switchSession(
         .cwd_override = options.cwd,
         .system_prompt = options.system_prompt,
         .tools = tool_items,
-            .thinking_level = options.thinking,
+        .thinking_level = options.thinking,
     });
     errdefer candidate.deinit();
 
@@ -973,6 +986,8 @@ fn switchSession(
         return;
     };
     errdefer candidate_provider.deinit(allocator);
+
+    candidate.setApiKey(candidate_provider.api_key);
 
     _ = session.agent.unsubscribe(subscriber);
     session.deinit();
@@ -1013,6 +1028,7 @@ fn switchModel(
     current_provider.deinit(allocator);
     current_provider.* = next_provider;
     try session.setModel(next_provider.model);
+    session.setApiKey(next_provider.api_key);
     try app_state.setFooter(next_provider.model.id, currentSessionLabel(session));
     try app_state.setStatus("idle");
 }
