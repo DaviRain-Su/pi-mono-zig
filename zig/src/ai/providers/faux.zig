@@ -162,6 +162,7 @@ const StreamPlanBlock = union(enum) {
 };
 
 const StreamPlan = struct {
+    io: std.Io,
     stream: *event_stream.AssistantMessageEventStream,
     blocks: []const StreamPlanBlock,
     final_message: types.AssistantMessage,
@@ -269,9 +270,10 @@ fn chunkDelayMs(chunk: []const u8, tokens_per_second: u32) u64 {
     return (@as(u64, tokens) * 1000 + tokens_per_second - 1) / tokens_per_second;
 }
 
-fn sleepForChunk(chunk: []const u8, tokens_per_second: u32) void {
-    _ = chunk;
-    _ = tokens_per_second;
+fn sleepForChunk(io: std.Io, chunk: []const u8, tokens_per_second: u32) void {
+    const delay_ms = chunkDelayMs(chunk, tokens_per_second);
+    if (delay_ms == 0) return;
+    std.Io.sleep(io, .fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
 }
 
 fn isAbortRequested(signal: ?*const std.atomic.Value(bool)) bool {
@@ -488,6 +490,7 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!
 }
 
 fn buildStreamPlan(
+    io: std.Io,
     state: *FauxProviderState,
     model: types.Model,
     context: types.Context,
@@ -571,6 +574,7 @@ fn buildStreamPlan(
 
     const plan = try allocator.create(StreamPlan);
     plan.* = .{
+        .io = io,
         .stream = stream_ptr,
         .blocks = blocks,
         .final_message = final_message,
@@ -600,7 +604,7 @@ fn emitChunks(
             minUsize(max_chars, maxUsize(min_chars, (plan.min_token_size + (chunk_index % (plan.max_token_size - plan.min_token_size + 1))) * 4));
         const end = @min(full_text.len, offset + span);
         const chunk = full_text[offset..end];
-        sleepForChunk(chunk, plan.tokens_per_second);
+        sleepForChunk(plan.io, chunk, plan.tokens_per_second);
         if (isAbortRequested(plan.signal)) return false;
         plan.stream.push(.{
             .event_type = event_type,
@@ -813,7 +817,7 @@ pub const FauxProvider = struct {
             },
         };
 
-        const plan = try buildStreamPlan(state, model, context, options, resolved, &stream_instance);
+        const plan = try buildStreamPlan(io, state, model, context, options, resolved, &stream_instance);
         runStreamPlan(plan);
         return stream_instance;
     }

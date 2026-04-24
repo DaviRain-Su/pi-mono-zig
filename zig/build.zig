@@ -16,6 +16,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const agent_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    agent_mod.addImport("ai", ai_mod);
+
+    mod.addImport("ai", ai_mod);
+    mod.addImport("agent", agent_mod);
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "pi",
@@ -40,13 +50,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_ai_tests = b.addRunArtifact(ai_tests);
     test_step.dependOn(&run_ai_tests.step);
-
-    const agent_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    agent_mod.addImport("ai", ai_mod);
 
     const agent_tests = b.addTest(.{
         .root_module = agent_mod,
@@ -74,12 +77,16 @@ pub fn build(b: *std.Build) void {
     const coding_agent_test_step = b.step("test-coding-agent", "Run coding-agent unit tests only");
     coding_agent_test_step.dependOn(&run_coding_agent_tests.step);
 
+    const main_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    main_test_mod.addImport("ai", ai_mod);
+    main_test_mod.addImport("agent", agent_mod);
+
     const main_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = main_test_mod,
     });
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
