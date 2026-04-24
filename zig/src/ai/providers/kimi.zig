@@ -646,6 +646,7 @@ fn appendTextDelta(
                     .event_type = .text_delta,
                     .content_index = @intCast(text.event_index),
                     .delta = try allocator.dupe(u8, delta),
+                    .owns_delta = true,
                 });
             },
             .thinking => |*thinking| {
@@ -654,6 +655,7 @@ fn appendTextDelta(
                     .event_type = .thinking_delta,
                     .content_index = @intCast(thinking.event_index),
                     .delta = try allocator.dupe(u8, delta),
+                    .owns_delta = true,
                 });
             },
             .tool_call => unreachable,

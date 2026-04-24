@@ -440,6 +440,7 @@ fn parseSseStreamLines(
                                     .event_type = .toolcall_delta,
                                     .content_index = @intCast(tool_call.event_index),
                                     .delta = try allocator.dupe(u8, arguments_delta),
+                                    .owns_delta = true,
                                 });
                             }
                         }
@@ -781,6 +782,7 @@ fn appendTextDelta(
                     .event_type = .text_delta,
                     .content_index = @intCast(text_block.event_index),
                     .delta = try allocator.dupe(u8, delta),
+                    .owns_delta = true,
                 });
             },
             .thinking => |*thinking_block| {
@@ -789,6 +791,7 @@ fn appendTextDelta(
                     .event_type = .thinking_delta,
                     .content_index = @intCast(thinking_block.event_index),
                     .delta = try allocator.dupe(u8, delta),
+                    .owns_delta = true,
                 });
             },
         }

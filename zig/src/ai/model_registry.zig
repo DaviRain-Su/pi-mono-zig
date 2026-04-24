@@ -333,6 +333,10 @@ pub fn getProviderConfig(provider: []const u8) ?ProviderConfig {
     return getDefault().getProviderConfig(provider);
 }
 
+pub fn builtInProviderConfigs() []const ProviderConfig {
+    return BUILT_IN_PROVIDER_CONFIGS[0..];
+}
+
 pub fn registerProvider(config: ProviderConfig) RegisterError!void {
     return getDefault().registerProvider(config);
 }

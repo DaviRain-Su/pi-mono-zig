@@ -1113,7 +1113,7 @@ fn handleContentBlockDelta(
         var entry = try ensureActiveTextBlock(allocator, active_blocks, stream_ptr, completed_count, bedrock_index, false);
         if (entry.block != .text) return BedrockError.InvalidBedrockChunk;
         try entry.block.text.appendSlice(allocator, text_value.string);
-        stream_ptr.push(.{ .event_type = .text_delta, .content_index = @intCast(entry.event_index), .delta = try allocator.dupe(u8, text_value.string) });
+        stream_ptr.push(.{ .event_type = .text_delta, .content_index = @intCast(entry.event_index), .delta = try allocator.dupe(u8, text_value.string), .owns_delta = true });
         return;
     }
 
@@ -1124,7 +1124,7 @@ fn handleContentBlockDelta(
         if (tool_use_value.object.get("input")) |input_value| {
             if (input_value != .string) return BedrockError.InvalidBedrockChunk;
             try entry.block.tool_call.partial_json.appendSlice(allocator, input_value.string);
-            stream_ptr.push(.{ .event_type = .toolcall_delta, .content_index = @intCast(entry.event_index), .delta = try allocator.dupe(u8, input_value.string) });
+            stream_ptr.push(.{ .event_type = .toolcall_delta, .content_index = @intCast(entry.event_index), .delta = try allocator.dupe(u8, input_value.string), .owns_delta = true });
         }
         return;
     }
@@ -1137,7 +1137,7 @@ fn handleContentBlockDelta(
         if (extractReasoningText(reasoning_value)) |text| {
             if (text.len > 0) {
                 try entry.block.thinking.text.appendSlice(allocator, text);
-                stream_ptr.push(.{ .event_type = .thinking_delta, .content_index = @intCast(entry.event_index), .delta = try allocator.dupe(u8, text) });
+                stream_ptr.push(.{ .event_type = .thinking_delta, .content_index = @intCast(entry.event_index), .delta = try allocator.dupe(u8, text), .owns_delta = true });
             }
         }
         if (extractReasoningSignature(reasoning_value)) |signature| {

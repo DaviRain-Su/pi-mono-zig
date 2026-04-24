@@ -456,6 +456,7 @@ const NativeTerminalBackend = struct {
     stdout_fd: std.posix.fd_t = 1,
     original_termios: ?std.posix.termios = null,
     cached_size: tui.Size = .{ .width = 80, .height = 24 },
+    resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     previous_sigwinch: ?std.posix.Sigaction = null,
     resize_signal_installed: bool = false,
     read_terminal_size_fn: *const fn (context: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size = readTerminalSizeWithIoctl,
@@ -478,6 +479,7 @@ const NativeTerminalBackend = struct {
         const raw = tui.terminal.makeRawMode(current);
         try std.posix.tcsetattr(self.stdin_fd, .NOW, raw);
         self.cached_size = self.readSize();
+        self.resize_pending.store(false, .seq_cst);
         self.installResizeHandler();
     }
 
@@ -501,7 +503,7 @@ const NativeTerminalBackend = struct {
 
     fn getSize(ptr: *anyopaque) !tui.Size {
         const self: *NativeTerminalBackend = @ptrCast(@alignCast(ptr));
-        self.cached_size = self.readSize();
+        self.refreshSizeIfPending();
         return self.cached_size;
     }
 
@@ -516,6 +518,11 @@ const NativeTerminalBackend = struct {
             .width = if (columns == 0) 80 else columns,
             .height = if (lines == 0) 24 else lines,
         };
+    }
+
+    fn refreshSizeIfPending(self: *NativeTerminalBackend) void {
+        if (!self.resize_pending.swap(false, .seq_cst)) return;
+        self.cached_size = self.readSize();
     }
 
     fn installResizeHandler(self: *NativeTerminalBackend) void {
@@ -562,7 +569,7 @@ fn handleSigwinch(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr:
     _ = ctx_ptr;
     if (sig != .WINCH) return;
     if (active_resize_backend) |backend| {
-        backend.cached_size = backend.readSize();
+        backend.resize_pending.store(true, .seq_cst);
     }
 }
 
@@ -2029,7 +2036,7 @@ test "native terminal backend falls back to environment variables when ioctl fai
     try std.testing.expectEqual(tui.Size{ .width = 132, .height = 43 }, backend.readSize());
 }
 
-test "SIGWINCH handler refreshes cached terminal size" {
+test "SIGWINCH handler only marks resize as pending" {
     const allocator = std.testing.allocator;
 
     const TestSizeReader = struct {
@@ -2062,5 +2069,44 @@ test "SIGWINCH handler refreshes cached terminal size" {
     var siginfo: std.posix.siginfo_t = undefined;
     handleSigwinch(.WINCH, &siginfo, null);
 
+    try std.testing.expect(backend.resize_pending.load(.seq_cst));
+    try std.testing.expectEqual(tui.Size{ .width = 80, .height = 24 }, backend.cached_size);
+}
+
+test "native terminal backend refreshes cached terminal size in main loop after SIGWINCH" {
+    const allocator = std.testing.allocator;
+
+    const TestSizeReader = struct {
+        size: tui.Size,
+
+        fn read(context: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size {
+            _ = fd;
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.size;
+        }
+    };
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var reader = TestSizeReader{
+        .size = .{ .width = 80, .height = 24 },
+    };
+    var backend = NativeTerminalBackend{
+        .env_map = &env_map,
+        .cached_size = .{ .width = 80, .height = 24 },
+        .read_terminal_size_fn = TestSizeReader.read,
+        .read_terminal_size_context = &reader,
+    };
+
+    active_resize_backend = &backend;
+    defer active_resize_backend = null;
+
+    reader.size = .{ .width = 101, .height = 33 };
+    var siginfo: std.posix.siginfo_t = undefined;
+    handleSigwinch(.WINCH, &siginfo, null);
+
+    backend.refreshSizeIfPending();
+    try std.testing.expect(!backend.resize_pending.load(.seq_cst));
     try std.testing.expectEqual(tui.Size{ .width = 101, .height = 33 }, backend.cached_size);
 }

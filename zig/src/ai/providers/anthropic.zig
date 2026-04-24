@@ -746,6 +746,7 @@ fn handleContentBlockDelta(
             .event_type = .text_delta,
             .content_index = @intCast(entry.event_index),
             .delta = try allocator.dupe(u8, text_value.string),
+            .owns_delta = true,
         });
         return;
     }
@@ -759,6 +760,7 @@ fn handleContentBlockDelta(
             .event_type = .thinking_delta,
             .content_index = @intCast(entry.event_index),
             .delta = try allocator.dupe(u8, thinking_value.string),
+            .owns_delta = true,
         });
         return;
     }
@@ -786,6 +788,7 @@ fn handleContentBlockDelta(
             .event_type = .toolcall_delta,
             .content_index = @intCast(entry.event_index),
             .delta = try allocator.dupe(u8, partial_json.string),
+            .owns_delta = true,
         });
         return;
     }

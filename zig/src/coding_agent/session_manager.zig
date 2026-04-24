@@ -149,6 +149,18 @@ pub const SessionManager = struct {
         session_file: []const u8,
         cwd_override: ?[]const u8,
     ) !SessionManager {
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+        return openWithWarningWriter(allocator, io, session_file, cwd_override, &stderr_writer.interface);
+    }
+
+    fn openWithWarningWriter(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        session_file: []const u8,
+        cwd_override: ?[]const u8,
+        warning_writer: ?*std.Io.Writer,
+    ) !SessionManager {
         const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, session_file, allocator, .unlimited);
         defer allocator.free(bytes);
 
@@ -175,10 +187,27 @@ pub const SessionManager = struct {
         };
         errdefer manager.deinit();
 
-        while (lines.next()) |line| {
+        var skipped_corrupted_lines: usize = 0;
+        var line_number: usize = 2;
+        while (lines.next()) |line| : (line_number += 1) {
             if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-            const entry = parseEntryLine(allocator, line) catch continue;
+            const entry = parseEntryLine(allocator, line) catch |err| {
+                skipped_corrupted_lines += 1;
+                if (warning_writer) |writer| {
+                    logCorruptedSessionLine(writer, session_file, line_number, err) catch {};
+                }
+                continue;
+            };
             try manager.appendLoadedEntry(entry);
+        }
+
+        if (skipped_corrupted_lines > 0 and warning_writer != null) {
+            logCorruptedSessionDataLoss(
+                warning_writer.?,
+                session_file,
+                skipped_corrupted_lines,
+            ) catch {};
+            warning_writer.?.flush() catch {};
         }
 
         return manager;
@@ -1047,6 +1076,33 @@ fn usageToJsonValue(allocator: std.mem.Allocator, usage: ai.Usage) !std.json.Val
     return .{ .object = object };
 }
 
+fn logCorruptedSessionLine(
+    writer: *std.Io.Writer,
+    session_file: []const u8,
+    line_number: usize,
+    err: anyerror,
+) !void {
+    try writer.print(
+        "Warning: skipped corrupted session line {d} in {s}: {s}\n",
+        .{ line_number, session_file, @errorName(err) },
+    );
+}
+
+fn logCorruptedSessionDataLoss(
+    writer: *std.Io.Writer,
+    session_file: []const u8,
+    skipped_corrupted_lines: usize,
+) !void {
+    try writer.print(
+        "Warning: loaded session {s} with {d} corrupted line{s} skipped; valid entries were preserved but some session data was lost.\n",
+        .{
+            session_file,
+            skipped_corrupted_lines,
+            if (skipped_corrupted_lines == 1) "" else "s",
+        },
+    );
+}
+
 fn parseHeaderLine(allocator: std.mem.Allocator, line: []const u8) !SessionHeader {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
@@ -1516,6 +1572,92 @@ test "session manager persists messages to jsonl and resumes from disk" {
     try std.testing.expectEqualStrings("world", context.messages[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings("faux", context.model.?.provider);
     try std.testing.expectEqualStrings("faux-session", context.model.?.model_id);
+}
+
+test "session manager logs corrupted lines while preserving valid entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project", session_dir);
+    defer manager.deinit();
+
+    var user = try userTextMessage(std.testing.allocator, "hello", 1);
+    defer deinitMessage(std.testing.allocator, &user);
+    _ = try manager.appendMessage(user);
+
+    var assistant = try assistantTextMessage(std.testing.allocator, "world", model, 2);
+    defer deinitMessage(std.testing.allocator, &assistant);
+    _ = try manager.appendMessage(assistant);
+
+    const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+
+    var rebuilt = std.ArrayList(u8).empty;
+    defer rebuilt.deinit(std.testing.allocator);
+
+    var lines = std.mem.splitScalar(u8, written, '\n');
+    const header_line = lines.next().?;
+    const user_line = lines.next().?;
+    const assistant_line = lines.next().?;
+
+    try rebuilt.appendSlice(std.testing.allocator, header_line);
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(std.testing.allocator, user_line);
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(std.testing.allocator, "{\"type\":\"corrupted\"}");
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(std.testing.allocator, assistant_line);
+    try rebuilt.append(std.testing.allocator, '\n');
+
+    try common.writeFileAbsolute(std.testing.io, session_file, rebuilt.items, true);
+
+    var warning_capture: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer warning_capture.deinit();
+
+    var reopened = try SessionManager.openWithWarningWriter(
+        std.testing.allocator,
+        std.testing.io,
+        session_file,
+        null,
+        &warning_capture.writer,
+    );
+    defer reopened.deinit();
+
+    var context = try reopened.buildSessionContext(std.testing.allocator);
+    defer context.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqualStrings("hello", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("world", context.messages[1].assistant.content[0].text.text);
+
+    const warnings = warning_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "line 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "UnsupportedSessionEntryType") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "data was lost") != null);
 }
 
 test "session manager supports branching and branch navigation" {

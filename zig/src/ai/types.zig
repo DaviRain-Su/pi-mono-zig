@@ -348,10 +348,17 @@ pub const AssistantMessageEvent = struct {
     event_type: EventType,
     content_index: ?u32 = null,
     delta: ?[]const u8 = null,
+    owns_delta: bool = false,
     content: ?[]const u8 = null,
     tool_call: ?ToolCall = null,
     message: ?AssistantMessage = null,
     error_message: ?[]const u8 = null,
+
+    pub fn deinitTransient(self: AssistantMessageEvent, allocator: std.mem.Allocator) void {
+        if (self.owns_delta) {
+            if (self.delta) |delta| allocator.free(delta);
+        }
+    }
 };
 
 test "Usage defaults" {

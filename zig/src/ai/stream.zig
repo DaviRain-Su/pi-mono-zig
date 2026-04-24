@@ -31,7 +31,9 @@ pub fn complete(
     var stream_instance = try stream(allocator, io, model, context, options);
     defer stream_instance.deinit();
 
-    while (stream_instance.next()) |_| {}
+    while (stream_instance.next()) |event| {
+        defer event.deinitTransient(allocator);
+    }
 
     return stream_instance.result() orelse EntryFunctionError.MissingCompletionResult;
 }
@@ -171,6 +173,54 @@ fn recordingStreamSimple(
 ) !event_stream.AssistantMessageEventStream {
     recording_state.stream_simple_calls += 1;
     return recordingStream(allocator, io, model, context, options);
+}
+
+fn ownedDeltaStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    _: types.Context,
+    _: ?types.StreamOptions,
+) !event_stream.AssistantMessageEventStream {
+    const result_allocator = std.heap.page_allocator;
+    const text = try result_allocator.dupe(u8, "owned delta complete");
+    const content = try result_allocator.alloc(types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = text } };
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    stream_instance.push(.{ .event_type = .start });
+    stream_instance.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream_instance.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = try allocator.dupe(u8, "owned "),
+        .owns_delta = true,
+    });
+    stream_instance.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = try allocator.dupe(u8, "delta "),
+        .owns_delta = true,
+    });
+    stream_instance.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = try allocator.dupe(u8, "complete"),
+        .owns_delta = true,
+    });
+    stream_instance.push(.{
+        .event_type = .done,
+        .message = .{
+            .content = content,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = types.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        },
+    });
+    return stream_instance;
 }
 
 test "stream routes to registered provider" {
@@ -389,6 +439,38 @@ test "complete returns final assistant message" {
     );
 
     try std.testing.expectEqualStrings("hello from complete", result.content[0].text.text);
+}
+
+test "complete frees owned streaming deltas after consumption" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "recording:test:owned-delta",
+        .stream = ownedDeltaStream,
+        .stream_simple = ownedDeltaStream,
+    });
+
+    const model = types.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:owned-delta",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    const result = try complete(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+
+    try std.testing.expectEqualStrings("owned delta complete", result.content[0].text.text);
 }
 
 test "completeSimple returns final assistant message from simple options" {

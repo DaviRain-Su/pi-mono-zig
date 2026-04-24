@@ -9,10 +9,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
         allocator: std.mem.Allocator,
         queue: std.ArrayList(T),
-        waiting: std.ArrayList(*IteratorResult),
         done: bool = false,
         final_result: ?R = null,
         mutex: std.Io.Mutex = .init,
+        condition: std.Io.Condition = .init,
         io: std.Io,
         is_complete_fn: *const fn (event: T) bool,
         extract_result_fn: *const fn (event: T) R,
@@ -32,7 +32,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .allocator = allocator,
                 .io = io,
                 .queue = std.ArrayList(T).empty,
-                .waiting = std.ArrayList(*IteratorResult).empty,
                 .done = false,
                 .final_result = null,
                 .is_complete_fn = is_complete,
@@ -42,7 +41,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
         pub fn deinit(self: *Self) void {
             self.queue.deinit(self.allocator);
-            self.waiting.deinit(self.allocator);
         }
 
         pub fn push(self: *Self, event: T) void {
@@ -56,13 +54,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 self.final_result = self.extract_result_fn(event);
             }
 
-            // Deliver to waiting consumer or queue it
-            if (self.waiting.items.len > 0) {
-                const waiter = self.waiting.orderedRemove(0);
-                waiter.* = .{ .value = event, .done = false };
-            } else {
-                self.queue.append(self.allocator, event) catch {};
-            }
+            self.queue.append(self.allocator, event) catch return;
+            self.condition.signal(self.io);
         }
 
         pub fn end(self: *Self, final_result: ?R) void {
@@ -74,40 +67,22 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 self.final_result = r;
             }
 
-            // Notify all waiting consumers that we're done
-            for (self.waiting.items) |waiter| {
-                waiter.* = .{ .value = null, .done = true };
-            }
-            self.waiting.clearRetainingCapacity();
+            self.condition.broadcast(self.io);
         }
 
         pub fn next(self: *Self) ?T {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            while (true) {
-                if (self.queue.items.len > 0) {
-                    return self.queue.orderedRemove(0);
-                } else if (self.done) {
-                    return null;
-                } else {
-                    // Wait for an event
-                    var iter_result: IteratorResult = .{ .value = null, .done = false };
-                    self.waiting.append(self.allocator, &iter_result) catch {
-                        return null;
-                    };
-                    self.mutex.unlock(self.io);
-                    // Busy wait for result
-                    while (!iter_result.done and iter_result.value == null) {
-                        std.Thread.yield() catch {};
-                    }
-                    self.mutex.lockUncancelable(self.io);
-                    self.waiting.clearRetainingCapacity();
-
-                    if (iter_result.done) return null;
-                    if (iter_result.value) |value| return value;
-                }
+            while (self.queue.items.len == 0 and !self.done) {
+                self.condition.waitUncancelable(self.io, &self.mutex);
             }
+
+            if (self.queue.items.len > 0) {
+                return self.queue.orderedRemove(0);
+            }
+
+            return null;
         }
 
         pub fn result(self: *Self) ?R {
@@ -239,4 +214,89 @@ test "EventStream end without events" {
     try std.testing.expect(stream.next() == null);
     const result = stream.result().?;
     try std.testing.expectEqualStrings("gpt-4", result.model);
+}
+
+test "EventStream next blocks until producer pushes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var stream = AssistantMessageEventStream.init(
+        allocator,
+        io,
+        isCompleteEvent,
+        extractResult,
+    );
+    defer stream.deinit();
+
+    const TestContext = struct {
+        stream: *AssistantMessageEventStream,
+
+        fn producer(ctx: *@This()) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
+            ctx.stream.push(.{ .event_type = .start });
+        }
+    };
+
+    var ctx = TestContext{ .stream = &stream };
+    const producer_thread = try std.Thread.spawn(.{}, TestContext.producer, .{&ctx});
+    defer producer_thread.join();
+
+    const started_at = std.Io.Clock.awake.now(io);
+    const event = stream.next().?;
+    const elapsed_ns = started_at.durationTo(std.Io.Clock.awake.now(io)).nanoseconds;
+
+    try std.testing.expectEqual(types.EventType.start, event.event_type);
+    try std.testing.expect(elapsed_ns >= 20 * std.time.ns_per_ms);
+}
+
+test "EventStream supports single-producer single-consumer concurrency" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const IntStream = EventStream(u32, u32);
+    const intIsComplete = struct {
+        fn f(_: u32) bool {
+            return false;
+        }
+    }.f;
+    const intExtractResult = struct {
+        fn f(event: u32) u32 {
+            return event;
+        }
+    }.f;
+
+    var stream = IntStream.init(
+        allocator,
+        io,
+        intIsComplete,
+        intExtractResult,
+    );
+    defer stream.deinit();
+
+    const TestContext = struct {
+        stream: *IntStream,
+        count: u32,
+
+        fn producer(ctx: *@This()) void {
+            for (0..ctx.count) |index| {
+                ctx.stream.push(@intCast(index));
+            }
+            ctx.stream.end(null);
+        }
+    };
+
+    var ctx = TestContext{
+        .stream = &stream,
+        .count = 128,
+    };
+
+    const producer_thread = try std.Thread.spawn(.{}, TestContext.producer, .{&ctx});
+    defer producer_thread.join();
+
+    var expected: u32 = 0;
+    while (stream.next()) |value| {
+        try std.testing.expectEqual(expected, value);
+        expected += 1;
+    }
+
+    try std.testing.expectEqual(ctx.count, expected);
 }

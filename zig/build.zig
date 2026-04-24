@@ -1,8 +1,28 @@
 const std = @import("std");
 
+const RequiredExternalTool = struct {
+    names: []const []const u8,
+    display_name: []const u8,
+    reason: []const u8,
+};
+
+const required_external_tools = [_]RequiredExternalTool{
+    .{
+        .names = &[_][]const u8{"rg"},
+        .display_name = "ripgrep (rg)",
+        .reason = "required by the coding-agent grep tool",
+    },
+    .{
+        .names = &[_][]const u8{"fd"},
+        .display_name = "fd",
+        .reason = "required by the coding-agent find tool",
+    },
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const external_tool_check_step = addExternalToolCheckStep(b);
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -39,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     b.installArtifact(exe);
+    b.getInstallStep().dependOn(external_tool_check_step);
 
     // Run command
     const run_cmd = b.addRunArtifact(exe);
@@ -47,10 +68,12 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
     const run_step = b.step("run", "Run the app");
+    run_step.dependOn(external_tool_check_step);
     run_step.dependOn(&run_cmd.step);
 
     // Tests
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(external_tool_check_step);
 
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
@@ -65,6 +88,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_agent_tests.step);
 
     const agent_test_step = b.step("test-agent", "Run agent unit tests only");
+    agent_test_step.dependOn(external_tool_check_step);
     agent_test_step.dependOn(&run_agent_tests.step);
 
     const coding_agent_mod = b.createModule(.{
@@ -83,6 +107,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_coding_agent_tests.step);
 
     const coding_agent_test_step = b.step("test-coding-agent", "Run coding-agent unit tests only");
+    coding_agent_test_step.dependOn(external_tool_check_step);
     coding_agent_test_step.dependOn(&run_coding_agent_tests.step);
 
     const main_test_mod = b.createModule(.{
@@ -107,5 +132,36 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tui_tests.step);
 
     const tui_test_step = b.step("test-tui", "Run TUI unit tests only");
+    tui_test_step.dependOn(external_tool_check_step);
     tui_test_step.dependOn(&run_tui_tests.step);
+}
+
+fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
+    const step = b.step(
+        "check-external-tools",
+        "Verify required external CLI tools are available in PATH",
+    );
+
+    var missing_tools = std.ArrayList([]const u8).empty;
+    defer missing_tools.deinit(b.allocator);
+
+    for (required_external_tools) |tool| {
+        _ = b.findProgram(tool.names, &.{}) catch |err| switch (err) {
+            error.FileNotFound => missing_tools.append(
+                b.allocator,
+                b.fmt("- {s}: {s}", .{ tool.display_name, tool.reason }),
+            ) catch @panic("OOM"),
+        };
+    }
+
+    if (missing_tools.items.len > 0) {
+        const missing_summary = std.mem.join(b.allocator, "\n", missing_tools.items) catch @panic("OOM");
+        const fail_step = b.addFail(b.fmt(
+            "Missing required external tools:\n{s}\n\nInstall them and ensure they are on PATH before running `zig build` or `zig build test`.\nHomebrew: `brew install ripgrep fd`.",
+            .{missing_summary},
+        ));
+        step.dependOn(&fail_step.step);
+    }
+
+    return step;
 }
