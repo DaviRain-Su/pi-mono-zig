@@ -4,6 +4,7 @@ pub const keys = @import("keys.zig");
 pub const terminal = @import("terminal.zig");
 pub const tui = @import("tui.zig");
 pub const components = struct {
+    pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
     pub const box = @import("components/box.zig");
     pub const editor = @import("components/editor.zig");
@@ -49,6 +50,7 @@ test {
     _ = @import("keys.zig");
     _ = @import("terminal.zig");
     _ = @import("tui.zig");
+    _ = @import("components/autocomplete.zig");
     _ = @import("components/text.zig");
     _ = @import("components/box.zig");
     _ = @import("components/editor.zig");
@@ -58,4 +60,9 @@ test {
     _ = @import("components/select_list.zig");
     _ = @import("components/spacer.zig");
     _ = @import("components/truncated_text.zig");
+}
+
+test "components export autocomplete module" {
+    _ = components.autocomplete;
+    _ = components.autocomplete.Item;
 }
