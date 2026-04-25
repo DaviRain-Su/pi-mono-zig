@@ -55,6 +55,33 @@ pub const ThinkingLevel = enum {
     xhigh,
 };
 
+pub const AnthropicEffort = enum {
+    low,
+    medium,
+    high,
+    xhigh,
+    max,
+};
+
+pub const AnthropicThinkingDisplay = enum {
+    summarized,
+    omitted,
+};
+
+pub const ThinkingBudgets = struct {
+    minimal: u32 = 1024,
+    low: u32 = 2048,
+    medium: u32 = 8192,
+    high: u32 = 16384,
+};
+
+pub const AnthropicToolChoice = union(enum) {
+    auto,
+    any,
+    none,
+    tool: []const u8,
+};
+
 pub const CacheRetention = enum {
     none,
     short,
@@ -278,6 +305,18 @@ pub const StreamOptions = struct {
     google_tool_choice: ?[]const u8 = null,
     /// Google provider thinking configuration.
     google_thinking: ?GoogleThinkingOptions = null,
+    /// Anthropic provider extended thinking enabled/disabled override.
+    anthropic_thinking_enabled: ?bool = null,
+    /// Anthropic provider token budget for non-adaptive thinking models.
+    anthropic_thinking_budget_tokens: ?u32 = null,
+    /// Anthropic provider thinking display mode.
+    anthropic_thinking_display: ?AnthropicThinkingDisplay = null,
+    /// Anthropic provider adaptive thinking effort.
+    anthropic_effort: ?AnthropicEffort = null,
+    /// Anthropic provider interleaved thinking beta toggle.
+    anthropic_interleaved_thinking: ?bool = null,
+    /// Anthropic provider tool choice override.
+    anthropic_tool_choice: ?AnthropicToolChoice = null,
     /// Responses API reasoning effort level.
     responses_reasoning_effort: ?ThinkingLevel = null,
     /// Mistral prompt mode, e.g. "reasoning".
@@ -300,7 +339,7 @@ pub const SimpleStreamOptions = struct {
     metadata: ?std.json.Value = null,
     signal: ?*const std.atomic.Value(bool) = null,
     reasoning: ?ThinkingLevel = null,
-    thinking_budgets: ?std.json.Value = null,
+    thinking_budgets: ?ThinkingBudgets = null,
     google_tool_choice: ?[]const u8 = null,
     google_thinking: ?GoogleThinkingOptions = null,
     mistral_prompt_mode: ?[]const u8 = null,
@@ -323,6 +362,12 @@ pub const SimpleStreamOptions = struct {
             .signal = self.signal,
             .google_tool_choice = self.google_tool_choice,
             .google_thinking = self.google_thinking,
+            .anthropic_thinking_enabled = null,
+            .anthropic_thinking_budget_tokens = null,
+            .anthropic_thinking_display = null,
+            .anthropic_effort = null,
+            .anthropic_interleaved_thinking = null,
+            .anthropic_tool_choice = null,
             .responses_reasoning_effort = null,
             .mistral_prompt_mode = self.mistral_prompt_mode,
             .mistral_reasoning_effort = self.mistral_reasoning_effort,
