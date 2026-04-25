@@ -55,6 +55,10 @@ pub const AvailableModel = struct {
     model_id: []const u8,
     display_name: []const u8,
     available: bool,
+    reasoning: bool,
+    supports_images: bool,
+    context_window: u32,
+    max_tokens: u32,
 };
 
 pub fn resolveProviderConfig(
@@ -97,22 +101,26 @@ pub fn listAvailableModels(
     env_map: *const std.process.Environ.Map,
     current_model: ?ai.Model,
 ) ![]AvailableModel {
+    const summaries = try ai.model_registry.listSummaries(allocator);
+    defer allocator.free(summaries);
+
     var models = std.ArrayList(AvailableModel).empty;
     errdefer models.deinit(allocator);
 
-    for (ai.model_registry.builtInProviderConfigs()) |descriptor| {
-        const model_id = descriptor.default_model_id orelse continue;
-        const available = try hasProviderCredentials(allocator, env_map, descriptor.provider);
-        const display_name = if (ai.model_registry.find(descriptor.provider, model_id)) |model|
-            model.name
-        else
-            model_id;
-
+    for (summaries) |summary| {
         try models.append(allocator, .{
-            .provider = descriptor.provider,
-            .model_id = model_id,
-            .display_name = display_name,
-            .available = available,
+            .provider = summary.provider,
+            .model_id = summary.id,
+            .display_name = summary.name,
+            .available = if (current_model) |model|
+                modelMatchesReference(model, summary.provider, summary.id) or
+                    try hasProviderCredentials(allocator, env_map, summary.provider)
+            else
+                try hasProviderCredentials(allocator, env_map, summary.provider),
+            .reasoning = summary.reasoning,
+            .supports_images = hasInputType(summary.input_types, "image"),
+            .context_window = summary.context_window,
+            .max_tokens = summary.max_tokens,
         });
     }
 
@@ -130,11 +138,38 @@ pub fn listAvailableModels(
                 .model_id = model.id,
                 .display_name = model.name,
                 .available = true,
+                .reasoning = model.reasoning,
+                .supports_images = hasInputType(model.input_types, "image"),
+                .context_window = model.context_window,
+                .max_tokens = model.max_tokens,
             });
         }
     }
 
+    std.mem.sort(AvailableModel, models.items, {}, lessThanAvailableModel);
     return try models.toOwnedSlice(allocator);
+}
+
+pub fn filterAvailableModels(
+    allocator: std.mem.Allocator,
+    available: []const AvailableModel,
+    patterns: []const []const u8,
+) ![]AvailableModel {
+    if (patterns.len == 0) return allocator.dupe(AvailableModel, available);
+
+    var filtered = std.ArrayList(AvailableModel).empty;
+    errdefer filtered.deinit(allocator);
+
+    for (available) |entry| {
+        for (patterns) |pattern| {
+            if (availableModelMatchesPattern(entry, pattern)) {
+                try filtered.append(allocator, entry);
+                break;
+            }
+        }
+    }
+
+    return try filtered.toOwnedSlice(allocator);
 }
 
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
@@ -155,6 +190,117 @@ fn shouldForceFauxProvider(env_map: *const std.process.Environ.Map, provider: []
         std.mem.eql(u8, value, "true") or
         std.mem.eql(u8, value, "*") or
         std.mem.eql(u8, value, provider);
+}
+
+fn lessThanAvailableModel(_: void, lhs: AvailableModel, rhs: AvailableModel) bool {
+    const provider_order = std.ascii.orderIgnoreCase(lhs.provider, rhs.provider);
+    if (provider_order != .eq) return provider_order == .lt;
+    return std.ascii.orderIgnoreCase(lhs.model_id, rhs.model_id) == .lt;
+}
+
+fn hasInputType(input_types: []const []const u8, expected: []const u8) bool {
+    for (input_types) |input_type| {
+        if (std.ascii.eqlIgnoreCase(input_type, expected)) return true;
+    }
+    return false;
+}
+
+fn modelMatchesReference(model: ai.Model, provider: []const u8, model_id: []const u8) bool {
+    return std.mem.eql(u8, model.provider, provider) and std.mem.eql(u8, model.id, model_id);
+}
+
+fn availableModelMatchesPattern(entry: AvailableModel, raw_pattern: []const u8) bool {
+    const pattern = normalizeModelPattern(raw_pattern);
+    if (pattern.len == 0) return false;
+
+    if (std.mem.indexOfScalar(u8, pattern, '/')) |slash_index| {
+        const provider_pattern = std.mem.trim(u8, pattern[0..slash_index], &std.ascii.whitespace);
+        const model_pattern = std.mem.trim(u8, pattern[slash_index + 1 ..], &std.ascii.whitespace);
+        if (provider_pattern.len == 0 or model_pattern.len == 0) return false;
+
+        return fieldMatches(entry.provider, provider_pattern, true) and
+            (fieldMatches(entry.model_id, model_pattern, false) or
+                fieldMatches(entry.display_name, model_pattern, false));
+    }
+
+    return fieldMatches(entry.model_id, pattern, false) or
+        fieldMatches(entry.display_name, pattern, false) or
+        fieldMatches(entry.provider, pattern, false);
+}
+
+fn normalizeModelPattern(raw_pattern: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw_pattern, &std.ascii.whitespace);
+    const colon_index = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return trimmed;
+    const suffix = trimmed[colon_index + 1 ..];
+    if (isThinkingLevelSuffix(suffix)) return trimmed[0..colon_index];
+    return trimmed;
+}
+
+fn isThinkingLevelSuffix(value: []const u8) bool {
+    return std.mem.eql(u8, value, "off") or
+        std.mem.eql(u8, value, "minimal") or
+        std.mem.eql(u8, value, "low") or
+        std.mem.eql(u8, value, "medium") or
+        std.mem.eql(u8, value, "high") or
+        std.mem.eql(u8, value, "xhigh");
+}
+
+fn fieldMatches(field: []const u8, pattern: []const u8, exact_when_plain: bool) bool {
+    if (pattern.len == 0) return false;
+    if (hasWildcard(pattern)) return wildcardMatchIgnoreCase(pattern, field);
+    if (exact_when_plain) return std.ascii.eqlIgnoreCase(field, pattern);
+    return containsIgnoreCase(field, pattern);
+}
+
+fn hasWildcard(pattern: []const u8) bool {
+    return std.mem.indexOfAny(u8, pattern, "*?[") != null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn wildcardMatchIgnoreCase(pattern: []const u8, text: []const u8) bool {
+    return wildcardMatchIgnoreCaseRecursive(pattern, text, 0, 0);
+}
+
+fn wildcardMatchIgnoreCaseRecursive(pattern: []const u8, text: []const u8, pattern_index: usize, text_index: usize) bool {
+    var p = pattern_index;
+    var t = text_index;
+
+    while (p < pattern.len) : (p += 1) {
+        switch (pattern[p]) {
+            '*' => {
+                var next_pattern = p + 1;
+                while (next_pattern < pattern.len and pattern[next_pattern] == '*') : (next_pattern += 1) {}
+                if (next_pattern == pattern.len) return true;
+
+                var candidate = t;
+                while (candidate <= text.len) : (candidate += 1) {
+                    if (wildcardMatchIgnoreCaseRecursive(pattern, text, next_pattern, candidate)) return true;
+                }
+                return false;
+            },
+            '?' => {
+                if (t >= text.len) return false;
+                t += 1;
+            },
+            else => {
+                if (t >= text.len) return false;
+                if (!std.ascii.eqlIgnoreCase(pattern[p .. p + 1], text[t .. t + 1])) return false;
+                t += 1;
+            },
+        }
+    }
+
+    return t == text.len;
 }
 
 fn resolveFauxProvider(
@@ -462,28 +608,31 @@ test "listAvailableModels enumerates all built-in providers" {
     var found_openai = false;
     var found_anthropic = false;
     var found_google = false;
-    var found_vertex = false;
-    var found_bedrock = false;
+    var found_openrouter = false;
     var found_faux = false;
+    var openai_count: usize = 0;
 
     for (models) |entry| {
         if (std.mem.eql(u8, entry.provider, "openai")) {
             found_openai = true;
-            try std.testing.expectEqualStrings("gpt-5.4", entry.model_id);
-            try std.testing.expectEqualStrings("GPT-5.4", entry.display_name);
-            try std.testing.expect(!entry.available);
+            openai_count += 1;
+            if (std.mem.eql(u8, entry.model_id, "gpt-5.4")) {
+                try std.testing.expectEqualStrings("GPT-5.4", entry.display_name);
+                try std.testing.expect(!entry.available);
+                try std.testing.expect(entry.supports_images);
+            }
         } else if (std.mem.eql(u8, entry.provider, "anthropic")) {
             found_anthropic = true;
-            try std.testing.expectEqualStrings("claude-opus-4-7", entry.model_id);
+            if (std.mem.eql(u8, entry.model_id, "claude-opus-4-7")) {
+                try std.testing.expect(entry.reasoning);
+            }
         } else if (std.mem.eql(u8, entry.provider, "google")) {
             found_google = true;
-            try std.testing.expectEqualStrings("gemini-3.1-pro-preview", entry.model_id);
-        } else if (std.mem.eql(u8, entry.provider, "google-vertex")) {
-            found_vertex = true;
-            try std.testing.expect(!entry.available);
-        } else if (std.mem.eql(u8, entry.provider, "amazon-bedrock")) {
-            found_bedrock = true;
-            try std.testing.expect(!entry.available);
+        } else if (std.mem.eql(u8, entry.provider, "openrouter")) {
+            found_openrouter = true;
+            if (std.mem.eql(u8, entry.model_id, "qwen/qwen3-coder:exacto")) {
+                try std.testing.expect(!entry.supports_images);
+            }
         } else if (std.mem.eql(u8, entry.provider, "faux")) {
             found_faux = true;
             try std.testing.expect(entry.available);
@@ -493,8 +642,36 @@ test "listAvailableModels enumerates all built-in providers" {
     try std.testing.expect(found_openai);
     try std.testing.expect(found_anthropic);
     try std.testing.expect(found_google);
-    try std.testing.expect(found_vertex);
-    try std.testing.expect(found_bedrock);
+    try std.testing.expect(found_openrouter);
     try std.testing.expect(found_faux);
-    try std.testing.expect(models.len >= 7);
+    try std.testing.expect(openai_count >= 3);
+    try std.testing.expect(models.len >= 20);
+}
+
+test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patterns" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const available = try listAvailableModels(allocator, &env_map, ai.model_registry.find("faux", "faux-1").?);
+    defer allocator.free(available);
+
+    const anthropic_only = try filterAvailableModels(allocator, available, &.{"anthropic/sonnet"});
+    defer allocator.free(anthropic_only);
+    try std.testing.expectEqual(@as(usize, 2), anthropic_only.len);
+    for (anthropic_only) |entry| {
+        try std.testing.expectEqualStrings("anthropic", entry.provider);
+        try std.testing.expect(containsIgnoreCase(entry.model_id, "sonnet"));
+    }
+
+    const globbed = try filterAvailableModels(allocator, available, &.{"openrouter/*exacto"});
+    defer allocator.free(globbed);
+    try std.testing.expectEqual(@as(usize, 1), globbed.len);
+    try std.testing.expectEqualStrings("openrouter", globbed[0].provider);
+    try std.testing.expectEqualStrings("qwen/qwen3-coder:exacto", globbed[0].model_id);
+
+    const with_thinking = try filterAvailableModels(allocator, available, &.{"claude-sonnet:high"});
+    defer allocator.free(with_thinking);
+    try std.testing.expectEqual(@as(usize, 2), with_thinking.len);
 }

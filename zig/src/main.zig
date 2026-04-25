@@ -79,6 +79,10 @@ pub fn runCli(
         return 0;
     }
 
+    if (options.list_models) {
+        return try printModelList(allocator, io, env_map, options.list_models_search, stdout);
+    }
+
     if (options.fork != null and
         (options.session != null or options.@"continue" or options.@"resume" or options.no_session))
     {
@@ -151,6 +155,7 @@ pub fn runCli(
                 .@"resume" = options.@"resume",
                 .fork = options.fork,
                 .no_session = options.no_session,
+                .model_patterns = options.models,
                 .selected_tools = selected_tools,
                 .initial_prompt = null,
                 .prompt_templates = prepared.resource_bundle.prompt_templates,
@@ -208,6 +213,7 @@ pub fn runCli(
             .@"resume" = options.@"resume",
             .fork = options.fork,
             .no_session = options.no_session,
+            .model_patterns = options.models,
             .selected_tools = selected_tools,
             .initial_prompt = prepared.expanded_prompt,
             .prompt_templates = prepared.resource_bundle.prompt_templates,
@@ -248,6 +254,119 @@ fn printVersion(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
     try stdout.writeAll(text);
 }
 
+fn printModelList(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    search: ?[]const u8,
+    stdout: *std.Io.Writer,
+) !u8 {
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, ".");
+    defer runtime_config.deinit();
+
+    const available = try coding_agent.provider_config.listAvailableModels(allocator, env_map, null);
+    defer allocator.free(available);
+
+    const filtered = if (search) |pattern|
+        try coding_agent.provider_config.filterAvailableModels(allocator, available, &.{pattern})
+    else
+        try allocator.dupe(coding_agent.provider_config.AvailableModel, available);
+    defer allocator.free(filtered);
+
+    if (filtered.len == 0) {
+        if (search) |pattern| {
+            try stdout.print("No models matching \"{s}\"\n", .{pattern});
+        } else {
+            try stdout.writeAll("No models available\n");
+        }
+        return 0;
+    }
+
+    const Row = struct {
+        provider: []const u8,
+        model: []const u8,
+        context: []u8,
+        max_out: []u8,
+        thinking: []const u8,
+        images: []const u8,
+    };
+
+    const rows = try allocator.alloc(Row, filtered.len);
+    defer {
+        for (rows) |row| {
+            allocator.free(row.context);
+            allocator.free(row.max_out);
+        }
+        allocator.free(rows);
+    }
+
+    var provider_width = "provider".len;
+    var model_width = "model".len;
+    var context_width = "context".len;
+    var max_out_width = "max-out".len;
+    var thinking_width = "thinking".len;
+    var images_width = "images".len;
+
+    for (filtered, 0..) |entry, index| {
+        const context = try formatTokenCount(allocator, entry.context_window);
+        errdefer allocator.free(context);
+        const max_out = try formatTokenCount(allocator, entry.max_tokens);
+        errdefer allocator.free(max_out);
+
+        rows[index] = .{
+            .provider = entry.provider,
+            .model = entry.model_id,
+            .context = context,
+            .max_out = max_out,
+            .thinking = if (entry.reasoning) "yes" else "no",
+            .images = if (entry.supports_images) "yes" else "no",
+        };
+
+        provider_width = @max(provider_width, rows[index].provider.len);
+        model_width = @max(model_width, rows[index].model.len);
+        context_width = @max(context_width, rows[index].context.len);
+        max_out_width = @max(max_out_width, rows[index].max_out.len);
+        thinking_width = @max(thinking_width, rows[index].thinking.len);
+        images_width = @max(images_width, rows[index].images.len);
+    }
+
+    try writeTableRow(
+        stdout,
+        "provider",
+        provider_width,
+        "model",
+        model_width,
+        "context",
+        context_width,
+        "max-out",
+        max_out_width,
+        "thinking",
+        thinking_width,
+        "images",
+        images_width,
+    );
+
+    for (rows) |row| {
+        try writeTableRow(
+            stdout,
+            row.provider,
+            provider_width,
+            row.model,
+            model_width,
+            row.context,
+            context_width,
+            row.max_out,
+            max_out_width,
+            row.thinking,
+            thinking_width,
+            row.images,
+            images_width,
+        );
+    }
+
+    return 0;
+}
+
 fn currentDateString(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     const now_seconds: u64 = @intCast(@divFloor(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = now_seconds };
@@ -260,6 +379,90 @@ fn currentDateString(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
         "{d:0>4}-{d:0>2}-{d:0>2}",
         .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 },
     );
+}
+
+fn writeTableRow(
+    stdout: *std.Io.Writer,
+    provider: []const u8,
+    provider_width: usize,
+    model: []const u8,
+    model_width: usize,
+    context: []const u8,
+    context_width: usize,
+    max_out: []const u8,
+    max_out_width: usize,
+    thinking: []const u8,
+    thinking_width: usize,
+    images: []const u8,
+    images_width: usize,
+) !void {
+    try writePadded(stdout, provider, provider_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, model, model_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, context, context_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, max_out, max_out_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, thinking, thinking_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, images, images_width);
+    try stdout.writeByte('\n');
+}
+
+fn writePadded(stdout: *std.Io.Writer, value: []const u8, width: usize) !void {
+    try stdout.writeAll(value);
+    if (width <= value.len) return;
+
+    var remaining = width - value.len;
+    var spaces: [32]u8 = [_]u8{' '} ** 32;
+    while (remaining > 0) {
+        const chunk = @min(remaining, spaces.len);
+        try stdout.writeAll(spaces[0..chunk]);
+        remaining -= chunk;
+    }
+}
+
+fn formatTokenCount(allocator: std.mem.Allocator, count: u32) ![]u8 {
+    if (count >= 1_000_000) {
+        if (count % 1_000_000 == 0) {
+            return std.fmt.allocPrint(allocator, "{d}M", .{count / 1_000_000});
+        }
+
+        const tenths = @divFloor((@as(u64, count) * 10) + 500_000, 1_000_000);
+        if (tenths % 10 == 0) {
+            return std.fmt.allocPrint(allocator, "{d}M", .{@as(u32, @intCast(tenths / 10))});
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "{d}.{d}M",
+            .{
+                @as(u32, @intCast(tenths / 10)),
+                @as(u32, @intCast(tenths % 10)),
+            },
+        );
+    }
+
+    if (count >= 1_000) {
+        if (count % 1_000 == 0) {
+            return std.fmt.allocPrint(allocator, "{d}K", .{count / 1_000});
+        }
+
+        const tenths = @divFloor((@as(u64, count) * 10) + 500, 1_000);
+        if (tenths % 10 == 0) {
+            return std.fmt.allocPrint(allocator, "{d}K", .{@as(u32, @intCast(tenths / 10))});
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "{d}.{d}K",
+            .{
+                @as(u32, @intCast(tenths / 10)),
+                @as(u32, @intCast(tenths % 10)),
+            },
+        );
+    }
+
+    return std.fmt.allocPrint(allocator, "{d}", .{count});
 }
 
 fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
@@ -310,7 +513,10 @@ fn prepareCliRuntime(
     });
     errdefer allocator.free(system_prompt);
 
-    const session_dir = try runtime_config.effectiveSessionDir(allocator, env_map, cwd);
+    const session_dir = if (options.session_dir) |value|
+        try config_mod.expandPath(allocator, env_map, value, cwd)
+    else
+        try runtime_config.effectiveSessionDir(allocator, env_map, cwd);
     errdefer allocator.free(session_dir);
 
     const expanded_prompt = if (options.prompt) |prompt|
@@ -464,11 +670,42 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--resume, -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--session <id|path>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--fork <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--session-dir <dir>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
+}
+
+test "runCli lists models and applies optional search" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--list-models", "sonnet" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "claude-sonnet-4-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "gpt-5.4") == null);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
 test "runCli prints faux response end to end" {
@@ -735,6 +972,44 @@ test "runCli no-session keeps runs ephemeral" {
     const session_file = try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir);
     defer if (session_file) |path| allocator.free(path);
     try std.testing.expect(session_file == null);
+}
+
+test "runCli stores sessions in overridden session directory" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-session-dir");
+    defer allocator.free(cwd);
+    const overridden_session_dir = try makeTmpPath(allocator, tmp, "custom-sessions");
+    defer allocator.free(overridden_session_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "stored in custom session dir");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--session-dir", overridden_session_dir, "--print", "hello" },
+        cwd,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("stored in custom session dir\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, overridden_session_dir)).?;
+    defer allocator.free(session_file);
+    try std.testing.expect(std.mem.startsWith(u8, session_file, overridden_session_dir));
 }
 
 test "runCli fork creates a new session from an existing session id" {
