@@ -262,6 +262,7 @@ pub const HttpClient = struct {
     }
 
     pub fn request(self: *HttpClient, req: HttpRequest) !HttpResponse {
+        const uri = std.Uri.parse(req.url) catch return HttpError.InvalidUrl;
         const method: std.http.Method = switch (req.method) {
             .GET => .GET,
             .POST => .POST,
@@ -289,12 +290,14 @@ pub const HttpClient = struct {
         defer response_writer.deinit();
 
         const result = try self.client.fetch(.{
-            .location = .{ .url = req.url },
+            .location = .{ .uri = uri },
             .method = method,
             .payload = req.body,
             .extra_headers = extra_headers.items,
             .response_writer = &response_writer.writer,
         });
+
+        if (httpStatusError(result.status)) |err| return err;
 
         const body_copy = try self.allocator.dupe(u8, response_writer.written());
 
@@ -415,6 +418,16 @@ pub const HttpClient = struct {
         return streaming;
     }
 };
+
+fn httpStatusError(status: std.http.Status) ?HttpError {
+    return switch (status.class()) {
+        .success => null,
+        .redirect => HttpError.UnexpectedRedirect,
+        .client_error => HttpError.ClientError,
+        .server_error => HttpError.ServerError,
+        else => null,
+    };
+}
 
 test "HttpClient init/deinit" {
     var client = try HttpClient.init(std.testing.allocator, std.testing.io);
@@ -556,15 +569,30 @@ test "StreamingResponse single line no newline" {
 const TestStreamingServer = struct {
     io: std.Io,
     server: std.Io.net.Server,
+    status_code: u16,
+    reason_phrase: []const u8,
     first_chunk: []const u8,
     second_chunk: []const u8,
     delay_ms: u64,
     thread: ?std.Thread = null,
 
     fn init(io: std.Io, first_chunk: []const u8, second_chunk: []const u8, delay_ms: u64) !TestStreamingServer {
+        return initWithStatus(io, 200, "OK", first_chunk, second_chunk, delay_ms);
+    }
+
+    fn initWithStatus(
+        io: std.Io,
+        status_code: u16,
+        reason_phrase: []const u8,
+        first_chunk: []const u8,
+        second_chunk: []const u8,
+        delay_ms: u64,
+    ) !TestStreamingServer {
         return .{
             .io = io,
             .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .status_code = status_code,
+            .reason_phrase = reason_phrase,
             .first_chunk = first_chunk,
             .second_chunk = second_chunk,
             .delay_ms = delay_ms,
@@ -630,8 +658,8 @@ const TestStreamingServer = struct {
         const total_len = self.first_chunk.len + self.second_chunk.len;
 
         try writer.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{total_len},
+            "HTTP/1.1 {d} {s}\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{ self.status_code, self.reason_phrase, total_len },
         );
         try writer.interface.flush();
 
@@ -650,6 +678,101 @@ const TestStreamingServer = struct {
         }
     }
 };
+
+test "request returns connection refused for unreachable endpoint" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var listener = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+    const port = listener.socket.address.getPort();
+    listener.deinit(io);
+
+    var client = try HttpClient.init(allocator, io);
+    defer client.deinit();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/missing", .{port});
+    defer allocator.free(url);
+
+    const response = client.request(.{
+        .method = .GET,
+        .url = url,
+    });
+
+    try std.testing.expectError(HttpError.ConnectionRefused, response);
+}
+
+test "request returns client error for 4xx responses" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try TestStreamingServer.initWithStatus(io, 404, "Not Found", "missing", "", 0);
+    defer server.deinit();
+    try server.start();
+
+    var client = try HttpClient.init(allocator, io);
+    defer client.deinit();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const response = client.request(.{
+        .method = .GET,
+        .url = url,
+    });
+
+    try std.testing.expectError(HttpError.ClientError, response);
+}
+
+test "request returns server error for 5xx responses" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try TestStreamingServer.initWithStatus(io, 503, "Service Unavailable", "down", "", 0);
+    defer server.deinit();
+    try server.start();
+
+    var client = try HttpClient.init(allocator, io);
+    defer client.deinit();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const response = client.request(.{
+        .method = .GET,
+        .url = url,
+    });
+
+    try std.testing.expectError(HttpError.ServerError, response);
+}
+
+test "requestStreaming times out before the first line arrives" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try TestStreamingServer.init(io, "", "data: delayed\n", 500);
+    defer server.deinit();
+    try server.start();
+
+    var client = try HttpClient.init(allocator, io);
+    defer client.deinit();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var streaming = try client.requestStreaming(.{
+        .method = .GET,
+        .url = url,
+        .timeout_ms = 100,
+    });
+    defer streaming.deinit();
+
+    const start_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    const line = streaming.readLine();
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, io).nanoseconds - start_ns, std.time.ns_per_ms);
+
+    try std.testing.expectError(HttpError.Timeout, line);
+    try std.testing.expect(elapsed_ms < server.delay_ms);
+}
 
 test "requestStreaming returns before full response body is available" {
     const allocator = std.testing.allocator;
