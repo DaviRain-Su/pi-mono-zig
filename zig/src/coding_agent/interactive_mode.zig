@@ -4082,26 +4082,32 @@ fn dispatchInputEvent(
     live_resources: *LiveResources,
 ) !void {
     switch (parsed.event) {
-        .key => |key| try handleInputKey(
-            allocator,
-            io,
-            env_map,
-            key,
-            session,
-            current_provider,
-            session_dir,
-            options,
-            tool_items,
-            app_state,
-            editor,
-            overlay,
-            auth_flow,
-            prompt_worker,
-            prompt_worker_active,
-            subscriber,
-            should_exit,
-            live_resources,
-        ),
+        .key => |key| {
+            if (parsed.event_type == .release) {
+                consumeInputBytes(input_buffer, parsed.consumed);
+                return;
+            }
+            try handleInputKey(
+                allocator,
+                io,
+                env_map,
+                key,
+                session,
+                current_provider,
+                session_dir,
+                options,
+                tool_items,
+                app_state,
+                editor,
+                overlay,
+                auth_flow,
+                prompt_worker,
+                prompt_worker_active,
+                subscriber,
+                should_exit,
+                live_resources,
+            );
+        },
         .paste => |content| {
             if (overlay.* != null) {
                 consumeInputBytes(input_buffer, parsed.consumed);
@@ -4109,6 +4115,7 @@ fn dispatchInputEvent(
             }
             _ = try editor.handlePaste(content);
         },
+        .protocol => {},
     }
     consumeInputBytes(input_buffer, parsed.consumed);
 }
@@ -4864,11 +4871,11 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(backend.restored);
     try std.testing.expectEqualStrings(
-        tui.Terminal.ALT_SCREEN_ENABLE ++ tui.Terminal.BRACKETED_PASTE_ENABLE ++ tui.Terminal.HIDE_CURSOR,
+        tui.Terminal.ALT_SCREEN_ENABLE ++ tui.Terminal.BRACKETED_PASTE_ENABLE ++ tui.Terminal.HIDE_CURSOR ++ tui.Terminal.KITTY_KEYBOARD_QUERY ++ tui.Terminal.KITTY_KEYBOARD_ENABLE,
         backend.writes.items[0],
     );
     try std.testing.expectEqualStrings(
-        tui.Terminal.ALT_SCREEN_DISABLE ++ tui.Terminal.BRACKETED_PASTE_DISABLE ++ tui.Terminal.SHOW_CURSOR,
+        tui.Terminal.ALT_SCREEN_DISABLE ++ tui.Terminal.BRACKETED_PASTE_DISABLE ++ tui.Terminal.KITTY_KEYBOARD_DISABLE ++ tui.Terminal.SHOW_CURSOR,
         backend.writes.items[backend.writes.items.len - 1],
     );
     try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));

@@ -54,19 +54,56 @@ pub const Key = union(enum) {
     unknown_escape,
 };
 
+pub const KeyModifiers = packed struct(u8) {
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    super: bool = false,
+    _reserved: u4 = 0,
+
+    pub fn hasAny(self: KeyModifiers) bool {
+        return self.shift or self.alt or self.ctrl or self.super;
+    }
+
+    pub fn fromCsiModifierParameter(parameter: u16) KeyModifiers {
+        const bits = if (parameter > 0) parameter - 1 else 0;
+        return .{
+            .shift = (bits & 1) != 0,
+            .alt = (bits & 2) != 0,
+            .ctrl = (bits & 4) != 0,
+            .super = (bits & 8) != 0,
+        };
+    }
+};
+
+pub const KeyEventType = enum {
+    press,
+    repeat,
+    release,
+};
+
 pub const ParsedKey = struct {
     key: Key,
     consumed: usize,
+    modifiers: KeyModifiers = .{},
+    event_type: KeyEventType = .press,
+};
+
+pub const ProtocolEvent = union(enum) {
+    kitty_keyboard: u16,
 };
 
 pub const InputEvent = union(enum) {
     key: Key,
     paste: []const u8,
+    protocol: ProtocolEvent,
 };
 
 pub const ParsedInput = struct {
     event: InputEvent,
     consumed: usize,
+    modifiers: KeyModifiers = .{},
+    event_type: KeyEventType = .press,
 };
 
 pub const ParseResult = union(enum) {
@@ -86,6 +123,17 @@ const ParseMode = enum {
 
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+const KITTY_PROTOCOL_RESPONSE_PREFIX = "\x1b[?";
+
+var kitty_protocol_active = false;
+
+pub fn setKittyProtocolActive(active: bool) void {
+    kitty_protocol_active = active;
+}
+
+pub fn isKittyProtocolActive() bool {
+    return kitty_protocol_active;
+}
 
 pub fn parseInputEvent(input: []const u8) ?InputParseResult {
     return parseInputEventWithMode(input, .buffering);
@@ -140,6 +188,10 @@ fn parseKeyWithMode(input: []const u8, mode: ParseMode) ?ParseResult {
 fn parseInputEventWithMode(input: []const u8, mode: ParseMode) ?InputParseResult {
     if (input.len == 0) return null;
 
+    if (parseKittyProtocolResponse(input, mode)) |protocol_result| {
+        return protocol_result;
+    }
+
     if (matchesBracketedPastePrefix(input)) {
         return .need_more_bytes;
     }
@@ -162,6 +214,8 @@ fn parseInputEventWithMode(input: []const u8, mode: ParseMode) ?InputParseResult
             .parsed = .{
                 .event = .{ .key = parsed_key.key },
                 .consumed = parsed_key.consumed,
+                .modifiers = parsed_key.modifiers,
+                .event_type = parsed_key.event_type,
             },
         },
         .need_more_bytes => .need_more_bytes,
@@ -172,11 +226,45 @@ fn matchesBracketedPastePrefix(input: []const u8) bool {
     return input.len < BRACKETED_PASTE_START.len and std.mem.startsWith(u8, BRACKETED_PASTE_START, input);
 }
 
+fn parseKittyProtocolResponse(input: []const u8, mode: ParseMode) ?InputParseResult {
+    if (!std.mem.startsWith(u8, input, KITTY_PROTOCOL_RESPONSE_PREFIX)) return null;
+
+    const sequence_len = findCsiSequenceLength(input) orelse {
+        return switch (mode) {
+            .buffering => .need_more_bytes,
+            .flush => null,
+        };
+    };
+
+    const sequence = input[0..sequence_len];
+    if (sequence[sequence.len - 1] != 'u') return null;
+    if (sequence.len <= KITTY_PROTOCOL_RESPONSE_PREFIX.len + 1) return null;
+
+    for (sequence[KITTY_PROTOCOL_RESPONSE_PREFIX.len .. sequence.len - 1]) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+    }
+
+    const flags = std.fmt.parseInt(u16, sequence[KITTY_PROTOCOL_RESPONSE_PREFIX.len .. sequence.len - 1], 10) catch return null;
+    setKittyProtocolActive(true);
+    return .{
+        .parsed = .{
+            .event = .{ .protocol = .{ .kitty_keyboard = flags } },
+            .consumed = sequence.len,
+        },
+    };
+}
+
 fn parsed(key: Key, consumed: usize) ParseResult {
+    return parsedWithDetails(key, consumed, .{}, .press);
+}
+
+fn parsedWithDetails(key: Key, consumed: usize, modifiers: KeyModifiers, event_type: KeyEventType) ParseResult {
     return .{
         .parsed = .{
             .key = key,
             .consumed = consumed,
+            .modifiers = modifiers,
+            .event_type = event_type,
         },
     };
 }
@@ -217,6 +305,10 @@ fn findCsiSequenceLength(input: []const u8) ?usize {
 }
 
 fn parseCompleteCsiSequence(sequence: []const u8) ParseResult {
+    if (parseKittyCsiUSequence(sequence)) |result| return result;
+    if (parseModifyOtherKeysSequence(sequence)) |result| return result;
+    if (parseParameterizedSpecialSequence(sequence)) |result| return result;
+
     if (std.mem.eql(u8, sequence, "\x1b[A")) return parsed(.up, sequence.len);
     if (std.mem.eql(u8, sequence, "\x1b[B")) return parsed(.down, sequence.len);
     if (std.mem.eql(u8, sequence, "\x1b[C")) return parsed(.right, sequence.len);
@@ -249,6 +341,245 @@ fn parseCompleteCsiSequence(sequence: []const u8) ParseResult {
     if (std.mem.eql(u8, sequence, "\x1b[23~")) return parsed(.f11, sequence.len);
     if (std.mem.eql(u8, sequence, "\x1b[24~")) return parsed(.f12, sequence.len);
     return parsed(.unknown_escape, sequence.len);
+}
+
+const ParsedNumber = struct {
+    value: u32,
+    end: usize,
+};
+
+fn parseUnsignedDecimal(input: []const u8, start: usize) ?ParsedNumber {
+    if (start >= input.len or !std.ascii.isDigit(input[start])) return null;
+
+    var end = start;
+    while (end < input.len and std.ascii.isDigit(input[end])) : (end += 1) {}
+
+    const value = std.fmt.parseInt(u32, input[start..end], 10) catch return null;
+    return .{ .value = value, .end = end };
+}
+
+fn parseEventType(value: u32) KeyEventType {
+    return switch (value) {
+        2 => .repeat,
+        3 => .release,
+        else => .press,
+    };
+}
+
+fn parseKittyCsiUSequence(sequence: []const u8) ?ParseResult {
+    if (sequence.len < 4 or sequence[sequence.len - 1] != 'u') return null;
+    if (!std.mem.startsWith(u8, sequence, "\x1b[")) return null;
+    if (sequence[2] == '?') return null;
+
+    var index: usize = 2;
+    const codepoint = parseUnsignedDecimal(sequence, index) orelse return null;
+    index = codepoint.end;
+
+    var shifted_codepoint: ?u32 = null;
+    if (index < sequence.len and sequence[index] == ':') {
+        index += 1;
+        if (parseUnsignedDecimal(sequence, index)) |shifted| {
+            shifted_codepoint = shifted.value;
+            index = shifted.end;
+        }
+
+        if (index < sequence.len and sequence[index] == ':') {
+            index += 1;
+            if (parseUnsignedDecimal(sequence, index)) |base_layout| {
+                index = base_layout.end;
+            }
+        }
+    }
+
+    var modifier_parameter: u16 = 1;
+    var event_type: KeyEventType = .press;
+    if (index < sequence.len and sequence[index] == ';') {
+        const modifier = parseUnsignedDecimal(sequence, index + 1) orelse return null;
+        modifier_parameter = std.math.cast(u16, modifier.value) orelse return null;
+        index = modifier.end;
+
+        if (index < sequence.len and sequence[index] == ':') {
+            const event_value = parseUnsignedDecimal(sequence, index + 1) orelse return null;
+            event_type = parseEventType(event_value.value);
+            index = event_value.end;
+        }
+    }
+
+    if (index != sequence.len - 1) return null;
+    return buildParsedKeyFromCodepoint(
+        codepoint.value,
+        shifted_codepoint,
+        KeyModifiers.fromCsiModifierParameter(modifier_parameter),
+        event_type,
+        sequence.len,
+    );
+}
+
+fn parseModifyOtherKeysSequence(sequence: []const u8) ?ParseResult {
+    if (sequence.len < 8 or sequence[sequence.len - 1] != '~') return null;
+    if (!std.mem.startsWith(u8, sequence, "\x1b[27;")) return null;
+
+    var index: usize = 5;
+    const modifier = parseUnsignedDecimal(sequence, index) orelse return null;
+    index = modifier.end;
+    if (index >= sequence.len or sequence[index] != ';') return null;
+
+    const codepoint = parseUnsignedDecimal(sequence, index + 1) orelse return null;
+    index = codepoint.end;
+    if (index != sequence.len - 1) return null;
+
+    return buildParsedKeyFromCodepoint(
+        codepoint.value,
+        null,
+        KeyModifiers.fromCsiModifierParameter(std.math.cast(u16, modifier.value) orelse return null),
+        .press,
+        sequence.len,
+    );
+}
+
+fn parseParameterizedSpecialSequence(sequence: []const u8) ?ParseResult {
+    if (!std.mem.startsWith(u8, sequence, "\x1b[")) return null;
+
+    const final = sequence[sequence.len - 1];
+    if (final != 'A' and final != 'B' and final != 'C' and final != 'D' and final != 'H' and final != 'F' and final != '~')
+        return null;
+
+    var index: usize = 2;
+    const first = parseUnsignedDecimal(sequence, index) orelse return null;
+    index = first.end;
+    if (index >= sequence.len or sequence[index] != ';') return null;
+
+    const modifier = parseUnsignedDecimal(sequence, index + 1) orelse return null;
+    index = modifier.end;
+
+    var event_type: KeyEventType = .press;
+    if (index < sequence.len - 1 and sequence[index] == ':') {
+        const event_value = parseUnsignedDecimal(sequence, index + 1) orelse return null;
+        event_type = parseEventType(event_value.value);
+        index = event_value.end;
+    }
+
+    if (index != sequence.len - 1) return null;
+
+    const modifiers = KeyModifiers.fromCsiModifierParameter(std.math.cast(u16, modifier.value) orelse return null);
+    const key: Key = switch (final) {
+        'A' => .up,
+        'B' => .down,
+        'C' => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_right else .right,
+        'D' => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_left else .left,
+        'H' => .home,
+        'F' => .end,
+        '~' => switch (first.value) {
+            2 => .insert,
+            3 => .delete,
+            5 => .page_up,
+            6 => .page_down,
+            7 => .home,
+            8 => .end,
+            11 => .f1,
+            12 => .f2,
+            13 => .f3,
+            14 => .f4,
+            15 => .f5,
+            17 => .f6,
+            18 => .f7,
+            19 => .f8,
+            20 => .f9,
+            21 => .f10,
+            23 => .f11,
+            24 => .f12,
+            else => return null,
+        },
+        else => return null,
+    };
+
+    return parsedWithDetails(key, sequence.len, modifiers, event_type);
+}
+
+fn buildParsedKeyFromCodepoint(
+    codepoint: u32,
+    shifted_codepoint: ?u32,
+    modifiers: KeyModifiers,
+    event_type: KeyEventType,
+    consumed: usize,
+) ?ParseResult {
+    const effective_codepoint = normalizeFunctionalCodepoint(if (modifiers.shift and shifted_codepoint != null) shifted_codepoint.? else codepoint);
+
+    const key: Key = switch (effective_codepoint) {
+        9 => if (modifiers.shift and !modifiers.alt and !modifiers.ctrl and !modifiers.super) .shift_tab else .tab,
+        13, 57414 => .enter,
+        27 => .escape,
+        127 => .backspace,
+        57399...57413, 57415, 57416 => printableKeyFromCodepoint(effective_codepoint) orelse return null,
+        57417 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_left else .left,
+        57418 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_right else .right,
+        57419 => .up,
+        57420 => .down,
+        57421 => .page_up,
+        57422 => .page_down,
+        57423 => .home,
+        57424 => .end,
+        57425 => .insert,
+        57426 => .delete,
+        else => keyFromCodepoint(effective_codepoint, modifiers) orelse return null,
+    };
+
+    return parsedWithDetails(key, consumed, modifiers, event_type);
+}
+
+fn keyFromCodepoint(codepoint: u32, modifiers: KeyModifiers) ?Key {
+    switch (codepoint) {
+        9 => return .tab,
+        13 => return .enter,
+        27 => return .escape,
+        127 => return .backspace,
+        32 => return .{ .printable = PrintableKey.fromSlice(" ") },
+        else => {},
+    }
+
+    if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super and isAsciiCtrlMappable(codepoint)) {
+        return .{ .ctrl = asciiCtrlValue(codepoint) };
+    }
+
+    return printableKeyFromCodepoint(codepoint);
+}
+
+fn printableKeyFromCodepoint(codepoint: u32) ?Key {
+    var utf8: [4]u8 = undefined;
+    const scalar = std.math.cast(u21, codepoint) orelse return null;
+    const length = std.unicode.utf8Encode(scalar, &utf8) catch return null;
+    return .{ .printable = PrintableKey.fromSlice(utf8[0..length]) };
+}
+
+fn isAsciiCtrlMappable(codepoint: u32) bool {
+    return (codepoint >= 'a' and codepoint <= 'z') or (codepoint >= 'A' and codepoint <= 'Z');
+}
+
+fn asciiCtrlValue(codepoint: u32) u8 {
+    return @intCast(std.ascii.toLower(@as(u8, @intCast(codepoint))));
+}
+
+fn normalizeFunctionalCodepoint(codepoint: u32) u32 {
+    return switch (codepoint) {
+        57399 => '0',
+        57400 => '1',
+        57401 => '2',
+        57402 => '3',
+        57403 => '4',
+        57404 => '5',
+        57405 => '6',
+        57406 => '7',
+        57407 => '8',
+        57408 => '9',
+        57409 => '.',
+        57410 => '/',
+        57411 => '*',
+        57412 => '-',
+        57413 => '+',
+        57415 => '=',
+        57416 => ',',
+        else => codepoint,
+    };
 }
 
 fn parseSs3Sequence(input: []const u8, mode: ParseMode) ParseResult {
@@ -344,8 +675,20 @@ test "flushKey keeps incomplete UTF-8 buffered until the sequence is complete" {
 test "parse home end function and bracketed paste sequences" {
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .home, .consumed = 3 } }, parseKey("\x1bOH").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .end, .consumed = 3 } }, parseKey("\x1bOF").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_left, .consumed = 6 } }, parseKey("\x1b[1;5D").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_right, .consumed = 6 } }, parseKey("\x1b[1;5C").?);
+    try std.testing.expectEqualDeep(ParseResult{
+        .parsed = .{
+            .key = .ctrl_left,
+            .consumed = 6,
+            .modifiers = .{ .ctrl = true },
+        },
+    }, parseKey("\x1b[1;5D").?);
+    try std.testing.expectEqualDeep(ParseResult{
+        .parsed = .{
+            .key = .ctrl_right,
+            .consumed = 6,
+            .modifiers = .{ .ctrl = true },
+        },
+    }, parseKey("\x1b[1;5C").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_left, .consumed = 3 } }, parseKey("\x1bOd").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_right, .consumed = 3 } }, parseKey("\x1bOc").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .page_up, .consumed = 4 } }, parseKey("\x1b[5~").?);
@@ -396,4 +739,63 @@ test "parseInputEvent assembles split UTF-8 codepoints across reads" {
         .key => |key| try std.testing.expectEqualDeep(Key{ .printable = PrintableKey.fromSlice("🙂") }, key),
         else => return error.UnexpectedPaste,
     }
+}
+
+test "parse kitty protocol response as a control event" {
+    setKittyProtocolActive(false);
+    defer setKittyProtocolActive(false);
+
+    const result = parseInputEvent("\x1b[?31u").?;
+    try std.testing.expect(result == .parsed);
+    try std.testing.expect(isKittyProtocolActive());
+    try std.testing.expectEqual(@as(usize, 6), result.parsed.consumed);
+
+    switch (result.parsed.event) {
+        .protocol => |protocol| switch (protocol) {
+            .kitty_keyboard => |flags| try std.testing.expectEqual(@as(u16, 31), flags),
+        },
+        else => return error.ExpectedProtocolEvent,
+    }
+}
+
+test "parse kitty CSI-u modifiers and release events" {
+    const result = parseKey("\x1b[1;5:3D").?;
+    try std.testing.expectEqualDeep(ParseResult{
+        .parsed = .{
+            .key = .ctrl_left,
+            .consumed = 8,
+            .modifiers = .{ .ctrl = true },
+            .event_type = .release,
+        },
+    }, result);
+}
+
+test "parse kitty CSI-u printable keys with shifted alternate codepoints" {
+    const result = parseKey("\x1b[97:65;2u").?;
+    try std.testing.expectEqualDeep(ParseResult{
+        .parsed = .{
+            .key = .{ .printable = PrintableKey.fromSlice("A") },
+            .consumed = 10,
+            .modifiers = .{ .shift = true },
+        },
+    }, result);
+}
+
+test "parse modifyOtherKeys and kitty special-key modifiers" {
+    try std.testing.expectEqualDeep(ParseResult{
+        .parsed = .{
+            .key = .enter,
+            .consumed = 10,
+            .modifiers = .{ .alt = true },
+        },
+    }, parseKey("\x1b[27;3;13~").?);
+
+    try std.testing.expectEqualDeep(ParseResult{
+        .parsed = .{
+            .key = .page_up,
+            .consumed = 8,
+            .modifiers = .{ .super = true },
+            .event_type = .repeat,
+        },
+    }, parseKey("\x1b[5;9:2~").?);
 }
