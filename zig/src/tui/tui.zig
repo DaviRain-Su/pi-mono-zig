@@ -22,6 +22,19 @@ pub const OverlayMargin = struct {
     left: usize = 0,
 };
 
+pub const OverlayAnimationKind = enum {
+    none,
+    slide_from_top,
+    slide_from_bottom,
+    slide_from_left,
+    slide_from_right,
+};
+
+pub const OverlayAnimation = struct {
+    kind: OverlayAnimationKind = .none,
+    progress: f32 = 1.0,
+};
+
 pub const OverlayOptions = struct {
     width: ?usize = null,
     max_height: ?usize = null,
@@ -31,6 +44,7 @@ pub const OverlayOptions = struct {
     row: ?usize = null,
     col: ?usize = null,
     margin: OverlayMargin = .{},
+    animation: OverlayAnimation = .{},
 };
 
 pub const Renderer = struct {
@@ -78,6 +92,16 @@ pub const Renderer = struct {
         if (self.overlays.items.len == 0) return false;
         _ = self.overlays.pop();
         return true;
+    }
+
+    pub fn updateOverlay(self: *Renderer, id: usize, component: component_mod.Component, options: OverlayOptions) bool {
+        for (self.overlays.items) |*entry| {
+            if (entry.id != id) continue;
+            entry.component = component;
+            entry.options = options;
+            return true;
+        }
+        return false;
     }
 
     pub fn hasOverlays(self: *const Renderer) bool {
@@ -243,8 +267,18 @@ fn resolveOverlayLayout(
     const base_row = options.row orelse anchor_row;
 
     return .{
-        .row = clampPosition(base_row, options.offset_y, margin.top, max_row),
-        .col = clampPosition(base_col, options.offset_x, margin.left, max_col),
+        .row = animatedRow(
+            clampPosition(base_row, options.offset_y, margin.top, max_row),
+            margin.top,
+            max_row,
+            options.animation,
+        ),
+        .col = animatedCol(
+            clampPosition(base_col, options.offset_x, margin.left, max_col),
+            margin.left,
+            max_col,
+            options.animation,
+        ),
     };
 }
 
@@ -252,6 +286,35 @@ fn clampPosition(base: usize, offset: isize, min_value: usize, max_value: usize)
     const shifted = @as(isize, @intCast(base)) + offset;
     const clamped = std.math.clamp(shifted, @as(isize, @intCast(min_value)), @as(isize, @intCast(max_value)));
     return @intCast(clamped);
+}
+
+fn animatedRow(base_row: usize, min_row: usize, max_row: usize, animation: OverlayAnimation) usize {
+    const progress = animationProgress(animation.progress);
+    return switch (animation.kind) {
+        .slide_from_top => interpolatePosition(min_row, base_row, progress),
+        .slide_from_bottom => interpolatePosition(max_row, base_row, progress),
+        else => base_row,
+    };
+}
+
+fn animatedCol(base_col: usize, min_col: usize, max_col: usize, animation: OverlayAnimation) usize {
+    const progress = animationProgress(animation.progress);
+    return switch (animation.kind) {
+        .slide_from_left => interpolatePosition(min_col, base_col, progress),
+        .slide_from_right => interpolatePosition(max_col, base_col, progress),
+        else => base_col,
+    };
+}
+
+fn interpolatePosition(start: usize, end: usize, progress: f32) usize {
+    if (start == end) return end;
+    const distance = @as(f32, @floatFromInt(if (end >= start) end - start else start - end));
+    const delta = @as(usize, @intFromFloat(@round(distance * progress)));
+    return if (end >= start) start + delta else start - @min(start, delta);
+}
+
+fn animationProgress(progress: f32) f32 {
+    return std.math.clamp(progress, 0.0, 1.0);
 }
 
 fn compositeLineAt(
@@ -469,4 +532,55 @@ test "overlay layout is recalculated on terminal resize" {
 
     try std.testing.expectEqual(@as(usize, 6), renderer.previous_lines.items.len);
     try std.testing.expect(std.mem.startsWith(u8, renderer.previous_lines.items[2], "     \x1b[0mpick"));
+}
+
+test "overlay update replaces options for subsequent renders" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 12, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const base = TestStaticComponent{ .lines = &[_][]const u8{} };
+    const overlay = TestStaticComponent{ .lines = &[_][]const u8{"menu"} };
+    const overlay_id = try renderer.showOverlay(overlay.component(), .{ .width = 6, .anchor = .top_left });
+
+    try renderer.render(base.component());
+    try std.testing.expect(std.mem.startsWith(u8, renderer.previous_lines.items[0], "\x1b[0mmenu"));
+
+    try std.testing.expect(renderer.updateOverlay(overlay_id, overlay.component(), .{
+        .width = 6,
+        .anchor = .bottom_right,
+    }));
+    try renderer.render(base.component());
+    try std.testing.expect(std.mem.indexOf(u8, renderer.previous_lines.items[3], "menu") != null);
+}
+
+test "overlay animation slides from top before reaching its anchor" {
+    const size = terminal_mod.Size{ .width = 20, .height = 10 };
+    const start = resolveOverlayLayout(.{
+        .width = 8,
+        .anchor = .center,
+        .animation = .{ .kind = .slide_from_top, .progress = 0.0 },
+    }, 8, 3, size);
+    const mid = resolveOverlayLayout(.{
+        .width = 8,
+        .anchor = .center,
+        .animation = .{ .kind = .slide_from_top, .progress = 0.5 },
+    }, 8, 3, size);
+    const end = resolveOverlayLayout(.{
+        .width = 8,
+        .anchor = .center,
+        .animation = .{ .kind = .slide_from_top, .progress = 1.0 },
+    }, 8, 3, size);
+
+    try std.testing.expectEqual(@as(usize, 0), start.row);
+    try std.testing.expect(mid.row > start.row);
+    try std.testing.expectEqual(end.row, resolveOverlayLayout(.{ .width = 8, .anchor = .center }, 8, 3, size).row);
 }
