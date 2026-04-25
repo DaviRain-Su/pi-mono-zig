@@ -978,5 +978,70 @@ test "registerFauxProvider queues responses and estimates usage" {
     try std.testing.expectEqual(@as(usize, 3), registration.state.call_count);
 }
 
+test "registerFauxProvider aborts mid-stream and stops emitting events" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{
+        .tokens_per_second = 10,
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+
+    const long_text =
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+    const content = [_]FauxContentBlock{fauxText(long_text)};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(content[0..], .{}) },
+    });
+
+    const context = types.Context{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "stream slowly" } }},
+            .timestamp = 1,
+        } }},
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try std.Thread.spawn(.{}, struct {
+        fn run(signal: *std.atomic.Value(bool), io: std.Io) void {
+            std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+            signal.store(true, .seq_cst);
+        }
+    }.run, .{ &abort_signal, std.testing.io });
+    defer abort_thread.join();
+
+    var stream = try FauxProvider.stream(allocator, std.testing.io, registration.getModel(), context, .{
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    var event_types: std.ArrayList(types.EventType) = .empty;
+    defer event_types.deinit(allocator);
+    var streamed_text: std.ArrayList(u8) = .empty;
+    defer streamed_text.deinit(allocator);
+
+    while (stream.next()) |event| {
+        try event_types.append(allocator, event.event_type);
+        if (event.event_type == .text_delta) {
+            if (event.delta) |delta| try streamed_text.appendSlice(allocator, delta);
+        }
+    }
+
+    const expected_events = [_]types.EventType{
+        .start,
+        .text_start,
+        .text_delta,
+        .error_event,
+    };
+    try std.testing.expectEqualSlices(types.EventType, expected_events[0..], event_types.items);
+    try std.testing.expectEqualStrings("abcd", streamed_text.items);
+    try std.testing.expect(!std.mem.eql(u8, long_text, streamed_text.items));
+
+    const result = stream.result().?;
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", result.error_message.?);
+    try std.testing.expectEqual(@as(usize, 0), registration.getPendingResponseCount());
+    try std.testing.expectEqual(@as(usize, 1), registration.state.call_count);
+}
+
 // test "registerFauxProvider simulates prompt caching per session id" {
 // ...
