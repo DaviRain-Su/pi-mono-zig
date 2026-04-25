@@ -175,7 +175,7 @@ pub fn filterAvailableModels(
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
     return switch (err) {
         error.MissingApiKey => missingApiKeyMessage(provider),
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, google, google-gemini-cli, google-vertex, amazon-bedrock, openrouter, zai, faux.",
+        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, faux.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
         error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
@@ -487,17 +487,50 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "anthropic")) {
         return "API key required. Use --api-key or set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN.";
     }
+    if (std.mem.eql(u8, provider, "github-copilot")) {
+        return "API key required. Use --api-key or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.";
+    }
     if (std.mem.eql(u8, provider, "amazon-bedrock")) {
         return "Credentials required. Use --api-key or configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or another supported AWS auth source.";
     }
     if (std.mem.eql(u8, provider, "mistral")) {
         return "API key required. Use --api-key or set MISTRAL_API_KEY.";
     }
+    if (std.mem.eql(u8, provider, "groq")) {
+        return "API key required. Use --api-key or set GROQ_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "cerebras")) {
+        return "API key required. Use --api-key or set CEREBRAS_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "xai")) {
+        return "API key required. Use --api-key or set XAI_API_KEY.";
+    }
     if (std.mem.eql(u8, provider, "openrouter")) {
         return "API key required. Use --api-key or set OPENROUTER_API_KEY.";
     }
+    if (std.mem.eql(u8, provider, "vercel-ai-gateway")) {
+        return "API key required. Use --api-key or set AI_GATEWAY_API_KEY.";
+    }
     if (std.mem.eql(u8, provider, "zai")) {
         return "API key required. Use --api-key or set ZAI_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "minimax")) {
+        return "API key required. Use --api-key or set MINIMAX_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "minimax-cn")) {
+        return "API key required. Use --api-key or set MINIMAX_CN_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "huggingface")) {
+        return "API key required. Use --api-key or set HF_TOKEN.";
+    }
+    if (std.mem.eql(u8, provider, "fireworks")) {
+        return "API key required. Use --api-key or set FIREWORKS_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "opencode") or std.mem.eql(u8, provider, "opencode-go")) {
+        return "API key required. Use --api-key or set OPENCODE_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "kimi-coding")) {
+        return "API key required. Use --api-key or set KIMI_API_KEY.";
     }
     if (std.mem.eql(u8, provider, "kimi")) {
         return "API key required. Use --api-key or set KIMI_API_KEY.";
@@ -608,6 +641,12 @@ test "listAvailableModels enumerates all built-in providers" {
     var found_openai = false;
     var found_anthropic = false;
     var found_google = false;
+    var found_github_copilot = false;
+    var found_groq = false;
+    var found_cerebras = false;
+    var found_xai = false;
+    var found_fireworks = false;
+    var found_huggingface = false;
     var found_openrouter = false;
     var found_faux = false;
     var openai_count: usize = 0;
@@ -628,6 +667,22 @@ test "listAvailableModels enumerates all built-in providers" {
             }
         } else if (std.mem.eql(u8, entry.provider, "google")) {
             found_google = true;
+        } else if (std.mem.eql(u8, entry.provider, "github-copilot")) {
+            found_github_copilot = true;
+            if (std.mem.eql(u8, entry.model_id, "gpt-5.4")) {
+                try std.testing.expect(entry.supports_images);
+                try std.testing.expect(entry.reasoning);
+            }
+        } else if (std.mem.eql(u8, entry.provider, "groq")) {
+            found_groq = true;
+        } else if (std.mem.eql(u8, entry.provider, "cerebras")) {
+            found_cerebras = true;
+        } else if (std.mem.eql(u8, entry.provider, "xai")) {
+            found_xai = true;
+        } else if (std.mem.eql(u8, entry.provider, "fireworks")) {
+            found_fireworks = true;
+        } else if (std.mem.eql(u8, entry.provider, "huggingface")) {
+            found_huggingface = true;
         } else if (std.mem.eql(u8, entry.provider, "openrouter")) {
             found_openrouter = true;
             if (std.mem.eql(u8, entry.model_id, "qwen/qwen3-coder:exacto")) {
@@ -642,6 +697,12 @@ test "listAvailableModels enumerates all built-in providers" {
     try std.testing.expect(found_openai);
     try std.testing.expect(found_anthropic);
     try std.testing.expect(found_google);
+    try std.testing.expect(found_github_copilot);
+    try std.testing.expect(found_groq);
+    try std.testing.expect(found_cerebras);
+    try std.testing.expect(found_xai);
+    try std.testing.expect(found_fireworks);
+    try std.testing.expect(found_huggingface);
     try std.testing.expect(found_openrouter);
     try std.testing.expect(found_faux);
     try std.testing.expect(openai_count >= 3);

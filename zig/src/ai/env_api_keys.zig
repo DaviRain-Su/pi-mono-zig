@@ -105,6 +105,7 @@ fn resolveEnvVar(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "minimax")) return "MINIMAX_API_KEY";
     if (std.mem.eql(u8, provider, "minimax-cn")) return "MINIMAX_CN_API_KEY";
     if (std.mem.eql(u8, provider, "huggingface")) return "HF_TOKEN";
+    if (std.mem.eql(u8, provider, "fireworks")) return "FIREWORKS_API_KEY";
     if (std.mem.eql(u8, provider, "opencode")) return "OPENCODE_API_KEY";
     if (std.mem.eql(u8, provider, "opencode-go")) return "OPENCODE_API_KEY";
     if (std.mem.eql(u8, provider, "kimi")) return "KIMI_API_KEY";
@@ -131,6 +132,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
     try env_map.put("MINIMAX_API_KEY", "minimax-key");
     try env_map.put("MINIMAX_CN_API_KEY", "minimax-cn-key");
     try env_map.put("HF_TOKEN", "hf-key");
+    try env_map.put("FIREWORKS_API_KEY", "fireworks-key");
     try env_map.put("OPENCODE_API_KEY", "opencode-key");
     try env_map.put("KIMI_API_KEY", "kimi-key");
     try env_map.put("COPILOT_GITHUB_TOKEN", "copilot-token");
@@ -163,6 +165,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
         .{ .provider = "minimax", .expected = "minimax-key" },
         .{ .provider = "minimax-cn", .expected = "minimax-cn-key" },
         .{ .provider = "huggingface", .expected = "hf-key" },
+        .{ .provider = "fireworks", .expected = "fireworks-key" },
         .{ .provider = "opencode", .expected = "opencode-key" },
         .{ .provider = "opencode-go", .expected = "opencode-key" },
         .{ .provider = "kimi", .expected = "kimi-key" },
