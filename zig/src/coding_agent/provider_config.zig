@@ -478,8 +478,11 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "azure-openai-responses")) {
         return "API key required. Use --api-key or set AZURE_OPENAI_API_KEY.";
     }
-    if (std.mem.eql(u8, provider, "google") or std.mem.eql(u8, provider, "google-gemini-cli")) {
+    if (std.mem.eql(u8, provider, "google")) {
         return "API key required. Use --api-key or set GEMINI_API_KEY.";
+    }
+    if (std.mem.eql(u8, provider, "google-gemini-cli")) {
+        return "OAuth authentication required. Use /login to authenticate with Google Cloud Code Assist.";
     }
     if (std.mem.eql(u8, provider, "google-vertex")) {
         return "Credentials required. Use --api-key, set GOOGLE_CLOUD_API_KEY, or configure GOOGLE_APPLICATION_CREDENTIALS with GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION.";
@@ -707,6 +710,42 @@ test "listAvailableModels enumerates all built-in providers" {
     try std.testing.expect(found_faux);
     try std.testing.expect(openai_count >= 3);
     try std.testing.expect(models.len >= 20);
+}
+
+test "listAvailableModels does not treat GEMINI_API_KEY as google-gemini-cli auth" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("GEMINI_API_KEY", "gemini-key");
+
+    const current_model = ai.model_registry.find("faux", "faux-1").?;
+    const models = try listAvailableModels(allocator, &env_map, current_model);
+    defer allocator.free(models);
+
+    var saw_google = false;
+    var saw_google_gemini_cli = false;
+
+    for (models) |entry| {
+        if (std.mem.eql(u8, entry.provider, "google") and std.mem.eql(u8, entry.model_id, "gemini-2.5-pro")) {
+            saw_google = true;
+            try std.testing.expect(entry.available);
+        }
+        if (std.mem.eql(u8, entry.provider, "google-gemini-cli") and std.mem.eql(u8, entry.model_id, "gemini-3.1-pro-preview")) {
+            saw_google_gemini_cli = true;
+            try std.testing.expect(!entry.available);
+        }
+    }
+
+    try std.testing.expect(saw_google);
+    try std.testing.expect(saw_google_gemini_cli);
+}
+
+test "resolveProviderErrorMessage guides google-gemini-cli users to login" {
+    try std.testing.expectEqualStrings(
+        "OAuth authentication required. Use /login to authenticate with Google Cloud Code Assist.",
+        resolveProviderErrorMessage(error.MissingApiKey, "google-gemini-cli"),
+    );
 }
 
 test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patterns" {
