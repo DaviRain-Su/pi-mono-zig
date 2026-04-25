@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const auth = @import("auth.zig");
 const keybindings_mod = @import("keybindings.zig");
 const resources_mod = @import("resources.zig");
 const session_mod = @import("session.zig");
@@ -285,22 +286,9 @@ fn loadAuthTokens(allocator: std.mem.Allocator, io: std.Io, path: []const u8, au
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const object = entry.value_ptr.object;
-        const token = blk: {
-            if (object.get("type")) |type_value| {
-                if (type_value == .string and std.mem.eql(u8, type_value.string, "oauth")) {
-                    if (object.get("access_token")) |access_token| {
-                        if (access_token == .string) break :blk access_token.string;
-                    }
-                    break :blk null;
-                }
-            }
-            if (object.get("key")) |key_value| {
-                if (key_value == .string) break :blk key_value.string;
-            }
-            break :blk null;
-        };
-        if (token) |value| {
-            try putOwnedString(auth_tokens, allocator, entry.key_ptr.*, value);
+        if (auth.buildApiKeyFromStoredEntry(allocator, entry.key_ptr.*, object) catch null) |api_key| {
+            defer allocator.free(api_key);
+            try putOwnedString(auth_tokens, allocator, entry.key_ptr.*, api_key);
         }
     }
 }
