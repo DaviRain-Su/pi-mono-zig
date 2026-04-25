@@ -2911,6 +2911,77 @@ fn getStringObjectValue(value: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+const InteractiveModeTestBackend = struct {
+    size: tui.Size,
+    entered_raw: bool = false,
+    restored: bool = false,
+    writes: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.writes.items) |entry| allocator.free(entry);
+        self.writes.deinit(allocator);
+    }
+
+    fn backend(self: *@This()) tui.Backend {
+        return .{
+            .ptr = self,
+            .enterRawModeFn = enterRawMode,
+            .restoreModeFn = restoreMode,
+            .writeFn = write,
+            .getSizeFn = getSize,
+        };
+    }
+
+    fn enterRawMode(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.entered_raw = true;
+    }
+
+    fn restoreMode(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.restored = true;
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
+    }
+
+    fn getSize(ptr: *anyopaque) !tui.Size {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.size;
+    }
+};
+
+fn renderScreenWithMockBackend(
+    allocator: std.mem.Allocator,
+    screen: *const ScreenComponent,
+    backend: *InteractiveModeTestBackend,
+) !tui.LineList {
+    var terminal = tui.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = tui.Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    try renderer.render(screen.component());
+
+    var lines = tui.LineList.empty;
+    errdefer freeLinesSafe(allocator, &lines);
+    for (renderer.previous_lines.items) |line| {
+        try lines.append(allocator, try allocator.dupe(u8, line));
+    }
+    return lines;
+}
+
+fn renderedLinesContain(lines: []const []const u8, needle: []const u8) bool {
+    for (lines) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return true;
+    }
+    return false;
+}
+
 test "screen renders welcome prompt footer and tool lines" {
     const allocator = std.testing.allocator;
 
@@ -2953,6 +3024,178 @@ test "screen renders welcome prompt footer and tool lines" {
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "Welcome to pi") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 3], "Input: w") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Model: faux-1") != null);
+}
+
+test "interactive mode startup renders welcome message footer and hints through a mock backend" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(backend.entered_raw);
+    try std.testing.expect(backend.restored);
+    try std.testing.expectEqualStrings(
+        tui.Terminal.ALT_SCREEN_ENABLE ++ tui.Terminal.BRACKETED_PASTE_ENABLE ++ tui.Terminal.HIDE_CURSOR,
+        backend.writes.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        tui.Terminal.ALT_SCREEN_DISABLE ++ tui.Terminal.BRACKETED_PASTE_DISABLE ++ tui.Terminal.SHOW_CURSOR,
+        backend.writes.items[backend.writes.items.len - 1],
+    );
+    try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));
+    try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
+    try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1 • Session: session.jsonl • Status: idle"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S sessions • Ctrl+P models • Ctrl+C interrupt • Ctrl+D exit • Ctrl+L clear"));
+}
+
+test "interactive mode renders submitted user messages through a mock backend" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .user = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello from interactive mode" } }},
+            .timestamp = 1,
+        } },
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "You: hello from interactive mode"));
+}
+
+test "interactive mode renders streaming assistant updates through a mock backend" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    try state.handleAgentEvent(.{
+        .event_type = .agent_start,
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_start,
+        .message = .{ .assistant = .{
+            .content = &[_]ai.ContentBlock{},
+            .tool_calls = null,
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = ai.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        } },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .message = .{ .assistant = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "streaming reply" } }},
+            .tool_calls = null,
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = ai.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        } },
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, ASSISTANT_PREFIX));
+    try std.testing.expect(renderedLinesContain(lines.items, "streaming reply"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Status: streaming"));
+}
+
+test "interactive mode renders tool execution details through a mock backend" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    var args_map = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args_map.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, "README.md") });
+    const args_object = std.json.Value{ .object = args_map };
+    defer common.deinitJsonValue(allocator, args_object);
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_start,
+        .tool_name = "read",
+        .args = args_object,
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_name = "read",
+        .result = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "project notes" } }},
+        },
+        .is_error = false,
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "Tool read: {\"path\":\"README.md\"}"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Tool result read: project notes"));
 }
 
 test "screen renders multi-line prompt with wrapped continuation lines" {
@@ -3198,6 +3441,141 @@ test "handleInputKey respects configured exit binding" {
         &live_resources,
     );
     try std.testing.expect(!should_exit);
+}
+
+test "handleInputKey dispatches interrupt exit and clear actions" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .user = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "keep me?" } }},
+            .timestamp = 1,
+        } },
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var overlay: ?SelectorOverlay = null;
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = true;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'c' },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqualStrings("interrupt requested", state.status);
+    state.mutex.unlock(state.io);
+
+    prompt_worker_active = false;
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'l' },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(!renderedLinesContain(lines.items, "keep me?"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
+    try std.testing.expect(renderedLinesContain(lines.items, "Status: display cleared"));
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'd' },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+    try std.testing.expect(should_exit);
 }
 
 test "parseSlashCommand recognizes builtins and arguments" {
