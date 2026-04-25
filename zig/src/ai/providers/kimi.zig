@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const openai = @import("openai.zig");
 
 pub const KimiProvider = struct {
     pub const api = "kimi-completions";
@@ -588,6 +589,7 @@ fn parseSseStreamLines(
                                 .event_type = .toolcall_delta,
                                 .content_index = @intCast(block.tool_call.event_index),
                                 .delta = event_delta,
+                                .owns_delta = event_delta != null,
                             });
                         }
                     }
@@ -704,22 +706,28 @@ fn finishCurrentBlock(
             },
             .tool_call => |*tool_call| {
                 const id = try allocator.dupe(u8, std.mem.trim(u8, tool_call.id.items, " "));
+                errdefer allocator.free(id);
                 const name = try allocator.dupe(u8, std.mem.trim(u8, tool_call.name.items, " "));
+                errdefer allocator.free(name);
                 const arguments = try parseStreamingJsonToValue(allocator, std.mem.trim(u8, tool_call.partial_args.items, " "));
-                try tool_calls.append(allocator, .{
+                errdefer freeJsonValue(allocator, arguments);
+
+                const placeholder = try allocator.dupe(u8, "");
+                errdefer allocator.free(placeholder);
+                try content_blocks.append(allocator, .{ .text = .{ .text = placeholder } });
+                errdefer _ = content_blocks.pop();
+
+                const stored_tool_call: types.ToolCall = .{
                     .id = id,
                     .name = name,
                     .arguments = arguments,
-                });
-                try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                };
+                try tool_calls.append(allocator, stored_tool_call);
+                errdefer _ = tool_calls.pop();
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),
-                    .tool_call = .{
-                        .id = try allocator.dupe(u8, id),
-                        .name = try allocator.dupe(u8, name),
-                        .arguments = try cloneJsonValue(allocator, arguments),
-                    },
+                    .tool_call = stored_tool_call,
                 });
             },
         }
@@ -871,17 +879,38 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
 }
 
 fn sanitizeSurrogates(text: []const u8) []const u8 {
-    return text;
+    return openai.sanitizeSurrogates(text);
 }
 
 fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
-    if (event.delta) |delta| allocator.free(delta);
-    if (event.tool_call) |tool_call| {
-        allocator.free(tool_call.id);
-        allocator.free(tool_call.name);
-        freeJsonValue(allocator, tool_call.arguments);
-    }
+    event.deinitTransient(allocator);
     if (event.error_message) |error_message| allocator.free(error_message);
+}
+
+fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    freeJsonValue(allocator, tool_call.arguments);
+}
+
+fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
+    for (message.content) |block| {
+        switch (block) {
+            .text => |text| allocator.free(text.text),
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+            .image => {},
+        }
+    }
+    allocator.free(message.content);
+    if (message.tool_calls) |tool_calls| {
+        for (tool_calls) |tool_call| freeToolCallOwned(allocator, tool_call);
+        allocator.free(tool_calls);
+    }
+    if (message.response_id) |response_id| allocator.free(response_id);
+    if (message.error_message) |error_message| allocator.free(error_message);
 }
 
 test "buildRequestPayload uses kimi-specific fields" {
@@ -1040,7 +1069,7 @@ test "parseSseStream emits kimi thinking and text events" {
 }
 
 test "parseSseStream emits kimi tool call events across fragmented deltas" {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.testing.allocator;
     const io = std.Io.failing;
 
     const body = try allocator.dupe(
@@ -1086,11 +1115,13 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
     const event3 = stream_instance.next().?;
     defer freeEvent(allocator, event3);
     try std.testing.expectEqual(types.EventType.toolcall_delta, event3.event_type);
+    try std.testing.expect(event3.owns_delta);
     try std.testing.expectEqualStrings("{\"command\":\"echo", event3.delta.?);
 
     const event4 = stream_instance.next().?;
     defer freeEvent(allocator, event4);
     try std.testing.expectEqual(types.EventType.toolcall_delta, event4.event_type);
+    try std.testing.expect(event4.owns_delta);
     try std.testing.expectEqualStrings(" hello\"}", event4.delta.?);
 
     const event5 = stream_instance.next().?;
@@ -1103,7 +1134,6 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
     try std.testing.expectEqualStrings("echo hello", event5.tool_call.?.arguments.object.get("command").?.string);
 
     const event6 = stream_instance.next().?;
-    defer freeEvent(allocator, event6);
     try std.testing.expectEqual(types.EventType.done, event6.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, event6.message.?.stop_reason);
     try std.testing.expectEqual(@as(u32, 10), event6.message.?.usage.input);
@@ -1113,4 +1143,18 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
     try std.testing.expectEqualStrings("run_terminal", event6.message.?.tool_calls.?[0].name);
     try std.testing.expect(event6.message.?.tool_calls.?[0].arguments == .object);
     try std.testing.expectEqualStrings("echo hello", event6.message.?.tool_calls.?[0].arguments.object.get("command").?.string);
+    try std.testing.expect(event5.tool_call.?.id.ptr == event6.message.?.tool_calls.?[0].id.ptr);
+    try std.testing.expect(event5.tool_call.?.name.ptr == event6.message.?.tool_calls.?[0].name.ptr);
+    try std.testing.expect(
+        event5.tool_call.?.arguments.object.get("command").?.string.ptr ==
+            event6.message.?.tool_calls.?[0].arguments.object.get("command").?.string.ptr,
+    );
+
+    freeAssistantMessageOwned(allocator, event6.message.?);
+}
+
+test "sanitizeSurrogates matches openai surrogate filtering" {
+    const input = [_]u8{ 'A', 0xED, 0xA0, 0x80, 'B' };
+    try std.testing.expectEqualStrings("AB", sanitizeSurrogates(&input));
+    try std.testing.expectEqualStrings(openai.sanitizeSurrogates(&input), sanitizeSurrogates(&input));
 }
