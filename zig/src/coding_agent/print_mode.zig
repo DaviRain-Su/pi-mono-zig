@@ -102,7 +102,7 @@ pub fn runPrintMode(
     allocator: std.mem.Allocator,
     io: std.Io,
     session: *session_mod.AgentSession,
-    prompt: []const u8,
+    input: anytype,
     options: RunPrintModeOptions,
     stdout_writer: *std.Io.Writer,
     stderr_writer: *std.Io.Writer,
@@ -144,7 +144,7 @@ pub fn runPrintMode(
         watcher_thread.join();
     }
 
-    session.prompt(prompt) catch |err| {
+    session.prompt(input) catch |err| {
         try stderr_writer.print("Error: {s}\n", .{@errorName(err)});
         try stderr_writer.flush();
         return 1;

@@ -55,6 +55,7 @@ pub const RunInteractiveModeOptions = struct {
     model_patterns: ?[]const []const u8 = null,
     selected_tools: ?[]const []const u8 = null,
     initial_prompt: ?[]const u8 = null,
+    initial_images: []const ai.ImageContent = &.{},
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
@@ -769,13 +770,22 @@ const PromptWorker = struct {
     session: *session_mod.AgentSession,
     app_state: *AppState,
     prompt_text: []u8 = &.{},
+    prompt_images: []ai.ImageContent = &.{},
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
-    fn start(self: *PromptWorker, allocator: std.mem.Allocator, session: *session_mod.AgentSession, app_state: *AppState, prompt_text: []const u8) !void {
+    fn start(
+        self: *PromptWorker,
+        allocator: std.mem.Allocator,
+        session: *session_mod.AgentSession,
+        app_state: *AppState,
+        prompt_text: []const u8,
+        prompt_images: []const ai.ImageContent,
+    ) !void {
         self.session = session;
         self.app_state = app_state;
         self.prompt_text = try allocator.dupe(u8, prompt_text);
+        self.prompt_images = try cloneImageContents(allocator, prompt_images);
         self.running.store(true, .seq_cst);
         self.thread = try std.Thread.spawn(.{}, run, .{ self, allocator });
     }
@@ -783,20 +793,60 @@ const PromptWorker = struct {
     fn join(self: *PromptWorker, allocator: std.mem.Allocator) void {
         if (self.thread) |thread| thread.join();
         if (self.prompt_text.len > 0) allocator.free(self.prompt_text);
+        deinitImageContents(allocator, self.prompt_images);
         self.prompt_text = &.{};
+        self.prompt_images = &.{};
         self.thread = null;
         self.running.store(false, .seq_cst);
     }
 
     fn run(self: *PromptWorker, allocator: std.mem.Allocator) void {
         defer self.running.store(false, .seq_cst);
-        self.session.prompt(self.prompt_text) catch |err| {
+        const result = if (self.prompt_images.len > 0)
+            self.session.prompt(.{
+                .text = self.prompt_text,
+                .images = self.prompt_images,
+            })
+        else
+            self.session.prompt(self.prompt_text);
+
+        result catch |err| {
             const message = std.fmt.allocPrint(allocator, "error: {s}", .{@errorName(err)}) catch return;
             defer allocator.free(message);
             self.app_state.setStatus(message) catch {};
         };
     }
 };
+
+fn cloneImageContents(allocator: std.mem.Allocator, images: []const ai.ImageContent) ![]ai.ImageContent {
+    if (images.len == 0) return &.{};
+
+    const cloned = try allocator.alloc(ai.ImageContent, images.len);
+    errdefer {
+        for (cloned[0..images.len]) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        allocator.free(cloned);
+    }
+
+    for (images, 0..) |image, index| {
+        cloned[index] = .{
+            .data = try allocator.dupe(u8, image.data),
+            .mime_type = try allocator.dupe(u8, image.mime_type),
+        };
+    }
+    return cloned;
+}
+
+fn deinitImageContents(allocator: std.mem.Allocator, images: []const ai.ImageContent) void {
+    if (images.len == 0) return;
+    for (images) |image| {
+        allocator.free(image.data);
+        allocator.free(image.mime_type);
+    }
+    allocator.free(images);
+}
 
 pub fn runInteractiveMode(
     allocator: std.mem.Allocator,
@@ -891,7 +941,7 @@ pub fn runInteractiveMode(
 
     if (options.initial_prompt) |initial_prompt| {
         if (initial_prompt.len > 0) {
-            try prompt_worker.start(allocator, &session, &app_state, initial_prompt);
+            try prompt_worker.start(allocator, &session, &app_state, initial_prompt, options.initial_images);
             prompt_worker_active = true;
         }
     }
@@ -1438,7 +1488,7 @@ fn submitEditorText(
         return;
     }
 
-    try prompt_worker.start(allocator, session, app_state, expanded);
+    try prompt_worker.start(allocator, session, app_state, expanded, &.{});
     prompt_worker_active.* = true;
     clearEditor(editor);
     try app_state.setStatus("streaming");
