@@ -213,14 +213,16 @@ fn truncatePlainAlloc(allocator: std.mem.Allocator, text: []const u8, max_width:
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
 
-    var width: usize = 0;
+    var visible_width: usize = 0;
     var index: usize = 0;
-    while (index < text.len and width < max_width) {
-        const rune_len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-        const actual_len = @min(rune_len, text.len - index);
-        try builder.appendSlice(allocator, text[index .. index + actual_len]);
-        index += actual_len;
-        width += 1;
+    while (index < text.len) {
+        const cluster = ansi.nextDisplayCluster(text, index);
+        if (cluster.end <= index) break;
+        if (visible_width + cluster.width > max_width) break;
+
+        try builder.appendSlice(allocator, text[index..cluster.end]);
+        index = cluster.end;
+        visible_width += cluster.width;
     }
 
     return builder.toOwnedSlice(allocator);
@@ -273,4 +275,64 @@ test "select list confirms the selected item on enter" {
     try std.testing.expect(result == .confirmed);
     try std.testing.expectEqual(@as(usize, 1), result.confirmed);
     try std.testing.expectEqualStrings("two", list.selectedItem().?.value);
+}
+
+test "select list truncation respects display width for wide and combining graphemes" {
+    const allocator = std.testing.allocator;
+
+    const cjk = try truncatePlainAlloc(allocator, "ab你好", 4);
+    defer allocator.free(cjk);
+    try std.testing.expectEqualStrings("ab你", cjk);
+    try std.testing.expectEqual(@as(usize, 4), ansi.visibleWidth(cjk));
+
+    const emoji = try truncatePlainAlloc(allocator, "🙂🙂x", 4);
+    defer allocator.free(emoji);
+    try std.testing.expectEqualStrings("🙂🙂", emoji);
+    try std.testing.expectEqual(@as(usize, 4), ansi.visibleWidth(emoji));
+
+    const combining = try truncatePlainAlloc(allocator, "e\u{0301}x", 1);
+    defer allocator.free(combining);
+    try std.testing.expectEqualStrings("e\u{0301}", combining);
+    try std.testing.expectEqual(@as(usize, 1), ansi.visibleWidth(combining));
+}
+
+test "select list render keeps unicode labels within requested width" {
+    const allocator = std.testing.allocator;
+
+    var list = SelectList{
+        .items = &[_]SelectItem{
+            .{ .value = "wide", .label = "你好世界🙂" },
+        },
+        .max_visible = 1,
+    };
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+    try list.renderInto(allocator, 8, &lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    for (lines.items) |line| {
+        try std.testing.expect(ansi.visibleWidth(line) <= 8);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "你好世界🙂") == null);
+}
+
+test "select list render truncates unicode descriptions by display width" {
+    const allocator = std.testing.allocator;
+
+    var list = SelectList{
+        .items = &[_]SelectItem{
+            .{ .value = "desc", .label = "go", .description = "描述文字🙂🙂更多内容" },
+        },
+        .max_visible = 1,
+    };
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+    try list.renderInto(allocator, 24, &lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expect(ansi.visibleWidth(lines.items[0]) <= 24);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "描述文字🙂🙂更多内容") == null);
 }
