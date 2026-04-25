@@ -494,6 +494,59 @@ test "buildRequestPayload adds eager_input_streaming by default" {
     try std.testing.expectEqual(true, first_tool.object.get("eager_input_streaming").?.bool);
 }
 
+test "github-copilot compat disables eager_input_streaming and enables legacy beta header" {
+    const allocator = std.testing.allocator;
+
+    const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    const tool_schema_value = std.json.Value{ .object = tool_schema };
+    defer freeJsonValue(allocator, tool_schema_value);
+
+    const tools = &[_]types.Tool{.{
+        .name = "todoWrite",
+        .description = "Write todos",
+        .parameters = tool_schema_value,
+    }};
+
+    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try compat.put(allocator, try allocator.dupe(u8, "supportsEagerToolInputStreaming"), .{ .bool = false });
+    const compat_value = std.json.Value{ .object = compat };
+    defer freeJsonValue(allocator, compat_value);
+
+    const model = types.Model{
+        .id = "claude-sonnet-4-5",
+        .name = "Claude Sonnet 4.5",
+        .api = "anthropic-messages",
+        .provider = "github-copilot",
+        .base_url = "https://api.githubcopilot.com/anthropic",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+        .compat = compat_value,
+    };
+
+    const context = types.Context{
+        .messages = &[_]types.Message{},
+        .tools = tools,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    const first_tool = payload.object.get("tools").?.array.items[0];
+    try std.testing.expect(first_tool == .object);
+    try std.testing.expect(first_tool.object.get("eager_input_streaming") == null);
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer headers.deinit();
+
+    try applyDefaultAnthropicHeaders(allocator, &headers, model, context, null);
+    try std.testing.expectEqualStrings(
+        "fine-grained-tool-streaming-2025-05-14",
+        headers.get("anthropic-beta").?,
+    );
+}
+
 test "buildRequestPayload omits anthropic long cache ttl when compat disables it" {
     const allocator = std.testing.allocator;
 

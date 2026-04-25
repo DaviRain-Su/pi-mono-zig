@@ -1528,6 +1528,115 @@ test "signRequestHeaders creates sigv4 authorization and security token" {
     );
 }
 
+fn appendBigEndianU32(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) !void {
+    try bytes.append(allocator, @intCast((value >> 24) & 0xff));
+    try bytes.append(allocator, @intCast((value >> 16) & 0xff));
+    try bytes.append(allocator, @intCast((value >> 8) & 0xff));
+    try bytes.append(allocator, @intCast(value & 0xff));
+}
+
+fn appendBigEndianU16(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) !void {
+    try bytes.append(allocator, @intCast((value >> 8) & 0xff));
+    try bytes.append(allocator, @intCast(value & 0xff));
+}
+
+fn appendEventStreamHeader(
+    allocator: std.mem.Allocator,
+    headers: *std.ArrayList(u8),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    try headers.append(allocator, @intCast(name.len));
+    try headers.appendSlice(allocator, name);
+    try headers.append(allocator, 7);
+    try appendBigEndianU16(headers, allocator, value.len);
+    try headers.appendSlice(allocator, value);
+}
+
+fn appendEventStreamFrame(
+    allocator: std.mem.Allocator,
+    frames: *std.ArrayList(u8),
+    event_type: []const u8,
+    payload: []const u8,
+) !void {
+    var headers = std.ArrayList(u8).empty;
+    defer headers.deinit(allocator);
+    try appendEventStreamHeader(allocator, &headers, ":event-type", event_type);
+
+    const total_length = 16 + headers.items.len + payload.len;
+    try appendBigEndianU32(frames, allocator, total_length);
+    try appendBigEndianU32(frames, allocator, headers.items.len);
+    try appendBigEndianU32(frames, allocator, 0);
+    try frames.appendSlice(allocator, headers.items);
+    try frames.appendSlice(allocator, payload);
+    try appendBigEndianU32(frames, allocator, 0);
+}
+
+test "parseEventStreamFrames handles bedrock binary converse stream" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = types.Model{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude 3.7 Sonnet",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"reasoningContent\":{\"reasoningText\":{\"text\":\"Need weather.\",\"signature\":\"sig-1\"}}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":0}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":1,\"delta\":{\"text\":\"Checking now\"}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":1}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStart", "{\"contentBlockIndex\":2,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-1\",\"name\":\"get_weather\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":2,\"delta\":{\"toolUse\":{\"input\":\"{\\\"city\\\":\\\"Ber\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":2,\"delta\":{\"toolUse\":{\"input\":\"lin\\\",\\\"unit\\\":\\\"C\\\"}\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":2}");
+    try appendEventStreamFrame(allocator, &body, "messageStop", "{\"stopReason\":\"tool_use\"}");
+    try appendEventStreamFrame(allocator, &body, "metadata", "{\"usage\":{\"inputTokens\":21,\"outputTokens\":9,\"totalTokens\":30}}");
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    try parseEventStreamFrames(allocator, &stream_instance, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
+    const thinking_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqualStrings("Need weather.", thinking_delta.delta.?);
+    try std.testing.expectEqual(types.EventType.thinking_end, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const text_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqualStrings("Checking now", text_delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
+    const tool_delta_one = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_one.event_type);
+    try std.testing.expect(std.mem.indexOf(u8, tool_delta_one.delta.?, "Ber") != null);
+    const tool_delta_two = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_two.event_type);
+    try std.testing.expect(std.mem.indexOf(u8, tool_delta_two.delta.?, "unit") != null);
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
+    try std.testing.expectEqualStrings("C", tool_end.tool_call.?.arguments.object.get("unit").?.string);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 21), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 9), done.message.?.usage.output);
+    try std.testing.expectEqual(@as(u32, 30), done.message.?.usage.total_tokens);
+}
+
 test "parse bedrock stream emits text thinking and tool call events" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
@@ -1594,4 +1703,51 @@ test "parse bedrock stream emits text thinking and tool call events" {
     try std.testing.expectEqual(@as(u32, 21), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 9), done.message.?.usage.output);
     try std.testing.expectEqual(@as(u32, 30), done.message.?.usage.total_tokens);
+}
+
+test "parseEventStreamFrames joins split tool call input fragments" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = types.Model{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude 3.7 Sonnet",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStart", "{\"contentBlockIndex\":0,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-1\",\"name\":\"get_weather\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"toolUse\":{\"input\":\"{\\\"city\\\":\\\"Ber\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"toolUse\":{\"input\":\"lin\\\",\\\"unit\\\":\\\"C\\\"}\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":0}");
+    try appendEventStreamFrame(allocator, &body, "messageStop", "{\"stopReason\":\"tool_use\"}");
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    try parseEventStreamFrames(allocator, &stream_instance, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
+    const tool_delta_one = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_one.event_type);
+    try std.testing.expectEqualStrings("{\"city\":\"Ber", tool_delta_one.delta.?);
+    const tool_delta_two = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_two.event_type);
+    try std.testing.expectEqualStrings("lin\",\"unit\":\"C\"}", tool_delta_two.delta.?);
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqualStrings("tool-1", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
+    try std.testing.expectEqualStrings("C", tool_end.tool_call.?.arguments.object.get("unit").?.string);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
 }
