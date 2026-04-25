@@ -1,11 +1,13 @@
 const std = @import("std");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
+const resources_mod = @import("../theme.zig");
 
 pub const Text = struct {
     text: []const u8 = "",
     padding_x: usize = 1,
     padding_y: usize = 1,
+    theme: ?*const resources_mod.Theme = null,
 
     pub fn component(self: *const Text) component_mod.Component {
         return .{
@@ -34,7 +36,13 @@ pub const Text = struct {
         @memset(blank_line, ' ');
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            if (self.theme) |theme| {
+                const themed = try theme.applyAlloc(allocator, .text, blank_line);
+                defer allocator.free(themed);
+                try component_mod.appendOwnedLine(lines, allocator, themed);
+            } else {
+                try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            }
         }
 
         for (wrapped.items) |line| {
@@ -46,12 +54,24 @@ pub const Text = struct {
 
             const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
             defer allocator.free(padded);
-            try component_mod.appendOwnedLine(lines, allocator, padded);
+            if (self.theme) |theme| {
+                const themed = try theme.applyAlloc(allocator, .text, padded);
+                defer allocator.free(themed);
+                try component_mod.appendOwnedLine(lines, allocator, themed);
+            } else {
+                try component_mod.appendOwnedLine(lines, allocator, padded);
+            }
             builder.deinit(allocator);
         }
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            if (self.theme) |theme| {
+                const themed = try theme.applyAlloc(allocator, .text, blank_line);
+                defer allocator.free(themed);
+                try component_mod.appendOwnedLine(lines, allocator, themed);
+            } else {
+                try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            }
         }
     }
 
@@ -82,4 +102,26 @@ test "text renders wrapped ANSI content with padding" {
     try std.testing.expectEqual(@as(usize, 4), lines.items.len);
     try std.testing.expectEqual(@as(usize, 6), ansi.visibleWidth(lines.items[1]));
     try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "\x1b[31m") != null);
+}
+
+test "text applies the active theme to padded output" {
+    const allocator = std.testing.allocator;
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+
+    const text = Text{
+        .text = "hello",
+        .padding_x = 1,
+        .padding_y = 0,
+        .theme = &theme,
+    };
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+
+    try text.renderInto(allocator, 8, &lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "hello") != null);
 }

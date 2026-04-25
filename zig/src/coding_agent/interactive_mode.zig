@@ -661,7 +661,9 @@ const ScreenComponent = struct {
         width: usize,
         lines: *tui.LineList,
     ) std.mem.Allocator.Error!void {
+        self.editor.setTheme(self.theme);
         if (self.overlay) |overlay| {
+            overlay.list().theme = self.theme;
             try self.renderOverlay(allocator, width, lines, overlay);
             return;
         }
@@ -679,7 +681,7 @@ const ScreenComponent = struct {
 
         var prompt_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &prompt_lines);
-        try renderPromptLines(allocator, self.editor, width, &prompt_lines);
+        try renderPromptLines(allocator, self.theme, self.editor, width, &prompt_lines);
         const footer_line = try formatFooterLine(
             allocator,
             self.theme,
@@ -721,11 +723,11 @@ const ScreenComponent = struct {
     ) std.mem.Allocator.Error!void {
         const title_plain = try fitLine(allocator, overlay.title(), width);
         defer allocator.free(title_plain);
-        const title_line = try applyThemeAlloc(allocator, self.theme, .footer, title_plain);
+        const title_line = try applyThemeAlloc(allocator, self.theme, .overlay_title, title_plain);
         defer allocator.free(title_line);
         const hint_plain = try fitLine(allocator, overlay.hint(), width);
         defer allocator.free(hint_plain);
-        const hint_line = try applyThemeAlloc(allocator, self.theme, .status, hint_plain);
+        const hint_line = try applyThemeAlloc(allocator, self.theme, .overlay_hint, hint_plain);
         defer allocator.free(hint_line);
 
         try tui.component.appendOwnedLine(lines, allocator, title_line);
@@ -2554,7 +2556,7 @@ fn loadSettingsOverlay(
     );
 
     if (runtime_config) |config| {
-        try appendInfoOverlayItem(allocator, &items, "Theme", try allocator.dupe(u8, config.settings.theme orelse "default"));
+        try appendInfoOverlayItem(allocator, &items, "Theme", try allocator.dupe(u8, config.settings.theme orelse "dark"));
         try appendInfoOverlayItem(
             allocator,
             &items,
@@ -3995,6 +3997,7 @@ const INPUT_PROMPT_PREFIX = "Input: ";
 
 fn renderPromptLines(
     allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
     width: usize,
     lines: *tui.LineList,
@@ -4014,7 +4017,13 @@ fn renderPromptLines(
         var builder = std.ArrayList(u8).empty;
         errdefer builder.deinit(allocator);
 
-        try builder.appendSlice(allocator, if (index == 0) INPUT_PROMPT_PREFIX else continuation_prefix);
+        if (index == 0 and theme != null) {
+            const themed_prefix = try applyThemeAlloc(allocator, theme, .prompt, INPUT_PROMPT_PREFIX);
+            defer allocator.free(themed_prefix);
+            try builder.appendSlice(allocator, themed_prefix);
+        } else {
+            try builder.appendSlice(allocator, if (index == 0) INPUT_PROMPT_PREFIX else continuation_prefix);
+        }
         try builder.appendSlice(allocator, editor_line);
 
         const fitted = try fitLine(allocator, builder.items, width);
@@ -4131,6 +4140,7 @@ fn renderAssistantChatItemInto(
 
     const markdown = tui.Markdown{
         .text = text,
+        .theme = theme,
     };
     try markdown.renderInto(allocator, width, lines);
 }
@@ -4878,8 +4888,11 @@ test "screen renders themed output and custom keybinding hints" {
 
     var theme = try resources_mod.Theme.initDefault(allocator);
     defer theme.deinit(allocator);
+    if (theme.styles[@intFromEnum(resources_mod.ThemeToken.welcome)].fg) |value| allocator.free(value);
     theme.styles[@intFromEnum(resources_mod.ThemeToken.welcome)].fg = try allocator.dupe(u8, "green");
+    if (theme.styles[@intFromEnum(resources_mod.ThemeToken.footer)].fg) |value| allocator.free(value);
     theme.styles[@intFromEnum(resources_mod.ThemeToken.footer)].fg = try allocator.dupe(u8, "cyan");
+    if (theme.styles[@intFromEnum(resources_mod.ThemeToken.status)].fg) |value| allocator.free(value);
     theme.styles[@intFromEnum(resources_mod.ThemeToken.status)].fg = try allocator.dupe(u8, "yellow");
 
     var editor = tui.Editor.init(allocator);
@@ -6024,6 +6037,112 @@ test "submitEditorText resets editor autocomplete state after submit" {
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
     try std.testing.expectEqualStrings("streaming", state.status);
+}
+
+test "reload slash command refreshes the selected theme from disk" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent/themes");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/settings.json",
+        .data =
+        \\{
+        \\  "defaultProvider": "faux",
+        \\  "defaultModel": "faux-1",
+        \\  "theme": "sunset"
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/themes/sunset.json",
+        .data =
+        \\{
+        \\  "name": "sunset",
+        \\  "colors": {
+        \\    "primary": "red",
+        \\    "secondary": "magenta",
+        \\    "success": "green",
+        \\    "warning": "yellow",
+        \\    "error": "red",
+        \\    "background": "#1a1b26",
+        \\    "foreground": "white",
+        \\    "border": "yellow",
+        \\    "muted": "blue"
+        \\  }
+        \\}
+        ,
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const agent_dir = try std.fs.path.resolve(allocator, &[_][]const u8{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "agent" });
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, cwd);
+    defer runtime_config.deinit();
+    var bundle = try resources_mod.loadResourceBundle(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = runtime_config.agent_dir,
+        .global = settingsResources(runtime_config.global_settings),
+        .project = settingsResources(runtime_config.project_settings),
+    });
+    defer bundle.deinit(allocator);
+
+    var live_resources = LiveResources.init(.{
+        .cwd = cwd,
+        .system_prompt = "sys",
+        .session_dir = agent_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+        .keybindings = &runtime_config.keybindings,
+        .prompt_templates = bundle.prompt_templates,
+        .theme = bundle.selectedTheme(),
+    });
+    defer live_resources.deinit(allocator);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const initial_prompt = try live_resources.theme.?.applyAlloc(allocator, .prompt, "Input:");
+    defer allocator.free(initial_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, initial_prompt, "[31m") != null or std.mem.indexOf(u8, initial_prompt, "38;2;") != null);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/themes/sunset.json",
+        .data =
+        \\{
+        \\  "name": "sunset",
+        \\  "base": "light",
+        \\  "colors": {
+        \\    "primary": "cyan",
+        \\    "secondary": "magenta",
+        \\    "success": "yellow",
+        \\    "warning": "yellow",
+        \\    "error": "red",
+        \\    "background": "#ffffff",
+        \\    "foreground": "#111111",
+        \\    "border": "red",
+        \\    "muted": "black"
+        \\  }
+        \\}
+        ,
+    });
+
+    try handleReloadSlashCommand(allocator, std.testing.io, &env_map, cwd, &state, &live_resources);
+
+    const reloaded_prompt = try live_resources.theme.?.applyAlloc(allocator, .prompt, "Input:");
+    defer allocator.free(reloaded_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, reloaded_prompt, "[36m") != null or std.mem.indexOf(u8, reloaded_prompt, "38;2;") != null);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqualStrings("Reloaded keybindings, skills, prompts, and themes", state.status);
 }
 
 test "handleInputKey shows session stats for slash session command" {
