@@ -2159,6 +2159,20 @@ fn summarizeSessionEntry(allocator: std.mem.Allocator, entry: session_manager_mo
         .thinking_level_change => |thinking_entry| std.fmt.allocPrint(allocator, "thinking: {s}", .{@tagName(thinking_entry.thinking_level)}),
         .model_change => |model_entry| std.fmt.allocPrint(allocator, "model: {s}/{s}", .{ model_entry.provider, model_entry.model_id }),
         .compaction => |compaction_entry| std.fmt.allocPrint(allocator, "compaction: {s}", .{trimSummaryText(try session_manager_mod.getCompactionSummary(compaction_entry))}),
+        .branch_summary => |branch_summary_entry| std.fmt.allocPrint(allocator, "branch summary: {s}", .{trimSummaryText(branch_summary_entry.summary)}),
+        .custom => |custom_entry| std.fmt.allocPrint(allocator, "custom: {s}", .{custom_entry.custom_type}),
+        .custom_message => |custom_message_entry| blk: {
+            const text = switch (custom_message_entry.content) {
+                .text => |value| try allocator.dupe(u8, value),
+                .blocks => |blocks| try blocksToText(allocator, blocks),
+            };
+            defer allocator.free(text);
+            break :blk std.fmt.allocPrint(
+                allocator,
+                "[{s}]: {s}",
+                .{ custom_message_entry.custom_type, trimSummaryText(text) },
+            );
+        },
         .label => |label_entry| if (label_entry.label) |label|
             std.fmt.allocPrint(allocator, "label: {s}", .{label})
         else
