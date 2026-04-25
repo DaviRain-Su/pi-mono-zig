@@ -2,6 +2,7 @@ const std = @import("std");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
 const keys = @import("../keys.zig");
+const resources_mod = @import("../theme.zig");
 
 pub const SelectItem = struct {
     value: []const u8,
@@ -26,6 +27,7 @@ pub const SelectList = struct {
     max_visible: usize = 5,
     padding_x: usize = 0,
     padding_y: usize = 0,
+    theme: ?*const resources_mod.Theme = null,
 
     pub fn component(self: *const SelectList) component_mod.Component {
         return .{
@@ -92,7 +94,13 @@ pub const SelectList = struct {
         if (self.items.len == 0) {
             const empty = try ansi.padRightVisibleAlloc(allocator, "No items", effective_width);
             defer allocator.free(empty);
-            try component_mod.appendOwnedLine(lines, allocator, empty);
+            if (self.theme) |theme| {
+                const themed = try theme.applyAlloc(allocator, .select_empty, empty);
+                defer allocator.free(themed);
+                try component_mod.appendOwnedLine(lines, allocator, themed);
+            } else {
+                try component_mod.appendOwnedLine(lines, allocator, empty);
+            }
         } else {
             const start_index = self.visibleStartIndex();
             const end_index = @min(start_index + @max(self.max_visible, 1), self.items.len);
@@ -105,7 +113,7 @@ pub const SelectList = struct {
             if (self.items.len > @max(self.max_visible, 1)) {
                 const info = try std.fmt.allocPrint(allocator, "  ({d}/{d})", .{ self.selectedIndex() + 1, self.items.len });
                 defer allocator.free(info);
-                const styled = try renderPaddedLine(allocator, info, effective_width, false);
+                const styled = try renderPaddedLine(allocator, self.theme, info, effective_width, false);
                 defer allocator.free(styled);
                 try component_mod.appendOwnedLine(lines, allocator, styled);
             }
@@ -136,7 +144,7 @@ pub const SelectList = struct {
     }
 
     fn renderItem(
-        _: *const SelectList,
+        self: *const SelectList,
         allocator: std.mem.Allocator,
         item: SelectItem,
         is_selected: bool,
@@ -166,9 +174,15 @@ pub const SelectList = struct {
                 const used_width = ansi.visibleWidth(prefix) + ansi.visibleWidth(truncated_label);
                 const gap = @max(@as(usize, 1), primary_width + prefix_width - used_width);
                 try line.appendNTimes(allocator, ' ', gap);
-                try line.appendSlice(allocator, "\x1b[2m");
-                try line.appendSlice(allocator, truncated_description);
-                try line.appendSlice(allocator, "\x1b[0m");
+                if (self.theme) |theme| {
+                    const themed_description = try theme.applyAlloc(allocator, .select_description, truncated_description);
+                    defer allocator.free(themed_description);
+                    try line.appendSlice(allocator, themed_description);
+                } else {
+                    try line.appendSlice(allocator, "\x1b[2m");
+                    try line.appendSlice(allocator, truncated_description);
+                    try line.appendSlice(allocator, "\x1b[0m");
+                }
             } else {
                 const truncated = try truncatePlainAlloc(allocator, display, content_width);
                 defer allocator.free(truncated);
@@ -180,7 +194,7 @@ pub const SelectList = struct {
             try line.appendSlice(allocator, truncated);
         }
 
-        const padded = try renderPaddedLine(allocator, line.items, width, is_selected);
+        const padded = try renderPaddedLine(allocator, self.theme, line.items, width, is_selected);
         line.deinit(allocator);
         return padded;
     }
@@ -188,12 +202,23 @@ pub const SelectList = struct {
 
 fn renderPaddedLine(
     allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
     text: []const u8,
     width: usize,
     selected: bool,
 ) std.mem.Allocator.Error![]u8 {
     const padded = try ansi.padRightVisibleAlloc(allocator, text, width);
     defer allocator.free(padded);
+
+    if (theme) |active_theme| {
+        if (selected) {
+            return active_theme.applyAlloc(allocator, .select_selected, padded);
+        }
+        if (std.mem.startsWith(u8, padded, "  (")) {
+            return active_theme.applyAlloc(allocator, .select_scroll, padded);
+        }
+        return allocator.dupe(u8, padded);
+    }
 
     if (!selected) {
         return allocator.dupe(u8, padded);
@@ -275,6 +300,30 @@ test "select list confirms the selected item on enter" {
     try std.testing.expect(result == .confirmed);
     try std.testing.expectEqual(@as(usize, 1), result.confirmed);
     try std.testing.expectEqualStrings("two", list.selectedItem().?.value);
+}
+
+test "select list applies themed selection and muted descriptions" {
+    const allocator = std.testing.allocator;
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+
+    var list = SelectList{
+        .items = &[_]SelectItem{
+            .{ .value = "one", .description = "first" },
+            .{ .value = "two", .description = "second" },
+        },
+        .selected_index = 1,
+        .theme = &theme,
+    };
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+
+    try list.renderInto(allocator, 24, &lines);
+
+    try std.testing.expect(lines.items.len >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "\x1b[") != null);
 }
 
 test "select list truncation respects display width for wide and combining graphemes" {

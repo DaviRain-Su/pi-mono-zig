@@ -4,6 +4,7 @@ const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
 const keys = @import("../keys.zig");
 const select_list = @import("select_list.zig");
+const resources_mod = @import("../theme.zig");
 
 pub const HandleResult = enum {
     handled,
@@ -25,6 +26,7 @@ pub const Editor = struct {
     cursor: usize = 0,
     padding_x: usize = 0,
     padding_y: usize = 0,
+    theme: ?*const resources_mod.Theme = null,
     autocomplete_catalog: std.ArrayList(select_list.SelectItem) = .empty,
     autocomplete_matches: []select_list.SelectItem = &.{},
     autocomplete_list: ?select_list.SelectList = null,
@@ -105,6 +107,13 @@ pub const Editor = struct {
     ) std.mem.Allocator.Error!void {
         const list = self.autocomplete_list orelse return;
         try list.renderInto(allocator, width, lines);
+    }
+
+    pub fn setTheme(self: *Editor, theme: ?*const resources_mod.Theme) void {
+        self.theme = theme;
+        if (self.autocomplete_list) |*list| {
+            list.theme = theme;
+        }
     }
 
     pub fn handleKey(self: *Editor, key: keys.Key) !HandleResult {
@@ -265,11 +274,17 @@ pub const Editor = struct {
         @memset(blank_line, ' ');
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            if (self.theme) |theme| {
+                const themed = try theme.applyAlloc(allocator, .editor, blank_line);
+                defer allocator.free(themed);
+                try component_mod.appendOwnedLine(lines, allocator, themed);
+            } else {
+                try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            }
         }
 
         if (self.buffer.items.len == 0) {
-            const rendered = try renderVisualLine(allocator, "", 0, self.padding_x, effective_width);
+            const rendered = try renderVisualLine(allocator, self.theme, "", 0, self.padding_x, effective_width);
             defer allocator.free(rendered);
             try component_mod.appendOwnedLine(lines, allocator, rendered);
         } else {
@@ -280,6 +295,7 @@ pub const Editor = struct {
                 const cursor_offset = if (self.cursor >= start and self.cursor <= end) self.cursor - start else null;
                 try appendWrappedLogicalLine(
                     allocator,
+                    self.theme,
                     self.buffer.items[start..end],
                     cursor_offset,
                     self.padding_x,
@@ -292,14 +308,20 @@ pub const Editor = struct {
                 start = end + 1;
                 if (start == self.buffer.items.len) {
                     const trailing_cursor = if (self.cursor == self.buffer.items.len) @as(?usize, 0) else null;
-                    try appendWrappedLogicalLine(allocator, "", trailing_cursor, self.padding_x, effective_width, lines);
+                    try appendWrappedLogicalLine(allocator, self.theme, "", trailing_cursor, self.padding_x, effective_width, lines);
                     break;
                 }
             }
         }
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            if (self.theme) |theme| {
+                const themed = try theme.applyAlloc(allocator, .editor, blank_line);
+                defer allocator.free(themed);
+                try component_mod.appendOwnedLine(lines, allocator, themed);
+            } else {
+                try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            }
         }
     }
 
@@ -395,6 +417,7 @@ pub const Editor = struct {
         self.autocomplete_list = .{
             .items = self.autocomplete_matches,
             .max_visible = self.autocomplete_max_visible,
+            .theme = self.theme,
         };
     }
 
@@ -589,6 +612,7 @@ pub const Editor = struct {
 
 fn appendWrappedLogicalLine(
     allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
     line: []const u8,
     cursor_offset: ?usize,
     padding_x: usize,
@@ -598,7 +622,7 @@ fn appendWrappedLogicalLine(
     const content_width = @max(@as(usize, 1), if (width > padding_x) width - padding_x else 1);
 
     if (line.len == 0) {
-        const rendered = try renderVisualLine(allocator, "", cursor_offset, padding_x, width);
+        const rendered = try renderVisualLine(allocator, theme, "", cursor_offset, padding_x, width);
         defer allocator.free(rendered);
         try component_mod.appendOwnedLine(lines, allocator, rendered);
         return;
@@ -611,7 +635,7 @@ fn appendWrappedLogicalLine(
     while (cursor < line.len) {
         const cluster = ansi.nextDisplayCluster(line, cursor);
         if (segment_width > 0 and segment_width + cluster.width > content_width) {
-            try appendWrappedSegment(allocator, line, segment_start, cursor, cursor_offset, padding_x, width, false, lines);
+            try appendWrappedSegment(allocator, theme, line, segment_start, cursor, cursor_offset, padding_x, width, false, lines);
             segment_start = cursor;
             segment_width = 0;
         }
@@ -620,11 +644,12 @@ fn appendWrappedLogicalLine(
         cursor = cluster.end;
     }
 
-    try appendWrappedSegment(allocator, line, segment_start, line.len, cursor_offset, padding_x, width, true, lines);
+    try appendWrappedSegment(allocator, theme, line, segment_start, line.len, cursor_offset, padding_x, width, true, lines);
 }
 
 fn appendWrappedSegment(
     allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
     line: []const u8,
     segment_start: usize,
     segment_end: usize,
@@ -642,42 +667,100 @@ fn appendWrappedSegment(
     else
         null;
 
-    const rendered = try renderVisualLine(allocator, line[segment_start..segment_end], segment_cursor, padding_x, width);
+    const rendered = try renderVisualLine(allocator, theme, line[segment_start..segment_end], segment_cursor, padding_x, width);
     defer allocator.free(rendered);
     try component_mod.appendOwnedLine(lines, allocator, rendered);
 }
 
 fn renderVisualLine(
     allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
     line: []const u8,
     cursor_offset: ?usize,
     padding_x: usize,
     width: usize,
 ) std.mem.Allocator.Error![]u8 {
+    if (theme == null) {
+        var builder = std.ArrayList(u8).empty;
+        errdefer builder.deinit(allocator);
+
+        try builder.appendNTimes(allocator, ' ', padding_x);
+
+        if (cursor_offset) |offset| {
+            const clamped = @min(offset, line.len);
+            try builder.appendSlice(allocator, line[0..clamped]);
+            if (clamped < line.len) {
+                const cluster = ansi.nextDisplayCluster(line, clamped);
+                try builder.appendSlice(allocator, "\x1b[7m");
+                try builder.appendSlice(allocator, line[clamped..cluster.end]);
+                try builder.appendSlice(allocator, "\x1b[0m");
+                try builder.appendSlice(allocator, line[cluster.end..]);
+            } else {
+                try builder.appendSlice(allocator, "\x1b[7m \x1b[0m");
+            }
+        } else {
+            try builder.appendSlice(allocator, line);
+        }
+
+        const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, width);
+        builder.deinit(allocator);
+        return padded;
+    }
+
+    const active_theme = theme.?;
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
 
-    try builder.appendNTimes(allocator, ' ', padding_x);
+    if (padding_x > 0) {
+        const left_padding = try allocator.alloc(u8, padding_x);
+        defer allocator.free(left_padding);
+        @memset(left_padding, ' ');
+        const themed_padding = try active_theme.applyAlloc(allocator, .editor, left_padding);
+        defer allocator.free(themed_padding);
+        try builder.appendSlice(allocator, themed_padding);
+    }
 
     if (cursor_offset) |offset| {
         const clamped = @min(offset, line.len);
-        try builder.appendSlice(allocator, line[0..clamped]);
+        if (clamped > 0) {
+            const before_cursor = try active_theme.applyAlloc(allocator, .editor, line[0..clamped]);
+            defer allocator.free(before_cursor);
+            try builder.appendSlice(allocator, before_cursor);
+        }
         if (clamped < line.len) {
             const cluster = ansi.nextDisplayCluster(line, clamped);
-            try builder.appendSlice(allocator, "\x1b[7m");
-            try builder.appendSlice(allocator, line[clamped..cluster.end]);
-            try builder.appendSlice(allocator, "\x1b[0m");
-            try builder.appendSlice(allocator, line[cluster.end..]);
+            const cursor_text = try active_theme.applyAlloc(allocator, .editor_cursor, line[clamped..cluster.end]);
+            defer allocator.free(cursor_text);
+            try builder.appendSlice(allocator, cursor_text);
+            if (cluster.end < line.len) {
+                const after_cursor = try active_theme.applyAlloc(allocator, .editor, line[cluster.end..]);
+                defer allocator.free(after_cursor);
+                try builder.appendSlice(allocator, after_cursor);
+            }
         } else {
-            try builder.appendSlice(allocator, "\x1b[7m \x1b[0m");
+            const cursor_space = try active_theme.applyAlloc(allocator, .editor_cursor, " ");
+            defer allocator.free(cursor_space);
+            try builder.appendSlice(allocator, cursor_space);
         }
     } else {
-        try builder.appendSlice(allocator, line);
+        if (line.len > 0) {
+            const themed_line = try active_theme.applyAlloc(allocator, .editor, line);
+            defer allocator.free(themed_line);
+            try builder.appendSlice(allocator, themed_line);
+        }
     }
 
-    const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, width);
-    builder.deinit(allocator);
-    return padded;
+    const trailing_width = if (width > ansi.visibleWidth(builder.items)) width - ansi.visibleWidth(builder.items) else 0;
+    if (trailing_width > 0) {
+        const trailing = try allocator.alloc(u8, trailing_width);
+        defer allocator.free(trailing);
+        @memset(trailing, ' ');
+        const themed_trailing = try active_theme.applyAlloc(allocator, .editor, trailing);
+        defer allocator.free(themed_trailing);
+        try builder.appendSlice(allocator, themed_trailing);
+    }
+
+    return builder.toOwnedSlice(allocator);
 }
 
 fn deleteRange(buffer: *std.ArrayList(u8), start: usize, end: usize) void {
@@ -1122,4 +1205,31 @@ test "editor cursor column uses display width for wide graphemes" {
 
     try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("你🙂a"));
     try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 5 }, editor.cursorPosition());
+}
+
+test "editor applies theme colors to content and autocomplete" {
+    const allocator = std.testing.allocator;
+
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    editor.setTheme(&theme);
+    try editor.setAutocompleteItems(&[_]select_list.SelectItem{
+        .{ .value = "apple", .label = "apple" },
+        .{ .value = "apricot", .label = "apricot" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("a") });
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+    try editor.renderInto(allocator, 12, &lines);
+
+    var saw_ansi = false;
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line, "\x1b[") != null) saw_ansi = true;
+    }
+    try std.testing.expect(saw_ansi);
 }

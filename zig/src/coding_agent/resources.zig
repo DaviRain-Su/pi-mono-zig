@@ -1,4 +1,6 @@
 const std = @import("std");
+const tui = @import("tui");
+const theme_mod = tui.theme;
 
 pub const SourceScope = enum {
     temporary,
@@ -197,93 +199,11 @@ pub const PromptTemplate = struct {
     }
 };
 
-pub const ThemeToken = enum(u8) {
-    welcome,
-    user,
-    assistant,
-    tool_call,
-    tool_result,
-    @"error",
-    status,
-    footer,
-    prompt,
-};
-
-pub const StyleSpec = struct {
-    fg: ?[]u8 = null,
-    bg: ?[]u8 = null,
-    bold: bool = false,
-    italic: bool = false,
-    underline: bool = false,
-
-    fn clone(self: StyleSpec, allocator: std.mem.Allocator) !StyleSpec {
-        return .{
-            .fg = if (self.fg) |value| try allocator.dupe(u8, value) else null,
-            .bg = if (self.bg) |value| try allocator.dupe(u8, value) else null,
-            .bold = self.bold,
-            .italic = self.italic,
-            .underline = self.underline,
-        };
-    }
-
-    fn deinit(self: *StyleSpec, allocator: std.mem.Allocator) void {
-        if (self.fg) |value| allocator.free(value);
-        if (self.bg) |value| allocator.free(value);
-        self.* = .{};
-    }
-};
-
-pub const Theme = struct {
-    name: []u8,
-    source_path: ?[]u8 = null,
-    source_info: ?SourceInfo = null,
-    styles: [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec = defaultThemeStyles(),
-
-    pub fn initDefault(allocator: std.mem.Allocator) !Theme {
-        return .{
-            .name = try allocator.dupe(u8, "default"),
-        };
-    }
-
-    pub fn clone(self: Theme, allocator: std.mem.Allocator) !Theme {
-        var styles = defaultThemeStyles();
-        for (&styles, self.styles) |*target, source| {
-            target.* = try source.clone(allocator);
-        }
-        return .{
-            .name = try allocator.dupe(u8, self.name),
-            .source_path = if (self.source_path) |value| try allocator.dupe(u8, value) else null,
-            .source_info = if (self.source_info) |value| try value.clone(allocator) else null,
-            .styles = styles,
-        };
-    }
-
-    pub fn deinit(self: *Theme, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        if (self.source_path) |value| allocator.free(value);
-        if (self.source_info) |*value| value.deinit(allocator);
-        for (&self.styles) |*style| style.deinit(allocator);
-        self.* = undefined;
-    }
-
-    pub fn applyAlloc(self: *const Theme, allocator: std.mem.Allocator, token: ThemeToken, text: []const u8) ![]u8 {
-        const style = self.styles[@intFromEnum(token)];
-        if (style.fg == null and style.bg == null and !style.bold and !style.italic and !style.underline) {
-            return allocator.dupe(u8, text);
-        }
-
-        var builder = std.ArrayList(u8).empty;
-        errdefer builder.deinit(allocator);
-        if (style.bold) try builder.appendSlice(allocator, "\x1b[1m");
-        if (style.italic) try builder.appendSlice(allocator, "\x1b[3m");
-        if (style.underline) try builder.appendSlice(allocator, "\x1b[4m");
-        if (style.fg) |value| try appendColorAnsi(allocator, &builder, value, true);
-        if (style.bg) |value| try appendColorAnsi(allocator, &builder, value, false);
-        try builder.appendSlice(allocator, text);
-        try builder.appendSlice(allocator, "\x1b[0m");
-        return try builder.toOwnedSlice(allocator);
-    }
-};
+pub const ThemeColor = theme_mod.ThemeColor;
+pub const ThemeToken = theme_mod.ThemeToken;
+pub const StyleSpec = theme_mod.StyleSpec;
+pub const ThemeColors = theme_mod.ThemeColors;
+pub const Theme = theme_mod.Theme;
 
 pub const ResourceBundle = struct {
     extensions: []LoadedExtension,
@@ -482,14 +402,19 @@ pub fn loadResourceBundle(
 
     var all_themes = std.ArrayList(Theme).empty;
     errdefer deinitThemesList(allocator, &all_themes);
-    try all_themes.append(allocator, try Theme.initDefault(allocator));
     for (themes) |theme| {
         try all_themes.append(allocator, theme);
     }
     allocator.free(themes);
+    if (findThemeIndex(all_themes.items, "dark") == null) {
+        try all_themes.append(allocator, try Theme.initDefault(allocator));
+    }
+    if (findThemeIndex(all_themes.items, "light") == null) {
+        try all_themes.append(allocator, try Theme.initLight(allocator));
+    }
 
     const selected_name = options.project.theme orelse options.global.theme;
-    const selected_index = findThemeIndex(all_themes.items, selected_name) orelse 0;
+    const selected_index = findThemeIndex(all_themes.items, selected_name) orelse findThemeIndex(all_themes.items, "dark") orelse 0;
 
     return .{
         .extensions = try extensions.toOwnedSlice(allocator),
@@ -645,6 +570,83 @@ fn defaultThemeStyles() [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec {
     var styles: [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec = undefined;
     for (&styles) |*style| style.* = .{};
     return styles;
+}
+
+const StyleTemplate = struct {
+    fg: ?[]const u8 = null,
+    bg: ?[]const u8 = null,
+    bold: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+
+    fn owned(self: StyleTemplate, allocator: std.mem.Allocator) !StyleSpec {
+        return .{
+            .fg = if (self.fg) |value| try allocator.dupe(u8, value) else null,
+            .bg = if (self.bg) |value| try allocator.dupe(u8, value) else null,
+            .bold = self.bold,
+            .italic = self.italic,
+            .underline = self.underline,
+        };
+    }
+};
+
+const PaletteTemplate = struct {
+    primary: []const u8,
+    secondary: []const u8,
+    success: []const u8,
+    warning: []const u8,
+    @"error": []const u8,
+    background: []const u8,
+    foreground: []const u8,
+    border: []const u8,
+    muted: []const u8,
+};
+
+fn defaultDarkPalette() PaletteTemplate {
+    return .{
+        .primary = "#7aa2f7",
+        .secondary = "#bb9af7",
+        .success = "#9ece6a",
+        .warning = "#e0af68",
+        .@"error" = "#f7768e",
+        .background = "#1a1b26",
+        .foreground = "#c0caf5",
+        .border = "#414868",
+        .muted = "#7f849c",
+    };
+}
+
+fn defaultLightPalette() PaletteTemplate {
+    return .{
+        .primary = "#3451b2",
+        .secondary = "#6f42c1",
+        .success = "#2f8f4e",
+        .warning = "#a05a00",
+        .@"error" = "#c1392b",
+        .background = "#f6f8fa",
+        .foreground = "#1f2328",
+        .border = "#afb8c1",
+        .muted = "#57606a",
+    };
+}
+
+fn initNamed(allocator: std.mem.Allocator, name: []const u8, palette: PaletteTemplate) !Theme {
+    var theme = Theme{
+        .name = try allocator.dupe(u8, name),
+    };
+    errdefer theme.deinit(allocator);
+
+    try theme.setColor(allocator, .primary, palette.primary);
+    try theme.setColor(allocator, .secondary, palette.secondary);
+    try theme.setColor(allocator, .success, palette.success);
+    try theme.setColor(allocator, .warning, palette.warning);
+    try theme.setColor(allocator, .@"error", palette.@"error");
+    try theme.setColor(allocator, .background, palette.background);
+    try theme.setColor(allocator, .foreground, palette.foreground);
+    try theme.setColor(allocator, .border, palette.border);
+    try theme.setColor(allocator, .muted, palette.muted);
+    try theme.applyDerivedStyles(allocator);
+    return theme;
 }
 
 const ParsedSource = union(enum) {
@@ -1202,17 +1204,35 @@ fn loadThemeFromFile(allocator: std.mem.Allocator, io: std.Io, resource: Resolve
     defer parsed.deinit();
     if (parsed.value != .object) return null;
 
-    var theme = Theme{
-        .name = try allocator.dupe(u8, trimExtension(std.fs.path.basename(resource.path), ".json")),
-        .source_path = try allocator.dupe(u8, resource.path),
-        .source_info = try resource.source_info.clone(allocator),
-    };
+    const base_theme_name = if (parsed.value.object.get("base")) |value|
+        if (value == .string) value.string else "dark"
+    else
+        "dark";
+
+    var theme = if (std.mem.eql(u8, base_theme_name, "light"))
+        try Theme.initLight(allocator)
+    else
+        try Theme.initDefault(allocator);
     errdefer theme.deinit(allocator);
+    allocator.free(theme.name);
+    theme.name = try allocator.dupe(u8, trimExtension(std.fs.path.basename(resource.path), ".json"));
 
     if (parsed.value.object.get("name")) |value| {
         if (value == .string) {
             allocator.free(theme.name);
             theme.name = try allocator.dupe(u8, value.string);
+        }
+    }
+
+    if (parsed.value.object.get("colors")) |value| {
+        if (value == .object) {
+            var iterator = value.object.iterator();
+            while (iterator.next()) |entry| {
+                const color = parseThemeColor(entry.key_ptr.*) orelse continue;
+                if (entry.value_ptr.* != .string) continue;
+                try theme.setColor(allocator, color, entry.value_ptr.string);
+            }
+            try theme.applyDerivedStyles(allocator);
         }
     }
 
@@ -1225,10 +1245,16 @@ fn loadThemeFromFile(allocator: std.mem.Allocator, io: std.Io, resource: Resolve
                 const object = entry.value_ptr.object;
                 var style = &theme.styles[@intFromEnum(token)];
                 if (object.get("fg")) |field| {
-                    if (field == .string) style.fg = try allocator.dupe(u8, field.string);
+                    if (field == .string) {
+                        if (style.fg) |existing| allocator.free(existing);
+                        style.fg = try allocator.dupe(u8, field.string);
+                    }
                 }
                 if (object.get("bg")) |field| {
-                    if (field == .string) style.bg = try allocator.dupe(u8, field.string);
+                    if (field == .string) {
+                        if (style.bg) |existing| allocator.free(existing);
+                        style.bg = try allocator.dupe(u8, field.string);
+                    }
                 }
                 if (object.get("bold")) |field| {
                     if (field == .bool) style.bold = field.bool;
@@ -1421,6 +1447,38 @@ fn parseThemeToken(name: []const u8) ?ThemeToken {
     if (std.mem.eql(u8, name, "status")) return .status;
     if (std.mem.eql(u8, name, "footer")) return .footer;
     if (std.mem.eql(u8, name, "prompt")) return .prompt;
+    if (std.mem.eql(u8, name, "boxBorder")) return .box_border;
+    if (std.mem.eql(u8, name, "text")) return .text;
+    if (std.mem.eql(u8, name, "editor")) return .editor;
+    if (std.mem.eql(u8, name, "editorCursor")) return .editor_cursor;
+    if (std.mem.eql(u8, name, "selectSelected")) return .select_selected;
+    if (std.mem.eql(u8, name, "selectDescription")) return .select_description;
+    if (std.mem.eql(u8, name, "selectScroll")) return .select_scroll;
+    if (std.mem.eql(u8, name, "selectEmpty")) return .select_empty;
+    if (std.mem.eql(u8, name, "markdownText")) return .markdown_text;
+    if (std.mem.eql(u8, name, "markdownHeading")) return .markdown_heading;
+    if (std.mem.eql(u8, name, "markdownLink")) return .markdown_link;
+    if (std.mem.eql(u8, name, "markdownCode")) return .markdown_code;
+    if (std.mem.eql(u8, name, "markdownCodeBorder")) return .markdown_code_border;
+    if (std.mem.eql(u8, name, "markdownQuote")) return .markdown_quote;
+    if (std.mem.eql(u8, name, "markdownQuoteBorder")) return .markdown_quote_border;
+    if (std.mem.eql(u8, name, "markdownListBullet")) return .markdown_list_bullet;
+    if (std.mem.eql(u8, name, "markdownRule")) return .markdown_rule;
+    if (std.mem.eql(u8, name, "overlayTitle")) return .overlay_title;
+    if (std.mem.eql(u8, name, "overlayHint")) return .overlay_hint;
+    return null;
+}
+
+fn parseThemeColor(name: []const u8) ?ThemeColor {
+    if (std.mem.eql(u8, name, "primary")) return .primary;
+    if (std.mem.eql(u8, name, "secondary")) return .secondary;
+    if (std.mem.eql(u8, name, "success")) return .success;
+    if (std.mem.eql(u8, name, "warning")) return .warning;
+    if (std.mem.eql(u8, name, "error")) return .@"error";
+    if (std.mem.eql(u8, name, "background")) return .background;
+    if (std.mem.eql(u8, name, "foreground")) return .foreground;
+    if (std.mem.eql(u8, name, "border")) return .border;
+    if (std.mem.eql(u8, name, "muted")) return .muted;
     return null;
 }
 
@@ -1823,4 +1881,74 @@ test "loadResourceBundle loads skills templates and themes with selected theme" 
     defer allocator.free(styled);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[1m") != null);
     try std.testing.expect(std.mem.indexOf(u8, styled, "Pi:") != null);
+}
+
+test "default themes include dark and light palettes" {
+    const allocator = std.testing.allocator;
+
+    var dark = try Theme.initDefault(allocator);
+    defer dark.deinit(allocator);
+    var light = try Theme.initLight(allocator);
+    defer light.deinit(allocator);
+
+    try std.testing.expectEqualStrings("dark", dark.name);
+    try std.testing.expectEqualStrings("light", light.name);
+
+    const dark_prompt = try dark.applyAlloc(allocator, .prompt, "> ");
+    defer allocator.free(dark_prompt);
+    const light_prompt = try light.applyAlloc(allocator, .prompt, "> ");
+    defer allocator.free(light_prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, dark_prompt, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, light_prompt, "\x1b[") != null);
+}
+
+test "theme files can override palette colors and component tokens" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dawn.json",
+        .data =
+        \\{
+        \\  "name": "dawn",
+        \\  "base": "light",
+        \\  "colors": {
+        \\    "primary": "#112233",
+        \\    "background": "#faf4ed",
+        \\    "foreground": "#302d41",
+        \\    "border": "#9988aa"
+        \\  },
+        \\  "tokens": {
+        \\    "overlayTitle": { "underline": true }
+        \\  }
+        \\}
+        ,
+    });
+
+    const path = try makeTmpPath(allocator, tmp, "dawn.json");
+    defer allocator.free(path);
+
+    var resource = ResolvedResource{
+        .path = try allocator.dupe(u8, path),
+        .enabled = true,
+        .source_info = .{
+            .path = try allocator.dupe(u8, path),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .user,
+            .origin = .top_level,
+            .base_dir = null,
+        },
+    };
+    defer resource.deinit(allocator);
+
+    var theme = (try loadThemeFromFile(allocator, std.testing.io, resource)).?;
+    defer theme.deinit(allocator);
+
+    try std.testing.expectEqualStrings("dawn", theme.name);
+    const overlay_title = theme.styles[@intFromEnum(ThemeToken.overlay_title)];
+    try std.testing.expect(overlay_title.underline);
+    try std.testing.expectEqualStrings("#112233", theme.colors.primary.?);
+    try std.testing.expectEqualStrings("#9988aa", theme.colors.border.?);
 }
