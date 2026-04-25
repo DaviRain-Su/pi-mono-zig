@@ -386,7 +386,7 @@ pub const SimpleStreamOptions = struct {
             .anthropic_effort = null,
             .anthropic_interleaved_thinking = null,
             .anthropic_tool_choice = null,
-            .responses_reasoning_effort = null,
+            .responses_reasoning_effort = self.reasoning,
             .mistral_prompt_mode = self.mistral_prompt_mode,
             .mistral_reasoning_effort = self.mistral_reasoning_effort,
         };
