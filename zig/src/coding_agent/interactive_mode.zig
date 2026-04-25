@@ -3,6 +3,7 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const tui = @import("tui");
+const auth = @import("auth.zig");
 const config_mod = @import("config.zig");
 const keybindings_mod = @import("keybindings.zig");
 const provider_config = @import("provider_config.zig");
@@ -82,7 +83,7 @@ const ASSISTANT_PREFIX = "Pi:";
 const SlashCommandKind = enum {
     settings,
     model,
-    @"import",
+    import,
     share,
     copy,
     name,
@@ -127,8 +128,8 @@ const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "fork", .description = "Create a new fork from the latest user message" },
     .{ .name = "clone", .description = "Duplicate the current session at the current position" },
     .{ .name = "tree", .description = "Navigate the session tree" },
-    .{ .name = "login", .description = "Show authentication guidance" },
-    .{ .name = "logout", .description = "Clear stored authentication for the current provider" },
+    .{ .name = "login", .description = "Log into a provider", .argument_hint = "<provider>" },
+    .{ .name = "logout", .description = "Remove stored authentication", .argument_hint = "<provider>" },
     .{ .name = "new", .description = "Start a fresh session" },
     .{ .name = "compact", .description = "Manually compact the session context", .argument_hint = "<instructions>" },
     .{ .name = "resume", .description = "Resume a different session" },
@@ -432,6 +433,7 @@ const SelectorOverlay = union(enum) {
     session: SessionOverlay,
     model: ModelOverlay,
     tree: TreeOverlay,
+    auth: AuthOverlay,
 
     fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -439,6 +441,7 @@ const SelectorOverlay = union(enum) {
             .session => |*overlay| overlay.deinit(allocator),
             .model => |*overlay| overlay.deinit(allocator),
             .tree => |*overlay| overlay.deinit(allocator),
+            .auth => |*overlay| overlay.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -449,6 +452,7 @@ const SelectorOverlay = union(enum) {
             .session => "Session selector",
             .model => "Model selector",
             .tree => "Session tree",
+            .auth => if (self.auth.mode == .login) "Login" else "Logout",
         };
     }
 
@@ -465,6 +469,7 @@ const SelectorOverlay = union(enum) {
             .session => &self.session.list,
             .model => &self.model.list,
             .tree => &self.tree.list,
+            .auth => &self.auth.list,
         };
     }
 };
@@ -554,6 +559,73 @@ const TreeOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+const AuthOverlayMode = enum {
+    login,
+    logout,
+};
+
+const AuthChoice = struct {
+    provider_id: []u8,
+    provider_name: []u8,
+};
+
+const AuthOverlay = struct {
+    mode: AuthOverlayMode,
+    choices: []AuthChoice,
+    items: []tui.SelectItem,
+    list: tui.SelectList,
+
+    fn deinit(self: *AuthOverlay, allocator: std.mem.Allocator) void {
+        for (self.choices) |choice| {
+            allocator.free(choice.provider_id);
+            allocator.free(choice.provider_name);
+        }
+        allocator.free(self.choices);
+        for (self.items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+const AuthFlow = union(enum) {
+    browser_redirect: PendingBrowserRedirect,
+    google_project: PendingGoogleProject,
+    copilot_device: auth.CopilotDeviceLogin,
+
+    fn deinit(self: *AuthFlow, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .browser_redirect => |*value| value.deinit(allocator),
+            .google_project => |*value| value.deinit(allocator),
+            .copilot_device => |*value| value.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+const PendingBrowserRedirect = struct {
+    session: auth.BrowserLoginSession,
+
+    fn deinit(self: *PendingBrowserRedirect, allocator: std.mem.Allocator) void {
+        self.session.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const PendingGoogleProject = struct {
+    provider_id: []const u8 = "google-gemini-cli",
+    provider_name: []const u8 = "Google Cloud Code Assist (Gemini CLI)",
+    exchange: auth.GoogleExchangeResult,
+
+    fn deinit(self: *PendingGoogleProject, allocator: std.mem.Allocator) void {
+        self.exchange.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -994,6 +1066,9 @@ pub fn runInteractiveMode(
     var overlay: ?SelectorOverlay = null;
     defer if (overlay) |*value| value.deinit(allocator);
 
+    var auth_flow: ?AuthFlow = null;
+    defer if (auth_flow) |*value| value.deinit(allocator);
+
     var prompt_worker: PromptWorker = undefined;
     var prompt_worker_active = false;
     defer if (prompt_worker_active) {
@@ -1051,6 +1126,7 @@ pub fn runInteractiveMode(
                         &app_state,
                         &editor,
                         &overlay,
+                        &auth_flow,
                         &prompt_worker,
                         &prompt_worker_active,
                         subscriber,
@@ -1075,6 +1151,7 @@ pub fn runInteractiveMode(
                 &app_state,
                 &editor,
                 &overlay,
+                &auth_flow,
                 &prompt_worker,
                 &prompt_worker_active,
                 subscriber,
@@ -1097,6 +1174,7 @@ pub fn runInteractiveMode(
                         &app_state,
                         &editor,
                         &overlay,
+                        &auth_flow,
                         &prompt_worker,
                         &prompt_worker_active,
                         subscriber,
@@ -1337,6 +1415,7 @@ fn handleInputKey(
     app_state: *AppState,
     editor: *tui.Editor,
     overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
     prompt_worker: *PromptWorker,
     prompt_worker_active: *bool,
     subscriber: agent.AgentSubscriber,
@@ -1412,12 +1491,86 @@ fn handleInputKey(
                             try navigateTree(session, tree_overlay.choices[index].entry_id, app_state);
                         }
                     },
+                    .auth => |auth_overlay| switch (auth_overlay.mode) {
+                        .login => try beginLoginFlow(
+                            allocator,
+                            io,
+                            auth_overlay.choices[index].provider_id,
+                            app_state,
+                            auth_flow,
+                        ),
+                        .logout => try logoutProviderById(
+                            allocator,
+                            io,
+                            env_map,
+                            session,
+                            current_provider,
+                            auth_overlay.choices[index].provider_id,
+                            options,
+                            app_state,
+                            live_resources,
+                        ),
+                    },
                 }
                 overlay_value.deinit(allocator);
                 overlay.* = null;
                 return;
             },
         }
+    }
+
+    if (auth_flow.* != null) {
+        if (resolveAppAction(live_resources.keybindings, key)) |action| {
+            if (action == .exit) {
+                should_exit.* = true;
+                if (prompt_worker_active.*) session.agent.abort();
+                return;
+            }
+        }
+
+        switch (key) {
+            .escape => {
+                cancelAuthFlow(allocator, auth_flow, app_state) catch {};
+                clearEditor(editor);
+                return;
+            },
+            .enter => {
+                if (editor.isShowingAutocomplete()) {
+                    _ = try editor.handleKey(key);
+                    return;
+                }
+                const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
+                submitAuthFlowInput(
+                    allocator,
+                    io,
+                    env_map,
+                    trimmed,
+                    session,
+                    current_provider,
+                    options,
+                    app_state,
+                    editor,
+                    auth_flow,
+                    live_resources,
+                ) catch |err| {
+                    const message = try std.fmt.allocPrint(allocator, "Authentication failed: {s}", .{@errorName(err)});
+                    defer allocator.free(message);
+                    try app_state.appendError(message);
+                };
+                return;
+            },
+            else => {},
+        }
+
+        const handled_auth = try editor.handleKey(key);
+        switch (handled_auth) {
+            .exit => {
+                should_exit.* = true;
+                if (prompt_worker_active.*) session.agent.abort();
+            },
+            else => {},
+        }
+        return;
     }
 
     if (key == .escape and editor.isShowingAutocomplete()) {
@@ -1467,6 +1620,7 @@ fn handleInputKey(
                 app_state,
                 editor,
                 overlay,
+                auth_flow,
                 prompt_worker,
                 prompt_worker_active,
                 subscriber,
@@ -1507,6 +1661,7 @@ fn submitEditorText(
     app_state: *AppState,
     editor: *tui.Editor,
     overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
     prompt_worker: *PromptWorker,
     prompt_worker_active: *bool,
     subscriber: agent.AgentSubscriber,
@@ -1526,6 +1681,7 @@ fn submitEditorText(
             tool_items,
             app_state,
             overlay,
+            auth_flow,
             prompt_worker_active,
             subscriber,
             should_exit,
@@ -1570,7 +1726,7 @@ fn parseSlashCommand(text: []const u8) ?SlashCommand {
 
     if (std.mem.eql(u8, command_name, "settings")) return .{ .kind = .settings, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "import")) return .{ .kind = .@"import", .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "import")) return .{ .kind = .import, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "share")) return .{ .kind = .share, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "copy")) return .{ .kind = .copy, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "name")) return .{ .kind = .name, .argument = argument, .raw = text };
@@ -1607,6 +1763,7 @@ fn handleSlashCommand(
     tool_items: []const agent.AgentTool,
     app_state: *AppState,
     overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
     prompt_worker_active: *bool,
     subscriber: agent.AgentSubscriber,
     should_exit: *bool,
@@ -1625,7 +1782,7 @@ fn handleSlashCommand(
             app_state,
             overlay,
         ),
-        .@"import" => {
+        .import => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before importing a session");
                 return;
@@ -1696,7 +1853,20 @@ fn handleSlashCommand(
             }
             try handleCompactSlashCommand(allocator, session, command.argument, app_state);
         },
-        .login => try handleLoginSlashCommand(allocator, session, live_resources.runtime_config, app_state),
+        .login => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before logging in");
+                return;
+            }
+            try handleLoginSlashCommand(
+                allocator,
+                io,
+                command.argument,
+                app_state,
+                overlay,
+                auth_flow,
+            );
+        },
         .logout => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before logging out");
@@ -1708,8 +1878,10 @@ fn handleSlashCommand(
                 env_map,
                 session,
                 current_provider,
+                command.argument,
                 options,
                 app_state,
+                overlay,
                 live_resources,
             );
         },
@@ -1996,36 +2168,342 @@ fn handleCompactSlashCommand(
 
 fn handleLoginSlashCommand(
     allocator: std.mem.Allocator,
-    session: *session_mod.AgentSession,
-    runtime_config: ?*const config_mod.RuntimeConfig,
+    io: std.Io,
+    argument: ?[]const u8,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+) !void {
+    if (argument) |provider_id| {
+        try beginLoginFlow(allocator, io, provider_id, app_state, auth_flow);
+        return;
+    }
+    overlay.* = try loadAuthOverlay(allocator, .login, null);
+}
+
+fn loadAuthOverlay(
+    allocator: std.mem.Allocator,
+    mode: AuthOverlayMode,
+    providers: ?[]const auth.ProviderInfo,
+) !SelectorOverlay {
+    const source = providers orelse auth.SUPPORTED_PROVIDERS[0..];
+    const choices = try allocator.alloc(AuthChoice, source.len);
+    errdefer {
+        for (choices) |choice| {
+            allocator.free(choice.provider_id);
+            allocator.free(choice.provider_name);
+        }
+        allocator.free(choices);
+    }
+
+    const items = try allocator.alloc(tui.SelectItem, source.len);
+    errdefer {
+        for (items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(items);
+    }
+
+    if (source.len == 0) {
+        return .{
+            .auth = .{
+                .mode = mode,
+                .choices = choices,
+                .items = items,
+                .list = .{
+                    .items = items,
+                    .max_visible = 8,
+                },
+            },
+        };
+    }
+
+    for (source, 0..) |provider, index| {
+        choices[index] = .{
+            .provider_id = try allocator.dupe(u8, provider.id),
+            .provider_name = try allocator.dupe(u8, provider.name),
+        };
+        items[index] = .{
+            .value = try allocator.dupe(u8, provider.id),
+            .label = try allocator.dupe(u8, provider.name),
+            .description = try allocator.dupe(
+                u8,
+                if (mode == .login) "OAuth login" else "Stored credentials",
+            ),
+        };
+    }
+
+    return .{
+        .auth = .{
+            .mode = mode,
+            .choices = choices,
+            .items = items,
+            .list = .{
+                .items = items,
+                .max_visible = 8,
+            },
+        },
+    };
+}
+
+fn beginLoginFlow(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    provider_id: []const u8,
+    app_state: *AppState,
+    auth_flow: *?AuthFlow,
+) !void {
+    if (auth.findSupportedProvider(provider_id)) |provider| {
+        if (auth_flow.*) |*existing| existing.deinit(allocator);
+        auth_flow.* = null;
+
+        if (std.mem.eql(u8, provider.id, "github-copilot")) {
+            const copilot = try auth.startGitHubCopilotLogin(allocator, io);
+            openBrowserBestEffort(io, copilot.verification_uri);
+
+            const intro = try std.fmt.allocPrint(
+                allocator,
+                "GitHub Copilot login started. Open {s} and enter code `{s}`.",
+                .{ copilot.verification_uri, copilot.user_code },
+            );
+            defer allocator.free(intro);
+            try app_state.appendInfo(intro);
+            try app_state.setStatus("Finish the browser login, then press Enter to complete authentication");
+            auth_flow.* = .{ .copilot_device = copilot };
+            return;
+        }
+
+        const browser_session = try auth.startBrowserLogin(allocator, io, provider.id);
+        openBrowserBestEffort(io, browser_session.auth_url);
+
+        const intro = try std.fmt.allocPrint(
+            allocator,
+            "{s} login started. Open the browser URL below and paste the final redirect URL into the prompt.",
+            .{provider.name},
+        );
+        defer allocator.free(intro);
+        try app_state.appendInfo(intro);
+        try app_state.appendInfo(browser_session.auth_url);
+        if (browser_session.kind == .google_gemini_cli) {
+            try app_state.appendInfo("You will be prompted for a Google Cloud project ID after the redirect is accepted.");
+        }
+        try app_state.setStatus("Paste the final redirect URL and press Enter, or Esc to cancel");
+        auth_flow.* = .{ .browser_redirect = .{ .session = browser_session } };
+        return;
+    }
+
+    const message = try std.fmt.allocPrint(allocator, "Unsupported login provider: {s}", .{provider_id});
+    defer allocator.free(message);
+    try app_state.appendError(message);
+}
+
+fn cancelAuthFlow(
+    allocator: std.mem.Allocator,
+    auth_flow: *?AuthFlow,
     app_state: *AppState,
 ) !void {
-    const auth_path = if (runtime_config) |config|
-        try std.fs.path.join(allocator, &[_][]const u8{ config.agent_dir, "auth.json" })
-    else
-        null;
-    defer if (auth_path) |path| allocator.free(path);
+    if (auth_flow.*) |*value| {
+        value.deinit(allocator);
+        auth_flow.* = null;
+    }
+    try app_state.setStatus("login cancelled");
+}
 
-    const message = if (auth_path) |path|
-        try std.fmt.allocPrint(
+fn submitAuthFlowInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    trimmed: []const u8,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    auth_flow: *?AuthFlow,
+    live_resources: *LiveResources,
+) !void {
+    const active = auth_flow.* orelse return;
+    switch (active) {
+        .browser_redirect => |redirect| {
+            if (trimmed.len == 0) {
+                try app_state.setStatus("Paste the redirect URL before pressing Enter");
+                return;
+            }
+
+            switch (redirect.session.kind) {
+                .anthropic => {
+                    var credential = try auth.completeBrowserLogin(allocator, io, &redirect.session, trimmed);
+                    defer credential.deinit(allocator);
+                    try persistLoginCredential(
+                        allocator,
+                        io,
+                        env_map,
+                        session,
+                        current_provider,
+                        redirect.session.provider_id,
+                        redirect.session.provider_name,
+                        &credential,
+                        options,
+                        app_state,
+                        auth_flow,
+                        live_resources,
+                    );
+                },
+                .google_gemini_cli => {
+                    const exchange = try auth.exchangeGoogleAuthorizationCode(allocator, io, &redirect.session, trimmed);
+                    if (auth_flow.*) |*value| value.deinit(allocator);
+                    auth_flow.* = .{ .google_project = .{ .exchange = exchange } };
+                    try app_state.setStatus("Enter the Google Cloud project ID for Code Assist and press Enter");
+                },
+            }
+        },
+        .google_project => |google_project| {
+            if (trimmed.len == 0) {
+                const env_project = env_map.get("GOOGLE_CLOUD_PROJECT") orelse env_map.get("GOOGLE_CLOUD_PROJECT_ID");
+                if (env_project == null) {
+                    try app_state.setStatus("Enter a Google Cloud project ID or set GOOGLE_CLOUD_PROJECT");
+                    return;
+                }
+            }
+
+            const project_id = if (trimmed.len > 0)
+                trimmed
+            else
+                env_map.get("GOOGLE_CLOUD_PROJECT") orelse env_map.get("GOOGLE_CLOUD_PROJECT_ID") orelse "";
+            var credential = try auth.finalizeGoogleCredential(allocator, &google_project.exchange, project_id);
+            defer credential.deinit(allocator);
+            try persistLoginCredential(
+                allocator,
+                io,
+                env_map,
+                session,
+                current_provider,
+                google_project.provider_id,
+                google_project.provider_name,
+                &credential,
+                options,
+                app_state,
+                auth_flow,
+                live_resources,
+            );
+        },
+        .copilot_device => |copilot| {
+            var result = try auth.pollGitHubCopilotLogin(allocator, io, &copilot);
+            defer result.deinit(allocator);
+            switch (result) {
+                .pending => |message| {
+                    try app_state.setStatus(message);
+                    return;
+                },
+                .completed => |oauth_credential| {
+                    var credential = auth.StoredCredential{ .oauth = .{
+                        .access = try allocator.dupe(u8, oauth_credential.access),
+                        .refresh = try allocator.dupe(u8, oauth_credential.refresh),
+                        .expires = oauth_credential.expires,
+                    } };
+                    defer credential.deinit(allocator);
+                    try persistLoginCredential(
+                        allocator,
+                        io,
+                        env_map,
+                        session,
+                        current_provider,
+                        copilot.provider_id,
+                        copilot.provider_name,
+                        &credential,
+                        options,
+                        app_state,
+                        auth_flow,
+                        live_resources,
+                    );
+                },
+            }
+        },
+    }
+
+    clearEditor(editor);
+}
+
+fn persistLoginCredential(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    provider_id: []const u8,
+    provider_name: []const u8,
+    credential: *const auth.StoredCredential,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    auth_flow: *?AuthFlow,
+    live_resources: *LiveResources,
+) !void {
+    const runtime_config = live_resources.runtime_config orelse {
+        try app_state.setStatus("Authentication storage is unavailable in this session");
+        return;
+    };
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+
+    try auth.upsertStoredCredential(allocator, io, auth_path, provider_id, credential);
+
+    if (auth_flow.*) |*value| value.deinit(allocator);
+    auth_flow.* = null;
+
+    _ = try live_resources.reload(allocator, io, env_map, options.cwd);
+
+    if (std.mem.eql(u8, session.agent.getModel().provider, provider_id)) {
+        const resolved = provider_config.resolveProviderConfig(
             allocator,
-            "Configure credentials for provider `{s}` via `--api-key`, provider environment variables, or `{s}`, then use `/reload`.",
-            .{ session.agent.getModel().provider, path },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "Configure credentials for provider `{s}` via `--api-key` or provider environment variables.",
-            .{session.agent.getModel().provider},
-        );
+            env_map,
+            provider_id,
+            session.agent.getModel().id,
+            overrideApiKeyForProvider(options, provider_id),
+            configuredApiKeyForProvider(live_resources.runtime_config, provider_id),
+        ) catch |err| {
+            const message = try std.fmt.allocPrint(allocator, "Saved credentials for {s}, but could not activate them: {s}", .{
+                provider_name,
+                provider_config.resolveProviderErrorMessage(err, provider_id),
+            });
+            defer allocator.free(message);
+            try app_state.appendError(message);
+            return;
+        };
+        current_provider.deinit(allocator);
+        current_provider.* = resolved;
+        session.setApiKey(resolved.api_key);
+    }
+
+    const message = try std.fmt.allocPrint(allocator, "Logged in to {s}. Credentials saved to {s}.", .{ provider_name, auth_path });
     defer allocator.free(message);
     try app_state.appendInfo(message);
+    try app_state.setStatus("logged in");
+}
+
+fn openBrowserBestEffort(io: std.Io, url: []const u8) void {
+    const argv = switch (builtin.os.tag) {
+        .macos => [_][]const u8{ "open", url },
+        .windows => [_][]const u8{ "cmd", "/c", "start", url },
+        else => [_][]const u8{ "xdg-open", url },
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    _ = child.wait(io) catch {};
 }
 
 const ClipboardCopyFn = *const fn (context: ?*anyopaque, io: std.Io, text: []const u8) anyerror!void;
 
 var clipboard_copy_context: ?*anyopaque = null;
 var clipboard_copy_fn: ClipboardCopyFn = defaultCopyTextToClipboard;
+var test_auth_flow: ?AuthFlow = null;
 
 fn loadSettingsOverlay(
     allocator: std.mem.Allocator,
@@ -2323,6 +2801,52 @@ fn handleLogoutSlashCommand(
     env_map: *const std.process.Environ.Map,
     session: *session_mod.AgentSession,
     current_provider: *provider_config.ResolvedProviderConfig,
+    argument: ?[]const u8,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    live_resources: *LiveResources,
+) !void {
+    const runtime_config = live_resources.runtime_config orelse {
+        try app_state.setStatus("Logout is unavailable in this session");
+        return;
+    };
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+
+    if (argument) |provider_id| {
+        try logoutProviderById(
+            allocator,
+            io,
+            env_map,
+            session,
+            current_provider,
+            provider_id,
+            options,
+            app_state,
+            live_resources,
+        );
+        return;
+    }
+
+    const providers = try auth.listStoredProviders(allocator, io, auth_path);
+    defer allocator.free(providers);
+    if (providers.len == 0) {
+        try app_state.setStatus("No providers logged in. Use /login first.");
+        return;
+    }
+
+    overlay.* = try loadAuthOverlay(allocator, .logout, providers);
+}
+
+fn logoutProviderById(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    provider_name: []const u8,
     options: RunInteractiveModeOptions,
     app_state: *AppState,
     live_resources: *LiveResources,
@@ -2332,35 +2856,38 @@ fn handleLogoutSlashCommand(
         return;
     };
 
-    const provider_name = try allocator.dupe(u8, session.agent.getModel().provider);
-    defer allocator.free(provider_name);
     const model_id = try allocator.dupe(u8, session.agent.getModel().id);
     defer allocator.free(model_id);
     const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "auth.json" });
     defer allocator.free(auth_path);
 
-    const removed = try removeStoredAuthToken(allocator, io, auth_path, provider_name);
-    try clearResolvedProviderApiKey(allocator, current_provider);
-    session.setApiKey(null);
+    const removed = try auth.removeStoredCredential(allocator, io, auth_path, provider_name);
+    const affects_current_provider = std.mem.eql(u8, session.agent.getModel().provider, provider_name);
+    if (affects_current_provider) {
+        try clearResolvedProviderApiKey(allocator, current_provider);
+        session.setApiKey(null);
+    }
 
     _ = try live_resources.reload(allocator, io, env_map, options.cwd);
 
-    const resolved = provider_config.resolveProviderConfig(
-        allocator,
-        env_map,
-        provider_name,
-        model_id,
-        overrideApiKeyForProvider(options, provider_name),
-        configuredApiKeyForProvider(live_resources.runtime_config, provider_name),
-    ) catch |err| switch (err) {
-        error.MissingApiKey => null,
-        else => return err,
-    };
+    if (affects_current_provider) {
+        const resolved = provider_config.resolveProviderConfig(
+            allocator,
+            env_map,
+            provider_name,
+            model_id,
+            overrideApiKeyForProvider(options, provider_name),
+            configuredApiKeyForProvider(live_resources.runtime_config, provider_name),
+        ) catch |err| switch (err) {
+            error.MissingApiKey => null,
+            else => return err,
+        };
 
-    if (resolved) |next_provider| {
-        current_provider.deinit(allocator);
-        current_provider.* = next_provider;
-        session.setApiKey(next_provider.api_key);
+        if (resolved) |next_provider| {
+            current_provider.deinit(allocator);
+            current_provider.* = next_provider;
+            session.setApiKey(next_provider.api_key);
+        }
     }
 
     const message = if (removed)
@@ -3384,6 +3911,7 @@ fn dispatchInputEvent(
     app_state: *AppState,
     editor: *tui.Editor,
     overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
     prompt_worker: *PromptWorker,
     prompt_worker_active: *bool,
     subscriber: agent.AgentSubscriber,
@@ -3405,6 +3933,7 @@ fn dispatchInputEvent(
             app_state,
             editor,
             overlay,
+            auth_flow,
             prompt_worker,
             prompt_worker_active,
             subscriber,
@@ -4497,6 +5026,7 @@ test "handleInputKey respects configured exit binding" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4519,6 +5049,7 @@ test "handleInputKey respects configured exit binding" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4595,6 +5126,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4620,6 +5152,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4654,6 +5187,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4673,7 +5207,7 @@ test "parseSlashCommand recognizes builtins and arguments" {
     try std.testing.expectEqualStrings("faux", model_command.argument.?);
 
     const import_command = parseSlashCommand("/import ./session.jsonl").?;
-    try std.testing.expectEqual(SlashCommandKind.@"import", import_command.kind);
+    try std.testing.expectEqual(SlashCommandKind.import, import_command.kind);
     try std.testing.expectEqualStrings("./session.jsonl", import_command.argument.?);
 
     const share_command = parseSlashCommand("/share").?;
@@ -4705,6 +5239,49 @@ test "parseSlashCommand recognizes builtins and arguments" {
 
     try std.testing.expect(parseSlashCommand("hello") == null);
     try std.testing.expect(parseSlashCommand("/unknown") == null);
+}
+
+test "handleLoginSlashCommand opens auth provider selector" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+
+    test_auth_flow = null;
+    try handleLoginSlashCommand(allocator, std.testing.io, null, &state, &overlay, &test_auth_flow);
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .auth);
+    try std.testing.expectEqual(AuthOverlayMode.login, overlay.?.auth.mode);
+    try std.testing.expectEqual(@as(usize, 3), overlay.?.auth.items.len);
+    try std.testing.expectEqualStrings("anthropic", overlay.?.auth.items[0].value);
+}
+
+test "beginLoginFlow starts anthropic oauth prompt state" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    test_auth_flow = null;
+    defer if (test_auth_flow) |*value| {
+        value.deinit(allocator);
+        test_auth_flow = null;
+    };
+
+    try beginLoginFlow(allocator, std.testing.io, "anthropic", &state, &test_auth_flow);
+
+    try std.testing.expect(test_auth_flow != null);
+    try std.testing.expect(test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.anthropic, test_auth_flow.?.browser_redirect.session.kind);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "You will be prompted") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Anthropic (Claude Pro/Max) login started") != null);
 }
 
 test "loadEditorAutocompleteItems includes slash command help text" {
@@ -4791,6 +5368,7 @@ test "handleInputKey opens settings overlay for slash settings command" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4867,6 +5445,7 @@ test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4939,6 +5518,7 @@ test "handleInputKey opens model overlay for slash model command" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5011,6 +5591,7 @@ test "handleInputKey reports unknown slash commands" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5084,6 +5665,7 @@ test "handleInputKey updates session name for slash name command" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5167,6 +5749,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5196,6 +5779,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5237,6 +5821,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5266,6 +5851,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5345,6 +5931,7 @@ test "submitEditorText resets editor autocomplete state after submit" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5436,6 +6023,7 @@ test "handleInputKey shows session stats for slash session command" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5593,6 +6181,7 @@ test "handleInputKey imports a session from an explicit jsonl path" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5684,6 +6273,7 @@ test "handleInputKey starts a fresh session for slash new command" {
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5785,6 +6375,7 @@ test "handleInputKey exports session transcript to explicit markdown and json pa
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -5814,6 +6405,7 @@ test "handleInputKey exports session transcript to explicit markdown and json pa
         &state,
         &editor,
         &overlay,
+        &test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -6071,6 +6663,95 @@ test "handleShareSlashCommand copies markdown transcript to the clipboard" {
     try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "share reply") != null);
 }
 
+test "handleLogoutSlashCommand opens selector for stored auth providers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        auth_path,
+        \\{
+        \\  "anthropic": {
+        \\    "type": "oauth",
+        \\    "access": "oauth-token",
+        \\    "refresh": "refresh-token",
+        \\    "expires": 1234
+        \\  },
+        \\  "github-copilot": {
+        \\    "type": "oauth",
+        \\    "access": "copilot-token",
+        \\    "refresh": "refresh-token",
+        \\    "expires": 1234
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+
+    try handleLogoutSlashCommand(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &session,
+        &current_provider,
+        null,
+        options,
+        &state,
+        &overlay,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .auth);
+    try std.testing.expectEqual(AuthOverlayMode.logout, overlay.?.auth.mode);
+    try std.testing.expectEqual(@as(usize, 2), overlay.?.auth.items.len);
+}
+
 test "handleLogoutSlashCommand removes stored auth for the current provider" {
     const allocator = std.testing.allocator;
 
@@ -6093,7 +6774,7 @@ test "handleLogoutSlashCommand removes stored auth for the current provider" {
         \\    "key": "logout-token"
         \\  }
         \\}
-        ,
+    ,
         true,
     );
 
@@ -6135,6 +6816,7 @@ test "handleLogoutSlashCommand removes stored auth for the current provider" {
     };
     var live_resources = LiveResources.init(options);
     defer live_resources.deinit(allocator);
+    var overlay: ?SelectorOverlay = null;
 
     try handleLogoutSlashCommand(
         allocator,
@@ -6142,8 +6824,10 @@ test "handleLogoutSlashCommand removes stored auth for the current provider" {
         &env_map,
         &session,
         &current_provider,
+        "openai",
         options,
         &state,
+        &overlay,
         &live_resources,
     );
 
