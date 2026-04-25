@@ -2,11 +2,6 @@ const std = @import("std");
 const ai = @import("ai");
 const common = @import("tools/common.zig");
 
-const ANTHROPIC_CLIENT_ID_B64 = "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl";
-const GOOGLE_CLIENT_ID_B64 = "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
-const GOOGLE_CLIENT_SECRET_B64 = "YOUR_GOOGLE_CLIENT_SECRET_HERE";
-const GITHUB_CLIENT_ID_B64 = "SXYxLmI1MDdhMDhjODdlY2ZlOTg=";
-
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_REDIRECT_URI = "http://localhost:53692/callback";
@@ -30,10 +25,22 @@ const COPILOT_USER_AGENT = "GitHubCopilotChat/0.35.0";
 const COPILOT_EDITOR_VERSION = "vscode/1.107.0";
 const COPILOT_PLUGIN_VERSION = "copilot-chat/0.35.0";
 const COPILOT_INTEGRATION_ID = "vscode-chat";
+const OAUTH_CONFIG_FILE_NAME = "oauth.json";
 const AUTH_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
     std.Io.File.Permissions.fromMode(0o600)
 else
     .default_file;
+
+pub const OAuthClientCredentials = struct {
+    client_id: []u8,
+    client_secret: ?[]u8 = null,
+
+    pub fn deinit(self: *OAuthClientCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.client_id);
+        if (self.client_secret) |client_secret| allocator.free(client_secret);
+        self.* = undefined;
+    }
+};
 
 pub const ProviderInfo = struct {
     id: []const u8,
@@ -82,10 +89,12 @@ pub const BrowserLoginSession = struct {
     kind: BrowserLoginKind,
     provider_id: []const u8,
     provider_name: []const u8,
+    oauth_client: OAuthClientCredentials,
     auth_url: []u8,
     verifier: []u8,
 
     pub fn deinit(self: *BrowserLoginSession, allocator: std.mem.Allocator) void {
+        self.oauth_client.deinit(allocator);
         allocator.free(self.auth_url);
         allocator.free(self.verifier);
         self.* = undefined;
@@ -95,6 +104,7 @@ pub const BrowserLoginSession = struct {
 pub const CopilotDeviceLogin = struct {
     provider_id: []const u8 = "github-copilot",
     provider_name: []const u8 = "GitHub Copilot",
+    oauth_client: OAuthClientCredentials,
     device_code: []u8,
     user_code: []u8,
     verification_uri: []u8,
@@ -102,6 +112,7 @@ pub const CopilotDeviceLogin = struct {
     expires_at_ms: i64,
 
     pub fn deinit(self: *CopilotDeviceLogin, allocator: std.mem.Allocator) void {
+        self.oauth_client.deinit(allocator);
         allocator.free(self.device_code);
         allocator.free(self.user_code);
         allocator.free(self.verification_uri);
@@ -141,21 +152,30 @@ pub fn findSupportedProvider(provider_id: []const u8) ?ProviderInfo {
     return null;
 }
 
-pub fn startBrowserLogin(allocator: std.mem.Allocator, io: std.Io, provider_id: []const u8) !BrowserLoginSession {
-    if (std.mem.eql(u8, provider_id, "anthropic")) return startAnthropicBrowserLogin(allocator, io);
-    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) return startGoogleBrowserLogin(allocator, io);
+pub fn startBrowserLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    provider_id: []const u8,
+) !BrowserLoginSession {
+    if (std.mem.eql(u8, provider_id, "anthropic")) return startAnthropicBrowserLogin(allocator, io, env_map);
+    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) return startGoogleBrowserLogin(allocator, io, env_map);
     return error.UnsupportedProvider;
 }
 
-pub fn startAnthropicBrowserLogin(allocator: std.mem.Allocator, io: std.Io) !BrowserLoginSession {
+pub fn startAnthropicBrowserLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+) !BrowserLoginSession {
     const provider = findSupportedProvider("anthropic").?;
     const verifier = try generatePkceVerifier(allocator, io);
     errdefer allocator.free(verifier);
     const challenge = try generatePkceChallenge(allocator, verifier);
     defer allocator.free(challenge);
-    const client_id = try decodeBase64String(allocator, ANTHROPIC_CLIENT_ID_B64);
-    defer allocator.free(client_id);
-    const encoded_client_id = try formEncode(allocator, client_id);
+    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, false);
+    errdefer oauth_client.deinit(allocator);
+    const encoded_client_id = try formEncode(allocator, oauth_client.client_id);
     defer allocator.free(encoded_client_id);
     const encoded_redirect_uri = try formEncode(allocator, ANTHROPIC_REDIRECT_URI);
     defer allocator.free(encoded_redirect_uri);
@@ -183,20 +203,25 @@ pub fn startAnthropicBrowserLogin(allocator: std.mem.Allocator, io: std.Io) !Bro
         .kind = .anthropic,
         .provider_id = provider.id,
         .provider_name = provider.name,
+        .oauth_client = oauth_client,
         .auth_url = auth_url,
         .verifier = verifier,
     };
 }
 
-pub fn startGoogleBrowserLogin(allocator: std.mem.Allocator, io: std.Io) !BrowserLoginSession {
+pub fn startGoogleBrowserLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+) !BrowserLoginSession {
     const provider = findSupportedProvider("google-gemini-cli").?;
     const verifier = try generatePkceVerifier(allocator, io);
     errdefer allocator.free(verifier);
     const challenge = try generatePkceChallenge(allocator, verifier);
     defer allocator.free(challenge);
-    const client_id = try decodeBase64String(allocator, GOOGLE_CLIENT_ID_B64);
-    defer allocator.free(client_id);
-    const encoded_client_id = try formEncode(allocator, client_id);
+    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, true);
+    errdefer oauth_client.deinit(allocator);
+    const encoded_client_id = try formEncode(allocator, oauth_client.client_id);
     defer allocator.free(encoded_client_id);
     const encoded_redirect_uri = try formEncode(allocator, GOOGLE_REDIRECT_URI);
     defer allocator.free(encoded_redirect_uri);
@@ -226,6 +251,7 @@ pub fn startGoogleBrowserLogin(allocator: std.mem.Allocator, io: std.Io) !Browse
         .kind = .google_gemini_cli,
         .provider_id = provider.id,
         .provider_name = provider.name,
+        .oauth_client = oauth_client,
         .auth_url = auth_url,
         .verifier = verifier,
     };
@@ -238,7 +264,7 @@ pub fn completeBrowserLogin(
     input: []const u8,
 ) !StoredCredential {
     return switch (session.kind) {
-        .anthropic => .{ .oauth = try exchangeAnthropicAuthorizationCode(allocator, io, session.verifier, input) },
+        .anthropic => .{ .oauth = try exchangeAnthropicAuthorizationCode(allocator, io, session, input) },
         .google_gemini_cli => return error.MissingProjectId,
     };
 }
@@ -258,13 +284,9 @@ pub fn exchangeGoogleAuthorizationCode(
     }
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
-    const client_id = try decodeBase64String(allocator, GOOGLE_CLIENT_ID_B64);
-    defer allocator.free(client_id);
-    const client_secret = try decodeBase64String(allocator, GOOGLE_CLIENT_SECRET_B64);
-    defer allocator.free(client_secret);
     const body = try buildFormBody(allocator, &.{
-        .{ .name = "client_id", .value = client_id },
-        .{ .name = "client_secret", .value = client_secret },
+        .{ .name = "client_id", .value = session.oauth_client.client_id },
+        .{ .name = "client_secret", .value = session.oauth_client.client_secret orelse return error.MissingOAuthClientSecret },
         .{ .name = "code", .value = code },
         .{ .name = "grant_type", .value = "authorization_code" },
         .{ .name = "redirect_uri", .value = GOOGLE_REDIRECT_URI },
@@ -306,12 +328,16 @@ pub fn finalizeGoogleCredential(
     };
 }
 
-pub fn startGitHubCopilotLogin(allocator: std.mem.Allocator, io: std.Io) !CopilotDeviceLogin {
+pub fn startGitHubCopilotLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+) !CopilotDeviceLogin {
     const provider = findSupportedProvider("github-copilot").?;
-    const client_id = try decodeBase64String(allocator, GITHUB_CLIENT_ID_B64);
-    defer allocator.free(client_id);
+    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, false);
+    errdefer oauth_client.deinit(allocator);
     const body = try buildFormBody(allocator, &.{
-        .{ .name = "client_id", .value = client_id },
+        .{ .name = "client_id", .value = oauth_client.client_id },
         .{ .name = "scope", .value = "read:user" },
     });
     defer allocator.free(body);
@@ -339,6 +365,7 @@ pub fn startGitHubCopilotLogin(allocator: std.mem.Allocator, io: std.Io) !Copilo
     return .{
         .provider_id = provider.id,
         .provider_name = provider.name,
+        .oauth_client = oauth_client,
         .device_code = try allocator.dupe(u8, device_code),
         .user_code = try allocator.dupe(u8, user_code),
         .verification_uri = try allocator.dupe(u8, verification_uri),
@@ -354,10 +381,8 @@ pub fn pollGitHubCopilotLogin(
 ) !CopilotPollResult {
     if (currentTimeMs(io) >= session.expires_at_ms) return error.AuthenticationExpired;
 
-    const client_id = try decodeBase64String(allocator, GITHUB_CLIENT_ID_B64);
-    defer allocator.free(client_id);
     const body = try buildFormBody(allocator, &.{
-        .{ .name = "client_id", .value = client_id },
+        .{ .name = "client_id", .value = session.oauth_client.client_id },
         .{ .name = "device_code", .value = session.device_code },
         .{ .name = "grant_type", .value = "urn:ietf:params:oauth:grant-type:device_code" },
     });
@@ -604,22 +629,161 @@ fn writeAuthObject(
     try atomic_file.replace(io);
 }
 
+pub fn formatOAuthClientConfigError(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider_id: []const u8,
+    err: anyerror,
+) !?[]u8 {
+    const handled = switch (err) {
+        error.MissingOAuthConfigFile, error.InvalidOAuthConfigFile, error.MissingOAuthClientConfig, error.MissingOAuthClientId, error.MissingOAuthClientSecret => true,
+        else => false,
+    };
+    if (!handled) return null;
+
+    const provider = findSupportedProvider(provider_id) orelse return null;
+    const oauth_path = try resolveOAuthConfigPath(allocator, env_map);
+    defer allocator.free(oauth_path);
+    const snippet = oauthConfigSnippet(provider_id);
+
+    const reason = switch (err) {
+        error.MissingOAuthConfigFile => "OAuth client credentials are not configured.",
+        error.InvalidOAuthConfigFile => "The OAuth client config file is not valid JSON.",
+        error.MissingOAuthClientConfig => "This provider is missing from the OAuth client config file.",
+        error.MissingOAuthClientId => "The provider config is missing client_id.",
+        error.MissingOAuthClientSecret => "The provider config is missing client_secret.",
+        else => unreachable,
+    };
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s} Create {s} with an entry for {s}, for example:\n{s}",
+        .{ reason, oauth_path, provider.name, snippet },
+    );
+}
+
+fn loadOAuthClientCredentials(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    provider_id: []const u8,
+    require_client_secret: bool,
+) !OAuthClientCredentials {
+    const oauth_path = try resolveOAuthConfigPath(allocator, env_map);
+    defer allocator.free(oauth_path);
+
+    const content = std.Io.Dir.readFileAlloc(.cwd(), io, oauth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingOAuthConfigFile,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.InvalidOAuthConfigFile;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidOAuthConfigFile;
+
+    const provider_object = findOAuthProviderObject(parsed.value.object, provider_id) orelse return error.MissingOAuthClientConfig;
+    const client_id = getObjectStringAny(provider_object, &.{ "client_id", "clientId" }) orelse return error.MissingOAuthClientId;
+    const client_secret = getObjectStringAny(provider_object, &.{ "client_secret", "clientSecret" });
+    if (require_client_secret and client_secret == null) return error.MissingOAuthClientSecret;
+
+    return .{
+        .client_id = try allocator.dupe(u8, client_id),
+        .client_secret = if (client_secret) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn resolveOAuthConfigPath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
+    const agent_dir = try resolveAgentDir(allocator, env_map);
+    defer allocator.free(agent_dir);
+    return std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CONFIG_FILE_NAME });
+}
+
+fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
+    if (env_map.get("PI_CODING_AGENT_DIR")) |value| {
+        return expandLeadingHome(allocator, env_map, value);
+    }
+
+    const base_dir = if (env_map.get("PI_CONFIG_DIR")) |value|
+        try expandLeadingHome(allocator, env_map, value)
+    else if (env_map.get("HOME")) |home|
+        try std.fs.path.join(allocator, &[_][]const u8{ home, ".pi" })
+    else
+        try allocator.dupe(u8, ".pi");
+    defer allocator.free(base_dir);
+
+    return std.fs.path.join(allocator, &[_][]const u8{ base_dir, "agent" });
+}
+
+fn expandLeadingHome(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, value: []const u8) ![]u8 {
+    const home = env_map.get("HOME") orelse return allocator.dupe(u8, value);
+    if (std.mem.eql(u8, value, "~")) return allocator.dupe(u8, home);
+    if (std.mem.startsWith(u8, value, "~/")) return std.fs.path.join(allocator, &[_][]const u8{ home, value[2..] });
+    return allocator.dupe(u8, value);
+}
+
+fn findOAuthProviderObject(root: std.json.ObjectMap, provider_id: []const u8) ?std.json.ObjectMap {
+    if (root.get(provider_id)) |value| {
+        if (value == .object) return value.object;
+    }
+
+    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
+        if (root.get("google")) |value| {
+            if (value == .object) return value.object;
+        }
+    }
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        if (root.get("github")) |value| {
+            if (value == .object) return value.object;
+        }
+    }
+
+    return null;
+}
+
+fn oauthConfigSnippet(provider_id: []const u8) []const u8 {
+    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
+        return
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "YOUR_GOOGLE_CLIENT_ID",
+        \\    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET"
+        \\  }
+        \\}
+        ;
+    }
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        return
+        \\{
+        \\  "github-copilot": {
+        \\    "client_id": "YOUR_GITHUB_CLIENT_ID"
+        \\  }
+        \\}
+        ;
+    }
+    return
+    \\{
+    \\  "anthropic": {
+    \\    "client_id": "YOUR_ANTHROPIC_CLIENT_ID"
+    \\  }
+    \\}
+    ;
+}
+
 fn exchangeAnthropicAuthorizationCode(
     allocator: std.mem.Allocator,
     io: std.Io,
-    verifier: []const u8,
+    session: *const BrowserLoginSession,
     input: []const u8,
 ) !OAuthCredential {
     const parsed = try parseAuthorizationInput(allocator, input);
     defer parsed.deinit(allocator);
 
     if (parsed.state) |state| {
-        if (!std.mem.eql(u8, state, verifier)) return error.InvalidOAuthState;
+        if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
     }
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
-    const client_id = try decodeBase64String(allocator, ANTHROPIC_CLIENT_ID_B64);
-    defer allocator.free(client_id);
 
     var payload = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     defer {
@@ -628,11 +792,11 @@ fn exchangeAnthropicAuthorizationCode(
     }
 
     try payload.put(allocator, try allocator.dupe(u8, "grant_type"), .{ .string = try allocator.dupe(u8, "authorization_code") });
-    try payload.put(allocator, try allocator.dupe(u8, "client_id"), .{ .string = try allocator.dupe(u8, client_id) });
+    try payload.put(allocator, try allocator.dupe(u8, "client_id"), .{ .string = try allocator.dupe(u8, session.oauth_client.client_id) });
     try payload.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, code) });
-    try payload.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, verifier) });
+    try payload.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, session.verifier) });
     try payload.put(allocator, try allocator.dupe(u8, "redirect_uri"), .{ .string = try allocator.dupe(u8, ANTHROPIC_REDIRECT_URI) });
-    try payload.put(allocator, try allocator.dupe(u8, "code_verifier"), .{ .string = try allocator.dupe(u8, verifier) });
+    try payload.put(allocator, try allocator.dupe(u8, "code_verifier"), .{ .string = try allocator.dupe(u8, session.verifier) });
 
     const payload_value: std.json.Value = .{ .object = payload };
     const json_body = try std.json.Stringify.valueAlloc(allocator, payload_value, .{});
@@ -853,14 +1017,6 @@ fn buildFormBody(allocator: std.mem.Allocator, fields: []const EncodedField) ![]
     return try list.toOwnedSlice(allocator);
 }
 
-fn decodeBase64String(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    const size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
-    const decoded = try allocator.alloc(u8, size);
-    errdefer allocator.free(decoded);
-    try std.base64.standard.Decoder.decode(decoded, encoded);
-    return decoded;
-}
-
 fn generatePkceVerifier(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var bytes: [32]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(@intCast(currentTimeMs(io)));
@@ -903,6 +1059,13 @@ fn getObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = object.get(key) orelse return null;
     if (value != .string) return null;
     return value.string;
+}
+
+fn getObjectStringAny(object: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (getObjectString(object, key)) |value| return value;
+    }
+    return null;
 }
 
 fn getObjectInt(object: std.json.ObjectMap, key: []const u8) ?i64 {
@@ -982,13 +1145,62 @@ fn mapHttpError(err: anyerror) anyerror {
 test "startAnthropicBrowserLogin builds a Claude OAuth URL" {
     const allocator = std.testing.allocator;
 
-    var session = try startAnthropicBrowserLogin(allocator, std.testing.io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
+    defer allocator.free(oauth_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        oauth_path,
+        \\{
+        \\  "anthropic": {
+        \\    "client_id": "anthropic-client-id"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startAnthropicBrowserLogin(allocator, std.testing.io, &env_map);
     defer session.deinit(allocator);
 
     try std.testing.expectEqual(BrowserLoginKind.anthropic, session.kind);
     try std.testing.expect(std.mem.startsWith(u8, session.auth_url, ANTHROPIC_AUTHORIZE_URL));
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=anthropic-client-id") != null);
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge=") != null);
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback") != null);
+}
+
+test "formatOAuthClientConfigError references oauth.json guidance" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    const message = (try formatOAuthClientConfigError(
+        allocator,
+        &env_map,
+        "google-gemini-cli",
+        error.MissingOAuthClientSecret,
+    )).?;
+    defer allocator.free(message);
+
+    try std.testing.expect(std.mem.indexOf(u8, message, "oauth.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "\"client_secret\"") != null);
 }
 
 test "buildApiKeyFromStoredEntry encodes google oauth credentials as provider json" {
@@ -1049,4 +1261,26 @@ test "upsertStoredCredential and listStoredProviders persist oauth state" {
     if (@hasDecl(@TypeOf(stat.permissions), "toMode")) {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
     }
+}
+
+fn makeAuthTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+
+    if (name.len == 0) {
+        return std.fs.path.resolve(allocator, &[_][]const u8{
+            cwd,
+            ".zig-cache",
+            "tmp",
+            &tmp.sub_path,
+        });
+    }
+
+    return std.fs.path.resolve(allocator, &[_][]const u8{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        name,
+    });
 }

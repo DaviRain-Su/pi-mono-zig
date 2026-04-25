@@ -1495,6 +1495,7 @@ fn handleInputKey(
                         .login => try beginLoginFlow(
                             allocator,
                             io,
+                            env_map,
                             auth_overlay.choices[index].provider_id,
                             app_state,
                             auth_flow,
@@ -1861,6 +1862,7 @@ fn handleSlashCommand(
             try handleLoginSlashCommand(
                 allocator,
                 io,
+                env_map,
                 command.argument,
                 app_state,
                 overlay,
@@ -2169,13 +2171,14 @@ fn handleCompactSlashCommand(
 fn handleLoginSlashCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
+    env_map: *const std.process.Environ.Map,
     argument: ?[]const u8,
     app_state: *AppState,
     overlay: *?SelectorOverlay,
     auth_flow: *?AuthFlow,
 ) !void {
     if (argument) |provider_id| {
-        try beginLoginFlow(allocator, io, provider_id, app_state, auth_flow);
+        try beginLoginFlow(allocator, io, env_map, provider_id, app_state, auth_flow);
         return;
     }
     overlay.* = try loadAuthOverlay(allocator, .login, null);
@@ -2251,6 +2254,7 @@ fn loadAuthOverlay(
 fn beginLoginFlow(
     allocator: std.mem.Allocator,
     io: std.Io,
+    env_map: *const std.process.Environ.Map,
     provider_id: []const u8,
     app_state: *AppState,
     auth_flow: *?AuthFlow,
@@ -2260,7 +2264,14 @@ fn beginLoginFlow(
         auth_flow.* = null;
 
         if (std.mem.eql(u8, provider.id, "github-copilot")) {
-            const copilot = try auth.startGitHubCopilotLogin(allocator, io);
+            const copilot = auth.startGitHubCopilotLogin(allocator, io, env_map) catch |err| {
+                if (try auth.formatOAuthClientConfigError(allocator, env_map, provider.id, err)) |message| {
+                    defer allocator.free(message);
+                    try app_state.appendError(message);
+                    return;
+                }
+                return err;
+            };
             openBrowserBestEffort(io, copilot.verification_uri);
 
             const intro = try std.fmt.allocPrint(
@@ -2275,7 +2286,14 @@ fn beginLoginFlow(
             return;
         }
 
-        const browser_session = try auth.startBrowserLogin(allocator, io, provider.id);
+        const browser_session = auth.startBrowserLogin(allocator, io, env_map, provider.id) catch |err| {
+            if (try auth.formatOAuthClientConfigError(allocator, env_map, provider.id, err)) |message| {
+                defer allocator.free(message);
+                try app_state.appendError(message);
+                return;
+            }
+            return err;
+        };
         openBrowserBestEffort(io, browser_session.auth_url);
 
         const intro = try std.fmt.allocPrint(
@@ -5244,6 +5262,9 @@ test "parseSlashCommand recognizes builtins and arguments" {
 test "handleLoginSlashCommand opens auth provider selector" {
     const allocator = std.testing.allocator;
 
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
@@ -5251,7 +5272,7 @@ test "handleLoginSlashCommand opens auth provider selector" {
     defer if (overlay) |*value| value.deinit(allocator);
 
     test_auth_flow = null;
-    try handleLoginSlashCommand(allocator, std.testing.io, null, &state, &overlay, &test_auth_flow);
+    try handleLoginSlashCommand(allocator, std.testing.io, &env_map, null, &state, &overlay, &test_auth_flow);
 
     try std.testing.expect(overlay != null);
     try std.testing.expect(overlay.? == .auth);
@@ -5263,6 +5284,29 @@ test "handleLoginSlashCommand opens auth provider selector" {
 test "beginLoginFlow starts anthropic oauth prompt state" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
+    defer allocator.free(oauth_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        oauth_path,
+        \\{
+        \\  "anthropic": {
+        \\    "client_id": "anthropic-client-id"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
@@ -5272,7 +5316,7 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
         test_auth_flow = null;
     };
 
-    try beginLoginFlow(allocator, std.testing.io, "anthropic", &state, &test_auth_flow);
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", &state, &test_auth_flow);
 
     try std.testing.expect(test_auth_flow != null);
     try std.testing.expect(test_auth_flow.? == .browser_redirect);
@@ -5282,6 +5326,38 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "You will be prompted") == null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Anthropic (Claude Pro/Max) login started") != null);
+}
+
+test "beginLoginFlow shows oauth.json guidance when oauth client config is missing" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    test_auth_flow = null;
+    defer if (test_auth_flow) |*value| {
+        value.deinit(allocator);
+        test_auth_flow = null;
+    };
+
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", &state, &test_auth_flow);
+
+    try std.testing.expect(test_auth_flow == null);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "oauth.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "\"anthropic\"") != null);
 }
 
 test "loadEditorAutocompleteItems includes slash command help text" {
