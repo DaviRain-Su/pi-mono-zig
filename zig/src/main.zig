@@ -712,6 +712,14 @@ fn prepareCliRuntime(
         .agent_dir = runtime_config.agent_dir,
         .global = settingsResources(runtime_config.global_settings),
         .project = settingsResources(runtime_config.project_settings),
+        .cli_extensions = options.extensions orelse &.{},
+        .cli_skills = options.skills orelse &.{},
+        .cli_prompts = options.prompt_templates orelse &.{},
+        .cli_themes = options.themes orelse &.{},
+        .include_default_extensions = !options.no_extensions,
+        .include_default_skills = !options.no_skills,
+        .include_default_prompts = !options.no_prompt_templates,
+        .include_default_themes = !options.no_themes,
     });
     errdefer resource_bundle.deinit(allocator);
 
@@ -1855,4 +1863,140 @@ test "prepareCliRuntime loads defaults resources context and prompt templates" {
     const expected_session_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, "sessions" });
     defer allocator.free(expected_session_dir);
     try std.testing.expectEqualStrings(expected_session_dir, prepared.session_dir);
+}
+
+test "prepareCliRuntime wires CLI resource overrides and discovery toggles" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/skills/default-reviewer");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/prompts");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/themes");
+    try tmp.dir.createDirPath(std.testing.io, "repo/cli-skills/reviewer");
+    try tmp.dir.createDirPath(std.testing.io, "repo/cli-prompts");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "defaultProvider": "faux",
+        \\  "defaultModel": "faux-1",
+        \\  "sessionDir": "~/sessions"
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/settings.json",
+        .data =
+        \\{
+        \\  "theme": "night"
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/extensions/default-extension.ts",
+        .data = "export default {};",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/skills/default-reviewer/SKILL.md",
+        .data =
+        \\---
+        \\description: Default review skill
+        \\---
+        \\Use the default review checklist.
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/prompts/fix.md",
+        .data = "Default fix $ARGUMENTS.",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/themes/night.json",
+        .data =
+        \\{
+        \\  "name": "night",
+        \\  "tokens": {
+        \\    "assistant": { "fg": "cyan" }
+        \\  }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/cli-extension.ts",
+        .data = "export default {};",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/cli-skills/reviewer/SKILL.md",
+        .data =
+        \\---
+        \\description: CLI review skill
+        \\---
+        \\Use the CLI review checklist.
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/cli-prompts/fix.md",
+        .data = "CLI fix $ARGUMENTS.",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/cli-night.json",
+        .data =
+        \\{
+        \\  "name": "night",
+        \\  "tokens": {
+        \\    "assistant": { "fg": "magenta" }
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var args = try cli.parseArgs(allocator, &.{
+        "--no-extensions",
+        "--extension",
+        "cli-extension.ts",
+        "--no-skills",
+        "--skill",
+        "cli-skills",
+        "--no-prompt-templates",
+        "--prompt-template",
+        "cli-prompts",
+        "--no-themes",
+        "--theme",
+        "cli-night.json",
+        "/fix parser bug",
+    });
+    defer args.deinit(allocator);
+
+    const selected_tools = effectiveToolSelection(&args);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, selected_tools);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), prepared.resource_bundle.extensions.len);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.resource_bundle.extensions[0].path, "cli-extension.ts") != null);
+    try std.testing.expectEqual(@as(usize, 1), prepared.resource_bundle.skills.len);
+    try std.testing.expectEqualStrings("reviewer", prepared.resource_bundle.skills[0].name);
+    try std.testing.expectEqual(@as(usize, 1), prepared.resource_bundle.prompt_templates.len);
+    try std.testing.expectEqualStrings("fix", prepared.resource_bundle.prompt_templates[0].name);
+    try std.testing.expectEqualStrings("CLI fix parser bug.", prepared.expanded_prompt.?);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "CLI review skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Default review skill") == null);
+    try std.testing.expectEqualStrings("night", prepared.resource_bundle.selectedTheme().name);
+
+    const styled = try prepared.resource_bundle.selectedTheme().applyAlloc(allocator, .assistant, "Pi:");
+    defer allocator.free(styled);
+    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[35m") != null);
 }
