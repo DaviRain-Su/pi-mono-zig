@@ -10,6 +10,10 @@ const PreparedToolCall = struct {
     tool_call: ai.ToolCall,
     tool: types.AgentTool,
     args: std.json.Value,
+
+    fn deinit(self: *PreparedToolCall, allocator: std.mem.Allocator) void {
+        deinitJsonValue(allocator, self.args);
+    }
 };
 
 const ImmediateToolCallOutcome = struct {
@@ -481,9 +485,11 @@ fn executeToolCallsSequential(
 
         const tool_result = switch (prepared) {
             .prepared => |prepared_tool| blk: {
+                var owned_prepared_tool = prepared_tool;
+                defer owned_prepared_tool.deinit(allocator);
                 const executed = try executePreparedToolCallSequential(
                     allocator,
-                    prepared_tool,
+                    owned_prepared_tool,
                     emit_context,
                     emit,
                     signal,
@@ -492,8 +498,9 @@ fn executeToolCallsSequential(
                     allocator,
                     current_context,
                     assistant_message,
-                    prepared_tool,
+                    owned_prepared_tool,
                     executed,
+                    false,
                     config,
                     emit_context,
                     emit,
@@ -530,7 +537,12 @@ fn executeToolCallsParallel(
     errdefer results.deinit(allocator);
 
     var prepared_calls = std.ArrayList(PreparedToolCall).empty;
-    defer prepared_calls.deinit(allocator);
+    defer {
+        for (prepared_calls.items) |*prepared_call| {
+            prepared_call.deinit(allocator);
+        }
+        prepared_calls.deinit(allocator);
+    }
 
     for (tool_calls) |tool_call| {
         try emit(emit_context, .{
@@ -599,7 +611,10 @@ fn executeToolCallsParallel(
         }
 
         const executed = ExecutedToolCallOutcome{
-            .result = task.result orelse try createErrorToolResult(allocator, "Parallel tool execution failed"),
+            .result = if (task.result) |result|
+                try cloneToolResult(result, allocator)
+            else
+                try createErrorToolResult(allocator, "Parallel tool execution failed"),
             .is_error = task.is_error,
         };
         const tool_result = try finalizeExecutedToolCall(
@@ -608,6 +623,7 @@ fn executeToolCallsParallel(
             assistant_message,
             task.prepared,
             executed,
+            true,
             config,
             emit_context,
             emit,
@@ -648,6 +664,7 @@ fn prepareToolCall(
             .args = &args,
             .context = current_context,
         }, signal) catch |err| {
+            deinitJsonValue(allocator, args);
             return .{ .immediate = .{
                 .result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)})),
                 .is_error = true,
@@ -656,6 +673,7 @@ fn prepareToolCall(
 
         if (before_result) |result| {
             if (result.block) {
+                deinitJsonValue(allocator, args);
                 return .{ .immediate = .{
                     .result = try createErrorToolResult(
                         allocator,
@@ -786,6 +804,7 @@ fn finalizeExecutedToolCall(
     assistant_message: ai.AssistantMessage,
     prepared: PreparedToolCall,
     executed: ExecutedToolCallOutcome,
+    owns_result_content: bool,
     config: types.AgentLoopConfig,
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
@@ -793,6 +812,7 @@ fn finalizeExecutedToolCall(
 ) !types.ToolResultMessage {
     var result = executed.result;
     var is_error = executed.is_error;
+    var result_content_owned = owns_result_content;
 
     if (config.after_tool_call) |after_tool_call| {
         const after_result = after_tool_call(allocator, .{
@@ -803,6 +823,7 @@ fn finalizeExecutedToolCall(
             .is_error = is_error,
             .context = current_context,
         }, signal) catch |err| {
+            if (result_content_owned) deinitContentBlocks(allocator, result.content);
             result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}));
             is_error = true;
             return try emitToolCallOutcome(
@@ -816,7 +837,14 @@ fn finalizeExecutedToolCall(
         };
 
         if (after_result) |override| {
-            if (override.content) |content| result.content = content;
+            if (override.content) |content| {
+                const replaced_content = !sameContentBlocks(result.content, content);
+                if (result_content_owned and replaced_content) {
+                    deinitContentBlocks(allocator, result.content);
+                }
+                result.content = content;
+                if (replaced_content) result_content_owned = false;
+            }
             if (override.details) |details| result.details = details;
             if (override.is_error) |next_is_error| is_error = next_is_error;
         }
@@ -900,6 +928,86 @@ fn emitPartialMessageUpdate(
         .message = .{ .assistant = partial_message },
         .assistant_message_event = assistant_message_event,
     });
+}
+
+fn cloneToolResult(
+    result: types.AgentToolResult,
+    allocator: std.mem.Allocator,
+) !types.AgentToolResult {
+    return .{
+        .content = try cloneContentBlocks(allocator, result.content),
+        .details = result.details,
+    };
+}
+
+fn cloneContentBlocks(
+    allocator: std.mem.Allocator,
+    blocks: []const ai.ContentBlock,
+) ![]const ai.ContentBlock {
+    const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
+    errdefer allocator.free(cloned);
+
+    for (blocks, 0..) |block, index| {
+        cloned[index] = cloneContentBlock(allocator, block) catch |err| {
+            deinitContentBlocks(allocator, cloned[0..index]);
+            allocator.free(cloned);
+            return err;
+        };
+    }
+
+    return cloned;
+}
+
+fn cloneContentBlock(
+    allocator: std.mem.Allocator,
+    block: ai.ContentBlock,
+) !ai.ContentBlock {
+    return switch (block) {
+        .text => |text| .{
+            .text = .{
+                .text = try allocator.dupe(u8, text.text),
+            },
+        },
+        .image => |image| .{
+            .image = .{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            },
+        },
+        .thinking => |thinking| .{
+            .thinking = .{
+                .thinking = try allocator.dupe(u8, thinking.thinking),
+                .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+                .redacted = thinking.redacted,
+            },
+        },
+    };
+}
+
+fn deinitContentBlocks(
+    allocator: std.mem.Allocator,
+    blocks: []const ai.ContentBlock,
+) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| allocator.free(text.text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+        }
+    }
+}
+
+fn sameContentBlocks(
+    lhs: []const ai.ContentBlock,
+    rhs: []const ai.ContentBlock,
+) bool {
+    return lhs.len == rhs.len and lhs.ptr == rhs.ptr;
 }
 
 fn convertToolsToLlm(
@@ -1000,6 +1108,28 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
     };
 }
 
+fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .null, .bool, .integer, .float => {},
+        .number_string => |v| allocator.free(v),
+        .string => |v| allocator.free(v),
+        .array => |array| {
+            for (array.items) |item| deinitJsonValue(allocator, item);
+            var array_mut = array;
+            array_mut.deinit();
+        },
+        .object => |object| {
+            var object_mut = object;
+            var iterator = object_mut.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                deinitJsonValue(allocator, entry.value_ptr.*);
+            }
+            object_mut.deinit(allocator);
+        },
+    }
+}
+
 fn jsonStringObject(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     try object.put(
@@ -1021,6 +1151,37 @@ fn textToolResult(allocator: std.mem.Allocator, text: []const u8) !types.AgentTo
         .content = content,
         .details = null,
     };
+}
+
+const ToolResultContentCapture = struct {
+    content_ptr: ?[*]const ai.ContentBlock = null,
+    text_ptr: ?[*]const u8 = null,
+    text_len: usize = 0,
+};
+
+var active_tool_result_content_capture: ?*ToolResultContentCapture = null;
+
+fn capturingEchoToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    signal: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const result = try echoToolExecute(allocator, tool_call_id, params, signal, on_update_context, on_update);
+    const capture = active_tool_result_content_capture orelse return result;
+
+    capture.content_ptr = result.content.ptr;
+    switch (result.content[0]) {
+        .text => |text| {
+            capture.text_ptr = text.text.ptr;
+            capture.text_len = text.text.len;
+        },
+        else => return error.UnexpectedToolResultContent,
+    }
+
+    return result;
 }
 
 fn getStringArg(args: std.json.Value, key: []const u8) ![]const u8 {
@@ -1583,6 +1744,93 @@ test "runAgentLoop executes multiple tool calls in parallel and emits tool resul
             return error.UnexpectedToolExecutionEndOrder;
         }
     }
+}
+
+test "executeToolCallsParallel returns tool result content that survives task arena cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tool_args = try jsonStringObject(arena.allocator(), "value", "hello");
+    const tool_calls = try arena.allocator().alloc(ai.ToolCall, 1);
+    tool_calls[0] = .{
+        .id = "tool-1",
+        .name = "echo",
+        .arguments = tool_args,
+    };
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute = capturingEchoToolExecute,
+    };
+
+    var capture = ToolResultContentCapture{};
+    active_tool_result_content_capture = &capture;
+    defer active_tool_result_content_capture = null;
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .content = &.{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-model",
+            .usage = ai.Usage.init(),
+            .stop_reason = .tool_use,
+            .timestamp = 1,
+        },
+        tool_calls,
+        .{
+            .model = .{
+                .id = "faux-model",
+                .name = "Faux Model",
+                .api = "faux",
+                .provider = "faux",
+                .base_url = "http://localhost",
+                .input_types = &[_][]const u8{"text"},
+                .context_window = 1024,
+                .max_tokens = 256,
+            },
+            .tool_execution = .parallel,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+    );
+    defer {
+        for (results) |result| {
+            deinitContentBlocks(std.testing.allocator, result.content);
+            std.testing.allocator.free(result.content);
+        }
+        std.testing.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(capture.content_ptr != null);
+    try std.testing.expect(capture.text_ptr != null);
+
+    const scratch_blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    defer std.testing.allocator.free(scratch_blocks);
+    const scratch_text = try std.testing.allocator.alloc(u8, capture.text_len);
+    defer std.testing.allocator.free(scratch_text);
+    @memset(scratch_text, 'x');
+    scratch_blocks[0] = .{
+        .text = .{
+            .text = scratch_text,
+        },
+    };
+
+    try std.testing.expect(results[0].content.ptr != capture.content_ptr.?);
+    try std.testing.expect(results[0].content[0].text.text.ptr != capture.text_ptr.?);
+    try std.testing.expectEqualStrings("echoed: hello", results[0].content[0].text.text);
 }
 
 test "runAgentLoop executes tool calls sequentially when configured" {
