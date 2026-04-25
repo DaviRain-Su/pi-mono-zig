@@ -608,12 +608,24 @@ const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "openai-responses", .api = "openai-responses", .base_url = "https://api.openai.com/v1", .default_model_id = "gpt-5-mini" },
     .{ .provider = "azure-openai-responses", .api = "azure-openai-responses", .base_url = "https://example.openai.azure.com/openai/v1", .default_model_id = "gpt-5.4" },
     .{ .provider = "openai-codex", .api = "openai-codex-responses", .base_url = "https://chatgpt.com/backend-api", .default_model_id = "gpt-5.5" },
+    .{ .provider = "github-copilot", .api = "openai-responses", .base_url = "https://api.individual.githubcopilot.com", .default_model_id = "gpt-5.4" },
     .{ .provider = "google", .api = "google-generative-ai", .base_url = "https://generativelanguage.googleapis.com/v1beta", .default_model_id = "gemini-3.1-pro-preview" },
     .{ .provider = "google-gemini-cli", .api = "google-gemini-cli", .base_url = "https://cloudcode-pa.googleapis.com", .default_model_id = "gemini-3.1-pro-preview" },
     .{ .provider = "google-vertex", .api = "google-vertex", .base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/test/locations/us-central1/publishers/google", .default_model_id = "gemini-3.1-pro-preview" },
     .{ .provider = "amazon-bedrock", .api = "bedrock-converse-stream", .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com", .default_model_id = "us.anthropic.claude-opus-4-6-v1" },
+    .{ .provider = "xai", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .default_model_id = "grok-4.20-0309-reasoning" },
+    .{ .provider = "groq", .api = "openai-completions", .base_url = "https://api.groq.com/openai/v1", .default_model_id = "openai/gpt-oss-120b" },
+    .{ .provider = "cerebras", .api = "openai-completions", .base_url = "https://api.cerebras.ai/v1", .default_model_id = "zai-glm-4.7" },
     .{ .provider = "openrouter", .api = "openai-completions", .base_url = "https://openrouter.ai/api/v1", .default_model_id = "moonshotai/kimi-k2.6" },
+    .{ .provider = "vercel-ai-gateway", .api = "anthropic-messages", .base_url = "https://ai-gateway.vercel.sh", .default_model_id = "zai/glm-5.1" },
     .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/paas/v4", .default_model_id = "glm-5.1" },
+    .{ .provider = "minimax", .api = "anthropic-messages", .base_url = "https://api.minimax.io/anthropic", .default_model_id = "MiniMax-M2.7" },
+    .{ .provider = "minimax-cn", .api = "anthropic-messages", .base_url = "https://api.minimaxi.com/anthropic", .default_model_id = "MiniMax-M2.7" },
+    .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
+    .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
+    .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
+    .{ .provider = "opencode-go", .api = "openai-completions", .base_url = "https://opencode.ai/zen/go/v1", .default_model_id = "kimi-k2.6" },
+    .{ .provider = "kimi-coding", .api = "anthropic-messages", .base_url = "https://api.kimi.com/coding", .default_model_id = "kimi-for-coding" },
     .{ .provider = "faux", .api = "faux", .base_url = "http://localhost:0", .default_model_id = "faux-1" },
 };
 
@@ -636,6 +648,7 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "azure-openai-responses", .id = "gpt-5.4", .name = "Azure GPT-5.4", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
     .{ .provider = "openai-codex", .id = "gpt-5.5", .name = "Codex GPT-5.5", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
     .{ .provider = "openai-codex", .id = "codex-mini-latest", .name = "Codex Mini Latest", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 200000, .max_tokens = 32768 },
+    .{ .provider = "github-copilot", .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
 
     .{ .provider = "google", .id = "gemini-2.5-pro", .name = "Gemini 2.5 Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 65536 },
     .{ .provider = "google", .id = "gemini-3.1-pro-preview", .name = "Gemini 3.1 Pro Preview", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 65536 },
@@ -645,13 +658,24 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "amazon-bedrock", .id = "anthropic.claude-3-7-sonnet-20250219-v1:0", .name = "Bedrock Claude 3.7 Sonnet", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 200000, .max_tokens = 8192 },
     .{ .provider = "amazon-bedrock", .id = "us.anthropic.claude-opus-4-6-v1", .name = "Bedrock Claude Opus 4.6 (US)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
     .{ .provider = "amazon-bedrock", .id = "global.anthropic.claude-opus-4-6-v1", .name = "Bedrock Claude Opus 4.6 (Global)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
+    .{ .provider = "xai", .id = "grok-4.20-0309-reasoning", .name = "Grok 4.20 (Reasoning)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 2000000, .max_tokens = 30000 },
+    .{ .provider = "groq", .id = "openai/gpt-oss-120b", .name = "GPT OSS 120B", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 131072, .max_tokens = 65536 },
+    .{ .provider = "cerebras", .id = "zai-glm-4.7", .name = "Z.AI GLM-4.7", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 131072, .max_tokens = 40000 },
 
     .{ .provider = "openrouter", .id = "moonshotai/kimi-k2.6", .name = "OpenRouter Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768 },
     .{ .provider = "openrouter", .id = "qwen/qwen3-coder:exacto", .name = "Qwen3 Coder Exacto", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 128000, .max_tokens = 8192 },
     .{ .provider = "openrouter", .id = "openai/gpt-4o:extended", .name = "GPT-4o Extended", .reasoning = false, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 128000, .max_tokens = 4096 },
+    .{ .provider = "vercel-ai-gateway", .id = "zai/glm-5.1", .name = "GLM 5.1", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 202800, .max_tokens = 64000 },
 
     .{ .provider = "zai", .id = "glm-5", .name = "GLM-5", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
     .{ .provider = "zai", .id = "glm-5.1", .name = "GLM-5.1", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
+    .{ .provider = "minimax", .id = "MiniMax-M2.7", .name = "MiniMax-M2.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072 },
+    .{ .provider = "minimax-cn", .id = "MiniMax-M2.7", .name = "MiniMax-M2.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072 },
+    .{ .provider = "huggingface", .id = "moonshotai/Kimi-K2.6", .name = "Kimi-K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 262144 },
+    .{ .provider = "fireworks", .id = "accounts/fireworks/models/kimi-k2p6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262000, .max_tokens = 262000 },
+    .{ .provider = "opencode", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
+    .{ .provider = "opencode-go", .id = "kimi-k2.6", .name = "Kimi K2.6 (3x limits)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
+    .{ .provider = "kimi-coding", .id = "kimi-for-coding", .name = "Kimi For Coding", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768 },
 
     .{ .provider = "faux", .id = "faux-1", .name = "Faux 1", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 8192, .max_tokens = 4096 },
 };
@@ -661,14 +685,29 @@ test "built-in models are registered at startup" {
     defer resetForTesting();
 
     try std.testing.expect(find("openai", "gpt-5.4") != null);
+    try std.testing.expect(find("github-copilot", "gpt-5.4") != null);
     try std.testing.expect(find("anthropic", "claude-opus-4-7") != null);
     try std.testing.expect(find("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1") != null);
+    try std.testing.expect(find("fireworks", "accounts/fireworks/models/kimi-k2p6") != null);
+    try std.testing.expect(find("groq", "openai/gpt-oss-120b") != null);
+    try std.testing.expect(find("cerebras", "zai-glm-4.7") != null);
     try std.testing.expect(find("google", "gemini-3.1-pro-preview") != null);
+    try std.testing.expect(find("huggingface", "moonshotai/Kimi-K2.6") != null);
+    try std.testing.expect(find("opencode-go", "kimi-k2.6") != null);
+    try std.testing.expect(find("kimi-coding", "kimi-for-coding") != null);
 
     const provider = getProviderConfig("openai").?;
     try std.testing.expectEqualStrings("openai-completions", provider.api);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", provider.base_url);
     try std.testing.expectEqualStrings("gpt-5.4", provider.default_model_id.?);
+
+    const copilot_provider = getProviderConfig("github-copilot").?;
+    try std.testing.expectEqualStrings("openai-responses", copilot_provider.api);
+    try std.testing.expectEqualStrings("gpt-5.4", copilot_provider.default_model_id.?);
+
+    const fireworks_provider = getProviderConfig("fireworks").?;
+    try std.testing.expectEqualStrings("anthropic-messages", fireworks_provider.api);
+    try std.testing.expectEqualStrings("accounts/fireworks/models/kimi-k2p6", fireworks_provider.default_model_id.?);
 }
 
 test "model lookup by id returns unique built-in model" {
