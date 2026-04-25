@@ -1038,3 +1038,79 @@ test "parseSseStream emits kimi thinking and text events" {
     try std.testing.expectEqual(@as(u32, 20), event8.message.?.usage.output);
     try std.testing.expectEqual(types.StopReason.stop, event8.message.?.stop_reason);
 }
+
+test "parseSseStream emits kimi tool call events across fragmented deltas" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_kimi\",\"function\":{\"name\":\"run_terminal\",\"arguments\":\"{\\\"command\\\":\\\"echo\"}}]},\"finish_reason\":null}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_kimi\",\"function\":{\"arguments\":\" hello\\\"}\"}}]},\"finish_reason\":\"tool_calls\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"cached_tokens\":2}}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    const event1 = stream_instance.next().?;
+    defer freeEvent(allocator, event1);
+    try std.testing.expectEqual(types.EventType.start, event1.event_type);
+
+    const event2 = stream_instance.next().?;
+    defer freeEvent(allocator, event2);
+    try std.testing.expectEqual(types.EventType.toolcall_start, event2.event_type);
+
+    const event3 = stream_instance.next().?;
+    defer freeEvent(allocator, event3);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, event3.event_type);
+    try std.testing.expectEqualStrings("{\"command\":\"echo", event3.delta.?);
+
+    const event4 = stream_instance.next().?;
+    defer freeEvent(allocator, event4);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, event4.event_type);
+    try std.testing.expectEqualStrings(" hello\"}", event4.delta.?);
+
+    const event5 = stream_instance.next().?;
+    defer freeEvent(allocator, event5);
+    try std.testing.expectEqual(types.EventType.toolcall_end, event5.event_type);
+    try std.testing.expect(event5.tool_call != null);
+    try std.testing.expectEqualStrings("call_kimi", event5.tool_call.?.id);
+    try std.testing.expectEqualStrings("run_terminal", event5.tool_call.?.name);
+    try std.testing.expect(event5.tool_call.?.arguments == .object);
+    try std.testing.expectEqualStrings("echo hello", event5.tool_call.?.arguments.object.get("command").?.string);
+
+    const event6 = stream_instance.next().?;
+    defer freeEvent(allocator, event6);
+    try std.testing.expectEqual(types.EventType.done, event6.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, event6.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 10), event6.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 5), event6.message.?.usage.output);
+    try std.testing.expect(event6.message.?.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), event6.message.?.tool_calls.?.len);
+    try std.testing.expectEqualStrings("run_terminal", event6.message.?.tool_calls.?[0].name);
+    try std.testing.expect(event6.message.?.tool_calls.?[0].arguments == .object);
+    try std.testing.expectEqualStrings("echo hello", event6.message.?.tool_calls.?[0].arguments.object.get("command").?.string);
+}
