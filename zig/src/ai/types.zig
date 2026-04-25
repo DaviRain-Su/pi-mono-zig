@@ -26,6 +26,7 @@ pub const KnownProvider = enum {
     openai,
     azure_openai_responses,
     openai_codex,
+    deepseek,
     github_copilot,
     xai,
     groq,
@@ -163,6 +164,11 @@ pub const UserMessage = struct {
 pub const AssistantMessage = struct {
     role: []const u8 = "assistant",
     content: []const ContentBlock,
+    /// TypeScript stores tool-call blocks inline in `content`.
+    /// Zig keeps finalized tool calls here as an owned cache because provider and
+    /// transform layers frequently need direct access after streaming assembly.
+    /// This is an intentional representation deviation; helper code is responsible
+    /// for preserving TypeScript-equivalent behavior at API boundaries.
     tool_calls: ?[]const ToolCall = null,
     api: Api,
     provider: Provider,
@@ -222,11 +228,15 @@ pub const OpenAICompletionsCompat = struct {
     requires_tool_result_name: ?bool = null,
     requires_assistant_after_tool_result: ?bool = null,
     requires_thinking_as_text: ?bool = null,
-    thinking_format: ?[]const u8 = null, // "openai", "openrouter", "zai", "qwen", "qwen-chat-template"
+    requires_reasoning_content_on_assistant_messages: ?bool = null,
+    thinking_format: ?[]const u8 = null, // "openai", "openrouter", "deepseek", "zai", "qwen", "qwen-chat-template"
+    open_router_routing: ?OpenRouterRouting = null,
+    vercel_gateway_routing: ?VercelGatewayRouting = null,
     zai_tool_stream: bool = false,
     supports_strict_mode: bool = true,
     cache_control_format: ?[]const u8 = null, // "anthropic"
     send_session_affinity_headers: bool = false,
+    supports_long_cache_retention: ?bool = null,
 };
 
 pub const OpenAIResponsesCompat = struct {
@@ -290,6 +300,10 @@ pub const StreamOptions = struct {
     session_id: ?[]const u8 = null,
     headers: ?std.StringHashMap([]const u8) = null,
     /// Optional callback for inspecting or replacing provider payloads before sending.
+    /// HTTP request timeout in milliseconds for providers/clients that support it.
+    timeout_ms: ?u32 = null,
+    /// Maximum retry attempts for providers/clients that support client-side retries.
+    max_retries: ?u32 = null,
     /// In Zig, this is a function pointer taking allocator, payload json.Value, model, and returning an optional modified payload.
     on_payload: ?*const fn (std.mem.Allocator, std.json.Value, Model) anyerror!?std.json.Value = null,
     /// Optional callback invoked after an HTTP response is received and before its body stream is consumed.
@@ -333,6 +347,8 @@ pub const SimpleStreamOptions = struct {
     cache_retention: CacheRetention = .short,
     session_id: ?[]const u8 = null,
     headers: ?std.StringHashMap([]const u8) = null,
+    timeout_ms: ?u32 = null,
+    max_retries: ?u32 = null,
     on_payload: ?*const fn (std.mem.Allocator, std.json.Value, Model) anyerror!?std.json.Value = null,
     on_response: ?*const fn (u16, std.StringHashMap([]const u8), Model) void = null,
     max_retry_delay_ms: u32 = 60000,
@@ -355,6 +371,8 @@ pub const SimpleStreamOptions = struct {
             .cache_retention = self.cache_retention,
             .session_id = self.session_id,
             .headers = self.headers,
+            .timeout_ms = self.timeout_ms,
+            .max_retries = self.max_retries,
             .on_payload = self.on_payload,
             .on_response = self.on_response,
             .max_retry_delay_ms = self.max_retry_delay_ms,
@@ -469,6 +487,7 @@ test "KnownProvider enum completeness" {
         .openai => "openai",
         .azure_openai_responses => "azure-openai-responses",
         .openai_codex => "openai-codex",
+        .deepseek => "deepseek",
         .github_copilot => "github-copilot",
         .xai => "xai",
         .groq => "groq",
@@ -514,6 +533,33 @@ test "AssistantMessage with responseId" {
         .timestamp = 1234567890,
     };
     try std.testing.expectEqualStrings("assistant", msg.role);
+}
+
+test "OpenAICompletionsCompat parity fields" {
+    const compat = OpenAICompletionsCompat{
+        .requires_reasoning_content_on_assistant_messages = true,
+        .open_router_routing = .{
+            .allow_fallbacks = false,
+        },
+        .vercel_gateway_routing = .{
+            .only = &[_][]const u8{"openai"},
+        },
+        .supports_long_cache_retention = false,
+    };
+    try std.testing.expectEqual(true, compat.requires_reasoning_content_on_assistant_messages.?);
+    try std.testing.expectEqual(false, compat.open_router_routing.?.allow_fallbacks.?);
+    try std.testing.expectEqual(@as(usize, 1), compat.vercel_gateway_routing.?.only.?.len);
+    try std.testing.expectEqualStrings("openai", compat.vercel_gateway_routing.?.only.?[0]);
+    try std.testing.expectEqual(false, compat.supports_long_cache_retention.?);
+}
+
+test "StreamOptions parity timeout and retries" {
+    const options = StreamOptions{
+        .timeout_ms = 30_000,
+        .max_retries = 4,
+    };
+    try std.testing.expectEqual(@as(u32, 30_000), options.timeout_ms.?);
+    try std.testing.expectEqual(@as(u32, 4), options.max_retries.?);
 }
 
 test "Model with cost and compat" {
