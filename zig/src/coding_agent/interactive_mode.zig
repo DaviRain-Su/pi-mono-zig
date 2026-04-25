@@ -18,6 +18,17 @@ pub const ToolRuntime = struct {
     io: std.Io,
 };
 
+/// Process-global tool runtime bridge for interactive mode.
+///
+/// `buildAgentTools()` registers plain `agent.types.ExecuteToolFn` callbacks, so the per-session `cwd`
+/// and `std.Io` handle needed by the tool implementations cannot be threaded through as parameters.
+/// Interactive mode therefore publishes that context here before starting agent work so tool callbacks in
+/// this module can reach the shared runtime without changing the agent/tool API surface.
+///
+/// Thread-safety model: interactive mode owns this slot on a single thread, writes it once during setup,
+/// only performs read-only access while the session is active, and clears it during teardown. It is global
+/// mutable state because the execute callback ABI has no user-data parameter, not because multiple runtimes
+/// are expected to coexist.
 var global_tool_runtime: ?ToolRuntime = null;
 
 pub fn setToolRuntime(runtime: ToolRuntime) void {
@@ -697,6 +708,16 @@ const NativeTerminalBackend = struct {
     }
 };
 
+/// Process-global pointer to the native terminal backend that should receive `SIGWINCH` notifications.
+///
+/// POSIX signal handlers must use a plain C callback (`handleSigwinch`) and cannot capture `self`, so the
+/// active backend is published here instead of being passed as a parameter. The handler only reads this
+/// pointer and atomically sets `resize_pending`; the interactive-mode thread remains responsible for calling
+/// `readSize()`, updating `cached_size`, and installing/removing the handler.
+///
+/// Thread-safety model: this relies on single-owner discipline rather than shared mutable access. Only one
+/// interactive backend may install the resize handler at a time, and the only cross-context mutation is the
+/// atomic `resize_pending` flag on the backend instance.
 var active_resize_backend: ?*NativeTerminalBackend = null;
 
 fn supportsResizeSignals() bool {
