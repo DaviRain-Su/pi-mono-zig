@@ -1141,7 +1141,7 @@ fn parseHeaderLine(allocator: std.mem.Allocator, line: []const u8) !SessionHeade
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
 
-    const object = requireObject(parsed.value);
+    const object = try requireObject(parsed.value);
     const entry_type = try getRequiredString(object, "type");
     if (!std.mem.eql(u8, entry_type, "session")) return error.InvalidSessionFile;
 
@@ -1157,46 +1157,85 @@ fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEntry 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
 
-    const object = requireObject(parsed.value);
+    const object = try requireObject(parsed.value);
     const entry_type = try getRequiredString(object, "type");
 
     if (std.mem.eql(u8, entry_type, "message")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        var message = try parseMessageValue(allocator, object.get("message") orelse return error.InvalidSessionEntry);
+        errdefer deinitMessage(allocator, &message);
+
         return .{ .message = .{
-            .id = try allocator.dupe(u8, try getRequiredString(object, "id")),
-            .parent_id = if (getOptionalString(object, "parentId")) |parent_id| try allocator.dupe(u8, parent_id) else null,
-            .timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp")),
-            .message = try parseMessageValue(allocator, object.get("message") orelse return error.InvalidSessionEntry),
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .message = message,
         } };
     }
 
     if (std.mem.eql(u8, entry_type, "thinking_level_change")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const thinking_level = try parseThinkingLevel(try getRequiredString(object, "thinkingLevel"));
+
         return .{ .thinking_level_change = .{
-            .id = try allocator.dupe(u8, try getRequiredString(object, "id")),
-            .parent_id = if (getOptionalString(object, "parentId")) |parent_id| try allocator.dupe(u8, parent_id) else null,
-            .timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp")),
-            .thinking_level = try parseThinkingLevel(try getRequiredString(object, "thinkingLevel")),
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .thinking_level = thinking_level,
         } };
     }
 
     if (std.mem.eql(u8, entry_type, "model_change")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const provider = try allocator.dupe(u8, try getRequiredString(object, "provider"));
+        errdefer allocator.free(provider);
+        const model_id = try allocator.dupe(u8, try getRequiredString(object, "modelId"));
+        errdefer allocator.free(model_id);
+
         return .{ .model_change = .{
-            .id = try allocator.dupe(u8, try getRequiredString(object, "id")),
-            .parent_id = if (getOptionalString(object, "parentId")) |parent_id| try allocator.dupe(u8, parent_id) else null,
-            .timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp")),
-            .provider = try allocator.dupe(u8, try getRequiredString(object, "provider")),
-            .model_id = try allocator.dupe(u8, try getRequiredString(object, "modelId")),
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .provider = provider,
+            .model_id = model_id,
         } };
     }
 
     if (std.mem.eql(u8, entry_type, "compaction")) {
         const summary = try getRequiredString(object, "summary");
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const first_kept_entry_id = try allocator.dupe(u8, try getRequiredString(object, "firstKeptEntryId"));
+        errdefer allocator.free(first_kept_entry_id);
+        var message = try createCompactionSummaryMessage(allocator, summary, 0);
+        errdefer deinitMessage(allocator, &message);
+
         return .{ .compaction = .{
-            .id = try allocator.dupe(u8, try getRequiredString(object, "id")),
-            .parent_id = if (getOptionalString(object, "parentId")) |parent_id| try allocator.dupe(u8, parent_id) else null,
-            .timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp")),
-            .first_kept_entry_id = try allocator.dupe(u8, try getRequiredString(object, "firstKeptEntryId")),
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .first_kept_entry_id = first_kept_entry_id,
             .tokens_before = @intCast(try getRequiredInteger(object, "tokensBefore")),
-            .message = try createCompactionSummaryMessage(allocator, summary, 0),
+            .message = message,
         } };
     }
 
@@ -1204,7 +1243,7 @@ fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEntry 
 }
 
 fn parseMessageValue(allocator: std.mem.Allocator, value: std.json.Value) !agent.AgentMessage {
-    const object = requireObject(value);
+    const object = try requireObject(value);
     const role = try getRequiredString(object, "role");
 
     if (std.mem.eql(u8, role, "user")) {
@@ -1262,7 +1301,7 @@ fn parseAssistantContentValue(
     allocator: std.mem.Allocator,
     value: std.json.Value,
 ) !struct { content: []const ai.ContentBlock, tool_calls: ?[]const ai.ToolCall } {
-    const array = requireArray(value);
+    const array = try requireArray(value);
 
     var content = std.ArrayList(ai.ContentBlock).empty;
     errdefer {
@@ -1277,7 +1316,7 @@ fn parseAssistantContentValue(
     }
 
     for (array.items) |item| {
-        const object = requireObject(item);
+        const object = try requireObject(item);
         const item_type = try getRequiredString(object, "type");
 
         if (std.mem.eql(u8, item_type, "toolCall")) {
@@ -1299,12 +1338,12 @@ fn parseAssistantContentValue(
 }
 
 fn parseGenericContentValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const ai.ContentBlock {
-    const array = requireArray(value);
+    const array = try requireArray(value);
     const blocks = try allocator.alloc(ai.ContentBlock, array.items.len);
     errdefer allocator.free(blocks);
 
     for (array.items, 0..) |item, index| {
-        blocks[index] = try parseContentBlockObject(allocator, requireObject(item));
+        blocks[index] = try parseContentBlockObject(allocator, try requireObject(item));
     }
 
     return blocks;
@@ -1336,7 +1375,7 @@ fn parseContentBlockObject(allocator: std.mem.Allocator, object: std.json.Object
 }
 
 fn parseUsageValue(value: std.json.Value) !ai.Usage {
-    const object = requireObject(value);
+    const object = try requireObject(value);
     const cost_value = object.get("cost");
     const cost = if (cost_value) |raw_cost| try parseUsageCost(raw_cost) else ai.types.UsageCost.init();
 
@@ -1351,7 +1390,7 @@ fn parseUsageValue(value: std.json.Value) !ai.Usage {
 }
 
 fn parseUsageCost(value: std.json.Value) !ai.types.UsageCost {
-    const object = requireObject(value);
+    const object = try requireObject(value);
     return .{
         .input = getNumber(object, "input") orelse 0,
         .output = getNumber(object, "output") orelse 0,
@@ -1401,17 +1440,17 @@ fn parseStopReason(value: []const u8) !ai.StopReason {
     return error.InvalidStopReason;
 }
 
-fn requireObject(value: std.json.Value) std.json.ObjectMap {
+fn requireObject(value: std.json.Value) !std.json.ObjectMap {
     return switch (value) {
         .object => |object| object,
-        else => @panic("expected json object"),
+        else => error.InvalidSessionFile,
     };
 }
 
-fn requireArray(value: std.json.Value) std.json.Array {
+fn requireArray(value: std.json.Value) !std.json.Array {
     return switch (value) {
         .array => |array| array,
-        else => @panic("expected json array"),
+        else => error.InvalidSessionFile,
     };
 }
 
@@ -1692,6 +1731,101 @@ test "session manager logs corrupted lines while preserving valid entries" {
     try std.testing.expect(std.mem.indexOf(u8, warnings, "line 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, warnings, "UnsupportedSessionEntryType") != null);
     try std.testing.expect(std.mem.indexOf(u8, warnings, "data was lost") != null);
+}
+
+test "session manager skips invalid json shapes without panicking" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project", session_dir);
+    defer manager.deinit();
+
+    var user = try userTextMessage(std.testing.allocator, "hello", 1);
+    defer deinitMessage(std.testing.allocator, &user);
+    _ = try manager.appendMessage(user);
+
+    var assistant = try assistantTextMessage(std.testing.allocator, "world", model, 2);
+    defer deinitMessage(std.testing.allocator, &assistant);
+    _ = try manager.appendMessage(assistant);
+
+    const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+
+    var rebuilt = std.ArrayList(u8).empty;
+    defer rebuilt.deinit(std.testing.allocator);
+
+    var lines = std.mem.splitScalar(u8, written, '\n');
+    const header_line = lines.next().?;
+    const user_line = lines.next().?;
+    const assistant_line = lines.next().?;
+
+    try rebuilt.appendSlice(std.testing.allocator, header_line);
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(std.testing.allocator, user_line);
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(
+        std.testing.allocator,
+        "{\"type\":\"message\",\"id\":\"bad-object\",\"parentId\":null,\"timestamp\":\"2026-04-25T00:00:00.000Z\",\"message\":[]}",
+    );
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(
+        std.testing.allocator,
+        "{\"type\":\"message\",\"id\":\"bad-array\",\"parentId\":\"bad-object\",\"timestamp\":\"2026-04-25T00:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"oops\"},\"api\":\"faux\",\"provider\":\"faux\",\"model\":\"faux-session\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0},\"stopReason\":\"stop\",\"timestamp\":2}}",
+    );
+    try rebuilt.append(std.testing.allocator, '\n');
+    try rebuilt.appendSlice(std.testing.allocator, assistant_line);
+    try rebuilt.append(std.testing.allocator, '\n');
+
+    try common.writeFileAbsolute(std.testing.io, session_file, rebuilt.items, true);
+
+    var warning_capture: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer warning_capture.deinit();
+
+    var reopened = try SessionManager.openWithWarningWriter(
+        std.testing.allocator,
+        std.testing.io,
+        session_file,
+        null,
+        &warning_capture.writer,
+    );
+    defer reopened.deinit();
+
+    var context = try reopened.buildSessionContext(std.testing.allocator);
+    defer context.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqualStrings("hello", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("world", context.messages[1].assistant.content[0].text.text);
+
+    const warnings = warning_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "line 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "line 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "InvalidSessionFile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warnings, "2 corrupted lines skipped") != null);
 }
 
 test "session manager supports branching and branch navigation" {
