@@ -486,7 +486,11 @@ const AppState = struct {
     }
 
     fn updateContextUsageLocked(self: *AppState, tokens: ?u32) void {
-        self.context_unknown = false;
+        if (tokens == null) {
+            self.context_unknown = true;
+        } else {
+            self.context_unknown = false;
+        }
         self.context_tokens = tokens;
         self.recalculateContextPercentLocked();
     }

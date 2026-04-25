@@ -57,7 +57,7 @@ pub fn adjustMaxTokensForThinking(
         .high, .xhigh => budgets.high,
     };
 
-    const max_tokens = @min(base_max_tokens +% thinking_budget, model_max_tokens);
+    const max_tokens = @min(base_max_tokens +| thinking_budget, model_max_tokens);
     if (max_tokens <= thinking_budget) {
         thinking_budget = if (max_tokens > min_output_tokens) max_tokens - min_output_tokens else 0;
     }

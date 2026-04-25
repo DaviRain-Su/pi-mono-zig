@@ -635,9 +635,14 @@ fn finalizeCurrentBlock(
                     final_text
                 else
                     try allocator.dupe(u8, thinking.text.items);
-                const signature = if (maybe_item_value) |item_value|
-                    try std.json.Stringify.valueAlloc(allocator, item_value, .{})
-                else if (thinking.signature) |existing|
+                const signature = if (maybe_item_value) |item_value| blk: {
+                    if (item_value == .object) {
+                        if (item_value.object.get("encrypted_content")) |encrypted| {
+                            if (encrypted == .string) break :blk try allocator.dupe(u8, encrypted.string);
+                        }
+                    }
+                    break :blk null;
+                } else if (thinking.signature) |existing|
                     try allocator.dupe(u8, existing)
                 else
                     null;
@@ -1243,7 +1248,10 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
         .string => |string| return .{ .string = try allocator.dupe(u8, string) },
         .array => |array| {
             var cloned = std.json.Array.init(allocator);
-            errdefer cloned.deinit();
+            errdefer {
+                for (cloned.items) |item| freeJsonValue(allocator, item);
+                cloned.deinit();
+            }
             for (array.items) |item| {
                 try cloned.append(try cloneJsonValue(allocator, item));
             }
@@ -1251,7 +1259,14 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
         },
         .object => |object| {
             var cloned = try initObject(allocator);
-            errdefer cloned.deinit(allocator);
+            errdefer {
+                var iter = cloned.iterator();
+                while (iter.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    freeJsonValue(allocator, entry.value_ptr.*);
+                }
+                cloned.deinit(allocator);
+            }
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
                 try cloned.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));

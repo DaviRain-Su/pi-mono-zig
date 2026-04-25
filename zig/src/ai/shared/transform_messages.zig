@@ -341,13 +341,23 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
         .string => |string| .{ .string = try allocator.dupe(u8, string) },
         .array => |array| blk: {
             var clone = std.json.Array.init(allocator);
-            errdefer clone.deinit();
+            errdefer {
+                for (clone.items) |item| freeJsonValue(allocator, item);
+                clone.deinit();
+            }
             for (array.items) |item| try clone.append(try cloneJsonValue(allocator, item));
             break :blk .{ .array = clone };
         },
         .object => |object| blk: {
             var clone = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer clone.deinit(allocator);
+            errdefer {
+                var iter = clone.iterator();
+                while (iter.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    freeJsonValue(allocator, entry.value_ptr.*);
+                }
+                clone.deinit(allocator);
+            }
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
                 try clone.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));

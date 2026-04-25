@@ -44,9 +44,6 @@ pub fn fuzzyFilterAlloc(
     var ranked = std.ArrayList(RankedItem).empty;
     defer ranked.deinit(allocator);
 
-    var token_iter = std.mem.tokenizeAny(u8, query, " \t\r\n");
-    while (token_iter.next()) |_| {}
-
     for (items, 0..) |item, index| {
         var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n");
         var total_score: i32 = 0;
