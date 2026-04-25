@@ -2977,12 +2977,10 @@ fn runEditTool(
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = getToolRuntime();
-    const args = tools.EditArgs{
-        .path = try getRequiredString(params, "path"),
-        .old_text = try getRequiredStringEither(params, "oldText", "old_text"),
-        .new_text = try getRequiredStringEither(params, "newText", "new_text"),
-    };
-    const result = try tools.EditTool.init(runtime.cwd, runtime.io).execute(allocator, args);
+    var parsed_args_storage = try tools.edit.parseArguments(allocator, params);
+    defer parsed_args_storage.deinit(allocator);
+    const edit_args = parsed_args_storage.toArgs();
+    const result = try tools.EditTool.init(runtime.cwd, runtime.io).execute(allocator, edit_args);
     return .{ .content = result.content };
 }
 
