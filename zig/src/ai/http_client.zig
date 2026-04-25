@@ -41,6 +41,7 @@ pub const StreamingResponse = struct {
     pos: usize = 0,
     buffer: std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    response_headers: ?std.StringHashMap([]const u8) = null,
     done: bool = false,
     owns_body: bool = true,
     request: ?*std.http.Client.Request = null,
@@ -74,6 +75,7 @@ pub const StreamingResponse = struct {
             self.allocator.destroy(request);
         }
         if (self.owns_body) self.allocator.free(self.body);
+        if (self.response_headers) |*headers| deinitOwnedHeaders(self.allocator, headers);
         if (self.decompress_buffer.len > 0) self.allocator.free(self.decompress_buffer);
         if (self.redirect_buffer.len > 0) self.allocator.free(self.redirect_buffer);
         if (self.extra_headers.len > 0) self.allocator.free(self.extra_headers);
@@ -374,12 +376,15 @@ pub const HttpClient = struct {
         }
 
         var response = try request_ptr.receiveHead(redirect_buffer);
+        var response_headers = try cloneResponseHeaders(self.allocator, response.head);
+        errdefer deinitOwnedHeaders(self.allocator, &response_headers);
 
         var streaming = StreamingResponse{
             .status = @intFromEnum(response.head.status),
             .body = &.{},
             .buffer = .empty,
             .allocator = self.allocator,
+            .response_headers = response_headers,
             .owns_body = false,
             .request = request_ptr,
             .redirect_buffer = redirect_buffer,
@@ -427,6 +432,33 @@ fn httpStatusError(status: std.http.Status) ?HttpError {
         .server_error => HttpError.ServerError,
         else => null,
     };
+}
+
+fn cloneResponseHeaders(
+    allocator: std.mem.Allocator,
+    head: std.http.Client.Response.Head,
+) !std.StringHashMap([]const u8) {
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitOwnedHeaders(allocator, &headers);
+
+    var iterator = head.iterateHeaders();
+    while (iterator.next()) |header| {
+        try headers.put(
+            try allocator.dupe(u8, header.name),
+            try allocator.dupe(u8, header.value),
+        );
+    }
+
+    return headers;
+}
+
+fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap([]const u8)) void {
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    headers.deinit();
 }
 
 test "HttpClient init/deinit" {
