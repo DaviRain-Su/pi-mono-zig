@@ -8,6 +8,12 @@ pub const DisplayCluster = struct {
     width: usize,
 };
 
+pub const RgbColor = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+};
+
 pub fn visibleWidth(text: []const u8) usize {
     var index: usize = 0;
     var width: usize = 0;
@@ -95,6 +101,56 @@ pub fn padRightVisibleAlloc(allocator: std.mem.Allocator, line: []const u8, widt
     }
 
     return buffer.toOwnedSlice(allocator);
+}
+
+pub fn parseHexColor(text: []const u8) ?RgbColor {
+    if (text.len != 7 or text[0] != '#') return null;
+    return .{
+        .r = std.fmt.parseInt(u8, text[1..3], 16) catch return null,
+        .g = std.fmt.parseInt(u8, text[3..5], 16) catch return null,
+        .b = std.fmt.parseInt(u8, text[5..7], 16) catch return null,
+    };
+}
+
+pub fn applyHorizontalGradientAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    start: RgbColor,
+    end: RgbColor,
+) std.mem.Allocator.Error![]u8 {
+    const visible_clusters = countVisibleClusters(text);
+    if (visible_clusters == 0) return allocator.dupe(u8, text);
+
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+
+    var cluster_index: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (ansiSequenceLength(text, index)) |len| {
+            try builder.appendSlice(allocator, text[index .. index + len]);
+            index += len;
+            continue;
+        }
+
+        const cluster = nextDisplayCluster(text, index);
+        if (cluster.width == 0) {
+            try builder.appendSlice(allocator, text[index..cluster.end]);
+            index = cluster.end;
+            continue;
+        }
+
+        const color = interpolateGradientColor(start, end, cluster_index, visible_clusters);
+        const color_code = try std.fmt.allocPrint(allocator, "\x1b[38;2;{d};{d};{d}m", .{ color.r, color.g, color.b });
+        defer allocator.free(color_code);
+        try builder.appendSlice(allocator, color_code);
+        try builder.appendSlice(allocator, text[index..cluster.end]);
+        cluster_index += 1;
+        index = cluster.end;
+    }
+
+    try builder.appendSlice(allocator, "\x1b[0m");
+    return builder.toOwnedSlice(allocator);
 }
 
 pub fn wrapTextWithAnsi(allocator: std.mem.Allocator, text: []const u8, width: usize, lines: *LineList) std.mem.Allocator.Error!void {
@@ -214,6 +270,39 @@ fn appendWrappedLine(
     if (active_sgr.items.len > 0) {
         try current_line.appendSlice(allocator, active_sgr.items);
     }
+}
+
+fn countVisibleClusters(text: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (ansiSequenceLength(text, index)) |len| {
+            index += len;
+            continue;
+        }
+
+        const cluster = nextDisplayCluster(text, index);
+        if (cluster.width > 0) count += 1;
+        index = cluster.end;
+    }
+    return count;
+}
+
+fn interpolateGradientColor(start: RgbColor, end: RgbColor, index: usize, total: usize) RgbColor {
+    if (total <= 1) return start;
+    return .{
+        .r = interpolateChannel(start.r, end.r, index, total),
+        .g = interpolateChannel(start.g, end.g, index, total),
+        .b = interpolateChannel(start.b, end.b, index, total),
+    };
+}
+
+fn interpolateChannel(start: u8, end: u8, index: usize, total: usize) u8 {
+    if (total <= 1) return start;
+    const start_weight = total - 1 - index;
+    const end_weight = index;
+    const numerator = @as(usize, start) * start_weight + @as(usize, end) * end_weight;
+    return @intCast(numerator / (total - 1));
 }
 
 fn updateActiveSgr(allocator: std.mem.Allocator, sequence: []const u8, active_sgr: *std.ArrayList(u8)) void {
@@ -561,4 +650,29 @@ test "slice visible range respects wide grapheme boundaries" {
     defer allocator.free(slice);
 
     try std.testing.expectEqualStrings("你好", slice);
+}
+
+test "parseHexColor parses rgb triplets" {
+    const color = parseHexColor("#123abc").?;
+    try std.testing.expectEqual(@as(u8, 0x12), color.r);
+    try std.testing.expectEqual(@as(u8, 0x3a), color.g);
+    try std.testing.expectEqual(@as(u8, 0xbc), color.b);
+    try std.testing.expect(parseHexColor("abc") == null);
+}
+
+test "applyHorizontalGradientAlloc colors visible grapheme clusters" {
+    const allocator = std.testing.allocator;
+
+    const gradient = try applyHorizontalGradientAlloc(
+        allocator,
+        "A🙂B",
+        .{ .r = 255, .g = 0, .b = 0 },
+        .{ .r = 0, .g = 0, .b = 255 },
+    );
+    defer allocator.free(gradient);
+
+    try std.testing.expect(std.mem.indexOf(u8, gradient, "\x1b[38;2;255;0;0mA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gradient, "\x1b[38;2;127;0;127m🙂") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gradient, "\x1b[38;2;0;0;255mB") != null);
+    try std.testing.expect(std.mem.endsWith(u8, gradient, "\x1b[0m"));
 }

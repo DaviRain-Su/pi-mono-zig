@@ -12,6 +12,11 @@ pub const ImageDimensions = struct {
     height_px: usize,
 };
 
+const RenderSize = struct {
+    width: usize,
+    height: usize,
+};
+
 pub const Image = struct {
     mime_type: []const u8,
     data: []const u8 = "",
@@ -97,27 +102,32 @@ pub const Image = struct {
 
         const render_width = resolveRenderWidth(self, width);
         const max_height = self.max_height_cells orelse std.math.maxInt(usize);
+        var source_lines = std.ArrayList([]const u8).empty;
+        defer source_lines.deinit(allocator);
 
-        var row_count: usize = 0;
         var split = std.mem.splitScalar(u8, art, '\n');
         while (split.next()) |raw_line| {
-            if (row_count >= max_height) break;
-
             const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
                 raw_line[0 .. raw_line.len - 1]
             else
                 raw_line;
-            const truncated = try truncatePlainAlloc(allocator, line, render_width);
-            defer allocator.free(truncated);
-
-            const padded = try ansi.padRightVisibleAlloc(allocator, truncated, render_width);
-            defer allocator.free(padded);
-            try component_mod.appendOwnedLine(lines, allocator, padded);
-            row_count += 1;
+            try source_lines.append(allocator, line);
         }
 
-        if (row_count == 0) {
+        const source_width = measureSourceWidth(source_lines.items);
+        if (source_lines.items.len == 0 or source_width == 0) {
             try self.renderPlaceholderInto(allocator, width, lines);
+            return;
+        }
+
+        const size = resolveAsciiRenderSize(self, render_width, max_height, source_width, source_lines.items.len);
+        for (0..size.height) |row| {
+            const source_row = @min((row * source_lines.items.len) / size.height, source_lines.items.len - 1);
+            const sampled = try sampleAsciiRowAlloc(allocator, source_lines.items[source_row], source_width, size.width);
+            defer allocator.free(sampled);
+            const padded = try ansi.padRightVisibleAlloc(allocator, sampled, render_width);
+            defer allocator.free(padded);
+            try component_mod.appendOwnedLine(lines, allocator, padded);
         }
     }
 
@@ -143,7 +153,7 @@ pub const Image = struct {
             return;
         }
 
-        const top = try buildBorderLine(allocator, render_width);
+        const top = try buildBorderLine(allocator, render_width, true);
         defer allocator.free(top);
         try component_mod.appendOwnedLine(lines, allocator, top);
 
@@ -192,7 +202,7 @@ pub const Image = struct {
             try component_mod.appendOwnedLine(lines, allocator, line);
         }
 
-        const bottom = try buildBorderLine(allocator, render_width);
+        const bottom = try buildBorderLine(allocator, render_width, false);
         defer allocator.free(bottom);
         try component_mod.appendOwnedLine(lines, allocator, bottom);
     }
@@ -201,6 +211,29 @@ pub const Image = struct {
 fn resolveRenderWidth(self: *const Image, width: usize) usize {
     const constrained = self.max_width_cells orelse width;
     return @max(@as(usize, 1), @min(width, constrained));
+}
+
+fn resolveAsciiRenderSize(
+    self: *const Image,
+    max_width: usize,
+    max_height: usize,
+    source_width: usize,
+    source_height: usize,
+) RenderSize {
+    const clamped_max_width = @max(@as(usize, 1), max_width);
+    const clamped_max_height = @max(@as(usize, 1), max_height);
+
+    var target_width = clamped_max_width;
+    var target_height = estimateRenderHeight(self, target_width, source_width, source_height);
+    if (target_height > clamped_max_height) {
+        target_height = clamped_max_height;
+        target_width = estimateRenderWidth(self, target_height, source_width, source_height);
+    }
+
+    return .{
+        .width = std.math.clamp(target_width, @as(usize, 1), clamped_max_width),
+        .height = std.math.clamp(target_height, @as(usize, 1), clamped_max_height),
+    };
 }
 
 fn resolvePlaceholderHeight(self: *const Image, render_width: usize) usize {
@@ -218,6 +251,38 @@ fn resolvePlaceholderHeight(self: *const Image, render_width: usize) usize {
     }
 
     return @max(@as(usize, 3), @min(max_height, estimated_height));
+}
+
+fn estimateRenderHeight(self: *const Image, target_width: usize, source_width: usize, source_height: usize) usize {
+    if (self.dimensions) |dimensions| {
+        if (dimensions.width_px > 0 and dimensions.height_px > 0) {
+            const numerator = dimensions.height_px * @max(target_width, 1);
+            const denominator = dimensions.width_px * 2;
+            return std.math.divCeil(usize, numerator, @max(denominator, 1)) catch 1;
+        }
+    }
+
+    return std.math.divCeil(usize, @max(source_height, 1) * @max(target_width, 1), @max(source_width, 1)) catch 1;
+}
+
+fn estimateRenderWidth(self: *const Image, target_height: usize, source_width: usize, source_height: usize) usize {
+    if (self.dimensions) |dimensions| {
+        if (dimensions.width_px > 0 and dimensions.height_px > 0) {
+            const numerator = dimensions.width_px * 2 * @max(target_height, 1);
+            return @max(@as(usize, 1), numerator / dimensions.height_px);
+        }
+    }
+
+    const numerator = @max(source_width, 1) * @max(target_height, 1);
+    return @max(@as(usize, 1), numerator / @max(source_height, 1));
+}
+
+fn measureSourceWidth(lines: []const []const u8) usize {
+    var max_width: usize = 0;
+    for (lines) |line| {
+        max_width = @max(max_width, ansi.visibleWidth(line));
+    }
+    return max_width;
 }
 
 fn buildFallbackLabel(allocator: std.mem.Allocator, self: *const Image) std.mem.Allocator.Error![]u8 {
@@ -247,16 +312,18 @@ fn buildFallbackLabel(allocator: std.mem.Allocator, self: *const Image) std.mem.
     return builder.toOwnedSlice(allocator);
 }
 
-fn buildBorderLine(allocator: std.mem.Allocator, width: usize) std.mem.Allocator.Error![]u8 {
+fn buildBorderLine(allocator: std.mem.Allocator, width: usize, top: bool) std.mem.Allocator.Error![]u8 {
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
 
-    try builder.append(allocator, '+');
+    try builder.appendSlice(allocator, if (top) "╭" else "╰");
     if (width > 2) {
-        try builder.appendNTimes(allocator, '-', width - 2);
+        for (0..width - 2) |_| {
+            try builder.appendSlice(allocator, "─");
+        }
     }
     if (width > 1) {
-        try builder.append(allocator, '+');
+        try builder.appendSlice(allocator, if (top) "╮" else "╯");
     }
 
     return builder.toOwnedSlice(allocator);
@@ -281,11 +348,11 @@ fn buildInteriorLine(
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
 
-    try builder.append(allocator, '|');
+    try builder.appendSlice(allocator, "│");
     try builder.appendNTimes(allocator, ' ', left_padding);
     try builder.appendSlice(allocator, label);
     try builder.appendNTimes(allocator, ' ', right_padding);
-    try builder.append(allocator, '|');
+    try builder.appendSlice(allocator, "│");
 
     return builder.toOwnedSlice(allocator);
 }
@@ -299,11 +366,37 @@ fn truncatePlainAlloc(allocator: std.mem.Allocator, text: []const u8, max_width:
     var width: usize = 0;
     var index: usize = 0;
     while (index < text.len and width < max_width) {
-        const rune_len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-        const actual_len = @min(rune_len, text.len - index);
-        try builder.appendSlice(allocator, text[index .. index + actual_len]);
-        index += actual_len;
-        width += 1;
+        const cluster = ansi.nextDisplayCluster(text, index);
+        if (cluster.width > max_width - width) break;
+        try builder.appendSlice(allocator, text[index..cluster.end]);
+        index = cluster.end;
+        width += cluster.width;
+    }
+
+    return builder.toOwnedSlice(allocator);
+}
+
+fn sampleAsciiRowAlloc(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    source_width: usize,
+    target_width: usize,
+) std.mem.Allocator.Error![]u8 {
+    if (target_width == 0) return allocator.dupe(u8, "");
+
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+
+    for (0..target_width) |column| {
+        const source_column = @min((column * source_width) / target_width, source_width - 1);
+        const cluster = try ansi.sliceVisibleAlloc(allocator, line, source_column, 1);
+        defer allocator.free(cluster);
+
+        if (cluster.len == 0) {
+            try builder.append(allocator, ' ');
+        } else {
+            try builder.appendSlice(allocator, cluster);
+        }
     }
 
     return builder.toOwnedSlice(allocator);
@@ -327,7 +420,7 @@ test "image renders placeholder box within width and height constraints" {
 
     try std.testing.expectEqual(@as(usize, 4), lines.items.len);
     try std.testing.expectEqual(@as(usize, 30), ansi.visibleWidth(lines.items[0]));
-    try std.testing.expect(std.mem.startsWith(u8, lines.items[0], "+----------------+"));
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "Image") != null);
 }
 
@@ -348,8 +441,30 @@ test "image renders provided ASCII art within constraints" {
     try image.renderInto(allocator, 5, &lines);
 
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqualStrings("ABC  ", lines.items[0]);
-    try std.testing.expectEqualStrings("FGH  ", lines.items[1]);
+    try std.testing.expectEqualStrings("ABD  ", lines.items[0]);
+    try std.testing.expectEqualStrings("FGI  ", lines.items[1]);
+}
+
+test "image preserves aspect ratio when scaling ascii art" {
+    const allocator = std.testing.allocator;
+
+    const image = Image{
+        .mime_type = "image/png",
+        .mode = .ascii,
+        .ascii_art = "ABCDEFGH\nIJKLMNOP\nQRSTUVWX\nYZabcdef",
+        .dimensions = .{ .width_px = 800, .height_px = 200 },
+        .max_width_cells = 8,
+        .max_height_cells = 2,
+    };
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+
+    try image.renderInto(allocator, 10, &lines);
+
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqual(@as(usize, 10), ansi.visibleWidth(lines.items[0]));
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "ABCDEFGH") != null);
 }
 
 test "image integrates with box component rendering" {
@@ -373,6 +488,6 @@ test "image integrates with box component rendering" {
     try box.renderInto(allocator, 18, &lines);
 
     try std.testing.expect(lines.items.len >= 3);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "+") != null or std.mem.indexOf(u8, lines.items[1], "Image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null or std.mem.indexOf(u8, lines.items[1], "Image") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "Image") != null);
 }
