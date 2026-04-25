@@ -373,8 +373,19 @@ pub const Editor = struct {
 
         const range = self.currentAutocompleteRange(force_show_all) orelse return;
         const prefix = self.buffer.items[range.start..range.end];
+        const wants_slash_commands = prefix.len > 0 and prefix[0] == '/';
 
-        const matches = try autocomplete.fuzzyFilterAlloc(self.allocator, self.autocomplete_catalog.items, prefix);
+        var filtered_catalog = std.ArrayList(select_list.SelectItem).empty;
+        defer filtered_catalog.deinit(self.allocator);
+        try filtered_catalog.ensureTotalCapacity(self.allocator, self.autocomplete_catalog.items.len);
+        for (self.autocomplete_catalog.items) |item| {
+            const is_slash_command = std.mem.startsWith(u8, item.value, "/");
+            if (wants_slash_commands != is_slash_command) continue;
+            try filtered_catalog.append(self.allocator, item);
+        }
+        if (filtered_catalog.items.len == 0) return;
+
+        const matches = try autocomplete.fuzzyFilterAlloc(self.allocator, filtered_catalog.items, prefix);
         if (matches.len == 0) {
             self.allocator.free(matches);
             return;
@@ -1042,6 +1053,31 @@ test "editor reset clears text and autocomplete state" {
     try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 0 }, editor.cursorPosition());
     try std.testing.expect(!editor.isShowingAutocomplete());
     try std.testing.expect(editor.selectedAutocompleteItem() == null);
+}
+
+test "editor only shows slash-command autocomplete for slash prefixes" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]select_list.SelectItem{
+        .{ .value = "/settings", .label = "/settings" },
+        .{ .value = "/session", .label = "/session" },
+        .{ .value = "session-notes", .label = "session-notes" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("/") });
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("s") });
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("e") });
+    try std.testing.expect(editor.isShowingAutocomplete());
+    try std.testing.expect(std.mem.startsWith(u8, editor.selectedAutocompleteItem().?.value, "/"));
+
+    editor.reset();
+    for ([_][]const u8{ "/", "n", "a", "m", "e", " ", "D", "e", "m", "o", " ", "s" }) |text| {
+        _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice(text) });
+    }
+    try std.testing.expect(editor.isShowingAutocomplete());
+    try std.testing.expectEqualStrings("session-notes", editor.selectedAutocompleteItem().?.value);
 }
 
 test "editor inserts bracketed paste content as a single edit" {
