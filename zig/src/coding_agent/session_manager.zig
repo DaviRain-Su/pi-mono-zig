@@ -64,11 +64,28 @@ pub const CompactionEntry = struct {
     message: agent.AgentMessage,
 };
 
+pub const LabelEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    target_id: []const u8,
+    label: ?[]const u8,
+};
+
+pub const SessionInfoEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    name: ?[]const u8,
+};
+
 pub const SessionEntry = union(enum) {
     message: SessionMessageEntry,
     thinking_level_change: ThinkingLevelChangeEntry,
     model_change: ModelChangeEntry,
     compaction: CompactionEntry,
+    label: LabelEntry,
+    session_info: SessionInfoEntry,
 
     pub fn id(self: *const SessionEntry) []const u8 {
         return switch (self.*) {
@@ -76,6 +93,8 @@ pub const SessionEntry = union(enum) {
             .thinking_level_change => |entry| entry.id,
             .model_change => |entry| entry.id,
             .compaction => |entry| entry.id,
+            .label => |entry| entry.id,
+            .session_info => |entry| entry.id,
         };
     }
 
@@ -85,6 +104,8 @@ pub const SessionEntry = union(enum) {
             .thinking_level_change => |entry| entry.parent_id,
             .model_change => |entry| entry.parent_id,
             .compaction => |entry| entry.parent_id,
+            .label => |entry| entry.parent_id,
+            .session_info => |entry| entry.parent_id,
         };
     }
 
@@ -94,6 +115,8 @@ pub const SessionEntry = union(enum) {
             .thinking_level_change => |entry| entry.timestamp,
             .model_change => |entry| entry.timestamp,
             .compaction => |entry| entry.timestamp,
+            .label => |entry| entry.timestamp,
+            .session_info => |entry| entry.timestamp,
         };
     }
 };
@@ -101,6 +124,8 @@ pub const SessionEntry = union(enum) {
 pub const SessionTreeNode = struct {
     entry: *const SessionEntry,
     children: []SessionTreeNode,
+    label: ?[]const u8 = null,
+    label_timestamp: ?[]const u8 = null,
 
     pub fn deinit(self: *SessionTreeNode, allocator: std.mem.Allocator) void {
         for (self.children) |*child| child.deinit(allocator);
@@ -108,6 +133,8 @@ pub const SessionTreeNode = struct {
         self.* = .{
             .entry = self.entry,
             .children = &.{},
+            .label = null,
+            .label_timestamp = null,
         };
     }
 };
@@ -121,6 +148,8 @@ pub const SessionManager = struct {
     persist: bool,
     entries: std.ArrayList(SessionEntry),
     by_id: std.StringHashMap(usize),
+    labels_by_id: std.StringHashMap([]const u8),
+    label_timestamps_by_id: std.StringHashMap([]const u8),
     leaf_id: ?[]const u8,
 
     pub fn create(
@@ -183,6 +212,8 @@ pub const SessionManager = struct {
             .persist = true,
             .entries = .empty,
             .by_id = std.StringHashMap(usize).init(allocator),
+            .labels_by_id = std.StringHashMap([]const u8).init(allocator),
+            .label_timestamps_by_id = std.StringHashMap([]const u8).init(allocator),
             .leaf_id = null,
         };
         errdefer manager.deinit();
@@ -233,6 +264,8 @@ pub const SessionManager = struct {
         for (self.entries.items) |*entry| deinitEntry(self.allocator, entry);
         self.entries.deinit(self.allocator);
         self.by_id.deinit();
+        self.labels_by_id.deinit();
+        self.label_timestamps_by_id.deinit();
         deinitHeader(self.allocator, &self.header);
         self.allocator.free(self.session_dir);
         if (self.session_file) |path| self.allocator.free(path);
@@ -264,12 +297,20 @@ pub const SessionManager = struct {
     }
 
     pub fn getSessionName(self: *const SessionManager) ?[]const u8 {
-        const session_file = self.getSessionFile() orelse return null;
-        const basename = std.fs.path.basename(session_file);
-        if (std.mem.endsWith(u8, basename, ".jsonl")) {
-            return basename[0 .. basename.len - ".jsonl".len];
+        var index = self.entries.items.len;
+        while (index > 0) {
+            index -= 1;
+            switch (self.entries.items[index]) {
+                .session_info => |entry| {
+                    const name = entry.name orelse return null;
+                    const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
+                    if (trimmed.len == 0) return null;
+                    return trimmed;
+                },
+                else => {},
+            }
         }
-        return basename;
+        return null;
     }
 
     pub fn getLeafId(self: *const SessionManager) ?[]const u8 {
@@ -379,6 +420,61 @@ pub const SessionManager = struct {
         return self.leaf_id.?;
     }
 
+    pub fn appendSessionInfo(self: *SessionManager, name: []const u8) ![]const u8 {
+        const id = try generateUniqueId(self.allocator, &self.by_id);
+        errdefer self.allocator.free(id);
+
+        const timestamp = try nowTimestamp(self.allocator, self.io);
+        errdefer self.allocator.free(timestamp);
+
+        const trimmed = std.mem.trim(u8, name, &std.ascii.whitespace);
+        const owned_name = if (trimmed.len == 0) null else try self.allocator.dupe(u8, trimmed);
+        errdefer if (owned_name) |value| self.allocator.free(value);
+
+        const entry = SessionEntry{
+            .session_info = .{
+                .id = id,
+                .parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null,
+                .timestamp = timestamp,
+                .name = owned_name,
+            },
+        };
+
+        try self.appendEntry(entry);
+        return self.leaf_id.?;
+    }
+
+    pub fn getLabel(self: *const SessionManager, id: []const u8) ?[]const u8 {
+        return self.labels_by_id.get(id);
+    }
+
+    pub fn appendLabelChange(self: *SessionManager, target_id: []const u8, label: ?[]const u8) ![]const u8 {
+        if (self.getEntry(target_id) == null) return error.EntryNotFound;
+
+        const id = try generateUniqueId(self.allocator, &self.by_id);
+        errdefer self.allocator.free(id);
+
+        const timestamp = try nowTimestamp(self.allocator, self.io);
+        errdefer self.allocator.free(timestamp);
+
+        const trimmed = if (label) |value| std.mem.trim(u8, value, &std.ascii.whitespace) else "";
+        const owned_label = if (trimmed.len == 0) null else try self.allocator.dupe(u8, trimmed);
+        errdefer if (owned_label) |value| self.allocator.free(value);
+
+        const entry = SessionEntry{
+            .label = .{
+                .id = id,
+                .parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null,
+                .timestamp = timestamp,
+                .target_id = try self.allocator.dupe(u8, target_id),
+                .label = owned_label,
+            },
+        };
+
+        try self.appendEntry(entry);
+        return self.leaf_id.?;
+    }
+
     pub fn branch(self: *SessionManager, entry_id: []const u8) !void {
         if (self.getEntry(entry_id) == null) return error.EntryNotFound;
         self.leaf_id = entry_id;
@@ -420,6 +516,7 @@ pub const SessionManager = struct {
                 .compaction => |*compaction_entry| {
                     latest_compaction = compaction_entry;
                 },
+                .label, .session_info => {},
             }
         }
 
@@ -441,6 +538,7 @@ pub const SessionManager = struct {
                             try appendVisibleMessage(&messages, message_entry.message, allocator);
                         },
                         .compaction => {},
+                        .label, .session_info => {},
                         else => {},
                     }
                 }
@@ -454,6 +552,7 @@ pub const SessionManager = struct {
                         try appendVisibleMessage(&messages, message_entry.message, allocator);
                     },
                     .compaction => {},
+                    .label, .session_info => {},
                     else => {},
                 }
             }
@@ -554,6 +653,8 @@ pub const SessionManager = struct {
         return .{
             .entry = entry,
             .children = children,
+            .label = self.labels_by_id.get(entry.id()),
+            .label_timestamp = self.label_timestamps_by_id.get(entry.id()),
         };
     }
 
@@ -567,6 +668,18 @@ pub const SessionManager = struct {
     }
 
     fn appendLoadedEntry(self: *SessionManager, entry: SessionEntry) !void {
+        switch (entry) {
+            .label => |label_entry| {
+                if (label_entry.label) |label| {
+                    try self.labels_by_id.put(label_entry.target_id, label);
+                    try self.label_timestamps_by_id.put(label_entry.target_id, label_entry.timestamp);
+                } else {
+                    _ = self.labels_by_id.remove(label_entry.target_id);
+                    _ = self.label_timestamps_by_id.remove(label_entry.target_id);
+                }
+            },
+            else => {},
+        }
         try self.entries.append(self.allocator, entry);
         const index = self.entries.items.len - 1;
         try self.by_id.put(entry.id(), index);
@@ -673,6 +786,8 @@ fn initEmpty(
         .persist = persist,
         .entries = .empty,
         .by_id = std.StringHashMap(usize).init(allocator),
+        .labels_by_id = std.StringHashMap([]const u8).init(allocator),
+        .label_timestamps_by_id = std.StringHashMap([]const u8).init(allocator),
         .leaf_id = null,
     };
 }
@@ -710,6 +825,19 @@ fn deinitEntry(allocator: std.mem.Allocator, entry: *SessionEntry) void {
             allocator.free(compaction_entry.timestamp);
             allocator.free(compaction_entry.first_kept_entry_id);
             deinitMessage(allocator, &compaction_entry.message);
+        },
+        .label => |*label_entry| {
+            allocator.free(label_entry.id);
+            if (label_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(label_entry.timestamp);
+            allocator.free(label_entry.target_id);
+            if (label_entry.label) |label| allocator.free(label);
+        },
+        .session_info => |*session_info_entry| {
+            allocator.free(session_info_entry.id);
+            if (session_info_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(session_info_entry.timestamp);
+            if (session_info_entry.name) |name| allocator.free(name);
         },
     }
 }
@@ -979,6 +1107,25 @@ fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.json
             );
             break :blk .{ .object = object };
         },
+        .label => |label_entry| blk: {
+            var object = try baseEntryObject(allocator, "label", label_entry.id, label_entry.parent_id, label_entry.timestamp);
+            try object.put(allocator, try allocator.dupe(u8, "targetId"), .{ .string = try allocator.dupe(u8, label_entry.target_id) });
+            try object.put(
+                allocator,
+                try allocator.dupe(u8, "label"),
+                if (label_entry.label) |label| .{ .string = try allocator.dupe(u8, label) } else .null,
+            );
+            break :blk .{ .object = object };
+        },
+        .session_info => |session_info_entry| blk: {
+            var object = try baseEntryObject(allocator, "session_info", session_info_entry.id, session_info_entry.parent_id, session_info_entry.timestamp);
+            if (session_info_entry.name) |name| {
+                try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, name) });
+            } else {
+                try object.put(allocator, try allocator.dupe(u8, "name"), .null);
+            }
+            break :blk .{ .object = object };
+        },
     };
 }
 
@@ -1236,6 +1383,45 @@ fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEntry 
             .first_kept_entry_id = first_kept_entry_id,
             .tokens_before = @intCast(try getRequiredInteger(object, "tokensBefore")),
             .message = message,
+        } };
+    }
+
+    if (std.mem.eql(u8, entry_type, "label")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const target_id = try allocator.dupe(u8, try getRequiredString(object, "targetId"));
+        errdefer allocator.free(target_id);
+        const label = if (getOptionalString(object, "label")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (label) |value| allocator.free(value);
+
+        return .{ .label = .{
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .target_id = target_id,
+            .label = label,
+        } };
+    }
+
+    if (std.mem.eql(u8, entry_type, "session_info")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const name = if (getOptionalString(object, "name")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (name) |value| allocator.free(value);
+
+        return .{ .session_info = .{
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .name = name,
         } };
     }
 
@@ -1645,6 +1831,59 @@ test "session manager persists messages to jsonl and resumes from disk" {
     try std.testing.expectEqualStrings("world", context.messages[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings("faux", context.model.?.provider);
     try std.testing.expectEqualStrings("faux-session", context.model.?.model_id);
+}
+
+test "session manager persists session names and labels" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project", session_dir);
+    defer manager.deinit();
+
+    var user = try userTextMessage(std.testing.allocator, "hello", 1);
+    defer deinitMessage(std.testing.allocator, &user);
+    const user_id = try manager.appendMessage(user);
+
+    _ = try manager.appendSessionInfo("Night Shift");
+    _ = try manager.appendLabelChange(user_id, "bookmark");
+
+    try std.testing.expectEqualStrings("Night Shift", manager.getSessionName().?);
+    try std.testing.expectEqualStrings("bookmark", manager.getLabel(user_id).?);
+
+    const tree = try manager.getTree(std.testing.allocator);
+    defer {
+        for (tree) |*node| node.deinit(std.testing.allocator);
+        std.testing.allocator.free(tree);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), tree.len);
+    try std.testing.expectEqualStrings("bookmark", tree[0].label.?);
+
+    const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"session_info\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"name\":\"Night Shift\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"label\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"label\":\"bookmark\"") != null);
+
+    var reopened = try SessionManager.open(std.testing.allocator, std.testing.io, session_file, null);
+    defer reopened.deinit();
+
+    try std.testing.expectEqualStrings("Night Shift", reopened.getSessionName().?);
+    try std.testing.expectEqualStrings("bookmark", reopened.getLabel(user_id).?);
 }
 
 test "session manager logs corrupted lines while preserving valid entries" {
