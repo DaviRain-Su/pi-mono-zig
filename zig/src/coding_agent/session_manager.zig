@@ -4,6 +4,9 @@ const agent = @import("agent");
 const common = @import("tools/common.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
+pub const BRANCH_SUMMARY_PREFIX =
+    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+pub const BRANCH_SUMMARY_SUFFIX = "</summary>";
 
 var global_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
@@ -26,7 +29,10 @@ pub const SessionContext = struct {
     model: ?SessionModelRef = null,
 
     pub fn deinit(self: *SessionContext, allocator: std.mem.Allocator) void {
-        allocator.free(self.messages);
+        for (@constCast(self.messages)) |*message| {
+            deinitMessage(allocator, message);
+        }
+        allocator.free(@constCast(self.messages));
         self.* = .{
             .messages = &.{},
         };
@@ -64,6 +70,47 @@ pub const CompactionEntry = struct {
     message: agent.AgentMessage,
 };
 
+pub const BranchSummaryEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    from_id: []const u8,
+    summary: []const u8,
+    details: ?std.json.Value = null,
+    from_hook: ?bool = null,
+};
+
+pub const CustomEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    custom_type: []const u8,
+    data: ?std.json.Value = null,
+};
+
+pub const CustomMessageContent = union(enum) {
+    text: []const u8,
+    blocks: []const ai.ContentBlock,
+
+    pub fn deinit(self: *CustomMessageContent, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |text| allocator.free(text),
+            .blocks => |blocks| common.deinitContentBlocks(allocator, blocks),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CustomMessageEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    custom_type: []const u8,
+    content: CustomMessageContent,
+    details: ?std.json.Value = null,
+    display: bool,
+};
+
 pub const LabelEntry = struct {
     id: []const u8,
     parent_id: ?[]const u8,
@@ -84,6 +131,9 @@ pub const SessionEntry = union(enum) {
     thinking_level_change: ThinkingLevelChangeEntry,
     model_change: ModelChangeEntry,
     compaction: CompactionEntry,
+    branch_summary: BranchSummaryEntry,
+    custom: CustomEntry,
+    custom_message: CustomMessageEntry,
     label: LabelEntry,
     session_info: SessionInfoEntry,
 
@@ -93,6 +143,9 @@ pub const SessionEntry = union(enum) {
             .thinking_level_change => |entry| entry.id,
             .model_change => |entry| entry.id,
             .compaction => |entry| entry.id,
+            .branch_summary => |entry| entry.id,
+            .custom => |entry| entry.id,
+            .custom_message => |entry| entry.id,
             .label => |entry| entry.id,
             .session_info => |entry| entry.id,
         };
@@ -104,6 +157,9 @@ pub const SessionEntry = union(enum) {
             .thinking_level_change => |entry| entry.parent_id,
             .model_change => |entry| entry.parent_id,
             .compaction => |entry| entry.parent_id,
+            .branch_summary => |entry| entry.parent_id,
+            .custom => |entry| entry.parent_id,
+            .custom_message => |entry| entry.parent_id,
             .label => |entry| entry.parent_id,
             .session_info => |entry| entry.parent_id,
         };
@@ -115,6 +171,9 @@ pub const SessionEntry = union(enum) {
             .thinking_level_change => |entry| entry.timestamp,
             .model_change => |entry| entry.timestamp,
             .compaction => |entry| entry.timestamp,
+            .branch_summary => |entry| entry.timestamp,
+            .custom => |entry| entry.timestamp,
+            .custom_message => |entry| entry.timestamp,
             .label => |entry| entry.timestamp,
             .session_info => |entry| entry.timestamp,
         };
@@ -420,6 +479,68 @@ pub const SessionManager = struct {
         return self.leaf_id.?;
     }
 
+    pub fn appendCustomEntry(self: *SessionManager, custom_type: []const u8, data: ?std.json.Value) ![]const u8 {
+        const id = try generateUniqueId(self.allocator, &self.by_id);
+        errdefer self.allocator.free(id);
+
+        const timestamp = try nowTimestamp(self.allocator, self.io);
+        errdefer self.allocator.free(timestamp);
+
+        const owned_data = if (data) |value| try common.cloneJsonValue(self.allocator, value) else null;
+        errdefer if (owned_data) |value| common.deinitJsonValue(self.allocator, value);
+
+        const entry = SessionEntry{
+            .custom = .{
+                .id = id,
+                .parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null,
+                .timestamp = timestamp,
+                .custom_type = try self.allocator.dupe(u8, custom_type),
+                .data = owned_data,
+            },
+        };
+
+        try self.appendEntry(entry);
+        return self.leaf_id.?;
+    }
+
+    pub fn appendCustomMessageEntry(
+        self: *SessionManager,
+        custom_type: []const u8,
+        content: CustomMessageContent,
+        display: bool,
+        details: ?std.json.Value,
+    ) ![]const u8 {
+        const id = try generateUniqueId(self.allocator, &self.by_id);
+        errdefer self.allocator.free(id);
+
+        const timestamp = try nowTimestamp(self.allocator, self.io);
+        errdefer self.allocator.free(timestamp);
+
+        const owned_content = try cloneCustomMessageContent(self.allocator, content);
+        errdefer {
+            var cleanup_content = owned_content;
+            cleanup_content.deinit(self.allocator);
+        }
+
+        const owned_details = if (details) |value| try common.cloneJsonValue(self.allocator, value) else null;
+        errdefer if (owned_details) |value| common.deinitJsonValue(self.allocator, value);
+
+        const entry = SessionEntry{
+            .custom_message = .{
+                .id = id,
+                .parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null,
+                .timestamp = timestamp,
+                .custom_type = try self.allocator.dupe(u8, custom_type),
+                .content = owned_content,
+                .details = owned_details,
+                .display = display,
+            },
+        };
+
+        try self.appendEntry(entry);
+        return self.leaf_id.?;
+    }
+
     pub fn appendSessionInfo(self: *SessionManager, name: []const u8) ![]const u8 {
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
@@ -480,6 +601,43 @@ pub const SessionManager = struct {
         self.leaf_id = entry_id;
     }
 
+    pub fn branchWithSummary(
+        self: *SessionManager,
+        branch_from_id: ?[]const u8,
+        summary: []const u8,
+        details: ?std.json.Value,
+        from_hook: ?bool,
+    ) ![]const u8 {
+        if (branch_from_id) |entry_id| {
+            if (self.getEntry(entry_id) == null) return error.EntryNotFound;
+        }
+        self.leaf_id = branch_from_id;
+
+        const id = try generateUniqueId(self.allocator, &self.by_id);
+        errdefer self.allocator.free(id);
+
+        const timestamp = try nowTimestamp(self.allocator, self.io);
+        errdefer self.allocator.free(timestamp);
+
+        const owned_details = if (details) |value| try common.cloneJsonValue(self.allocator, value) else null;
+        errdefer if (owned_details) |value| common.deinitJsonValue(self.allocator, value);
+
+        const entry = SessionEntry{
+            .branch_summary = .{
+                .id = id,
+                .parent_id = if (branch_from_id) |entry_id| try self.allocator.dupe(u8, entry_id) else null,
+                .timestamp = timestamp,
+                .from_id = try self.allocator.dupe(u8, branch_from_id orelse "root"),
+                .summary = try self.allocator.dupe(u8, summary),
+                .details = owned_details,
+                .from_hook = from_hook,
+            },
+        };
+
+        try self.appendEntry(entry);
+        return self.leaf_id.?;
+    }
+
     pub fn resetLeaf(self: *SessionManager) void {
         self.leaf_id = null;
     }
@@ -493,7 +651,10 @@ pub const SessionManager = struct {
         defer allocator.free(branch_entries);
 
         var messages = std.ArrayList(agent.AgentMessage).empty;
-        errdefer messages.deinit(allocator);
+        errdefer {
+            for (messages.items) |*message| deinitMessage(allocator, message);
+            messages.deinit(allocator);
+        }
 
         var thinking_level = agent.ThinkingLevel.off;
         var model: ?SessionModelRef = null;
@@ -516,12 +677,12 @@ pub const SessionManager = struct {
                 .compaction => |*compaction_entry| {
                     latest_compaction = compaction_entry;
                 },
-                .label, .session_info => {},
+                .branch_summary, .custom, .custom_message, .label, .session_info => {},
             }
         }
 
         if (latest_compaction) |compaction_entry| {
-            try appendVisibleMessage(&messages, compaction_entry.message, allocator);
+            try appendClonedVisibleMessage(&messages, compaction_entry.message, allocator);
 
             const compaction_index = findEntryIndex(branch_entries, compaction_entry.id) orelse return error.InvalidSessionTree;
             var found_first_kept = false;
@@ -532,36 +693,17 @@ pub const SessionManager = struct {
                     found_first_kept = true;
                 }
                 if (found_first_kept) {
-                    switch (entry.*) {
-                        .message => |message_entry| {
-                            updateModelFromMessage(&model, message_entry.message);
-                            try appendVisibleMessage(&messages, message_entry.message, allocator);
-                        },
-                        .compaction => {},
-                        .label, .session_info => {},
-                        else => {},
-                    }
+                    try appendContextEntry(&messages, entry.*, allocator, &model);
                 }
             }
 
             index = compaction_index + 1;
             while (index < branch_entries.len) : (index += 1) {
-                switch (branch_entries[index].*) {
-                    .message => |message_entry| {
-                        updateModelFromMessage(&model, message_entry.message);
-                        try appendVisibleMessage(&messages, message_entry.message, allocator);
-                    },
-                    .compaction => {},
-                    .label, .session_info => {},
-                    else => {},
-                }
+                try appendContextEntry(&messages, branch_entries[index].*, allocator, &model);
             }
         } else {
             for (branch_entries) |entry| {
-                if (entry.* != .message) continue;
-                const message_entry = entry.message;
-                updateModelFromMessage(&model, message_entry.message);
-                try appendVisibleMessage(&messages, message_entry.message, allocator);
+                try appendContextEntry(&messages, entry.*, allocator, &model);
             }
         }
 
@@ -826,6 +968,29 @@ fn deinitEntry(allocator: std.mem.Allocator, entry: *SessionEntry) void {
             allocator.free(compaction_entry.first_kept_entry_id);
             deinitMessage(allocator, &compaction_entry.message);
         },
+        .branch_summary => |*branch_summary_entry| {
+            allocator.free(branch_summary_entry.id);
+            if (branch_summary_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(branch_summary_entry.timestamp);
+            allocator.free(branch_summary_entry.from_id);
+            allocator.free(branch_summary_entry.summary);
+            if (branch_summary_entry.details) |details| common.deinitJsonValue(allocator, details);
+        },
+        .custom => |*custom_entry| {
+            allocator.free(custom_entry.id);
+            if (custom_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(custom_entry.timestamp);
+            allocator.free(custom_entry.custom_type);
+            if (custom_entry.data) |data| common.deinitJsonValue(allocator, data);
+        },
+        .custom_message => |*custom_message_entry| {
+            allocator.free(custom_message_entry.id);
+            if (custom_message_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(custom_message_entry.timestamp);
+            allocator.free(custom_message_entry.custom_type);
+            custom_message_entry.content.deinit(allocator);
+            if (custom_message_entry.details) |details| common.deinitJsonValue(allocator, details);
+        },
         .label => |*label_entry| {
             allocator.free(label_entry.id);
             if (label_entry.parent_id) |parent_id| allocator.free(parent_id);
@@ -911,18 +1076,120 @@ fn updateModelFromMessage(model: *?SessionModelRef, message: agent.AgentMessage)
     }
 }
 
-fn appendVisibleMessage(
+fn cloneCustomMessageContent(
+    allocator: std.mem.Allocator,
+    content: CustomMessageContent,
+) !CustomMessageContent {
+    return switch (content) {
+        .text => |text| .{ .text = try allocator.dupe(u8, text) },
+        .blocks => |blocks| .{ .blocks = try cloneContentBlocks(allocator, blocks) },
+    };
+}
+
+fn appendContextEntry(
+    messages: *std.ArrayList(agent.AgentMessage),
+    entry: SessionEntry,
+    allocator: std.mem.Allocator,
+    model: *?SessionModelRef,
+) !void {
+    switch (entry) {
+        .message => |message_entry| {
+            updateModelFromMessage(model, message_entry.message);
+            try appendClonedVisibleMessage(messages, message_entry.message, allocator);
+        },
+        .branch_summary => |branch_summary_entry| {
+            var message = try createBranchSummaryContextMessage(
+                allocator,
+                branch_summary_entry.summary,
+                branch_summary_entry.timestamp,
+            );
+            errdefer deinitMessage(allocator, &message);
+            try appendOwnedVisibleMessage(messages, allocator, message);
+        },
+        .custom_message => |custom_message_entry| {
+            var message = try createCustomContextMessage(
+                allocator,
+                custom_message_entry.content,
+                custom_message_entry.timestamp,
+            );
+            errdefer deinitMessage(allocator, &message);
+            try appendOwnedVisibleMessage(messages, allocator, message);
+        },
+        .thinking_level_change,
+        .model_change,
+        .compaction,
+        .custom,
+        .label,
+        .session_info,
+        => {},
+    }
+}
+
+fn appendClonedVisibleMessage(
     messages: *std.ArrayList(agent.AgentMessage),
     message: agent.AgentMessage,
     allocator: std.mem.Allocator,
 ) !void {
+    var owned = try cloneMessage(allocator, message);
+    errdefer deinitMessage(allocator, &owned);
+    try appendOwnedVisibleMessage(messages, allocator, owned);
+}
+
+fn appendOwnedVisibleMessage(
+    messages: *std.ArrayList(agent.AgentMessage),
+    allocator: std.mem.Allocator,
+    message: agent.AgentMessage,
+) !void {
+    var owned = message;
     switch (message) {
         .assistant => |assistant_message| {
-            if (assistant_message.stop_reason == .error_reason) return;
+            if (assistant_message.stop_reason == .error_reason) {
+                deinitMessage(allocator, &owned);
+                return;
+            }
         },
         else => {},
     }
-    try messages.append(allocator, message);
+    try messages.append(allocator, owned);
+}
+
+fn createBranchSummaryContextMessage(
+    allocator: std.mem.Allocator,
+    summary: []const u8,
+    timestamp: []const u8,
+) !agent.AgentMessage {
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}\n{s}",
+        .{ BRANCH_SUMMARY_PREFIX, summary, BRANCH_SUMMARY_SUFFIX },
+    );
+    errdefer allocator.free(text);
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = text } };
+    return .{ .user = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = blocks,
+        .timestamp = parseContextTimestamp(timestamp),
+    } };
+}
+
+fn createCustomContextMessage(
+    allocator: std.mem.Allocator,
+    content: CustomMessageContent,
+    timestamp: []const u8,
+) !agent.AgentMessage {
+    return .{ .user = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = switch (content) {
+            .text => |text| try common.makeTextContent(allocator, text),
+            .blocks => |blocks| try cloneContentBlocks(allocator, blocks),
+        },
+        .timestamp = parseContextTimestamp(timestamp),
+    } };
+}
+
+fn parseContextTimestamp(timestamp: []const u8) i64 {
+    return std.fmt.parseInt(i64, timestamp, 10) catch 0;
 }
 
 fn findEntryIndex(entries: []const *const SessionEntry, id: []const u8) ?usize {
@@ -1107,6 +1374,36 @@ fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.json
             );
             break :blk .{ .object = object };
         },
+        .branch_summary => |branch_summary_entry| blk: {
+            var object = try baseEntryObject(allocator, "branch_summary", branch_summary_entry.id, branch_summary_entry.parent_id, branch_summary_entry.timestamp);
+            try object.put(allocator, try allocator.dupe(u8, "fromId"), .{ .string = try allocator.dupe(u8, branch_summary_entry.from_id) });
+            try object.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, branch_summary_entry.summary) });
+            if (branch_summary_entry.details) |details| {
+                try object.put(allocator, try allocator.dupe(u8, "details"), try common.cloneJsonValue(allocator, details));
+            }
+            if (branch_summary_entry.from_hook) |from_hook| {
+                try object.put(allocator, try allocator.dupe(u8, "fromHook"), .{ .bool = from_hook });
+            }
+            break :blk .{ .object = object };
+        },
+        .custom => |custom_entry| blk: {
+            var object = try baseEntryObject(allocator, "custom", custom_entry.id, custom_entry.parent_id, custom_entry.timestamp);
+            try object.put(allocator, try allocator.dupe(u8, "customType"), .{ .string = try allocator.dupe(u8, custom_entry.custom_type) });
+            if (custom_entry.data) |data| {
+                try object.put(allocator, try allocator.dupe(u8, "data"), try common.cloneJsonValue(allocator, data));
+            }
+            break :blk .{ .object = object };
+        },
+        .custom_message => |custom_message_entry| blk: {
+            var object = try baseEntryObject(allocator, "custom_message", custom_message_entry.id, custom_message_entry.parent_id, custom_message_entry.timestamp);
+            try object.put(allocator, try allocator.dupe(u8, "customType"), .{ .string = try allocator.dupe(u8, custom_message_entry.custom_type) });
+            try object.put(allocator, try allocator.dupe(u8, "content"), try customMessageContentToJsonValue(allocator, custom_message_entry.content));
+            try object.put(allocator, try allocator.dupe(u8, "display"), .{ .bool = custom_message_entry.display });
+            if (custom_message_entry.details) |details| {
+                try object.put(allocator, try allocator.dupe(u8, "details"), try common.cloneJsonValue(allocator, details));
+            }
+            break :blk .{ .object = object };
+        },
         .label => |label_entry| blk: {
             var object = try baseEntryObject(allocator, "label", label_entry.id, label_entry.parent_id, label_entry.timestamp);
             try object.put(allocator, try allocator.dupe(u8, "targetId"), .{ .string = try allocator.dupe(u8, label_entry.target_id) });
@@ -1237,6 +1534,16 @@ fn contentBlocksToJsonValue(
     }
 
     return .{ .array = array };
+}
+
+fn customMessageContentToJsonValue(
+    allocator: std.mem.Allocator,
+    content: CustomMessageContent,
+) !std.json.Value {
+    return switch (content) {
+        .text => |text| .{ .string = try allocator.dupe(u8, text) },
+        .blocks => |blocks| try contentBlocksToJsonValue(allocator, blocks, null),
+    };
 }
 
 fn usageToJsonValue(allocator: std.mem.Allocator, usage: ai.Usage) !std.json.Value {
@@ -1386,6 +1693,80 @@ fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEntry 
         } };
     }
 
+    if (std.mem.eql(u8, entry_type, "branch_summary")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const from_id = try allocator.dupe(u8, try getRequiredString(object, "fromId"));
+        errdefer allocator.free(from_id);
+        const summary = try allocator.dupe(u8, try getRequiredString(object, "summary"));
+        errdefer allocator.free(summary);
+        const details = if (object.get("details")) |value| try common.cloneJsonValue(allocator, value) else null;
+        errdefer if (details) |value| common.deinitJsonValue(allocator, value);
+
+        return .{ .branch_summary = .{
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .from_id = from_id,
+            .summary = summary,
+            .details = details,
+            .from_hook = getOptionalBool(object, "fromHook"),
+        } };
+    }
+
+    if (std.mem.eql(u8, entry_type, "custom")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const custom_type = try allocator.dupe(u8, try getRequiredString(object, "customType"));
+        errdefer allocator.free(custom_type);
+        const data = if (object.get("data")) |value| try common.cloneJsonValue(allocator, value) else null;
+        errdefer if (data) |value| common.deinitJsonValue(allocator, value);
+
+        return .{ .custom = .{
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .custom_type = custom_type,
+            .data = data,
+        } };
+    }
+
+    if (std.mem.eql(u8, entry_type, "custom_message")) {
+        const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
+        errdefer allocator.free(id);
+        const parent_id = if (getOptionalString(object, "parentId")) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (parent_id) |value| allocator.free(value);
+        const timestamp = try allocator.dupe(u8, try getRequiredString(object, "timestamp"));
+        errdefer allocator.free(timestamp);
+        const custom_type = try allocator.dupe(u8, try getRequiredString(object, "customType"));
+        errdefer allocator.free(custom_type);
+        const content = try parseCustomMessageContentValue(allocator, object.get("content") orelse return error.InvalidSessionEntry);
+        errdefer {
+            var cleanup_content = content;
+            cleanup_content.deinit(allocator);
+        }
+        const details = if (object.get("details")) |value| try common.cloneJsonValue(allocator, value) else null;
+        errdefer if (details) |value| common.deinitJsonValue(allocator, value);
+
+        return .{ .custom_message = .{
+            .id = id,
+            .parent_id = parent_id,
+            .timestamp = timestamp,
+            .custom_type = custom_type,
+            .content = content,
+            .details = details,
+            .display = try getRequiredBool(object, "display"),
+        } };
+    }
+
     if (std.mem.eql(u8, entry_type, "label")) {
         const id = try allocator.dupe(u8, try getRequiredString(object, "id"));
         errdefer allocator.free(id);
@@ -1469,6 +1850,14 @@ fn parseMessageValue(allocator: std.mem.Allocator, value: std.json.Value) !agent
     }
 
     return error.UnsupportedSessionMessageRole;
+}
+
+fn parseCustomMessageContentValue(allocator: std.mem.Allocator, value: std.json.Value) !CustomMessageContent {
+    return switch (value) {
+        .string => |text| .{ .text = try allocator.dupe(u8, text) },
+        .array => .{ .blocks = try parseGenericContentValue(allocator, value) },
+        else => error.InvalidSessionEntry,
+    };
 }
 
 fn parseUserContentValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const ai.ContentBlock {
@@ -1673,6 +2062,14 @@ fn getOptionalBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     };
 }
 
+fn getRequiredBool(object: std.json.ObjectMap, key: []const u8) !bool {
+    const value = object.get(key) orelse return error.MissingField;
+    return switch (value) {
+        .bool => |bool_value| bool_value,
+        else => error.InvalidField,
+    };
+}
+
 fn getRequiredI64(object: std.json.ObjectMap, key: []const u8) !i64 {
     const value = object.get(key) orelse return error.MissingField;
     return switch (value) {
@@ -1741,6 +2138,12 @@ fn countJsonLines(bytes: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
+}
+
+fn parseJsonTestValue(allocator: std.mem.Allocator, json: []const u8) !std.json.Value {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    return try common.cloneJsonValue(allocator, parsed.value);
 }
 
 test "session manager creates empty session with metadata" {
@@ -1884,6 +2287,93 @@ test "session manager persists session names and labels" {
 
     try std.testing.expectEqualStrings("Night Shift", reopened.getSessionName().?);
     try std.testing.expectEqualStrings("bookmark", reopened.getLabel(user_id).?);
+}
+
+test "session manager persists branch summaries and custom entry types" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project", session_dir);
+    defer manager.deinit();
+
+    var user = try userTextMessage(std.testing.allocator, "hello", 1);
+    defer deinitMessage(std.testing.allocator, &user);
+    const user_id = try manager.appendMessage(user);
+
+    const custom_data = try parseJsonTestValue(std.testing.allocator, "{\"step\":1,\"state\":\"warm\"}");
+    defer common.deinitJsonValue(std.testing.allocator, custom_data);
+    _ = try manager.appendCustomEntry("ext.state", custom_data);
+
+    const custom_details = try parseJsonTestValue(std.testing.allocator, "{\"visible\":true}");
+    defer common.deinitJsonValue(std.testing.allocator, custom_details);
+    _ = try manager.appendCustomMessageEntry(
+        "ext.note",
+        .{ .text = "remember this branch" },
+        true,
+        custom_details,
+    );
+
+    const branch_details = try parseJsonTestValue(std.testing.allocator, "{\"files\":[\"a.txt\",\"b.txt\"]}");
+    defer common.deinitJsonValue(std.testing.allocator, branch_details);
+    const summary_id = try manager.branchWithSummary(manager.getLeafId(), "branched away from alternate draft", branch_details, true);
+
+    _ = try manager.appendLabelChange(user_id, "bookmark");
+    _ = try manager.appendSessionInfo("Night Shift");
+
+    var context = try manager.buildSessionContext(std.testing.allocator);
+    defer context.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+    try std.testing.expectEqualStrings("hello", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("remember this branch", context.messages[1].user.content[0].text.text);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[2].user.content[0].text.text, "branched away from alternate draft") != null);
+
+    try std.testing.expectEqualStrings("Night Shift", manager.getSessionName().?);
+    try std.testing.expectEqualStrings("bookmark", manager.getLabel(user_id).?);
+
+    const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"custom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"custom_message\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"branch_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"customType\":\"ext.note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"fromHook\":true") != null);
+
+    var reopened = try SessionManager.open(std.testing.allocator, std.testing.io, session_file, null);
+    defer reopened.deinit();
+
+    try std.testing.expectEqualStrings("Night Shift", reopened.getSessionName().?);
+    try std.testing.expectEqualStrings("bookmark", reopened.getLabel(user_id).?);
+
+    const reopened_summary = reopened.getEntry(summary_id);
+    try std.testing.expect(reopened_summary != null);
+    try std.testing.expect(reopened_summary.?.* == .branch_summary);
+    try std.testing.expectEqualStrings("branched away from alternate draft", reopened_summary.?.branch_summary.summary);
+    try std.testing.expectEqual(true, reopened_summary.?.branch_summary.from_hook.?);
+
+    const entries = reopened.getEntries();
+    try std.testing.expectEqual(@as(usize, 6), entries.len);
+    try std.testing.expect(entries[1] == .custom);
+    try std.testing.expect(entries[2] == .custom_message);
+    try std.testing.expect(entries[3] == .branch_summary);
+
+    var reopened_context = try reopened.buildSessionContext(std.testing.allocator);
+    defer reopened_context.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), reopened_context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, reopened_context.messages[2].user.content[0].text.text, BRANCH_SUMMARY_PREFIX) != null);
 }
 
 test "session manager logs corrupted lines while preserving valid entries" {
