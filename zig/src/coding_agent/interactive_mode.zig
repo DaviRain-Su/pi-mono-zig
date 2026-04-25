@@ -662,11 +662,6 @@ const ScreenComponent = struct {
         lines: *tui.LineList,
     ) std.mem.Allocator.Error!void {
         self.editor.setTheme(self.theme);
-        if (self.overlay) |overlay| {
-            overlay.list().theme = self.theme;
-            try self.renderOverlay(allocator, width, lines, overlay);
-            return;
-        }
 
         var chat_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &chat_lines);
@@ -700,10 +695,13 @@ const ScreenComponent = struct {
 
         const reserved_lines: usize = prompt_lines.items.len + 2 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
-        const visible_chat_start = if (chat_lines.items.len > chat_capacity) chat_lines.items.len - chat_capacity else 0;
-        for (chat_lines.items[visible_chat_start..]) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
-        }
+        const chat_component = BorrowedLinesComponent{ .lines = chat_lines.items };
+        const chat_viewport = tui.Viewport{
+            .child = chat_component.component(),
+            .height = chat_capacity,
+            .anchor = .bottom,
+        };
+        try chat_viewport.renderInto(allocator, width, lines);
         for (prompt_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
@@ -713,36 +711,144 @@ const ScreenComponent = struct {
         try tui.component.appendOwnedLine(lines, allocator, footer_line);
         try tui.component.appendOwnedLine(lines, allocator, hints_line);
     }
+};
 
-    fn renderOverlay(
-        self: *const ScreenComponent,
+const BorrowedLinesComponent = struct {
+    lines: []const []u8,
+
+    fn component(self: *const BorrowedLinesComponent) tui.Component {
+        return .{
+            .ptr = self,
+            .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    fn renderIntoOpaque(
+        ptr: *const anyopaque,
         allocator: std.mem.Allocator,
         width: usize,
         lines: *tui.LineList,
-        overlay: *SelectorOverlay,
     ) std.mem.Allocator.Error!void {
-        const title_plain = try fitLine(allocator, overlay.title(), width);
-        defer allocator.free(title_plain);
-        const title_line = try applyThemeAlloc(allocator, self.theme, .overlay_title, title_plain);
-        defer allocator.free(title_line);
-        const hint_plain = try fitLine(allocator, overlay.hint(), width);
-        defer allocator.free(hint_plain);
-        const hint_line = try applyThemeAlloc(allocator, self.theme, .overlay_hint, hint_plain);
-        defer allocator.free(hint_line);
-
-        try tui.component.appendOwnedLine(lines, allocator, title_line);
-        try tui.component.appendOwnedLine(lines, allocator, hint_line);
-
-        var list_lines = tui.LineList.empty;
-        defer freeLinesSafe(allocator, &list_lines);
-        try overlay.list().renderInto(allocator, width, &list_lines);
-
-        const available_rows = if (self.height > 2) self.height - 2 else list_lines.items.len;
-        for (list_lines.items[0..@min(available_rows, list_lines.items.len)]) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
+        const self: *const BorrowedLinesComponent = @ptrCast(@alignCast(ptr));
+        for (self.lines) |line| {
+            const fitted = try fitLine(allocator, line, width);
+            defer allocator.free(fitted);
+            try tui.component.appendOwnedLine(lines, allocator, fitted);
         }
     }
 };
+
+const OverlayPanelComponent = struct {
+    overlay: *SelectorOverlay,
+    theme: ?*const resources_mod.Theme = null,
+    max_height: usize = 12,
+
+    fn component(self: *const OverlayPanelComponent) tui.Component {
+        return .{
+            .ptr = self,
+            .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    fn renderIntoOpaque(
+        ptr: *const anyopaque,
+        allocator: std.mem.Allocator,
+        width: usize,
+        lines: *tui.LineList,
+    ) std.mem.Allocator.Error!void {
+        const self: *const OverlayPanelComponent = @ptrCast(@alignCast(ptr));
+        try self.renderInto(allocator, width, lines);
+    }
+
+    fn renderInto(
+        self: *const OverlayPanelComponent,
+        allocator: std.mem.Allocator,
+        width: usize,
+        lines: *tui.LineList,
+    ) std.mem.Allocator.Error!void {
+        const title_text = try applyThemeAlloc(allocator, self.theme, .overlay_title, self.overlay.title());
+        defer allocator.free(title_text);
+        const hint_text = try applyThemeAlloc(allocator, self.theme, .overlay_hint, self.overlay.hint());
+        defer allocator.free(hint_text);
+
+        const title_component = tui.Text{
+            .text = title_text,
+            .padding_x = 0,
+            .padding_y = 0,
+        };
+        const hint_component = tui.Text{
+            .text = hint_text,
+            .padding_x = 0,
+            .padding_y = 0,
+        };
+
+        var overlay_list = self.overlay.list();
+        overlay_list.theme = self.theme;
+
+        const box_padding_y: usize = 1;
+        const border_lines: usize = if (self.theme != null and width >= 2) 2 else 0;
+        const chrome_lines = border_lines + box_padding_y * 2 + 3;
+        const body_height = @max(@as(usize, 3), if (self.max_height > chrome_lines) self.max_height - chrome_lines else 3);
+        overlay_list.max_visible = body_height;
+
+        const list_viewport = tui.Viewport{
+            .child = overlay_list.component(),
+            .height = body_height,
+            .show_indicators = true,
+            .theme = self.theme,
+            .indicator_token = .select_scroll,
+        };
+
+        var content = tui.Flex.init(.column);
+        defer content.deinit(allocator);
+        content.gap = 1;
+        try content.addChild(allocator, .{ .component = title_component.component() });
+        try content.addChild(allocator, .{ .component = hint_component.component() });
+        try content.addChild(allocator, .{ .component = list_viewport.component() });
+
+        var panel_box = tui.Box.init(2, box_padding_y);
+        defer panel_box.deinit(allocator);
+        panel_box.theme = self.theme;
+        try panel_box.addChild(allocator, content.component());
+        try panel_box.renderInto(allocator, width, lines);
+    }
+};
+
+fn overlayPanelMaxHeight(height: usize) usize {
+    return if (height > 4) height - 4 else @max(height, 3);
+}
+
+fn overlayPanelWidth(width: usize) usize {
+    if (width <= 24) return @max(width -| 2, 12);
+    return std.math.clamp((width * 2) / 3, @as(usize, 24), @min(width -| 2, @as(usize, 96)));
+}
+
+fn overlayAnimationProgress(now_ms: i64, opened_at_ms: ?i64) f32 {
+    const opened = opened_at_ms orelse return 1.0;
+    const elapsed_ms = @max(now_ms - opened, 0);
+    const duration_ms: f32 = 140.0;
+    const progress = @as(f32, @floatFromInt(elapsed_ms)) / duration_ms;
+    return std.math.clamp(progress, 0.0, 1.0);
+}
+
+fn nowMilliseconds() i64 {
+    var now: std.c.timeval = undefined;
+    _ = std.c.gettimeofday(&now, null);
+    return @as(i64, @intCast(now.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(now.usec)), std.time.us_per_ms);
+}
+
+fn overlayPanelOptions(size: tui.Size, progress: f32) tui.OverlayOptions {
+    return .{
+        .width = overlayPanelWidth(size.width),
+        .max_height = overlayPanelMaxHeight(size.height),
+        .anchor = .center,
+        .margin = .{ .top = 1, .right = 1, .bottom = 1, .left = 1 },
+        .animation = .{
+            .kind = .slide_from_top,
+            .progress = progress,
+        },
+    };
+}
 
 const NativeTerminalBackend = struct {
     env_map: *const std.process.Environ.Map,
@@ -1067,6 +1173,10 @@ pub fn runInteractiveMode(
 
     var overlay: ?SelectorOverlay = null;
     defer if (overlay) |*value| value.deinit(allocator);
+    var overlay_panel: ?OverlayPanelComponent = null;
+    var overlay_handle_id: ?usize = null;
+    var overlay_opened_at_ms: ?i64 = null;
+    var last_overlay_tag: ?std.meta.Tag(SelectorOverlay) = null;
 
     var auth_flow: ?AuthFlow = null;
     defer if (auth_flow) |*value| value.deinit(allocator);
@@ -1101,6 +1211,38 @@ pub fn runInteractiveMode(
         screen.overlay = if (overlay) |*value| value else null;
         screen.keybindings = live_resources.keybindings;
         screen.theme = live_resources.theme;
+
+        if (overlay) |*overlay_value| {
+            const overlay_tag = std.meta.activeTag(overlay_value.*);
+            const now_ms = nowMilliseconds();
+            if (last_overlay_tag == null or last_overlay_tag.? != overlay_tag) {
+                overlay_opened_at_ms = now_ms;
+            }
+            last_overlay_tag = overlay_tag;
+
+            const progress = overlayAnimationProgress(now_ms, overlay_opened_at_ms);
+            overlay_panel = .{
+                .overlay = overlay_value,
+                .theme = live_resources.theme,
+                .max_height = overlayPanelMaxHeight(size.height),
+            };
+
+            const overlay_options = overlayPanelOptions(size, progress);
+            if (overlay_handle_id) |existing_id| {
+                _ = renderer.updateOverlay(existing_id, overlay_panel.?.component(), overlay_options);
+            } else {
+                overlay_handle_id = try renderer.showOverlay(overlay_panel.?.component(), overlay_options);
+            }
+        } else {
+            last_overlay_tag = null;
+            overlay_opened_at_ms = null;
+            overlay_panel = null;
+            if (overlay_handle_id) |existing_id| {
+                _ = renderer.removeOverlay(existing_id);
+                overlay_handle_id = null;
+            }
+        }
+
         try renderer.render(screen.component());
 
         if (should_exit and !prompt_worker_active) break;
@@ -4617,6 +4759,35 @@ fn renderScreenWithMockBackend(
     return lines;
 }
 
+fn renderScreenWithMockBackendAndOverlay(
+    allocator: std.mem.Allocator,
+    screen: *const ScreenComponent,
+    overlay: *SelectorOverlay,
+    backend: *InteractiveModeTestBackend,
+) !tui.LineList {
+    var terminal = tui.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = tui.Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const panel = OverlayPanelComponent{
+        .overlay = overlay,
+        .theme = screen.theme,
+        .max_height = overlayPanelMaxHeight(screen.height),
+    };
+    _ = try renderer.showOverlay(panel.component(), overlayPanelOptions(backend.size, 1.0));
+    try renderer.render(screen.component());
+
+    var lines = tui.LineList.empty;
+    errdefer freeLinesSafe(allocator, &lines);
+    for (renderer.previous_lines.items) |line| {
+        try lines.append(allocator, try allocator.dupe(u8, line));
+    }
+    return lines;
+}
+
 fn renderedLinesContain(lines: []const []const u8, needle: []const u8) bool {
     for (lines) |line| {
         if (std.mem.indexOf(u8, line, needle) != null) return true;
@@ -5883,12 +6054,13 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         .state = &state,
         .editor = &editor,
         .height = 24,
-        .overlay = &overlay.?,
     };
 
-    var lines = tui.LineList.empty;
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 24 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 80, &lines);
     try std.testing.expect(renderedLinesContain(lines.items, "[bookmark]"));
 
     overlay.?.deinit(allocator);
@@ -5948,8 +6120,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &live_resources,
     );
 
-    screen.overlay = &overlay.?;
-    try screen.renderInto(allocator, 80, &lines);
+    lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
     try std.testing.expect(!renderedLinesContain(lines.items, "[bookmark]"));
 }
 
