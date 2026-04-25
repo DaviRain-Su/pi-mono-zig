@@ -158,9 +158,13 @@ pub const GoogleVertexProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                var response_headers = std.StringHashMap([]const u8).init(allocator);
-                defer response_headers.deinit();
-                callback(response.status, response_headers, model);
+                if (response.response_headers) |response_headers| {
+                    callback(response.status, response_headers, model);
+                } else {
+                    var response_headers = std.StringHashMap([]const u8).init(allocator);
+                    defer response_headers.deinit();
+                    callback(response.status, response_headers, model);
+                }
             }
         }
 

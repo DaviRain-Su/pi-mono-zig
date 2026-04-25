@@ -302,9 +302,8 @@ pub fn exchangeGoogleAuthorizationCode(
     const parsed = try parseAuthorizationInput(allocator, input);
     defer parsed.deinit(allocator);
 
-    if (parsed.state) |state| {
-        if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
-    }
+    const state = parsed.state orelse return error.InvalidOAuthState;
+    if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
     const body = try buildFormBody(allocator, &.{
@@ -852,9 +851,8 @@ fn exchangeAnthropicAuthorizationCode(
     const parsed = try parseAuthorizationInput(allocator, input);
     defer parsed.deinit(allocator);
 
-    if (parsed.state) |state| {
-        if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
-    }
+    const state = parsed.state orelse return error.InvalidOAuthState;
+    if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
 

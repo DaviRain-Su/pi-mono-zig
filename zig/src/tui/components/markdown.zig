@@ -456,13 +456,14 @@ fn renderTableBlock(
     }
 
     const row_cells = try allocator.alloc([]const []const u8, row_lines.len);
-    defer {
-        for (row_cells) |cells| allocator.free(cells);
-        allocator.free(row_cells);
-    }
+    @memset(row_cells, &.{});
+    defer allocator.free(row_cells);
+    var cells_parsed: usize = 0;
     for (row_lines, 0..) |row_line, index| {
         row_cells[index] = try parseTableCellsAlloc(allocator, row_line);
+        cells_parsed = index + 1;
     }
+    defer for (row_cells[0..cells_parsed]) |cells| allocator.free(cells);
 
     const column_widths = try allocator.alloc(usize, column_count);
     defer allocator.free(column_widths);

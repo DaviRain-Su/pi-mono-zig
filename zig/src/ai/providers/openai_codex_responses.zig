@@ -119,9 +119,13 @@ pub const OpenAICodexResponsesProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                var response_headers = std.StringHashMap([]const u8).init(allocator);
-                defer response_headers.deinit();
-                callback(response.status, response_headers, model);
+                if (response.response_headers) |response_headers| {
+                    callback(response.status, response_headers, model);
+                } else {
+                    var response_headers = std.StringHashMap([]const u8).init(allocator);
+                    defer response_headers.deinit();
+                    callback(response.status, response_headers, model);
+                }
             }
         }
 
@@ -804,9 +808,14 @@ fn finalizeCurrentBlock(
             },
             .thinking => |*thinking| {
                 const owned = try allocator.dupe(u8, thinking.text.items);
-                const signature = if (maybe_item_value) |item_value|
-                    try std.json.Stringify.valueAlloc(allocator, item_value, .{})
-                else if (thinking.signature) |existing|
+                const signature = if (maybe_item_value) |item_value| blk: {
+                    if (item_value == .object) {
+                        if (item_value.object.get("encrypted_content")) |encrypted| {
+                            if (encrypted == .string) break :blk try allocator.dupe(u8, encrypted.string);
+                        }
+                    }
+                    break :blk null;
+                } else if (thinking.signature) |existing|
                     try allocator.dupe(u8, existing)
                 else
                     null;

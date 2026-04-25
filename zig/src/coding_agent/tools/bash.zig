@@ -113,14 +113,18 @@ pub const BashTool = struct {
         const stdout_file = child.stdout.?;
         child.stdout = null;
 
-        var reader_state = OutputReaderState.init(allocator, stdout_file, self.io);
-        const reader_thread = try std.Thread.spawn(.{}, readOutputThread, .{&reader_state});
-
         var wait_state = WaitState{
             .child = &child,
             .io = self.io,
         };
         const wait_thread = try std.Thread.spawn(.{}, waitChildThread, .{&wait_state});
+
+        var reader_state = OutputReaderState.init(allocator, stdout_file, self.io);
+        const reader_thread = std.Thread.spawn(.{}, readOutputThread, .{&reader_state}) catch |err| {
+            child.kill(self.io);
+            wait_thread.join();
+            return err;
+        };
 
         // Both threads spawned successfully; now install the defer that joins and cleans up
         var threads_joined = false;

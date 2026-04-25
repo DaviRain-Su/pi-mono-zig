@@ -171,7 +171,7 @@ fn parseKeyWithMode(input: []const u8, mode: ParseMode) ?ParseResult {
         0x09 => return parsed(.tab, 1),
         0x7f, 0x08 => return parsed(.backspace, 1),
         0x1b => return parseEscapeSequence(input, mode),
-        0x01...0x07, 0x0b, 0x0c, 0x0e...0x1a => return parsed(.{ .ctrl = @as(u8, 'a') + first - 1 }, 1),
+        0x01...0x07, 0x0b, 0x0c, 0x0e...0x1a, 0x1c...0x1f => return parsed(.{ .ctrl = @as(u8, 'a') + first - 1 }, 1),
         else => {},
     }
 

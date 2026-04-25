@@ -130,16 +130,20 @@ describe("Application inference profile support", () => {
 		};
 
 		let capturedPayload: any;
-		const s = streamBedrock(model, {
-systemPrompt: "You are helpful.",
-messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
-		}, {
-			signal: AbortSignal.abort(),
-			onPayload: (payload) => {
-				capturedPayload = payload;
-				return payload;
+		const s = streamBedrock(
+			model,
+			{
+				systemPrompt: "You are helpful.",
+				messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
 			},
-		});
+			{
+				signal: AbortSignal.abort(),
+				onPayload: (payload) => {
+					capturedPayload = payload;
+					return payload;
+				},
+			},
+		);
 
 		for await (const event of s) {
 			if (event.type === "error") break;
@@ -165,7 +169,10 @@ messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
 
 		const payload = await capturePayload(model);
 
-		expect(payload.additionalModelRequestFields?.thinking).toMatchObject({ type: "enabled", budget_tokens: expect.any(Number) });
+		expect(payload.additionalModelRequestFields?.thinking).toMatchObject({
+			type: "enabled",
+			budget_tokens: expect.any(Number),
+		});
 		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual(["interleaved-thinking-2025-05-14"]);
 	});
 });

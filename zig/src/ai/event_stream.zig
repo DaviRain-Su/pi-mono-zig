@@ -54,7 +54,11 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 self.final_result = self.extract_result_fn(event);
             }
 
-            self.queue.append(self.allocator, event) catch return;
+            self.queue.append(self.allocator, event) catch {
+                self.done = true;
+                self.condition.broadcast(self.io);
+                return;
+            };
             self.condition.signal(self.io);
         }
 
