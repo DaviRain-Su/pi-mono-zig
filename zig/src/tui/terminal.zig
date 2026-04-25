@@ -1,4 +1,5 @@
 const std = @import("std");
+const keys = @import("keys.zig");
 
 pub const Size = struct {
     width: usize,
@@ -39,6 +40,9 @@ pub const Terminal = struct {
     pub const ALT_SCREEN_DISABLE = "\x1b[?1049l";
     pub const BRACKETED_PASTE_ENABLE = "\x1b[?2004h";
     pub const BRACKETED_PASTE_DISABLE = "\x1b[?2004l";
+    pub const KITTY_KEYBOARD_QUERY = "\x1b[?u";
+    pub const KITTY_KEYBOARD_ENABLE = "\x1b[>7u";
+    pub const KITTY_KEYBOARD_DISABLE = "\x1b[<u";
     pub const SYNC_OUTPUT_ENABLE = "\x1b[?2026h";
     pub const SYNC_OUTPUT_DISABLE = "\x1b[?2026l";
     pub const HIDE_CURSOR = "\x1b[?25l";
@@ -54,8 +58,10 @@ pub const Terminal = struct {
         try self.backend.enterRawMode();
         errdefer self.backend.restoreMode() catch {};
 
-        try self.backend.write(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR);
-        errdefer self.backend.write(ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ SHOW_CURSOR) catch {};
+        keys.setKittyProtocolActive(false);
+
+        try self.backend.write(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR ++ KITTY_KEYBOARD_QUERY ++ KITTY_KEYBOARD_ENABLE);
+        errdefer self.backend.write(ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
 
         self.current_size = try self.backend.getSize();
         self.started = true;
@@ -65,7 +71,8 @@ pub const Terminal = struct {
     pub fn stop(self: *Terminal) void {
         if (!self.started) return;
 
-        self.backend.write(ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ SHOW_CURSOR) catch {};
+        keys.setKittyProtocolActive(false);
+        self.backend.write(ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
         self.backend.restoreMode() catch {};
         self.started = false;
         self.raw_mode_enabled = false;
@@ -154,7 +161,7 @@ test "terminal enters raw mode on startup and restores on exit" {
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(terminal.raw_mode_enabled);
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR,
+        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
         backend.writes.items[0],
     );
 
@@ -163,7 +170,7 @@ test "terminal enters raw mode on startup and restores on exit" {
     try std.testing.expect(backend.restored);
     try std.testing.expect(!terminal.raw_mode_enabled);
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR,
+        Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         backend.writes.items[1],
     );
 }
@@ -181,11 +188,11 @@ test "terminal restores terminal modes when startup fails after entering alterna
     try std.testing.expect(!terminal.raw_mode_enabled);
     try std.testing.expectEqual(@as(usize, 2), backend.writes.items.len);
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR,
+        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
         backend.writes.items[0],
     );
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR,
+        Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         backend.writes.items[1],
     );
 }
