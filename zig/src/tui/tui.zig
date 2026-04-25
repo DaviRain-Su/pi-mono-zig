@@ -47,6 +47,20 @@ pub const OverlayOptions = struct {
     animation: OverlayAnimation = .{},
 };
 
+pub const RenderMode = enum {
+    none,
+    full,
+    diff,
+};
+
+pub const RenderStats = struct {
+    mode: RenderMode = .none,
+    changed_line_count: usize = 0,
+    payload_bytes: usize = 0,
+    frame_bytes: usize = 0,
+    synchronized_output: bool = false,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     terminal: *terminal_mod.Terminal,
@@ -54,12 +68,18 @@ pub const Renderer = struct {
     previous_size: ?terminal_mod.Size = null,
     overlays: std.ArrayList(OverlayEntry) = .empty,
     next_overlay_id: usize = 1,
+    synchronized_output_enabled: bool = true,
+    last_render_stats: RenderStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, terminal: *terminal_mod.Terminal) Renderer {
         return .{
             .allocator = allocator,
             .terminal = terminal,
         };
+    }
+
+    pub fn getLastRenderStats(self: *const Renderer) RenderStats {
+        return self.last_render_stats;
     }
 
     pub fn deinit(self: *Renderer) void {
@@ -135,7 +155,7 @@ pub const Renderer = struct {
             if (index > 0) try buffer.append(self.allocator, '\n');
             try buffer.appendSlice(self.allocator, line);
         }
-        try self.terminal.write(buffer.items);
+        try self.writeFrame(.full, lines.len, buffer.items);
     }
 
     fn diffRedraw(self: *Renderer, lines: []const []u8) !void {
@@ -143,10 +163,12 @@ pub const Renderer = struct {
         defer buffer.deinit(self.allocator);
 
         const max_lines = @max(lines.len, self.previous_lines.items.len);
+        var changed_line_count: usize = 0;
         for (0..max_lines) |row| {
             const old_line = if (row < self.previous_lines.items.len) self.previous_lines.items[row] else "";
             const new_line = if (row < lines.len) lines[row] else "";
             if (std.mem.eql(u8, old_line, new_line)) continue;
+            changed_line_count += 1;
 
             const cursor = try std.fmt.allocPrint(self.allocator, "\x1b[{d};1H\x1b[2K", .{row + 1});
             defer self.allocator.free(cursor);
@@ -154,9 +176,35 @@ pub const Renderer = struct {
             try buffer.appendSlice(self.allocator, new_line);
         }
 
-        if (buffer.items.len > 0) {
-            try self.terminal.write(buffer.items);
+        try self.writeFrame(.diff, changed_line_count, buffer.items);
+    }
+
+    fn writeFrame(self: *Renderer, mode: RenderMode, changed_line_count: usize, payload: []const u8) !void {
+        self.last_render_stats = .{
+            .mode = mode,
+            .changed_line_count = changed_line_count,
+            .payload_bytes = payload.len,
+            .frame_bytes = payload.len,
+            .synchronized_output = false,
+        };
+
+        if (payload.len == 0) return;
+
+        if (!self.synchronized_output_enabled) {
+            try self.terminal.write(payload);
+            return;
         }
+
+        var frame = std.ArrayList(u8).empty;
+        defer frame.deinit(self.allocator);
+
+        try frame.appendSlice(self.allocator, terminal_mod.Terminal.SYNC_OUTPUT_ENABLE);
+        try frame.appendSlice(self.allocator, payload);
+        try frame.appendSlice(self.allocator, terminal_mod.Terminal.SYNC_OUTPUT_DISABLE);
+
+        self.last_render_stats.frame_bytes = frame.items.len;
+        self.last_render_stats.synchronized_output = true;
+        try self.terminal.write(frame.items);
     }
 
     fn replacePreviousLines(self: *Renderer, lines: []const []u8) !void {
@@ -443,9 +491,17 @@ test "differential renderer only redraws changed lines" {
 
     try std.testing.expectEqual(baseline_write_count + 1, backend.writes.items.len);
     const delta = backend.writes.items[backend.writes.items.len - 1];
+    try std.testing.expect(std.mem.startsWith(u8, delta, terminal_mod.Terminal.SYNC_OUTPUT_ENABLE));
+    try std.testing.expect(std.mem.endsWith(u8, delta, terminal_mod.Terminal.SYNC_OUTPUT_DISABLE));
     try std.testing.expect(std.mem.indexOf(u8, delta, "\x1b[2;1H\x1b[2K") != null);
     try std.testing.expect(std.mem.indexOf(u8, delta, "\x1b[1;1H") == null);
     try std.testing.expect(std.mem.indexOf(u8, delta, "\x1b[3;1H") == null);
+
+    const stats = renderer.getLastRenderStats();
+    try std.testing.expectEqual(RenderMode.diff, stats.mode);
+    try std.testing.expectEqual(@as(usize, 1), stats.changed_line_count);
+    try std.testing.expect(stats.synchronized_output);
+    try std.testing.expect(stats.frame_bytes < backend.writes.items[1].len);
 }
 
 test "renderer performs a full redraw when the terminal size changes" {
@@ -471,9 +527,43 @@ test "renderer performs a full redraw when the terminal size changes" {
 
     try std.testing.expectEqual(initial_write_count + 1, backend.writes.items.len);
     const redraw = backend.writes.items[backend.writes.items.len - 1];
-    try std.testing.expect(std.mem.startsWith(u8, redraw, "\x1b[2J\x1b[H"));
+    try std.testing.expect(std.mem.startsWith(u8, redraw, terminal_mod.Terminal.SYNC_OUTPUT_ENABLE ++ "\x1b[2J\x1b[H"));
+    try std.testing.expect(std.mem.endsWith(u8, redraw, terminal_mod.Terminal.SYNC_OUTPUT_DISABLE));
     try std.testing.expect(std.mem.indexOf(u8, redraw, "one") != null);
     try std.testing.expect(std.mem.indexOf(u8, redraw, "two") != null);
+
+    const stats = renderer.getLastRenderStats();
+    try std.testing.expectEqual(RenderMode.full, stats.mode);
+    try std.testing.expectEqual(@as(usize, 2), stats.changed_line_count);
+    try std.testing.expect(stats.synchronized_output);
+}
+
+test "renderer skips terminal writes when a frame is unchanged" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 12, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const static_component = TestStaticComponent{ .lines = &[_][]const u8{ "same", "frame" } };
+    try renderer.render(static_component.component());
+    const baseline_write_count = backend.writes.items.len;
+
+    try renderer.render(static_component.component());
+
+    try std.testing.expectEqual(baseline_write_count, backend.writes.items.len);
+    const stats = renderer.getLastRenderStats();
+    try std.testing.expectEqual(RenderMode.diff, stats.mode);
+    try std.testing.expectEqual(@as(usize, 0), stats.changed_line_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.payload_bytes);
+    try std.testing.expectEqual(@as(usize, 0), stats.frame_bytes);
+    try std.testing.expect(!stats.synchronized_output);
 }
 
 test "renderer composites overlays on top of base content and can dismiss them" {
