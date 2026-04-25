@@ -8,6 +8,9 @@ pub const LoaderStyle = enum {
     dots,
     pulse,
     line,
+    arc,
+    bounce,
+    grow,
     custom,
 };
 
@@ -113,6 +116,9 @@ pub const Loader = struct {
             .dots => DEFAULT_DOT_FRAMES[0..],
             .pulse => DEFAULT_PULSE_FRAMES[0..],
             .line => DEFAULT_LINE_FRAMES[0..],
+            .arc => DEFAULT_ARC_FRAMES[0..],
+            .bounce => DEFAULT_BOUNCE_FRAMES[0..],
+            .grow => DEFAULT_GROW_FRAMES[0..],
             .custom => unreachable,
         };
     }
@@ -201,6 +207,9 @@ const DEFAULT_SPINNER_FRAMES = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼",
 const DEFAULT_DOT_FRAMES = [_][]const u8{ ".", "..", "..." };
 const DEFAULT_PULSE_FRAMES = [_][]const u8{ "●○○", "○●○", "○○●" };
 const DEFAULT_LINE_FRAMES = [_][]const u8{ "-", "\\", "|", "/" };
+const DEFAULT_ARC_FRAMES = [_][]const u8{ "◜", "◠", "◝", "◞", "◡", "◟" };
+const DEFAULT_BOUNCE_FRAMES = [_][]const u8{ "⠁", "⠂", "⠄", "⠂" };
+const DEFAULT_GROW_FRAMES = [_][]const u8{ "▁", "▃", "▄", "▆", "█", "▆", "▄", "▃" };
 
 fn resolvedIntervalMs(interval_ms: u32) u64 {
     return if (interval_ms == 0) DEFAULT_INTERVAL_MS else interval_ms;
@@ -297,6 +306,27 @@ test "loader supports alternate styles and elapsed time frame selection" {
     var custom = try renderLines(allocator, loader.component(), 18);
     defer component_mod.freeLines(allocator, &custom);
     try std.testing.expect(std.mem.indexOf(u8, custom.items[0], "[== ] Syncing") != null);
+}
+
+test "loader includes additional spinner style presets" {
+    const allocator = std.testing.allocator;
+
+    var loader = Loader{
+        .message = "Polishing",
+        .indicator = .{ .style = .arc },
+        .frame_index = 2,
+    };
+
+    var arc = try renderLines(allocator, loader.component(), 16);
+    defer component_mod.freeLines(allocator, &arc);
+    try std.testing.expect(std.mem.indexOf(u8, arc.items[0], "◝ Polishing") != null);
+
+    loader.setStyle(.grow);
+    loader.setFrameIndex(4);
+
+    var grow = try renderLines(allocator, loader.component(), 16);
+    defer component_mod.freeLines(allocator, &grow);
+    try std.testing.expect(std.mem.indexOf(u8, grow.items[0], "█ Polishing") != null);
 }
 
 test "cancellable loader renders cancel hint and aborts on escape" {

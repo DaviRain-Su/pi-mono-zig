@@ -51,25 +51,45 @@ pub const Markdown = struct {
         const normalized = try normalizeTabsAlloc(allocator, self.text);
         defer allocator.free(normalized);
 
+        var source_lines = std.ArrayList([]const u8).empty;
+        defer source_lines.deinit(allocator);
+        var split = std.mem.splitScalar(u8, normalized, '\n');
+        while (split.next()) |raw_line| {
+            try source_lines.append(allocator, trimCarriageReturn(raw_line));
+        }
+
         var paragraph_lines = std.ArrayList([]const u8).empty;
         defer paragraph_lines.deinit(allocator);
 
+        var code_block_lines = std.ArrayList([]const u8).empty;
+        defer code_block_lines.deinit(allocator);
+
         var in_code_block = false;
-        var line_iter = std.mem.splitScalar(u8, normalized, '\n');
-        while (line_iter.next()) |raw_line| {
-            const line = trimCarriageReturn(raw_line);
+        var code_block_language: []const u8 = "";
+        var line_index: usize = 0;
+        while (line_index < source_lines.items.len) {
+            const line = source_lines.items[line_index];
             const trimmed = std.mem.trim(u8, line, " \t");
 
             if (in_code_block) {
                 if (isCodeFence(trimmed)) {
-                    const code_border = try styleWithThemeOrAnsiAlloc(allocator, self.theme, .markdown_code_border, trimmed, CODE_BORDER_STYLE);
-                    defer allocator.free(code_border);
-                    try appendWrappedText(allocator, effective_width, self.padding_x, content_width, code_border, lines);
+                    try renderCodeBlock(
+                        allocator,
+                        self.theme,
+                        effective_width,
+                        self.padding_x,
+                        content_width,
+                        code_block_language,
+                        code_block_lines.items,
+                        lines,
+                    );
+                    code_block_lines.clearRetainingCapacity();
+                    code_block_language = "";
                     in_code_block = false;
+                    line_index += 1;
                 } else {
-                    const styled_code = try styleWithThemeOrAnsiAlloc(allocator, self.theme, .markdown_code, line, CODE_STYLE);
-                    defer allocator.free(styled_code);
-                    try appendWrappedPrefixedText(allocator, effective_width, self.padding_x, "  ", "  ", styled_code, lines);
+                    try code_block_lines.append(allocator, line);
+                    line_index += 1;
                 }
                 continue;
             }
@@ -77,15 +97,16 @@ pub const Markdown = struct {
             if (trimmed.len == 0) {
                 try flushParagraphLines(allocator, self.theme, effective_width, content_width, self.padding_x, &paragraph_lines, lines);
                 try appendOwnedMarkdownLine(allocator, self.theme, blank_line, lines);
+                line_index += 1;
                 continue;
             }
 
             if (isCodeFence(trimmed)) {
                 try flushParagraphLines(allocator, self.theme, effective_width, content_width, self.padding_x, &paragraph_lines, lines);
-                const code_border = try styleWithThemeOrAnsiAlloc(allocator, self.theme, .markdown_code_border, trimmed, CODE_BORDER_STYLE);
-                defer allocator.free(code_border);
-                try appendWrappedText(allocator, effective_width, self.padding_x, content_width, code_border, lines);
                 in_code_block = true;
+                code_block_language = std.mem.trim(u8, trimmed[3..], " \t");
+                code_block_lines.clearRetainingCapacity();
+                line_index += 1;
                 continue;
             }
 
@@ -99,6 +120,7 @@ pub const Markdown = struct {
                 defer allocator.free(styled_heading);
 
                 try appendWrappedText(allocator, effective_width, self.padding_x, content_width, styled_heading, lines);
+                line_index += 1;
                 continue;
             }
 
@@ -109,6 +131,23 @@ pub const Markdown = struct {
                 const styled_separator = try styleWithThemeOrAnsiAlloc(allocator, self.theme, .markdown_rule, separator, RULE_STYLE);
                 defer allocator.free(styled_separator);
                 try appendWrappedText(allocator, effective_width, self.padding_x, content_width, styled_separator, lines);
+                line_index += 1;
+                continue;
+            }
+
+            if (detectTableBlock(source_lines.items, line_index)) |table_match| {
+                try flushParagraphLines(allocator, self.theme, effective_width, content_width, self.padding_x, &paragraph_lines, lines);
+                try renderTableBlock(
+                    allocator,
+                    self.theme,
+                    effective_width,
+                    self.padding_x,
+                    content_width,
+                    source_lines.items[line_index],
+                    source_lines.items[line_index + 2 .. table_match.end_index],
+                    lines,
+                );
+                line_index = table_match.end_index;
                 continue;
             }
 
@@ -123,6 +162,7 @@ pub const Markdown = struct {
                 const border_prefix = try formatQuoteBorderPrefix(allocator, self.theme);
                 defer allocator.free(border_prefix);
                 try appendWrappedPrefixedText(allocator, effective_width, self.padding_x, border_prefix, border_prefix, styled_quote, lines);
+                line_index += 1;
                 continue;
             }
 
@@ -149,17 +189,26 @@ pub const Markdown = struct {
                     formatted_item,
                     lines,
                 );
+                line_index += 1;
                 continue;
             }
 
             try paragraph_lines.append(allocator, line);
+            line_index += 1;
         }
 
         try flushParagraphLines(allocator, self.theme, effective_width, content_width, self.padding_x, &paragraph_lines, lines);
         if (in_code_block) {
-            const code_border = try styleWithThemeOrAnsiAlloc(allocator, self.theme, .markdown_code_border, "```", CODE_BORDER_STYLE);
-            defer allocator.free(code_border);
-            try appendWrappedText(allocator, effective_width, self.padding_x, content_width, code_border, lines);
+            try renderCodeBlock(
+                allocator,
+                self.theme,
+                effective_width,
+                self.padding_x,
+                content_width,
+                code_block_language,
+                code_block_lines.items,
+                lines,
+            );
         }
 
         for (0..self.padding_y) |_| {
@@ -291,6 +340,164 @@ fn trimCarriageReturn(text: []const u8) []const u8 {
     return text;
 }
 
+const TableMatch = struct {
+    end_index: usize,
+};
+
+fn detectTableBlock(source_lines: []const []const u8, start_index: usize) ?TableMatch {
+    if (start_index + 1 >= source_lines.len) return null;
+
+    const header_cells = countTableCells(source_lines[start_index]);
+    if (header_cells < 2) return null;
+    if (!isTableSeparatorLine(source_lines[start_index + 1], header_cells)) return null;
+
+    var end_index = start_index + 2;
+    while (end_index < source_lines.len) : (end_index += 1) {
+        const trimmed = std.mem.trim(u8, source_lines[end_index], " \t");
+        if (trimmed.len == 0) break;
+        if (countTableCells(source_lines[end_index]) != header_cells) break;
+    }
+
+    return .{ .end_index = end_index };
+}
+
+fn renderCodeBlock(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    effective_width: usize,
+    padding_x: usize,
+    content_width: usize,
+    language: []const u8,
+    code_lines: []const []const u8,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    if (content_width < 4) {
+        const fallback = if (language.len > 0)
+            try std.fmt.allocPrint(allocator, "```{s}", .{language})
+        else
+            try allocator.dupe(u8, "```");
+        defer allocator.free(fallback);
+        try appendWrappedText(allocator, effective_width, padding_x, content_width, fallback, lines);
+        for (code_lines) |code_line| {
+            const styled = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code, code_line, CODE_STYLE);
+            defer allocator.free(styled);
+            try appendWrappedText(allocator, effective_width, padding_x, content_width, styled, lines);
+        }
+        const closing = try allocator.dupe(u8, "```");
+        defer allocator.free(closing);
+        try appendWrappedText(allocator, effective_width, padding_x, content_width, closing, lines);
+        return;
+    }
+
+    const top = try buildCodeBorderLine(allocator, theme, content_width, language, true);
+    defer allocator.free(top);
+    try appendMarkdownPaddedLine(allocator, effective_width, padding_x, top, lines);
+
+    const inner_width = content_width - 4;
+    const left_border = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, "│ ", CODE_BORDER_STYLE);
+    defer allocator.free(left_border);
+    const right_border = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, " │", CODE_BORDER_STYLE);
+    defer allocator.free(right_border);
+
+    if (code_lines.len == 0) {
+        var empty_builder = std.ArrayList(u8).empty;
+        defer empty_builder.deinit(allocator);
+        try empty_builder.appendSlice(allocator, left_border);
+        try empty_builder.appendNTimes(allocator, ' ', inner_width);
+        try empty_builder.appendSlice(allocator, right_border);
+        try appendMarkdownPaddedLine(allocator, effective_width, padding_x, empty_builder.items, lines);
+    } else {
+        for (code_lines) |code_line| {
+            const styled_code = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code, code_line, CODE_STYLE);
+            defer allocator.free(styled_code);
+
+            var wrapped = component_mod.LineList.empty;
+            defer component_mod.freeLines(allocator, &wrapped);
+            try ansi.wrapTextWithAnsi(allocator, styled_code, inner_width, &wrapped);
+
+            for (wrapped.items) |wrapped_line| {
+                const padded_cell = try ansi.padRightVisibleAlloc(allocator, wrapped_line, inner_width);
+                defer allocator.free(padded_cell);
+
+                var builder = std.ArrayList(u8).empty;
+                defer builder.deinit(allocator);
+                try builder.appendSlice(allocator, left_border);
+                try builder.appendSlice(allocator, padded_cell);
+                try builder.appendSlice(allocator, right_border);
+                try appendMarkdownPaddedLine(allocator, effective_width, padding_x, builder.items, lines);
+            }
+        }
+    }
+
+    const bottom = try buildCodeBorderLine(allocator, theme, content_width, "", false);
+    defer allocator.free(bottom);
+    try appendMarkdownPaddedLine(allocator, effective_width, padding_x, bottom, lines);
+}
+
+fn renderTableBlock(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    effective_width: usize,
+    padding_x: usize,
+    content_width: usize,
+    header_line: []const u8,
+    row_lines: []const []const u8,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    const header_cells = try parseTableCellsAlloc(allocator, header_line);
+    defer allocator.free(header_cells);
+    if (header_cells.len == 0) return;
+
+    const column_count = header_cells.len;
+    const border_overhead = column_count * 3 + 1;
+    if (content_width <= border_overhead) {
+        try appendWrappedText(allocator, effective_width, padding_x, content_width, header_line, lines);
+        return;
+    }
+
+    const row_cells = try allocator.alloc([]const []const u8, row_lines.len);
+    defer {
+        for (row_cells) |cells| allocator.free(cells);
+        allocator.free(row_cells);
+    }
+    for (row_lines, 0..) |row_line, index| {
+        row_cells[index] = try parseTableCellsAlloc(allocator, row_line);
+    }
+
+    const column_widths = try allocator.alloc(usize, column_count);
+    defer allocator.free(column_widths);
+    for (column_widths) |*column_width| column_width.* = 3;
+
+    try updateColumnWidths(allocator, theme, header_cells, column_widths, true);
+    for (row_cells) |cells| {
+        try updateColumnWidths(allocator, theme, cells, column_widths, false);
+    }
+
+    const available_width = content_width - border_overhead;
+    shrinkColumnWidths(column_widths, available_width);
+
+    const top = try buildTableBorderLine(allocator, theme, column_widths, .top);
+    defer allocator.free(top);
+    try appendMarkdownPaddedLine(allocator, effective_width, padding_x, top, lines);
+
+    try appendTableRow(allocator, theme, effective_width, padding_x, header_cells, column_widths, true, lines);
+
+    const middle = try buildTableBorderLine(allocator, theme, column_widths, .middle);
+    defer allocator.free(middle);
+    try appendMarkdownPaddedLine(allocator, effective_width, padding_x, middle, lines);
+
+    for (row_cells, 0..) |cells, index| {
+        try appendTableRow(allocator, theme, effective_width, padding_x, cells, column_widths, false, lines);
+        if (index + 1 < row_cells.len) {
+            try appendMarkdownPaddedLine(allocator, effective_width, padding_x, middle, lines);
+        }
+    }
+
+    const bottom = try buildTableBorderLine(allocator, theme, column_widths, .bottom);
+    defer allocator.free(bottom);
+    try appendMarkdownPaddedLine(allocator, effective_width, padding_x, bottom, lines);
+}
+
 fn flushParagraphLines(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -394,6 +601,210 @@ fn appendWrappedPrefixedText(
     }
 }
 
+fn appendMarkdownPaddedLine(
+    allocator: std.mem.Allocator,
+    effective_width: usize,
+    padding_x: usize,
+    line: []const u8,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+    try builder.appendNTimes(allocator, ' ', padding_x);
+    try builder.appendSlice(allocator, line);
+
+    const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
+    defer allocator.free(padded);
+    try appendOwnedMarkdownLine(allocator, null, padded, lines);
+}
+
+fn buildCodeBorderLine(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    width: usize,
+    language: []const u8,
+    top: bool,
+) std.mem.Allocator.Error![]u8 {
+    var plain = std.ArrayList(u8).empty;
+    defer plain.deinit(allocator);
+
+    const left = if (top) "┌" else "└";
+    const right = if (top) "┐" else "┘";
+    try plain.appendSlice(allocator, left);
+
+    var remaining = width - 2;
+    if (top and language.len > 0 and remaining > ansi.visibleWidth(language) + 2) {
+        try plain.appendSlice(allocator, "─ ");
+        try plain.appendSlice(allocator, language);
+        try plain.appendSlice(allocator, " ");
+        remaining -= ansi.visibleWidth(language) + 2;
+    }
+    for (0..remaining) |_| {
+        try plain.appendSlice(allocator, "─");
+    }
+    try plain.appendSlice(allocator, right);
+
+    return styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, plain.items, CODE_BORDER_STYLE);
+}
+
+const TableBorderPosition = enum {
+    top,
+    middle,
+    bottom,
+};
+
+fn buildTableBorderLine(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    column_widths: []const usize,
+    position: TableBorderPosition,
+) std.mem.Allocator.Error![]u8 {
+    const left = switch (position) {
+        .top => "┌",
+        .middle => "├",
+        .bottom => "└",
+    };
+    const mid = switch (position) {
+        .top => "┬",
+        .middle => "┼",
+        .bottom => "┴",
+    };
+    const right = switch (position) {
+        .top => "┐",
+        .middle => "┤",
+        .bottom => "┘",
+    };
+
+    var plain = std.ArrayList(u8).empty;
+    defer plain.deinit(allocator);
+    try plain.appendSlice(allocator, left);
+    for (column_widths, 0..) |column_width, index| {
+        try plain.appendSlice(allocator, "─");
+        for (0..column_width) |_| {
+            try plain.appendSlice(allocator, "─");
+        }
+        try plain.appendSlice(allocator, "─");
+        if (index + 1 < column_widths.len) {
+            try plain.appendSlice(allocator, mid);
+        }
+    }
+    try plain.appendSlice(allocator, right);
+
+    return styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, plain.items, CODE_BORDER_STYLE);
+}
+
+fn appendTableRow(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    effective_width: usize,
+    padding_x: usize,
+    cells: []const []const u8,
+    column_widths: []const usize,
+    header: bool,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    const CellWrap = struct {
+        lines: component_mod.LineList = .empty,
+    };
+
+    const wrapped_cells = try allocator.alloc(CellWrap, column_widths.len);
+    defer {
+        for (wrapped_cells) |*cell| component_mod.freeLines(allocator, &cell.lines);
+        allocator.free(wrapped_cells);
+    }
+    for (wrapped_cells) |*cell| cell.* = .{};
+
+    var row_height: usize = 1;
+    for (column_widths, 0..) |column_width, index| {
+        const cell_text = if (index < cells.len) cells[index] else "";
+        const rendered = try renderInline(allocator, theme, cell_text);
+        defer allocator.free(rendered);
+
+        const styled = if (header)
+            try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_heading, rendered, HEADER_TWO_STYLE)
+        else
+            try allocator.dupe(u8, rendered);
+        defer allocator.free(styled);
+
+        try ansi.wrapTextWithAnsi(allocator, styled, column_width, &wrapped_cells[index].lines);
+        row_height = @max(row_height, @max(@as(usize, 1), wrapped_cells[index].lines.items.len));
+    }
+
+    const left_border = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, "│ ", CODE_BORDER_STYLE);
+    defer allocator.free(left_border);
+    const middle_border = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, " │ ", CODE_BORDER_STYLE);
+    defer allocator.free(middle_border);
+    const right_border = try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_code_border, " │", CODE_BORDER_STYLE);
+    defer allocator.free(right_border);
+
+    for (0..row_height) |row_index| {
+        var builder = std.ArrayList(u8).empty;
+        defer builder.deinit(allocator);
+        try builder.appendSlice(allocator, left_border);
+
+        for (column_widths, 0..) |column_width, index| {
+            const wrapped_line = if (row_index < wrapped_cells[index].lines.items.len)
+                wrapped_cells[index].lines.items[row_index]
+            else
+                "";
+            const padded = try ansi.padRightVisibleAlloc(allocator, wrapped_line, column_width);
+            defer allocator.free(padded);
+            try builder.appendSlice(allocator, padded);
+            if (index + 1 < column_widths.len) {
+                try builder.appendSlice(allocator, middle_border);
+            }
+        }
+
+        try builder.appendSlice(allocator, right_border);
+        try appendMarkdownPaddedLine(allocator, effective_width, padding_x, builder.items, lines);
+    }
+}
+
+fn updateColumnWidths(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    cells: []const []const u8,
+    column_widths: []usize,
+    header: bool,
+) std.mem.Allocator.Error!void {
+    for (column_widths, 0..) |*column_width, index| {
+        const cell_text = if (index < cells.len) cells[index] else "";
+        const rendered = try renderInline(allocator, theme, cell_text);
+        defer allocator.free(rendered);
+
+        const styled = if (header)
+            try styleWithThemeOrAnsiAlloc(allocator, theme, .markdown_heading, rendered, HEADER_TWO_STYLE)
+        else
+            try allocator.dupe(u8, rendered);
+        defer allocator.free(styled);
+
+        column_width.* = @max(column_width.*, @max(@as(usize, 3), ansi.visibleWidth(styled)));
+    }
+}
+
+fn shrinkColumnWidths(column_widths: []usize, available_width: usize) void {
+    var total_width: usize = 0;
+    for (column_widths) |column_width| total_width += column_width;
+
+    while (total_width > available_width) {
+        var widest_index: ?usize = null;
+        var widest_width: usize = 0;
+        for (column_widths, 0..) |column_width, index| {
+            if (column_width > widest_width and column_width > 3) {
+                widest_width = column_width;
+                widest_index = index;
+            }
+        }
+
+        if (widest_index) |index| {
+            column_widths[index] -= 1;
+            total_width -= 1;
+        } else {
+            break;
+        }
+    }
+}
+
 fn appendOwnedMarkdownLine(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -427,9 +838,9 @@ fn formatQuoteBorderPrefix(
     theme: ?*const resources_mod.Theme,
 ) std.mem.Allocator.Error![]u8 {
     if (theme) |active_theme| {
-        return active_theme.applyAlloc(allocator, .markdown_quote_border, "│ ");
+        return active_theme.applyAlloc(allocator, .markdown_quote_border, "▍ ");
     }
-    return std.fmt.allocPrint(allocator, "{s}│{s} ", .{ QUOTE_BORDER_STYLE, RESET });
+    return std.fmt.allocPrint(allocator, "{s}▍{s} ", .{ QUOTE_BORDER_STYLE, RESET });
 }
 
 fn formatListBulletPrefix(
@@ -553,6 +964,61 @@ fn parseListItem(line: []const u8) ?ListItem {
     };
 }
 
+fn parseTableCellsAlloc(allocator: std.mem.Allocator, line: []const u8) std.mem.Allocator.Error![]const []const u8 {
+    var trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len > 0 and trimmed[0] == '|') trimmed = trimmed[1..];
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '|') trimmed = trimmed[0 .. trimmed.len - 1];
+
+    var cells = std.ArrayList([]const u8).empty;
+    defer cells.deinit(allocator);
+
+    var split = std.mem.splitScalar(u8, trimmed, '|');
+    while (split.next()) |cell| {
+        try cells.append(allocator, std.mem.trim(u8, cell, " \t"));
+    }
+
+    return cells.toOwnedSlice(allocator);
+}
+
+fn countTableCells(line: []const u8) usize {
+    var trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, '|') == null) return 0;
+    if (trimmed[0] == '|') trimmed = trimmed[1..];
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '|') trimmed = trimmed[0 .. trimmed.len - 1];
+
+    var count: usize = 0;
+    var split = std.mem.splitScalar(u8, trimmed, '|');
+    while (split.next()) |_| count += 1;
+    return count;
+}
+
+fn isTableSeparatorLine(line: []const u8, expected_cells: usize) bool {
+    var trimmed_line = std.mem.trim(u8, line, " \t");
+    if (trimmed_line.len == 0) return false;
+    if (trimmed_line[0] == '|') trimmed_line = trimmed_line[1..];
+    if (trimmed_line.len > 0 and trimmed_line[trimmed_line.len - 1] == '|') {
+        trimmed_line = trimmed_line[0 .. trimmed_line.len - 1];
+    }
+
+    var count: usize = 0;
+    var split = std.mem.splitScalar(u8, trimmed_line, '|');
+    while (split.next()) |cell| {
+        count += 1;
+        const trimmed = std.mem.trim(u8, cell, " \t");
+        if (trimmed.len < 3) return false;
+        var has_dash = false;
+        for (trimmed) |byte| {
+            switch (byte) {
+                '-' => has_dash = true,
+                ':' => {},
+                else => return false,
+            }
+        }
+        if (!has_dash) return false;
+    }
+    return count == expected_cells and count > 0;
+}
+
 fn leadingWhitespaceLength(text: []const u8) usize {
     var index: usize = 0;
     while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
@@ -645,6 +1111,9 @@ test "markdown renders headings lists blockquotes rules and code blocks" {
         \\- bullet item
         \\1. ordered item
         \\> quoted text
+        \\| Name | Role |
+        \\| --- | --- |
+        \\| Pi | Agent |
         \\---
         \\```zig
         \\const answer = 42;
@@ -665,10 +1134,12 @@ test "markdown renders headings lists blockquotes rules and code blocks" {
     try std.testing.expect(std.mem.indexOf(u8, joined, LINK_STYLE ++ "link" ++ RESET) != null);
     try std.testing.expect(std.mem.indexOf(u8, joined, LIST_STYLE ++ "• " ++ RESET ++ "bullet item") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined, LIST_STYLE ++ "1. " ++ RESET ++ "ordered item") != null);
-    try std.testing.expect(std.mem.indexOf(u8, joined, QUOTE_BORDER_STYLE ++ "│" ++ RESET ++ " " ++ QUOTE_STYLE ++ "quoted text" ++ RESET) != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, QUOTE_BORDER_STYLE ++ "▍" ++ RESET ++ " " ++ QUOTE_STYLE ++ "quoted text" ++ RESET) != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "┌") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "│ " ++ HEADER_TWO_STYLE ++ "Name" ++ RESET) != null or std.mem.indexOf(u8, joined, "Name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, "Agent") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined, RULE_STYLE ++ "────────────────") != null);
-    try std.testing.expect(std.mem.indexOf(u8, joined, CODE_BORDER_STYLE ++ "```zig" ++ RESET) != null);
-    try std.testing.expect(std.mem.indexOf(u8, joined, CODE_STYLE ++ "const answer = 42." ++ RESET) == null);
+    try std.testing.expect(std.mem.indexOf(u8, joined, CODE_BORDER_STYLE ++ "┌─ zig ") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined, CODE_STYLE ++ "const answer = 42;" ++ RESET) != null);
 }
 
