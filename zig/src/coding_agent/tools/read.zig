@@ -109,6 +109,20 @@ pub const ReadTool = struct {
     }
 };
 
+pub fn parseArguments(args: std.json.Value) !ReadArgs {
+    if (args != .object) return error.InvalidToolArguments;
+
+    const path = try parseRequiredString(args.object, "path");
+    const offset = try getOptionalPositiveInt(args.object, "offset");
+    const limit = try getOptionalPositiveInt(args.object, "limit");
+
+    return .{
+        .path = path,
+        .offset = offset,
+        .limit = limit,
+    };
+}
+
 fn buildImageResult(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -263,6 +277,23 @@ fn formatSize(allocator: std.mem.Allocator, bytes: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d:.1}MB", .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)});
 }
 
+fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
+}
+
+fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return error.InvalidToolArguments;
+    return value.string;
+}
+
+fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?usize {
+    const value = object.get(key) orelse return null;
+    if (value != .integer) return error.InvalidToolArguments;
+    if (value.integer <= 0) return error.InvalidToolArguments;
+    return @intCast(value.integer);
+}
+
 fn schemaProperty(
     allocator: std.mem.Allocator,
     type_name: []const u8,
@@ -278,6 +309,10 @@ fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8)
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
     return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
+    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
 test "read tool returns full file contents" {
@@ -376,4 +411,40 @@ test "read tool returns a clear error for missing files" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "File not found"));
     try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "/definitely/missing/file.txt"));
+}
+
+test "read tool validates required arguments" {
+    const object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
+}
+
+test "read tool validates positive offset and limit" {
+    var object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "path"), .{
+        .string = try std.testing.allocator.dupe(u8, "file.txt"),
+    });
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "offset"), .{ .integer = 0 });
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
+
+    var limit_object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = limit_object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try limit_object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "path"), .{
+        .string = try std.testing.allocator.dupe(u8, "file.txt"),
+    });
+    try limit_object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "limit"), .{ .integer = 0 });
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = limit_object }));
 }

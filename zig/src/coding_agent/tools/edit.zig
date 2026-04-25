@@ -160,6 +160,16 @@ pub const EditTool = struct {
     }
 };
 
+pub fn parseArguments(args: std.json.Value) !EditArgs {
+    if (args != .object) return error.InvalidToolArguments;
+
+    return .{
+        .path = try parseRequiredString(args.object, "path"),
+        .old_text = try parseRequiredStringEither(args.object, "oldText", "old_text"),
+        .new_text = try parseRequiredStringEither(args.object, "newText", "new_text"),
+    };
+}
+
 const StrippedBom = struct {
     bom: []const u8,
     text: []const u8,
@@ -210,6 +220,21 @@ fn restoreLineEndings(
     };
 }
 
+fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
+}
+
+fn parseRequiredStringEither(object: std.json.ObjectMap, primary: []const u8, alternate: []const u8) ![]const u8 {
+    if (try parseOptionalString(object, primary)) |value| return value;
+    return (try parseOptionalString(object, alternate)) orelse error.InvalidToolArguments;
+}
+
+fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return error.InvalidToolArguments;
+    return value.string;
+}
+
 fn schemaProperty(
     allocator: std.mem.Allocator,
     type_name: []const u8,
@@ -225,6 +250,10 @@ fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8)
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
     return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
+    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
 test "edit tool replaces matching text in a file" {
@@ -288,4 +317,14 @@ test "edit tool returns an error when the search text is not found" {
 
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "Search text not found"));
+}
+
+test "edit tool validates required arguments" {
+    const object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
 }
