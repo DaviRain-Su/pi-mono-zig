@@ -247,7 +247,9 @@ fn buildUserMessage(
                     var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                     errdefer part.deinit(allocator);
                     try part.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
-                    try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitizeSurrogates(text.text)) });
+                    const sanitized = try sanitizeSurrogates(allocator, text.text);
+                    defer allocator.free(sanitized);
+                    try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
                     try content.append(.{ .object = part });
                 },
                 .image => |image| {
@@ -326,10 +328,14 @@ fn buildAssistantMessage(
         }
     }
 
-    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitizeSurrogates(text.items)) });
+    const sanitized_text = try sanitizeSurrogates(allocator, text.items);
+    defer allocator.free(sanitized_text);
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitized_text) });
 
     if (reasoning.items.len > 0) {
-        try object.put(allocator, try allocator.dupe(u8, "reasoning_content"), .{ .string = try allocator.dupe(u8, sanitizeSurrogates(reasoning.items)) });
+        const sanitized_reasoning = try sanitizeSurrogates(allocator, reasoning.items);
+        defer allocator.free(sanitized_reasoning);
+        try object.put(allocator, try allocator.dupe(u8, "reasoning_content"), .{ .string = try allocator.dupe(u8, sanitized_reasoning) });
     }
 
     if (assistant_message.stop_reason == .aborted) {
@@ -386,7 +392,9 @@ fn buildToolResultMessage(
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer object.deinit(allocator);
     try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "tool") });
-    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitizeSurrogates(content.items)) });
+    const sanitized_content = try sanitizeSurrogates(allocator, content.items);
+    defer allocator.free(sanitized_content);
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitized_content) });
     try object.put(allocator, try allocator.dupe(u8, "tool_call_id"), .{ .string = try allocator.dupe(u8, tool_result.tool_call_id) });
     if (tool_result.tool_name.len > 0) {
         try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_result.tool_name) });
@@ -412,7 +420,9 @@ fn buildMessageObject(allocator: std.mem.Allocator, role: []const u8, content: [
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer object.deinit(allocator);
     try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, role) });
-    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitizeSurrogates(content)) });
+    const sanitized_content = try sanitizeSurrogates(allocator, content);
+    defer allocator.free(sanitized_content);
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitized_content) });
     return object;
 }
 
@@ -878,8 +888,8 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
-fn sanitizeSurrogates(text: []const u8) []const u8 {
-    return openai.sanitizeSurrogates(text);
+fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    return try openai.sanitizeSurrogates(allocator, text);
 }
 
 fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
@@ -1154,7 +1164,12 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
 }
 
 test "sanitizeSurrogates matches openai surrogate filtering" {
+    const allocator = std.testing.allocator;
     const input = [_]u8{ 'A', 0xED, 0xA0, 0x80, 'B' };
-    try std.testing.expectEqualStrings("AB", sanitizeSurrogates(&input));
-    try std.testing.expectEqualStrings(openai.sanitizeSurrogates(&input), sanitizeSurrogates(&input));
+    const sanitized = try sanitizeSurrogates(allocator, &input);
+    defer allocator.free(sanitized);
+    const openai_sanitized = try openai.sanitizeSurrogates(allocator, &input);
+    defer allocator.free(openai_sanitized);
+    try std.testing.expectEqualStrings("AB", sanitized);
+    try std.testing.expectEqualStrings(openai_sanitized, sanitized);
 }

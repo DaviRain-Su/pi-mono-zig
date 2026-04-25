@@ -114,7 +114,6 @@ pub const BashTool = struct {
         child.stdout = null;
 
         var reader_state = OutputReaderState.init(allocator, stdout_file, self.io);
-        defer reader_state.deinit();
         const reader_thread = try std.Thread.spawn(.{}, readOutputThread, .{&reader_state});
 
         var wait_state = WaitState{
@@ -122,6 +121,16 @@ pub const BashTool = struct {
             .io = self.io,
         };
         const wait_thread = try std.Thread.spawn(.{}, waitChildThread, .{&wait_state});
+
+        // Both threads spawned successfully; now install the defer that joins and cleans up
+        var threads_joined = false;
+        defer {
+            if (!threads_joined) {
+                wait_thread.join();
+                reader_thread.join();
+            }
+            reader_state.deinit();
+        }
 
         const started_at = std.Io.Clock.now(.awake, self.io).nanoseconds;
         var timed_out = false;
@@ -150,6 +159,7 @@ pub const BashTool = struct {
 
         wait_thread.join();
         reader_thread.join();
+        threads_joined = true;
 
         if (reader_state.err) |err| return err;
         if (wait_state.err) |err| return err;
@@ -381,7 +391,7 @@ fn captureOutputInSecureTempFile(
     io: std.Io,
     output: []const u8,
 ) ![]u8 {
-    var temp_file = try SecureTempFile.create(allocator, io);
+    var temp_file = SecureTempFile.create(allocator, io) catch |err| return err;
     errdefer temp_file.deinit(allocator, io);
     try temp_file.file.?.writeStreamingAll(io, output);
     temp_file.file.?.close(io);
