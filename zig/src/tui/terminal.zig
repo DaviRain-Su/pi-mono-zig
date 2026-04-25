@@ -39,6 +39,8 @@ pub const Terminal = struct {
     pub const ALT_SCREEN_DISABLE = "\x1b[?1049l";
     pub const BRACKETED_PASTE_ENABLE = "\x1b[?2004h";
     pub const BRACKETED_PASTE_DISABLE = "\x1b[?2004l";
+    pub const SYNC_OUTPUT_ENABLE = "\x1b[?2026h";
+    pub const SYNC_OUTPUT_DISABLE = "\x1b[?2026l";
     pub const HIDE_CURSOR = "\x1b[?25l";
     pub const SHOW_CURSOR = "\x1b[?25h";
 
