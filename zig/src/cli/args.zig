@@ -48,10 +48,12 @@ pub const Args = struct {
     version: bool = false,
     prompt: ?[]const u8 = null,
     prompt_owned: bool = false,
+    file_args: ?[]const []const u8 = null,
 
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         if (self.tools) |tools| allocator.free(tools);
         if (self.models) |models| allocator.free(models);
+        if (self.file_args) |file_args| allocator.free(file_args);
         if (self.prompt_owned and self.prompt != null) allocator.free(self.prompt.?);
         self.* = undefined;
     }
@@ -63,6 +65,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
     var prompt_builder = std.ArrayList(u8).empty;
     var prompt_transferred = false;
     defer if (!prompt_transferred) prompt_builder.deinit(allocator);
+    var file_args_builder = std.ArrayList([]const u8).empty;
+    var file_args_transferred = false;
+    defer if (!file_args_transferred) file_args_builder.deinit(allocator);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -144,6 +149,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             result.append_system_prompt = argv[i];
+        } else if (std.mem.startsWith(u8, arg, "@")) {
+            try file_args_builder.append(allocator, arg[1..]);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownOption;
         } else {
@@ -160,6 +167,11 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
         prompt_transferred = true;
     }
 
+    if (file_args_builder.items.len > 0) {
+        result.file_args = try file_args_builder.toOwnedSlice(allocator);
+        file_args_transferred = true;
+    }
+
     return result;
 }
 
@@ -169,7 +181,7 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\pi - AI assistant (Zig rewrite) v{s}
         \\
         \\Usage:
-        \\  pi [options] [prompt]
+        \\  pi [options] [@files...] [prompt]
         \\
         \\Options:
         \\  --model <model>                Model ID (default depends on provider)
@@ -198,6 +210,7 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  pi --version
         \\  pi --model gpt-4.1 --provider openai "Summarize this repository"
         \\  pi --session-dir ./tmp/sessions --print "Summarize this repository"
+        \\  pi @prompt.md @screenshot.png "What changed in this image?"
         \\  pi --models anthropic/*,*gpt-5*
         \\  pi --list-models sonnet
         \\  pi --print --mode json "Explain the latest session"
@@ -277,6 +290,8 @@ test "parse args supports expected CLI flags" {
         "--tools",
         "read, grep,ls",
         "--no-tools",
+        "@prompt.md",
+        "@image.png",
         "Summarize the repository",
     });
     defer args.deinit(allocator);
@@ -300,6 +315,9 @@ test "parse args supports expected CLI flags" {
     try std.testing.expectEqual(Mode.json, args.mode);
     try std.testing.expect(args.no_tools);
     try std.testing.expectEqualStrings("Summarize the repository", args.prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), args.file_args.?.len);
+    try std.testing.expectEqualStrings("prompt.md", args.file_args.?[0]);
+    try std.testing.expectEqualStrings("image.png", args.file_args.?[1]);
     try std.testing.expectEqual(@as(usize, 3), args.tools.?.len);
     try std.testing.expectEqualStrings("read", args.tools.?[0]);
     try std.testing.expectEqualStrings("grep", args.tools.?[1]);
@@ -372,6 +390,23 @@ test "parse args concatenates multiple positional prompts" {
     try std.testing.expectEqualStrings("Summarize the repository", args.prompt.?);
 }
 
+test "parse args keeps @file arguments separate from the prompt" {
+    const allocator = std.testing.allocator;
+
+    var args = try parseArgs(allocator, &.{
+        "@notes.md",
+        "Explain",
+        "@diagram.png",
+        "this",
+    });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Explain this", args.prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), args.file_args.?.len);
+    try std.testing.expectEqualStrings("notes.md", args.file_args.?[0]);
+    try std.testing.expectEqualStrings("diagram.png", args.file_args.?[1]);
+}
+
 test "parse args rejects invalid thinking level" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidThinkingLevel, parseArgs(allocator, &.{ "--thinking", "turbo" }));
@@ -399,6 +434,7 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--help, -h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "[@files...] [prompt]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") != null);
 }
 

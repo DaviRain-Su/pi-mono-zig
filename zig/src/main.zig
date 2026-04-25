@@ -9,6 +9,41 @@ const coding_agent = @import("coding_agent/root.zig");
 
 const VERSION = "0.1.0";
 
+const AppMode = enum {
+    interactive,
+    print,
+    json,
+    rpc,
+};
+
+const CliStdin = struct {
+    is_tty: bool = true,
+    content: ?[]const u8 = null,
+    owns_content: bool = false,
+
+    fn deinit(self: *CliStdin, allocator: std.mem.Allocator) void {
+        if (self.owns_content and self.content != null) allocator.free(self.content.?);
+        self.* = .{};
+    }
+};
+
+const PreparedInitialInput = struct {
+    prompt: ?[]u8 = null,
+    images: []ai.ImageContent = &.{},
+
+    fn deinit(self: *PreparedInitialInput, allocator: std.mem.Allocator) void {
+        if (self.prompt) |prompt| allocator.free(prompt);
+        if (self.images.len > 0) {
+            for (self.images) |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            }
+            allocator.free(self.images);
+        }
+        self.* = .{};
+    }
+};
+
 const PreparedCliRuntime = struct {
     runtime_config: config_mod.RuntimeConfig,
     resource_bundle: resources_mod.ResourceBundle,
@@ -48,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
         try argv.append(init.gpa, arg);
     }
 
-    const exit_code = try runCli(init.gpa, init.io, init.environ_map, argv.items, null, stdout, stderr);
+    const exit_code = try runCliWithInput(init.gpa, init.io, init.environ_map, argv.items, null, null, stdout, stderr);
     try flushWriters(stdout, stderr);
     if (exit_code != 0) std.process.exit(exit_code);
 }
@@ -59,6 +94,20 @@ pub fn runCli(
     env_map: *const std.process.Environ.Map,
     argv: []const []const u8,
     cwd_override: ?[]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    var stdin_input = CliStdin{};
+    return runCliWithInput(allocator, io, env_map, argv, cwd_override, &stdin_input, stdout, stderr);
+}
+
+fn runCliWithInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    argv: []const []const u8,
+    cwd_override: ?[]const u8,
+    provided_stdin: ?*CliStdin,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
@@ -79,6 +128,16 @@ pub fn runCli(
         return 0;
     }
 
+    var detected_stdin = if (provided_stdin) |stdin_override|
+        CliStdin{
+            .is_tty = stdin_override.is_tty,
+            .content = stdin_override.content,
+            .owns_content = false,
+        }
+    else
+        try detectCliStdin(allocator, io, options.mode);
+    defer if (provided_stdin == null) detected_stdin.deinit(allocator);
+
     if (options.list_models) {
         return try printModelList(allocator, io, env_map, options.list_models_search, stdout);
     }
@@ -95,12 +154,12 @@ pub fn runCli(
         return 1;
     }
 
-    if (options.print and options.prompt == null) {
-        try stderr.writeAll("Error: No prompt provided\n\n");
-        try printUsage(allocator, stdout);
+    if (options.mode == .rpc and options.file_args != null) {
+        try stderr.writeAll("Error: @file arguments are not supported in RPC mode\n");
         return 1;
     }
 
+    const app_mode = resolveAppMode(options.mode, options.print, detected_stdin.is_tty);
     const selected_tools = effectiveToolSelection(&options);
     const cwd = if (cwd_override) |override| blk: {
         break :blk try allocator.dupe(u8, override);
@@ -115,6 +174,29 @@ pub fn runCli(
     defer prepared.deinit(allocator);
     try writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
 
+    var initial_input = prepareInitialInput(
+        allocator,
+        io,
+        env_map,
+        cwd,
+        options.file_args,
+        prepared.expanded_prompt,
+        detected_stdin.content,
+        stderr,
+    ) catch |err| switch (err) {
+        error.CliInputFailed => return 1,
+        else => return err,
+    };
+    defer initial_input.deinit(allocator);
+
+    if (app_mode == .print or app_mode == .json) {
+        if (initial_input.prompt == null) {
+            try stderr.writeAll("Error: No prompt provided\n\n");
+            try printUsage(allocator, stdout);
+            return 1;
+        }
+    }
+
     var provider_runtime = coding_agent.resolveProviderConfig(
         allocator,
         env_map,
@@ -128,7 +210,7 @@ pub fn runCli(
     };
     defer provider_runtime.deinit(allocator);
 
-    if (options.print or options.mode == .rpc) {
+    if (app_mode != .interactive) {
         coding_agent.interactive_mode.setToolRuntime(.{
             .cwd = cwd,
             .io = io,
@@ -158,6 +240,7 @@ pub fn runCli(
                 .model_patterns = options.models,
                 .selected_tools = selected_tools,
                 .initial_prompt = null,
+                .initial_images = &.{},
                 .prompt_templates = prepared.resource_bundle.prompt_templates,
                 .keybindings = &prepared.runtime_config.keybindings,
                 .theme = prepared.resource_bundle.selectedTheme(),
@@ -169,7 +252,7 @@ pub fn runCli(
         );
         defer session.deinit();
 
-        if (options.mode == .rpc) {
+        if (app_mode == .rpc) {
             return try coding_agent.runRpcMode(
                 allocator,
                 io,
@@ -180,16 +263,30 @@ pub fn runCli(
             );
         }
 
+        if (initial_input.images.len > 0) {
+            return try coding_agent.runPrintMode(
+                allocator,
+                io,
+                &session,
+                .{
+                    .text = initial_input.prompt.?,
+                    .images = initial_input.images,
+                },
+                .{
+                    .mode = if (app_mode == .json) .json else .text,
+                },
+                stdout,
+                stderr,
+            );
+        }
+
         return try coding_agent.runPrintMode(
             allocator,
             io,
             &session,
-            prepared.expanded_prompt.?,
+            initial_input.prompt.?,
             .{
-                .mode = switch (options.mode) {
-                    .json => .json,
-                    else => .text,
-                },
+                .mode = if (app_mode == .json) .json else .text,
             },
             stdout,
             stderr,
@@ -215,7 +312,8 @@ pub fn runCli(
             .no_session = options.no_session,
             .model_patterns = options.models,
             .selected_tools = selected_tools,
-            .initial_prompt = prepared.expanded_prompt,
+            .initial_prompt = initial_input.prompt,
+            .initial_images = initial_input.images,
             .prompt_templates = prepared.resource_bundle.prompt_templates,
             .keybindings = &prepared.runtime_config.keybindings,
             .theme = prepared.resource_bundle.selectedTheme(),
@@ -233,6 +331,134 @@ fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
         error.UnknownOption => "Unknown option",
         error.OutOfMemory => "Out of memory while parsing CLI arguments",
     };
+}
+
+fn resolveAppMode(mode: cli.Mode, print_requested: bool, stdin_is_tty: bool) AppMode {
+    return switch (mode) {
+        .rpc => .rpc,
+        .json => .json,
+        .text => if (print_requested or !stdin_is_tty) .print else .interactive,
+    };
+}
+
+fn stdinIsTty(io: std.Io) bool {
+    return std.Io.File.stdin().isTty(io) catch true;
+}
+
+fn detectCliStdin(allocator: std.mem.Allocator, io: std.Io, mode: cli.Mode) !CliStdin {
+    if (mode == .rpc or stdinIsTty(io)) return .{};
+
+    const content = try readPipedStdin(allocator, io);
+    return .{
+        .is_tty = false,
+        .content = content,
+        .owns_content = content != null,
+    };
+}
+
+fn readPipedStdin(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    var collected = std.ArrayList(u8).empty;
+    defer collected.deinit(allocator);
+
+    while (true) {
+        const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try collected.append(allocator, byte);
+    }
+
+    const trimmed = std.mem.trim(u8, collected.items, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn prepareInitialInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    file_args: ?[]const []const u8,
+    prompt: ?[]const u8,
+    stdin_content: ?[]const u8,
+    stderr: *std.Io.Writer,
+) !PreparedInitialInput {
+    var file_text = std.ArrayList(u8).empty;
+    defer file_text.deinit(allocator);
+    var images = std.ArrayList(ai.ImageContent).empty;
+    errdefer {
+        for (images.items) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        images.deinit(allocator);
+    }
+
+    if (file_args) |paths| {
+        for (paths) |path| {
+            const absolute_path = try config_mod.expandPath(allocator, env_map, path, cwd);
+            defer allocator.free(absolute_path);
+
+            const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, absolute_path, allocator, .unlimited) catch |err| {
+                switch (err) {
+                    error.FileNotFound => try stderr.print("Error: File not found: {s}\n", .{absolute_path}),
+                    else => try stderr.print("Error: Could not read file {s}: {s}\n", .{ absolute_path, @errorName(err) }),
+                }
+                return error.CliInputFailed;
+            };
+            defer allocator.free(bytes);
+
+            if (bytes.len == 0) continue;
+
+            if (detectImageMime(bytes)) |mime_type| {
+                const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+                _ = std.base64.standard.Encoder.encode(encoded, bytes);
+
+                try images.append(allocator, .{
+                    .data = encoded,
+                    .mime_type = try allocator.dupe(u8, mime_type),
+                });
+
+                const note = try std.fmt.allocPrint(allocator, "<file name=\"{s}\"></file>\n", .{absolute_path});
+                defer allocator.free(note);
+                try file_text.appendSlice(allocator, note);
+            } else {
+                const header = try std.fmt.allocPrint(allocator, "<file name=\"{s}\">\n", .{absolute_path});
+                defer allocator.free(header);
+                try file_text.appendSlice(allocator, header);
+                try file_text.appendSlice(allocator, bytes);
+                try file_text.appendSlice(allocator, "\n</file>\n");
+            }
+        }
+    }
+
+    var prompt_builder = std.ArrayList(u8).empty;
+    defer prompt_builder.deinit(allocator);
+    if (stdin_content) |content| try prompt_builder.appendSlice(allocator, content);
+    if (file_text.items.len > 0) try prompt_builder.appendSlice(allocator, file_text.items);
+    if (prompt) |text| try prompt_builder.appendSlice(allocator, text);
+
+    return .{
+        .prompt = if (prompt_builder.items.len > 0)
+            try prompt_builder.toOwnedSlice(allocator)
+        else
+            null,
+        .images = try images.toOwnedSlice(allocator),
+    };
+}
+
+fn detectImageMime(bytes: []const u8) ?[]const u8 {
+    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
+    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
+    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) {
+        return "image/gif";
+    }
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) {
+        return "image/webp";
+    }
+    return null;
 }
 
 fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
@@ -733,6 +959,158 @@ test "runCli prints faux response end to end" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("hello from cli\n", stdout_capture.writer.buffered());
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli auto-switches to print mode for piped stdin" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "hello from stdin");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var stdin_input = CliStdin{
+        .is_tty = false,
+        .content = "prompt from pipe",
+    };
+
+    const exit_code = try runCliWithInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux" },
+        "/tmp/project",
+        &stdin_input,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("hello from stdin\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli injects @file text into the initial prompt" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try makeTmpPath(allocator, tmp, "cli-file-text");
+    defer allocator.free(cwd);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
+    const note_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "note.txt" });
+    defer allocator.free(note_path);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = note_path,
+        .data = "alpha beta",
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "text file injected");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var stdin_input = CliStdin{};
+
+    const exit_code = try runCliWithInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "@note.txt", "Question?" },
+        cwd,
+        &stdin_input,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("text file injected\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    const user_text = context.messages[0].user.content[0].text.text;
+    try std.testing.expect(std.mem.startsWith(u8, user_text, "<file name=\""));
+    try std.testing.expect(std.mem.indexOf(u8, user_text, "alpha beta") != null);
+    try std.testing.expect(std.mem.endsWith(u8, user_text, "</file>\nQuestion?"));
+    try std.testing.expectEqualStrings("text file injected", context.messages[1].assistant.content[0].text.text);
+}
+
+test "runCli injects image file arguments into the initial prompt" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try makeTmpPath(allocator, tmp, "cli-file-image");
+    defer allocator.free(cwd);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
+    const image_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "screenshot.png" });
+    defer allocator.free(image_path);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = image_path,
+        .data = "\x89PNG\r\n\x1a\nfakepng",
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "image file injected");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var stdin_input = CliStdin{};
+
+    const exit_code = try runCliWithInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "@screenshot.png", "Describe it" },
+        cwd,
+        &stdin_input,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("image file injected\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqual(@as(usize, 2), context.messages[0].user.content.len);
+    const user_text = context.messages[0].user.content[0].text.text;
+    try std.testing.expect(std.mem.startsWith(u8, user_text, "<file name=\""));
+    try std.testing.expect(std.mem.endsWith(u8, user_text, "\"></file>\nDescribe it"));
+    try std.testing.expectEqualStrings("image/png", context.messages[0].user.content[1].image.mime_type);
+    try std.testing.expect(context.messages[0].user.content[1].image.data.len > 0);
+    try std.testing.expectEqualStrings("image file injected", context.messages[1].assistant.content[0].text.text);
 }
 
 test "cli executable print mode writes assistant text to stdout without interactive escape codes" {
