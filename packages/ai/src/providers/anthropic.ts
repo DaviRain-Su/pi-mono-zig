@@ -237,6 +237,15 @@ interface SseDecoderState {
 	raw: string[];
 }
 
+const ANTHROPIC_MESSAGE_EVENTS: ReadonlySet<string> = new Set([
+	"message_start",
+	"message_delta",
+	"message_stop",
+	"content_block_start",
+	"content_block_delta",
+	"content_block_stop",
+]);
+
 function flushSseEvent(state: SseDecoderState): ServerSentEvent | null {
 	if (!state.event && state.data.length === 0) {
 		return null;
@@ -376,12 +385,12 @@ async function* iterateAnthropicEvents(
 	}
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
-		if (!sse.event || sse.event === "ping") {
-			continue;
-		}
-
 		if (sse.event === "error") {
 			throw new Error(sse.data);
+		}
+
+		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
+			continue;
 		}
 
 		try {
