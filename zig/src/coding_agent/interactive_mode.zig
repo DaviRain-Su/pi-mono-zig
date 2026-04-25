@@ -116,7 +116,7 @@ const BuiltinSlashCommand = struct {
 };
 
 const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
-    .{ .name = "settings", .description = "Open settings overlay" },
+    .{ .name = "settings", .description = "Open settings editor" },
     .{ .name = "model", .description = "Select model (opens selector UI)", .argument_hint = "<provider/model>" },
     .{ .name = "export", .description = "Export session transcript", .argument_hint = "<path.json|path.md>" },
     .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
@@ -430,6 +430,7 @@ const AppState = struct {
 
 const SelectorOverlay = union(enum) {
     info: InfoOverlay,
+    settings_editor: SettingsEditorOverlay,
     session: SessionOverlay,
     model: ModelOverlay,
     tree: TreeOverlay,
@@ -438,6 +439,7 @@ const SelectorOverlay = union(enum) {
     fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .info => |*overlay| overlay.deinit(allocator),
+            .settings_editor => |*overlay| overlay.deinit(allocator),
             .session => |*overlay| overlay.deinit(allocator),
             .model => |*overlay| overlay.deinit(allocator),
             .tree => |*overlay| overlay.deinit(allocator),
@@ -449,6 +451,7 @@ const SelectorOverlay = union(enum) {
     fn title(self: *const SelectorOverlay) []const u8 {
         return switch (self.*) {
             .info => self.info.title,
+            .settings_editor => self.settings_editor.title,
             .session => "Session selector",
             .model => "Model selector",
             .tree => "Session tree",
@@ -459,17 +462,8 @@ const SelectorOverlay = union(enum) {
     fn hint(self: *const SelectorOverlay) []const u8 {
         return switch (self.*) {
             .info => self.info.hint,
+            .settings_editor => self.settings_editor.hint,
             else => "Up/Down move • Enter select • Esc cancel",
-        };
-    }
-
-    fn list(self: *SelectorOverlay) *tui.SelectList {
-        return switch (self.*) {
-            .info => &self.info.list,
-            .session => &self.session.list,
-            .model => &self.model.list,
-            .tree => &self.tree.list,
-            .auth => &self.auth.list,
         };
     }
 };
@@ -489,6 +483,21 @@ const InfoOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+const SettingsEditorOverlay = struct {
+    title: []u8,
+    hint: []u8,
+    path: []u8,
+    editor: tui.Editor,
+
+    fn deinit(self: *SettingsEditorOverlay, allocator: std.mem.Allocator) void {
+        allocator.free(self.title);
+        allocator.free(self.hint);
+        allocator.free(self.path);
+        self.editor.deinit();
         self.* = undefined;
     }
 };
@@ -782,29 +791,60 @@ const OverlayPanelComponent = struct {
             .padding_y = 0,
         };
 
-        var overlay_list = self.overlay.list();
-        overlay_list.theme = self.theme;
-
-        const box_padding_y: usize = 1;
-        const border_lines: usize = if (self.theme != null and width >= 2) 2 else 0;
-        const chrome_lines = border_lines + box_padding_y * 2 + 3;
-        const body_height = @max(@as(usize, 3), if (self.max_height > chrome_lines) self.max_height - chrome_lines else 3);
-        overlay_list.max_visible = body_height;
-
-        const list_viewport = tui.Viewport{
-            .child = overlay_list.component(),
-            .height = body_height,
-            .show_indicators = true,
-            .theme = self.theme,
-            .indicator_token = .select_scroll,
-        };
-
         var content = tui.Flex.init(.column);
         defer content.deinit(allocator);
         content.gap = 1;
         try content.addChild(allocator, .{ .component = title_component.component() });
         try content.addChild(allocator, .{ .component = hint_component.component() });
-        try content.addChild(allocator, .{ .component = list_viewport.component() });
+
+        const box_padding_y: usize = 1;
+        const border_lines: usize = if (self.theme != null and width >= 2) 2 else 0;
+
+        switch (self.overlay.*) {
+            .settings_editor => |*settings_editor| {
+                settings_editor.editor.setTheme(self.theme);
+                const path_text = try applyThemeAlloc(allocator, self.theme, .overlay_hint, settings_editor.path);
+                defer allocator.free(path_text);
+                const path_component = tui.Text{
+                    .text = path_text,
+                    .padding_x = 0,
+                    .padding_y = 0,
+                };
+                try content.addChild(allocator, .{ .component = path_component.component() });
+
+                const chrome_lines = border_lines + box_padding_y * 2 + 4;
+                const body_height = @max(@as(usize, 4), if (self.max_height > chrome_lines) self.max_height - chrome_lines else 4);
+                const editor_viewport = tui.Viewport{
+                    .child = settings_editor.editor.component(),
+                    .height = body_height,
+                    .anchor = .top,
+                };
+                try content.addChild(allocator, .{ .component = editor_viewport.component() });
+            },
+            else => {
+                const chrome_lines = border_lines + box_padding_y * 2 + 3;
+                const body_height = @max(@as(usize, 3), if (self.max_height > chrome_lines) self.max_height - chrome_lines else 3);
+                const overlay_list = switch (self.overlay.*) {
+                    .info => |*info_overlay| &info_overlay.list,
+                    .session => |*session_overlay| &session_overlay.list,
+                    .model => |*model_overlay| &model_overlay.list,
+                    .tree => |*tree_overlay| &tree_overlay.list,
+                    .auth => |*auth_overlay| &auth_overlay.list,
+                    else => unreachable,
+                };
+                overlay_list.theme = self.theme;
+                overlay_list.max_visible = body_height;
+
+                const list_viewport = tui.Viewport{
+                    .child = overlay_list.component(),
+                    .height = body_height,
+                    .show_indicators = true,
+                    .theme = self.theme,
+                    .indicator_token = .select_scroll,
+                };
+                try content.addChild(allocator, .{ .component = list_viewport.component() });
+            },
+        }
 
         var panel_box = tui.Box.init(2, box_padding_y);
         defer panel_box.deinit(allocator);
@@ -1160,6 +1200,7 @@ pub fn runInteractiveMode(
 
     var editor = tui.Editor.init(allocator);
     defer editor.deinit();
+    configurePrimaryEditor(&editor, live_resources.runtime_config);
     const autocomplete_items = try loadEditorAutocompleteItems(allocator, io, options.cwd);
     defer freeOwnedSelectItems(allocator, autocomplete_items);
     try editor.setAutocompleteItems(autocomplete_items);
@@ -1574,6 +1615,37 @@ fn handleInputKey(
                 return;
             }
         }
+
+        if (std.meta.activeTag(overlay_value.*) == .settings_editor) {
+            switch (key) {
+                .escape => {
+                    overlay_value.deinit(allocator);
+                    overlay.* = null;
+                    return;
+                },
+                .ctrl => |ctrl| {
+                    if (ctrl == 's') {
+                        try saveSettingsEditorOverlay(
+                            allocator,
+                            io,
+                            env_map,
+                            session,
+                            options,
+                            app_state,
+                            editor,
+                            overlay,
+                            live_resources,
+                        );
+                        return;
+                    }
+                },
+                else => {},
+            }
+
+            _ = try overlay_value.settings_editor.editor.handleKey(key);
+            return;
+        }
+
         switch (key) {
             .escape => {
                 overlay_value.deinit(allocator);
@@ -1583,7 +1655,15 @@ fn handleInputKey(
             else => {},
         }
 
-        const result = overlay_value.list().handleKey(key);
+        const overlay_list = switch (overlay_value.*) {
+            .info => &overlay_value.info.list,
+            .session => &overlay_value.session.list,
+            .model => &overlay_value.model.list,
+            .tree => &overlay_value.tree.list,
+            .auth => &overlay_value.auth.list,
+            else => unreachable,
+        };
+        const result = overlay_list.handleKey(key);
         switch (result) {
             .handled, .ignored => return,
             .dismissed => {
@@ -1656,6 +1736,7 @@ fn handleInputKey(
                             live_resources,
                         ),
                     },
+                    else => unreachable,
                 }
                 overlay_value.deinit(allocator);
                 overlay.* = null;
@@ -1915,7 +1996,14 @@ fn handleSlashCommand(
     live_resources: *LiveResources,
 ) !void {
     switch (command.kind) {
-        .settings => overlay.* = try loadSettingsOverlay(allocator, session, live_resources.runtime_config),
+        .settings => try handleSettingsSlashCommand(
+            allocator,
+            io,
+            session,
+            app_state,
+            overlay,
+            live_resources,
+        ),
         .model => try handleModelSlashCommand(
             allocator,
             env_map,
@@ -2667,99 +2755,52 @@ var clipboard_copy_context: ?*anyopaque = null;
 var clipboard_copy_fn: ClipboardCopyFn = defaultCopyTextToClipboard;
 var test_auth_flow: ?AuthFlow = null;
 
-fn loadSettingsOverlay(
+fn handleSettingsSlashCommand(
     allocator: std.mem.Allocator,
+    io: std.Io,
     session: *const session_mod.AgentSession,
-    runtime_config: ?*const config_mod.RuntimeConfig,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    live_resources: *LiveResources,
+) !void {
+    _ = session;
+    const runtime_config = live_resources.runtime_config orelse {
+        try app_state.setStatus("Settings editor is unavailable in this session");
+        return;
+    };
+    overlay.* = try loadSettingsEditorOverlay(allocator, io, runtime_config, live_resources.theme);
+}
+
+fn loadSettingsEditorOverlay(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: *const config_mod.RuntimeConfig,
+    theme: ?*const resources_mod.Theme,
 ) !SelectorOverlay {
-    var items = std.ArrayList(tui.SelectItem).empty;
-    errdefer {
-        freeOwnedSelectItems(allocator, items.items);
-        items.deinit(allocator);
-    }
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "settings.json" });
+    errdefer allocator.free(settings_path);
 
-    const current_model = session.agent.getModel();
-    try appendInfoOverlayItem(
-        allocator,
-        &items,
-        "Model",
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current_model.provider, current_model.id }),
-    );
+    const initial_content = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "{\n}\n"),
+        else => return err,
+    };
+    defer allocator.free(initial_content);
 
-    if (session.session_manager.getSessionName()) |name| {
-        try appendInfoOverlayItem(allocator, &items, "Session name", try allocator.dupe(u8, name));
-    }
+    var editor = tui.Editor.init(allocator);
+    errdefer editor.deinit();
+    editor.padding_x = 1;
+    editor.autocomplete_max_visible = 8;
+    editor.setTheme(theme);
+    _ = try editor.handlePaste(initial_content);
 
-    try appendInfoOverlayItem(
-        allocator,
-        &items,
-        "Session file",
-        try allocator.dupe(u8, session.session_manager.getSessionFile() orelse "in-memory"),
-    );
-
-    if (runtime_config) |config| {
-        try appendInfoOverlayItem(allocator, &items, "Theme", try allocator.dupe(u8, config.settings.theme orelse "dark"));
-        try appendInfoOverlayItem(
-            allocator,
-            &items,
-            "Editor padding",
-            try std.fmt.allocPrint(allocator, "{d}", .{config.settings.editor_padding_x orelse 1}),
-        );
-        try appendInfoOverlayItem(
-            allocator,
-            &items,
-            "Autocomplete items",
-            try std.fmt.allocPrint(allocator, "{d}", .{config.settings.autocomplete_max_visible orelse 5}),
-        );
-        try appendInfoOverlayItem(
-            allocator,
-            &items,
-            "Session directory",
-            try allocator.dupe(u8, config.settings.session_dir orelse session.session_manager.getSessionDir()),
-        );
-
-        const compaction = config.settings.compaction orelse session_mod.CompactionSettings{};
-        try appendInfoOverlayItem(
-            allocator,
-            &items,
-            "Compaction",
-            try std.fmt.allocPrint(
-                allocator,
-                "{s} • reserve {d} • keep recent {d}",
-                .{
-                    if (compaction.enabled) "enabled" else "disabled",
-                    compaction.reserve_tokens,
-                    compaction.keep_recent_tokens,
-                },
-            ),
-        );
-
-        const retry = config.settings.retry orelse session_mod.RetrySettings{};
-        try appendInfoOverlayItem(
-            allocator,
-            &items,
-            "Retry",
-            try std.fmt.allocPrint(
-                allocator,
-                "{s} • max retries {d} • base delay {d}ms",
-                .{
-                    if (retry.enabled) "enabled" else "disabled",
-                    retry.max_retries,
-                    retry.base_delay_ms,
-                },
-            ),
-        );
-    } else {
-        try appendInfoOverlayItem(allocator, &items, "Settings", try allocator.dupe(u8, "Runtime config unavailable"));
-    }
-
-    return try loadInfoOverlay(
-        allocator,
-        "Settings",
-        "Up/Down scroll • Enter close • Esc close",
-        try items.toOwnedSlice(allocator),
-        10,
-    );
+    return .{
+        .settings_editor = .{
+            .title = try allocator.dupe(u8, "Settings"),
+            .hint = try allocator.dupe(u8, "Edit settings.json • Ctrl+S save • Esc cancel"),
+            .path = settings_path,
+            .editor = editor,
+        },
+    };
 }
 
 fn loadHotkeysOverlay(
@@ -3350,6 +3391,25 @@ fn handleReloadSlashCommand(
 
     const diagnostics = try live_resources.reload(allocator, io, env_map, cwd);
     try app_state.setStatus("Reloaded keybindings, skills, prompts, and themes");
+    try appendResourceDiagnostics(allocator, app_state, diagnostics);
+}
+
+fn configurePrimaryEditor(editor: *tui.Editor, runtime_config: ?*const config_mod.RuntimeConfig) void {
+    editor.padding_x = if (runtime_config) |runtime_config_value|
+        runtime_config_value.settings.editor_padding_x orelse 0
+    else
+        0;
+    editor.autocomplete_max_visible = if (runtime_config) |runtime_config_value|
+        runtime_config_value.settings.autocomplete_max_visible orelse 5
+    else
+        5;
+}
+
+fn appendResourceDiagnostics(
+    allocator: std.mem.Allocator,
+    app_state: *AppState,
+    diagnostics: []const resources_mod.Diagnostic,
+) !void {
     for (diagnostics) |diagnostic| {
         const message = if (diagnostic.path) |path|
             try std.fmt.allocPrint(allocator, "{s}: {s} ({s})", .{ diagnostic.kind, diagnostic.message, path })
@@ -3362,6 +3422,57 @@ fn handleReloadSlashCommand(
             try app_state.appendInfo(message);
         }
     }
+}
+
+fn saveSettingsEditorOverlay(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    live_resources: *LiveResources,
+) !void {
+    var overlay_value = overlay.* orelse return;
+    if (std.meta.activeTag(overlay_value) != .settings_editor) return;
+
+    const trimmed = std.mem.trim(u8, overlay_value.settings_editor.editor.text(), " \t\r\n");
+    const serialized = if (trimmed.len == 0)
+        "{\n}\n"
+    else
+        overlay_value.settings_editor.editor.text();
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, serialized, .{}) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Invalid settings.json: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try app_state.appendError("Invalid settings.json: top-level value must be an object");
+        return;
+    }
+
+    try common.writeFileAbsolute(io, overlay_value.settings_editor.path, serialized, true);
+
+    const diagnostics = try live_resources.reload(allocator, io, env_map, options.cwd);
+    configurePrimaryEditor(editor, live_resources.runtime_config);
+    session.compaction_settings = configuredCompactionSettings(live_resources.runtime_config);
+    session.retry_settings = configuredRetrySettings(live_resources.runtime_config);
+
+    const path_copy = try allocator.dupe(u8, overlay_value.settings_editor.path);
+    defer allocator.free(path_copy);
+    overlay_value.deinit(allocator);
+    overlay.* = null;
+
+    const message = try std.fmt.allocPrint(allocator, "Saved settings to {s}", .{path_copy});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+    try app_state.setStatus("settings saved");
+    try appendResourceDiagnostics(allocator, app_state, diagnostics);
 }
 
 fn handleExportSlashCommand(
@@ -5551,6 +5662,83 @@ test "beginLoginFlow shows oauth.json guidance when oauth client config is missi
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "\"anthropic\"") != null);
 }
 
+test "persistLoginCredential writes auth.json for slash login flows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    var credential = auth.StoredCredential{ .oauth = .{
+        .access = try allocator.dupe(u8, "oauth-access-token"),
+        .refresh = try allocator.dupe(u8, "oauth-refresh-token"),
+        .expires = 1234,
+    } };
+    defer credential.deinit(allocator);
+
+    var auth_flow: ?AuthFlow = null;
+    try persistLoginCredential(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &session,
+        &current_provider,
+        "anthropic",
+        "Anthropic (Claude Pro/Max)",
+        &credential,
+        options,
+        &state,
+        &auth_flow,
+        &live_resources,
+    );
+
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"oauth-access-token\"") != null);
+    try std.testing.expectEqualStrings("oauth-access-token", live_resources.runtime_config.?.lookupApiKey("anthropic").?);
+}
+
 test "loadEditorAutocompleteItems includes slash command help text" {
     const allocator = std.testing.allocator;
 
@@ -5568,7 +5756,7 @@ test "loadEditorAutocompleteItems includes slash command help text" {
         if (std.mem.eql(u8, item.label, "/settings")) {
             saw_settings = true;
             try std.testing.expectEqualStrings("/settings", item.value);
-            try std.testing.expectEqualStrings("Open settings overlay", item.description.?);
+            try std.testing.expectEqualStrings("Open settings editor", item.description.?);
         }
     }
 
@@ -5578,14 +5766,38 @@ test "loadEditorAutocompleteItems includes slash command help text" {
 test "handleInputKey opens settings overlay for slash settings command" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        settings_path,
+        \\{
+        \\  "theme": "dark",
+        \\  "editorPaddingX": 1
+        \\}
+    ,
+        true,
+    );
+
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
 
     var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
-        .cwd = "/tmp/project",
+        .cwd = root_dir,
         .system_prompt = "sys",
         .model = current_provider.model,
         .api_key = current_provider.api_key,
@@ -5615,12 +5827,15 @@ test "handleInputKey opens settings overlay for slash settings command" {
     };
 
     const options = RunInteractiveModeOptions{
-        .cwd = "/tmp/project",
+        .cwd = root_dir,
         .system_prompt = "sys",
-        .session_dir = "/tmp/project/.pi/sessions",
+        .session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions"),
         .provider = "faux",
+        .runtime_config = &runtime_config,
     };
+    defer allocator.free(options.session_dir);
     var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
 
     try handleInputKey(
         allocator,
@@ -5644,8 +5859,143 @@ test "handleInputKey opens settings overlay for slash settings command" {
     );
 
     try std.testing.expect(overlay != null);
-    try std.testing.expect(overlay.? == .info);
+    try std.testing.expect(overlay.? == .settings_editor);
     try std.testing.expectEqualStrings("Settings", overlay.?.title());
+    try std.testing.expect(std.mem.indexOf(u8, overlay.?.settings_editor.editor.text(), "\"theme\": \"dark\"") != null);
+}
+
+test "settings editor overlay saves settings.json and reloads runtime settings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        settings_path,
+        \\{
+        \\  "theme": "dark"
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var overlay: ?SelectorOverlay = try loadSettingsEditorOverlay(allocator, std.testing.io, &runtime_config, null);
+    defer if (overlay) |*value| value.deinit(allocator);
+
+    overlay.?.settings_editor.editor.reset();
+    _ = try overlay.?.settings_editor.editor.handlePaste(
+        \\{
+        \\  "theme": "light",
+        \\  "editorPaddingX": 2,
+        \\  "autocompleteMaxVisible": 9,
+        \\  "compaction": {
+        \\    "enabled": true,
+        \\    "reserveTokens": 1200,
+        \\    "keepRecentTokens": 6400
+        \\  },
+        \\  "retry": {
+        \\    "enabled": true,
+        \\    "maxRetries": 4,
+        \\    "baseDelayMs": 2500
+        \\  }
+        \\}
+        \\
+    );
+
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+    var auth_flow: ?AuthFlow = null;
+    defer if (auth_flow) |*value| value.deinit(allocator);
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 's' },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqualStrings("light", live_resources.runtime_config.?.settings.theme.?);
+    try std.testing.expectEqual(@as(usize, 2), editor.padding_x);
+    try std.testing.expectEqual(@as(usize, 9), editor.autocomplete_max_visible);
+    try std.testing.expectEqual(true, session.compaction_settings.enabled);
+    try std.testing.expectEqual(@as(u32, 1200), session.compaction_settings.reserve_tokens);
+    try std.testing.expectEqual(@as(u32, 6400), session.compaction_settings.keep_recent_tokens);
+    try std.testing.expectEqual(true, session.retry_settings.enabled);
+    try std.testing.expectEqual(@as(u32, 4), session.retry_settings.max_retries);
+    try std.testing.expectEqual(@as(u64, 2500), session.retry_settings.base_delay_ms);
+
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"theme\": \"light\"") != null);
 }
 
 test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
