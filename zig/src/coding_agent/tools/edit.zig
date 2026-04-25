@@ -4,10 +4,31 @@ const common = @import("common.zig");
 
 const utf8_bom = "\xEF\xBB\xBF";
 
-pub const EditArgs = struct {
-    path: []const u8,
+pub const Edit = struct {
     old_text: []const u8,
     new_text: []const u8,
+};
+
+pub const EditArgs = struct {
+    path: []const u8,
+    edits: []const Edit,
+};
+
+pub const ParsedEditArgs = struct {
+    path: []const u8,
+    edits: []const Edit,
+
+    pub fn deinit(self: *ParsedEditArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.edits);
+        self.* = undefined;
+    }
+
+    pub fn toArgs(self: ParsedEditArgs) EditArgs {
+        return .{
+            .path = self.path,
+            .edits = self.edits,
+        };
+    }
 };
 
 pub const EditExecutionResult = struct {
@@ -26,7 +47,7 @@ pub const EditTool = struct {
 
     pub const name = "edit";
     pub const description =
-        "Edit a single file using exact text replacement. The search text must match exactly one location in the file.";
+        "Edit a single file using one or more exact text replacements. Each search text must match exactly one location in the original file, and edits must not overlap.";
 
     pub fn init(cwd: []const u8, io: std.Io) EditTool {
         return .{
@@ -47,21 +68,24 @@ pub const EditTool = struct {
             "string",
             "Path to the file to edit (absolute or relative to cwd)",
         ));
+        try properties.put(allocator, try allocator.dupe(u8, "edits"), try schemaArrayProperty(
+            allocator,
+            "One or more exact text replacements. Each oldText is matched against the original file, not incrementally after earlier edits.",
+            try editSchemaEntry(allocator),
+        ));
         try properties.put(allocator, try allocator.dupe(u8, "oldText"), try schemaProperty(
             allocator,
             "string",
-            "Exact text to replace. It must match exactly one location in the file.",
+            "Legacy single-edit search text. It must match exactly one location in the file.",
         ));
         try properties.put(allocator, try allocator.dupe(u8, "newText"), try schemaProperty(
             allocator,
             "string",
-            "Replacement text for the matched block.",
+            "Legacy single-edit replacement text.",
         ));
 
         var required = std.json.Array.init(allocator);
         try required.append(.{ .string = try allocator.dupe(u8, "path") });
-        try required.append(.{ .string = try allocator.dupe(u8, "oldText") });
-        try required.append(.{ .string = try allocator.dupe(u8, "newText") });
 
         var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
@@ -75,9 +99,9 @@ pub const EditTool = struct {
         allocator: std.mem.Allocator,
         args: EditArgs,
     ) !EditExecutionResult {
-        if (args.old_text.len == 0) {
+        if (args.edits.len == 0) {
             return .{
-                .content = try common.makeTextContent(allocator, "Search text must not be empty"),
+                .content = try common.makeTextContent(allocator, "Edit tool input is invalid. edits must contain at least one replacement."),
                 .is_error = true,
             };
         }
@@ -103,35 +127,39 @@ pub const EditTool = struct {
 
         const normalized_content = try normalizeToLf(allocator, stripped.text);
         defer allocator.free(normalized_content);
-        const normalized_old = try normalizeToLf(allocator, args.old_text);
-        defer allocator.free(normalized_old);
-        const normalized_new = try normalizeToLf(allocator, args.new_text);
-        defer allocator.free(normalized_new);
 
-        const match_count = std.mem.count(u8, normalized_content, normalized_old);
-        if (match_count == 0) {
-            const message = try std.fmt.allocPrint(allocator, "Search text not found in {s}", .{args.path});
+        var normalized_edits = try allocator.alloc(Edit, args.edits.len);
+        defer {
+            for (normalized_edits) |edit| {
+                allocator.free(edit.old_text);
+                allocator.free(edit.new_text);
+            }
+            allocator.free(normalized_edits);
+        }
+
+        for (args.edits, 0..) |edit, index| {
+            normalized_edits[index] = .{
+                .old_text = try normalizeToLf(allocator, edit.old_text),
+                .new_text = try normalizeToLf(allocator, edit.new_text),
+            };
+        }
+
+        var validation = try validateEdits(allocator, normalized_content, normalized_edits, args.path);
+        defer validation.deinit(allocator);
+
+        if (validation.has_failure) {
+            const message = if (args.edits.len == 1)
+                try allocator.dupe(u8, validation.firstFailureMessage().?)
+            else
+                try formatBatchFailureMessage(allocator, args.path, validation.statuses);
             defer allocator.free(message);
             return .{
                 .content = try common.makeTextContent(allocator, message),
                 .is_error = true,
             };
         }
-        if (match_count > 1) {
-            const message = try std.fmt.allocPrint(allocator, "Search text matched multiple locations in {s}", .{args.path});
-            defer allocator.free(message);
-            return .{
-                .content = try common.makeTextContent(allocator, message),
-                .is_error = true,
-            };
-        }
 
-        const match_index = std.mem.indexOf(u8, normalized_content, normalized_old).?;
-        const replaced = try std.mem.concat(allocator, u8, &[_][]const u8{
-            normalized_content[0..match_index],
-            normalized_new,
-            normalized_content[match_index + normalized_old.len ..],
-        });
+        const replaced = try applyValidatedEdits(allocator, normalized_content, validation.matched_edits);
         defer allocator.free(replaced);
 
         const restored = try restoreLineEndings(allocator, replaced, original_line_ending);
@@ -152,7 +180,10 @@ pub const EditTool = struct {
             };
         };
 
-        const message = try std.fmt.allocPrint(allocator, "Successfully replaced text in {s}", .{args.path});
+        const message = if (args.edits.len == 1)
+            try std.fmt.allocPrint(allocator, "Successfully replaced text in {s}", .{args.path})
+        else
+            try std.fmt.allocPrint(allocator, "Successfully replaced {d} block(s) in {s}", .{ args.edits.len, args.path });
         defer allocator.free(message);
         return .{
             .content = try common.makeTextContent(allocator, message),
@@ -160,13 +191,38 @@ pub const EditTool = struct {
     }
 };
 
-pub fn parseArguments(args: std.json.Value) !EditArgs {
+pub fn parseArguments(allocator: std.mem.Allocator, args: std.json.Value) !ParsedEditArgs {
     if (args != .object) return error.InvalidToolArguments;
+
+    var edits = std.ArrayList(Edit).empty;
+    errdefer edits.deinit(allocator);
+
+    if (args.object.get("edits")) |edits_value| {
+        if (edits_value != .array) return error.InvalidToolArguments;
+        for (edits_value.array.items) |edit_value| {
+            if (edit_value != .object) return error.InvalidToolArguments;
+            try edits.append(allocator, .{
+                .old_text = try parseRequiredStringEither(edit_value.object, "oldText", "old_text"),
+                .new_text = try parseRequiredStringEither(edit_value.object, "newText", "new_text"),
+            });
+        }
+    }
+
+    const legacy_old = try parseOptionalStringEither(args.object, "oldText", "old_text");
+    const legacy_new = try parseOptionalStringEither(args.object, "newText", "new_text");
+    if ((legacy_old == null) != (legacy_new == null)) return error.InvalidToolArguments;
+    if (legacy_old) |old_text| {
+        try edits.append(allocator, .{
+            .old_text = old_text,
+            .new_text = legacy_new.?,
+        });
+    }
+
+    if (edits.items.len == 0) return error.InvalidToolArguments;
 
     return .{
         .path = try parseRequiredString(args.object, "path"),
-        .old_text = try parseRequiredStringEither(args.object, "oldText", "old_text"),
-        .new_text = try parseRequiredStringEither(args.object, "newText", "new_text"),
+        .edits = try edits.toOwnedSlice(allocator),
     };
 }
 
@@ -179,6 +235,40 @@ const LineEnding = enum {
     lf,
     crlf,
     cr,
+};
+
+const EditStatus = struct {
+    matched: bool = false,
+    message: ?[]u8 = null,
+};
+
+const MatchedEdit = struct {
+    edit_index: usize,
+    match_index: usize,
+    match_length: usize,
+    new_text: []const u8,
+};
+
+const ValidationResult = struct {
+    statuses: []EditStatus,
+    matched_edits: []MatchedEdit,
+    has_failure: bool,
+
+    pub fn deinit(self: *ValidationResult, allocator: std.mem.Allocator) void {
+        for (self.statuses) |status| {
+            if (status.message) |message| allocator.free(message);
+        }
+        allocator.free(self.statuses);
+        allocator.free(self.matched_edits);
+        self.* = undefined;
+    }
+
+    fn firstFailureMessage(self: ValidationResult) ?[]const u8 {
+        for (self.statuses) |status| {
+            if (status.message) |message| return message;
+        }
+        return null;
+    }
 };
 
 fn stripBom(text: []const u8) StrippedBom {
@@ -229,10 +319,56 @@ fn parseRequiredStringEither(object: std.json.ObjectMap, primary: []const u8, al
     return (try parseOptionalString(object, alternate)) orelse error.InvalidToolArguments;
 }
 
+fn parseOptionalStringEither(object: std.json.ObjectMap, primary: []const u8, alternate: []const u8) !?[]const u8 {
+    if (try parseOptionalString(object, primary)) |value| return value;
+    return try parseOptionalString(object, alternate);
+}
+
 fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
     const value = object.get(key) orelse return null;
     if (value != .string) return error.InvalidToolArguments;
     return value.string;
+}
+
+fn editSchemaEntry(allocator: std.mem.Allocator) !std.json.Value {
+    var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value = std.json.Value{ .object = properties };
+        common.deinitJsonValue(allocator, value);
+    }
+
+    try properties.put(allocator, try allocator.dupe(u8, "oldText"), try schemaProperty(
+        allocator,
+        "string",
+        "Exact text to replace. It must match exactly one location in the original file.",
+    ));
+    try properties.put(allocator, try allocator.dupe(u8, "newText"), try schemaProperty(
+        allocator,
+        "string",
+        "Replacement text for the matched block.",
+    ));
+
+    var required = std.json.Array.init(allocator);
+    try required.append(.{ .string = try allocator.dupe(u8, "oldText") });
+    try required.append(.{ .string = try allocator.dupe(u8, "newText") });
+
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
+    try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
+    try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
+    return .{ .object = root };
+}
+
+fn schemaArrayProperty(
+    allocator: std.mem.Allocator,
+    description_text: []const u8,
+    item_schema: std.json.Value,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "array") });
+    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
+    try object.put(allocator, try allocator.dupe(u8, "items"), item_schema);
+    return .{ .object = object };
 }
 
 fn schemaProperty(
@@ -256,6 +392,135 @@ fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
+fn validateEdits(
+    allocator: std.mem.Allocator,
+    normalized_content: []const u8,
+    edits: []const Edit,
+    path: []const u8,
+) !ValidationResult {
+    var statuses = try allocator.alloc(EditStatus, edits.len);
+    errdefer allocator.free(statuses);
+    for (statuses) |*status| status.* = .{};
+
+    var matched = std.ArrayList(MatchedEdit).empty;
+    errdefer matched.deinit(allocator);
+
+    var has_failure = false;
+    for (edits, 0..) |edit, index| {
+        if (edit.old_text.len == 0) {
+            statuses[index].message = if (edits.len == 1)
+                try allocator.dupe(u8, "Search text must not be empty")
+            else
+                try allocator.dupe(u8, "search text must not be empty");
+            has_failure = true;
+            continue;
+        }
+
+        const match_count = std.mem.count(u8, normalized_content, edit.old_text);
+        if (match_count == 0) {
+            statuses[index].message = if (edits.len == 1)
+                try std.fmt.allocPrint(allocator, "Search text not found in {s}", .{path})
+            else
+                try allocator.dupe(u8, "search text not found");
+            has_failure = true;
+            continue;
+        }
+        if (match_count > 1) {
+            statuses[index].message = if (edits.len == 1)
+                try std.fmt.allocPrint(allocator, "Search text matched multiple locations in {s}", .{path})
+            else
+                try allocator.dupe(u8, "search text matched multiple locations");
+            has_failure = true;
+            continue;
+        }
+
+        statuses[index].matched = true;
+        try matched.append(allocator, .{
+            .edit_index = index,
+            .match_index = std.mem.indexOf(u8, normalized_content, edit.old_text).?,
+            .match_length = edit.old_text.len,
+            .new_text = edit.new_text,
+        });
+    }
+
+    std.mem.sort(MatchedEdit, matched.items, {}, struct {
+        fn lessThan(_: void, lhs: MatchedEdit, rhs: MatchedEdit) bool {
+            return lhs.match_index < rhs.match_index;
+        }
+    }.lessThan);
+
+    if (matched.items.len > 1) {
+        for (matched.items[1..], 1..) |current, sorted_index| {
+            const previous = matched.items[sorted_index - 1];
+            if (previous.match_index + previous.match_length > current.match_index) {
+                statuses[current.edit_index].matched = false;
+                statuses[current.edit_index].message = try std.fmt.allocPrint(
+                    allocator,
+                    "overlaps with edits[{d}]",
+                    .{previous.edit_index},
+                );
+                has_failure = true;
+            }
+        }
+    }
+
+    return .{
+        .statuses = statuses,
+        .matched_edits = try matched.toOwnedSlice(allocator),
+        .has_failure = has_failure,
+    };
+}
+
+fn applyValidatedEdits(
+    allocator: std.mem.Allocator,
+    normalized_content: []const u8,
+    matched_edits: []const MatchedEdit,
+) ![]u8 {
+    var replaced = try allocator.dupe(u8, normalized_content);
+    errdefer allocator.free(replaced);
+
+    var index = matched_edits.len;
+    while (index > 0) {
+        index -= 1;
+        const edit = matched_edits[index];
+        const next = try std.mem.concat(allocator, u8, &[_][]const u8{
+            replaced[0..edit.match_index],
+            edit.new_text,
+            replaced[edit.match_index + edit.match_length ..],
+        });
+        allocator.free(replaced);
+        replaced = next;
+    }
+
+    return replaced;
+}
+
+fn formatBatchFailureMessage(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    statuses: []const EditStatus,
+) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+
+    const header = try std.fmt.allocPrint(
+        allocator,
+        "Failed to apply {d} edit(s) to {s}. No changes were written.",
+        .{ statuses.len, path },
+    );
+    defer allocator.free(header);
+    try buffer.appendSlice(allocator, header);
+
+    for (statuses, 0..) |status, index| {
+        const outcome = if (status.message) |message| message else "matched uniquely";
+        const line = try std.fmt.allocPrint(allocator, "\n- edits[{d}]: {s}", .{ index, outcome });
+        defer allocator.free(line);
+        try buffer.appendSlice(allocator, line);
+    }
+
+    return buffer.toOwnedSlice(allocator);
+}
+
 test "edit tool replaces matching text in a file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -277,8 +542,10 @@ test "edit tool replaces matching text in a file" {
 
     var result = try EditTool.init(".", std.testing.io).execute(std.testing.allocator, .{
         .path = absolute_path,
-        .old_text = "old text",
-        .new_text = "new text",
+        .edits = &[_]Edit{.{
+            .old_text = "old text",
+            .new_text = "new text",
+        }},
     });
     defer result.deinit(std.testing.allocator);
 
@@ -310,13 +577,155 @@ test "edit tool returns an error when the search text is not found" {
 
     var result = try EditTool.init(".", std.testing.io).execute(std.testing.allocator, .{
         .path = absolute_path,
-        .old_text = "missing text",
-        .new_text = "new text",
+        .edits = &[_]Edit{.{
+            .old_text = "missing text",
+            .new_text = "new text",
+        }},
     });
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "Search text not found"));
+}
+
+test "edit tool applies multiple edits atomically in one call" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "editable.txt",
+        .data = "first old\nsecond old\nthird old\n",
+    });
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "editable.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var result = try EditTool.init(".", std.testing.io).execute(std.testing.allocator, .{
+        .path = absolute_path,
+        .edits = &[_]Edit{
+            .{ .old_text = "first old", .new_text = "first new" },
+            .{ .old_text = "third old", .new_text = "third new" },
+        },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "Successfully replaced 2 block(s)"));
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("first new\nsecond old\nthird new\n", written);
+}
+
+test "edit tool reports batch failure without writing partial changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "editable.txt",
+        .data = "first old\nsecond old\nthird old\n",
+    });
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "editable.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var result = try EditTool.init(".", std.testing.io).execute(std.testing.allocator, .{
+        .path = absolute_path,
+        .edits = &[_]Edit{
+            .{ .old_text = "first old", .new_text = "first new" },
+            .{ .old_text = "missing text", .new_text = "unused" },
+        },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "No changes were written"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "edits[0]: matched uniquely"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "edits[1]: search text not found"));
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("first old\nsecond old\nthird old\n", written);
+}
+
+test "edit tool reports overlapping edits without writing changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "editable.txt",
+        .data = "abcdefg",
+    });
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "editable.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var result = try EditTool.init(".", std.testing.io).execute(std.testing.allocator, .{
+        .path = absolute_path,
+        .edits = &[_]Edit{
+            .{ .old_text = "abcd", .new_text = "ABCD" },
+            .{ .old_text = "cdef", .new_text = "CDEF" },
+        },
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "No changes were written"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, result.content[0].text.text, 1, "edits[1]: overlaps with edits[0]"));
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("abcdefg", written);
+}
+
+test "edit tool parses edits arrays and appends legacy single-edit arguments" {
+    var object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    var edits = std.json.Array.init(std.testing.allocator);
+    var first_edit = try jsonObject(std.testing.allocator);
+    try first_edit.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "oldText"), .{ .string = try std.testing.allocator.dupe(u8, "first old") });
+    try first_edit.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "newText"), .{ .string = try std.testing.allocator.dupe(u8, "first new") });
+    try edits.append(.{ .object = first_edit });
+
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "path"), .{ .string = try std.testing.allocator.dupe(u8, "editable.txt") });
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "edits"), .{ .array = edits });
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "oldText"), .{ .string = try std.testing.allocator.dupe(u8, "legacy old") });
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "newText"), .{ .string = try std.testing.allocator.dupe(u8, "legacy new") });
+
+    var parsed = try parseArguments(std.testing.allocator, .{ .object = object });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("editable.txt", parsed.path);
+    try std.testing.expectEqual(@as(usize, 2), parsed.edits.len);
+    try std.testing.expectEqualStrings("first old", parsed.edits[0].old_text);
+    try std.testing.expectEqualStrings("first new", parsed.edits[0].new_text);
+    try std.testing.expectEqualStrings("legacy old", parsed.edits[1].old_text);
+    try std.testing.expectEqualStrings("legacy new", parsed.edits[1].new_text);
 }
 
 test "edit tool validates required arguments" {
@@ -326,5 +735,5 @@ test "edit tool validates required arguments" {
         common.deinitJsonValue(std.testing.allocator, value);
     }
 
-    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(std.testing.allocator, .{ .object = object }));
 }
