@@ -87,6 +87,25 @@ pub const WriteTool = struct {
     }
 };
 
+pub fn parseArguments(args: std.json.Value) !WriteArgs {
+    if (args != .object) return error.InvalidToolArguments;
+
+    return .{
+        .path = try parseRequiredString(args.object, "path"),
+        .content = try parseRequiredString(args.object, "content"),
+    };
+}
+
+fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
+}
+
+fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return error.InvalidToolArguments;
+    return value.string;
+}
+
 fn schemaProperty(
     allocator: std.mem.Allocator,
     type_name: []const u8,
@@ -102,6 +121,10 @@ fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8)
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
     return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
+    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
 test "write tool creates a new file with the requested content" {
@@ -163,4 +186,14 @@ test "write tool overwrites an existing file" {
     const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("after", written);
+}
+
+test "write tool validates required arguments" {
+    const object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
 }

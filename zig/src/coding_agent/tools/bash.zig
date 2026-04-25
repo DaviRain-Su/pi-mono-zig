@@ -246,6 +246,18 @@ pub const BashTool = struct {
     }
 };
 
+pub fn parseArguments(args: std.json.Value) !BashArgs {
+    if (args != .object) return error.InvalidToolArguments;
+
+    const command = try parseRequiredString(args.object, "command");
+    const timeout_seconds = try getOptionalPositiveInt(args.object, "timeout_seconds");
+
+    return .{
+        .command = command,
+        .timeout_seconds = timeout_seconds,
+    };
+}
+
 const OutputReaderState = struct {
     allocator: std.mem.Allocator,
     file: std.Io.File,
@@ -362,6 +374,23 @@ fn captureOutputInSecureTempFile(
     return true;
 }
 
+fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
+}
+
+fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return error.InvalidToolArguments;
+    return value.string;
+}
+
+fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?u64 {
+    const value = object.get(key) orelse return null;
+    if (value != .integer) return error.InvalidToolArguments;
+    if (value.integer <= 0) return error.InvalidToolArguments;
+    return @intCast(value.integer);
+}
+
 fn schemaProperty(
     allocator: std.mem.Allocator,
     type_name: []const u8,
@@ -377,6 +406,10 @@ fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8)
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
     return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
+    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
 fn processExists(allocator: std.mem.Allocator, pid: std.posix.pid_t) !bool {
@@ -503,6 +536,31 @@ test "bash tool truncates large output without leaking a temp path" {
         1,
         "Full output was stored in a secure temporary file and deleted after execution",
     ));
+}
+
+test "bash tool validates required arguments" {
+    const object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
+}
+
+test "bash tool validates positive timeout_seconds" {
+    var object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "command"), .{
+        .string = try std.testing.allocator.dupe(u8, "echo hello"),
+    });
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "timeout_seconds"), .{ .integer = 0 });
+
+    try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
 }
 
 test "secure temp file is unlinked immediately after creation" {
