@@ -232,6 +232,12 @@ pub const Editor = struct {
         return .handled;
     }
 
+    pub fn reset(self: *Editor) void {
+        self.buffer.clearRetainingCapacity();
+        self.cursor = 0;
+        self.clearAutocomplete();
+    }
+
     pub fn renderInto(
         self: *const Editor,
         allocator: std.mem.Allocator,
@@ -1012,6 +1018,30 @@ test "editor autocomplete enter confirms selection without inserting newline" {
 
     try std.testing.expectEqualStrings("modern", editor.text());
     try std.testing.expect(std.mem.indexOfScalar(u8, editor.text(), '\n') == null);
+}
+
+test "editor reset clears text and autocomplete state" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]select_list.SelectItem{
+        .{ .value = "read", .label = "read" },
+        .{ .value = "reload", .label = "reload" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("r") });
+
+    try std.testing.expect(editor.isShowingAutocomplete());
+    try std.testing.expectEqualStrings("r", editor.text());
+
+    editor.reset();
+
+    try std.testing.expectEqualStrings("", editor.text());
+    try std.testing.expectEqual(@as(usize, 0), editor.cursorIndex());
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 0 }, editor.cursorPosition());
+    try std.testing.expect(!editor.isShowingAutocomplete());
+    try std.testing.expect(editor.selectedAutocompleteItem() == null);
 }
 
 test "editor inserts bracketed paste content as a single edit" {

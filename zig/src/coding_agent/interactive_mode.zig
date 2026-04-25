@@ -1352,8 +1352,7 @@ fn parseSlashCommand(text: []const u8) ?SlashCommand {
 }
 
 fn clearEditor(editor: *tui.Editor) void {
-    editor.buffer.clearRetainingCapacity();
-    editor.cursor = 0;
+    editor.reset();
 }
 
 fn handleSlashCommand(
@@ -3336,6 +3335,91 @@ test "handleInputKey reports unknown slash commands" {
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Unknown slash command") != null);
+}
+
+test "submitEditorText resets editor autocomplete state after submit" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "submitted");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]tui.SelectItem{
+        .{ .value = "read", .label = "read" },
+        .{ .value = "reload", .label = "reload" },
+    });
+    _ = try editor.handleKey(.{ .printable = tui.keys.PrintableKey.fromSlice("r") });
+    try std.testing.expect(editor.isShowingAutocomplete());
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    defer if (prompt_worker_active) prompt_worker.join(allocator);
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try submitEditorText(
+        allocator,
+        std.testing.io,
+        &env_map,
+        editor.text(),
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(prompt_worker_active);
+    try std.testing.expectEqualStrings("", editor.text());
+    try std.testing.expectEqual(@as(usize, 0), editor.cursorIndex());
+    try std.testing.expect(!editor.isShowingAutocomplete());
+    try std.testing.expect(editor.selectedAutocompleteItem() == null);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqualStrings("streaming", state.status);
 }
 
 test "handleInputKey shows session stats for slash session command" {
