@@ -745,8 +745,12 @@ fn finalizeCurrentBlock(
     if (current_block.*) |*block| {
         switch (block.*) {
             .text => |*text| {
-                const final_text = extractMessageText(maybe_item_value) orelse text.text.items;
-                const owned = try allocator.dupe(u8, final_text);
+                const extracted_text = try extractMessageText(allocator, maybe_item_value);
+                defer if (extracted_text) |final_text| allocator.free(final_text);
+                const owned = if (extracted_text) |final_text|
+                    try allocator.dupe(u8, final_text)
+                else
+                    try allocator.dupe(u8, text.text.items);
                 try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
                 stream_ptr.push(.{
                     .event_type = .text_end,
@@ -755,8 +759,12 @@ fn finalizeCurrentBlock(
                 });
             },
             .thinking => |*thinking| {
-                const final_text = extractReasoningSummary(maybe_item_value) orelse thinking.text.items;
-                const owned = try allocator.dupe(u8, final_text);
+                const extracted_text = try extractReasoningSummary(allocator, maybe_item_value);
+                defer if (extracted_text) |final_text| allocator.free(final_text);
+                const owned = if (extracted_text) |final_text|
+                    try allocator.dupe(u8, final_text)
+                else
+                    try allocator.dupe(u8, thinking.text.items);
                 const signature = if (maybe_item_value) |item_value|
                     try std.json.Stringify.valueAlloc(allocator, item_value, .{})
                 else if (thinking.signature) |existing|
@@ -840,7 +848,7 @@ fn extractStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
     return field_value.string;
 }
 
-fn extractMessageText(maybe_item_value: ?std.json.Value) ?[]const u8 {
+fn extractMessageText(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
     const item_value = maybe_item_value orelse return null;
     if (item_value != .object) return null;
     const content_value = item_value.object.get("content") orelse return null;
@@ -858,35 +866,35 @@ fn extractMessageText(maybe_item_value: ?std.json.Value) ?[]const u8 {
     }
     if (total_len == 0) return null;
 
-    const allocator = std.heap.page_allocator;
     var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     for (content_value.array.items) |part| {
         if (part != .object) continue;
         const part_type = extractStringField(part, "type") orelse continue;
         if (std.mem.eql(u8, part_type, "output_text")) {
-            if (extractStringField(part, "text")) |text| buffer.appendSlice(allocator, text) catch {};
+            if (extractStringField(part, "text")) |text| try buffer.appendSlice(allocator, text);
         } else if (std.mem.eql(u8, part_type, "refusal")) {
-            if (extractStringField(part, "refusal")) |text| buffer.appendSlice(allocator, text) catch {};
+            if (extractStringField(part, "refusal")) |text| try buffer.appendSlice(allocator, text);
         }
     }
-    return buffer.toOwnedSlice(allocator) catch null;
+    return try buffer.toOwnedSlice(allocator);
 }
 
-fn extractReasoningSummary(maybe_item_value: ?std.json.Value) ?[]const u8 {
+fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
     const item_value = maybe_item_value orelse return null;
     if (item_value != .object) return null;
     const summary_value = item_value.object.get("summary") orelse return null;
     if (summary_value != .array or summary_value.array.items.len == 0) return null;
 
-    const allocator = std.heap.page_allocator;
     var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     for (summary_value.array.items, 0..) |part, index| {
         if (part != .object) continue;
         const text = extractStringField(part, "text") orelse continue;
-        if (buffer.items.len > 0 and index > 0) buffer.appendSlice(allocator, "\n\n") catch {};
-        buffer.appendSlice(allocator, text) catch {};
+        if (buffer.items.len > 0 and index > 0) try buffer.appendSlice(allocator, "\n\n");
+        try buffer.appendSlice(allocator, text);
     }
-    return buffer.toOwnedSlice(allocator) catch null;
+    return try buffer.toOwnedSlice(allocator);
 }
 
 fn updateResponseIdFromResponseObject(allocator: std.mem.Allocator, output: *types.AssistantMessage, response_value: std.json.Value) !void {
@@ -1165,6 +1173,38 @@ test "resolveAuthHeaderValue supports bearer token authentication" {
     try std.testing.expectEqualStrings("Bearer entra-token", auth.value);
 }
 
+test "extractMessageText uses caller allocator" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},{\"type\":\"refusal\",\"refusal\":\" Azure\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractMessageText(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("Hello Azure", text);
+}
+
+test "extractReasoningSummary uses caller allocator" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[{\"text\":\"first\"},{\"text\":\"second\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractReasoningSummary(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("first\n\nsecond", text);
+}
+
 test "parseSseStreamLines emits Azure text events" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1226,4 +1266,77 @@ test "parseSseStreamLines emits Azure text events" {
     try std.testing.expectEqualStrings("Hello Azure", event5.message.?.content[0].text.text);
 
     freeAssistantMessageOwned(allocator, event5.message.?);
+}
+
+test "parseSseStreamLines emits Azure reasoning events without leaks" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n" ++
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"first\"}\n" ++
+            "data: {\"type\":\"response.reasoning_summary_part.done\"}\n" ++
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"second\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"text\":\"first\"},{\"text\":\"second\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2,\"total_tokens\":4}}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "https://example.openai.azure.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    const event1 = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, event1.event_type);
+
+    const event2 = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, event2.event_type);
+
+    const event3 = stream.next().?;
+    defer freeEventOwned(allocator, event3);
+    try std.testing.expectEqual(types.EventType.thinking_delta, event3.event_type);
+    try std.testing.expectEqualStrings("first", event3.delta.?);
+
+    const event4 = stream.next().?;
+    defer freeEventOwned(allocator, event4);
+    try std.testing.expectEqual(types.EventType.thinking_delta, event4.event_type);
+    try std.testing.expectEqualStrings("\n\n", event4.delta.?);
+
+    const event5 = stream.next().?;
+    defer freeEventOwned(allocator, event5);
+    try std.testing.expectEqual(types.EventType.thinking_delta, event5.event_type);
+    try std.testing.expectEqualStrings("second", event5.delta.?);
+
+    const event6 = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, event6.event_type);
+    try std.testing.expectEqualStrings("first\n\nsecond", event6.content.?);
+
+    const event7 = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, event7.event_type);
+    try std.testing.expect(event7.message != null);
+    try std.testing.expectEqualStrings("first\n\nsecond", event7.message.?.content[0].thinking.thinking);
+
+    freeAssistantMessageOwned(allocator, event7.message.?);
 }
