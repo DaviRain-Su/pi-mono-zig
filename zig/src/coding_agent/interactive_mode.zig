@@ -49,6 +49,9 @@ pub const RunInteractiveModeOptions = struct {
     thinking: agent.ThinkingLevel = .off,
     session: ?[]const u8 = null,
     @"continue": bool = false,
+    @"resume": bool = false,
+    fork: ?[]const u8 = null,
+    no_session: bool = false,
     selected_tools: ?[]const []const u8 = null,
     initial_prompt: ?[]const u8 = null,
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
@@ -1078,6 +1081,52 @@ pub fn openInitialSession(
     const thinking_level = options.thinking;
     const compaction_settings = configuredCompactionSettings(options.runtime_config);
     const retry_settings = configuredRetrySettings(options.runtime_config);
+    if (options.no_session) {
+        return try session_mod.AgentSession.create(allocator, io, .{
+            .cwd = options.cwd,
+            .system_prompt = options.system_prompt,
+            .model = model,
+            .api_key = api_key,
+            .thinking_level = thinking_level,
+            .tools = tool_items,
+            .compaction = compaction_settings,
+            .retry = retry_settings,
+        });
+    }
+
+    if (options.fork) |session_ref| {
+        const session_path = try resolveSessionPath(allocator, io, session_dir, options.cwd, session_ref);
+        defer allocator.free(session_path);
+
+        var source_session = try session_mod.AgentSession.open(allocator, io, .{
+            .session_file = session_path,
+            .cwd_override = options.cwd,
+            .system_prompt = options.system_prompt,
+            .model = model,
+            .api_key = api_key,
+            .thinking_level = thinking_level,
+            .tools = tool_items,
+            .compaction = compaction_settings,
+            .retry = retry_settings,
+        });
+        defer source_session.deinit();
+
+        return try createSeededSession(
+            allocator,
+            io,
+            options.cwd,
+            options.system_prompt,
+            model,
+            api_key,
+            thinking_level,
+            tool_items,
+            compaction_settings,
+            retry_settings,
+            session_dir,
+            source_session.agent.getMessages(),
+        );
+    }
+
     if (options.session) |session_ref| {
         const session_path = try resolveSessionPath(allocator, io, session_dir, options.cwd, session_ref);
         defer allocator.free(session_path);
@@ -1094,7 +1143,7 @@ pub fn openInitialSession(
         });
     }
 
-    if (options.@"continue") {
+    if (options.@"continue" or options.@"resume") {
         if (try session_manager_mod.findMostRecentSession(allocator, io, session_dir)) |recent| {
             defer allocator.free(recent);
             return try session_mod.AgentSession.open(allocator, io, .{
@@ -1111,9 +1160,39 @@ pub fn openInitialSession(
         }
     }
 
-    return try session_mod.AgentSession.create(allocator, io, .{
-        .cwd = options.cwd,
-        .system_prompt = options.system_prompt,
+    return try createSeededSession(
+        allocator,
+        io,
+        options.cwd,
+        options.system_prompt,
+        model,
+        api_key,
+        thinking_level,
+        tool_items,
+        compaction_settings,
+        retry_settings,
+        session_dir,
+        &.{},
+    );
+}
+
+fn createSeededSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    system_prompt: []const u8,
+    model: ai.Model,
+    api_key: ?[]const u8,
+    thinking_level: agent.ThinkingLevel,
+    tool_items: []const agent.AgentTool,
+    compaction_settings: session_mod.CompactionSettings,
+    retry_settings: session_mod.RetrySettings,
+    session_dir: ?[]const u8,
+    messages: []const agent.AgentMessage,
+) !session_mod.AgentSession {
+    var session = try session_mod.AgentSession.create(allocator, io, .{
+        .cwd = cwd,
+        .system_prompt = system_prompt,
         .model = model,
         .api_key = api_key,
         .thinking_level = thinking_level,
@@ -1122,6 +1201,14 @@ pub fn openInitialSession(
         .compaction = compaction_settings,
         .retry = retry_settings,
     });
+    errdefer session.deinit();
+
+    for (messages) |message| {
+        _ = try session.session_manager.appendMessage(message);
+    }
+    try session.agent.setMessages(messages);
+
+    return session;
 }
 
 fn handleInputKey(
