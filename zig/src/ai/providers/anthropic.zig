@@ -1,4 +1,5 @@
 const std = @import("std");
+const env_api_keys = @import("../env_api_keys.zig");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
@@ -12,6 +13,8 @@ const AnthropicError = error{
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CLAUDE_CODE_VERSION = "2.1.75";
 const TOOL_PLACEHOLDER_TEXT = "";
+const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
+const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
 
 const CurrentBlock = union(enum) {
     text: std.ArrayList(u8),
@@ -38,6 +41,15 @@ const AnthropicCompat = struct {
     supports_long_cache_retention: bool = true,
 };
 
+const ResolvedOptions = struct {
+    options: ?types.StreamOptions,
+    owned_api_key: ?[]u8 = null,
+
+    fn deinit(self: ResolvedOptions, allocator: std.mem.Allocator) void {
+        if (self.owned_api_key) |api_key| allocator.free(api_key);
+    }
+};
+
 pub const AnthropicProvider = struct {
     pub const api = "anthropic-messages";
 
@@ -51,10 +63,13 @@ pub const AnthropicProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        var payload = try buildRequestPayload(allocator, model, context, options);
+        const resolved_options = try resolveStreamOptions(allocator, model, options);
+        defer resolved_options.deinit(allocator);
+
+        var payload = try buildRequestPayload(allocator, model, context, resolved_options.options);
         defer freeJsonValue(allocator, payload);
 
-        if (options) |stream_options| {
+        if (resolved_options.options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
                     freeJsonValue(allocator, payload);
@@ -70,14 +85,15 @@ pub const AnthropicProvider = struct {
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
-        defer headers.deinit();
-        try headers.put("Content-Type", "application/json");
-        try headers.put("Accept", "text/event-stream");
-        try headers.put("anthropic-version", "2023-06-01");
-        try applyAuthHeaders(allocator, &headers, model, options);
-        try applyDefaultAnthropicHeaders(allocator, &headers, model, context, options);
+        errdefer deinitOwnedHeaders(allocator, &headers);
+        defer deinitOwnedHeaders(allocator, &headers);
+        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+        try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        try putOwnedHeader(allocator, &headers, "anthropic-version", "2023-06-01");
+        try applyAuthHeaders(allocator, &headers, model, resolved_options.options);
+        try applyDefaultAnthropicHeaders(allocator, &headers, model, context, resolved_options.options);
         try mergeHeaders(allocator, &headers, model.headers);
-        if (options) |stream_options| {
+        if (resolved_options.options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
         }
 
@@ -89,15 +105,19 @@ pub const AnthropicProvider = struct {
             .url = url,
             .headers = headers,
             .body = json_body,
-            .aborted = if (options) |stream_options| stream_options.signal else null,
+            .aborted = if (resolved_options.options) |stream_options| stream_options.signal else null,
         });
         defer response.deinit();
 
-        if (options) |stream_options| {
+        if (resolved_options.options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                var response_headers = std.StringHashMap([]const u8).init(allocator);
-                defer response_headers.deinit();
-                callback(response.status, response_headers, model);
+                if (response.response_headers) |response_headers| {
+                    callback(response.status, response_headers, model);
+                } else {
+                    var response_headers = std.StringHashMap([]const u8).init(allocator);
+                    defer response_headers.deinit();
+                    callback(response.status, response_headers, model);
+                }
             }
         }
 
@@ -122,7 +142,7 @@ pub const AnthropicProvider = struct {
             return stream_instance;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, context, options);
+        try parseSseStreamLines(allocator, &stream_instance, &response, model, context, resolved_options.options);
         return stream_instance;
     }
 
@@ -136,6 +156,43 @@ pub const AnthropicProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
+
+fn resolveStreamOptions(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+) !ResolvedOptions {
+    return resolveStreamOptionsWithEnvMap(allocator, model, options, null);
+}
+
+fn resolveStreamOptionsWithEnvMap(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    env_map: ?*const std.process.Environ.Map,
+) !ResolvedOptions {
+    var resolved = ResolvedOptions{ .options = options };
+    const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
+    if (provided_api_key) |api_key| {
+        if (api_key.len > 0) return resolved;
+    }
+
+    const env_api_key = if (env_map) |map|
+        try env_api_keys.getEnvApiKeyFromMap(allocator, map, model.provider)
+    else
+        try env_api_keys.getEnvApiKey(allocator, model.provider);
+
+    resolved.owned_api_key = env_api_key;
+    if (env_api_key) |api_key| {
+        var updated = options orelse types.StreamOptions{};
+        updated.api_key = api_key;
+        resolved.options = updated;
+    } else if (options) |stream_options| {
+        resolved.options = stream_options;
+    }
+
+    return resolved;
+}
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
@@ -172,18 +229,41 @@ pub fn buildRequestPayload(
         try payload.put(allocator, try allocator.dupe(u8, "tools"), tools_value);
     }
 
-    if (model.reasoning) {
-        var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "enabled") });
-        try thinking.put(allocator, try allocator.dupe(u8, "budget_tokens"), .{ .integer = 1024 });
-        try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, "summarized") });
-        try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
-    }
-
     if (options) |stream_options| {
         if (stream_options.temperature) |temperature| {
-            if (!model.reasoning) {
+            if (stream_options.anthropic_thinking_enabled != true) {
                 try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
+            }
+        }
+
+        if (model.reasoning) {
+            if (stream_options.anthropic_thinking_enabled == true) {
+                const display = anthropicThinkingDisplayString(stream_options.anthropic_thinking_display orelse .summarized);
+                var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                if (supportsAdaptiveThinking(model)) {
+                    try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "adaptive") });
+                    try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, display) });
+                    try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+
+                    if (stream_options.anthropic_effort) |effort| {
+                        var output_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                        try output_config.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, anthropicEffortString(effort)) });
+                        try payload.put(allocator, try allocator.dupe(u8, "output_config"), .{ .object = output_config });
+                    }
+                } else {
+                    try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "enabled") });
+                    try thinking.put(
+                        allocator,
+                        try allocator.dupe(u8, "budget_tokens"),
+                        .{ .integer = @intCast(stream_options.anthropic_thinking_budget_tokens orelse 1024) },
+                    );
+                    try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, display) });
+                    try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+                }
+            } else if (stream_options.anthropic_thinking_enabled == false) {
+                var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "disabled") });
+                try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
             }
         }
 
@@ -197,6 +277,10 @@ pub fn buildRequestPayload(
                     }
                 }
             }
+        }
+
+        if (stream_options.anthropic_tool_choice) |tool_choice| {
+            try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try buildToolChoiceValue(allocator, tool_choice, is_oauth));
         }
     }
 
@@ -213,7 +297,55 @@ pub fn mapStopReason(reason: []const u8) !types.StopReason {
     return AnthropicError.UnknownStopReason;
 }
 
-test "buildRequestPayload includes system tools and cache control" {
+fn anthropicEffortString(effort: types.AnthropicEffort) []const u8 {
+    return switch (effort) {
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+        .max => "max",
+    };
+}
+
+fn anthropicThinkingDisplayString(display: types.AnthropicThinkingDisplay) []const u8 {
+    return switch (display) {
+        .summarized => "summarized",
+        .omitted => "omitted",
+    };
+}
+
+fn supportsAdaptiveThinking(model: types.Model) bool {
+    return std.mem.indexOf(u8, model.id, "opus-4-6") != null or
+        std.mem.indexOf(u8, model.id, "opus-4.6") != null or
+        std.mem.indexOf(u8, model.id, "opus-4-7") != null or
+        std.mem.indexOf(u8, model.id, "opus-4.7") != null or
+        std.mem.indexOf(u8, model.id, "sonnet-4-6") != null or
+        std.mem.indexOf(u8, model.id, "sonnet-4.6") != null;
+}
+
+fn buildToolChoiceValue(
+    allocator: std.mem.Allocator,
+    tool_choice: types.AnthropicToolChoice,
+    is_oauth: bool,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    switch (tool_choice) {
+        .auto => try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "auto") }),
+        .any => try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "any") }),
+        .none => try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "none") }),
+        .tool => |name| {
+            try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool") });
+            try object.put(
+                allocator,
+                try allocator.dupe(u8, "name"),
+                .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(name) else name) },
+            );
+        },
+    }
+    return .{ .object = object };
+}
+
+test "buildRequestPayload includes system tools and cache control without default thinking" {
     const allocator = std.testing.allocator;
 
     var tool_params = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -261,7 +393,7 @@ test "buildRequestPayload includes system tools and cache control" {
     try std.testing.expect(object.get("system").? == .array);
     try std.testing.expect(object.get("messages").? == .array);
     try std.testing.expect(object.get("tools").? == .array);
-    try std.testing.expect(object.get("thinking").? == .object);
+    try std.testing.expect(object.get("thinking") == null);
 }
 
 test "buildRequestPayload applies Claude Code stealth mode for oauth" {
@@ -538,11 +670,11 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
     try std.testing.expect(first_tool.object.get("eager_input_streaming") == null);
 
     var headers = std.StringHashMap([]const u8).init(allocator);
-    defer headers.deinit();
+    defer deinitOwnedHeaders(allocator, &headers);
 
     try applyDefaultAnthropicHeaders(allocator, &headers, model, context, null);
     try std.testing.expectEqualStrings(
-        "fine-grained-tool-streaming-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
         headers.get("anthropic-beta").?,
     );
 }
@@ -581,6 +713,226 @@ test "buildRequestPayload omits anthropic long cache ttl when compat disables it
     const cache_control = system.object.get("cache_control").?;
     try std.testing.expect(cache_control == .object);
     try std.testing.expect(cache_control.object.get("ttl") == null);
+}
+
+test "buildRequestPayload supports disabled thinking and temperature" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .temperature = 0.25,
+        .anthropic_thinking_enabled = false,
+    });
+    defer freeJsonValue(allocator, payload);
+
+    const thinking = payload.object.get("thinking").?.object;
+    try std.testing.expectEqualStrings("disabled", thinking.get("type").?.string);
+    try std.testing.expectEqual(@as(f64, 0.25), payload.object.get("temperature").?.float);
+}
+
+test "buildRequestPayload supports adaptive thinking effort" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "claude-opus-4-6",
+        .name = "Claude Opus 4.6",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .anthropic_thinking_enabled = true,
+        .anthropic_effort = .max,
+    });
+    defer freeJsonValue(allocator, payload);
+
+    const thinking = payload.object.get("thinking").?.object;
+    try std.testing.expectEqualStrings("adaptive", thinking.get("type").?.string);
+    try std.testing.expectEqualStrings("summarized", thinking.get("display").?.string);
+    const output_config = payload.object.get("output_config").?.object;
+    try std.testing.expectEqualStrings("max", output_config.get("effort").?.string);
+    try std.testing.expect(payload.object.get("temperature") == null);
+}
+
+test "buildRequestPayload supports budget thinking display and tool choice" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .anthropic_thinking_enabled = true,
+        .anthropic_thinking_budget_tokens = 4096,
+        .anthropic_thinking_display = .omitted,
+        .anthropic_tool_choice = .{ .tool = "todoWrite" },
+    });
+    defer freeJsonValue(allocator, payload);
+
+    const thinking = payload.object.get("thinking").?.object;
+    try std.testing.expectEqualStrings("enabled", thinking.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 4096), thinking.get("budget_tokens").?.integer);
+    try std.testing.expectEqualStrings("omitted", thinking.get("display").?.string);
+
+    const tool_choice = payload.object.get("tool_choice").?.object;
+    try std.testing.expectEqualStrings("tool", tool_choice.get("type").?.string);
+    try std.testing.expectEqualStrings("todoWrite", tool_choice.get("name").?.string);
+}
+
+test "applyDefaultAnthropicHeaders adds interleaved thinking beta for legacy models" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    try applyDefaultAnthropicHeaders(allocator, &headers, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .anthropic_interleaved_thinking = true,
+    });
+
+    try std.testing.expectEqualStrings("interleaved-thinking-2025-05-14", headers.get("anthropic-beta").?);
+}
+
+test "resolveStreamOptions falls back to env api key before building payload" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat-env");
+
+    const model = types.Model{
+        .id = "claude-3-5-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const resolved = try resolveStreamOptionsWithEnvMap(allocator, model, null, &env_map);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("sk-ant-oat-env", resolved.options.?.api_key.?);
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .messages = &[_]types.Message{},
+    }, resolved.options);
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expect(payload.object.get("system").? == .array);
+}
+
+test "stream on_response receives actual response headers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_headers\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n" ++
+        "\n";
+
+    var server = try ResponseHeaderServer.init(
+        io,
+        "x-request-id: req_123\r\nanthropic-processing-ms: 17\r\n",
+        body,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const user_content = [_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }};
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &user_content,
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    OnResponseCapture.reset();
+
+    var stream = try AnthropicProvider.stream(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .on_response = &OnResponseCapture.callback,
+    });
+    defer stream.deinit();
+
+    try drainStreamAndFreeDoneMessage(allocator, &stream);
+
+    try std.testing.expect(OnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 200), OnResponseCapture.status);
 }
 
 fn parseSseStreamLines(
@@ -1237,9 +1589,10 @@ fn applyAuthHeaders(
 
     if (std.mem.eql(u8, model.provider, "github-copilot") or isOAuthToken(api_key)) {
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-        try headers.put("Authorization", authorization);
+        defer allocator.free(authorization);
+        try putOwnedHeader(allocator, headers, "Authorization", authorization);
     } else {
-        try headers.put("x-api-key", try allocator.dupe(u8, api_key));
+        try putOwnedHeader(allocator, headers, "x-api-key", api_key);
     }
 }
 
@@ -1251,33 +1604,61 @@ fn applyDefaultAnthropicHeaders(
     options: ?types.StreamOptions,
 ) !void {
     const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
-    const use_fine_grained_tool_streaming_beta = shouldUseFineGrainedToolStreamingBeta(model, context);
-
-    if (std.mem.eql(u8, model.provider, "github-copilot")) {
-        if (use_fine_grained_tool_streaming_beta) {
-            try headers.put("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
-        }
-        return;
+    if (try buildAnthropicBetaHeader(allocator, model, context, options, api_key)) |beta_header| {
+        defer allocator.free(beta_header);
+        try putOwnedHeader(allocator, headers, "anthropic-beta", beta_header);
     }
 
     if (isOAuthToken(api_key)) {
-        if (use_fine_grained_tool_streaming_beta) {
-            try headers.put("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14");
-        } else {
-            try headers.put("anthropic-beta", "claude-code-20250219,oauth-2025-04-20");
-        }
-        try headers.put("user-agent", try std.fmt.allocPrint(allocator, "claude-cli/{s}", .{CLAUDE_CODE_VERSION}));
-        try headers.put("x-app", "cli");
-    } else {
-        if (use_fine_grained_tool_streaming_beta) {
-            try headers.put("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
-        }
+        const user_agent = try std.fmt.allocPrint(allocator, "claude-cli/{s}", .{CLAUDE_CODE_VERSION});
+        defer allocator.free(user_agent);
+        try putOwnedHeader(allocator, headers, "user-agent", user_agent);
+        try putOwnedHeader(allocator, headers, "x-app", "cli");
     }
 }
 
 fn shouldUseFineGrainedToolStreamingBeta(model: types.Model, context: types.Context) bool {
     if (context.tools == null or context.tools.?.len == 0) return false;
     return !getAnthropicCompat(model).supports_eager_tool_input_streaming;
+}
+
+fn shouldUseInterleavedThinkingBeta(model: types.Model, options: ?types.StreamOptions) bool {
+    if (supportsAdaptiveThinking(model)) return false;
+    if (options) |stream_options| {
+        return stream_options.anthropic_interleaved_thinking orelse true;
+    }
+    return true;
+}
+
+fn buildAnthropicBetaHeader(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    api_key: []const u8,
+) !?[]u8 {
+    var features: [4][]const u8 = undefined;
+    var count: usize = 0;
+
+    if (!std.mem.eql(u8, model.provider, "github-copilot") and isOAuthToken(api_key)) {
+        features[count] = "claude-code-20250219";
+        count += 1;
+        features[count] = "oauth-2025-04-20";
+        count += 1;
+    }
+
+    if (shouldUseFineGrainedToolStreamingBeta(model, context)) {
+        features[count] = FINE_GRAINED_TOOL_STREAMING_BETA;
+        count += 1;
+    }
+
+    if (shouldUseInterleavedThinkingBeta(model, options)) {
+        features[count] = INTERLEAVED_THINKING_BETA;
+        count += 1;
+    }
+
+    if (count == 0) return null;
+    return try std.mem.join(allocator, ",", features[0..count]);
 }
 
 fn mergeHeaders(
@@ -1288,9 +1669,34 @@ fn mergeHeaders(
     if (source) |headers| {
         var iterator = headers.iterator();
         while (iterator.next()) |entry| {
-            try target.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
+            try putOwnedHeader(allocator, target, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
+}
+
+fn putOwnedHeader(
+    allocator: std.mem.Allocator,
+    headers: *std.StringHashMap([]const u8),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    if (try headers.fetchPut(owned_name, owned_value)) |previous| {
+        allocator.free(previous.key);
+        allocator.free(previous.value);
+    }
+}
+
+fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap([]const u8)) void {
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    headers.deinit();
 }
 
 fn isOAuthToken(api_key: []const u8) bool {
@@ -1396,6 +1802,140 @@ fn canonicalClaudeCodeToolName(name: []const u8) []const u8 {
         if (std.ascii.eqlIgnoreCase(entry.lower, name)) return entry.canonical;
     }
     return name;
+}
+
+const ResponseHeaderServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    response_headers: []const u8,
+    body: []const u8,
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, response_headers: []const u8, body: []const u8) !ResponseHeaderServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .response_headers = response_headers,
+            .body = body,
+        };
+    }
+
+    fn start(self: *ResponseHeaderServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *ResponseHeaderServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn url(self: *const ResponseHeaderServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn run(self: *ResponseHeaderServer) void {
+        const stream = self.server.accept(self.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => std.debug.panic("response header test server accept failed: {}", .{err}),
+        };
+        defer stream.close(self.io);
+
+        readRequestHead(stream) catch |err| std.debug.panic("response header test server read failed: {}", .{err});
+        writeResponse(self, stream) catch |err| std.debug.panic("response header test server write failed: {}", .{err});
+    }
+
+    fn readRequestHead(stream: std.Io.net.Stream) !void {
+        var read_buffer: [1024]u8 = undefined;
+        var reader = stream.reader(std.testing.io, &read_buffer);
+        var tail = [_]u8{ 0, 0, 0, 0 };
+        var count: usize = 0;
+
+        while (true) {
+            const byte = try reader.interface.takeByte();
+            tail[count % tail.len] = byte;
+            count += 1;
+
+            if (count >= 4) {
+                const start_index = count % tail.len;
+                const ordered = [_]u8{
+                    tail[start_index],
+                    tail[(start_index + 1) % tail.len],
+                    tail[(start_index + 2) % tail.len],
+                    tail[(start_index + 3) % tail.len],
+                };
+                if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
+            }
+        }
+    }
+
+    fn writeResponse(self: *ResponseHeaderServer, stream: std.Io.net.Stream) !void {
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n{s}\r\n",
+            .{ self.body.len, self.response_headers },
+        );
+        try writer.interface.writeAll(self.body);
+        try writer.interface.flush();
+    }
+};
+
+const OnResponseCapture = struct {
+    var called = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) void {
+        called = true;
+        status = callback_status;
+        std.testing.expectEqualStrings("anthropic-messages", model.api) catch unreachable;
+        std.testing.expectEqualStrings("text/event-stream", headers.get("Content-Type").?) catch unreachable;
+        std.testing.expectEqualStrings("req_123", headers.get("x-request-id").?) catch unreachable;
+        std.testing.expectEqualStrings("17", headers.get("anthropic-processing-ms").?) catch unreachable;
+    }
+};
+
+fn drainStreamAndFreeDoneMessage(
+    allocator: std.mem.Allocator,
+    stream: *event_stream.AssistantMessageEventStream,
+) !void {
+    while (stream.next()) |event| {
+        defer event.deinitTransient(allocator);
+        if (event.message) |message| freeAssistantMessageOwned(allocator, message);
+    }
+}
+
+fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    freeJsonValue(allocator, tool_call.arguments);
+}
+
+fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
+    for (message.content) |block| {
+        switch (block) {
+            .text => |text| allocator.free(text.text),
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        }
+    }
+    if (message.content.len > 0) allocator.free(message.content);
+    if (message.tool_calls) |tool_calls| {
+        for (tool_calls) |tool_call| freeToolCallOwned(allocator, tool_call);
+        allocator.free(tool_calls);
+    }
+    if (message.response_id) |response_id| allocator.free(response_id);
+    if (message.error_message) |error_message| allocator.free(error_message);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {

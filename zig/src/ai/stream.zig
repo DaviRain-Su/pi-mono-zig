@@ -46,7 +46,8 @@ pub fn streamSimple(
     options: ?types.SimpleStreamOptions,
 ) !event_stream.AssistantMessageEventStream {
     const stream_options = if (options) |simple_options| blk: {
-        var mapped = simple_options.toStreamOptions();
+        var mapped = simple_options_mod.buildBaseOptions(model, simple_options, null);
+        applyAnthropicSimpleOptions(&mapped, model, simple_options);
         applyResponsesSimpleOptions(&mapped, model, simple_options.reasoning);
         applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
         break :blk mapped;
@@ -62,12 +63,43 @@ pub fn completeSimple(
     options: ?types.SimpleStreamOptions,
 ) !types.AssistantMessage {
     const stream_options = if (options) |simple_options| blk: {
-        var mapped = simple_options.toStreamOptions();
+        var mapped = simple_options_mod.buildBaseOptions(model, simple_options, null);
+        applyAnthropicSimpleOptions(&mapped, model, simple_options);
         applyResponsesSimpleOptions(&mapped, model, simple_options.reasoning);
         applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
         break :blk mapped;
     } else null;
     return try complete(allocator, io, model, context, stream_options);
+}
+
+fn applyAnthropicSimpleOptions(
+    stream_options: *types.StreamOptions,
+    model: types.Model,
+    options: types.SimpleStreamOptions,
+) void {
+    if (!model.reasoning) return;
+    if (!std.mem.eql(u8, model.api, "anthropic-messages")) return;
+
+    if (options.reasoning == null) {
+        stream_options.anthropic_thinking_enabled = false;
+        return;
+    }
+
+    stream_options.anthropic_thinking_enabled = true;
+    if (supportsAdaptiveAnthropicThinking(model)) {
+        stream_options.anthropic_effort = mapThinkingLevelToAnthropicEffort(model, options.reasoning.?);
+        return;
+    }
+
+    const base_max_tokens = stream_options.max_tokens orelse 0;
+    const adjusted = simple_options_mod.adjustMaxTokensForThinking(
+        base_max_tokens,
+        model.max_tokens,
+        options.reasoning.?,
+        options.thinking_budgets,
+    );
+    stream_options.max_tokens = adjusted.max_tokens;
+    stream_options.anthropic_thinking_budget_tokens = adjusted.thinking_budget;
 }
 
 fn applyMistralSimpleOptions(
@@ -106,6 +138,34 @@ fn applyResponsesSimpleOptions(
         simple_options_mod.clampReasoning(reasoning).?;
 }
 
+fn supportsAdaptiveAnthropicThinking(model: types.Model) bool {
+    return std.mem.indexOf(u8, model.id, "opus-4-6") != null or
+        std.mem.indexOf(u8, model.id, "opus-4.6") != null or
+        std.mem.indexOf(u8, model.id, "opus-4-7") != null or
+        std.mem.indexOf(u8, model.id, "opus-4.7") != null or
+        std.mem.indexOf(u8, model.id, "sonnet-4-6") != null or
+        std.mem.indexOf(u8, model.id, "sonnet-4.6") != null;
+}
+
+fn mapThinkingLevelToAnthropicEffort(
+    model: types.Model,
+    reasoning: types.ThinkingLevel,
+) types.AnthropicEffort {
+    return switch (reasoning) {
+        .minimal, .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => if (std.mem.indexOf(u8, model.id, "opus-4-6") != null or
+            std.mem.indexOf(u8, model.id, "opus-4.6") != null)
+            .max
+        else if (std.mem.indexOf(u8, model.id, "opus-4-7") != null or
+            std.mem.indexOf(u8, model.id, "opus-4.7") != null)
+            .xhigh
+        else
+            .high,
+    };
+}
+
 const RecordingState = struct {
     stream_calls: usize = 0,
     stream_simple_calls: usize = 0,
@@ -115,6 +175,9 @@ const RecordingState = struct {
     saw_responses_reasoning_effort: ?types.ThinkingLevel = null,
     saw_mistral_prompt_mode: ?[]const u8 = null,
     saw_mistral_reasoning_effort: ?[]const u8 = null,
+    saw_anthropic_thinking_enabled: ?bool = null,
+    saw_anthropic_thinking_budget_tokens: ?u32 = null,
+    saw_anthropic_effort: ?types.AnthropicEffort = null,
     response_text: []const u8 = "recorded response",
 };
 
@@ -141,6 +204,9 @@ fn recordingStream(
         recording_state.saw_responses_reasoning_effort = stream_options.responses_reasoning_effort;
         recording_state.saw_mistral_prompt_mode = stream_options.mistral_prompt_mode;
         recording_state.saw_mistral_reasoning_effort = stream_options.mistral_reasoning_effort;
+        recording_state.saw_anthropic_thinking_enabled = stream_options.anthropic_thinking_enabled;
+        recording_state.saw_anthropic_thinking_budget_tokens = stream_options.anthropic_thinking_budget_tokens;
+        recording_state.saw_anthropic_effort = stream_options.anthropic_effort;
     }
 
     const result_allocator = std.heap.page_allocator;
@@ -369,6 +435,138 @@ test "streamSimple maps Mistral reasoning to provider options" {
 
     try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
     try std.testing.expectEqualStrings("high", recording_state.saw_mistral_reasoning_effort.?);
+}
+
+test "streamSimple maps Anthropic reasoning to provider options" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "anthropic-messages",
+        .stream = recordingStream,
+        .stream_simple = recordingStreamSimple,
+    });
+
+    const adaptive_model = types.Model{
+        .id = "claude-sonnet-4-6",
+        .name = "Claude Sonnet 4.6",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    resetRecordingState();
+    var no_reasoning_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        adaptive_model,
+        .{ .messages = &[_]types.Message{} },
+        .{},
+    );
+    defer no_reasoning_stream.deinit();
+    while (no_reasoning_stream.next()) |_| {}
+
+    try std.testing.expectEqual(@as(?bool, false), recording_state.saw_anthropic_thinking_enabled);
+    try std.testing.expect(recording_state.saw_anthropic_effort == null);
+
+    resetRecordingState();
+    var adaptive_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        adaptive_model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .reasoning = .medium },
+    );
+    defer adaptive_stream.deinit();
+    while (adaptive_stream.next()) |_| {}
+
+    try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_thinking_enabled);
+    try std.testing.expectEqual(@as(?types.AnthropicEffort, .medium), recording_state.saw_anthropic_effort);
+    try std.testing.expect(recording_state.saw_anthropic_thinking_budget_tokens == null);
+
+    const opus46_model = types.Model{
+        .id = "claude-opus-4-6",
+        .name = "Claude Opus 4.6",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    resetRecordingState();
+    var opus46_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        opus46_model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .reasoning = .xhigh },
+    );
+    defer opus46_stream.deinit();
+    while (opus46_stream.next()) |_| {}
+
+    try std.testing.expectEqual(@as(?types.AnthropicEffort, .max), recording_state.saw_anthropic_effort);
+
+    const opus47_model = types.Model{
+        .id = "claude-opus-4-7",
+        .name = "Claude Opus 4.7",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    resetRecordingState();
+    var opus47_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        opus47_model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .reasoning = .xhigh },
+    );
+    defer opus47_stream.deinit();
+    while (opus47_stream.next()) |_| {}
+
+    try std.testing.expectEqual(@as(?types.AnthropicEffort, .xhigh), recording_state.saw_anthropic_effort);
+
+    const legacy_model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude 3.7 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    resetRecordingState();
+    var legacy_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        legacy_model,
+        .{ .messages = &[_]types.Message{} },
+        .{
+            .reasoning = .medium,
+            .thinking_budgets = .{ .medium = 4096 },
+        },
+    );
+    defer legacy_stream.deinit();
+    while (legacy_stream.next()) |_| {}
+
+    try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_thinking_enabled);
+    try std.testing.expectEqual(@as(?u32, 4096), recording_state.saw_anthropic_thinking_budget_tokens);
+    try std.testing.expectEqual(@as(?u32, 32000 + 4096), recording_state.saw_max_tokens);
 }
 
 test "streamSimple preserves xhigh reasoning for Codex GPT-5.5" {

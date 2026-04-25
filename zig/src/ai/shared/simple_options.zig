@@ -1,13 +1,6 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
-pub const ThinkingBudgets = struct {
-    minimal: u32 = 1024,
-    low: u32 = 2048,
-    medium: u32 = 8192,
-    high: u32 = 16384,
-};
-
 pub const AdjustedThinkingTokens = struct {
     max_tokens: u32,
     thinking_budget: u32,
@@ -52,9 +45,9 @@ pub fn adjustMaxTokensForThinking(
     base_max_tokens: u32,
     model_max_tokens: u32,
     reasoning_level: types.ThinkingLevel,
-    custom_budgets: ?ThinkingBudgets,
+    custom_budgets: ?types.ThinkingBudgets,
 ) AdjustedThinkingTokens {
-    const budgets = custom_budgets orelse ThinkingBudgets{};
+    const budgets = custom_budgets orelse types.ThinkingBudgets{};
     const min_output_tokens: u32 = 1024;
     const level = clampReasoning(reasoning_level).?;
     var thinking_budget = switch (level) {

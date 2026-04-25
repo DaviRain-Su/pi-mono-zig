@@ -213,7 +213,7 @@ test "github-copilot eager streaming compat is applied to streamed anthropic req
 
     const request = server.captured orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(
-        "fine-grained-tool-streaming-2025-05-14",
+        "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
         request.headers.get("anthropic-beta").?,
     );
 
