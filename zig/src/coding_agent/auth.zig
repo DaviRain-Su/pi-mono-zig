@@ -2,6 +2,8 @@ const std = @import("std");
 const ai = @import("ai");
 const common = @import("tools/common.zig");
 
+const DEFAULT_ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_REDIRECT_URI = "http://localhost:53692/callback";
@@ -683,6 +685,23 @@ pub fn formatOAuthClientConfigError(
     );
 }
 
+pub fn formatAuthenticationError(allocator: std.mem.Allocator, err: anyerror) !?[]u8 {
+    const message = switch (err) {
+        error.InvalidAuthorizationInput => "Paste the full redirect URL or authorization code from the browser callback.",
+        error.MissingAuthorizationCode => "The callback URL is missing the `code` parameter. Paste the full redirect URL.",
+        error.InvalidOAuthState => "The callback URL belongs to a different login attempt. Run /login again and paste the newest redirect URL.",
+        error.MissingProjectId => "Enter a Google Cloud project ID after the redirect URL is accepted.",
+        error.InvalidAuthResponse => "OAuth token exchange returned an unexpected response.",
+        error.MissingAccessToken => "OAuth token exchange succeeded but did not return an access token.",
+        error.MissingRefreshToken => "OAuth token exchange succeeded but did not return a refresh token.",
+        error.HttpRequestFailed => "OAuth token exchange failed. Verify the client credentials and try /login again.",
+        error.Timeout => "OAuth token exchange timed out. Try /login again.",
+        error.ConnectionRefused, error.ConnectionReset, error.NetworkUnreachable, error.UnknownHost, error.TlsFailure => "Could not reach the OAuth provider during token exchange.",
+        else => return null,
+    };
+    return try allocator.dupe(u8, message);
+}
+
 fn loadOAuthClientCredentials(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -704,14 +723,47 @@ fn loadOAuthClientCredentials(
     if (parsed.value != .object) return error.InvalidOAuthConfigFile;
 
     const provider_object = findOAuthProviderObject(parsed.value.object, provider_id) orelse return error.MissingOAuthClientConfig;
-    const client_id = getObjectStringAny(provider_object, &.{ "client_id", "clientId" }) orelse return error.MissingOAuthClientId;
+    const configured_client_id = getObjectStringAny(provider_object, &.{ "client_id", "clientId" });
     const client_secret = getObjectStringAny(provider_object, &.{ "client_secret", "clientSecret" });
     if (require_client_secret and client_secret == null) return error.MissingOAuthClientSecret;
 
     return .{
-        .client_id = try allocator.dupe(u8, client_id),
+        .client_id = try resolveOAuthClientId(allocator, provider_id, configured_client_id),
         .client_secret = if (client_secret) |value| try allocator.dupe(u8, value) else null,
     };
+}
+
+fn resolveOAuthClientId(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    configured_client_id: ?[]const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, configured_client_id orelse "", &std.ascii.whitespace);
+    if (trimmed.len == 0) return error.MissingOAuthClientId;
+
+    if (std.mem.eql(u8, provider_id, "anthropic") and !isValidAnthropicClientId(trimmed)) {
+        return allocator.dupe(u8, DEFAULT_ANTHROPIC_CLIENT_ID);
+    }
+
+    return allocator.dupe(u8, trimmed);
+}
+
+fn isValidAnthropicClientId(value: []const u8) bool {
+    const uuid = if (std.mem.startsWith(u8, value, "urn:uuid:")) value["urn:uuid:".len..] else value;
+    if (uuid.len != 36) return false;
+
+    for (uuid, 0..) |char, index| {
+        switch (index) {
+            8, 13, 18, 23 => {
+                if (char != '-') return false;
+            },
+            else => {
+                if (!std.ascii.isHex(char)) return false;
+            },
+        }
+    }
+
+    return true;
 }
 
 fn resolveOAuthConfigPath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
@@ -785,7 +837,7 @@ fn oauthConfigSnippet(provider_id: []const u8) []const u8 {
     return
     \\{
     \\  "anthropic": {
-    \\    "client_id": "YOUR_ANTHROPIC_CLIENT_ID"
+    \\    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     \\  }
     \\}
     ;
@@ -877,7 +929,7 @@ fn refreshGitHubCopilotToken(
 }
 
 fn parseAuthorizationInput(allocator: std.mem.Allocator, input: []const u8) !AuthorizationInput {
-    const trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
+    const trimmed = std.mem.trim(u8, input, " \t\r\n\"'");
     if (trimmed.len == 0) return error.InvalidAuthorizationInput;
 
     if (std.mem.indexOfScalar(u8, trimmed, '?')) |query_index| {
@@ -893,10 +945,14 @@ fn parseAuthorizationInput(allocator: std.mem.Allocator, input: []const u8) !Aut
 
 fn extractAuthorizationFromQuery(allocator: std.mem.Allocator, query: ?[]const u8) !AuthorizationInput {
     const query_text = query orelse return error.InvalidAuthorizationInput;
-    var iterator = std.mem.splitScalar(u8, query_text, '&');
+    const fragment_trimmed = if (std.mem.indexOfScalar(u8, query_text, '#')) |fragment_index|
+        query_text[0..fragment_index]
+    else
+        query_text;
     var result = AuthorizationInput{};
     errdefer result.deinit(allocator);
 
+    var iterator = std.mem.splitScalar(u8, fragment_trimmed, '&');
     while (iterator.next()) |part| {
         const equals_index = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const name = part[0..equals_index];
@@ -1194,9 +1250,54 @@ test "startAnthropicBrowserLogin builds a Claude OAuth URL" {
 
     try std.testing.expectEqual(BrowserLoginKind.anthropic, session.kind);
     try std.testing.expect(std.mem.startsWith(u8, session.auth_url, ANTHROPIC_AUTHORIZE_URL));
-    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=anthropic-client-id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e") != null);
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge=") != null);
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback") != null);
+}
+
+test "loadOAuthClientCredentials falls back to public Anthropic client id for invalid configured values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
+    defer allocator.free(oauth_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        oauth_path,
+        \\{
+        \\  "anthropic": {
+        \\    "client_id": "not-a-valid-uuid"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var credentials = try loadOAuthClientCredentials(allocator, std.testing.io, &env_map, "anthropic", false);
+    defer credentials.deinit(allocator);
+
+    try std.testing.expectEqualStrings(DEFAULT_ANTHROPIC_CLIENT_ID, credentials.client_id);
+}
+
+test "parseAuthorizationInput accepts full callback URLs with fragments and quotes" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try parseAuthorizationInput(
+        allocator,
+        "\"http://localhost:53692/callback?code=4ujivk7vnGi64Hqicga0DG96C9YglzNJFgfYjrLHndQRK8gn&state=9geviroXK7Sa3j6MjojixMzGOWHRCvszOAKSbWCulSg#_=_\"",
+    );
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectEqualStrings("4ujivk7vnGi64Hqicga0DG96C9YglzNJFgfYjrLHndQRK8gn", parsed.code.?);
+    try std.testing.expectEqualStrings("9geviroXK7Sa3j6MjojixMzGOWHRCvszOAKSbWCulSg", parsed.state.?);
 }
 
 test "formatOAuthClientConfigError references oauth.json guidance" {

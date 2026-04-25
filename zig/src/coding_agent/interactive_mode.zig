@@ -194,6 +194,14 @@ const LiveResources = struct {
     }
 };
 
+const FooterUsageTotals = struct {
+    input: u64 = 0,
+    output: u64 = 0,
+    cache_read: u64 = 0,
+    cache_write: u64 = 0,
+    cost: f64 = 0,
+};
+
 const AppState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -204,6 +212,12 @@ const AppState = struct {
     status: []u8 = &.{},
     model_label: []u8 = &.{},
     session_label: []u8 = &.{},
+    git_branch: []u8 = &.{},
+    usage_totals: FooterUsageTotals = .{},
+    context_window: u32 = 0,
+    context_tokens: ?u32 = null,
+    context_percent: ?f64 = null,
+    context_unknown: bool = false,
 
     fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
@@ -214,6 +228,7 @@ const AppState = struct {
         state.status = try allocator.dupe(u8, "idle");
         state.model_label = try allocator.dupe(u8, "unknown");
         state.session_label = try allocator.dupe(u8, "new");
+        state.git_branch = try allocator.dupe(u8, "");
         try state.appendItemLocked(.welcome, "Welcome to pi (Zig interactive mode). Type a prompt and press Enter.");
         return state;
     }
@@ -224,6 +239,7 @@ const AppState = struct {
         self.allocator.free(self.status);
         self.allocator.free(self.model_label);
         self.allocator.free(self.session_label);
+        self.allocator.free(self.git_branch);
         self.* = undefined;
     }
 
@@ -239,6 +255,21 @@ const AppState = struct {
         defer self.mutex.unlock(self.io);
         try self.replaceLabelLocked(&self.model_label, model_label);
         try self.replaceLabelLocked(&self.session_label, session_label);
+    }
+
+    fn setFooterDetails(
+        self: *AppState,
+        model: ai.Model,
+        session_label: []const u8,
+        git_branch: ?[]const u8,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.replaceLabelLocked(&self.model_label, model.id);
+        try self.replaceLabelLocked(&self.session_label, session_label);
+        try self.replaceLabelLocked(&self.git_branch, git_branch orelse "");
+        self.context_window = model.context_window;
+        self.recalculateContextPercentLocked();
     }
 
     fn setStatus(self: *AppState, text: []const u8) !void {
@@ -260,14 +291,16 @@ const AppState = struct {
         try self.replaceLabelLocked(&self.status, text);
     }
 
-    fn rebuildFromMessages(
+    fn rebuildFromSession(
         self: *AppState,
-        session_label: []const u8,
-        model_label: []const u8,
-        messages: []const agent.AgentMessage,
+        session: *const session_mod.AgentSession,
+        git_branch: ?[]const u8,
     ) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        const messages = session.agent.getMessages();
+        const stats = session_advanced.getSessionStats(session);
 
         for (self.items.items) |item| self.allocator.free(item.text);
         self.items.clearRetainingCapacity();
@@ -275,8 +308,21 @@ const AppState = struct {
         self.last_streaming_assistant_index = null;
 
         try self.replaceLabelLocked(&self.status, "idle");
-        try self.replaceLabelLocked(&self.model_label, model_label);
-        try self.replaceLabelLocked(&self.session_label, session_label);
+        try self.replaceLabelLocked(&self.model_label, session.agent.getModel().id);
+        try self.replaceLabelLocked(&self.session_label, currentSessionLabel(session));
+        try self.replaceLabelLocked(&self.git_branch, git_branch orelse "");
+        self.usage_totals = .{
+            .input = stats.tokens.input,
+            .output = stats.tokens.output,
+            .cache_read = stats.tokens.cache_read,
+            .cache_write = stats.tokens.cache_write,
+            .cost = stats.cost,
+        };
+        self.context_window = session.agent.getModel().context_window;
+        self.context_tokens = if (stats.context_usage) |usage| usage.tokens else null;
+        self.context_percent = if (stats.context_usage) |usage| usage.percent else null;
+        self.context_unknown = if (stats.context_usage) |usage| usage.percent == null else false;
+        self.recalculateContextPercentLocked();
         try self.appendItemLocked(.welcome, "Welcome to pi (Zig interactive mode). Type a prompt and press Enter.");
 
         for (messages) |message| {
@@ -322,9 +368,10 @@ const AppState = struct {
             },
             .message_start => {
                 if (event.message) |message| switch (message) {
-                    .assistant => {
+                    .assistant => |assistant_message| {
                         try self.appendItemLocked(.assistant, "");
                         self.last_streaming_assistant_index = self.items.items.len - 1;
+                        self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         try self.replaceLabelLocked(&self.status, "streaming");
                     },
                     else => {},
@@ -333,6 +380,7 @@ const AppState = struct {
             .message_update => {
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant_message| {
+                        self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         const rendered = try formatAssistantMessage(self.allocator, assistant_message);
                         defer self.allocator.free(rendered);
                         const target_index = self.last_streaming_assistant_index orelse blk: {
@@ -353,6 +401,8 @@ const AppState = struct {
                         try self.appendItemLocked(.user, rendered);
                     },
                     .assistant => |assistant_message| {
+                        self.addUsageLocked(assistant_message.usage);
+                        self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         const rendered = try formatAssistantMessage(self.allocator, assistant_message);
                         defer self.allocator.free(rendered);
                         if (self.last_streaming_assistant_index) |index| {
@@ -425,6 +475,43 @@ const AppState = struct {
     fn replaceLabelLocked(self: *AppState, field: *[]u8, text: []const u8) !void {
         self.allocator.free(field.*);
         field.* = try self.allocator.dupe(u8, text);
+    }
+
+    fn addUsageLocked(self: *AppState, usage: ai.Usage) void {
+        self.usage_totals.input +|= usage.input;
+        self.usage_totals.output +|= usage.output;
+        self.usage_totals.cache_read +|= usage.cache_read;
+        self.usage_totals.cache_write +|= usage.cache_write;
+        self.usage_totals.cost += usage.cost.total;
+    }
+
+    fn updateContextUsageLocked(self: *AppState, tokens: ?u32) void {
+        self.context_unknown = false;
+        self.context_tokens = tokens;
+        self.recalculateContextPercentLocked();
+    }
+
+    fn recalculateContextPercentLocked(self: *AppState) void {
+        if (self.context_window == 0) {
+            self.context_percent = null;
+            self.context_tokens = null;
+            self.context_unknown = false;
+            return;
+        }
+
+        if (self.context_unknown) {
+            self.context_percent = null;
+            return;
+        }
+
+        if (self.context_tokens) |tokens| {
+            self.context_percent =
+                (@as(f64, @floatFromInt(tokens)) / @as(f64, @floatFromInt(self.context_window))) * 100.0;
+            return;
+        }
+
+        self.context_tokens = 0;
+        self.context_percent = 0.0;
     }
 };
 
@@ -686,14 +773,7 @@ const ScreenComponent = struct {
         var prompt_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &prompt_lines);
         try renderPromptLines(allocator, self.theme, self.editor, width, &prompt_lines);
-        const footer_line = try formatFooterLine(
-            allocator,
-            self.theme,
-            self.state.model_label,
-            self.state.session_label,
-            self.state.status,
-            width,
-        );
+        const footer_line = try formatFooterLine(allocator, self.theme, self.state, width);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
         defer allocator.free(hints_line);
@@ -1184,11 +1264,7 @@ pub fn runInteractiveMode(
     try session.agent.subscribe(subscriber);
     defer _ = session.agent.unsubscribe(subscriber);
 
-    try app_state.rebuildFromMessages(
-        currentSessionLabel(&session),
-        current_provider.model.id,
-        session.agent.getMessages(),
-    );
+    try rebuildAppStateFromSession(allocator, io, &app_state, &session);
 
     var backend = NativeTerminalBackend{ .env_map = env_map };
     var terminal = tui.Terminal.init(backend.backend());
@@ -1779,7 +1855,13 @@ fn handleInputKey(
                     auth_flow,
                     live_resources,
                 ) catch |err| {
-                    const message = try std.fmt.allocPrint(allocator, "Authentication failed: {s}", .{@errorName(err)});
+                    const auth_message = try auth.formatAuthenticationError(allocator, err);
+                    defer if (auth_message) |formatted| allocator.free(formatted);
+                    const message = try std.fmt.allocPrint(
+                        allocator,
+                        "Authentication failed: {s}",
+                        .{if (auth_message) |formatted| formatted else @errorName(err)},
+                    );
                     defer allocator.free(message);
                     try app_state.appendError(message);
                 };
@@ -2215,7 +2297,7 @@ fn switchSession(
     current_provider.* = candidate_provider;
     try session.agent.subscribe(subscriber);
 
-    try app_state.rebuildFromMessages(currentSessionLabel(session), session.agent.getModel().id, session.agent.getMessages());
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session);
 }
 
 fn switchModel(
@@ -2250,7 +2332,7 @@ fn switchModel(
     current_provider.* = next_provider;
     try session.setModel(next_provider.model);
     session.setApiKey(next_provider.api_key);
-    try app_state.setFooter(next_provider.model.id, currentSessionLabel(session));
+    try updateAppFooterFromSession(allocator, session.io, app_state, session);
     try app_state.setStatus("idle");
 }
 
@@ -2331,7 +2413,7 @@ fn handleNameSlashCommand(
     };
 
     _ = try session.session_manager.appendSessionInfo(name);
-    try app_state.setFooter(session.agent.getModel().id, currentSessionLabel(session));
+    try updateAppFooterFromSession(allocator, session.io, app_state, session);
 
     const message = try std.fmt.allocPrint(allocator, "Session name set: {s}", .{currentSessionLabel(session)});
     defer allocator.free(message);
@@ -2396,7 +2478,7 @@ fn handleCompactSlashCommand(
         .{ result.tokens_before, result.first_kept_entry_id },
     );
     defer allocator.free(info);
-    try app_state.rebuildFromMessages(currentSessionLabel(session), session.agent.getModel().id, session.agent.getMessages());
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session);
     try app_state.appendInfo(info);
 }
 
@@ -3887,6 +3969,123 @@ fn currentSessionLabel(session: *const session_mod.AgentSession) []const u8 {
         session.session_manager.getSessionId();
 }
 
+fn rebuildAppStateFromSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    app_state: *AppState,
+    session: *const session_mod.AgentSession,
+) !void {
+    const git_branch = try resolveGitBranch(allocator, io, session.cwd);
+    defer if (git_branch) |branch| allocator.free(branch);
+    try app_state.rebuildFromSession(session, git_branch);
+}
+
+fn updateAppFooterFromSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    app_state: *AppState,
+    session: *const session_mod.AgentSession,
+) !void {
+    const git_branch = try resolveGitBranch(allocator, io, session.cwd);
+    defer if (git_branch) |branch| allocator.free(branch);
+    try app_state.setFooterDetails(session.agent.getModel(), currentSessionLabel(session), git_branch);
+}
+
+fn assistantContextTokens(usage: ai.Usage) ?u32 {
+    return usage.input +| usage.cache_read +| usage.cache_write;
+}
+
+fn resolveGitBranch(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !?[]u8 {
+    const repo_root = try findGitRoot(allocator, io, cwd) orelse return null;
+    defer allocator.free(repo_root);
+
+    const git_path = try std.fs.path.join(allocator, &[_][]const u8{ repo_root, ".git" });
+    defer allocator.free(git_path);
+
+    const git_dir = try resolveGitDirectory(allocator, io, repo_root, git_path) orelse return null;
+    defer allocator.free(git_dir);
+
+    const head_path = try std.fs.path.join(allocator, &[_][]const u8{ git_dir, "HEAD" });
+    defer allocator.free(head_path);
+
+    const head = std.Io.Dir.readFileAlloc(.cwd(), io, head_path, allocator, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(head);
+
+    return parseGitHeadBranch(allocator, head);
+}
+
+fn findGitRoot(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !?[]u8 {
+    var current = try allocator.dupe(u8, cwd);
+    errdefer allocator.free(current);
+
+    while (true) {
+        const git_path = try std.fs.path.join(allocator, &[_][]const u8{ current, ".git" });
+        defer allocator.free(git_path);
+
+        const stat = std.Io.Dir.statFile(.cwd(), io, git_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (stat != null) {
+            return current;
+        }
+
+        const parent = std.fs.path.dirname(current) orelse {
+            allocator.free(current);
+            return null;
+        };
+        if (std.mem.eql(u8, parent, current)) {
+            allocator.free(current);
+            return null;
+        }
+
+        const owned_parent = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = owned_parent;
+    }
+}
+
+fn resolveGitDirectory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo_root: []const u8,
+    git_path: []const u8,
+) !?[]u8 {
+    const stat = std.Io.Dir.statFile(.cwd(), io, git_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+
+    if (stat.kind == .directory) return try allocator.dupe(u8, git_path);
+    if (stat.kind != .file) return null;
+
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, git_path, allocator, .limited(4096));
+    defer allocator.free(content);
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    const prefix = "gitdir:";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+
+    const gitdir = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
+    if (std.fs.path.isAbsolute(gitdir)) return try allocator.dupe(u8, gitdir);
+    return try std.fs.path.resolve(allocator, &[_][]const u8{ repo_root, gitdir });
+}
+
+fn parseGitHeadBranch(allocator: std.mem.Allocator, head_contents: []const u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, head_contents, " \t\r\n");
+    const prefix = "ref:";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+
+    const ref_name = std.mem.trim(u8, trimmed[prefix.len..], " \t");
+    const heads_prefix = "refs/heads/";
+    if (std.mem.startsWith(u8, ref_name, heads_prefix)) {
+        return try allocator.dupe(u8, ref_name[heads_prefix.len..]);
+    }
+    return try allocator.dupe(u8, std.fs.path.basename(ref_name));
+}
+
 fn formatSessionInfo(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) ![]u8 {
     const stats = session_advanced.getSessionStats(session);
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -4027,12 +4226,7 @@ fn replaceCurrentSession(
     session.* = candidate.*;
     candidate.* = undefined;
     try session.agent.subscribe(subscriber);
-    const session_label = try allocator.dupe(u8, currentSessionLabel(session));
-    defer allocator.free(session_label);
-    const model_label = try allocator.dupe(u8, session.agent.getModel().id);
-    defer allocator.free(model_label);
-    try app_state.rebuildFromMessages(session_label, model_label, session.agent.getMessages());
-    try app_state.setFooter(model_label, session_label);
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session);
     try app_state.setStatus("idle");
 }
 
@@ -4042,7 +4236,7 @@ fn navigateTree(
     app_state: *AppState,
 ) !void {
     try session.navigateTo(entry_id);
-    try app_state.rebuildFromMessages(currentSessionLabel(session), session.agent.getModel().id, session.agent.getMessages());
+    try rebuildAppStateFromSession(session.allocator, session.io, app_state, session);
     try app_state.setStatus("session tree updated");
 }
 
@@ -4296,20 +4490,104 @@ fn renderPromptLines(
 fn formatFooterLine(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
-    model_label: []const u8,
-    session_label: []const u8,
-    status: []const u8,
+    state: *const AppState,
     width: usize,
 ) ![]u8 {
-    const line = try std.fmt.allocPrint(allocator, "Model: {s} • Session: {s} • Status: {s}", .{
-        model_label,
-        session_label,
-        status,
-    });
-    defer allocator.free(line);
-    const fitted = try fitLine(allocator, line, width);
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+
+    var needs_separator = false;
+    if (state.git_branch.len > 0) {
+        const branch_text = try std.fmt.allocPrint(allocator, "Branch: {s}", .{state.git_branch});
+        defer allocator.free(branch_text);
+        try appendFooterPart(allocator, &builder, &needs_separator, branch_text);
+    }
+    const session_text = try std.fmt.allocPrint(allocator, "Session: {s}", .{state.session_label});
+    defer allocator.free(session_text);
+    try appendFooterPart(allocator, &builder, &needs_separator, session_text);
+    const status_text = try std.fmt.allocPrint(allocator, "Status: {s}", .{state.status});
+    defer allocator.free(status_text);
+    try appendFooterPart(allocator, &builder, &needs_separator, status_text);
+
+    const input_text = try formatCompactTokenCount(allocator, state.usage_totals.input);
+    defer allocator.free(input_text);
+    const output_text = try formatCompactTokenCount(allocator, state.usage_totals.output);
+    defer allocator.free(output_text);
+    const input_part = try std.fmt.allocPrint(allocator, "↑{s}", .{input_text});
+    defer allocator.free(input_part);
+    const output_part = try std.fmt.allocPrint(allocator, "↓{s}", .{output_text});
+    defer allocator.free(output_part);
+    try appendFooterPart(allocator, &builder, &needs_separator, input_part);
+    try appendFooterPart(allocator, &builder, &needs_separator, output_part);
+
+    if (state.usage_totals.cache_read > 0) {
+        const cache_read_text = try formatCompactTokenCount(allocator, state.usage_totals.cache_read);
+        defer allocator.free(cache_read_text);
+        const cache_read_part = try std.fmt.allocPrint(allocator, "R{s}", .{cache_read_text});
+        defer allocator.free(cache_read_part);
+        try appendFooterPart(allocator, &builder, &needs_separator, cache_read_part);
+    }
+    if (state.usage_totals.cache_write > 0) {
+        const cache_write_text = try formatCompactTokenCount(allocator, state.usage_totals.cache_write);
+        defer allocator.free(cache_write_text);
+        const cache_write_part = try std.fmt.allocPrint(allocator, "W{s}", .{cache_write_text});
+        defer allocator.free(cache_write_part);
+        try appendFooterPart(allocator, &builder, &needs_separator, cache_write_part);
+    }
+    if (state.usage_totals.cost > 0) {
+        const cost_text = try std.fmt.allocPrint(allocator, "${d:.3}", .{state.usage_totals.cost});
+        defer allocator.free(cost_text);
+        try appendFooterPart(allocator, &builder, &needs_separator, cost_text);
+    }
+    if (state.context_window > 0) {
+        const window_text = try formatCompactTokenCount(allocator, state.context_window);
+        defer allocator.free(window_text);
+        const context_text = if (state.context_percent) |percent|
+            try std.fmt.allocPrint(allocator, "ctx {d:.1}%/{s}", .{ percent, window_text })
+        else
+            try std.fmt.allocPrint(allocator, "ctx ?/{s}", .{window_text});
+        defer allocator.free(context_text);
+        try appendFooterPart(allocator, &builder, &needs_separator, context_text);
+    }
+
+    const model_text = try std.fmt.allocPrint(allocator, "Model: {s}", .{state.model_label});
+    defer allocator.free(model_text);
+    try appendFooterPart(allocator, &builder, &needs_separator, model_text);
+
+    const fitted = try fitLine(allocator, builder.items, width);
     defer allocator.free(fitted);
     return try applyThemeAlloc(allocator, theme, .footer, fitted);
+}
+
+fn appendFooterPart(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    needs_separator: *bool,
+    text: []const u8,
+) std.mem.Allocator.Error!void {
+    if (needs_separator.*) try builder.appendSlice(allocator, " • ");
+    try builder.appendSlice(allocator, text);
+    needs_separator.* = true;
+}
+
+fn formatCompactTokenCount(allocator: std.mem.Allocator, count: u64) ![]u8 {
+    if (count < 1_000) return std.fmt.allocPrint(allocator, "{d}", .{count});
+    if (count < 10_000) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{d}.{d}k",
+            .{ count / 1_000, (count % 1_000) / 100 },
+        );
+    }
+    if (count < 1_000_000) return std.fmt.allocPrint(allocator, "{d}k", .{(count + 500) / 1_000});
+    if (count < 10_000_000) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{d}.{d}M",
+            .{ count / 1_000_000, (count % 1_000_000) / 100_000 },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "{d}M", .{(count + 500_000) / 1_000_000});
 }
 
 fn formatHintsLine(
@@ -4954,7 +5232,7 @@ test "screen renders welcome prompt footer and tool lines" {
     try std.testing.expect(lines.items.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "Welcome to pi") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 3], "Input: w") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Model: faux-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Session: session.jsonl") != null);
 }
 
 test "interactive mode startup renders welcome message footer and hints through a mock backend" {
@@ -4991,7 +5269,9 @@ test "interactive mode startup renders welcome message footer and hints through 
     );
     try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));
     try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
-    try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1 • Session: session.jsonl • Status: idle"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Session: session.jsonl"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
     try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S sessions • Ctrl+P models • Ctrl+C interrupt • Ctrl+D exit • Ctrl+L clear"));
 }
 
@@ -5161,7 +5441,7 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     }
     try std.testing.expect(saw_input);
     try std.testing.expect(saw_continuation);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Model:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Session:") != null);
 }
 
 test "screen renders themed output and custom keybinding hints" {
@@ -7188,6 +7468,130 @@ test "app state streams assistant updates and records tool results" {
     defer state.mutex.unlock(state.io);
     try std.testing.expectEqualStrings("partial", state.items.items[state.items.items.len - 2].text);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Tool result bash: /tmp") != null);
+}
+
+test "app state aggregates usage totals and footer renders git branch stats" {
+    const allocator = std.testing.allocator;
+
+    const model = ai.Model{
+        .id = "faux-1",
+        .name = "Faux 1",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .reasoning = false,
+        .input_types = &[_][]const u8{"text"},
+        .cost = .{},
+        .context_window = 128000,
+        .max_tokens = 4096,
+        .headers = null,
+        .compat = null,
+    };
+
+    var usage = ai.Usage.init();
+    usage.input = 11;
+    usage.output = 7;
+    usage.cache_read = 2;
+    usage.cache_write = 1;
+    usage.total_tokens = 21;
+    usage.cost.total = 0.42;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooterDetails(model, "session.jsonl", "zig-implementation");
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_start,
+        .message = .{ .assistant = .{
+            .content = &[_]ai.ContentBlock{},
+            .tool_calls = null,
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = usage,
+            .stop_reason = .stop,
+            .timestamp = 1,
+        } },
+    });
+
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqual(@as(u64, 0), state.usage_totals.input);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0109375), state.context_percent.?, @as(f64, 0.0000001));
+    state.mutex.unlock(state.io);
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .assistant = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "done" } }},
+            .tool_calls = null,
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = usage,
+            .stop_reason = .stop,
+            .timestamp = 1,
+        } },
+    });
+    try state.handleAgentEvent(.{ .event_type = .agent_end });
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqual(@as(u64, 11), state.usage_totals.input);
+    try std.testing.expectEqual(@as(u64, 7), state.usage_totals.output);
+    try std.testing.expectEqual(@as(u64, 2), state.usage_totals.cache_read);
+    try std.testing.expectEqual(@as(u64, 1), state.usage_totals.cache_write);
+    try std.testing.expectEqual(@as(u32, 14), state.context_tokens.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.42), state.usage_totals.cost, @as(f64, 0.0000001));
+
+    const footer = try formatFooterLine(allocator, null, &state, 160);
+    defer allocator.free(footer);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Branch: zig-implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Session: session.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Status: idle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "↑11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "↓7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "R2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "W1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "$0.420") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 0.0%/128k") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Model: faux-1") != null);
+}
+
+test "resolveGitBranch reads heads from git directories and gitdir files" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
+    try tmp.dir.createDirPath(std.testing.io, "repo/src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.git/HEAD",
+        .data = "ref: refs/heads/feature/footer\n",
+    });
+
+    const repo_cwd = try makeInteractiveTestPath(allocator, tmp, "repo/src");
+    defer allocator.free(repo_cwd);
+    const repo_branch = try resolveGitBranch(allocator, std.testing.io, repo_cwd);
+    defer if (repo_branch) |branch| allocator.free(branch);
+    try std.testing.expectEqualStrings("feature/footer", repo_branch.?);
+
+    try tmp.dir.createDirPath(std.testing.io, "worktree/gitdata");
+    try tmp.dir.createDirPath(std.testing.io, "worktree/app");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "worktree/.git",
+        .data = "gitdir: gitdata\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "worktree/gitdata/HEAD",
+        .data = "ref: refs/heads/zig-implementation\n",
+    });
+
+    const worktree_cwd = try makeInteractiveTestPath(allocator, tmp, "worktree/app");
+    defer allocator.free(worktree_cwd);
+    const worktree_branch = try resolveGitBranch(allocator, std.testing.io, worktree_cwd);
+    defer if (worktree_branch) |branch| allocator.free(branch);
+    try std.testing.expectEqualStrings("zig-implementation", worktree_branch.?);
 }
 
 test "interactive tool conversation renders tool lines and persists session entries" {
