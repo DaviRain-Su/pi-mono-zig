@@ -239,12 +239,14 @@ pub fn buildRequestPayload(
     }
 
     if (context.tools) |tools| {
-        var tools_array = std.json.Array.init(allocator);
-        errdefer tools_array.deinit();
-        for (tools) |tool| {
-            try tools_array.append(try buildToolObject(allocator, tool));
+        if (tools.len > 0) {
+            var tools_array = std.json.Array.init(allocator);
+            errdefer tools_array.deinit();
+            for (tools) |tool| {
+                try tools_array.append(try buildToolObject(allocator, tool));
+            }
+            try payload.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tools_array });
         }
-        try payload.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tools_array });
     }
 
     return .{ .object = payload };
@@ -733,7 +735,9 @@ fn buildSystemInputItem(allocator: std.mem.Allocator, model: types.Model, system
     errdefer object.deinit(allocator);
     const role = if (model.reasoning) "developer" else "system";
     try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, role) });
-    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, openai.sanitizeSurrogates(system_prompt)) });
+    const sanitized = try openai.sanitizeSurrogates(allocator, system_prompt);
+    defer allocator.free(sanitized);
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, sanitized) });
     return .{ .object = object };
 }
 
@@ -763,7 +767,9 @@ fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: ty
                 var part = try initObject(allocator);
                 errdefer part.deinit(allocator);
                 try part.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "input_text") });
-                try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, openai.sanitizeSurrogates(text.text)) });
+                const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
+                defer allocator.free(sanitized);
+                try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
                 try content.append(.{ .object = part });
             },
             .image => |image| {
@@ -818,7 +824,9 @@ fn appendAssistantInputItems(
                 var text_object = try initObject(allocator);
                 errdefer text_object.deinit(allocator);
                 try text_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "output_text") });
-                try text_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, openai.sanitizeSurrogates(text.text)) });
+                const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
+                defer allocator.free(sanitized);
+                try text_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
                 try text_object.put(allocator, try allocator.dupe(u8, "annotations"), .{ .array = std.json.Array.init(allocator) });
                 try content.append(.{ .object = text_object });
                 try message_object.put(allocator, try allocator.dupe(u8, "content"), .{ .array = content });
@@ -882,7 +890,9 @@ fn buildToolResultInputItem(
             var text_object = try initObject(allocator);
             errdefer text_object.deinit(allocator);
             try text_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "input_text") });
-            try text_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, openai.sanitizeSurrogates(text_parts.items)) });
+            const sanitized = try openai.sanitizeSurrogates(allocator, text_parts.items);
+            defer allocator.free(sanitized);
+            try text_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
             try output_parts.append(.{ .object = text_object });
         }
         for (tool_result.content) |block| {
@@ -903,11 +913,12 @@ fn buildToolResultInputItem(
         try object.put(allocator, try allocator.dupe(u8, "output"), .{ .array = output_parts });
     } else {
         const output_text = if (text_parts.items.len > 0)
-            openai.sanitizeSurrogates(text_parts.items)
+            try openai.sanitizeSurrogates(allocator, text_parts.items)
         else if (image_count > 0)
-            "(see attached image)"
+            try allocator.dupe(u8, "(see attached image)")
         else
-            "";
+            try allocator.dupe(u8, "");
+        defer allocator.free(output_text);
         try object.put(allocator, try allocator.dupe(u8, "output"), .{ .string = try allocator.dupe(u8, output_text) });
     }
 
@@ -1734,6 +1745,36 @@ test "buildRequestPayload omits long cache retention when compat disables it" {
 
     try std.testing.expect(payload.object.get("prompt_cache_key") != null);
     try std.testing.expect(payload.object.get("prompt_cache_retention") == null);
+}
+
+test "buildRequestPayload omits empty tools array" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+        .tools = &[_]types.Tool{},
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expect(payload.object.get("tools") == null);
 }
 
 test "buildRequestHeaders omits session_id when compat disables it" {
