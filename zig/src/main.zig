@@ -79,6 +79,13 @@ pub fn runCli(
         return 0;
     }
 
+    if (options.fork != null and
+        (options.session != null or options.@"continue" or options.@"resume" or options.no_session))
+    {
+        try stderr.writeAll("Error: --fork cannot be combined with --session, --continue, --resume, or --no-session\n");
+        return 1;
+    }
+
     if (options.mode == .rpc and options.prompt != null) {
         try stderr.writeAll("Error: Prompt arguments are not supported in RPC mode\n");
         return 1;
@@ -141,6 +148,9 @@ pub fn runCli(
                 .thinking = prepared.thinking_level,
                 .session = options.session,
                 .@"continue" = options.@"continue",
+                .@"resume" = options.@"resume",
+                .fork = options.fork,
+                .no_session = options.no_session,
                 .selected_tools = selected_tools,
                 .initial_prompt = null,
                 .prompt_templates = prepared.resource_bundle.prompt_templates,
@@ -195,6 +205,9 @@ pub fn runCli(
             .thinking = prepared.thinking_level,
             .session = options.session,
             .@"continue" = options.@"continue",
+            .@"resume" = options.@"resume",
+            .fork = options.fork,
+            .no_session = options.no_session,
             .selected_tools = selected_tools,
             .initial_prompt = prepared.expanded_prompt,
             .prompt_templates = prepared.resource_bundle.prompt_templates,
@@ -448,7 +461,10 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--api-key <key>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--thinking <level>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--continue, -c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--resume, -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--session <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--fork <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-session") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
@@ -614,6 +630,221 @@ test "runCli persists and continues sessions across runs" {
     try std.testing.expectEqualStrings("first reply", context.messages[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings("second prompt", context.messages[2].user.content[0].text.text);
     try std.testing.expectEqualStrings("second reply", context.messages[3].assistant.content[0].text.text);
+}
+
+test "runCli resume loads the latest session" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-resume");
+    defer allocator.free(cwd);
+
+    var first_env = std.process.Environ.Map.init(allocator);
+    defer first_env.deinit();
+    try first_env.put("PI_FAUX_RESPONSE", "first reply");
+
+    var first_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stdout.deinit();
+    var first_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stderr.deinit();
+
+    const first_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &first_env,
+        &.{ "--provider", "faux", "--print", "first prompt" },
+        cwd,
+        &first_stdout.writer,
+        &first_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), first_exit);
+
+    var second_env = std.process.Environ.Map.init(allocator);
+    defer second_env.deinit();
+    try second_env.put("PI_FAUX_RESPONSE", "resumed reply");
+
+    var second_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stdout.deinit();
+    var second_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stderr.deinit();
+
+    const second_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &second_env,
+        &.{ "--provider", "faux", "--print", "--resume", "second prompt" },
+        cwd,
+        &second_stdout.writer,
+        &second_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), second_exit);
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("first prompt", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("first reply", context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("second prompt", context.messages[2].user.content[0].text.text);
+    try std.testing.expectEqualStrings("resumed reply", context.messages[3].assistant.content[0].text.text);
+}
+
+test "runCli no-session keeps runs ephemeral" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-no-session");
+    defer allocator.free(cwd);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "ephemeral reply");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "--no-session", "hello" },
+        cwd,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("ephemeral reply\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir);
+    defer if (session_file) |path| allocator.free(path);
+    try std.testing.expect(session_file == null);
+}
+
+test "runCli fork creates a new session from an existing session id" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-fork");
+    defer allocator.free(cwd);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+
+    var first_env = std.process.Environ.Map.init(allocator);
+    defer first_env.deinit();
+    try first_env.put("PI_FAUX_RESPONSE", "seed reply");
+
+    var first_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stdout.deinit();
+    var first_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer first_stderr.deinit();
+
+    const first_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &first_env,
+        &.{ "--provider", "faux", "--print", "seed prompt" },
+        cwd,
+        &first_stdout.writer,
+        &first_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), first_exit);
+
+    const original_session_path = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(original_session_path);
+
+    const source_path = try allocator.dupe(u8, original_session_path);
+    defer allocator.free(source_path);
+
+    var source_manager = try coding_agent.SessionManager.open(allocator, std.testing.io, source_path, cwd);
+    defer source_manager.deinit();
+    const source_session_id = try allocator.dupe(u8, source_manager.getSessionId());
+    defer allocator.free(source_session_id);
+
+    var second_env = std.process.Environ.Map.init(allocator);
+    defer second_env.deinit();
+    try second_env.put("PI_FAUX_RESPONSE", "fork reply");
+
+    var second_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stdout.deinit();
+    var second_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer second_stderr.deinit();
+
+    const second_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &second_env,
+        &.{ "--provider", "faux", "--print", "--fork", source_session_id, "fork prompt" },
+        cwd,
+        &second_stdout.writer,
+        &second_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), second_exit);
+
+    const forked_session_path = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(forked_session_path);
+    try std.testing.expect(!std.mem.eql(u8, source_path, forked_session_path));
+
+    var original_manager = try coding_agent.SessionManager.open(allocator, std.testing.io, source_path, cwd);
+    defer original_manager.deinit();
+    var original_context = try original_manager.buildSessionContext(allocator);
+    defer original_context.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), original_context.messages.len);
+    try std.testing.expectEqualStrings("seed prompt", original_context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("seed reply", original_context.messages[1].assistant.content[0].text.text);
+
+    var forked_manager = try coding_agent.SessionManager.open(allocator, std.testing.io, forked_session_path, cwd);
+    defer forked_manager.deinit();
+    var forked_context = try forked_manager.buildSessionContext(allocator);
+    defer forked_context.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), forked_context.messages.len);
+    try std.testing.expectEqualStrings("seed prompt", forked_context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("seed reply", forked_context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("fork prompt", forked_context.messages[2].user.content[0].text.text);
+    try std.testing.expectEqualStrings("fork reply", forked_context.messages[3].assistant.content[0].text.text);
+}
+
+test "runCli rejects conflicting fork flags" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--fork", "session-123", "--resume", "--print", "hello" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "--fork cannot be combined") != null);
 }
 
 test "cli executable continue resumes the latest session while preserving older sessions" {

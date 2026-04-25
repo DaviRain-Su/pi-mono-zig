@@ -32,7 +32,10 @@ pub const Args = struct {
     append_system_prompt: ?[]const u8 = null,
     thinking: ?ThinkingLevel = null,
     @"continue": bool = false,
+    @"resume": bool = false,
     session: ?[]const u8 = null,
+    fork: ?[]const u8 = null,
+    no_session: bool = false,
     print: bool = false,
     mode: Mode = .text,
     tools: ?[]const []const u8 = null,
@@ -82,10 +85,18 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             result.thinking = parseThinkingLevel(argv[i]) orelse return error.InvalidThinkingLevel;
         } else if (std.mem.eql(u8, arg, "--continue") or std.mem.eql(u8, arg, "-c")) {
             result.@"continue" = true;
+        } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "-r")) {
+            result.@"resume" = true;
         } else if (std.mem.eql(u8, arg, "--session")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             result.session = argv[i];
+        } else if (std.mem.eql(u8, arg, "--fork")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            result.fork = argv[i];
+        } else if (std.mem.eql(u8, arg, "--no-session")) {
+            result.no_session = true;
         } else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             result.print = true;
         } else if (std.mem.eql(u8, arg, "--mode")) {
@@ -143,7 +154,10 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --api-key <key>                API key (defaults to provider env vars)
         \\  --thinking <level>             Thinking level: off, minimal, low, medium, high, xhigh
         \\  --continue, -c                 Continue a previous session
+        \\  --resume, -r                   Resume the latest session
         \\  --session <id|path>            Use a specific session identifier or path
+        \\  --fork <id|path>               Fork a specific session into a new session
+        \\  --no-session                   Run without session persistence
         \\  --print, -p                    Non-interactive mode
         \\  --mode <text|json|rpc>         Output mode (default: text)
         \\  --tools <names>                Comma-separated tool allowlist
@@ -212,8 +226,12 @@ test "parse args supports expected CLI flags" {
         "--thinking",
         "high",
         "--continue",
+        "--resume",
         "--session",
         "session-123",
+        "--fork",
+        "session-456",
+        "--no-session",
         "--print",
         "--mode",
         "json",
@@ -229,7 +247,10 @@ test "parse args supports expected CLI flags" {
     try std.testing.expectEqualStrings("secret", args.api_key.?);
     try std.testing.expectEqual(ThinkingLevel.high, args.thinking.?);
     try std.testing.expect(args.@"continue");
+    try std.testing.expect(args.@"resume");
     try std.testing.expectEqualStrings("session-123", args.session.?);
+    try std.testing.expectEqualStrings("session-456", args.fork.?);
+    try std.testing.expect(args.no_session);
     try std.testing.expect(args.print);
     try std.testing.expectEqual(Mode.json, args.mode);
     try std.testing.expect(args.no_tools);
@@ -296,7 +317,10 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--api-key <key>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--thinking <level>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--continue, -c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--resume, -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--session <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--fork <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-session") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
