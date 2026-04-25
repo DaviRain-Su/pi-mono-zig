@@ -162,6 +162,7 @@ const StreamPlanBlock = union(enum) {
 };
 
 const StreamPlan = struct {
+    allocator: std.mem.Allocator,
     io: std.Io,
     stream: *event_stream.AssistantMessageEventStream,
     blocks: []const StreamPlanBlock,
@@ -489,7 +490,113 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!
     }
 }
 
+fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .null, .bool, .integer, .float => {},
+        .number_string => |owned| allocator.free(owned),
+        .string => |owned| allocator.free(owned),
+        .array => |array| {
+            for (array.items) |item| deinitJsonValue(allocator, item);
+            var mutable = array;
+            mutable.deinit();
+        },
+        .object => |object| {
+            var mutable = object;
+            var iterator = mutable.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                deinitJsonValue(allocator, entry.value_ptr.*);
+            }
+            mutable.deinit(allocator);
+        },
+    }
+}
+
+fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const types.ContentBlock) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| allocator.free(text.text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+        }
+    }
+    allocator.free(blocks);
+}
+
+fn deinitContentBlocksPartial(allocator: std.mem.Allocator, allocated: []const types.ContentBlock, initialized_len: usize) void {
+    for (allocated[0..initialized_len]) |block| {
+        switch (block) {
+            .text => |text| allocator.free(text.text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+        }
+    }
+    allocator.free(allocated);
+}
+
+fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const types.ToolCall) void {
+    for (tool_calls) |tool_call| {
+        allocator.free(tool_call.id);
+        allocator.free(tool_call.name);
+        deinitJsonValue(allocator, tool_call.arguments);
+    }
+    allocator.free(tool_calls);
+}
+
+fn deinitToolCallsPartial(allocator: std.mem.Allocator, allocated: []const types.ToolCall, initialized_len: usize) void {
+    for (allocated[0..initialized_len]) |tool_call| {
+        allocator.free(tool_call.id);
+        allocator.free(tool_call.name);
+        deinitJsonValue(allocator, tool_call.arguments);
+    }
+    allocator.free(allocated);
+}
+
+fn deinitAssistantMessage(allocator: std.mem.Allocator, message: *types.AssistantMessage) void {
+    deinitContentBlocks(allocator, message.content);
+    if (message.tool_calls) |tool_calls| deinitToolCalls(allocator, tool_calls);
+    if (message.response_id) |response_id| allocator.free(response_id);
+}
+
+fn deinitStreamPlanBlocks(allocator: std.mem.Allocator, blocks: []const StreamPlanBlock) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text, .thinking => {},
+            .tool_call => |tool_call| allocator.free(tool_call.serialized_arguments),
+        }
+    }
+    allocator.free(blocks);
+}
+
+fn deinitStreamPlanBlocksPartial(allocator: std.mem.Allocator, allocated: []const StreamPlanBlock, initialized_len: usize) void {
+    for (allocated[0..initialized_len]) |block| {
+        switch (block) {
+            .text, .thinking => {},
+            .tool_call => |tool_call| allocator.free(tool_call.serialized_arguments),
+        }
+    }
+    allocator.free(allocated);
+}
+
+fn destroyStreamPlan(plan: *StreamPlan) void {
+    deinitStreamPlanBlocks(plan.allocator, plan.blocks);
+    plan.allocator.destroy(plan);
+}
+
 fn buildStreamPlan(
+    allocator: std.mem.Allocator,
     io: std.Io,
     state: *FauxProviderState,
     model: types.Model,
@@ -498,8 +605,9 @@ fn buildStreamPlan(
     response: FauxAssistantMessage,
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !*StreamPlan {
-    const allocator = std.heap.page_allocator;
     const blocks = try allocator.alloc(StreamPlanBlock, response.content.len);
+    var block_index: usize = 0;
+    errdefer deinitStreamPlanBlocksPartial(allocator, blocks, block_index);
 
     var content_count: usize = 0;
     var tool_call_count: usize = 0;
@@ -511,10 +619,13 @@ fn buildStreamPlan(
     }
 
     const content_blocks = try allocator.alloc(types.ContentBlock, content_count);
-    const tool_calls = if (tool_call_count > 0) try allocator.alloc(types.ToolCall, tool_call_count) else null;
-
     var content_index: usize = 0;
+    errdefer deinitContentBlocksPartial(allocator, content_blocks, content_index);
+
+    const tool_calls = if (tool_call_count > 0) try allocator.alloc(types.ToolCall, tool_call_count) else null;
     var tool_call_index: usize = 0;
+    errdefer if (tool_calls) |owned_tool_calls| deinitToolCallsPartial(allocator, owned_tool_calls, tool_call_index);
+
     for (response.content, 0..) |block, index| {
         switch (block) {
             .text => |text| {
@@ -522,32 +633,32 @@ fn buildStreamPlan(
                 blocks[index] = .{ .text = owned };
                 content_blocks[content_index] = .{ .text = .{ .text = owned } };
                 content_index += 1;
+                block_index += 1;
             },
             .thinking => |thinking| {
                 const owned = try allocator.dupe(u8, thinking);
                 blocks[index] = .{ .thinking = owned };
                 content_blocks[content_index] = .{ .thinking = .{ .thinking = owned } };
                 content_index += 1;
+                block_index += 1;
             },
             .tool_call => |tool_call| {
-                const id = try allocator.dupe(u8, tool_call.id);
-                const name = try allocator.dupe(u8, tool_call.name);
-                const arguments = try cloneJsonValue(allocator, tool_call.arguments);
-                const serialized_arguments = try std.json.Stringify.valueAlloc(allocator, arguments, .{});
-
-                blocks[index] = .{ .tool_call = .{
-                    .id = id,
-                    .name = name,
-                    .arguments = arguments,
-                    .serialized_arguments = serialized_arguments,
-                } };
-
                 tool_calls.?[tool_call_index] = .{
-                    .id = id,
-                    .name = name,
+                    .id = try allocator.dupe(u8, tool_call.id),
+                    .name = try allocator.dupe(u8, tool_call.name),
                     .arguments = try cloneJsonValue(allocator, tool_call.arguments),
                 };
+                const finalized_tool_call = tool_calls.?[tool_call_index];
+                const serialized_arguments = try std.json.Stringify.valueAlloc(allocator, finalized_tool_call.arguments, .{});
+
+                blocks[index] = .{ .tool_call = .{
+                    .id = finalized_tool_call.id,
+                    .name = finalized_tool_call.name,
+                    .arguments = finalized_tool_call.arguments,
+                    .serialized_arguments = serialized_arguments,
+                } };
                 tool_call_index += 1;
+                block_index += 1;
             },
         }
     }
@@ -555,11 +666,11 @@ fn buildStreamPlan(
     const assistant_text = try assistantContentToText(allocator, response.content);
     defer allocator.free(assistant_text);
 
-    var usage = try estimatePromptUsage(std.heap.page_allocator, state, context, options);
+    var usage = try estimatePromptUsage(allocator, state, context, options);
     usage.output = estimateTokens(assistant_text);
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 
-    const final_message = types.AssistantMessage{
+    var final_message = types.AssistantMessage{
         .content = content_blocks,
         .tool_calls = tool_calls,
         .api = state.api,
@@ -568,12 +679,14 @@ fn buildStreamPlan(
         .response_id = if (response.response_id) |response_id| try allocator.dupe(u8, response_id) else null,
         .usage = usage,
         .stop_reason = response.stop_reason,
-        .error_message = if (response.error_message) |error_message| try allocator.dupe(u8, error_message) else null,
+        .error_message = response.error_message,
         .timestamp = response.timestamp,
     };
+    errdefer deinitAssistantMessage(allocator, &final_message);
 
     const plan = try allocator.create(StreamPlan);
     plan.* = .{
+        .allocator = allocator,
         .io = io,
         .stream = stream_ptr,
         .blocks = blocks,
@@ -591,6 +704,7 @@ fn emitChunks(
     event_type: types.EventType,
     content_index: usize,
     full_text: []const u8,
+    own_chunks: bool,
 ) bool {
     const min_chars = maxUsize(1, plan.min_token_size * 4);
     const max_chars = maxUsize(min_chars, plan.max_token_size * 4);
@@ -609,7 +723,8 @@ fn emitChunks(
         plan.stream.push(.{
             .event_type = event_type,
             .content_index = @as(u32, @intCast(content_index)),
-            .delta = chunk,
+            .delta = if (own_chunks) plan.allocator.dupe(u8, chunk) catch return false else chunk,
+            .owns_delta = own_chunks,
         });
         offset = end;
         chunk_index += 1;
@@ -620,6 +735,7 @@ fn emitChunks(
             .event_type = event_type,
             .content_index = @as(u32, @intCast(content_index)),
             .delta = "",
+            .owns_delta = false,
         });
     }
 
@@ -652,6 +768,8 @@ fn emitAbort(plan: *StreamPlan) void {
 }
 
 fn runStreamPlan(plan: *StreamPlan) void {
+    defer destroyStreamPlan(plan);
+
     if (isAbortRequested(plan.signal)) {
         emitAbort(plan);
         return;
@@ -677,7 +795,7 @@ fn runStreamPlan(plan: *StreamPlan) void {
         switch (block) {
             .thinking => |thinking| {
                 plan.stream.push(.{ .event_type = .thinking_start, .content_index = @as(u32, @intCast(index)) });
-                if (!emitChunks(plan, .thinking_delta, index, thinking)) {
+                if (!emitChunks(plan, .thinking_delta, index, thinking, false)) {
                     emitAbort(plan);
                     return;
                 }
@@ -689,7 +807,7 @@ fn runStreamPlan(plan: *StreamPlan) void {
             },
             .text => |text| {
                 plan.stream.push(.{ .event_type = .text_start, .content_index = @as(u32, @intCast(index)) });
-                if (!emitChunks(plan, .text_delta, index, text)) {
+                if (!emitChunks(plan, .text_delta, index, text, false)) {
                     emitAbort(plan);
                     return;
                 }
@@ -704,7 +822,7 @@ fn runStreamPlan(plan: *StreamPlan) void {
                     .event_type = .toolcall_start,
                     .content_index = @as(u32, @intCast(index)),
                 });
-                if (!emitChunks(plan, .toolcall_delta, index, tool_call.serialized_arguments)) {
+                if (!emitChunks(plan, .toolcall_delta, index, tool_call.serialized_arguments, true)) {
                     emitAbort(plan);
                     return;
                 }
@@ -777,8 +895,6 @@ pub const FauxProvider = struct {
         context: types.Context,
         options: ?types.StreamOptions,
     ) !event_stream.AssistantMessageEventStream {
-        _ = allocator;
-
         var stream_instance = event_stream.createAssistantMessageEventStream(std.heap.page_allocator, io);
         errdefer stream_instance.deinit();
 
@@ -804,7 +920,7 @@ pub const FauxProvider = struct {
 
         const resolved = switch (step.?) {
             .message => |message| message,
-            .factory => |factory| factory(std.heap.page_allocator, context, options, &state.call_count, model) catch |err| {
+            .factory => |factory| factory(allocator, context, options, &state.call_count, model) catch |err| {
                 const error_text = @errorName(err);
                 const error_message = createErrorMessage(state.api, state.provider, model.id, error_text);
                 stream_instance.push(.{
@@ -817,7 +933,7 @@ pub const FauxProvider = struct {
             },
         };
 
-        const plan = try buildStreamPlan(io, state, model, context, options, resolved, &stream_instance);
+        const plan = try buildStreamPlan(allocator, io, state, model, context, options, resolved, &stream_instance);
         runStreamPlan(plan);
         return stream_instance;
     }
@@ -906,6 +1022,7 @@ fn collectEventTypes(stream_instance: *event_stream.AssistantMessageEventStream,
     errdefer events.deinit(allocator);
 
     while (stream_instance.next()) |event| {
+        event.deinitTransient(allocator);
         try events.append(allocator, event.event_type);
     }
 
@@ -920,6 +1037,7 @@ fn collectToolCallDeltas(stream_instance: *event_stream.AssistantMessageEventStr
         if (event.event_type == .toolcall_delta) {
             if (event.delta) |delta| try deltas.appendSlice(allocator, delta);
         }
+        event.deinitTransient(allocator);
     }
 
     return try deltas.toOwnedSlice(allocator);
@@ -955,7 +1073,8 @@ test "registerFauxProvider queues responses and estimates usage" {
     defer first_stream.deinit();
     const first_events = try collectEventTypes(&first_stream, allocator);
     defer allocator.free(first_events);
-    const first = first_stream.result().?;
+    var first = first_stream.result().?;
+    defer deinitAssistantMessage(allocator, &first);
     try std.testing.expectEqualStrings("hello", first.content[0].text.text);
     try std.testing.expectEqual(@as(u32, 2), first.usage.output);
 
@@ -963,7 +1082,8 @@ test "registerFauxProvider queues responses and estimates usage" {
     defer second_stream.deinit();
     const second_events = try collectEventTypes(&second_stream, allocator);
     defer allocator.free(second_events);
-    const second = second_stream.result().?;
+    var second = second_stream.result().?;
+    defer deinitAssistantMessage(allocator, &second);
     try std.testing.expectEqualStrings("world!", second.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 0), registration.getPendingResponseCount());
     try std.testing.expectEqual(@as(usize, 2), registration.state.call_count);
@@ -972,7 +1092,8 @@ test "registerFauxProvider queues responses and estimates usage" {
     defer exhausted_stream.deinit();
     const exhausted_events = try collectEventTypes(&exhausted_stream, allocator);
     defer allocator.free(exhausted_events);
-    const exhausted = exhausted_stream.result().?;
+    var exhausted = exhausted_stream.result().?;
+    defer deinitAssistantMessage(allocator, &exhausted);
     try std.testing.expectEqual(types.StopReason.error_reason, exhausted.stop_reason);
     try std.testing.expectEqualStrings("No more faux responses queued", exhausted.error_message.?);
     try std.testing.expectEqual(@as(usize, 3), registration.state.call_count);
@@ -1024,6 +1145,7 @@ test "registerFauxProvider aborts mid-stream and stops emitting events" {
         if (event.event_type == .text_delta) {
             if (event.delta) |delta| try streamed_text.appendSlice(allocator, delta);
         }
+        event.deinitTransient(allocator);
     }
 
     const expected_events = [_]types.EventType{
@@ -1036,11 +1158,204 @@ test "registerFauxProvider aborts mid-stream and stops emitting events" {
     try std.testing.expectEqualStrings("abcd", streamed_text.items);
     try std.testing.expect(!std.mem.eql(u8, long_text, streamed_text.items));
 
-    const result = stream.result().?;
+    var result = stream.result().?;
+    defer deinitAssistantMessage(allocator, &result);
     try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
     try std.testing.expectEqualStrings("Request was aborted", result.error_message.?);
     try std.testing.expectEqual(@as(usize, 0), registration.getPendingResponseCount());
     try std.testing.expectEqual(@as(usize, 1), registration.state.call_count);
+}
+
+test "registerFauxProvider streams explicit aborted assistant message as terminal error" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 2, .max = 2 },
+    });
+    defer registration.unregister();
+
+    const content = [_]FauxContentBlock{fauxText("partial")};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(content[0..], .{
+            .stop_reason = .aborted,
+            .error_message = "Request was aborted",
+        }) },
+    });
+
+    var stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), .{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
+            .timestamp = 1,
+        } }},
+    }, null);
+    defer stream.deinit();
+
+    const event_types = try collectEventTypes(&stream, allocator);
+    defer allocator.free(event_types);
+    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
+        .start,
+        .text_start,
+        .text_delta,
+        .text_end,
+        .error_event,
+    }, event_types);
+
+    var result = stream.result().?;
+    defer deinitAssistantMessage(allocator, &result);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", result.error_message.?);
+}
+
+test "registerFauxProvider aborts before the first chunk" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{
+        .tokens_per_second = 50,
+        .token_size = .{ .min = 3, .max = 3 },
+    });
+    defer registration.unregister();
+
+    const content = [_]FauxContentBlock{fauxText("abcdefghijklmnopqrstuvwxyz")};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(content[0..], .{}) },
+    });
+
+    var abort_signal = std.atomic.Value(bool).init(true);
+    var stream = try FauxProvider.stream(allocator, std.testing.io, registration.getModel(), .{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
+            .timestamp = 1,
+        } }},
+    }, .{
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    const event_types = try collectEventTypes(&stream, allocator);
+    defer allocator.free(event_types);
+    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{.error_event}, event_types);
+
+    var result = stream.result().?;
+    defer deinitAssistantMessage(allocator, &result);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", result.error_message.?);
+}
+
+test "registerFauxProvider aborts mid-thinking stream and stops emitting events" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{
+        .tokens_per_second = 10,
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+
+    const content = [_]FauxContentBlock{fauxThinking("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz")};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(content[0..], .{}) },
+    });
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try std.Thread.spawn(.{}, struct {
+        fn run(signal: *std.atomic.Value(bool), io: std.Io) void {
+            std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+            signal.store(true, .seq_cst);
+        }
+    }.run, .{ &abort_signal, std.testing.io });
+    defer abort_thread.join();
+
+    var stream = try FauxProvider.stream(allocator, std.testing.io, registration.getModel(), .{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
+            .timestamp = 1,
+        } }},
+    }, .{
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    var event_types: std.ArrayList(types.EventType) = .empty;
+    defer event_types.deinit(allocator);
+
+    while (stream.next()) |event| {
+        try event_types.append(allocator, event.event_type);
+        event.deinitTransient(allocator);
+    }
+
+    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
+        .start,
+        .thinking_start,
+        .thinking_delta,
+        .error_event,
+    }, event_types.items);
+
+    var result = stream.result().?;
+    defer deinitAssistantMessage(allocator, &result);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
+}
+
+test "registerFauxProvider aborts mid-toolcall stream and stops emitting events" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{
+        .tokens_per_second = 10,
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try arguments.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, "abcdefghijklmnopqrstuvwxyz") });
+    try arguments.put(allocator, try allocator.dupe(u8, "count"), .{ .integer = 123456789 });
+    const arguments_value = std.json.Value{ .object = arguments };
+    defer deinitJsonValue(allocator, arguments_value);
+
+    const tool_call = try fauxToolCall(allocator, "echo", arguments_value, .{ .id = "tool-1" });
+    defer switch (tool_call) {
+        .tool_call => |value| {
+            allocator.free(value.id);
+            allocator.free(value.name);
+            deinitJsonValue(allocator, value.arguments);
+        },
+        else => unreachable,
+    };
+    const content = [_]FauxContentBlock{tool_call};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(content[0..], .{ .stop_reason = .tool_use }) },
+    });
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try std.Thread.spawn(.{}, struct {
+        fn run(signal: *std.atomic.Value(bool), io: std.Io) void {
+            std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+            signal.store(true, .seq_cst);
+        }
+    }.run, .{ &abort_signal, std.testing.io });
+    defer abort_thread.join();
+
+    var stream = try FauxProvider.stream(allocator, std.testing.io, registration.getModel(), .{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
+            .timestamp = 1,
+        } }},
+    }, .{
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    var event_types: std.ArrayList(types.EventType) = .empty;
+    defer event_types.deinit(allocator);
+
+    while (stream.next()) |event| {
+        try event_types.append(allocator, event.event_type);
+        event.deinitTransient(allocator);
+    }
+
+    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
+        .start,
+        .toolcall_start,
+        .toolcall_delta,
+        .error_event,
+    }, event_types.items);
+
+    var result = stream.result().?;
+    defer deinitAssistantMessage(allocator, &result);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
 }
 
 // test "registerFauxProvider simulates prompt caching per session id" {
