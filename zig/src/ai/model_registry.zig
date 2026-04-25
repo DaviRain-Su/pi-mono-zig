@@ -41,23 +41,19 @@ const ModelEntry = struct {
     model: types.Model,
 
     fn deinit(self: *ModelEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.model.id);
-        allocator.free(self.model.name);
-        allocator.free(self.model.api);
-        allocator.free(self.model.provider);
-        allocator.free(self.model.base_url);
-
-        for (self.model.input_types) |input_type| allocator.free(input_type);
-        allocator.free(self.model.input_types);
-
-        if (self.model.headers) |*headers| {
-            deinitHeaders(allocator, headers);
-        }
-        if (self.model.compat) |compat| {
-            deinitJsonValue(allocator, compat);
-        }
+        deinitOwnedModel(allocator, &self.model);
         self.* = undefined;
     }
+};
+
+pub const ModelSummary = struct {
+    id: []const u8,
+    name: []const u8,
+    provider: []const u8,
+    reasoning: bool,
+    input_types: []const []const u8,
+    context_window: u32,
+    max_tokens: u32,
 };
 
 pub const ModelRegistry = struct {
@@ -246,6 +242,22 @@ pub const ModelRegistry = struct {
         return self.providers.count();
     }
 
+    pub fn listSummaries(self: *const ModelRegistry, allocator: std.mem.Allocator) ![]ModelSummary {
+        const summaries = try allocator.alloc(ModelSummary, self.models.items.len);
+        for (self.models.items, 0..) |entry, index| {
+            summaries[index] = .{
+                .id = entry.model.id,
+                .name = entry.model.name,
+                .provider = entry.model.provider,
+                .reasoning = entry.model.reasoning,
+                .input_types = entry.model.input_types,
+                .context_window = entry.model.context_window,
+                .max_tokens = entry.model.max_tokens,
+            };
+        }
+        return summaries;
+    }
+
     fn syncModelsForProvider(
         self: *ModelRegistry,
         provider: []const u8,
@@ -329,6 +341,10 @@ pub fn matchScopedModel(reference: []const u8) ?types.Model {
     return getDefault().matchScopedModel(reference);
 }
 
+pub fn listSummaries(allocator: std.mem.Allocator) ![]ModelSummary {
+    return getDefault().listSummaries(allocator);
+}
+
 pub fn getProviderConfig(provider: []const u8) ?ProviderConfig {
     return getDefault().getProviderConfig(provider);
 }
@@ -404,6 +420,24 @@ fn cloneInputTypes(allocator: std.mem.Allocator, input_types: []const []const u8
     }
 
     return owned_input_types;
+}
+
+fn deinitOwnedModel(allocator: std.mem.Allocator, model: *types.Model) void {
+    allocator.free(model.id);
+    allocator.free(model.name);
+    allocator.free(model.api);
+    allocator.free(model.provider);
+    allocator.free(model.base_url);
+
+    for (model.input_types) |input_type| allocator.free(input_type);
+    allocator.free(model.input_types);
+
+    if (model.headers) |*headers| {
+        deinitHeaders(allocator, headers);
+    }
+    if (model.compat) |compat| {
+        deinitJsonValue(allocator, compat);
+    }
 }
 
 fn cloneHeaders(
@@ -679,6 +713,27 @@ test "provider config updates propagate to models" {
 
     const model = registry.find("openai", "gpt-5.4").?;
     try std.testing.expectEqualStrings("https://proxy.example.com/v1", model.base_url);
+}
+
+test "list summaries returns all registered models" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const summaries = try listSummaries(std.testing.allocator);
+    defer std.testing.allocator.free(summaries);
+
+    try std.testing.expect(summaries.len >= 20);
+
+    var found_exacto = false;
+    for (summaries) |summary| {
+        if (std.mem.eql(u8, summary.provider, "openrouter") and std.mem.eql(u8, summary.id, "qwen/qwen3-coder:exacto")) {
+            found_exacto = true;
+            try std.testing.expect(summary.reasoning);
+            try std.testing.expectEqual(@as(u32, 128000), summary.context_window);
+        }
+    }
+
+    try std.testing.expect(found_exacto);
 }
 
 test "custom models can be registered at runtime" {

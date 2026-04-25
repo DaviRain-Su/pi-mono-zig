@@ -730,7 +730,7 @@ fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Env
     return std.fs.path.join(allocator, &[_][]const u8{ base_dir, "agent" });
 }
 
-fn expandPath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, value: []const u8, cwd: []const u8) ![]u8 {
+pub fn expandPath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, value: []const u8, cwd: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(value)) return allocator.dupe(u8, value);
     if (std.mem.startsWith(u8, value, "~/") or std.mem.eql(u8, value, "~")) {
         return expandLeadingHome(allocator, env_map, value);

@@ -35,6 +35,10 @@ pub const Args = struct {
     @"resume": bool = false,
     session: ?[]const u8 = null,
     fork: ?[]const u8 = null,
+    session_dir: ?[]const u8 = null,
+    models: ?[]const []const u8 = null,
+    list_models: bool = false,
+    list_models_search: ?[]const u8 = null,
     no_session: bool = false,
     print: bool = false,
     mode: Mode = .text,
@@ -47,6 +51,7 @@ pub const Args = struct {
 
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         if (self.tools) |tools| allocator.free(tools);
+        if (self.models) |models| allocator.free(models);
         if (self.prompt_owned and self.prompt != null) allocator.free(self.prompt.?);
         self.* = undefined;
     }
@@ -95,6 +100,24 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             result.fork = argv[i];
+        } else if (std.mem.eql(u8, arg, "--session-dir")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            result.session_dir = argv[i];
+        } else if (std.mem.eql(u8, arg, "--models")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            if (result.models) |models| {
+                allocator.free(models);
+                result.models = null;
+            }
+            result.models = try parseCommaSeparatedList(allocator, argv[i]);
+        } else if (std.mem.eql(u8, arg, "--list-models")) {
+            result.list_models = true;
+            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+                i += 1;
+                result.list_models_search = argv[i];
+            }
         } else if (std.mem.eql(u8, arg, "--no-session")) {
             result.no_session = true;
         } else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
@@ -157,7 +180,10 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --resume, -r                   Resume the latest session
         \\  --session <id|path>            Use a specific session identifier or path
         \\  --fork <id|path>               Fork a specific session into a new session
+        \\  --session-dir <dir>            Directory for session storage and lookup
         \\  --no-session                   Run without session persistence
+        \\  --models <patterns>            Comma-separated model patterns for model selection
+        \\  --list-models [search]         List available models and exit
         \\  --print, -p                    Non-interactive mode
         \\  --mode <text|json|rpc>         Output mode (default: text)
         \\  --tools <names>                Comma-separated tool allowlist
@@ -171,6 +197,9 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  pi --help
         \\  pi --version
         \\  pi --model gpt-4.1 --provider openai "Summarize this repository"
+        \\  pi --session-dir ./tmp/sessions --print "Summarize this repository"
+        \\  pi --models anthropic/*,*gpt-5*
+        \\  pi --list-models sonnet
         \\  pi --print --mode json "Explain the latest session"
         \\  pi --tools read,grep,ls "Inspect the codebase"
         \\
@@ -200,18 +229,22 @@ fn parseThinkingLevel(value: []const u8) ?ThinkingLevel {
     return null;
 }
 
-fn parseToolList(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
-    var tools = std.ArrayList([]const u8).empty;
-    errdefer tools.deinit(allocator);
+fn parseCommaSeparatedList(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    var items = std.ArrayList([]const u8).empty;
+    errdefer items.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |item| {
         const trimmed = std.mem.trim(u8, item, " \t\r\n");
         if (trimmed.len == 0) continue;
-        try tools.append(allocator, trimmed);
+        try items.append(allocator, trimmed);
     }
 
-    return try tools.toOwnedSlice(allocator);
+    return try items.toOwnedSlice(allocator);
+}
+
+fn parseToolList(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    return parseCommaSeparatedList(allocator, value);
 }
 
 test "parse args supports expected CLI flags" {
@@ -231,6 +264,12 @@ test "parse args supports expected CLI flags" {
         "session-123",
         "--fork",
         "session-456",
+        "--session-dir",
+        "./sessions",
+        "--models",
+        "anthropic/*,*gpt-5*",
+        "--list-models",
+        "sonnet",
         "--no-session",
         "--print",
         "--mode",
@@ -250,6 +289,12 @@ test "parse args supports expected CLI flags" {
     try std.testing.expect(args.@"resume");
     try std.testing.expectEqualStrings("session-123", args.session.?);
     try std.testing.expectEqualStrings("session-456", args.fork.?);
+    try std.testing.expectEqualStrings("./sessions", args.session_dir.?);
+    try std.testing.expectEqual(@as(usize, 2), args.models.?.len);
+    try std.testing.expectEqualStrings("anthropic/*", args.models.?[0]);
+    try std.testing.expectEqualStrings("*gpt-5*", args.models.?[1]);
+    try std.testing.expect(args.list_models);
+    try std.testing.expectEqualStrings("sonnet", args.list_models_search.?);
     try std.testing.expect(args.no_session);
     try std.testing.expect(args.print);
     try std.testing.expectEqual(Mode.json, args.mode);
@@ -288,6 +333,31 @@ test "parse args frees previous tool list when --tools is repeated" {
     try std.testing.expectEqualStrings("ls", args.tools.?[0]);
 }
 
+test "parse args frees previous model list when --models is repeated" {
+    const allocator = std.testing.allocator;
+
+    var args = try parseArgs(allocator, &.{
+        "--models",
+        "anthropic/*,openai/*",
+        "--models",
+        "faux/*",
+    });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), args.models.?.len);
+    try std.testing.expectEqualStrings("faux/*", args.models.?[0]);
+}
+
+test "parse args supports list-models without a search term" {
+    const allocator = std.testing.allocator;
+
+    var args = try parseArgs(allocator, &.{"--list-models"});
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.list_models);
+    try std.testing.expect(args.list_models_search == null);
+}
+
 test "parse args concatenates multiple positional prompts" {
     const allocator = std.testing.allocator;
 
@@ -320,7 +390,10 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--resume, -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--session <id|path>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--fork <id|path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--session-dir <dir>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);

@@ -52,6 +52,7 @@ pub const RunInteractiveModeOptions = struct {
     @"resume": bool = false,
     fork: ?[]const u8 = null,
     no_session: bool = false,
+    model_patterns: ?[]const []const u8 = null,
     selected_tools: ?[]const []const u8 = null,
     initial_prompt: ?[]const u8 = null,
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
@@ -1319,6 +1320,7 @@ fn handleInputKey(
             action,
             session,
             session_dir,
+            options.model_patterns,
             app_state,
             overlay,
             prompt_worker_active,
@@ -1678,11 +1680,11 @@ fn handleModelSlashCommand(
     overlay: *?SelectorOverlay,
 ) !void {
     const search = argument orelse {
-        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
+        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns);
         return;
     };
 
-    const available = try provider_config.listAvailableModels(allocator, env_map, session.agent.getModel());
+    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), options.model_patterns);
     defer allocator.free(available);
 
     for (available) |entry| {
@@ -1712,7 +1714,7 @@ fn handleModelSlashCommand(
     const message = try std.fmt.allocPrint(allocator, "No exact model match for {s}; opening model selector", .{search});
     defer allocator.free(message);
     try app_state.appendInfo(message);
-    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
+    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns);
 }
 
 fn handleSessionSlashCommand(
@@ -1867,8 +1869,9 @@ fn loadModelOverlay(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
+    model_patterns: ?[]const []const u8,
 ) !SelectorOverlay {
-    const available = try provider_config.listAvailableModels(allocator, env_map, current_model);
+    const available = try loadSelectableModels(allocator, env_map, current_model, model_patterns);
     defer allocator.free(available);
 
     const choices = try allocator.alloc(ModelChoice, available.len);
@@ -1917,6 +1920,41 @@ fn loadModelOverlay(
             },
         },
     };
+}
+
+fn loadSelectableModels(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    current_model: ai.Model,
+    model_patterns: ?[]const []const u8,
+) ![]provider_config.AvailableModel {
+    const available = try provider_config.listAvailableModels(allocator, env_map, current_model);
+    errdefer allocator.free(available);
+
+    const patterns = model_patterns orelse return available;
+    const filtered = try provider_config.filterAvailableModels(allocator, available, patterns);
+    allocator.free(available);
+
+    if (filtered.len != 0) return filtered;
+
+    allocator.free(filtered);
+    return allocator.dupe(provider_config.AvailableModel, &[_]provider_config.AvailableModel{.{
+        .provider = current_model.provider,
+        .model_id = current_model.id,
+        .display_name = current_model.name,
+        .available = true,
+        .reasoning = current_model.reasoning,
+        .supports_images = modelSupportsInput(current_model.input_types, "image"),
+        .context_window = current_model.context_window,
+        .max_tokens = current_model.max_tokens,
+    }});
+}
+
+fn modelSupportsInput(input_types: []const []const u8, expected: []const u8) bool {
+    for (input_types) |input_type| {
+        if (std.ascii.eqlIgnoreCase(input_type, expected)) return true;
+    }
+    return false;
 }
 
 fn loadTreeOverlay(
@@ -2656,6 +2694,7 @@ fn handleAppAction(
     action: keybindings_mod.Action,
     session: *session_mod.AgentSession,
     session_dir: []const u8,
+    model_patterns: ?[]const []const u8,
     app_state: *AppState,
     overlay: *?SelectorOverlay,
     prompt_worker_active: *bool,
@@ -2685,7 +2724,7 @@ fn handleAppAction(
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
-            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel());
+            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns);
         },
     }
 }
@@ -4495,4 +4534,26 @@ test "native terminal backend refreshes cached terminal size in main loop after 
     backend.refreshSizeIfPending();
     try std.testing.expect(!backend.resize_pending.load(.seq_cst));
     try std.testing.expectEqual(tui.Size{ .width = 101, .height = 33 }, backend.cached_size);
+}
+
+test "loadSelectableModels respects CLI model patterns" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const current_model = ai.model_registry.find("faux", "faux-1").?;
+    const filtered = try loadSelectableModels(
+        allocator,
+        &env_map,
+        current_model,
+        &.{"anthropic/sonnet:high"},
+    );
+    defer allocator.free(filtered);
+
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    for (filtered) |entry| {
+        try std.testing.expectEqualStrings("anthropic", entry.provider);
+        try std.testing.expect(std.mem.indexOf(u8, entry.model_id, "sonnet") != null);
+    }
 }
