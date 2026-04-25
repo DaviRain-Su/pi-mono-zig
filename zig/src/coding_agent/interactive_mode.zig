@@ -81,6 +81,7 @@ const ASSISTANT_PREFIX = "Pi:";
 
 const SlashCommandKind = enum {
     model,
+    name,
     session,
     tree,
     fork,
@@ -1506,6 +1507,7 @@ fn parseSlashCommand(text: []const u8) ?SlashCommand {
     const argument = if (raw_argument.len == 0) null else raw_argument;
 
     if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "name")) return .{ .kind = .name, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "session")) return .{ .kind = .session, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "tree")) return .{ .kind = .tree, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "fork")) return .{ .kind = .fork, .argument = argument, .raw = text };
@@ -1552,6 +1554,7 @@ fn handleSlashCommand(
             app_state,
             overlay,
         ),
+        .name => try handleNameSlashCommand(allocator, session, command.argument, app_state),
         .session => try handleSessionSlashCommand(allocator, session, app_state),
         .tree => {
             if (prompt_worker_active.*) {
@@ -1775,6 +1778,31 @@ fn handleSessionSlashCommand(
     const info = try formatSessionInfo(allocator, session);
     defer allocator.free(info);
     try app_state.appendInfo(info);
+}
+
+fn handleNameSlashCommand(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    argument: ?[]const u8,
+    app_state: *AppState,
+) !void {
+    const name = argument orelse {
+        const current_name = session.session_manager.getSessionName() orelse {
+            try app_state.appendInfo("Usage: /name <name>");
+            return;
+        };
+        const message = try std.fmt.allocPrint(allocator, "Session name: {s}", .{current_name});
+        defer allocator.free(message);
+        try app_state.appendInfo(message);
+        return;
+    };
+
+    _ = try session.session_manager.appendSessionInfo(name);
+    try app_state.setFooter(session.agent.getModel().id, currentSessionLabel(session));
+
+    const message = try std.fmt.allocPrint(allocator, "Session name set: {s}", .{currentSessionLabel(session)});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
 }
 
 fn handleCompactSlashCommand(
@@ -2081,7 +2109,10 @@ fn appendTreeNodes(
         defer allocator.free(prefix);
         const summary = try summarizeSessionEntry(allocator, node.entry.*);
         defer allocator.free(summary);
-        const label = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, summary });
+        const label = if (node.label) |entry_label|
+            try std.fmt.allocPrint(allocator, "{s}{s} [{s}]", .{ prefix, summary, entry_label })
+        else
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, summary });
         defer allocator.free(label);
 
         try choices.append(allocator, .{ .entry_id = try allocator.dupe(u8, node.entry.id()) });
@@ -2128,6 +2159,14 @@ fn summarizeSessionEntry(allocator: std.mem.Allocator, entry: session_manager_mo
         .thinking_level_change => |thinking_entry| std.fmt.allocPrint(allocator, "thinking: {s}", .{@tagName(thinking_entry.thinking_level)}),
         .model_change => |model_entry| std.fmt.allocPrint(allocator, "model: {s}/{s}", .{ model_entry.provider, model_entry.model_id }),
         .compaction => |compaction_entry| std.fmt.allocPrint(allocator, "compaction: {s}", .{trimSummaryText(try session_manager_mod.getCompactionSummary(compaction_entry))}),
+        .label => |label_entry| if (label_entry.label) |label|
+            std.fmt.allocPrint(allocator, "label: {s}", .{label})
+        else
+            allocator.dupe(u8, "label cleared"),
+        .session_info => |session_info_entry| if (session_info_entry.name) |name|
+            std.fmt.allocPrint(allocator, "session name: {s}", .{name})
+        else
+            allocator.dupe(u8, "session name cleared"),
     };
 }
 
@@ -2209,10 +2248,12 @@ fn listSessions(
 
     for (names.items, 0..) |name, index| {
         const path = try std.fs.path.join(allocator, &[_][]const u8{ session_dir, name });
+        const display_name = try loadSessionDisplayName(allocator, io, path, name);
+        errdefer allocator.free(display_name);
         paths[index] = .{ .path = path };
         items[index] = .{
             .value = try allocator.dupe(u8, name),
-            .label = try allocator.dupe(u8, name),
+            .label = display_name,
             .description = try allocator.dupe(u8, path),
         };
     }
@@ -2220,7 +2261,23 @@ fn listSessions(
     return .{ .paths = paths, .items = items };
 }
 
+fn loadSessionDisplayName(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_path: []const u8,
+    fallback_name: []const u8,
+) ![]u8 {
+    var manager = session_manager_mod.SessionManager.open(allocator, io, session_path, null) catch {
+        return allocator.dupe(u8, fallback_name);
+    };
+    defer manager.deinit();
+
+    if (manager.getSessionName()) |name| return allocator.dupe(u8, name);
+    return allocator.dupe(u8, fallback_name);
+}
+
 fn currentSessionLabel(session: *const session_mod.AgentSession) []const u8 {
+    if (session.session_manager.getSessionName()) |name| return name;
     return if (session.session_manager.getSessionFile()) |path|
         std.fs.path.basename(path)
     else
@@ -2233,6 +2290,9 @@ fn formatSessionInfo(allocator: std.mem.Allocator, session: *const session_mod.A
     defer writer.deinit();
 
     try writer.writer.writeAll("Session Info\n");
+    if (session.session_manager.getSessionName()) |name| {
+        try writer.writer.print("Name: {s}\n", .{name});
+    }
     try writer.writer.print("File: {s}\n", .{stats.session_file orelse "in-memory"});
     try writer.writer.print("ID: {s}\n", .{stats.session_id});
     try writer.writer.print("Model: {s}/{s}\n", .{ session.agent.getModel().provider, session.agent.getModel().id });
@@ -3781,6 +3841,10 @@ test "parseSlashCommand recognizes builtins and arguments" {
     try std.testing.expectEqual(SlashCommandKind.model, model_command.kind);
     try std.testing.expectEqualStrings("faux", model_command.argument.?);
 
+    const name_command = parseSlashCommand("/name Night Shift").?;
+    try std.testing.expectEqual(SlashCommandKind.name, name_command.kind);
+    try std.testing.expectEqualStrings("Night Shift", name_command.argument.?);
+
     const export_command = parseSlashCommand("/export \"/tmp/out.md\"").?;
     try std.testing.expectEqual(SlashCommandKind.@"export", export_command.kind);
     try std.testing.expectEqualStrings("\"/tmp/out.md\"", export_command.argument.?);
@@ -3932,6 +3996,82 @@ test "handleInputKey reports unknown slash commands" {
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Unknown slash command") != null);
+}
+
+test "handleInputKey updates session name for slash name command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/name Night Shift");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expectEqualStrings("Night Shift", session.session_manager.getSessionName().?);
+    try std.testing.expectEqualStrings("Night Shift", currentSessionLabel(&session));
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqualStrings("Night Shift", state.session_label);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Session name set: Night Shift") != null);
 }
 
 test "submitEditorText resets editor autocomplete state after submit" {
@@ -4105,6 +4245,55 @@ test "handleInputKey shows session stats for slash session command" {
     try std.testing.expect(std.mem.indexOf(u8, info, "Messages: user=1, assistant=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, info, "Tokens: input=11, output=7, cache_read=2, cache_write=1, total=21") != null);
     try std.testing.expect(std.mem.indexOf(u8, info, "Context:") != null);
+}
+
+test "session overlays use persisted session names and labels" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var user = try makeInteractiveTestUserMessage("bookmark me", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    const user_id = try session.session_manager.appendMessage(user);
+    _ = try session.session_manager.appendLabelChange(user_id, "bookmark");
+    _ = try session.session_manager.appendSessionInfo("Night Shift");
+
+    var session_overlay = try loadSessionOverlay(allocator, std.testing.io, session_dir);
+    defer session_overlay.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Night Shift", session_overlay.session.items[0].label);
+
+    var tree_overlay = try loadTreeOverlay(allocator, &session);
+    defer tree_overlay.deinit(allocator);
+
+    var saw_name = false;
+    var saw_label = false;
+    for (tree_overlay.tree.items) |item| {
+        if (std.mem.indexOf(u8, item.label, "session name: Night Shift") != null) saw_name = true;
+        if (std.mem.indexOf(u8, item.label, "[bookmark]") != null) saw_label = true;
+    }
+
+    try std.testing.expect(saw_name);
+    try std.testing.expect(saw_label);
 }
 
 test "handleInputKey exports session transcript to explicit markdown and json paths" {
