@@ -31,6 +31,14 @@ pub const Args = struct {
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     thinking: ?ThinkingLevel = null,
+    extensions: ?[]const []const u8 = null,
+    no_extensions: bool = false,
+    skills: ?[]const []const u8 = null,
+    no_skills: bool = false,
+    prompt_templates: ?[]const []const u8 = null,
+    no_prompt_templates: bool = false,
+    themes: ?[]const []const u8 = null,
+    no_themes: bool = false,
     @"continue": bool = false,
     @"resume": bool = false,
     session: ?[]const u8 = null,
@@ -51,6 +59,10 @@ pub const Args = struct {
     file_args: ?[]const []const u8 = null,
 
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
+        if (self.extensions) |extensions| allocator.free(extensions);
+        if (self.skills) |skills| allocator.free(skills);
+        if (self.prompt_templates) |prompt_templates| allocator.free(prompt_templates);
+        if (self.themes) |themes| allocator.free(themes);
         if (self.tools) |tools| allocator.free(tools);
         if (self.models) |models| allocator.free(models);
         if (self.file_args) |file_args| allocator.free(file_args);
@@ -68,6 +80,18 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
     var file_args_builder = std.ArrayList([]const u8).empty;
     var file_args_transferred = false;
     defer if (!file_args_transferred) file_args_builder.deinit(allocator);
+    var extensions_builder = std.ArrayList([]const u8).empty;
+    var extensions_transferred = false;
+    defer if (!extensions_transferred) extensions_builder.deinit(allocator);
+    var skills_builder = std.ArrayList([]const u8).empty;
+    var skills_transferred = false;
+    defer if (!skills_transferred) skills_builder.deinit(allocator);
+    var prompt_templates_builder = std.ArrayList([]const u8).empty;
+    var prompt_templates_transferred = false;
+    defer if (!prompt_templates_transferred) prompt_templates_builder.deinit(allocator);
+    var themes_builder = std.ArrayList([]const u8).empty;
+    var themes_transferred = false;
+    defer if (!themes_transferred) themes_builder.deinit(allocator);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -89,6 +113,30 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             result.api_key = argv[i];
+        } else if (std.mem.eql(u8, arg, "--extension") or std.mem.eql(u8, arg, "-e")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            try extensions_builder.append(allocator, argv[i]);
+        } else if (std.mem.eql(u8, arg, "--no-extensions") or std.mem.eql(u8, arg, "-ne")) {
+            result.no_extensions = true;
+        } else if (std.mem.eql(u8, arg, "--skill")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            try skills_builder.append(allocator, argv[i]);
+        } else if (std.mem.eql(u8, arg, "--no-skills") or std.mem.eql(u8, arg, "-ns")) {
+            result.no_skills = true;
+        } else if (std.mem.eql(u8, arg, "--prompt-template")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            try prompt_templates_builder.append(allocator, argv[i]);
+        } else if (std.mem.eql(u8, arg, "--no-prompt-templates") or std.mem.eql(u8, arg, "-np")) {
+            result.no_prompt_templates = true;
+        } else if (std.mem.eql(u8, arg, "--theme")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            try themes_builder.append(allocator, argv[i]);
+        } else if (std.mem.eql(u8, arg, "--no-themes")) {
+            result.no_themes = true;
         } else if (std.mem.eql(u8, arg, "--thinking")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
@@ -171,6 +219,22 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
         result.file_args = try file_args_builder.toOwnedSlice(allocator);
         file_args_transferred = true;
     }
+    if (extensions_builder.items.len > 0) {
+        result.extensions = try extensions_builder.toOwnedSlice(allocator);
+        extensions_transferred = true;
+    }
+    if (skills_builder.items.len > 0) {
+        result.skills = try skills_builder.toOwnedSlice(allocator);
+        skills_transferred = true;
+    }
+    if (prompt_templates_builder.items.len > 0) {
+        result.prompt_templates = try prompt_templates_builder.toOwnedSlice(allocator);
+        prompt_templates_transferred = true;
+    }
+    if (themes_builder.items.len > 0) {
+        result.themes = try themes_builder.toOwnedSlice(allocator);
+        themes_transferred = true;
+    }
 
     return result;
 }
@@ -188,6 +252,14 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --provider <provider>          Provider name (default: openai)
         \\  --api-key <key>                API key (defaults to provider env vars)
         \\  --thinking <level>             Thinking level: off, minimal, low, medium, high, xhigh
+        \\  --extension, -e <path>         Load an extension file or directory (repeatable)
+        \\  --no-extensions, -ne           Disable default extension discovery
+        \\  --skill <path>                 Load a skill file or directory (repeatable)
+        \\  --no-skills, -ns               Disable default skill discovery
+        \\  --prompt-template <path>       Load a prompt template file or directory (repeatable)
+        \\  --no-prompt-templates, -np     Disable default prompt template discovery
+        \\  --theme <path>                 Load a theme file or directory (repeatable)
+        \\  --no-themes                    Disable default theme discovery
         \\  --continue, -c                 Continue a previous session
         \\  --resume, -r                   Resume the latest session
         \\  --session <id|path>            Use a specific session identifier or path
@@ -269,6 +341,18 @@ test "parse args supports expected CLI flags" {
         "openai",
         "--api-key",
         "secret",
+        "--extension",
+        "extensions/review.ts",
+        "--no-extensions",
+        "--skill",
+        "skills/reviewer",
+        "--no-skills",
+        "--prompt-template",
+        "prompts/fix.md",
+        "--no-prompt-templates",
+        "--theme",
+        "themes/night.json",
+        "--no-themes",
         "--thinking",
         "high",
         "--continue",
@@ -299,6 +383,18 @@ test "parse args supports expected CLI flags" {
     try std.testing.expectEqualStrings("gpt-4.1", args.model.?);
     try std.testing.expectEqualStrings("openai", args.provider.?);
     try std.testing.expectEqualStrings("secret", args.api_key.?);
+    try std.testing.expectEqual(@as(usize, 1), args.extensions.?.len);
+    try std.testing.expectEqualStrings("extensions/review.ts", args.extensions.?[0]);
+    try std.testing.expect(args.no_extensions);
+    try std.testing.expectEqual(@as(usize, 1), args.skills.?.len);
+    try std.testing.expectEqualStrings("skills/reviewer", args.skills.?[0]);
+    try std.testing.expect(args.no_skills);
+    try std.testing.expectEqual(@as(usize, 1), args.prompt_templates.?.len);
+    try std.testing.expectEqualStrings("prompts/fix.md", args.prompt_templates.?[0]);
+    try std.testing.expect(args.no_prompt_templates);
+    try std.testing.expectEqual(@as(usize, 1), args.themes.?.len);
+    try std.testing.expectEqualStrings("themes/night.json", args.themes.?[0]);
+    try std.testing.expect(args.no_themes);
     try std.testing.expectEqual(ThinkingLevel.high, args.thinking.?);
     try std.testing.expect(args.@"continue");
     try std.testing.expect(args.@"resume");
@@ -421,6 +517,14 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--provider <provider>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--api-key <key>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--thinking <level>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--extension, -e <path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-extensions, -ne") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--skill <path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-skills, -ns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--prompt-template <path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-prompt-templates, -np") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--theme <path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-themes") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--continue, -c") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--resume, -r") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--session <id|path>") != null);
