@@ -122,9 +122,13 @@ pub const OpenAIResponsesProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                var response_headers = std.StringHashMap([]const u8).init(allocator);
-                defer response_headers.deinit();
-                callback(response.status, response_headers, model);
+                if (response.response_headers) |response_headers| {
+                    callback(response.status, response_headers, model);
+                } else {
+                    var response_headers = std.StringHashMap([]const u8).init(allocator);
+                    defer response_headers.deinit();
+                    callback(response.status, response_headers, model);
+                }
             }
         }
 
@@ -613,8 +617,10 @@ fn finalizeCurrentBlock(
     if (current_block.*) |*block| {
         switch (block.*) {
             .text => |*text| {
-                const final_text = extractMessageText(maybe_item_value) orelse text.text.items;
-                const owned = try allocator.dupe(u8, final_text);
+                const owned = if (try extractMessageText(allocator, maybe_item_value)) |final_text|
+                    final_text
+                else
+                    try allocator.dupe(u8, text.text.items);
                 try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
                 stream_ptr.push(.{
                     .event_type = .text_end,
@@ -623,8 +629,10 @@ fn finalizeCurrentBlock(
                 });
             },
             .thinking => |*thinking| {
-                const final_text = extractReasoningSummary(maybe_item_value) orelse thinking.text.items;
-                const owned = try allocator.dupe(u8, final_text);
+                const owned = if (try extractReasoningSummary(allocator, maybe_item_value)) |final_text|
+                    final_text
+                else
+                    try allocator.dupe(u8, thinking.text.items);
                 const signature = if (maybe_item_value) |item_value|
                     try std.json.Stringify.valueAlloc(allocator, item_value, .{})
                 else if (thinking.signature) |existing|
@@ -668,7 +676,7 @@ fn finalizeCurrentBlock(
                     .arguments = arguments,
                 };
                 try tool_calls.append(allocator, stored_tool_call);
-                try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                try content_blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, "") } });
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),
@@ -957,7 +965,7 @@ fn extractStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
     return field_value.string;
 }
 
-fn extractMessageText(maybe_item_value: ?std.json.Value) ?[]const u8 {
+fn extractMessageText(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
     const item_value = maybe_item_value orelse return null;
     if (item_value != .object) return null;
     const content_value = item_value.object.get("content") orelse return null;
@@ -975,35 +983,35 @@ fn extractMessageText(maybe_item_value: ?std.json.Value) ?[]const u8 {
     }
     if (total_len == 0) return null;
 
-    const allocator = std.heap.page_allocator;
     var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     for (content_value.array.items) |part| {
         if (part != .object) continue;
         const part_type = extractStringField(part, "type") orelse continue;
         if (std.mem.eql(u8, part_type, "output_text")) {
-            if (extractStringField(part, "text")) |text| buffer.appendSlice(allocator, text) catch {};
+            if (extractStringField(part, "text")) |text| try buffer.appendSlice(allocator, text);
         } else if (std.mem.eql(u8, part_type, "refusal")) {
-            if (extractStringField(part, "refusal")) |text| buffer.appendSlice(allocator, text) catch {};
+            if (extractStringField(part, "refusal")) |text| try buffer.appendSlice(allocator, text);
         }
     }
-    return buffer.toOwnedSlice(allocator) catch null;
+    return try buffer.toOwnedSlice(allocator);
 }
 
-fn extractReasoningSummary(maybe_item_value: ?std.json.Value) ?[]const u8 {
+fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
     const item_value = maybe_item_value orelse return null;
     if (item_value != .object) return null;
     const summary_value = item_value.object.get("summary") orelse return null;
     if (summary_value != .array or summary_value.array.items.len == 0) return null;
 
-    const allocator = std.heap.page_allocator;
     var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
     for (summary_value.array.items, 0..) |part, index| {
         if (part != .object) continue;
         const text = extractStringField(part, "text") orelse continue;
-        if (buffer.items.len > 0 and index > 0) buffer.appendSlice(allocator, "\n\n") catch {};
-        buffer.appendSlice(allocator, text) catch {};
+        if (buffer.items.len > 0 and index > 0) try buffer.appendSlice(allocator, "\n\n");
+        try buffer.appendSlice(allocator, text);
     }
-    return buffer.toOwnedSlice(allocator) catch null;
+    return try buffer.toOwnedSlice(allocator);
 }
 
 fn updateResponseIdFromResponseObject(allocator: std.mem.Allocator, output: *types.AssistantMessage, response_value: std.json.Value) !void {
@@ -1296,6 +1304,207 @@ fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.Assist
 fn freeEventOwned(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
     if (event.delta) |delta| allocator.free(delta);
     if (event.tool_call) |tool_call| freeToolCallOwned(allocator, tool_call);
+}
+
+const ResponseHeaderServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    response_headers: []const u8,
+    body: []const u8,
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, response_headers: []const u8, body: []const u8) !ResponseHeaderServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .response_headers = response_headers,
+            .body = body,
+        };
+    }
+
+    fn start(self: *ResponseHeaderServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *ResponseHeaderServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn url(self: *const ResponseHeaderServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn run(self: *ResponseHeaderServer) void {
+        const stream = self.server.accept(self.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => std.debug.panic("response header test server accept failed: {}", .{err}),
+        };
+        defer stream.close(self.io);
+
+        readRequestHead(stream) catch |err| std.debug.panic("response header test server read failed: {}", .{err});
+        writeResponse(self, stream) catch |err| std.debug.panic("response header test server write failed: {}", .{err});
+    }
+
+    fn readRequestHead(stream: std.Io.net.Stream) !void {
+        var read_buffer: [1024]u8 = undefined;
+        var reader = stream.reader(std.testing.io, &read_buffer);
+        var tail = [_]u8{ 0, 0, 0, 0 };
+        var count: usize = 0;
+
+        while (true) {
+            const byte = try reader.interface.takeByte();
+            tail[count % tail.len] = byte;
+            count += 1;
+
+            if (count >= 4) {
+                const start_index = count % tail.len;
+                const ordered = [_]u8{
+                    tail[start_index],
+                    tail[(start_index + 1) % tail.len],
+                    tail[(start_index + 2) % tail.len],
+                    tail[(start_index + 3) % tail.len],
+                };
+                if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
+            }
+        }
+    }
+
+    fn writeResponse(self: *ResponseHeaderServer, stream: std.Io.net.Stream) !void {
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n{s}\r\n",
+            .{ self.body.len, self.response_headers },
+        );
+        try writer.interface.writeAll(self.body);
+        try writer.interface.flush();
+    }
+};
+
+const OnResponseCapture = struct {
+    var called = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) void {
+        called = true;
+        status = callback_status;
+        std.testing.expectEqualStrings("openai-responses", model.api) catch unreachable;
+        std.testing.expectEqualStrings("text/event-stream", headers.get("Content-Type").?) catch unreachable;
+        std.testing.expectEqualStrings("req_123", headers.get("x-request-id").?) catch unreachable;
+        std.testing.expectEqualStrings("17", headers.get("openai-processing-ms").?) catch unreachable;
+    }
+};
+
+fn drainStreamAndFreeDoneMessage(
+    allocator: std.mem.Allocator,
+    stream: *event_stream.AssistantMessageEventStream,
+) !void {
+    while (stream.next()) |event| {
+        if (event.delta != null or event.tool_call != null) {
+            freeEventOwned(allocator, event);
+        }
+        if (event.message) |message| {
+            freeAssistantMessageOwned(allocator, message);
+        }
+    }
+}
+
+test "extractMessageText uses caller allocator" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},{\"type\":\"refusal\",\"refusal\":\" no\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractMessageText(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("Hello no", text);
+}
+
+test "extractReasoningSummary uses caller allocator" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[{\"text\":\"first\"},{\"text\":\"second\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractReasoningSummary(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("first\n\nsecond", text);
+}
+
+test "stream on_response receives actual response headers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body =
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_headers\"}}\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_headers\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n" ++
+        "data: [DONE]\n";
+
+    var server = try ResponseHeaderServer.init(
+        io,
+        "x-request-id: req_123\r\nopenai-processing-ms: 17\r\n",
+        body,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const user_content = [_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }};
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &user_content,
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    OnResponseCapture.reset();
+
+    var stream = try OpenAIResponsesProvider.stream(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .on_response = &OnResponseCapture.callback,
+    });
+    defer stream.deinit();
+
+    try drainStreamAndFreeDoneMessage(allocator, &stream);
+
+    try std.testing.expect(OnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 200), OnResponseCapture.status);
 }
 
 test "buildRequestPayload uses previous_response_id for continuation" {
