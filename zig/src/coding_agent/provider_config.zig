@@ -9,6 +9,7 @@ pub const ResolveProviderError = error{
     UnknownProvider,
     InvalidFauxStopReason,
     InvalidFauxTokensPerSecond,
+    InvalidFauxContextWindow,
     InvalidFauxToolArguments,
 };
 
@@ -64,11 +65,16 @@ pub fn resolveProviderConfig(
     api_key_override: ?[]const u8,
     configured_api_key: ?[]const u8,
 ) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
-    if (std.mem.eql(u8, provider, "faux")) {
-        return try resolveFauxProvider(allocator, env_map, model_override);
+    const descriptor = if (!std.mem.eql(u8, provider, "faux"))
+        ai.model_registry.getProviderConfig(provider) orelse return error.UnknownProvider
+    else
+        null;
+
+    if (std.mem.eql(u8, provider, "faux") or shouldForceFauxProvider(env_map, provider)) {
+        return try resolveFauxProvider(allocator, env_map, provider, model_override, descriptor);
     }
 
-    const descriptor = ai.model_registry.getProviderConfig(provider) orelse return error.UnknownProvider;
+    const provider_descriptor = descriptor.?;
     const owned_api_key = if (api_key_override == null)
         try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider)
     else
@@ -76,8 +82,8 @@ pub fn resolveProviderConfig(
     errdefer if (owned_api_key) |api_key| allocator.free(api_key);
 
     const api_key = api_key_override orelse configured_api_key orelse owned_api_key orelse return error.MissingApiKey;
-    const model_id = model_override orelse descriptor.default_model_id orelse provider;
-    const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(descriptor, model_id);
+    const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
+    const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(provider_descriptor, model_id);
 
     return .{
         .model = model,
@@ -137,22 +143,66 @@ pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const 
         error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, google, google-gemini-cli, google-vertex, amazon-bedrock, openrouter, zai, faux.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
+        error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
         error.InvalidFauxToolArguments => "Invalid PI_FAUX_TOOL_ARGS_JSON. Expected a JSON object or value.",
         else => @errorName(err),
     };
 }
 
+fn shouldForceFauxProvider(env_map: *const std.process.Environ.Map, provider: []const u8) bool {
+    const value = env_map.get("PI_FAUX_FORCE") orelse return false;
+    return std.mem.eql(u8, value, "1") or
+        std.mem.eql(u8, value, "true") or
+        std.mem.eql(u8, value, "*") or
+        std.mem.eql(u8, value, provider);
+}
+
 fn resolveFauxProvider(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
+    provider: []const u8,
     model_override: ?[]const u8,
+    descriptor: ?ai.model_registry.ProviderConfig,
 ) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
     const tokens_per_second = if (env_map.get("PI_FAUX_TOKENS_PER_SECOND")) |value|
         std.fmt.parseInt(u32, value, 10) catch return error.InvalidFauxTokensPerSecond
     else
         null;
 
+    const context_window = if (env_map.get("PI_FAUX_CONTEXT_WINDOW")) |value|
+        std.fmt.parseInt(u32, value, 10) catch return error.InvalidFauxContextWindow
+    else
+        null;
+
+    const selected_model_id = model_override orelse if (descriptor) |provider_descriptor|
+        provider_descriptor.default_model_id orelse provider
+    else
+        provider;
+    const registered_model = ai.model_registry.find(provider, selected_model_id);
+
+    var faux_model_definition: ?faux.FauxModelDefinition = null;
+    if (descriptor != null or model_override != null or context_window != null) {
+        faux_model_definition = .{
+            .id = selected_model_id,
+            .name = if (registered_model) |model| model.name else selected_model_id,
+            .reasoning = if (registered_model) |model| model.reasoning else false,
+            .input = if (registered_model) |model| model.input_types else null,
+            .cost = if (registered_model) |model| model.cost else null,
+            .context_window = context_window orelse if (registered_model) |model| model.context_window else null,
+            .max_tokens = if (registered_model) |model| model.max_tokens else null,
+        };
+    }
+
+    var faux_model_definitions: [1]faux.FauxModelDefinition = undefined;
+    const faux_models: ?[]const faux.FauxModelDefinition = if (faux_model_definition) |definition| blk: {
+        faux_model_definitions[0] = definition;
+        break :blk faux_model_definitions[0..];
+    } else null;
+
     const registration = try faux.registerFauxProvider(allocator, .{
+        .api = if (descriptor) |provider_descriptor| provider_descriptor.api else null,
+        .provider = provider,
+        .models = faux_models,
         .tokens_per_second = tokens_per_second,
     });
     errdefer registration.unregister();
@@ -187,14 +237,8 @@ fn resolveFauxProvider(
         });
     }
 
-    var model = registration.getModel();
-    if (model_override) |override| {
-        model.id = override;
-        model.name = override;
-    }
-
     return .{
-        .model = model,
+        .model = registration.getModel(),
         .api_key = null,
         .faux_registration = registration,
         .owned_faux_messages = owned_messages,
@@ -366,6 +410,43 @@ test "resolveProviderConfig uses configured api key when env is missing" {
 
     try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+}
+
+test "resolveProviderConfig can force faux responses for built-in providers" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("PI_FAUX_FORCE", "1");
+    try env_map.put("PI_FAUX_RESPONSE", "forced faux response");
+
+    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null, null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), resolved.api_key);
+    try std.testing.expect(resolved.faux_registration != null);
+    try std.testing.expectEqualStrings("openai", resolved.model.provider);
+    try std.testing.expectEqualStrings("openai-completions", resolved.model.api);
+    try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+}
+
+test "resolveProviderConfig applies faux context window overrides" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("PI_FAUX_FORCE", "1");
+    try env_map.put("PI_FAUX_CONTEXT_WINDOW", "48");
+    try env_map.put("PI_FAUX_RESPONSE", "forced faux response");
+
+    var resolved = try resolveProviderConfig(allocator, &env_map, "anthropic", null, null, null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("anthropic", resolved.model.provider);
+    try std.testing.expectEqualStrings("claude-opus-4-7", resolved.model.id);
+    try std.testing.expectEqual(@as(u32, 48), resolved.model.context_window);
 }
 
 test "listAvailableModels enumerates all built-in providers" {

@@ -1076,6 +1076,8 @@ pub fn openInitialSession(
     tool_items: []const agent.AgentTool,
 ) !session_mod.AgentSession {
     const thinking_level = options.thinking;
+    const compaction_settings = configuredCompactionSettings(options.runtime_config);
+    const retry_settings = configuredRetrySettings(options.runtime_config);
     if (options.session) |session_ref| {
         const session_path = try resolveSessionPath(allocator, io, session_dir, options.cwd, session_ref);
         defer allocator.free(session_path);
@@ -1087,6 +1089,8 @@ pub fn openInitialSession(
             .api_key = api_key,
             .thinking_level = thinking_level,
             .tools = tool_items,
+            .compaction = compaction_settings,
+            .retry = retry_settings,
         });
     }
 
@@ -1101,6 +1105,8 @@ pub fn openInitialSession(
                 .api_key = api_key,
                 .thinking_level = thinking_level,
                 .tools = tool_items,
+                .compaction = compaction_settings,
+                .retry = retry_settings,
             });
         }
     }
@@ -1113,6 +1119,8 @@ pub fn openInitialSession(
         .thinking_level = thinking_level,
         .session_dir = session_dir,
         .tools = tool_items,
+        .compaction = compaction_settings,
+        .retry = retry_settings,
     });
 }
 
@@ -1500,6 +1508,8 @@ fn switchSession(
         .system_prompt = options.system_prompt,
         .tools = tool_items,
         .thinking_level = options.thinking,
+        .compaction = configuredCompactionSettings(runtime_config),
+        .retry = configuredRetrySettings(runtime_config),
     });
     errdefer candidate.deinit();
 
@@ -2598,6 +2608,20 @@ fn configuredApiKeyForProvider(runtime_config: ?*const config_mod.RuntimeConfig,
         return runtime_config_value.lookupApiKey(provider_name);
     }
     return null;
+}
+
+fn configuredCompactionSettings(runtime_config: ?*const config_mod.RuntimeConfig) session_mod.CompactionSettings {
+    if (runtime_config) |runtime_config_value| {
+        return runtime_config_value.settings.compaction orelse .{};
+    }
+    return .{};
+}
+
+fn configuredRetrySettings(runtime_config: ?*const config_mod.RuntimeConfig) session_mod.RetrySettings {
+    if (runtime_config) |runtime_config_value| {
+        return runtime_config_value.settings.retry orelse .{};
+    }
+    return .{};
 }
 
 fn settingsResources(settings: config_mod.Settings) resources_mod.SettingsResources {
