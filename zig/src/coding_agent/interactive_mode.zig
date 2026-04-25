@@ -80,8 +80,13 @@ const ChatItem = struct {
 const ASSISTANT_PREFIX = "Pi:";
 
 const SlashCommandKind = enum {
+    settings,
     model,
+    @"import",
+    share,
+    copy,
     name,
+    hotkeys,
     label,
     session,
     tree,
@@ -89,6 +94,8 @@ const SlashCommandKind = enum {
     clone,
     compact,
     login,
+    logout,
+    new,
     @"resume",
     reload,
     @"export",
@@ -99,6 +106,34 @@ const SlashCommand = struct {
     kind: SlashCommandKind,
     argument: ?[]const u8 = null,
     raw: []const u8,
+};
+
+const BuiltinSlashCommand = struct {
+    name: []const u8,
+    description: []const u8,
+    argument_hint: ?[]const u8 = null,
+};
+
+const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
+    .{ .name = "settings", .description = "Open settings overlay" },
+    .{ .name = "model", .description = "Select model (opens selector UI)", .argument_hint = "<provider/model>" },
+    .{ .name = "export", .description = "Export session transcript", .argument_hint = "<path.json|path.md>" },
+    .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
+    .{ .name = "share", .description = "Copy a shareable markdown transcript" },
+    .{ .name = "copy", .description = "Copy last assistant message" },
+    .{ .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
+    .{ .name = "session", .description = "Show session info and stats" },
+    .{ .name = "hotkeys", .description = "Show keyboard shortcut help" },
+    .{ .name = "fork", .description = "Create a new fork from the latest user message" },
+    .{ .name = "clone", .description = "Duplicate the current session at the current position" },
+    .{ .name = "tree", .description = "Navigate the session tree" },
+    .{ .name = "login", .description = "Show authentication guidance" },
+    .{ .name = "logout", .description = "Clear stored authentication for the current provider" },
+    .{ .name = "new", .description = "Start a fresh session" },
+    .{ .name = "compact", .description = "Manually compact the session context", .argument_hint = "<instructions>" },
+    .{ .name = "resume", .description = "Resume a different session" },
+    .{ .name = "reload", .description = "Reload keybindings, skills, prompts, and themes" },
+    .{ .name = "quit", .description = "Quit pi" },
 };
 
 const LiveResources = struct {
@@ -393,12 +428,14 @@ const AppState = struct {
 };
 
 const SelectorOverlay = union(enum) {
+    info: InfoOverlay,
     session: SessionOverlay,
     model: ModelOverlay,
     tree: TreeOverlay,
 
     fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .info => |*overlay| overlay.deinit(allocator),
             .session => |*overlay| overlay.deinit(allocator),
             .model => |*overlay| overlay.deinit(allocator),
             .tree => |*overlay| overlay.deinit(allocator),
@@ -408,6 +445,7 @@ const SelectorOverlay = union(enum) {
 
     fn title(self: *const SelectorOverlay) []const u8 {
         return switch (self.*) {
+            .info => self.info.title,
             .session => "Session selector",
             .model => "Model selector",
             .tree => "Session tree",
@@ -415,16 +453,38 @@ const SelectorOverlay = union(enum) {
     }
 
     fn hint(self: *const SelectorOverlay) []const u8 {
-        _ = self;
-        return "Up/Down move • Enter select • Esc cancel";
+        return switch (self.*) {
+            .info => self.info.hint,
+            else => "Up/Down move • Enter select • Esc cancel",
+        };
     }
 
     fn list(self: *SelectorOverlay) *tui.SelectList {
         return switch (self.*) {
+            .info => &self.info.list,
             .session => &self.session.list,
             .model => &self.model.list,
             .tree => &self.tree.list,
         };
+    }
+};
+
+const InfoOverlay = struct {
+    title: []u8,
+    hint: []u8,
+    items: []tui.SelectItem,
+    list: tui.SelectList,
+
+    fn deinit(self: *InfoOverlay, allocator: std.mem.Allocator) void {
+        allocator.free(self.title);
+        allocator.free(self.hint);
+        for (self.items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(self.items);
+        self.* = undefined;
     }
 };
 
@@ -1310,6 +1370,7 @@ fn handleInputKey(
             },
             .confirmed => |index| {
                 switch (overlay_value.*) {
+                    .info => {},
                     .session => |session_overlay| {
                         if (session_overlay.choices[index].path.len == 0) {
                             try app_state.setStatus("No sessions found");
@@ -1507,8 +1568,13 @@ fn parseSlashCommand(text: []const u8) ?SlashCommand {
         "";
     const argument = if (raw_argument.len == 0) null else raw_argument;
 
+    if (std.mem.eql(u8, command_name, "settings")) return .{ .kind = .settings, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "import")) return .{ .kind = .@"import", .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "share")) return .{ .kind = .share, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "copy")) return .{ .kind = .copy, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "name")) return .{ .kind = .name, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "hotkeys")) return .{ .kind = .hotkeys, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "label")) return .{ .kind = .label, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "session")) return .{ .kind = .session, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "tree")) return .{ .kind = .tree, .argument = argument, .raw = text };
@@ -1516,6 +1582,8 @@ fn parseSlashCommand(text: []const u8) ?SlashCommand {
     if (std.mem.eql(u8, command_name, "clone")) return .{ .kind = .clone, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "compact")) return .{ .kind = .compact, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "login")) return .{ .kind = .login, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "logout")) return .{ .kind = .logout, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "new")) return .{ .kind = .new, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "resume")) return .{ .kind = .@"resume", .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "reload")) return .{ .kind = .reload, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "export")) return .{ .kind = .@"export", .argument = argument, .raw = text };
@@ -1545,6 +1613,7 @@ fn handleSlashCommand(
     live_resources: *LiveResources,
 ) !void {
     switch (command.kind) {
+        .settings => overlay.* = try loadSettingsOverlay(allocator, session, live_resources.runtime_config),
         .model => try handleModelSlashCommand(
             allocator,
             env_map,
@@ -1556,7 +1625,29 @@ fn handleSlashCommand(
             app_state,
             overlay,
         ),
+        .@"import" => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before importing a session");
+                return;
+            }
+            try handleImportSlashCommand(
+                allocator,
+                io,
+                env_map,
+                session,
+                current_provider,
+                command.argument,
+                options,
+                live_resources.runtime_config,
+                tool_items,
+                app_state,
+                subscriber,
+            );
+        },
+        .share => try handleShareSlashCommand(allocator, io, session, app_state),
+        .copy => try handleCopySlashCommand(allocator, io, session, app_state),
         .name => try handleNameSlashCommand(allocator, session, command.argument, app_state),
+        .hotkeys => overlay.* = try loadHotkeysOverlay(allocator, live_resources.keybindings),
         .label => try handleLabelSlashCommand(allocator, session, command.argument, app_state),
         .session => try handleSessionSlashCommand(allocator, session, app_state),
         .tree => {
@@ -1606,6 +1697,39 @@ fn handleSlashCommand(
             try handleCompactSlashCommand(allocator, session, command.argument, app_state);
         },
         .login => try handleLoginSlashCommand(allocator, session, live_resources.runtime_config, app_state),
+        .logout => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before logging out");
+                return;
+            }
+            try handleLogoutSlashCommand(
+                allocator,
+                io,
+                env_map,
+                session,
+                current_provider,
+                options,
+                app_state,
+                live_resources,
+            );
+        },
+        .new => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before starting a new session");
+                return;
+            }
+            try handleNewSlashCommand(
+                allocator,
+                io,
+                session,
+                current_provider,
+                session_dir,
+                options,
+                tool_items,
+                app_state,
+                subscriber,
+            );
+        },
         .@"resume" => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before switching sessions");
@@ -1896,6 +2020,630 @@ fn handleLoginSlashCommand(
         );
     defer allocator.free(message);
     try app_state.appendInfo(message);
+}
+
+const ClipboardCopyFn = *const fn (context: ?*anyopaque, io: std.Io, text: []const u8) anyerror!void;
+
+var clipboard_copy_context: ?*anyopaque = null;
+var clipboard_copy_fn: ClipboardCopyFn = defaultCopyTextToClipboard;
+
+fn loadSettingsOverlay(
+    allocator: std.mem.Allocator,
+    session: *const session_mod.AgentSession,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) !SelectorOverlay {
+    var items = std.ArrayList(tui.SelectItem).empty;
+    errdefer {
+        freeOwnedSelectItems(allocator, items.items);
+        items.deinit(allocator);
+    }
+
+    const current_model = session.agent.getModel();
+    try appendInfoOverlayItem(
+        allocator,
+        &items,
+        "Model",
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current_model.provider, current_model.id }),
+    );
+
+    if (session.session_manager.getSessionName()) |name| {
+        try appendInfoOverlayItem(allocator, &items, "Session name", try allocator.dupe(u8, name));
+    }
+
+    try appendInfoOverlayItem(
+        allocator,
+        &items,
+        "Session file",
+        try allocator.dupe(u8, session.session_manager.getSessionFile() orelse "in-memory"),
+    );
+
+    if (runtime_config) |config| {
+        try appendInfoOverlayItem(allocator, &items, "Theme", try allocator.dupe(u8, config.settings.theme orelse "default"));
+        try appendInfoOverlayItem(
+            allocator,
+            &items,
+            "Editor padding",
+            try std.fmt.allocPrint(allocator, "{d}", .{config.settings.editor_padding_x orelse 1}),
+        );
+        try appendInfoOverlayItem(
+            allocator,
+            &items,
+            "Autocomplete items",
+            try std.fmt.allocPrint(allocator, "{d}", .{config.settings.autocomplete_max_visible orelse 5}),
+        );
+        try appendInfoOverlayItem(
+            allocator,
+            &items,
+            "Session directory",
+            try allocator.dupe(u8, config.settings.session_dir orelse session.session_manager.getSessionDir()),
+        );
+
+        const compaction = config.settings.compaction orelse session_mod.CompactionSettings{};
+        try appendInfoOverlayItem(
+            allocator,
+            &items,
+            "Compaction",
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} • reserve {d} • keep recent {d}",
+                .{
+                    if (compaction.enabled) "enabled" else "disabled",
+                    compaction.reserve_tokens,
+                    compaction.keep_recent_tokens,
+                },
+            ),
+        );
+
+        const retry = config.settings.retry orelse session_mod.RetrySettings{};
+        try appendInfoOverlayItem(
+            allocator,
+            &items,
+            "Retry",
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} • max retries {d} • base delay {d}ms",
+                .{
+                    if (retry.enabled) "enabled" else "disabled",
+                    retry.max_retries,
+                    retry.base_delay_ms,
+                },
+            ),
+        );
+    } else {
+        try appendInfoOverlayItem(allocator, &items, "Settings", try allocator.dupe(u8, "Runtime config unavailable"));
+    }
+
+    return try loadInfoOverlay(
+        allocator,
+        "Settings",
+        "Up/Down scroll • Enter close • Esc close",
+        try items.toOwnedSlice(allocator),
+        10,
+    );
+}
+
+fn loadHotkeysOverlay(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) !SelectorOverlay {
+    var items = std.ArrayList(tui.SelectItem).empty;
+    errdefer {
+        freeOwnedSelectItems(allocator, items.items);
+        items.deinit(allocator);
+    }
+
+    const bindings = keybindings orelse {
+        try appendInfoOverlayItem(allocator, &items, "Hotkeys", try allocator.dupe(u8, "Keybindings unavailable"));
+        return try loadInfoOverlay(
+            allocator,
+            "Keyboard shortcuts",
+            "Up/Down scroll • Enter close • Esc close",
+            try items.toOwnedSlice(allocator),
+            10,
+        );
+    };
+
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .interrupt, "Cancel autocomplete or abort streaming");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .clear, "Clear the chat display");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .exit, "Exit interactive mode");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .open_sessions, "Open the session selector");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .open_models, "Open the model selector");
+    try appendInfoOverlayItem(allocator, &items, "Enter", try allocator.dupe(u8, "Submit the current prompt"));
+    try appendInfoOverlayItem(allocator, &items, "Tab", try allocator.dupe(u8, "Accept the selected autocomplete entry"));
+    try appendInfoOverlayItem(allocator, &items, "/", try allocator.dupe(u8, "Start a slash command"));
+    try appendInfoOverlayItem(allocator, &items, "!", try allocator.dupe(u8, "Run a bash command"));
+    try appendInfoOverlayItem(allocator, &items, "!!", try allocator.dupe(u8, "Run a bash command without adding output to context"));
+
+    return try loadInfoOverlay(
+        allocator,
+        "Keyboard shortcuts",
+        "Up/Down scroll • Enter close • Esc close",
+        try items.toOwnedSlice(allocator),
+        12,
+    );
+}
+
+fn loadInfoOverlay(
+    allocator: std.mem.Allocator,
+    title: []const u8,
+    hint: []const u8,
+    items: []tui.SelectItem,
+    max_visible: usize,
+) !SelectorOverlay {
+    return .{
+        .info = .{
+            .title = try allocator.dupe(u8, title),
+            .hint = try allocator.dupe(u8, hint),
+            .items = items,
+            .list = .{
+                .items = items,
+                .max_visible = max_visible,
+            },
+        },
+    };
+}
+
+fn appendInfoOverlayItem(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(tui.SelectItem),
+    label: []const u8,
+    description: []u8,
+) !void {
+    errdefer allocator.free(description);
+    const value = try allocator.dupe(u8, label);
+    errdefer allocator.free(value);
+    const owned_label = try allocator.dupe(u8, label);
+    errdefer allocator.free(owned_label);
+    try items.append(allocator, .{
+        .value = value,
+        .label = owned_label,
+        .description = description,
+    });
+}
+
+fn appendHotkeyOverlayItem(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(tui.SelectItem),
+    keybindings: *const keybindings_mod.Keybindings,
+    action: keybindings_mod.Action,
+    description: []const u8,
+) !void {
+    const label = try keybindings.primaryLabel(allocator, action);
+    errdefer allocator.free(label);
+    const value = try allocator.dupe(u8, label);
+    errdefer allocator.free(value);
+    const owned_description = try allocator.dupe(u8, description);
+    errdefer allocator.free(owned_description);
+    try items.append(allocator, .{
+        .value = value,
+        .label = label,
+        .description = owned_description,
+    });
+}
+
+fn handleImportSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    argument: ?[]const u8,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    subscriber: agent.AgentSubscriber,
+) !void {
+    const raw_path = argument orelse {
+        try app_state.appendError("Usage: /import <path.jsonl>");
+        return;
+    };
+
+    const session_path = try common.resolvePath(allocator, options.cwd, normalizePathArgument(raw_path));
+    defer allocator.free(session_path);
+
+    switchSession(
+        allocator,
+        io,
+        env_map,
+        session,
+        current_provider,
+        session_path,
+        options,
+        runtime_config,
+        tool_items,
+        app_state,
+        subscriber,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            const message = try std.fmt.allocPrint(allocator, "Failed to import session: file not found: {s}", .{session_path});
+            defer allocator.free(message);
+            try app_state.appendError(message);
+            return;
+        },
+        else => return err,
+    };
+
+    const message = try std.fmt.allocPrint(allocator, "Session imported from {s}", .{session_path});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+}
+
+fn handleCopySlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const session_mod.AgentSession,
+    app_state: *AppState,
+) !void {
+    const text = lastAssistantTextAlloc(allocator, session) orelse {
+        try app_state.appendError("No assistant messages to copy yet.");
+        return;
+    };
+    defer allocator.free(text);
+
+    copyTextToClipboard(io, text) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Failed to copy assistant message: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        return;
+    };
+
+    try app_state.appendInfo("Copied last assistant message to clipboard");
+    try app_state.setStatus("copied");
+}
+
+fn handleShareSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const session_mod.AgentSession,
+    app_state: *AppState,
+) !void {
+    if (session.agent.getMessages().len == 0) {
+        try app_state.appendError("No session messages to share yet.");
+        return;
+    }
+
+    const text = try buildShareText(allocator, session);
+    defer allocator.free(text);
+
+    copyTextToClipboard(io, text) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Failed to copy share text: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        return;
+    };
+
+    try app_state.appendInfo("Copied shareable markdown transcript to clipboard");
+    try app_state.setStatus("share text copied");
+}
+
+fn handleLogoutSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    live_resources: *LiveResources,
+) !void {
+    const runtime_config = live_resources.runtime_config orelse {
+        try app_state.setStatus("Logout is unavailable in this session");
+        return;
+    };
+
+    const provider_name = try allocator.dupe(u8, session.agent.getModel().provider);
+    defer allocator.free(provider_name);
+    const model_id = try allocator.dupe(u8, session.agent.getModel().id);
+    defer allocator.free(model_id);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+
+    const removed = try removeStoredAuthToken(allocator, io, auth_path, provider_name);
+    try clearResolvedProviderApiKey(allocator, current_provider);
+    session.setApiKey(null);
+
+    _ = try live_resources.reload(allocator, io, env_map, options.cwd);
+
+    const resolved = provider_config.resolveProviderConfig(
+        allocator,
+        env_map,
+        provider_name,
+        model_id,
+        overrideApiKeyForProvider(options, provider_name),
+        configuredApiKeyForProvider(live_resources.runtime_config, provider_name),
+    ) catch |err| switch (err) {
+        error.MissingApiKey => null,
+        else => return err,
+    };
+
+    if (resolved) |next_provider| {
+        current_provider.deinit(allocator);
+        current_provider.* = next_provider;
+        session.setApiKey(next_provider.api_key);
+    }
+
+    const message = if (removed)
+        try std.fmt.allocPrint(allocator, "Removed stored authentication for provider `{s}`.", .{provider_name})
+    else
+        try std.fmt.allocPrint(allocator, "No stored authentication found for provider `{s}`.", .{provider_name});
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+    try app_state.setStatus("logged out");
+}
+
+fn handleNewSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    subscriber: agent.AgentSubscriber,
+) !void {
+    var candidate = try createSeededSession(
+        allocator,
+        io,
+        options.cwd,
+        options.system_prompt,
+        current_provider.model,
+        current_provider.api_key,
+        session.agent.getThinkingLevel(),
+        tool_items,
+        configuredCompactionSettings(options.runtime_config),
+        configuredRetrySettings(options.runtime_config),
+        if (session.session_manager.getSessionDir().len > 0) session_dir else null,
+        &.{},
+    );
+    errdefer candidate.deinit();
+
+    try replaceCurrentSession(allocator, session, &candidate, app_state, subscriber);
+    try app_state.appendInfo("New session started");
+}
+
+fn clearResolvedProviderApiKey(
+    allocator: std.mem.Allocator,
+    current_provider: *provider_config.ResolvedProviderConfig,
+) !void {
+    if (current_provider.owned_api_key) |api_key| allocator.free(api_key);
+    current_provider.owned_api_key = null;
+    current_provider.api_key = null;
+}
+
+fn copyTextToClipboard(io: std.Io, text: []const u8) !void {
+    try clipboard_copy_fn(clipboard_copy_context, io, text);
+}
+
+fn defaultCopyTextToClipboard(_: ?*anyopaque, io: std.Io, text: []const u8) !void {
+    switch (builtin.os.tag) {
+        .macos => try runClipboardCommand(io, &[_][]const u8{"pbcopy"}, text),
+        .windows => try runClipboardCommand(io, &[_][]const u8{"clip"}, text),
+        else => {
+            runClipboardCommand(io, &[_][]const u8{"wl-copy"}, text) catch {
+                runClipboardCommand(io, &[_][]const u8{ "xclip", "-selection", "clipboard" }, text) catch {
+                    try runClipboardCommand(io, &[_][]const u8{ "xsel", "--clipboard", "--input" }, text);
+                };
+            };
+        },
+    }
+}
+
+fn runClipboardCommand(io: std.Io, argv: []const []const u8, text: []const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer {
+        if (child.id != null) child.kill(io);
+    }
+
+    const stdin_file = child.stdin.?;
+    child.stdin = null;
+
+    var buffer: [1024]u8 = undefined;
+    var writer = stdin_file.writer(io, &buffer);
+    try writer.interface.writeAll(text);
+    try writer.flush();
+    stdin_file.close(io);
+
+    const term = try child.wait(io);
+    if (exitCodeFromChildTerm(term) != 0) return error.ClipboardCommandFailed;
+}
+
+fn exitCodeFromChildTerm(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
+}
+
+fn lastAssistantTextAlloc(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) ?[]u8 {
+    const messages = session.agent.getMessages();
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        switch (messages[index]) {
+            .assistant => |assistant_message| {
+                const text = assistantBlocksToTextAlloc(allocator, assistant_message.content) catch return null;
+                if (text.len == 0) {
+                    allocator.free(text);
+                    return null;
+                }
+                return text;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn assistantBlocksToTextAlloc(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var wrote_any = false;
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                if (text.text.len == 0) continue;
+                if (wrote_any) try writer.writer.writeAll("\n");
+                try writer.writer.writeAll(text.text);
+                wrote_any = true;
+            },
+            .thinking => |thinking| {
+                if (thinking.thinking.len == 0) continue;
+                if (wrote_any) try writer.writer.writeAll("\n");
+                try writer.writer.writeAll(thinking.thinking);
+                wrote_any = true;
+            },
+            .image => {},
+        }
+    }
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn buildShareText(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) ![]u8 {
+    const stats = session_advanced.getSessionStats(session);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    try writer.writer.print("# Session {s}\n\n", .{stats.session_name orelse stats.session_id});
+    try writer.writer.print("- Session ID: `{s}`\n", .{stats.session_id});
+    try writer.writer.print("- Working directory: `{s}`\n", .{session.cwd});
+    try writer.writer.print("- Model: `{s}` / `{s}`\n\n", .{ session.agent.getModel().provider, session.agent.getModel().id });
+    try writer.writer.writeAll("## Transcript\n\n");
+
+    for (session.agent.getMessages(), 0..) |message, index| {
+        try writer.writer.print("### {d}. {s}\n\n", .{ index + 1, switch (message) {
+            .user => "User",
+            .assistant => "Assistant",
+            .tool_result => "Tool Result",
+        } });
+        const markdown = try messageToShareMarkdown(allocator, message);
+        defer allocator.free(markdown);
+        if (markdown.len == 0) {
+            try writer.writer.writeAll("_No text content_\n\n");
+        } else {
+            try writer.writer.print("{s}\n\n", .{markdown});
+        }
+    }
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn messageToShareMarkdown(allocator: std.mem.Allocator, message: agent.AgentMessage) ![]u8 {
+    return switch (message) {
+        .user => |user_message| blocksToShareText(allocator, user_message.content),
+        .assistant => |assistant_message| blk: {
+            const text = try blocksToShareText(allocator, assistant_message.content);
+            if (text.len > 0) break :blk text;
+            if (assistant_message.tool_calls) |calls| {
+                var writer: std.Io.Writer.Allocating = .init(allocator);
+                defer writer.deinit();
+                for (calls, 0..) |tool_call, index| {
+                    if (index > 0) try writer.writer.writeAll("\n");
+                    const args = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{ .whitespace = .indent_2 });
+                    defer allocator.free(args);
+                    try writer.writer.print("- `{s}` `{s}`\n```json\n{s}\n```", .{ tool_call.name, tool_call.id, args });
+                }
+                break :blk try allocator.dupe(u8, writer.written());
+            }
+            break :blk text;
+        },
+        .tool_result => |tool_result| blk: {
+            const text = try blocksToShareText(allocator, tool_result.content);
+            defer allocator.free(text);
+            if (text.len == 0) {
+                break :blk try std.fmt.allocPrint(allocator, "`{s}` returned no text content", .{tool_result.tool_name});
+            }
+            break :blk try std.fmt.allocPrint(allocator, "`{s}`\n\n{s}", .{ tool_result.tool_name, text });
+        },
+    };
+}
+
+fn blocksToShareText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var wrote_any = false;
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                if (text.text.len == 0) continue;
+                if (wrote_any) try writer.writer.writeAll("\n");
+                try writer.writer.writeAll(text.text);
+                wrote_any = true;
+            },
+            .thinking => |thinking| {
+                if (thinking.thinking.len == 0) continue;
+                if (wrote_any) try writer.writer.writeAll("\n");
+                try writer.writer.print("_Thinking:_ {s}", .{thinking.thinking});
+                wrote_any = true;
+            },
+            .image => |image| {
+                if (wrote_any) try writer.writer.writeAll("\n");
+                try writer.writer.print("![image](data:{s};base64,{s})", .{ image.mime_type, image.data });
+                wrote_any = true;
+            },
+        }
+    }
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn removeStoredAuthToken(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    auth_path: []const u8,
+    provider_name: []const u8,
+) !bool {
+    const content = std.Io.Dir.readFileAlloc(.cwd(), io, auth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    var next_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const next_value: std.json.Value = .{ .object = next_object };
+        common.deinitJsonValue(allocator, next_value);
+    }
+
+    var removed = false;
+    var iterator = parsed.value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, provider_name)) {
+            removed = true;
+            continue;
+        }
+        try next_object.put(
+            allocator,
+            try allocator.dupe(u8, entry.key_ptr.*),
+            try common.cloneJsonValue(allocator, entry.value_ptr.*),
+        );
+    }
+    if (!removed) {
+        const next_value: std.json.Value = .{ .object = next_object };
+        common.deinitJsonValue(allocator, next_value);
+        return false;
+    }
+
+    const next_value: std.json.Value = .{ .object = next_object };
+    defer common.deinitJsonValue(allocator, next_value);
+
+    const serialized = try std.json.Stringify.valueAlloc(allocator, next_value, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, auth_path, serialized, true);
+    return true;
 }
 
 fn handleReloadSlashCommand(
@@ -2517,6 +3265,27 @@ fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd: []
         items.deinit(allocator);
     }
 
+    for (BUILTIN_SLASH_COMMANDS) |command| {
+        const value = if (command.argument_hint != null)
+            try std.fmt.allocPrint(allocator, "/{s} ", .{command.name})
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{command.name});
+        errdefer allocator.free(value);
+        const label = if (command.argument_hint) |argument_hint|
+            try std.fmt.allocPrint(allocator, "/{s} {s}", .{ command.name, argument_hint })
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{command.name});
+        errdefer allocator.free(label);
+        const description = try allocator.dupe(u8, command.description);
+        errdefer allocator.free(description);
+
+        try items.append(allocator, .{
+            .value = value,
+            .label = label,
+            .description = description,
+        });
+    }
+
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
         if (std.mem.eql(u8, entry.name, ".git")) continue;
@@ -2541,6 +3310,9 @@ fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd: []
 
     std.mem.sort(tui.SelectItem, items.items, {}, struct {
         fn lessThan(_: void, lhs: tui.SelectItem, rhs: tui.SelectItem) bool {
+            const lhs_slash = std.mem.startsWith(u8, lhs.value, "/");
+            const rhs_slash = std.mem.startsWith(u8, rhs.value, "/");
+            if (lhs_slash != rhs_slash) return lhs_slash;
             const lhs_dir = std.mem.endsWith(u8, lhs.value, "/");
             const rhs_dir = std.mem.endsWith(u8, rhs.value, "/");
             if (lhs_dir != rhs_dir) return lhs_dir;
@@ -3892,17 +4664,40 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
 }
 
 test "parseSlashCommand recognizes builtins and arguments" {
+    const settings_command = parseSlashCommand("/settings").?;
+    try std.testing.expectEqual(SlashCommandKind.settings, settings_command.kind);
+    try std.testing.expect(settings_command.argument == null);
+
     const model_command = parseSlashCommand("/model faux").?;
     try std.testing.expectEqual(SlashCommandKind.model, model_command.kind);
     try std.testing.expectEqualStrings("faux", model_command.argument.?);
+
+    const import_command = parseSlashCommand("/import ./session.jsonl").?;
+    try std.testing.expectEqual(SlashCommandKind.@"import", import_command.kind);
+    try std.testing.expectEqualStrings("./session.jsonl", import_command.argument.?);
+
+    const share_command = parseSlashCommand("/share").?;
+    try std.testing.expectEqual(SlashCommandKind.share, share_command.kind);
+
+    const copy_command = parseSlashCommand("/copy").?;
+    try std.testing.expectEqual(SlashCommandKind.copy, copy_command.kind);
 
     const name_command = parseSlashCommand("/name Night Shift").?;
     try std.testing.expectEqual(SlashCommandKind.name, name_command.kind);
     try std.testing.expectEqualStrings("Night Shift", name_command.argument.?);
 
+    const hotkeys_command = parseSlashCommand("/hotkeys").?;
+    try std.testing.expectEqual(SlashCommandKind.hotkeys, hotkeys_command.kind);
+
     const label_command = parseSlashCommand("/label bookmark").?;
     try std.testing.expectEqual(SlashCommandKind.label, label_command.kind);
     try std.testing.expectEqualStrings("bookmark", label_command.argument.?);
+
+    const logout_command = parseSlashCommand("/logout").?;
+    try std.testing.expectEqual(SlashCommandKind.logout, logout_command.kind);
+
+    const new_command = parseSlashCommand("/new").?;
+    try std.testing.expectEqual(SlashCommandKind.new, new_command.kind);
 
     const export_command = parseSlashCommand("/export \"/tmp/out.md\"").?;
     try std.testing.expectEqual(SlashCommandKind.@"export", export_command.kind);
@@ -3910,6 +4705,178 @@ test "parseSlashCommand recognizes builtins and arguments" {
 
     try std.testing.expect(parseSlashCommand("hello") == null);
     try std.testing.expect(parseSlashCommand("/unknown") == null);
+}
+
+test "loadEditorAutocompleteItems includes slash command help text" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+
+    const items = try loadEditorAutocompleteItems(allocator, std.testing.io, root_dir);
+    defer freeOwnedSelectItems(allocator, items);
+
+    var saw_settings = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.label, "/settings")) {
+            saw_settings = true;
+            try std.testing.expectEqualStrings("/settings", item.value);
+            try std.testing.expectEqualStrings("Open settings overlay", item.description.?);
+        }
+    }
+
+    try std.testing.expect(saw_settings);
+}
+
+test "handleInputKey opens settings overlay for slash settings command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/settings");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .info);
+    try std.testing.expectEqualStrings("Settings", overlay.?.title());
+}
+
+test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/hotkeys");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+        .keybindings = &custom_keybindings,
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .info);
+    try std.testing.expectEqualStrings("Keyboard shortcuts", overlay.?.title());
 }
 
 test "handleInputKey opens model overlay for slash model command" {
@@ -4533,6 +5500,205 @@ test "session overlays use persisted session names and labels" {
     try std.testing.expect(saw_label);
 }
 
+test "handleInputKey imports a session from an explicit jsonl path" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var source = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer source.deinit();
+
+    var user = try makeInteractiveTestUserMessage("import me", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    var assistant = try makeInteractiveTestAssistantMessage("imported reply", current_provider.model, ai.Usage.init(), 2);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    _ = try source.session_manager.appendMessage(user);
+    _ = try source.session_manager.appendMessage(assistant);
+    try source.agent.setMessages(&.{ user, assistant });
+
+    const source_path = try allocator.dupe(u8, source.session_manager.getSessionFile().?);
+    defer allocator.free(source_path);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    const command = try std.fmt.allocPrint(allocator, "/import \"{s}\"", .{source_path});
+    defer allocator.free(command);
+    _ = try editor.handlePaste(command);
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+    try session.agent.subscribe(subscriber);
+    defer _ = session.agent.unsubscribe(subscriber);
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
+    try std.testing.expectEqualStrings("import me", session.agent.getMessages()[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("imported reply", session.agent.getMessages()[1].assistant.content[0].text.text);
+}
+
+test "handleInputKey starts a fresh session for slash new command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var user = try makeInteractiveTestUserMessage("old prompt", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    _ = try session.session_manager.appendMessage(user);
+    try session.agent.setMessages(&.{user});
+
+    const previous_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(previous_file);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/new");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+    try session.agent.subscribe(subscriber);
+    defer _ = session.agent.unsubscribe(subscriber);
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), session.agent.getMessages().len);
+    try std.testing.expect(!std.mem.eql(u8, previous_file, session.session_manager.getSessionFile().?));
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "New session started") != null);
+}
+
 test "handleInputKey exports session transcript to explicit markdown and json paths" {
     const allocator = std.testing.allocator;
 
@@ -4823,6 +5989,170 @@ test "interactive tool conversation renders tool lines and persists session entr
     try std.testing.expectEqualStrings("The file says: secret note", context.messages[3].assistant.content[0].text.text);
 }
 
+test "handleCopySlashCommand copies the last assistant message to the clipboard" {
+    const allocator = std.testing.allocator;
+
+    var capture = ClipboardCapture{ .allocator = allocator };
+    defer capture.deinit();
+    const previous_context = clipboard_copy_context;
+    const previous_fn = clipboard_copy_fn;
+    clipboard_copy_context = &capture;
+    clipboard_copy_fn = captureClipboardText;
+    defer {
+        clipboard_copy_context = previous_context;
+        clipboard_copy_fn = previous_fn;
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var assistant = try makeInteractiveTestAssistantMessage("copied reply", current_provider.model, ai.Usage.init(), 1);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    try session.agent.setMessages(&.{assistant});
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleCopySlashCommand(allocator, std.testing.io, &session, &state);
+    try std.testing.expectEqualStrings("copied reply", capture.text.?);
+}
+
+test "handleShareSlashCommand copies markdown transcript to the clipboard" {
+    const allocator = std.testing.allocator;
+
+    var capture = ClipboardCapture{ .allocator = allocator };
+    defer capture.deinit();
+    const previous_context = clipboard_copy_context;
+    const previous_fn = clipboard_copy_fn;
+    clipboard_copy_context = &capture;
+    clipboard_copy_fn = captureClipboardText;
+    defer {
+        clipboard_copy_context = previous_context;
+        clipboard_copy_fn = previous_fn;
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var user = try makeInteractiveTestUserMessage("share prompt", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    var assistant = try makeInteractiveTestAssistantMessage("share reply", current_provider.model, ai.Usage.init(), 2);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    try session.agent.setMessages(&.{ user, assistant });
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &session, &state);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "# Session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "share prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "share reply") != null);
+}
+
+test "handleLogoutSlashCommand removes stored auth for the current provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        auth_path,
+        \\{
+        \\  "openai": {
+        \\    "key": "logout-token"
+        \\  }
+        \\}
+        ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(
+        allocator,
+        &env_map,
+        "openai",
+        null,
+        null,
+        runtime_config.lookupApiKey("openai"),
+    );
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "openai",
+        .runtime_config = &runtime_config,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    try handleLogoutSlashCommand(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &session,
+        &current_provider,
+        options,
+        &state,
+        &live_resources,
+    );
+
+    try std.testing.expect(current_provider.api_key == null);
+    const auth_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(auth_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, auth_bytes, "openai") == null);
+}
+
 fn makeInteractiveTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
     if (name.len == 0) {
         const relative_root = try std.fs.path.join(allocator, &[_][]const u8{
@@ -4879,6 +6209,22 @@ fn makeInteractiveTestAssistantMessage(
         .stop_reason = .stop,
         .timestamp = timestamp,
     } };
+}
+
+const ClipboardCapture = struct {
+    allocator: std.mem.Allocator,
+    text: ?[]u8 = null,
+
+    fn deinit(self: *ClipboardCapture) void {
+        if (self.text) |text| self.allocator.free(text);
+    }
+};
+
+fn captureClipboardText(context: ?*anyopaque, io: std.Io, text: []const u8) !void {
+    _ = io;
+    const capture: *ClipboardCapture = @ptrCast(@alignCast(context.?));
+    if (capture.text) |existing| capture.allocator.free(existing);
+    capture.text = try capture.allocator.dupe(u8, text);
 }
 
 test "native terminal backend prefers ioctl size over environment variables" {
