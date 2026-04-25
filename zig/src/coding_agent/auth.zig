@@ -2,10 +2,10 @@ const std = @import("std");
 const ai = @import("ai");
 const common = @import("tools/common.zig");
 
-const ANTHROPIC_CLIENT_ID_B64 = "YOUR_ANTHROPIC_CLIENT_ID_HERE";
-const GOOGLE_CLIENT_ID_B64 = "YOUR_GOOGLE_CLIENT_ID_HERE";
+const ANTHROPIC_CLIENT_ID_B64 = "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl";
+const GOOGLE_CLIENT_ID_B64 = "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
 const GOOGLE_CLIENT_SECRET_B64 = "YOUR_GOOGLE_CLIENT_SECRET_HERE";
-const GITHUB_CLIENT_ID_B64 = "YOUR_GITHUB_CLIENT_ID_HERE";
+const GITHUB_CLIENT_ID_B64 = "SXYxLmI1MDdhMDhjODdlY2ZlOTg=";
 
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
