@@ -29,13 +29,16 @@ pub const PendingMessageQueue = struct {
     pub fn deinit(self: *PendingMessageQueue) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        deinitMessageSlice(self.allocator, self.messages.items);
         self.messages.deinit(self.allocator);
     }
 
     pub fn enqueue(self: *PendingMessageQueue, message: types.AgentMessage) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.messages.append(self.allocator, message);
+        var owned_message = try cloneMessage(self.allocator, message);
+        errdefer deinitMessage(self.allocator, &owned_message);
+        try self.messages.append(self.allocator, owned_message);
     }
 
     pub fn hasItems(self: *const PendingMessageQueue) bool {
@@ -53,6 +56,7 @@ pub const PendingMessageQueue = struct {
     pub fn clear(self: *PendingMessageQueue) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        deinitMessageSlice(self.allocator, self.messages.items);
         self.messages.clearRetainingCapacity();
     }
 
@@ -65,13 +69,15 @@ pub const PendingMessageQueue = struct {
         }
 
         if (self.mode == .all) {
-            const drained = try allocator.dupe(types.AgentMessage, self.messages.items);
+            const drained = try cloneMessageSlice(allocator, self.messages.items);
+            deinitMessageSlice(self.allocator, self.messages.items);
             self.messages.clearRetainingCapacity();
             return drained;
         }
 
-        const first = try allocator.dupe(types.AgentMessage, self.messages.items[0..1]);
-        _ = self.messages.orderedRemove(0);
+        const first = try cloneMessageSlice(allocator, self.messages.items[0..1]);
+        var removed = self.messages.orderedRemove(0);
+        deinitMessage(self.allocator, &removed);
         return first;
     }
 };
@@ -595,6 +601,27 @@ fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage) voi
     }
 }
 
+fn cloneMessageSlice(allocator: std.mem.Allocator, messages: []const types.AgentMessage) ![]types.AgentMessage {
+    const cloned = try allocator.alloc(types.AgentMessage, messages.len);
+    errdefer allocator.free(cloned);
+
+    var index: usize = 0;
+    errdefer {
+        for (cloned[0..index]) |*message| deinitMessage(allocator, message);
+    }
+
+    for (messages, 0..) |message, message_index| {
+        cloned[message_index] = try cloneMessage(allocator, message);
+        index += 1;
+    }
+
+    return cloned;
+}
+
+fn deinitMessageSlice(allocator: std.mem.Allocator, messages: []types.AgentMessage) void {
+    for (messages) |*message| deinitMessage(allocator, message);
+}
+
 fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]const ai.ContentBlock {
     const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
     errdefer allocator.free(cloned);
@@ -967,7 +994,10 @@ test "pending message queue drains according to mode" {
     try queue_all.enqueue(try userTextMessage(arena.allocator(), "two", 2));
 
     const drained_all = try queue_all.drain(std.testing.allocator);
-    defer std.testing.allocator.free(drained_all);
+    defer {
+        deinitMessageSlice(std.testing.allocator, drained_all);
+        std.testing.allocator.free(drained_all);
+    }
     try std.testing.expectEqual(@as(usize, 2), drained_all.len);
     try std.testing.expect(!queue_all.hasItems());
 
@@ -977,10 +1007,122 @@ test "pending message queue drains according to mode" {
     try queue_one.enqueue(try userTextMessage(arena.allocator(), "second", 2));
 
     const first = try queue_one.drain(std.testing.allocator);
-    defer std.testing.allocator.free(first);
+    defer {
+        deinitMessageSlice(std.testing.allocator, first);
+        std.testing.allocator.free(first);
+    }
     try std.testing.expectEqual(@as(usize, 1), first.len);
     try std.testing.expectEqualStrings("first", first[0].user.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), queue_one.len());
+}
+
+fn complexAssistantMessage(
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    timestamp: i64,
+) !types.AgentMessage {
+    const text = try std.fmt.allocPrint(allocator, "{s} text", .{label});
+    const thinking = try std.fmt.allocPrint(allocator, "{s} thinking", .{label});
+    const signature = try std.fmt.allocPrint(allocator, "sig-{s}", .{label});
+    const response_id = try std.fmt.allocPrint(allocator, "resp-{s}", .{label});
+    const error_message = try std.fmt.allocPrint(allocator, "error-{s}", .{label});
+    const tool_call_id = try std.fmt.allocPrint(allocator, "tool-{s}", .{label});
+
+    const content = try allocator.alloc(ai.ContentBlock, 2);
+    content[0] = .{ .text = .{ .text = text } };
+    content[1] = .{ .thinking = .{
+        .thinking = thinking,
+        .signature = signature,
+    } };
+
+    var items = std.json.Array.init(allocator);
+    try items.append(.{ .integer = 1 });
+    try items.append(.{ .string = try allocator.dupe(u8, "nested") });
+
+    var arguments = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try arguments.put(allocator, try allocator.dupe(u8, "label"), .{ .string = try allocator.dupe(u8, label) });
+    try arguments.put(allocator, try allocator.dupe(u8, "items"), .{ .array = items });
+
+    const tool_calls = try allocator.alloc(ai.ToolCall, 1);
+    tool_calls[0] = .{
+        .id = tool_call_id,
+        .name = try allocator.dupe(u8, "echo"),
+        .arguments = .{ .object = arguments },
+    };
+
+    return .{ .assistant = .{
+        .content = content,
+        .tool_calls = tool_calls,
+        .api = try allocator.dupe(u8, "faux"),
+        .provider = try allocator.dupe(u8, "faux"),
+        .model = try allocator.dupe(u8, "faux-model"),
+        .response_id = response_id,
+        .usage = .{
+            .input = 1,
+            .output = 2,
+            .total_tokens = 3,
+        },
+        .stop_reason = .tool_use,
+        .error_message = error_message,
+        .timestamp = timestamp,
+    } };
+}
+
+test "pending message queue drains queue-owned copies after source allocations are released" {
+    var queue = PendingMessageQueue.init(std.testing.allocator, std.Io.failing, .all);
+    defer queue.deinit();
+
+    {
+        var source_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer source_arena.deinit();
+
+        try queue.enqueue(try complexAssistantMessage(source_arena.allocator(), "copied", 7));
+    }
+
+    const drained = try queue.drain(std.testing.allocator);
+    defer {
+        deinitMessageSlice(std.testing.allocator, drained);
+        std.testing.allocator.free(drained);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), drained.len);
+    const assistant = drained[0].assistant;
+    try std.testing.expectEqualStrings("copied text", assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("copied thinking", assistant.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("sig-copied", assistant.content[1].thinking.signature.?);
+    try std.testing.expectEqualStrings("tool-copied", assistant.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("copied", assistant.tool_calls.?[0].arguments.object.get("label").?.string);
+    try std.testing.expectEqualStrings("nested", assistant.tool_calls.?[0].arguments.object.get("items").?.array.items[1].string);
+    try std.testing.expect(!queue.hasItems());
+}
+
+test "pending message queue clear and deinit release nested queue-owned allocations" {
+    {
+        var clear_queue = PendingMessageQueue.init(std.testing.allocator, std.Io.failing, .all);
+        defer clear_queue.deinit();
+
+        {
+            var source_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer source_arena.deinit();
+
+            try clear_queue.enqueue(try complexAssistantMessage(source_arena.allocator(), "clear", 9));
+        }
+
+        clear_queue.clear();
+        try std.testing.expectEqual(@as(usize, 0), clear_queue.len());
+    }
+
+    {
+        var deinit_queue = PendingMessageQueue.init(std.testing.allocator, std.Io.failing, .all);
+        defer deinit_queue.deinit();
+
+        {
+            var source_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer source_arena.deinit();
+
+            try deinit_queue.enqueue(try complexAssistantMessage(source_arena.allocator(), "deinit", 10));
+        }
+    }
 }
 
 const PromptEventCapture = struct {
