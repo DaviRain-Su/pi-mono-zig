@@ -158,6 +158,27 @@ pub fn startBrowserLogin(
     env_map: *const std.process.Environ.Map,
     provider_id: []const u8,
 ) !BrowserLoginSession {
+    // Check if OAuth config exists before starting the flow
+    const oauth_path = try resolveOAuthConfigPath(allocator, env_map);
+    defer allocator.free(oauth_path);
+
+    const content = std.Io.Dir.readFileAlloc(.cwd(), io, oauth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            return error.MissingOAuthConfigFile;
+        },
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.InvalidOAuthConfigFile;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidOAuthConfigFile;
+
+    const provider_object = findOAuthProviderObject(parsed.value.object, provider_id);
+    if (provider_object == null) {
+        return error.MissingOAuthClientConfig;
+    }
+
     if (std.mem.eql(u8, provider_id, "anthropic")) return startAnthropicBrowserLogin(allocator, io, env_map);
     if (std.mem.eql(u8, provider_id, "google-gemini-cli")) return startGoogleBrowserLogin(allocator, io, env_map);
     return error.UnsupportedProvider;
