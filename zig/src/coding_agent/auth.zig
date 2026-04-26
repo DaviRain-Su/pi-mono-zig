@@ -47,16 +47,50 @@ pub const OAuthClientCredentials = struct {
     }
 };
 
+pub const ProviderAuthType = enum {
+    oauth,
+    api_key,
+};
+
 pub const ProviderInfo = struct {
     id: []const u8,
     name: []const u8,
+    auth_type: ProviderAuthType,
 };
 
-pub const SUPPORTED_PROVIDERS = [_]ProviderInfo{
-    .{ .id = "anthropic", .name = "Anthropic (Claude Pro/Max)" },
-    .{ .id = "github-copilot", .name = "GitHub Copilot" },
-    .{ .id = "google-gemini-cli", .name = "Google Cloud Code Assist (Gemini CLI)" },
+pub const OAUTH_LOGIN_PROVIDERS = [_]ProviderInfo{
+    .{ .id = "anthropic", .name = "Anthropic (Claude Pro/Max)", .auth_type = .oauth },
+    .{ .id = "github-copilot", .name = "GitHub Copilot", .auth_type = .oauth },
+    .{ .id = "google-gemini-cli", .name = "Google Cloud Code Assist (Gemini CLI)", .auth_type = .oauth },
 };
+
+pub const API_KEY_LOGIN_PROVIDERS = [_]ProviderInfo{
+    .{ .id = "anthropic", .name = "Anthropic", .auth_type = .api_key },
+    .{ .id = "amazon-bedrock", .name = "Amazon Bedrock", .auth_type = .api_key },
+    .{ .id = "azure-openai-responses", .name = "Azure OpenAI Responses", .auth_type = .api_key },
+    .{ .id = "cerebras", .name = "Cerebras", .auth_type = .api_key },
+    .{ .id = "fireworks", .name = "Fireworks", .auth_type = .api_key },
+    .{ .id = "google", .name = "Google Gemini", .auth_type = .api_key },
+    .{ .id = "google-vertex", .name = "Google Vertex AI", .auth_type = .api_key },
+    .{ .id = "groq", .name = "Groq", .auth_type = .api_key },
+    .{ .id = "huggingface", .name = "Hugging Face", .auth_type = .api_key },
+    .{ .id = "kimi", .name = "Kimi", .auth_type = .api_key },
+    .{ .id = "kimi-coding", .name = "Kimi For Coding", .auth_type = .api_key },
+    .{ .id = "mistral", .name = "Mistral", .auth_type = .api_key },
+    .{ .id = "minimax", .name = "MiniMax", .auth_type = .api_key },
+    .{ .id = "minimax-cn", .name = "MiniMax (China)", .auth_type = .api_key },
+    .{ .id = "opencode", .name = "OpenCode Zen", .auth_type = .api_key },
+    .{ .id = "opencode-go", .name = "OpenCode Go", .auth_type = .api_key },
+    .{ .id = "openai", .name = "OpenAI", .auth_type = .api_key },
+    .{ .id = "openai-codex", .name = "OpenAI Codex", .auth_type = .api_key },
+    .{ .id = "openai-responses", .name = "OpenAI Responses", .auth_type = .api_key },
+    .{ .id = "openrouter", .name = "OpenRouter", .auth_type = .api_key },
+    .{ .id = "vercel-ai-gateway", .name = "Vercel AI Gateway", .auth_type = .api_key },
+    .{ .id = "xai", .name = "xAI", .auth_type = .api_key },
+    .{ .id = "zai", .name = "ZAI", .auth_type = .api_key },
+};
+
+pub const SUPPORTED_PROVIDERS = OAUTH_LOGIN_PROVIDERS ++ API_KEY_LOGIN_PROVIDERS;
 
 pub const OAuthCredential = struct {
     access: []u8,
@@ -167,6 +201,45 @@ pub fn findSupportedProvider(provider_id: []const u8) ?ProviderInfo {
         if (std.mem.eql(u8, provider.id, provider_id)) return provider;
     }
     return null;
+}
+
+pub fn findSupportedProviderByAuthType(provider_id: []const u8, auth_type: ProviderAuthType) ?ProviderInfo {
+    for (SUPPORTED_PROVIDERS) |provider| {
+        if (provider.auth_type == auth_type and std.mem.eql(u8, provider.id, provider_id)) return provider;
+    }
+    return null;
+}
+
+pub fn getApiKeyProviderDisplayName(provider_id: []const u8) []const u8 {
+    for (API_KEY_LOGIN_PROVIDERS) |provider| {
+        if (std.mem.eql(u8, provider.id, provider_id)) return provider.name;
+    }
+    return provider_id;
+}
+
+pub fn isApiKeyLoginProvider(
+    provider_id: []const u8,
+    oauth_provider_ids: []const []const u8,
+    built_in_provider_ids: ?[]const []const u8,
+) bool {
+    for (API_KEY_LOGIN_PROVIDERS) |provider| {
+        if (std.mem.eql(u8, provider.id, provider_id)) return true;
+    }
+
+    if (built_in_provider_ids) |provider_ids| {
+        for (provider_ids) |candidate| {
+            if (std.mem.eql(u8, candidate, provider_id)) return false;
+        }
+    } else {
+        for (ai.model_registry.builtInProviderConfigs()) |provider| {
+            if (std.mem.eql(u8, provider.provider, provider_id)) return false;
+        }
+    }
+
+    for (oauth_provider_ids) |candidate| {
+        if (std.mem.eql(u8, candidate, provider_id)) return false;
+    }
+    return true;
 }
 
 pub fn startBrowserLogin(
@@ -541,10 +614,12 @@ pub fn listStoredProviders(
     var providers = std.ArrayList(ProviderInfo).empty;
     errdefer providers.deinit(allocator);
 
-    for (SUPPORTED_PROVIDERS) |provider| {
-        if (stored.object.get(provider.id)) |entry| {
-            if (entry == .object) try providers.append(allocator, provider);
-        }
+    var iterator = stored.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const auth_type = storedCredentialAuthType(entry.value_ptr.object) orelse continue;
+        const provider = findSupportedProviderByAuthType(entry.key_ptr.*, auth_type) orelse continue;
+        try providers.append(allocator, provider);
     }
 
     return try providers.toOwnedSlice(allocator);
@@ -667,6 +742,15 @@ fn credentialToJson(allocator: std.mem.Allocator, credential: *const StoredCrede
     }
 
     return .{ .object = object };
+}
+
+fn storedCredentialAuthType(object: std.json.ObjectMap) ?ProviderAuthType {
+    if (getObjectString(object, "type")) |value| {
+        if (std.mem.eql(u8, value, "oauth")) return .oauth;
+        if (std.mem.eql(u8, value, "api_key")) return .api_key;
+    }
+    if (getObjectString(object, "key") != null) return .api_key;
+    return null;
 }
 
 const AuthFileLock = struct {
@@ -1448,6 +1532,19 @@ test "buildApiKeyFromStoredEntry encodes google oauth credentials as provider js
     try std.testing.expect(std.mem.indexOf(u8, api_key, "\"projectId\":\"project-123\"") != null);
 }
 
+test "isApiKeyLoginProvider keeps built-in API key providers separate from OAuth-only providers" {
+    const oauth_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "custom-oauth" };
+    const built_in_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "amazon-bedrock", "openai" };
+
+    try std.testing.expect(isApiKeyLoginProvider("anthropic", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+    try std.testing.expectEqualStrings("Anthropic", getApiKeyProviderDisplayName("anthropic"));
+    try std.testing.expect(isApiKeyLoginProvider("openai", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+    try std.testing.expect(!isApiKeyLoginProvider("github-copilot", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+    try std.testing.expect(isApiKeyLoginProvider("amazon-bedrock", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+    try std.testing.expect(!isApiKeyLoginProvider("custom-oauth", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+    try std.testing.expect(isApiKeyLoginProvider("custom-api", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+}
+
 test "resolveApiKey prefers runtime overrides over stored and environment credentials" {
     const allocator = std.testing.allocator;
 
@@ -1522,11 +1619,43 @@ test "upsertStoredCredential and listStoredProviders persist oauth state" {
 
     try std.testing.expectEqual(@as(usize, 1), providers.len);
     try std.testing.expectEqualStrings("google-gemini-cli", providers[0].id);
-
     const stat = try std.Io.Dir.statFile(.cwd(), std.testing.io, auth_path, .{});
     if (@hasDecl(@TypeOf(stat.permissions), "toMode")) {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
     }
+}
+
+test "listStoredProviders includes built-in API key credentials" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const auth_path = try std.fs.path.resolve(allocator, &[_][]const u8{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "agent",
+        "auth.json",
+    });
+    defer allocator.free(auth_path);
+
+    var credential = StoredCredential{
+        .api_key = try allocator.dupe(u8, "openai-key"),
+    };
+    defer credential.deinit(allocator);
+
+    try upsertStoredCredential(allocator, std.testing.io, auth_path, "openai", &credential);
+    const providers = try listStoredProviders(allocator, std.testing.io, auth_path);
+    defer allocator.free(providers);
+
+    try std.testing.expectEqual(@as(usize, 1), providers.len);
+    try std.testing.expectEqualStrings("openai", providers[0].id);
+    try std.testing.expectEqualStrings("OpenAI", providers[0].name);
+    try std.testing.expectEqual(ProviderAuthType.api_key, providers[0].auth_type);
 }
 
 test "auth storage lock serializes concurrent writes" {

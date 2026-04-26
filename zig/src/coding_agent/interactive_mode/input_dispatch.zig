@@ -167,6 +167,7 @@ pub fn handleInputKey(
                             io,
                             env_map,
                             auth_overlay.choices[index].provider_id,
+                            auth_overlay.choices[index].auth_type,
                             app_state,
                             auth_flow,
                         ),

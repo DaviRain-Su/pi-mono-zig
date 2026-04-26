@@ -597,7 +597,7 @@ pub fn handleLoginSlashCommand(
     auth_flow: *?AuthFlow,
 ) !void {
     if (argument) |provider_id| {
-        try beginLoginFlow(allocator, io, env_map, provider_id, app_state, auth_flow);
+        try beginLoginFlow(allocator, io, env_map, provider_id, null, app_state, auth_flow);
         return;
     }
     overlay.* = try loadAuthOverlay(allocator, .login, null);
@@ -608,16 +608,37 @@ pub fn beginLoginFlow(
     io: std.Io,
     env_map: *const std.process.Environ.Map,
     provider_id: []const u8,
+    auth_type: ?auth.ProviderAuthType,
     app_state: *AppState,
     auth_flow: *?AuthFlow,
 ) !void {
-    if (auth.findSupportedProvider(provider_id)) |provider| {
+    const provider = if (auth_type) |value|
+        auth.findSupportedProviderByAuthType(provider_id, value)
+    else
+        auth.findSupportedProvider(provider_id);
+    if (provider) |resolved_provider| {
         if (auth_flow.*) |*existing| existing.deinit(allocator);
         auth_flow.* = null;
 
-        if (std.mem.eql(u8, provider.id, "github-copilot")) {
+        if (resolved_provider.auth_type == .api_key) {
+            const intro = try std.fmt.allocPrint(
+                allocator,
+                "{s} API key login started. Paste the API key or credential string into the prompt below.",
+                .{resolved_provider.name},
+            );
+            defer allocator.free(intro);
+            try app_state.appendInfo(intro);
+            try app_state.setStatus("Paste the API key and press Enter, or Esc to cancel");
+            auth_flow.* = .{ .api_key = .{
+                .provider_id = resolved_provider.id,
+                .provider_name = resolved_provider.name,
+            } };
+            return;
+        }
+
+        if (std.mem.eql(u8, resolved_provider.id, "github-copilot")) {
             const copilot = auth.startGitHubCopilotLogin(allocator, io, env_map) catch |err| {
-                if (try auth.formatOAuthClientConfigError(allocator, env_map, provider.id, err)) |message| {
+                if (try auth.formatOAuthClientConfigError(allocator, env_map, resolved_provider.id, err)) |message| {
                     defer allocator.free(message);
                     try app_state.appendError(message);
                     return;
@@ -638,8 +659,8 @@ pub fn beginLoginFlow(
             return;
         }
 
-        const browser_session = auth.startBrowserLogin(allocator, io, env_map, provider.id) catch |err| {
-            if (try auth.formatOAuthClientConfigError(allocator, env_map, provider.id, err)) |message| {
+        const browser_session = auth.startBrowserLogin(allocator, io, env_map, resolved_provider.id) catch |err| {
+            if (try auth.formatOAuthClientConfigError(allocator, env_map, resolved_provider.id, err)) |message| {
                 defer allocator.free(message);
                 try app_state.appendError(message);
                 return;
@@ -651,7 +672,7 @@ pub fn beginLoginFlow(
         const intro = try std.fmt.allocPrint(
             allocator,
             "{s} login started. Open the browser URL below. If the localhost callback page says connection refused, copy that full address-bar URL and paste it into the prompt.",
-            .{provider.name},
+            .{resolved_provider.name},
         );
         defer allocator.free(intro);
         try app_state.appendInfo(intro);
@@ -790,6 +811,31 @@ pub fn submitAuthFlowInput(
                     );
                 },
             }
+        },
+        .api_key => |api_key_prompt| {
+            if (trimmed.len == 0) {
+                try app_state.setStatus("Paste the API key before pressing Enter");
+                return;
+            }
+
+            var credential = auth.StoredCredential{
+                .api_key = try allocator.dupe(u8, trimmed),
+            };
+            defer credential.deinit(allocator);
+            try persistLoginCredential(
+                allocator,
+                io,
+                env_map,
+                session,
+                current_provider,
+                api_key_prompt.provider_id,
+                api_key_prompt.provider_name,
+                &credential,
+                options,
+                app_state,
+                auth_flow,
+                live_resources,
+            );
         },
     }
 

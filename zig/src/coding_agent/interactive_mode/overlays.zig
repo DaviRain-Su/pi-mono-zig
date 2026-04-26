@@ -167,6 +167,7 @@ pub const AuthOverlayMode = enum {
 pub const AuthChoice = struct {
     provider_id: []u8,
     provider_name: []u8,
+    auth_type: auth.ProviderAuthType,
 };
 
 pub const AuthOverlay = struct {
@@ -195,12 +196,14 @@ pub const AuthFlow = union(enum) {
     browser_redirect: PendingBrowserRedirect,
     google_project: PendingGoogleProject,
     copilot_device: auth.CopilotDeviceLogin,
+    api_key: PendingApiKeyEntry,
 
     pub fn deinit(self: *AuthFlow, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .browser_redirect => |*value| value.deinit(allocator),
             .google_project => |*value| value.deinit(allocator),
             .copilot_device => |*value| value.deinit(allocator),
+            .api_key => |*value| value.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -222,6 +225,15 @@ pub const PendingGoogleProject = struct {
 
     pub fn deinit(self: *PendingGoogleProject, allocator: std.mem.Allocator) void {
         self.exchange.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PendingApiKeyEntry = struct {
+    provider_id: []const u8,
+    provider_name: []const u8,
+
+    pub fn deinit(self: *PendingApiKeyEntry, _: std.mem.Allocator) void {
         self.* = undefined;
     }
 };
@@ -269,13 +281,17 @@ pub fn loadAuthOverlay(
         choices[index] = .{
             .provider_id = try allocator.dupe(u8, provider.id),
             .provider_name = try allocator.dupe(u8, provider.name),
+            .auth_type = provider.auth_type,
         };
         items[index] = .{
             .value = try allocator.dupe(u8, provider.id),
             .label = try allocator.dupe(u8, provider.name),
             .description = try allocator.dupe(
                 u8,
-                if (mode == .login) "OAuth login" else "Stored credentials",
+                switch (mode) {
+                    .login => if (provider.auth_type == .oauth) "OAuth login" else "API key login",
+                    .logout => if (provider.auth_type == .oauth) "Stored OAuth credentials" else "Stored API key",
+                },
             ),
         };
     }
