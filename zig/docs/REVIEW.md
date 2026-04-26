@@ -251,12 +251,225 @@
 
 #### 阶段 1+2+3 合计
 
-- 阶段 1：**8–13 周**（约 2–3 个月）
+- 阶段 1：**8–13 周**（约 2–3 个月，含隐藏工作量更可能 **12–16 周**）
 - 阶段 2：持续，无固定工期
 - 阶段 3：**2–3 周**（按需启动）
 
 依赖顺序：阶段 1 必须先完成（否则没扩展生态可用），阶段 2/3 可并行推进。
 **未先做阶段 1 就去做 providers/MCP/UI 会反复返工。**
+
+---
+
+### 6.B 路线 B 阶段 1 详细设计
+
+下面把阶段 1 拆到可以直接开工的颗粒度。
+
+#### 6.B.1 进程模型
+
+```
+Zig 宿主进程
+  └─ spawn ─→ Bun 子进程 (extension-host.ts)
+                 ├─ 加载所有已安装扩展
+                 ├─ 维护扩展实例生命周期
+                 └─ 通过 stdio 与 Zig 通信
+
+通信通道：
+  - Zig → Bun: 子进程 stdin
+  - Bun → Zig: 子进程 stdout
+  - Bun 日志:   子进程 stderr（Zig 旁路收集）
+```
+
+要点：
+- **一个 Bun 子进程承载所有扩展**（不是每扩展一进程），扩展之间共享 Bun runtime。
+- 启动时机：Zig 宿主初始化后惰性 spawn，第一次需要扩展时才起。
+- 关闭时机：Zig 宿主退出前发送 `shutdown` 通知，超时则 SIGTERM 强杀。
+
+#### 6.B.2 协议（JSON-RPC over stdio + 长度前缀）
+
+帧格式（避免 stdout 输出乱掉行边界）：
+```
+Content-Length: <bytes>\r\n
+\r\n
+<json payload>
+```
+
+这是 LSP 同款帧格式，库现成，调试友好。
+
+消息类型：
+- **Request**（双向都能发）：`{ jsonrpc, id, method, params }`
+- **Response**：`{ jsonrpc, id, result | error }`
+- **Notification**（无 id，无回包）：`{ jsonrpc, method, params }`
+
+#### 6.B.3 核心方法分类
+
+**Zig → Bun（宿主调扩展）**
+| 方法 | 用途 |
+|---|---|
+| `host/initialize` | 握手、传配置、扩展目录 |
+| `host/shutdown` | 优雅退出 |
+| `extensions/load` | 加载某个扩展 |
+| `extensions/unload` | 卸载某个扩展 |
+| `extensions/reload` | 热重载 |
+| `extensions/list` | 已加载列表 |
+| `tool/invoke` | 调用扩展注册的 tool |
+| `command/run` | 调用扩展注册的 slash command |
+| `provider/complete` | 调用扩展注册的 provider |
+| `ui/event` | 把 UI 事件转发给扩展 |
+
+**Bun → Zig（扩展调宿主）**
+| 方法 | 用途 |
+|---|---|
+| `register/tool` | 扩展声明它提供的 tool |
+| `register/command` | 声明 slash command |
+| `register/provider` | 声明 provider |
+| `register/oauth` | 声明 OAuth 流程 |
+| `register/ui` | 声明 UI widget / footer / header |
+| `session/append` | 写入 session entry |
+| `session/query` | 读 session 历史 |
+| `agent/emit` | 发 event |
+| `host/log` | 日志（Zig 决定怎么输出） |
+| `host/fs` | 受权限控制的 FS 访问 |
+| `ui/request` | 向 TUI 请求（弹 overlay 等） |
+
+注意：**所有"注册"调用都是幂等的，且必须在 `extensions/load` 处理期间完成**。
+load 返回后注册集合冻结，避免运行期偷偷改 tool 列表。
+
+#### 6.B.4 流式与事件
+
+很多 method 是流式的（tool 输出、provider 流式 token、session entry 增量）。
+方案：
+
+- 对流式调用，response 只回 `{ stream_id }`，后续走 notification：
+  - `stream/chunk` `{ stream_id, data }`
+  - `stream/end` `{ stream_id, ok | error }`
+- 调用方可发 `stream/cancel` `{ stream_id }` 取消。
+
+这样不引入 WebSocket / SSE 复杂度，单 stdio 通道就能跑。
+
+#### 6.B.5 扩展 manifest
+
+每个扩展一个 `package.json` + 一个 `extension.json`：
+
+```jsonc
+// extension.json
+{
+  "id": "my-extension",
+  "version": "1.0.0",
+  "type": "node",                  // 阶段 3 后还会有 "wasm"
+  "entry": "./dist/index.js",
+  "engines": { "pi-agent": "^1.0" },
+  "capabilities": {
+    "tools": ["my_tool"],
+    "commands": ["/my-cmd"],
+    "providers": ["my-provider"],
+    "ui": ["footer"]
+  },
+  "permissions": {
+    "fs": { "read": ["${workspace}"], "write": [] },
+    "net": { "domains": ["api.example.com"] },
+    "shell": false
+  }
+}
+```
+
+`capabilities` 仅作声明，**实际能力以 `register/*` 调用为准**，但宿主可以在 manifest 与
+register 不一致时拒绝加载或告警。
+
+#### 6.B.6 安装路径与 Bun 锁定
+
+```
+~/.pi/
+  bun/
+    bun-1.1.x/                    # 自带 Bun，按版本号目录
+  extensions/
+    <ext-id>@<version>/
+      extension.json
+      package.json
+      node_modules/               # 由 bun install 填充
+      dist/
+  extension-host/
+    host.ts                       # Zig 自带的 host 脚本
+  config.json
+```
+
+包管理：`pi install <pkg>` ≈ `cd ~/.pi/extensions/<id> && bun install <pkg>`。
+
+#### 6.B.7 权限模型
+
+扩展权限**默认拒绝**，从三处汇总：
+
+1. `extension.json.permissions` 声明
+2. 用户在 `~/.pi/config.json` 里允许或拒绝
+3. 运行时弹窗（首次访问敏感资源时）
+
+宿主侧拦截点：
+- **FS**：扩展走 `host/fs`，Zig 校验路径白名单
+- **网络**：Bun 启动时通过 `--allow-net=...` 限制（Bun 已支持类 Deno 的权限 flag）
+- **Shell**：扩展不允许直接 `child_process.spawn`，必须走 `host/shell`，Zig 决定是否放行
+
+#### 6.B.8 与 TS 现有扩展 API 的对齐
+
+阶段 1 的核心交付物是一个 **`@pi-agent/sdk`** npm 包，给扩展作者写 TS 时引入：
+
+```ts
+import { defineExtension, defineTool } from "@pi-agent/sdk";
+
+export default defineExtension({
+  id: "my-ext",
+  tools: [
+    defineTool({
+      name: "my_tool",
+      schema: { ... },
+      async run(params, ctx) {
+        ctx.log("hello");
+        return { content: "..." };
+      },
+    }),
+  ],
+});
+```
+
+`@pi-agent/sdk` 内部把 `defineTool` 等翻译成 `register/tool` JSON-RPC 调用。
+**TS 现有扩展只要换成这个 SDK，就能在 Zig 宿主下跑**。
+
+如果当前 TS 版的 SDK 已经是同名同 shape，那直接复用，不再造新的。
+**关键动作**：开工前，把 TS 现有 SDK 的所有公开签名导出成 `.d.ts`，作为 Zig 宿主的实现契约。
+
+#### 6.B.9 错误处理与崩溃恢复
+
+- **Bun 子进程崩溃**：Zig 监听退出码，记录 stderr，标记所有扩展为"unloaded"，向 TUI
+  发提示，不影响主流程。
+- **重启策略**：用户主动 `/reload-extensions`，或 Zig 在下一次需要扩展时惰性重启。
+- **单个扩展抛错**：Bun host 用 `try/catch` 包住，回 `error` response，Zig 记录但不
+  传染其他扩展。
+- **协议错误**：收到不识别的 method 回 `MethodNotFound`，不识别的 id 回 `InvalidRequest`。
+  连续 N 次协议错误则视为 host 行为异常，重启。
+
+#### 6.B.10 测试策略
+
+- **协议层**：用 Mock Bun host（一个 Zig 写的回放器）跑契约测试。
+- **集成层**：跑一个真实 hello-world 扩展，覆盖 tool / command / provider / 流式 /
+  错误 / 取消六类场景。
+- **回归层**：从 TS 仓库选 3–5 个真实扩展，作为冒烟用例。
+- **性能层**：单次 RPC < 5ms（本机 stdio），流式 chunk 延迟 < 10ms。
+
+#### 6.B.11 阶段 1 工期细分（修正版）
+
+| 子任务 | 估时 |
+|---|---|
+| 协议（帧格式 + JSON-RPC + 流式 + 取消） | 1 周 |
+| Bun 子进程生命周期（启动/关闭/崩溃恢复） | 1 周 |
+| Zig 端 binding（method 路由、`host/*` 实现） | 2 周 |
+| TS 端 host.ts + `@pi-agent/sdk` | 2 周 |
+| 权限模型（FS/Net/Shell 拦截） | 1 周 |
+| 包管理（`pi install/remove/update/list/config`） | 1 周 |
+| 扩展 manifest + 安装目录管理 | 0.5 周 |
+| TS 扩展 API 契约对齐（按 `.d.ts` 实现） | 2–3 周 |
+| 真实扩展联调（含意外坑） | 2–3 周 |
+| 测试套件 | 1 周 |
+| **合计** | **13.5–16.5 周** |
+
+比初版的 8–13 周更接近真实数字。
 
 ---
 
