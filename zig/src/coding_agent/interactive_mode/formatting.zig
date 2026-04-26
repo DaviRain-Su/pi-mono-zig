@@ -13,7 +13,7 @@ pub fn formatPrefixedBlocks(allocator: std.mem.Allocator, prefix: []const u8, bl
 }
 
 pub fn formatAssistantMessage(allocator: std.mem.Allocator, message: ai.AssistantMessage) ![]u8 {
-    const body = try blocksToText(allocator, message.content);
+    const body = try blocksToTextWithoutThinking(allocator, message.content);
     defer allocator.free(body);
     if (body.len > 0) {
         return allocator.dupe(u8, body);
@@ -221,23 +221,62 @@ fn looksLikeGateMessage(body: []const u8) bool {
 }
 
 pub fn blocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    return blocksToTextFiltered(allocator, blocks, true);
+}
+
+fn blocksToTextWithoutThinking(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    return blocksToTextFiltered(allocator, blocks, false);
+}
+
+fn blocksToTextFiltered(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock, include_thinking: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    for (blocks, 0..) |block, index| {
-        if (index > 0) try out.appendSlice(allocator, "\n");
+    var appended = false;
+    for (blocks) |block| {
         switch (block) {
-            .text => |text| try out.appendSlice(allocator, text.text),
-            .thinking => |thinking| try out.appendSlice(allocator, thinking.thinking),
+            .thinking => |thinking| {
+                if (!include_thinking) continue;
+                if (appended) try out.appendSlice(allocator, "\n");
+                try out.appendSlice(allocator, thinking.thinking);
+                appended = true;
+            },
+            .text => |text| {
+                if (appended) try out.appendSlice(allocator, "\n");
+                try out.appendSlice(allocator, text.text);
+                appended = true;
+            },
             .image => |image| {
+                if (appended) try out.appendSlice(allocator, "\n");
                 const note = try std.fmt.allocPrint(allocator, "[image:{s}:{d}]", .{ image.mime_type, image.data.len });
                 defer allocator.free(note);
                 try out.appendSlice(allocator, note);
+                appended = true;
             },
         }
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+test "formatAssistantMessage hides thinking blocks" {
+    const allocator = std.testing.allocator;
+    const blocks = [_]ai.ContentBlock{
+        .{ .thinking = .{ .thinking = "internal reasoning" } },
+        .{ .text = .{ .text = "visible answer" } },
+    };
+    const rendered = try formatAssistantMessage(allocator, .{
+        .content = &blocks,
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .model = "gpt-5.5",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    });
+    defer allocator.free(rendered);
+
+    try std.testing.expectEqualStrings("visible answer", rendered);
 }
 
 test "formatToolCall renders read arguments as a concise status line" {

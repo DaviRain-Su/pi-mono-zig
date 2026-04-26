@@ -279,7 +279,6 @@ pub fn handleInputKey(
         );
         return;
     }
-
     if (live_resources.keybindings != null and isLegacyAppActionKey(key)) {
         return;
     }
@@ -388,6 +387,19 @@ pub fn submitEditorText(
     }
 
     if (prompt_worker_active.*) {
+        if (session.isStreaming() or session.isCompacting()) {
+            try queueEditorText(
+                allocator,
+                trimmed,
+                session,
+                app_state,
+                editor,
+                .steering,
+                if (session.isCompacting()) "queued steering message for after compaction" else "queued steering message",
+                live_resources.prompt_templates,
+            );
+            return;
+        }
         try app_state.setStatus("response in progress");
         return;
     }
@@ -399,6 +411,182 @@ pub fn submitEditorText(
     prompt_worker_active.* = true;
     clearEditor(app_state, editor);
     try app_state.setStatus("thinking");
+}
+
+fn queueEditorText(
+    allocator: std.mem.Allocator,
+    trimmed: []const u8,
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    mode: rendering.QueueDisplayMode,
+    status_text: []const u8,
+    prompt_templates: []const resources_mod.PromptTemplate,
+) !void {
+    const expanded = try resources_mod.expandPromptTemplate(allocator, trimmed, prompt_templates);
+    defer allocator.free(expanded);
+
+    const prompt_images = try app_state.clonePendingEditorImages(allocator);
+    defer prompt_worker_mod.deinitImageContents(allocator, prompt_images);
+
+    switch (mode) {
+        .steering => try session.steer(expanded, prompt_images),
+        .follow_up => try session.followUp(expanded, prompt_images),
+    }
+
+    try app_state.appendQueuedMessage(mode, expanded);
+    clearEditor(app_state, editor);
+    try app_state.setStatus(status_text);
+}
+
+fn handleFollowUpAction(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    live_resources: *LiveResources,
+) !void {
+    if (editor.isShowingAutocomplete()) {
+        _ = try editor.handleKey(.enter);
+        return;
+    }
+
+    const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    if (parseSlashCommand(trimmed) != null or trimmed[0] == '/') {
+        try submitEditorText(
+            allocator,
+            io,
+            env_map,
+            trimmed,
+            session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
+            app_state,
+            editor,
+            overlay,
+            auth_flow,
+            prompt_worker,
+            prompt_worker_active,
+            subscriber,
+            should_exit,
+            live_resources,
+        );
+        return;
+    }
+
+    if (prompt_worker_active.* and (session.isStreaming() or session.isCompacting())) {
+        try queueEditorText(
+            allocator,
+            trimmed,
+            session,
+            app_state,
+            editor,
+            .follow_up,
+            if (session.isCompacting()) "queued follow-up for after compaction" else "queued follow-up message",
+            live_resources.prompt_templates,
+        );
+        return;
+    }
+
+    try submitEditorText(
+        allocator,
+        io,
+        env_map,
+        trimmed,
+        session,
+        current_provider,
+        session_dir,
+        options,
+        tool_items,
+        app_state,
+        editor,
+        overlay,
+        auth_flow,
+        prompt_worker,
+        prompt_worker_active,
+        subscriber,
+        should_exit,
+        live_resources,
+    );
+}
+
+fn handleDequeueAction(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+    editor: *tui.Editor,
+) !void {
+    var cleared = try session.clearQueue(allocator);
+    defer cleared.deinit(allocator);
+
+    if (cleared.count() == 0) {
+        try app_state.setStatus("No queued messages to restore");
+        return;
+    }
+
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+
+    var appended_any = false;
+    for (cleared.steering) |queued| {
+        if (queued.text.len > 0) {
+            if (appended_any) try builder.appendSlice(allocator, "\n\n");
+            try builder.appendSlice(allocator, queued.text);
+            appended_any = true;
+        }
+        for (queued.images) |image| {
+            try app_state.appendPendingEditorImage(.{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            });
+        }
+    }
+    for (cleared.follow_up) |queued| {
+        if (queued.text.len > 0) {
+            if (appended_any) try builder.appendSlice(allocator, "\n\n");
+            try builder.appendSlice(allocator, queued.text);
+            appended_any = true;
+        }
+        for (queued.images) |image| {
+            try app_state.appendPendingEditorImage(.{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            });
+        }
+    }
+
+    const current_text = editor.text();
+    if (current_text.len > 0) {
+        if (appended_any) try builder.appendSlice(allocator, "\n\n");
+        try builder.appendSlice(allocator, current_text);
+    }
+
+    editor.reset();
+    _ = try editor.handlePaste(builder.items);
+    app_state.clearQueuedMessages();
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Restored {d} queued message{s} to the editor",
+        .{ cleared.count(), if (cleared.count() == 1) "" else "s" },
+    );
+    defer allocator.free(message);
+    try app_state.setStatus(message);
 }
 
 fn handlePasteImageAction(
@@ -541,6 +729,41 @@ pub fn dispatchInputEvent(
                 consumeInputBytes(input_buffer, parsed.consumed);
                 return;
             }
+            if (overlay.* == null and auth_flow.* == null) {
+                if (resolveParsedAppAction(live_resources.keybindings, key, parsed.modifiers)) |action| {
+                    switch (action) {
+                        .queue_follow_up => {
+                            try handleFollowUpAction(
+                                allocator,
+                                io,
+                                env_map,
+                                session,
+                                current_provider,
+                                session_dir,
+                                options,
+                                tool_items,
+                                app_state,
+                                editor,
+                                overlay,
+                                auth_flow,
+                                prompt_worker,
+                                prompt_worker_active,
+                                subscriber,
+                                should_exit,
+                                live_resources,
+                            );
+                            consumeInputBytes(input_buffer, parsed.consumed);
+                            return;
+                        },
+                        .dequeue_messages => {
+                            try handleDequeueAction(allocator, session, app_state, editor);
+                            consumeInputBytes(input_buffer, parsed.consumed);
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+            }
             try handleInputKey(
                 allocator,
                 io,
@@ -594,7 +817,31 @@ pub fn resolveAppAction(keybindings: ?*const keybindings_mod.Keybindings, key: t
     return legacyAppActionForKey(key);
 }
 
+pub fn resolveParsedAppAction(
+    keybindings: ?*const keybindings_mod.Keybindings,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) ?keybindings_mod.Action {
+    if (keybindings) |bindings| return bindings.actionForKeyWithModifiers(key, modifiers);
+    return legacyParsedAppActionForKey(key, modifiers);
+}
+
 pub fn legacyAppActionForKey(key: tui.Key) ?keybindings_mod.Action {
+    return legacyParsedAppActionForKey(key, .{});
+}
+
+pub fn legacyParsedAppActionForKey(
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) ?keybindings_mod.Action {
+    if (modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super) {
+        return switch (key) {
+            .enter => .queue_follow_up,
+            .up => .dequeue_messages,
+            else => null,
+        };
+    }
+
     return switch (key) {
         .ctrl => |ctrl| switch (ctrl) {
             'c' => .interrupt,
@@ -654,6 +901,7 @@ pub fn handleAppAction(
             }
             overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns, runtime_config);
         },
+        .queue_follow_up, .dequeue_messages => {},
         .paste_image => {},
     }
 }

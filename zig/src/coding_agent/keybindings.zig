@@ -7,6 +7,8 @@ pub const Action = enum(u8) {
     clear,
     open_sessions,
     open_models,
+    queue_follow_up,
+    dequeue_messages,
     paste_image,
 };
 
@@ -16,6 +18,8 @@ pub const KeySpec = union(enum) {
     enter,
     tab,
     shift_tab,
+    alt_enter,
+    alt_up,
     up,
     down,
     left,
@@ -27,26 +31,28 @@ pub const KeySpec = union(enum) {
     backspace,
     delete,
 
-    pub fn matches(self: KeySpec, key: tui.Key) bool {
+    pub fn matches(self: KeySpec, key: tui.Key, modifiers: tui.keys.KeyModifiers) bool {
         return switch (self) {
             .ctrl => |value| switch (key) {
-                .ctrl => |pressed| pressed == value,
+                .ctrl => |pressed| pressed == value and !modifiers.hasAny(),
                 else => false,
             },
-            .escape => key == .escape,
-            .enter => key == .enter,
-            .tab => key == .tab,
-            .shift_tab => key == .shift_tab,
-            .up => key == .up,
-            .down => key == .down,
-            .left => key == .left,
-            .right => key == .right,
-            .home => key == .home,
-            .end => key == .end,
-            .page_up => key == .page_up,
-            .page_down => key == .page_down,
-            .backspace => key == .backspace,
-            .delete => key == .delete,
+            .escape => key == .escape and !modifiers.hasAny(),
+            .enter => key == .enter and !modifiers.hasAny(),
+            .tab => key == .tab and !modifiers.hasAny(),
+            .shift_tab => key == .shift_tab and !modifiers.hasAny(),
+            .alt_enter => key == .enter and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
+            .alt_up => key == .up and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
+            .up => key == .up and !modifiers.hasAny(),
+            .down => key == .down and !modifiers.hasAny(),
+            .left => key == .left and !modifiers.hasAny(),
+            .right => key == .right and !modifiers.hasAny(),
+            .home => key == .home and !modifiers.hasAny(),
+            .end => key == .end and !modifiers.hasAny(),
+            .page_up => key == .page_up and !modifiers.hasAny(),
+            .page_down => key == .page_down and !modifiers.hasAny(),
+            .backspace => key == .backspace and !modifiers.hasAny(),
+            .delete => key == .delete and !modifiers.hasAny(),
         };
     }
 
@@ -57,6 +63,8 @@ pub const KeySpec = union(enum) {
             .enter => allocator.dupe(u8, "Enter"),
             .tab => allocator.dupe(u8, "Tab"),
             .shift_tab => allocator.dupe(u8, "Shift+Tab"),
+            .alt_enter => allocator.dupe(u8, "Alt+Enter"),
+            .alt_up => allocator.dupe(u8, "Alt+Up"),
             .up => allocator.dupe(u8, "Up"),
             .down => allocator.dupe(u8, "Down"),
             .left => allocator.dupe(u8, "Left"),
@@ -83,6 +91,8 @@ const DEFINITIONS = [_]BindingDefinition{
     .{ .action = .clear, .id = "app.clear", .defaults = &.{"ctrl+l"} },
     .{ .action = .open_sessions, .id = "app.session.select", .defaults = &.{"ctrl+s"} },
     .{ .action = .open_models, .id = "app.model.select", .defaults = &.{"ctrl+p"} },
+    .{ .action = .queue_follow_up, .id = "app.message.followUp", .defaults = &.{"alt+enter"} },
+    .{ .action = .dequeue_messages, .id = "app.message.dequeue", .defaults = &.{"alt+up"} },
     .{ .action = .paste_image, .id = "app.clipboard.pasteImage", .defaults = &.{"ctrl+v"} },
 };
 
@@ -118,9 +128,17 @@ pub const Keybindings = struct {
     }
 
     pub fn actionForKey(self: *const Keybindings, key: tui.Key) ?Action {
+        return self.actionForKeyWithModifiers(key, .{});
+    }
+
+    pub fn actionForKeyWithModifiers(
+        self: *const Keybindings,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+    ) ?Action {
         for (DEFINITIONS, 0..) |definition, index| {
             for (self.bindings[index]) |spec| {
-                if (spec.matches(key)) return definition.action;
+                if (spec.matches(key, modifiers)) return definition.action;
             }
         }
         return null;
@@ -202,6 +220,8 @@ fn parseKeySpec(raw: []const u8) ?KeySpec {
     if (std.mem.eql(u8, normalized, "enter") or std.mem.eql(u8, normalized, "return")) return .enter;
     if (std.mem.eql(u8, normalized, "tab")) return .tab;
     if (std.mem.eql(u8, normalized, "shift+tab")) return .shift_tab;
+    if (std.mem.eql(u8, normalized, "alt+enter")) return .alt_enter;
+    if (std.mem.eql(u8, normalized, "alt+up")) return .alt_up;
     if (std.mem.eql(u8, normalized, "up")) return .up;
     if (std.mem.eql(u8, normalized, "down")) return .down;
     if (std.mem.eql(u8, normalized, "left")) return .left;
@@ -232,6 +252,8 @@ test "keybindings use defaults and allow overrides from file" {
     try std.testing.expectEqual(Action.clear, defaults.actionForKey(.{ .ctrl = 'l' }).?);
     try std.testing.expectEqual(Action.exit, defaults.actionForKey(.{ .ctrl = 'd' }).?);
     try std.testing.expectEqual(Action.exit, defaults.actionForKey(.escape).?);
+    try std.testing.expectEqual(Action.queue_follow_up, defaults.actionForKeyWithModifiers(.enter, .{ .alt = true }).?);
+    try std.testing.expectEqual(Action.dequeue_messages, defaults.actionForKeyWithModifiers(.up, .{ .alt = true }).?);
     try std.testing.expectEqual(Action.paste_image, defaults.actionForKey(.{ .ctrl = 'v' }).?);
 
     var tmp = std.testing.tmpDir(.{});
@@ -243,6 +265,8 @@ test "keybindings use defaults and allow overrides from file" {
         \\{
         \\  "app.clear": "ctrl+x",
         \\  "app.exit": ["ctrl+q"],
+        \\  "app.message.followUp": "alt+up",
+        \\  "app.message.dequeue": "alt+enter",
         \\  "app.clipboard.pasteImage": "ctrl+y"
         \\}
         ,
@@ -258,6 +282,8 @@ test "keybindings use defaults and allow overrides from file" {
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'l' }) == null);
     try std.testing.expectEqual(Action.exit, loaded.actionForKey(.{ .ctrl = 'q' }).?);
     try std.testing.expect(loaded.actionForKey(.escape) == null);
+    try std.testing.expectEqual(Action.queue_follow_up, loaded.actionForKeyWithModifiers(.up, .{ .alt = true }).?);
+    try std.testing.expectEqual(Action.dequeue_messages, loaded.actionForKeyWithModifiers(.enter, .{ .alt = true }).?);
     try std.testing.expectEqual(Action.paste_image, loaded.actionForKey(.{ .ctrl = 'y' }).?);
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'v' }) == null);
 }
