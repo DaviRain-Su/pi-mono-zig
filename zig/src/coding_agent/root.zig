@@ -52,4 +52,5 @@ test {
     _ = @import("rpc_mode.zig");
     _ = @import("provider_config.zig");
     _ = @import("interactive_mode.zig");
+    _ = @import("migrations.zig");
 }
