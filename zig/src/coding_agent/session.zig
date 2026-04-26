@@ -21,6 +21,38 @@ pub const CompactionResult = struct {
     tokens_before: u32,
 };
 
+pub const QueuedInput = struct {
+    text: []u8,
+    images: []ai.ImageContent,
+
+    pub fn deinit(self: *QueuedInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.images) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        allocator.free(self.images);
+        self.* = undefined;
+    }
+};
+
+pub const ClearedQueue = struct {
+    steering: []QueuedInput,
+    follow_up: []QueuedInput,
+
+    pub fn count(self: ClearedQueue) usize {
+        return self.steering.len + self.follow_up.len;
+    }
+
+    pub fn deinit(self: *ClearedQueue, allocator: std.mem.Allocator) void {
+        for (self.steering) |*item| item.deinit(allocator);
+        allocator.free(self.steering);
+        for (self.follow_up) |*item| item.deinit(allocator);
+        allocator.free(self.follow_up);
+        self.* = undefined;
+    }
+};
+
 pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -34,6 +66,7 @@ pub const AgentSession = struct {
     retry_settings: RetrySettings,
     retry_attempt: u32,
     overflow_recovery_attempted: bool,
+    compaction_active: std.atomic.Value(bool),
 
     pub const CreateOptions = struct {
         cwd: []const u8,
@@ -135,6 +168,45 @@ pub const AgentSession = struct {
         try self.runPostPromptMaintenance();
     }
 
+    pub fn steer(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
+        var message = try queuedUserMessage(self.allocator, text, images);
+        defer deinitQueuedUserMessage(self.allocator, &message);
+        try self.agent.steer(message);
+    }
+
+    pub fn followUp(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
+        var message = try queuedUserMessage(self.allocator, text, images);
+        defer deinitQueuedUserMessage(self.allocator, &message);
+        try self.agent.followUp(message);
+    }
+
+    pub fn clearQueue(self: *AgentSession, allocator: std.mem.Allocator) !ClearedQueue {
+        const steering_messages = try self.agent.takeSteeringMessages(allocator);
+        defer {
+            agent.deinitMessageSlice(allocator, steering_messages);
+            allocator.free(steering_messages);
+        }
+
+        const follow_up_messages = try self.agent.takeFollowUpMessages(allocator);
+        defer {
+            agent.deinitMessageSlice(allocator, follow_up_messages);
+            allocator.free(follow_up_messages);
+        }
+
+        return .{
+            .steering = try queuedInputsFromMessages(allocator, steering_messages),
+            .follow_up = try queuedInputsFromMessages(allocator, follow_up_messages),
+        };
+    }
+
+    pub fn isStreaming(self: *const AgentSession) bool {
+        return self.agent.isStreaming();
+    }
+
+    pub fn isCompacting(self: *const AgentSession) bool {
+        return self.compaction_active.load(.seq_cst);
+    }
+
     pub fn compact(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
         return try self.runCompaction(custom_instructions);
     }
@@ -177,8 +249,7 @@ pub const AgentSession = struct {
 
             if (try self.handleOverflowCompaction(last_assistant)) continue;
             if (try self.handleRetryableError(last_assistant)) continue;
-
-            try self.handleThresholdCompaction(last_assistant);
+            if (try self.handleThresholdCompaction(last_assistant)) continue;
             return;
         }
     }
@@ -195,16 +266,21 @@ pub const AgentSession = struct {
         return true;
     }
 
-    fn handleThresholdCompaction(self: *AgentSession, last_assistant: ai.AssistantMessage) !void {
+    fn handleThresholdCompaction(self: *AgentSession, last_assistant: ai.AssistantMessage) !bool {
         _ = last_assistant;
-        if (!self.compaction_settings.enabled) return;
+        if (!self.compaction_settings.enabled) return false;
         const context_window = self.agent.getModel().context_window;
-        if (context_window == 0) return;
-        if (!shouldAutoCompact(estimateContextTokens(self.agent.getMessages()), context_window, self.compaction_settings)) return;
+        if (context_window == 0) return false;
+        if (!shouldAutoCompact(estimateContextTokens(self.agent.getMessages()), context_window, self.compaction_settings)) return false;
         _ = self.runCompaction(null) catch |err| switch (err) {
-            error.NothingToCompact => return,
+            error.NothingToCompact => return false,
             else => return err,
         };
+        if (self.agent.hasQueuedMessages()) {
+            try self.agent.continueRun();
+            return true;
+        }
+        return false;
     }
 
     fn handleRetryableError(self: *AgentSession, last_assistant: ai.AssistantMessage) !bool {
@@ -224,6 +300,9 @@ pub const AgentSession = struct {
     }
 
     fn runCompaction(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
+        self.compaction_active.store(true, .seq_cst);
+        defer self.compaction_active.store(false, .seq_cst);
+
         const branch_entries = try self.session_manager.getBranch(self.allocator, null);
         defer self.allocator.free(branch_entries);
 
@@ -307,6 +386,7 @@ pub const AgentSession = struct {
             .retry_settings = retry_settings,
             .retry_attempt = 0,
             .overflow_recovery_attempted = false,
+            .compaction_active = std.atomic.Value(bool).init(false),
         };
 
         try instance.agent.subscribe(instance.subscriber);
@@ -331,6 +411,97 @@ pub const AgentSession = struct {
         }
     }
 };
+
+fn queuedUserMessage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    images: []const ai.ImageContent,
+) !agent.AgentMessage {
+    const content = try allocator.alloc(ai.ContentBlock, 1 + images.len);
+    content[0] = .{ .text = .{ .text = text } };
+    for (images, 0..) |image, index| {
+        content[index + 1] = .{ .image = image };
+    }
+    return .{ .user = .{
+        .content = content,
+        .timestamp = 0,
+    } };
+}
+
+fn deinitQueuedUserMessage(allocator: std.mem.Allocator, message: *agent.AgentMessage) void {
+    switch (message.*) {
+        .user => |user_message| allocator.free(user_message.content),
+        else => {},
+    }
+}
+
+fn queuedInputsFromMessages(
+    allocator: std.mem.Allocator,
+    messages: []const agent.AgentMessage,
+) ![]QueuedInput {
+    if (messages.len == 0) return try allocator.alloc(QueuedInput, 0);
+
+    const queued = try allocator.alloc(QueuedInput, messages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (queued[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(queued);
+    }
+
+    for (messages, 0..) |message, index| {
+        queued[index] = try queuedInputFromMessage(allocator, message);
+        initialized += 1;
+    }
+
+    return queued;
+}
+
+fn queuedInputFromMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !QueuedInput {
+    const user_message = switch (message) {
+        .user => |user| user,
+        else => return error.InvalidQueuedMessage,
+    };
+
+    var text_block: []const u8 = "";
+    var image_count: usize = 0;
+    for (user_message.content) |block| {
+        switch (block) {
+            .text => |text| {
+                if (text_block.len == 0) text_block = text.text;
+            },
+            .image => image_count += 1,
+            else => {},
+        }
+    }
+
+    const images = try allocator.alloc(ai.ImageContent, image_count);
+    var image_index: usize = 0;
+    errdefer {
+        for (images[0..image_index]) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        allocator.free(images);
+    }
+
+    for (user_message.content) |block| {
+        switch (block) {
+            .image => |image| {
+                images[image_index] = .{
+                    .data = try allocator.dupe(u8, image.data),
+                    .mime_type = try allocator.dupe(u8, image.mime_type),
+                };
+                image_index += 1;
+            },
+            else => {},
+        }
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, text_block),
+        .images = images,
+    };
+}
 
 fn resolveModel(explicit_model: ?ai.Model, restored: ?session_manager.SessionModelRef) ai.Model {
     if (explicit_model) |model| return model;
