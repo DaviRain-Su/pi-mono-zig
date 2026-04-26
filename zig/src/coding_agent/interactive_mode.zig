@@ -605,16 +605,46 @@ fn runBashTool(
     params: std.json.Value,
     tool_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
-    _: ?*anyopaque,
-    _: ?agent.types.AgentToolUpdateCallback,
+    on_update_context: ?*anyopaque,
+    on_update: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.BashArgs{
         .command = try getRequiredString(params, "command"),
         .timeout_seconds = getOptionalU64(params, "timeout_seconds"),
     };
-    const result = try tools.BashTool.init(runtime.cwd, runtime.io).execute(allocator, args, signal);
+    var update_forward = BashToolUpdateForwardContext{
+        .downstream_context = on_update_context,
+        .downstream = on_update,
+    };
+    const result = try tools.BashTool.init(runtime.cwd, runtime.io).executeWithUpdates(
+        allocator,
+        args,
+        signal,
+        &update_forward,
+        forwardBashToolUpdate,
+    );
     return .{ .content = result.content };
+}
+
+const BashToolUpdateForwardContext = struct {
+    downstream_context: ?*anyopaque,
+    downstream: ?agent.types.AgentToolUpdateCallback,
+};
+
+fn forwardBashToolUpdate(
+    context: ?*anyopaque,
+    result: tools.BashExecutionResult,
+) !void {
+    const forward_context: *BashToolUpdateForwardContext = @ptrCast(@alignCast(context.?));
+    const callback = forward_context.downstream orelse return;
+
+    const partial = agent.AgentToolResult{
+        .content = result.content,
+        .details = null,
+    };
+
+    try callback(forward_context.downstream_context, partial);
 }
 
 fn runWriteTool(
@@ -4835,4 +4865,42 @@ test "loadSelectableModels respects CLI model patterns" {
         try std.testing.expectEqualStrings("anthropic", entry.provider);
         try std.testing.expect(std.mem.indexOf(u8, entry.model_id, "sonnet") != null);
     }
+}
+
+test "forwardBashToolUpdate borrows streaming content without freeing it twice" {
+    const allocator = std.testing.allocator;
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        text: ?[]u8 = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.text) |text| self.allocator.free(text);
+        }
+
+        fn collect(context: ?*anyopaque, partial_result: agent.AgentToolResult) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            try std.testing.expectEqual(@as(usize, 1), partial_result.content.len);
+            try std.testing.expectEqualStrings("streaming update", partial_result.content[0].text.text);
+            self.text = try self.allocator.dupe(u8, partial_result.content[0].text.text);
+        }
+    };
+
+    var capture = Capture{ .allocator = allocator };
+    defer capture.deinit();
+
+    var context = BashToolUpdateForwardContext{
+        .downstream_context = &capture,
+        .downstream = Capture.collect,
+    };
+
+    var result = tools.BashExecutionResult{
+        .content = try common.makeTextContent(allocator, "streaming update"),
+        .details = null,
+        .is_error = false,
+    };
+    defer result.deinit(allocator);
+
+    try forwardBashToolUpdate(&context, result);
+    try std.testing.expectEqualStrings("streaming update", capture.text.?);
 }
