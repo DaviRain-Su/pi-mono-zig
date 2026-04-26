@@ -1,3 +1,4 @@
+pub const vaxis = @import("vaxis");
 pub const ansi = @import("ansi.zig");
 pub const component = @import("component.zig");
 pub const keys = @import("keys.zig");
@@ -91,4 +92,10 @@ test {
 test "components export autocomplete module" {
     _ = components.autocomplete;
     _ = components.autocomplete.Item;
+}
+
+test "exports vaxis module" {
+    _ = vaxis.Vaxis;
+    _ = vaxis.Tty;
+    _ = vaxis.Loop;
 }
