@@ -7,6 +7,7 @@ pub const Action = enum(u8) {
     clear,
     open_sessions,
     open_models,
+    paste_image,
 };
 
 pub const KeySpec = union(enum) {
@@ -82,6 +83,7 @@ const DEFINITIONS = [_]BindingDefinition{
     .{ .action = .clear, .id = "app.clear", .defaults = &.{"ctrl+l"} },
     .{ .action = .open_sessions, .id = "app.session.select", .defaults = &.{"ctrl+s"} },
     .{ .action = .open_models, .id = "app.model.select", .defaults = &.{"ctrl+p"} },
+    .{ .action = .paste_image, .id = "app.clipboard.pasteImage", .defaults = &.{"ctrl+v"} },
 };
 
 pub const Keybindings = struct {
@@ -230,6 +232,7 @@ test "keybindings use defaults and allow overrides from file" {
     try std.testing.expectEqual(Action.clear, defaults.actionForKey(.{ .ctrl = 'l' }).?);
     try std.testing.expectEqual(Action.exit, defaults.actionForKey(.{ .ctrl = 'd' }).?);
     try std.testing.expectEqual(Action.exit, defaults.actionForKey(.escape).?);
+    try std.testing.expectEqual(Action.paste_image, defaults.actionForKey(.{ .ctrl = 'v' }).?);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -239,7 +242,8 @@ test "keybindings use defaults and allow overrides from file" {
         .data =
         \\{
         \\  "app.clear": "ctrl+x",
-        \\  "app.exit": ["ctrl+q"]
+        \\  "app.exit": ["ctrl+q"],
+        \\  "app.clipboard.pasteImage": "ctrl+y"
         \\}
         ,
     });
@@ -254,4 +258,6 @@ test "keybindings use defaults and allow overrides from file" {
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'l' }) == null);
     try std.testing.expectEqual(Action.exit, loaded.actionForKey(.{ .ctrl = 'q' }).?);
     try std.testing.expect(loaded.actionForKey(.escape) == null);
+    try std.testing.expectEqual(Action.paste_image, loaded.actionForKey(.{ .ctrl = 'y' }).?);
+    try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'v' }) == null);
 }
