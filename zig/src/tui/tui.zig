@@ -2,6 +2,7 @@ const std = @import("std");
 const ansi = @import("ansi.zig");
 const component_mod = @import("component.zig");
 const terminal_mod = @import("terminal.zig");
+const vaxis_adapter_mod = @import("vaxis_adapter.zig");
 
 pub const OverlayAnchor = enum {
     center,
@@ -131,10 +132,8 @@ pub const Renderer = struct {
     pub fn render(self: *Renderer, root: component_mod.Component) !void {
         const size = try self.terminal.refreshSize();
 
-        var new_lines = component_mod.LineList.empty;
+        var new_lines = try self.renderLinesForSize(root, size);
         defer component_mod.freeLines(self.allocator, &new_lines);
-        try root.renderInto(self.allocator, size.width, &new_lines);
-        try self.compositeOverlays(size, &new_lines);
 
         if (self.previous_size == null or self.previous_size.?.width != size.width or self.previous_size.?.height != size.height) {
             try self.fullRedraw(new_lines.items);
@@ -144,6 +143,37 @@ pub const Renderer = struct {
 
         try self.replacePreviousLines(new_lines.items);
         self.previous_size = size;
+    }
+
+    pub fn renderToVaxis(self: *Renderer, root: component_mod.Component, adapter: *vaxis_adapter_mod.VaxisAdapter) !void {
+        const size = try self.terminal.refreshSize();
+
+        var new_lines = try self.renderLinesForSize(root, size);
+        defer component_mod.freeLines(self.allocator, &new_lines);
+
+        try adapter.render(size, new_lines.items);
+
+        self.last_render_stats = .{
+            .mode = if (self.previous_size == null or self.previous_size.?.width != size.width or self.previous_size.?.height != size.height)
+                .full
+            else
+                .diff,
+            .changed_line_count = changedLineCount(self.previous_lines.items, new_lines.items),
+            .payload_bytes = 0,
+            .frame_bytes = 0,
+            .synchronized_output = false,
+        };
+
+        try self.replacePreviousLines(new_lines.items);
+        self.previous_size = size;
+    }
+
+    fn renderLinesForSize(self: *Renderer, root: component_mod.Component, size: terminal_mod.Size) !component_mod.LineList {
+        var new_lines = component_mod.LineList.empty;
+        errdefer component_mod.freeLines(self.allocator, &new_lines);
+        try root.renderInto(self.allocator, size.width, &new_lines);
+        try self.compositeOverlays(size, &new_lines);
+        return new_lines;
     }
 
     fn fullRedraw(self: *Renderer, lines: []const []u8) !void {
@@ -410,6 +440,17 @@ fn compositeLineAt(
     return composed;
 }
 
+fn changedLineCount(old_lines: []const []u8, new_lines: []const []u8) usize {
+    const max_lines = @max(old_lines.len, new_lines.len);
+    var changed: usize = 0;
+    for (0..max_lines) |row| {
+        const old_line = if (row < old_lines.len) old_lines[row] else "";
+        const new_line = if (row < new_lines.len) new_lines[row] else "";
+        if (!std.mem.eql(u8, old_line, new_line)) changed += 1;
+    }
+    return changed;
+}
+
 const TestMockBackend = struct {
     size: terminal_mod.Size,
     writes: std.ArrayList([]u8) = .empty,
@@ -673,4 +714,41 @@ test "overlay animation slides from top before reaching its anchor" {
     try std.testing.expectEqual(@as(usize, 0), start.row);
     try std.testing.expect(mid.row > start.row);
     try std.testing.expectEqual(end.row, resolveOverlayLayout(.{ .width = 8, .anchor = .center }, 8, 3, size).row);
+}
+
+test "renderer can render composed overlays through the libvaxis adapter" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 14, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const base = TestStaticComponent{ .lines = &[_][]const u8{"base"} };
+    const overlay = TestStaticComponent{ .lines = &[_][]const u8{"\x1b[38;2;12;34;56mmenu\x1b[0m"} };
+    _ = try renderer.showOverlay(overlay.component(), .{ .width = 6, .anchor = .center });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var vx = try @import("vaxis").init(std.testing.io, allocator, &env_map, .{});
+    defer vx.deinit(allocator, &writer.writer);
+
+    var adapter = vaxis_adapter_mod.VaxisAdapter.init(allocator, &vx, &writer.writer);
+    defer adapter.deinit();
+    try renderer.renderToVaxis(base.component(), &adapter);
+
+    const window = vx.window();
+    const menu_cell = window.readCell(4, 1).?;
+    try std.testing.expectEqualStrings("m", menu_cell.char.grapheme);
+    try std.testing.expectEqual(@import("vaxis").Cell.Color{ .rgb = .{ 12, 34, 56 } }, menu_cell.style.fg);
+    try std.testing.expect(std.mem.indexOf(u8, renderer.previous_lines.items[1], "menu") != null);
 }

@@ -263,6 +263,8 @@ pub fn runInteractiveMode(
 
     var renderer = tui.Renderer.init(allocator, &terminal);
     defer renderer.deinit();
+    var vaxis_adapter = tui.VaxisAdapter.init(allocator, input_loop.vaxis_state, input_loop.loop.tty.writer());
+    defer vaxis_adapter.deinit();
 
     var editor = tui.Editor.init(allocator);
     defer editor.deinit();
@@ -350,7 +352,7 @@ pub fn runInteractiveMode(
             }
         }
 
-        try renderer.render(screen.component());
+        try renderer.renderToVaxis(screen.component(), &vaxis_adapter);
 
         if (should_exit and !prompt_worker_active) break;
 
