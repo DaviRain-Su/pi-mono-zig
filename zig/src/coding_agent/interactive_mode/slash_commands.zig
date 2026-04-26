@@ -33,6 +33,7 @@ const loadHotkeysOverlay = overlays.loadHotkeysOverlay;
 const loadSettingsEditorOverlay = overlays.loadSettingsEditorOverlay;
 const loadSessionOverlay = overlays.loadSessionOverlay;
 const loadModelOverlay = overlays.loadModelOverlay;
+const loadScopedModelOverlay = overlays.loadScopedModelOverlay;
 const loadTreeOverlay = overlays.loadTreeOverlay;
 const AppState = rendering.AppState;
 const rebuildAppStateFromSession = rendering.rebuildAppStateFromSession;
@@ -41,6 +42,7 @@ const updateAppFooterFromSession = rendering.updateAppFooterFromSession;
 pub const SlashCommandKind = enum {
     settings,
     model,
+    scoped_models,
     import,
     share,
     copy,
@@ -76,6 +78,7 @@ pub const BuiltinSlashCommand = struct {
 pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "settings", .description = "Open settings editor" },
     .{ .name = "model", .description = "Select model (opens selector UI)", .argument_hint = "<provider/model>" },
+    .{ .name = "scoped-models", .description = "Select from the scoped model cycling list" },
     .{ .name = "export", .description = "Export session transcript", .argument_hint = "<path.json|path.md>" },
     .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
     .{ .name = "share", .description = "Copy a shareable markdown transcript" },
@@ -143,6 +146,7 @@ pub fn parseSlashCommand(text: []const u8) ?SlashCommand {
 
     if (std.mem.eql(u8, command_name, "settings")) return .{ .kind = .settings, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "scoped-models")) return .{ .kind = .scoped_models, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "import")) return .{ .kind = .import, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "share")) return .{ .kind = .share, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "copy")) return .{ .kind = .copy, .argument = argument, .raw = text };
@@ -197,6 +201,16 @@ pub fn handleSlashCommand(
             session,
             current_provider,
             command.argument,
+            options,
+            live_resources.runtime_config,
+            app_state,
+            overlay,
+        ),
+        .scoped_models => try handleScopedModelsSlashCommand(
+            allocator,
+            env_map,
+            session,
+            current_provider,
             options,
             live_resources.runtime_config,
             app_state,
@@ -488,6 +502,37 @@ pub fn handleModelSlashCommand(
     defer allocator.free(message);
     try app_state.appendInfo(message);
     overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
+}
+
+pub fn handleScopedModelsSlashCommand(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+) !void {
+    _ = current_provider;
+
+    overlay.* = loadScopedModelOverlay(
+        allocator,
+        env_map,
+        session.agent.getModel(),
+        options.model_patterns,
+        runtime_config,
+    ) catch |err| switch (err) {
+        error.NoScopedModelPatterns => {
+            try app_state.setStatus("No scoped models configured. Launch pi with --models to limit model cycling.");
+            return;
+        },
+        error.NoScopedModelsAvailable => {
+            try app_state.setStatus("No scoped models matched the current model scope.");
+            return;
+        },
+        else => return err,
+    };
 }
 
 pub fn handleSessionSlashCommand(

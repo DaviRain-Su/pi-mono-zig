@@ -65,6 +65,7 @@ pub const appendInfoOverlayItem = overlays.appendInfoOverlayItem;
 pub const appendHotkeyOverlayItem = overlays.appendHotkeyOverlayItem;
 pub const loadSessionOverlay = overlays.loadSessionOverlay;
 pub const loadModelOverlay = overlays.loadModelOverlay;
+pub const loadScopedModelOverlay = overlays.loadScopedModelOverlay;
 pub const loadSelectableModels = overlays.loadSelectableModels;
 pub const modelSupportsInput = overlays.modelSupportsInput;
 pub const loadTreeOverlay = overlays.loadTreeOverlay;
@@ -131,6 +132,7 @@ pub const handleSlashCommand = slash_commands.handleSlashCommand;
 pub const switchSession = slash_commands.switchSession;
 pub const switchModel = slash_commands.switchModel;
 pub const handleModelSlashCommand = slash_commands.handleModelSlashCommand;
+pub const handleScopedModelsSlashCommand = slash_commands.handleScopedModelsSlashCommand;
 pub const handleSessionSlashCommand = slash_commands.handleSessionSlashCommand;
 pub const handleNameSlashCommand = slash_commands.handleNameSlashCommand;
 pub const handleLabelSlashCommand = slash_commands.handleLabelSlashCommand;
@@ -1474,6 +1476,10 @@ test "parseSlashCommand recognizes builtins and arguments" {
     try std.testing.expectEqual(SlashCommandKind.model, model_command.kind);
     try std.testing.expectEqualStrings("faux", model_command.argument.?);
 
+    const scoped_models_command = parseSlashCommand("/scoped-models").?;
+    try std.testing.expectEqual(SlashCommandKind.scoped_models, scoped_models_command.kind);
+    try std.testing.expect(scoped_models_command.argument == null);
+
     const import_command = parseSlashCommand("/import ./session.jsonl").?;
     try std.testing.expectEqual(SlashCommandKind.import, import_command.kind);
     try std.testing.expectEqualStrings("./session.jsonl", import_command.argument.?);
@@ -2218,6 +2224,291 @@ test "handleInputKey opens model overlay for slash model command" {
     try std.testing.expect(overlay != null);
     try std.testing.expect(overlay.? == .model);
     try std.testing.expectEqual(@as(usize, 0), editor.text().len);
+}
+
+test "handleInputKey opens scoped model overlay for slash scoped-models command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "test-openai-key");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "openai", "gpt-5.4", null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/scoped-models");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const scoped_patterns = [_][]const u8{
+        "openai/gpt-5.4",
+        "openai/gpt-5.5",
+    };
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "openai",
+        .model = "gpt-5.4",
+        .model_patterns = scoped_patterns[0..],
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .model);
+    try std.testing.expectEqualStrings("Scoped model selector", overlay.?.title());
+    try std.testing.expectEqual(@as(usize, 2), overlay.?.model.items.len);
+    try std.testing.expectEqualStrings("gpt-5.4", overlay.?.model.items[0].value);
+    try std.testing.expectEqualStrings("gpt-5.5", overlay.?.model.items[1].value);
+    try std.testing.expectEqual(@as(usize, 0), editor.text().len);
+}
+
+test "handleInputKey scoped model overlay supports navigation and selection" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "test-openai-key");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "openai", "gpt-5.4", null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/scoped-models");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const scoped_patterns = [_][]const u8{
+        "openai/gpt-5.4",
+        "openai/gpt-5.5",
+    };
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "openai",
+        .model = "gpt-5.4",
+        .model_patterns = scoped_patterns[0..],
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .model);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .down,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), overlay.?.model.list.selectedIndex());
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqualStrings("gpt-5.5", session.agent.getModel().id);
+    try std.testing.expectEqualStrings("gpt-5.5", current_provider.model.id);
+}
+
+test "handleInputKey reports when scoped models are not configured" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/scoped-models");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay == null);
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.status, "No scoped models configured") != null);
 }
 
 test "handleInputKey reports unknown slash commands" {
