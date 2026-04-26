@@ -130,7 +130,9 @@ pub const OpenAICodexResponsesProvider = struct {
         }
 
         if (response.status != 200) {
-            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response.body });
+            const response_body = try response.readAll(allocator);
+            defer allocator.free(response_body);
+            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response_body });
             return emitErrorMessage(allocator, &stream_instance, model, error_message);
         }
 
@@ -208,16 +210,14 @@ pub fn buildRequestPayload(
     try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
     try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
 
-    if (context.system_prompt) |system_prompt| {
-        const sanitized = try openai.sanitizeSurrogates(allocator, system_prompt);
-        defer allocator.free(sanitized);
-        try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, sanitized) });
-    }
+    const instructions = if (context.system_prompt) |system_prompt|
+        try openai.sanitizeSurrogates(allocator, system_prompt)
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(instructions);
+    try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
 
     if (options) |stream_options| {
-        if (stream_options.max_tokens) |max_tokens| {
-            try payload.put(allocator, try allocator.dupe(u8, "max_output_tokens"), .{ .integer = @intCast(max_tokens) });
-        }
         if (stream_options.temperature) |temperature| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
         }
@@ -798,7 +798,11 @@ fn finalizeCurrentBlock(
     if (current_block.*) |*block| {
         switch (block.*) {
             .text => |*text| {
-                const owned = try allocator.dupe(u8, text.text.items);
+                const final_text = if (extractFinalTextFromItem(maybe_item_value, text.part_kind)) |value|
+                    if (value.len > 0 or text.text.items.len == 0) value else text.text.items
+                else
+                    text.text.items;
+                const owned = try allocator.dupe(u8, final_text);
                 try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
                 stream_ptr.push(.{
                     .event_type = .text_end,
@@ -973,6 +977,25 @@ fn parseUsage(value: std.json.Value) types.Usage {
     else
         usage.input + usage.output + usage.cache_read + usage.cache_write;
     return usage;
+}
+
+fn extractFinalTextFromItem(maybe_item_value: ?std.json.Value, part_kind: MessagePartKind) ?[]const u8 {
+    const item_value = maybe_item_value orelse return null;
+    if (item_value != .object) return null;
+    const content = item_value.object.get("content") orelse return null;
+    if (content != .array) return null;
+
+    const expected_type: []const u8 = switch (part_kind) {
+        .output_text => "output_text",
+        .refusal => "refusal",
+    };
+    for (content.array.items) |part| {
+        if (part != .object) continue;
+        const part_type = extractStringField(part, "type") orelse continue;
+        if (!std.mem.eql(u8, part_type, expected_type)) continue;
+        return extractStringField(part, "text");
+    }
+    return null;
 }
 
 fn extractCombinedToolCallId(allocator: std.mem.Allocator, item_value: std.json.Value) !?[]const u8 {
@@ -1247,6 +1270,7 @@ test "buildRequestPayload uses Codex-specific request shape" {
     try std.testing.expectEqualStrings("session-123", payload.object.get("prompt_cache_key").?.string);
     try std.testing.expectEqualStrings("auto", payload.object.get("tool_choice").?.string);
     try std.testing.expectEqual(payload.object.get("parallel_tool_calls").?.bool, true);
+    try std.testing.expect(payload.object.get("max_output_tokens") == null);
 
     const text_config = payload.object.get("text").?;
     try std.testing.expect(text_config == .object);
@@ -1321,6 +1345,56 @@ test "parseSseStreamLines handles response.done terminal events" {
     freeAssistantMessageOwned(allocator, done.message.?);
 }
 
+test "parseSseStreamLines uses final output item text when delta stream is incomplete" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"What would you like to work\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"What would you like to work on?\"}]}}\n" ++
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_codex\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":7,\"total_tokens\":12}}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5.5",
+        .name = "Codex GPT-5.5",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+    _ = stream_instance.next();
+    _ = stream_instance.next();
+
+    const delta = stream_instance.next().?;
+    defer freeEventOwned(allocator, delta);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqualStrings("What would you like to work on?", text_end.content.?);
+
+    const done = stream_instance.next().?;
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("What would you like to work on?", done.message.?.content[0].text.text);
+    freeAssistantMessageOwned(allocator, done.message.?);
+}
+
 test "parseSseStreamLines maps incomplete Codex responses to length" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1387,6 +1461,26 @@ test "resolveCodexUrl appends codex responses path" {
     defer allocator.free(url);
 
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", url);
+}
+
+test "buildRequestPayload includes empty instructions when no system prompt is provided" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5.5",
+        .name = "Codex GPT-5.5",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, null);
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expectEqualStrings("", payload.object.get("instructions").?.string);
 }
 
 test "buildRequestPayload preserves xhigh reasoning for GPT-5.5" {
