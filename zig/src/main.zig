@@ -2,70 +2,21 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
-const config_mod = @import("coding_agent/config.zig");
-const context_files_mod = @import("coding_agent/context_files.zig");
-const resources_mod = @import("coding_agent/resources.zig");
-const session_advanced = @import("coding_agent/session_advanced.zig");
+const bootstrap = @import("cli/bootstrap.zig");
+const input_prep = @import("cli/input_prep.zig");
+const runtime_prep = @import("cli/runtime_prep.zig");
+const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 
 const VERSION = "0.1.0";
 
-const AppMode = enum {
-    interactive,
-    print,
-    json,
-    rpc,
-};
-
-const CliStdin = struct {
-    is_tty: bool = true,
-    content: ?[]const u8 = null,
-    owns_content: bool = false,
-
-    fn deinit(self: *CliStdin, allocator: std.mem.Allocator) void {
-        if (self.owns_content and self.content != null) allocator.free(self.content.?);
-        self.* = .{};
-    }
-};
-
-const PreparedInitialInput = struct {
-    prompt: ?[]u8 = null,
-    images: []ai.ImageContent = &.{},
-
-    fn deinit(self: *PreparedInitialInput, allocator: std.mem.Allocator) void {
-        if (self.prompt) |prompt| allocator.free(prompt);
-        if (self.images.len > 0) {
-            for (self.images) |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            }
-            allocator.free(self.images);
-        }
-        self.* = .{};
-    }
-};
-
-const PreparedCliRuntime = struct {
-    runtime_config: config_mod.RuntimeConfig,
-    resource_bundle: resources_mod.ResourceBundle,
-    context_files: []context_files_mod.ContextFile,
-    system_prompt: []u8,
-    session_dir: []u8,
-    expanded_prompt: ?[]u8,
-    provider_name: []const u8,
-    model_name: ?[]const u8,
-    thinking_level: agent.ThinkingLevel,
-
-    fn deinit(self: *PreparedCliRuntime, allocator: std.mem.Allocator) void {
-        if (self.expanded_prompt) |prompt| allocator.free(prompt);
-        allocator.free(self.session_dir);
-        allocator.free(self.system_prompt);
-        context_files_mod.deinitContextFiles(allocator, self.context_files);
-        self.resource_bundle.deinit(allocator);
-        self.runtime_config.deinit();
-        self.* = undefined;
-    }
-};
+const AppMode = bootstrap.AppMode;
+const CliStdin = input_prep.CliStdin;
+const PreparedInitialInput = input_prep.PreparedInitialInput;
+const PreparedCliRuntime = runtime_prep.PreparedCliRuntime;
+const effectiveToolSelection = bootstrap.effectiveToolSelection;
+const prepareCliRuntime = runtime_prep.prepareCliRuntime;
+const startupNetworkOperationsEnabled = bootstrap.startupNetworkOperationsEnabled;
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
@@ -85,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const exit_code = try runCliWithInput(init.gpa, init.io, init.environ_map, argv.items, null, null, stdout, stderr);
-    try flushWriters(stdout, stderr);
+    try output.flushWriters(stdout, stderr);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
@@ -112,26 +63,26 @@ fn runCliWithInput(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
-    var options = cli.parseArgs(allocator, argv) catch |err| {
-        try stderr.print("Error: {s}\n\n", .{parseErrorMessage(err)});
-        try printUsage(allocator, stdout);
+    var options = bootstrap.parseArgs(allocator, argv) catch |err| {
+        try stderr.print("Error: {s}\n\n", .{bootstrap.parseErrorMessage(err)});
+        try output.printUsage(allocator, VERSION, stdout);
         return 1;
     };
     defer options.deinit(allocator);
 
     if (options.help) {
-        try printUsage(allocator, stdout);
+        try output.printUsage(allocator, VERSION, stdout);
         return 0;
     }
 
     if (options.version) {
-        try printVersion(allocator, stdout);
+        try output.printVersion(allocator, VERSION, stdout);
         return 0;
     }
 
     if (options.@"export") |session_file| {
-        return runSessionExport(allocator, io, env_map, cwd_override, session_file, options.prompt, stdout, stderr) catch |err| {
-            try stderr.print("Error: {s}\n", .{exportErrorMessage(err)});
+        return output.runSessionExport(allocator, io, env_map, cwd_override, session_file, options.prompt, stdout, stderr) catch |err| {
+            try stderr.print("Error: {s}\n", .{output.exportErrorMessage(err)});
             return 1;
         };
     }
@@ -143,11 +94,11 @@ fn runCliWithInput(
             .owns_content = false,
         }
     else
-        try detectCliStdin(allocator, io, options.mode);
+        try input_prep.detectCliStdin(allocator, io, options.mode);
     defer if (provided_stdin == null) detected_stdin.deinit(allocator);
 
     if (options.list_models) {
-        return try printModelList(allocator, io, env_map, options.list_models_search, stdout);
+        return try output.printModelList(allocator, io, env_map, options.list_models_search, stdout);
     }
 
     if (options.fork != null and
@@ -167,8 +118,8 @@ fn runCliWithInput(
         return 1;
     }
 
-    const app_mode = resolveAppMode(options.mode, options.print, detected_stdin.is_tty);
-    const selected_tools = effectiveToolSelection(&options);
+    const app_mode = bootstrap.resolveAppMode(options.mode, options.print, detected_stdin.is_tty);
+    const selected_tools = bootstrap.effectiveToolSelection(&options);
     const cwd = if (cwd_override) |override| blk: {
         break :blk try allocator.dupe(u8, override);
     } else blk: {
@@ -178,11 +129,11 @@ fn runCliWithInput(
     };
     defer allocator.free(cwd);
 
-    var prepared = try prepareCliRuntime(allocator, io, env_map, cwd, &options, selected_tools);
+    var prepared = try runtime_prep.prepareCliRuntime(allocator, io, env_map, cwd, &options, selected_tools);
     defer prepared.deinit(allocator);
-    try writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
+    try output.writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
 
-    var initial_input = prepareInitialInput(
+    var initial_input = input_prep.prepareInitialInput(
         allocator,
         io,
         env_map,
@@ -200,7 +151,7 @@ fn runCliWithInput(
     if (app_mode == .print or app_mode == .json) {
         if (initial_input.prompt == null) {
             try stderr.writeAll("Error: No prompt provided\n\n");
-            try printUsage(allocator, stdout);
+            try output.printUsage(allocator, VERSION, stdout);
             return 1;
         }
     }
@@ -331,608 +282,6 @@ fn runCliWithInput(
         },
         stderr,
     );
-}
-
-fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
-    return switch (err) {
-        error.MissingOptionValue => "Missing value for option",
-        error.InvalidMode => "Invalid mode. Expected one of: text, json, rpc",
-        error.InvalidThinkingLevel => "Invalid thinking level. Expected one of: off, minimal, low, medium, high, xhigh",
-        error.UnknownOption => "Unknown option",
-        error.OutOfMemory => "Out of memory while parsing CLI arguments",
-    };
-}
-
-fn resolveAppMode(mode: cli.Mode, print_requested: bool, stdin_is_tty: bool) AppMode {
-    return switch (mode) {
-        .rpc => .rpc,
-        .json => .json,
-        .text => if (print_requested or !stdin_is_tty) .print else .interactive,
-    };
-}
-
-fn stdinIsTty(io: std.Io) bool {
-    return std.Io.File.stdin().isTty(io) catch true;
-}
-
-fn detectCliStdin(allocator: std.mem.Allocator, io: std.Io, mode: cli.Mode) !CliStdin {
-    if (mode == .rpc or stdinIsTty(io)) return .{};
-
-    const content = try readPipedStdin(allocator, io);
-    return .{
-        .is_tty = false,
-        .content = content,
-        .owns_content = content != null,
-    };
-}
-
-fn readPipedStdin(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
-    var stdin_buffer: [4096]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
-    var collected = std.ArrayList(u8).empty;
-    defer collected.deinit(allocator);
-
-    while (true) {
-        const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        try collected.append(allocator, byte);
-    }
-
-    const trimmed = std.mem.trim(u8, collected.items, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return try allocator.dupe(u8, trimmed);
-}
-
-fn prepareInitialInput(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-    cwd: []const u8,
-    file_args: ?[]const []const u8,
-    prompt: ?[]const u8,
-    stdin_content: ?[]const u8,
-    stderr: *std.Io.Writer,
-) !PreparedInitialInput {
-    var file_text = std.ArrayList(u8).empty;
-    defer file_text.deinit(allocator);
-    var images = std.ArrayList(ai.ImageContent).empty;
-    errdefer {
-        for (images.items) |image| {
-            allocator.free(image.data);
-            allocator.free(image.mime_type);
-        }
-        images.deinit(allocator);
-    }
-
-    if (file_args) |paths| {
-        for (paths) |path| {
-            const absolute_path = try config_mod.expandPath(allocator, env_map, path, cwd);
-            defer allocator.free(absolute_path);
-
-            const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, absolute_path, allocator, .unlimited) catch |err| {
-                switch (err) {
-                    error.FileNotFound => try stderr.print("Error: File not found: {s}\n", .{absolute_path}),
-                    else => try stderr.print("Error: Could not read file {s}: {s}\n", .{ absolute_path, @errorName(err) }),
-                }
-                return error.CliInputFailed;
-            };
-            defer allocator.free(bytes);
-
-            if (bytes.len == 0) continue;
-
-            if (detectImageMime(bytes)) |mime_type| {
-                const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-                _ = std.base64.standard.Encoder.encode(encoded, bytes);
-
-                try images.append(allocator, .{
-                    .data = encoded,
-                    .mime_type = try allocator.dupe(u8, mime_type),
-                });
-
-                const note = try std.fmt.allocPrint(allocator, "<file name=\"{s}\"></file>\n", .{absolute_path});
-                defer allocator.free(note);
-                try file_text.appendSlice(allocator, note);
-            } else {
-                const header = try std.fmt.allocPrint(allocator, "<file name=\"{s}\">\n", .{absolute_path});
-                defer allocator.free(header);
-                try file_text.appendSlice(allocator, header);
-                try file_text.appendSlice(allocator, bytes);
-                try file_text.appendSlice(allocator, "\n</file>\n");
-            }
-        }
-    }
-
-    var prompt_builder = std.ArrayList(u8).empty;
-    defer prompt_builder.deinit(allocator);
-    if (stdin_content) |content| try prompt_builder.appendSlice(allocator, content);
-    if (file_text.items.len > 0) try prompt_builder.appendSlice(allocator, file_text.items);
-    if (prompt) |text| try prompt_builder.appendSlice(allocator, text);
-
-    return .{
-        .prompt = if (prompt_builder.items.len > 0)
-            try prompt_builder.toOwnedSlice(allocator)
-        else
-            null,
-        .images = try images.toOwnedSlice(allocator),
-    };
-}
-
-fn detectImageMime(bytes: []const u8) ?[]const u8 {
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
-    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) {
-        return "image/gif";
-    }
-    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) {
-        return "image/webp";
-    }
-    return null;
-}
-
-fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
-    if (options.no_tools) {
-        return options.tools orelse &[_][]const u8{};
-    }
-    if (options.no_builtin_tools and options.tools == null) {
-        return &[_][]const u8{};
-    }
-    return options.tools;
-}
-
-fn startupNetworkOperationsEnabled(options: *const cli.Args, env_map: *const std.process.Environ.Map) bool {
-    return !options.offline and !isTruthyEnvFlag(env_map.get("PI_OFFLINE"));
-}
-
-fn isTruthyEnvFlag(value: ?[]const u8) bool {
-    const text = value orelse return false;
-    return std.ascii.eqlIgnoreCase(text, "1") or
-        std.ascii.eqlIgnoreCase(text, "true") or
-        std.ascii.eqlIgnoreCase(text, "yes") or
-        std.ascii.eqlIgnoreCase(text, "on");
-}
-
-fn runSessionExport(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-    cwd_override: ?[]const u8,
-    session_file: []const u8,
-    output_path: ?[]const u8,
-    stdout: *std.Io.Writer,
-    stderr: *std.Io.Writer,
-) !u8 {
-    const cwd = if (cwd_override) |override| blk: {
-        break :blk try allocator.dupe(u8, override);
-    } else blk: {
-        const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-        defer allocator.free(real_cwd);
-        break :blk try allocator.dupe(u8, real_cwd);
-    };
-    defer allocator.free(cwd);
-
-    const resolved_session_file = try config_mod.expandPath(allocator, env_map, session_file, cwd);
-    defer allocator.free(resolved_session_file);
-    const resolved_output_path = if (output_path) |path|
-        try config_mod.expandPath(allocator, env_map, path, cwd)
-    else
-        null;
-    defer if (resolved_output_path) |path| allocator.free(path);
-
-    const exported_path = session_advanced.exportFromFile(
-        allocator,
-        io,
-        cwd,
-        resolved_session_file,
-        resolved_output_path,
-    ) catch |err| {
-        _ = stderr;
-        return err;
-    };
-    defer allocator.free(exported_path);
-
-    try stdout.print("Exported to: {s}\n", .{exported_path});
-    return 0;
-}
-
-fn exportErrorMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.FileNotFound => "File not found",
-        error.UnsupportedExportPath => "Unsupported export path. Use a .html, .jsonl, .json, or .md output path",
-        error.SessionExportRequiresPersistentFile => "Cannot export JSONL from an in-memory session",
-        else => @errorName(err),
-    };
-}
-
-fn printUsage(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
-    const text = try cli.helpText(allocator, VERSION);
-    defer allocator.free(text);
-    try stdout.writeAll(text);
-}
-
-fn printVersion(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
-    const text = try cli.versionText(allocator, VERSION);
-    defer allocator.free(text);
-    try stdout.writeAll(text);
-}
-
-fn printModelList(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-    search: ?[]const u8,
-    stdout: *std.Io.Writer,
-) !u8 {
-    var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, ".");
-    defer runtime_config.deinit();
-
-    const available = try coding_agent.provider_config.listAvailableModels(allocator, env_map, null, .{
-        .auth_tokens = &runtime_config.auth_tokens,
-        .provider_api_keys = &runtime_config.provider_api_keys,
-    });
-    defer allocator.free(available);
-
-    const configured = try coding_agent.provider_config.filterConfiguredModels(allocator, available);
-    defer allocator.free(configured);
-
-    const filtered = if (search) |pattern|
-        try coding_agent.provider_config.filterAvailableModels(allocator, configured, &.{pattern})
-    else
-        try allocator.dupe(coding_agent.provider_config.AvailableModel, configured);
-    defer allocator.free(filtered);
-
-    if (filtered.len == 0) {
-        if (search) |pattern| {
-            try stdout.print("No models matching \"{s}\"\n", .{pattern});
-        } else {
-            try stdout.writeAll("No models available\n");
-        }
-        return 0;
-    }
-
-    const Row = struct {
-        provider: []const u8,
-        model: []const u8,
-        context: []u8,
-        max_out: []u8,
-        thinking: []const u8,
-        images: []const u8,
-    };
-
-    const rows = try allocator.alloc(Row, filtered.len);
-    defer {
-        for (rows) |row| {
-            allocator.free(row.context);
-            allocator.free(row.max_out);
-        }
-        allocator.free(rows);
-    }
-
-    var provider_width = "provider".len;
-    var model_width = "model".len;
-    var context_width = "context".len;
-    var max_out_width = "max-out".len;
-    var thinking_width = "thinking".len;
-    var images_width = "images".len;
-
-    for (filtered, 0..) |entry, index| {
-        const context = try formatTokenCount(allocator, entry.context_window);
-        errdefer allocator.free(context);
-        const max_out = try formatTokenCount(allocator, entry.max_tokens);
-        errdefer allocator.free(max_out);
-
-        rows[index] = .{
-            .provider = entry.provider,
-            .model = entry.model_id,
-            .context = context,
-            .max_out = max_out,
-            .thinking = if (entry.reasoning) "yes" else "no",
-            .images = if (entry.supports_images) "yes" else "no",
-        };
-
-        provider_width = @max(provider_width, rows[index].provider.len);
-        model_width = @max(model_width, rows[index].model.len);
-        context_width = @max(context_width, rows[index].context.len);
-        max_out_width = @max(max_out_width, rows[index].max_out.len);
-        thinking_width = @max(thinking_width, rows[index].thinking.len);
-        images_width = @max(images_width, rows[index].images.len);
-    }
-
-    try writeTableRow(
-        stdout,
-        "provider",
-        provider_width,
-        "model",
-        model_width,
-        "context",
-        context_width,
-        "max-out",
-        max_out_width,
-        "thinking",
-        thinking_width,
-        "images",
-        images_width,
-    );
-
-    for (rows) |row| {
-        try writeTableRow(
-            stdout,
-            row.provider,
-            provider_width,
-            row.model,
-            model_width,
-            row.context,
-            context_width,
-            row.max_out,
-            max_out_width,
-            row.thinking,
-            thinking_width,
-            row.images,
-            images_width,
-        );
-    }
-
-    return 0;
-}
-
-fn currentDateString(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    const now_seconds: u64 = @intCast(@divFloor(std.Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = now_seconds };
-    const epoch_day = epoch_seconds.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    return std.fmt.allocPrint(
-        allocator,
-        "{d:0>4}-{d:0>2}-{d:0>2}",
-        .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 },
-    );
-}
-
-fn writeTableRow(
-    stdout: *std.Io.Writer,
-    provider: []const u8,
-    provider_width: usize,
-    model: []const u8,
-    model_width: usize,
-    context: []const u8,
-    context_width: usize,
-    max_out: []const u8,
-    max_out_width: usize,
-    thinking: []const u8,
-    thinking_width: usize,
-    images: []const u8,
-    images_width: usize,
-) !void {
-    try writePadded(stdout, provider, provider_width);
-    try stdout.writeAll("  ");
-    try writePadded(stdout, model, model_width);
-    try stdout.writeAll("  ");
-    try writePadded(stdout, context, context_width);
-    try stdout.writeAll("  ");
-    try writePadded(stdout, max_out, max_out_width);
-    try stdout.writeAll("  ");
-    try writePadded(stdout, thinking, thinking_width);
-    try stdout.writeAll("  ");
-    try writePadded(stdout, images, images_width);
-    try stdout.writeByte('\n');
-}
-
-fn writePadded(stdout: *std.Io.Writer, value: []const u8, width: usize) !void {
-    try stdout.writeAll(value);
-    if (width <= value.len) return;
-
-    var remaining = width - value.len;
-    var spaces: [32]u8 = [_]u8{' '} ** 32;
-    while (remaining > 0) {
-        const chunk = @min(remaining, spaces.len);
-        try stdout.writeAll(spaces[0..chunk]);
-        remaining -= chunk;
-    }
-}
-
-fn formatTokenCount(allocator: std.mem.Allocator, count: u32) ![]u8 {
-    if (count >= 1_000_000) {
-        if (count % 1_000_000 == 0) {
-            return std.fmt.allocPrint(allocator, "{d}M", .{count / 1_000_000});
-        }
-
-        const tenths = @divFloor((@as(u64, count) * 10) + 500_000, 1_000_000);
-        if (tenths % 10 == 0) {
-            return std.fmt.allocPrint(allocator, "{d}M", .{@as(u32, @intCast(tenths / 10))});
-        }
-        return std.fmt.allocPrint(
-            allocator,
-            "{d}.{d}M",
-            .{
-                @as(u32, @intCast(tenths / 10)),
-                @as(u32, @intCast(tenths % 10)),
-            },
-        );
-    }
-
-    if (count >= 1_000) {
-        if (count % 1_000 == 0) {
-            return std.fmt.allocPrint(allocator, "{d}K", .{count / 1_000});
-        }
-
-        const tenths = @divFloor((@as(u64, count) * 10) + 500, 1_000);
-        if (tenths % 10 == 0) {
-            return std.fmt.allocPrint(allocator, "{d}K", .{@as(u32, @intCast(tenths / 10))});
-        }
-        return std.fmt.allocPrint(
-            allocator,
-            "{d}.{d}K",
-            .{
-                @as(u32, @intCast(tenths / 10)),
-                @as(u32, @intCast(tenths % 10)),
-            },
-        );
-    }
-
-    return std.fmt.allocPrint(allocator, "{d}", .{count});
-}
-
-fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    try stdout.flush();
-    try stderr.flush();
-}
-
-fn prepareCliRuntime(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-    cwd: []const u8,
-    options: *const cli.Args,
-    selected_tools: ?[]const []const u8,
-) !PreparedCliRuntime {
-    var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, cwd);
-    errdefer runtime_config.deinit();
-
-    var resource_bundle = try resources_mod.loadResourceBundle(allocator, io, .{
-        .cwd = cwd,
-        .agent_dir = runtime_config.agent_dir,
-        .global = settingsResources(runtime_config.global_settings),
-        .project = settingsResources(runtime_config.project_settings),
-        .cli_extensions = options.extensions orelse &.{},
-        .cli_skills = options.skills orelse &.{},
-        .cli_prompts = options.prompt_templates orelse &.{},
-        .cli_themes = options.themes orelse &.{},
-        .include_default_extensions = !options.no_extensions,
-        .include_default_skills = !options.no_skills,
-        .include_default_prompts = !options.no_prompt_templates,
-        .include_default_themes = !options.no_themes,
-    });
-    errdefer resource_bundle.deinit(allocator);
-
-    const context_files = if (options.no_context_files)
-        try allocator.dupe(context_files_mod.ContextFile, &.{})
-    else
-        try context_files_mod.loadContextFiles(allocator, io, cwd);
-    errdefer context_files_mod.deinitContextFiles(allocator, context_files);
-
-    _ = startupNetworkOperationsEnabled(options, env_map);
-
-    const current_date = try currentDateString(allocator, io);
-    defer allocator.free(current_date);
-
-    const initial_model = try selectInitialModel(allocator, env_map, &runtime_config, options);
-    const provider_name = initial_model.provider_name;
-    const model_name = initial_model.model_name;
-    const thinking_level = if (options.thinking) |level|
-        mapThinkingLevel(level)
-    else
-        runtime_config.settings.default_thinking_level orelse .off;
-
-    const system_prompt = try coding_agent.buildSystemPrompt(allocator, .{
-        .cwd = cwd,
-        .current_date = current_date,
-        .custom_prompt = options.system_prompt,
-        .append_prompt = options.append_system_prompt,
-        .selected_tools = selected_tools,
-        .context_files = context_files,
-        .skills = resource_bundle.skills,
-    });
-    errdefer allocator.free(system_prompt);
-
-    const session_dir = if (options.session_dir) |value|
-        try config_mod.expandPath(allocator, env_map, value, cwd)
-    else
-        try runtime_config.effectiveSessionDir(allocator, env_map, cwd);
-    errdefer allocator.free(session_dir);
-
-    const expanded_prompt = if (options.prompt) |prompt|
-        try resources_mod.expandPromptTemplate(allocator, prompt, resource_bundle.prompt_templates)
-    else
-        null;
-    errdefer if (expanded_prompt) |value| allocator.free(value);
-
-    return .{
-        .runtime_config = runtime_config,
-        .resource_bundle = resource_bundle,
-        .context_files = context_files,
-        .system_prompt = system_prompt,
-        .session_dir = session_dir,
-        .expanded_prompt = expanded_prompt,
-        .provider_name = provider_name,
-        .model_name = model_name,
-        .thinking_level = thinking_level,
-    };
-}
-
-const InitialModelSelection = struct {
-    provider_name: []const u8,
-    model_name: ?[]const u8,
-};
-
-fn selectInitialModel(
-    allocator: std.mem.Allocator,
-    env_map: *const std.process.Environ.Map,
-    runtime_config: *const config_mod.RuntimeConfig,
-    options: *const cli.Args,
-) !InitialModelSelection {
-    if (options.provider != null or runtime_config.settings.default_provider != null) {
-        return .{
-            .provider_name = options.provider orelse runtime_config.settings.default_provider.?,
-            .model_name = options.model orelse runtime_config.settings.default_model,
-        };
-    }
-
-    if (options.model != null or runtime_config.settings.default_model != null) {
-        return .{
-            .provider_name = "openai",
-            .model_name = options.model orelse runtime_config.settings.default_model,
-        };
-    }
-
-    const model = try coding_agent.provider_config.findInitialDefaultModel(allocator, env_map, .{
-        .auth_tokens = &runtime_config.auth_tokens,
-        .provider_api_keys = &runtime_config.provider_api_keys,
-    });
-    if (model) |value| {
-        return .{
-            .provider_name = value.provider,
-            .model_name = value.id,
-        };
-    }
-
-    return .{
-        .provider_name = "openai",
-        .model_name = null,
-    };
-}
-
-fn settingsResources(settings: config_mod.Settings) resources_mod.SettingsResources {
-    return .{
-        .packages = settings.packages,
-        .extensions = settings.extensions,
-        .skills = settings.skills,
-        .prompts = settings.prompts,
-        .themes = settings.themes,
-        .theme = settings.theme,
-    };
-}
-
-fn writeResourceDiagnostics(stderr: *std.Io.Writer, diagnostics: []const resources_mod.Diagnostic) !void {
-    for (diagnostics) |diagnostic| {
-        if (diagnostic.path) |path| {
-            try stderr.print("Warning: {s}: {s} ({s})\n", .{ diagnostic.kind, diagnostic.message, path });
-        } else {
-            try stderr.print("Warning: {s}: {s}\n", .{ diagnostic.kind, diagnostic.message });
-        }
-    }
-}
-
-fn mapThinkingLevel(level: cli.ThinkingLevel) agent.ThinkingLevel {
-    return switch (level) {
-        .off => .off,
-        .minimal => .minimal,
-        .low => .low,
-        .medium => .medium,
-        .high => .high,
-        .xhigh => .xhigh,
-    };
 }
 
 fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
