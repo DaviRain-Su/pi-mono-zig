@@ -694,16 +694,25 @@ fn buildStreamEventValue(
                 const text = try blocksToText(allocator, message.tool_result.content);
                 defer allocator.free(text);
                 try putStringField(&result, allocator, "text", text);
+                if (message.tool_result.details) |details| {
+                    try putField(&result, allocator, "details", try common.cloneJsonValue(allocator, details));
+                }
             },
         }
     } else if (event.result) |tool_result| {
         const text = try blocksToText(allocator, tool_result.content);
         defer allocator.free(text);
         try putStringField(&result, allocator, "text", text);
+        if (tool_result.details) |details| {
+            try putField(&result, allocator, "details", try common.cloneJsonValue(allocator, details));
+        }
     } else if (event.partial_result) |partial_result| {
         const text = try blocksToText(allocator, partial_result.content);
         defer allocator.free(text);
         try putStringField(&result, allocator, "text", text);
+        if (partial_result.details) |details| {
+            try putField(&result, allocator, "details", try common.cloneJsonValue(allocator, details));
+        }
     }
 
     if (event.tool_name) |tool_name| try putStringField(&result, allocator, "toolName", tool_name);
@@ -767,6 +776,46 @@ fn putIntField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: [
 
 fn parseJsonLine(allocator: std.mem.Allocator, line: []const u8) !std.json.Parsed(std.json.Value) {
     return try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+}
+
+fn makeTestToolDetails(allocator: std.mem.Allocator, exit_code: i64, timed_out: bool) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value: std.json.Value = .{ .object = object };
+        common.deinitJsonValue(allocator, value);
+    }
+    try object.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = exit_code });
+    try object.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = timed_out });
+
+    var truncation = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value: std.json.Value = .{ .object = truncation };
+        common.deinitJsonValue(allocator, value);
+    }
+    try truncation.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, "tail output") });
+    try truncation.put(allocator, try allocator.dupe(u8, "truncated"), .{ .bool = true });
+    try truncation.put(allocator, try allocator.dupe(u8, "truncated_by"), .{ .string = try allocator.dupe(u8, "bytes") });
+    try truncation.put(allocator, try allocator.dupe(u8, "total_lines"), .{ .integer = 3000 });
+    try truncation.put(allocator, try allocator.dupe(u8, "output_lines"), .{ .integer = 42 });
+
+    try object.put(allocator, try allocator.dupe(u8, "full_output_path"), .{ .string = try allocator.dupe(u8, "/tmp/pi-bash-test.log") });
+    try object.put(allocator, try allocator.dupe(u8, "truncation"), .{ .object = truncation });
+    return .{ .object = object };
+}
+
+fn testBashToolExecuteWithDetails(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    return .{
+        .content = try common.makeTextContent(allocator, "bash output"),
+        .details = try makeTestToolDetails(allocator, 9, false),
+    };
 }
 
 test "rpc initialize reports capabilities and session state" {
@@ -958,6 +1007,105 @@ test "rpc stream emits notifications and final response" {
 
     try std.testing.expect(saw_event);
     try std.testing.expect(saw_response);
+}
+
+test "rpc stream notification includes structured tool details" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "echo hello") });
+    const args_value = std.json.Value{ .object = args };
+    defer common.deinitJsonValue(allocator, args_value);
+
+    const first_blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    first_blocks[0] = try ai.providers.faux.fauxToolCall(allocator, "bash", args_value, .{ .id = "tool-1" });
+    defer {
+        switch (first_blocks[0]) {
+            .tool_call => |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                common.deinitJsonValue(allocator, tool_call.arguments);
+            },
+            else => {},
+        }
+        allocator.free(first_blocks);
+    }
+
+    const second_blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    defer allocator.free(second_blocks);
+    second_blocks[0] = ai.providers.faux.fauxText("bash reply");
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(first_blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(second_blocks, .{}) },
+    });
+
+    const bash_tool = agent.AgentTool{
+        .name = "bash",
+        .description = "Run bash",
+        .label = "bash",
+        .parameters = .null,
+        .execute = testBashToolExecuteWithDetails,
+    };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+        .tools = &[_]agent.AgentTool{bash_tool},
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{
+            "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"stream-1\",\"method\":\"stream\",\"params\":{\"message\":\"run bash\"}}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, stdout_capture.writer.buffered(), "\n"), '\n');
+    _ = lines.next().?;
+
+    var saw_details = false;
+    while (lines.next()) |line| {
+        var parsed = try parseJsonLine(allocator, line);
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        if (root.get("params")) |params| {
+            const event = params.object;
+            if (event.get("toolName")) |tool_name| {
+                const tool_name_string = switch (tool_name) {
+                    .string => |string| string,
+                    else => continue,
+                };
+                if (!std.mem.eql(u8, tool_name_string, "bash")) continue;
+                const details = event.get("details") orelse continue;
+                if (details != .object) continue;
+                try std.testing.expectEqual(@as(i64, 9), details.object.get("exit_code").?.integer);
+                try std.testing.expectEqual(false, details.object.get("timed_out").?.bool);
+                try std.testing.expectEqualStrings("/tmp/pi-bash-test.log", details.object.get("full_output_path").?.string);
+                try std.testing.expectEqualStrings("bytes", details.object.get("truncation").?.object.get("truncated_by").?.string);
+                try std.testing.expectEqual(@as(i64, 3000), details.object.get("truncation").?.object.get("total_lines").?.integer);
+                saw_details = true;
+                break;
+            }
+        }
+    }
+
+    try std.testing.expect(saw_details);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
 test "rpc supports cancellation with json-rpc cancel requests" {

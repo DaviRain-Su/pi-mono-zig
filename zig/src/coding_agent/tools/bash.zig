@@ -33,6 +33,51 @@ pub const BashExecutionResult = struct {
     }
 };
 
+pub fn detailsToJsonValue(allocator: std.mem.Allocator, details: BashDetails) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value: std.json.Value = .{ .object = object };
+        common.deinitJsonValue(allocator, value);
+    }
+
+    if (details.exit_code) |exit_code| {
+        try object.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = @intCast(exit_code) });
+    }
+    try object.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = details.timed_out });
+    if (details.full_output_path) |path| {
+        try object.put(allocator, try allocator.dupe(u8, "full_output_path"), .{ .string = try allocator.dupe(u8, path) });
+    }
+    if (details.truncation) |truncation_result| {
+        try object.put(allocator, try allocator.dupe(u8, "truncation"), try truncationToJsonValue(allocator, truncation_result));
+    }
+
+    return .{ .object = object };
+}
+
+fn truncationToJsonValue(allocator: std.mem.Allocator, truncation_result: truncate.TruncationResult) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value: std.json.Value = .{ .object = object };
+        common.deinitJsonValue(allocator, value);
+    }
+
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, truncation_result.content) });
+    try object.put(allocator, try allocator.dupe(u8, "truncated"), .{ .bool = truncation_result.truncated });
+    if (truncation_result.truncated_by) |truncated_by| {
+        try object.put(allocator, try allocator.dupe(u8, "truncated_by"), .{ .string = try allocator.dupe(u8, @tagName(truncated_by)) });
+    }
+    try object.put(allocator, try allocator.dupe(u8, "total_lines"), .{ .integer = @intCast(truncation_result.total_lines) });
+    try object.put(allocator, try allocator.dupe(u8, "total_bytes"), .{ .integer = @intCast(truncation_result.total_bytes) });
+    try object.put(allocator, try allocator.dupe(u8, "output_lines"), .{ .integer = @intCast(truncation_result.output_lines) });
+    try object.put(allocator, try allocator.dupe(u8, "output_bytes"), .{ .integer = @intCast(truncation_result.output_bytes) });
+    try object.put(allocator, try allocator.dupe(u8, "last_line_partial"), .{ .bool = truncation_result.last_line_partial });
+    try object.put(allocator, try allocator.dupe(u8, "first_line_exceeds_limit"), .{ .bool = truncation_result.first_line_exceeds_limit });
+    try object.put(allocator, try allocator.dupe(u8, "max_lines"), .{ .integer = @intCast(truncation_result.max_lines) });
+    try object.put(allocator, try allocator.dupe(u8, "max_bytes"), .{ .integer = @intCast(truncation_result.max_bytes) });
+
+    return .{ .object = object };
+}
+
 pub const BashUpdateCallback = *const fn (
     context: ?*anyopaque,
     // Borrowed for the duration of the callback. Clone any owned fields before retaining them.
@@ -780,6 +825,45 @@ test "buildStreamingPreview frees truncation buffers for truncated output" {
         1,
         "[Running... 1.5s elapsed]",
     ));
+}
+
+test "detailsToJsonValue serializes bash metadata for downstream consumers" {
+    var details = BashDetails{
+        .exit_code = 23,
+        .timed_out = true,
+        .full_output_path = try std.testing.allocator.dupe(u8, "/tmp/pi-bash-test.log"),
+        .truncation = .{
+            .content = try std.testing.allocator.dupe(u8, "tail output"),
+            .truncated = true,
+            .truncated_by = .bytes,
+            .total_lines = 3000,
+            .total_bytes = 120_000,
+            .output_lines = 42,
+            .output_bytes = 51_200,
+            .last_line_partial = true,
+            .first_line_exceeds_limit = false,
+            .max_lines = truncate.DEFAULT_MAX_LINES,
+            .max_bytes = truncate.DEFAULT_MAX_BYTES,
+        },
+    };
+    defer details.deinit(std.testing.allocator);
+
+    const value = try detailsToJsonValue(std.testing.allocator, details);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const object = value.object;
+    try std.testing.expectEqual(@as(i64, 23), object.get("exit_code").?.integer);
+    try std.testing.expectEqual(true, object.get("timed_out").?.bool);
+    try std.testing.expectEqualStrings("/tmp/pi-bash-test.log", object.get("full_output_path").?.string);
+
+    const truncation_object = object.get("truncation").?.object;
+    try std.testing.expectEqual(true, truncation_object.get("truncated").?.bool);
+    try std.testing.expectEqualStrings("bytes", truncation_object.get("truncated_by").?.string);
+    try std.testing.expectEqual(@as(i64, 3000), truncation_object.get("total_lines").?.integer);
+    try std.testing.expectEqual(@as(i64, 120_000), truncation_object.get("total_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), truncation_object.get("output_lines").?.integer);
+    try std.testing.expectEqual(@as(i64, 51_200), truncation_object.get("output_bytes").?.integer);
+    try std.testing.expectEqual(true, truncation_object.get("last_line_partial").?.bool);
 }
 
 test "bash tool validates required arguments" {
