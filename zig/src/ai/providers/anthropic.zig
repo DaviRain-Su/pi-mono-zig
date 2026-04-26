@@ -81,14 +81,15 @@ pub const AnthropicProvider = struct {
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
 
-        const url = try std.fmt.allocPrint(allocator, "{s}/messages", .{model.base_url});
+        const url = try buildMessagesUrl(allocator, model.base_url);
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
         errdefer deinitOwnedHeaders(allocator, &headers);
         defer deinitOwnedHeaders(allocator, &headers);
         try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        try putOwnedHeader(allocator, &headers, "Accept", "application/json");
+        try putOwnedHeader(allocator, &headers, "anthropic-dangerous-direct-browser-access", "true");
         try putOwnedHeader(allocator, &headers, "anthropic-version", "2023-06-01");
         try applyAuthHeaders(allocator, &headers, model, resolved_options.options);
         try applyDefaultAnthropicHeaders(allocator, &headers, model, context, resolved_options.options);
@@ -122,7 +123,9 @@ pub const AnthropicProvider = struct {
         }
 
         if (response.status != 200) {
-            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response.body });
+            const response_body = try response.readAll(allocator);
+            defer allocator.free(response_body);
+            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response_body });
             const message = types.AssistantMessage{
                 .content = &[_]types.ContentBlock{},
                 .api = model.api,
@@ -156,6 +159,26 @@ pub const AnthropicProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
+
+fn buildMessagesUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
+    if (std.mem.endsWith(u8, trimmed, "/v1")) {
+        return std.fmt.allocPrint(allocator, "{s}/messages", .{trimmed});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/v1/messages", .{trimmed});
+}
+
+test "buildMessagesUrl appends SDK-compatible Anthropic path" {
+    const allocator = std.testing.allocator;
+
+    const anthropic_url = try buildMessagesUrl(allocator, "https://api.anthropic.com/v1");
+    defer allocator.free(anthropic_url);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", anthropic_url);
+
+    const kimi_url = try buildMessagesUrl(allocator, "https://api.kimi.com/coding");
+    defer allocator.free(kimi_url);
+    try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1/messages", kimi_url);
+}
 
 fn resolveStreamOptions(
     allocator: std.mem.Allocator,
@@ -679,6 +702,29 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
     );
 }
 
+test "kimi-coding default headers match SDK parity" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    try applyDefaultAnthropicHeaders(allocator, &headers, model, .{ .messages = &[_]types.Message{} }, null);
+    try std.testing.expectEqualStrings("KimiCLI/1.5", headers.get("user-agent").?);
+    try std.testing.expectEqualStrings("interleaved-thinking-2025-05-14", headers.get("anthropic-beta").?);
+}
+
 test "buildRequestPayload omits anthropic long cache ttl when compat disables it" {
     const allocator = std.testing.allocator;
 
@@ -965,6 +1011,11 @@ fn parseSseStreamLines(
         active_blocks.deinit(allocator);
     }
 
+    var sse_event = std.ArrayList(u8).empty;
+    defer sse_event.deinit(allocator);
+    var sse_data = std.ArrayList(u8).empty;
+    defer sse_data.deinit(allocator);
+
     stream_ptr.push(.{ .event_type = .start });
 
     while (try streaming.readLine()) |line| {
@@ -980,63 +1031,57 @@ fn parseSseStreamLines(
             return;
         }
 
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "event:")) continue;
-        const data = parseSseLine(trimmed) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = try json_parse.parseStreamingJson(allocator, data);
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) return AnthropicError.InvalidAnthropicChunk;
-
-        const event_type = value.object.get("type") orelse return AnthropicError.InvalidAnthropicChunk;
-        if (event_type != .string) return AnthropicError.InvalidAnthropicChunk;
-
-        if (std.mem.eql(u8, event_type.string, "message_start")) {
-            if (value.object.get("message")) |message_value| {
-                if (message_value == .object) {
-                    if (message_value.object.get("id")) |id_value| {
-                        if (id_value == .string and output.response_id == null) {
-                            output.response_id = try allocator.dupe(u8, id_value.string);
-                        }
-                    }
-                    if (message_value.object.get("usage")) |usage_value| {
-                        updateUsage(&output.usage, usage_value);
-                    }
-                }
-            }
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (trimmed.len == 0) {
+            if (try processAnthropicSseEvent(
+                allocator,
+                stream_ptr,
+                sse_event.items,
+                sse_data.items,
+                model,
+                &output,
+                &content_blocks,
+                &tool_calls,
+                &active_blocks,
+                context,
+                options,
+            )) return;
+            sse_event.clearRetainingCapacity();
+            sse_data.clearRetainingCapacity();
             continue;
         }
 
-        if (std.mem.eql(u8, event_type.string, "content_block_start")) {
-            try handleContentBlockStart(allocator, &active_blocks, stream_ptr, value, context, options);
-            continue;
-        }
+        if (trimmed[0] == ':') continue;
+        try appendSseField(allocator, trimmed, &sse_event, &sse_data);
+    }
 
-        if (std.mem.eql(u8, event_type.string, "content_block_delta")) {
-            try handleContentBlockDelta(allocator, &active_blocks, stream_ptr, value);
-            continue;
-        }
+    if (sse_data.items.len > 0) {
+        if (try processAnthropicSseEvent(
+            allocator,
+            stream_ptr,
+            sse_event.items,
+            sse_data.items,
+            model,
+            &output,
+            &content_blocks,
+            &tool_calls,
+            &active_blocks,
+            context,
+            options,
+        )) return;
+    }
 
-        if (std.mem.eql(u8, event_type.string, "content_block_stop")) {
-            try handleContentBlockStop(allocator, &active_blocks, &content_blocks, &tool_calls, stream_ptr, value);
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type.string, "message_delta")) {
-            if (value.object.get("delta")) |delta_value| {
-                if (delta_value == .object) {
-                    if (delta_value.object.get("stop_reason")) |stop_reason| {
-                        if (stop_reason == .string) output.stop_reason = try mapStopReason(stop_reason.string);
-                    }
-                }
-            }
-            if (value.object.get("usage")) |usage_value| {
-                updateUsage(&output.usage, usage_value);
-            }
-            continue;
-        }
+    if (content_blocks.items.len == 0 and tool_calls.items.len == 0) {
+        const error_message = try allocator.dupe(u8, "Provider returned an empty assistant response");
+        output.stop_reason = .error_reason;
+        output.error_message = error_message;
+        stream_ptr.push(.{
+            .event_type = .error_event,
+            .error_message = error_message,
+            .message = output,
+        });
+        stream_ptr.end(output);
+        return;
     }
 
     output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
@@ -1049,6 +1094,180 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn appendSseField(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    event_name: *std.ArrayList(u8),
+    data: *std.ArrayList(u8),
+) !void {
+    const delimiter_index = std.mem.indexOfScalar(u8, line, ':') orelse line.len;
+    const field = line[0..delimiter_index];
+    var value = if (delimiter_index < line.len) line[delimiter_index + 1 ..] else "";
+    if (value.len > 0 and value[0] == ' ') value = value[1..];
+
+    if (std.mem.eql(u8, field, "event")) {
+        event_name.clearRetainingCapacity();
+        try event_name.appendSlice(allocator, value);
+    } else if (std.mem.eql(u8, field, "data")) {
+        if (data.items.len > 0) try data.append(allocator, '\n');
+        try data.appendSlice(allocator, value);
+    }
+}
+
+fn processAnthropicSseEvent(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    sse_event: []const u8,
+    data: []const u8,
+    model: types.Model,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !bool {
+    if (data.len == 0) return false;
+    if (std.mem.eql(u8, std.mem.trim(u8, data, " \t\r\n"), "[DONE]")) return true;
+
+    var parsed = json_parse.parseStreamingJson(allocator, data) catch |err| {
+        if (std.mem.eql(u8, sse_event, "error")) {
+            try emitAnthropicStreamError(allocator, stream_ptr, output, data);
+            return true;
+        }
+        return err;
+    };
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return AnthropicError.InvalidAnthropicChunk;
+
+    if (std.mem.eql(u8, sse_event, "error")) {
+        const error_message = try formatAnthropicStreamError(allocator, value, data);
+        try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+        return true;
+    }
+
+    const event_type = value.object.get("type") orelse {
+        if (value.object.get("error") != null) {
+            const error_message = try formatAnthropicStreamError(allocator, value, data);
+            try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+            return true;
+        }
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (event_type != .string) return AnthropicError.InvalidAnthropicChunk;
+
+    if (std.mem.eql(u8, event_type.string, "message_start")) {
+        if (value.object.get("message")) |message_value| {
+            if (message_value == .object) {
+                if (message_value.object.get("id")) |id_value| {
+                    if (id_value == .string and output.response_id == null) {
+                        output.response_id = try allocator.dupe(u8, id_value.string);
+                    }
+                }
+                if (message_value.object.get("usage")) |usage_value| {
+                    updateUsage(&output.usage, usage_value);
+                }
+            }
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "content_block_start")) {
+        try handleContentBlockStart(allocator, active_blocks, stream_ptr, value, context, options);
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "content_block_delta")) {
+        try handleContentBlockDelta(allocator, active_blocks, stream_ptr, value);
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "content_block_stop")) {
+        try handleContentBlockStop(allocator, active_blocks, content_blocks, tool_calls, stream_ptr, value);
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "message_delta")) {
+        if (value.object.get("delta")) |delta_value| {
+            if (delta_value == .object) {
+                if (delta_value.object.get("stop_reason")) |stop_reason| {
+                    if (stop_reason == .string) output.stop_reason = try mapStopReason(stop_reason.string);
+                }
+            }
+        }
+        if (value.object.get("usage")) |usage_value| {
+            updateUsage(&output.usage, usage_value);
+        }
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "message_stop") or
+        std.mem.eql(u8, event_type.string, "ping"))
+    {
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "error")) {
+        const error_message = try formatAnthropicStreamError(allocator, value, data);
+        try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+        return true;
+    }
+
+    return false;
+}
+
+fn emitAnthropicStreamError(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    data: []const u8,
+) !void {
+    const error_message = try std.fmt.allocPrint(allocator, "Provider stream error: {s}", .{data});
+    try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+}
+
+fn emitOwnedAnthropicStreamError(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    error_message: []const u8,
+) !void {
+    output.stop_reason = .error_reason;
+    output.error_message = error_message;
+    stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = output.*,
+    });
+    stream_ptr.end(output.*);
+}
+
+fn formatAnthropicStreamError(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    raw: []const u8,
+) ![]u8 {
+    if (value == .object) {
+        if (value.object.get("error")) |error_value| {
+            if (error_value == .object) {
+                const error_type = if (error_value.object.get("type")) |type_value|
+                    if (type_value == .string) type_value.string else "error"
+                else
+                    "error";
+                const message = if (error_value.object.get("message")) |message_value|
+                    if (message_value == .string) message_value.string else raw
+                else
+                    raw;
+                return std.fmt.allocPrint(allocator, "{s}: {s}", .{ error_type, message });
+            }
+        }
+        if (value.object.get("message")) |message_value| {
+            if (message_value == .string) return allocator.dupe(u8, message_value.string);
+        }
+    }
+    return std.fmt.allocPrint(allocator, "Provider stream error: {s}", .{raw});
 }
 
 fn handleContentBlockStart(
@@ -1614,6 +1833,8 @@ fn applyDefaultAnthropicHeaders(
         defer allocator.free(user_agent);
         try putOwnedHeader(allocator, headers, "user-agent", user_agent);
         try putOwnedHeader(allocator, headers, "x-app", "cli");
+    } else if (std.mem.eql(u8, model.provider, "kimi-coding")) {
+        try putOwnedHeader(allocator, headers, "user-agent", "KimiCLI/1.5");
     }
 }
 

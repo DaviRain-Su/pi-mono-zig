@@ -135,6 +135,53 @@ pub fn exportToMarkdown(
     return resolved_path;
 }
 
+pub fn exportToHtml(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const session_mod.AgentSession,
+    output_path: ?[]const u8,
+) ![]const u8 {
+    const resolved_path = try resolveExportPath(allocator, session, output_path, ".html");
+    errdefer allocator.free(resolved_path);
+
+    const html = try renderSessionHtml(allocator, session);
+    defer allocator.free(html);
+
+    try common.writeFileAbsolute(io, resolved_path, html, true);
+    return resolved_path;
+}
+
+pub fn exportFromFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    session_file: []const u8,
+    output_path: ?[]const u8,
+) ![]const u8 {
+    var session = try session_mod.AgentSession.open(allocator, io, .{
+        .session_file = session_file,
+        .cwd_override = cwd,
+    });
+    defer session.deinit();
+
+    if (output_path) |path| {
+        if (std.mem.endsWith(u8, path, ".jsonl")) {
+            return exportToJsonl(allocator, io, &session, path);
+        }
+        if (std.mem.endsWith(u8, path, ".json")) {
+            return exportToJson(allocator, io, &session, path);
+        }
+        if (std.mem.endsWith(u8, path, ".md")) {
+            return exportToMarkdown(allocator, io, &session, path);
+        }
+        if (!std.mem.endsWith(u8, path, ".html")) {
+            return error.UnsupportedExportPath;
+        }
+    }
+
+    return exportToHtml(allocator, io, &session, output_path);
+}
+
 fn resolveExportPath(
     allocator: std.mem.Allocator,
     session: *const session_mod.AgentSession,
@@ -152,6 +199,147 @@ fn resolveExportPath(
     const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ session.session_manager.getSessionId(), extension });
     defer allocator.free(filename);
     return std.fs.path.join(allocator, &[_][]const u8{ base_dir, filename });
+}
+
+fn exportToJsonl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const session_mod.AgentSession,
+    output_path: []const u8,
+) ![]const u8 {
+    const session_file = session.session_manager.getSessionFile() orelse return error.SessionExportRequiresPersistentFile;
+    const resolved_path = try common.resolvePath(allocator, session.cwd, output_path);
+    errdefer allocator.free(resolved_path);
+
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, session_file, allocator, .unlimited);
+    defer allocator.free(bytes);
+    try common.writeFileAbsolute(io, resolved_path, bytes, true);
+    return resolved_path;
+}
+
+fn renderSessionHtml(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) ![]u8 {
+    const stats = getSessionStats(session);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    const title = stats.session_name orelse stats.session_id;
+    try writer.writer.writeAll(
+        \\<!DOCTYPE html>
+        \\<html lang="en">
+        \\<head>
+        \\  <meta charset="utf-8" />
+        \\  <meta name="viewport" content="width=device-width, initial-scale=1" />
+        \\  <title>
+    );
+    try writeEscapedHtml(&writer.writer, title);
+    try writer.writer.writeAll(
+        \\</title>
+        \\  <style>
+        \\    :root { color-scheme: dark; }
+        \\    body { margin: 0; font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; }
+        \\    main { max-width: 960px; margin: 0 auto; padding: 24px; }
+        \\    .card { background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+        \\    .meta { color: #94a3b8; }
+        \\    .message h2 { margin-top: 0; }
+        \\    pre { white-space: pre-wrap; word-break: break-word; background: #020617; border-radius: 8px; padding: 12px; overflow-x: auto; }
+        \\    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        \\  </style>
+        \\</head>
+        \\<body>
+        \\  <main>
+        \\    <section class="card">
+        \\      <h1>
+    );
+    try writeEscapedHtml(&writer.writer, title);
+    try writer.writer.writeAll(
+        \\</h1>
+        \\      <p class="meta"><strong>Session ID:</strong> <code>
+    );
+    try writeEscapedHtml(&writer.writer, stats.session_id);
+    try writer.writer.writeAll(
+        \\</code></p>
+        \\      <p class="meta"><strong>Session file:</strong> <code>
+    );
+    try writeEscapedHtml(&writer.writer, stats.session_file orelse "in-memory");
+    try writer.writer.writeAll(
+        \\</code></p>
+        \\      <p class="meta"><strong>Working directory:</strong> <code>
+    );
+    try writeEscapedHtml(&writer.writer, session.cwd);
+    try writer.writer.writeAll(
+        \\</code></p>
+        \\      <p class="meta"><strong>Model:</strong> <code>
+    );
+    try writeEscapedHtml(&writer.writer, session.agent.getModel().provider);
+    try writer.writer.writeAll(" / ");
+    try writeEscapedHtml(&writer.writer, session.agent.getModel().id);
+    try writer.writer.writeAll(
+        \\</code></p>
+        \\      <p class="meta"><strong>Messages:</strong> 
+    );
+    try writer.writer.print("{d}", .{stats.total_messages});
+    try writer.writer.writeAll(
+        \\ · <strong>Tokens:</strong> 
+    );
+    try writer.writer.print("{d}", .{stats.tokens.total});
+    try writer.writer.writeAll(
+        \\ · <strong>Cost:</strong> $
+    );
+    try writer.writer.print("{d:.4}", .{stats.cost});
+    try writer.writer.writeAll(
+        \\</p>
+        \\    </section>
+    );
+
+    for (session.agent.getMessages(), 0..) |message, index| {
+        const text = try messageToMarkdown(allocator, message);
+        defer allocator.free(text);
+
+        try writer.writer.writeAll(
+            \\
+            \\    <section class="card message">
+            \\      <h2>
+        );
+        try writer.writer.print("{d}. ", .{index + 1});
+        try writeEscapedHtml(&writer.writer, messageTitle(message));
+        try writer.writer.writeAll(
+            \\</h2>
+            \\      <pre>
+        );
+        if (text.len == 0) {
+            try writer.writer.writeAll("_No text content_");
+        } else {
+            try writeEscapedHtml(&writer.writer, text);
+        }
+        try writer.writer.writeAll(
+            \\</pre>
+            \\    </section>
+        );
+    }
+
+    try writer.writer.writeAll(
+        \\
+        \\  </main>
+        \\</body>
+        \\</html>
+        \\
+    );
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn writeEscapedHtml(writer: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| {
+        switch (byte) {
+            '&' => try writer.writeAll("&amp;"),
+            '<' => try writer.writeAll("&lt;"),
+            '>' => try writer.writeAll("&gt;"),
+            '"' => try writer.writeAll("&quot;"),
+            '\'' => try writer.writeAll("&#39;"),
+            else => try writer.writeByte(byte),
+        }
+    }
 }
 
 fn messageTitle(message: agent.AgentMessage) []const u8 {
@@ -303,7 +491,7 @@ fn jsonValueCharCount(value: std.json.Value) usize {
     };
 }
 
-test "session advanced stats and exports cover markdown and json output" {
+test "session advanced stats and exports cover markdown json and html output" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -348,15 +536,22 @@ test "session advanced stats and exports cover markdown and json output" {
     defer allocator.free(json_path);
     const markdown_path = try exportToMarkdown(allocator, std.testing.io, &session, null);
     defer allocator.free(markdown_path);
+    const html_path = try exportToHtml(allocator, std.testing.io, &session, null);
+    defer allocator.free(html_path);
 
     const json_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, json_path, allocator, .limited(1024 * 1024));
     defer allocator.free(json_bytes);
     const markdown_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, markdown_path, allocator, .limited(1024 * 1024));
     defer allocator.free(markdown_bytes);
+    const html_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, html_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(html_bytes);
 
     try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "# Session") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "document this session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "<!DOCTYPE html>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "document this session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "done") != null);
 }
 
 fn makeUserMessage(text: []const u8, timestamp: i64) !agent.AgentMessage {

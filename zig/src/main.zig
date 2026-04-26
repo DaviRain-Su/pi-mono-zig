@@ -5,6 +5,7 @@ const cli = @import("cli/args.zig");
 const config_mod = @import("coding_agent/config.zig");
 const context_files_mod = @import("coding_agent/context_files.zig");
 const resources_mod = @import("coding_agent/resources.zig");
+const session_advanced = @import("coding_agent/session_advanced.zig");
 const coding_agent = @import("coding_agent/root.zig");
 
 const VERSION = "0.1.0";
@@ -126,6 +127,13 @@ fn runCliWithInput(
     if (options.version) {
         try printVersion(allocator, stdout);
         return 0;
+    }
+
+    if (options.@"export") |session_file| {
+        return runSessionExport(allocator, io, env_map, cwd_override, session_file, options.prompt, stdout, stderr) catch |err| {
+            try stderr.print("Error: {s}\n", .{exportErrorMessage(err)});
+            return 1;
+        };
     }
 
     var detected_stdin = if (provided_stdin) |stdin_override|
@@ -318,6 +326,8 @@ fn runCliWithInput(
             .keybindings = &prepared.runtime_config.keybindings,
             .theme = prepared.resource_bundle.selectedTheme(),
             .runtime_config = &prepared.runtime_config,
+            .offline = options.offline,
+            .verbose = options.verbose,
         },
         stderr,
     );
@@ -465,7 +475,74 @@ fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
     if (options.no_tools) {
         return options.tools orelse &[_][]const u8{};
     }
+    if (options.no_builtin_tools and options.tools == null) {
+        return &[_][]const u8{};
+    }
     return options.tools;
+}
+
+fn startupNetworkOperationsEnabled(options: *const cli.Args, env_map: *const std.process.Environ.Map) bool {
+    return !options.offline and !isTruthyEnvFlag(env_map.get("PI_OFFLINE"));
+}
+
+fn isTruthyEnvFlag(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.ascii.eqlIgnoreCase(text, "1") or
+        std.ascii.eqlIgnoreCase(text, "true") or
+        std.ascii.eqlIgnoreCase(text, "yes") or
+        std.ascii.eqlIgnoreCase(text, "on");
+}
+
+fn runSessionExport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd_override: ?[]const u8,
+    session_file: []const u8,
+    output_path: ?[]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const cwd = if (cwd_override) |override| blk: {
+        break :blk try allocator.dupe(u8, override);
+    } else blk: {
+        const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(real_cwd);
+        break :blk try allocator.dupe(u8, real_cwd);
+    };
+    defer allocator.free(cwd);
+
+    const resolved_session_file = try config_mod.expandPath(allocator, env_map, session_file, cwd);
+    defer allocator.free(resolved_session_file);
+    const resolved_output_path = if (output_path) |path|
+        try config_mod.expandPath(allocator, env_map, path, cwd)
+    else
+        null;
+    defer if (resolved_output_path) |path| allocator.free(path);
+
+    const exported_path = session_advanced.exportFromFile(
+        allocator,
+        io,
+        cwd,
+        resolved_session_file,
+        resolved_output_path,
+    ) catch |err| {
+        _ = stderr;
+        return err;
+    };
+    defer allocator.free(exported_path);
+
+    try stdout.print("Exported to: {s}\n", .{exported_path});
+    return 0;
+}
+
+fn exportErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "File not found",
+        error.UnsupportedExportPath => "Unsupported export path. Use a .html, .jsonl, .json, or .md output path",
+        error.SessionExportRequiresPersistentFile => "Cannot export JSONL from an in-memory session",
+        else => @errorName(err),
+    };
 }
 
 fn printUsage(allocator: std.mem.Allocator, stdout: *std.Io.Writer) !void {
@@ -490,13 +567,19 @@ fn printModelList(
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, ".");
     defer runtime_config.deinit();
 
-    const available = try coding_agent.provider_config.listAvailableModels(allocator, env_map, null);
+    const available = try coding_agent.provider_config.listAvailableModels(allocator, env_map, null, .{
+        .auth_tokens = &runtime_config.auth_tokens,
+        .provider_api_keys = &runtime_config.provider_api_keys,
+    });
     defer allocator.free(available);
 
+    const configured = try coding_agent.provider_config.filterConfiguredModels(allocator, available);
+    defer allocator.free(configured);
+
     const filtered = if (search) |pattern|
-        try coding_agent.provider_config.filterAvailableModels(allocator, available, &.{pattern})
+        try coding_agent.provider_config.filterAvailableModels(allocator, configured, &.{pattern})
     else
-        try allocator.dupe(coding_agent.provider_config.AvailableModel, available);
+        try allocator.dupe(coding_agent.provider_config.AvailableModel, configured);
     defer allocator.free(filtered);
 
     if (filtered.len == 0) {
@@ -723,14 +806,20 @@ fn prepareCliRuntime(
     });
     errdefer resource_bundle.deinit(allocator);
 
-    const context_files = try context_files_mod.loadContextFiles(allocator, io, cwd);
+    const context_files = if (options.no_context_files)
+        try allocator.dupe(context_files_mod.ContextFile, &.{})
+    else
+        try context_files_mod.loadContextFiles(allocator, io, cwd);
     errdefer context_files_mod.deinitContextFiles(allocator, context_files);
+
+    _ = startupNetworkOperationsEnabled(options, env_map);
 
     const current_date = try currentDateString(allocator, io);
     defer allocator.free(current_date);
 
-    const provider_name = options.provider orelse runtime_config.settings.default_provider orelse "openai";
-    const model_name = options.model orelse runtime_config.settings.default_model;
+    const initial_model = try selectInitialModel(allocator, env_map, &runtime_config, options);
+    const provider_name = initial_model.provider_name;
+    const model_name = initial_model.model_name;
     const thinking_level = if (options.thinking) |level|
         mapThinkingLevel(level)
     else
@@ -769,6 +858,48 @@ fn prepareCliRuntime(
         .provider_name = provider_name,
         .model_name = model_name,
         .thinking_level = thinking_level,
+    };
+}
+
+const InitialModelSelection = struct {
+    provider_name: []const u8,
+    model_name: ?[]const u8,
+};
+
+fn selectInitialModel(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    runtime_config: *const config_mod.RuntimeConfig,
+    options: *const cli.Args,
+) !InitialModelSelection {
+    if (options.provider != null or runtime_config.settings.default_provider != null) {
+        return .{
+            .provider_name = options.provider orelse runtime_config.settings.default_provider.?,
+            .model_name = options.model orelse runtime_config.settings.default_model,
+        };
+    }
+
+    if (options.model != null or runtime_config.settings.default_model != null) {
+        return .{
+            .provider_name = "openai",
+            .model_name = options.model orelse runtime_config.settings.default_model,
+        };
+    }
+
+    const model = try coding_agent.provider_config.findInitialDefaultModel(allocator, env_map, .{
+        .auth_tokens = &runtime_config.auth_tokens,
+        .provider_api_keys = &runtime_config.provider_api_keys,
+    });
+    if (model) |value| {
+        return .{
+            .provider_name = value.provider,
+            .model_name = value.id,
+        };
+    }
+
+    return .{
+        .provider_name = "openai",
+        .model_name = null,
     };
 }
 
@@ -912,6 +1043,53 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-builtin-tools, -nbt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-context-files, -nc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--export <file>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--verbose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--offline") != null);
+}
+
+test "effectiveToolSelection disables built-in tools when requested" {
+    const allocator = std.testing.allocator;
+
+    var no_builtin_args = try cli.parseArgs(allocator, &.{"--no-builtin-tools"});
+    defer no_builtin_args.deinit(allocator);
+    const no_builtin_selection = effectiveToolSelection(&no_builtin_args).?;
+    try std.testing.expectEqual(@as(usize, 0), no_builtin_selection.len);
+
+    var explicit_args = try cli.parseArgs(allocator, &.{
+        "--no-builtin-tools",
+        "--tools",
+        "read,ls",
+    });
+    defer explicit_args.deinit(allocator);
+    const explicit_selection = effectiveToolSelection(&explicit_args).?;
+    try std.testing.expectEqual(@as(usize, 2), explicit_selection.len);
+    try std.testing.expectEqualStrings("read", explicit_selection[0]);
+    try std.testing.expectEqualStrings("ls", explicit_selection[1]);
+
+    var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, no_builtin_selection);
+    defer built_tools.deinit();
+    try std.testing.expectEqual(@as(usize, 0), built_tools.items.len);
+}
+
+test "startup network operations respect CLI offline flag and environment" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var default_args = try cli.parseArgs(allocator, &.{});
+    defer default_args.deinit(allocator);
+    try std.testing.expect(startupNetworkOperationsEnabled(&default_args, &env_map));
+
+    var offline_args = try cli.parseArgs(allocator, &.{"--offline"});
+    defer offline_args.deinit(allocator);
+    try std.testing.expect(!startupNetworkOperationsEnabled(&offline_args, &env_map));
+
+    try env_map.put("PI_OFFLINE", "true");
+    try std.testing.expect(!startupNetworkOperationsEnabled(&default_args, &env_map));
 }
 
 test "runCli lists models and applies optional search" {
@@ -919,6 +1097,7 @@ test "runCli lists models and applies optional search" {
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
 
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
@@ -999,6 +1178,91 @@ test "runCli auto-switches to print mode for piped stdin" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("hello from stdin\n", stdout_capture.writer.buffered());
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli exports session files to html and jsonl" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "cli-export");
+    defer allocator.free(cwd);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "export reply");
+
+    var create_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer create_stdout.deinit();
+    var create_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer create_stderr.deinit();
+
+    const create_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "export prompt" },
+        cwd,
+        &create_stdout.writer,
+        &create_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), create_exit);
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    const html_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "exported.html" });
+    defer allocator.free(html_path);
+    const jsonl_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "exported.jsonl" });
+    defer allocator.free(jsonl_path);
+
+    var html_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer html_stdout.deinit();
+    var html_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer html_stderr.deinit();
+    const html_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--export", session_file, html_path },
+        cwd,
+        &html_stdout.writer,
+        &html_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), html_exit);
+    try std.testing.expect(std.mem.indexOf(u8, html_stdout.writer.buffered(), "Exported to:") != null);
+    try std.testing.expectEqualStrings("", html_stderr.writer.buffered());
+
+    const html_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, html_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(html_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "<!DOCTYPE html>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "export prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "export reply") != null);
+
+    var jsonl_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer jsonl_stdout.deinit();
+    var jsonl_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer jsonl_stderr.deinit();
+    const jsonl_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--export", session_file, jsonl_path },
+        cwd,
+        &jsonl_stdout.writer,
+        &jsonl_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), jsonl_exit);
+    try std.testing.expectEqualStrings("", jsonl_stderr.writer.buffered());
+
+    const exported_jsonl = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, jsonl_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(exported_jsonl);
+    try std.testing.expect(std.mem.indexOf(u8, exported_jsonl, "\"export prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported_jsonl, "\"export reply\"") != null);
 }
 
 test "runCli injects @file text into the initial prompt" {
@@ -1999,4 +2263,117 @@ test "prepareCliRuntime wires CLI resource overrides and discovery toggles" {
     const styled = try prepared.resource_bundle.selectedTheme().applyAlloc(allocator, .assistant, "Pi:");
     defer allocator.free(styled);
     try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[35m") != null);
+}
+
+test "prepareCliRuntime skips context file discovery when requested" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "defaultProvider": "faux",
+        \\  "defaultModel": "faux-1"
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/AGENTS.md",
+        .data = "Project instructions from AGENTS.md",
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var args = try cli.parseArgs(allocator, &.{
+        "--no-context-files",
+        "--verbose",
+        "hello",
+    });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.verbose);
+
+    const selected_tools = effectiveToolSelection(&args);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, selected_tools);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), prepared.context_files.len);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Project instructions from AGENTS.md") == null);
+}
+
+test "prepareCliRuntime selects default model from configured api key" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/auth.json",
+        .data =
+        \\{
+        \\  "kimi": { "type": "api_key", "key": "stored-kimi-key" }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, null);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqualStrings("kimi", prepared.provider_name);
+    try std.testing.expectEqualStrings("kimi-k2.6", prepared.model_name.?);
+}
+
+test "prepareCliRuntime selects kimi-coding from KIMI_API_KEY" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("KIMI_API_KEY", "kimi-key");
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, null);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqualStrings("kimi-coding", prepared.provider_name);
+    try std.testing.expectEqualStrings("kimi-for-coding", prepared.model_name.?);
 }
