@@ -60,6 +60,31 @@ pub const PendingMessageQueue = struct {
         self.messages.clearRetainingCapacity();
     }
 
+    pub fn snapshot(self: *const PendingMessageQueue, allocator: std.mem.Allocator) ![]types.AgentMessage {
+        @constCast(&self.mutex).lockUncancelable(self.io);
+        defer @constCast(&self.mutex).unlock(self.io);
+
+        if (self.messages.items.len == 0) {
+            return try allocator.alloc(types.AgentMessage, 0);
+        }
+
+        return try cloneMessageSlice(allocator, self.messages.items);
+    }
+
+    pub fn takeAll(self: *PendingMessageQueue, allocator: std.mem.Allocator) ![]types.AgentMessage {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.messages.items.len == 0) {
+            return try allocator.alloc(types.AgentMessage, 0);
+        }
+
+        const drained = try cloneMessageSlice(allocator, self.messages.items);
+        deinitMessageSlice(self.allocator, self.messages.items);
+        self.messages.clearRetainingCapacity();
+        return drained;
+    }
+
     pub fn drain(self: *PendingMessageQueue, allocator: std.mem.Allocator) ![]types.AgentMessage {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -357,6 +382,22 @@ pub const Agent = struct {
         self.clearFollowUpQueue();
     }
 
+    pub fn snapshotSteeringMessages(self: *const Agent, allocator: std.mem.Allocator) ![]types.AgentMessage {
+        return try self.steering_queue.snapshot(allocator);
+    }
+
+    pub fn snapshotFollowUpMessages(self: *const Agent, allocator: std.mem.Allocator) ![]types.AgentMessage {
+        return try self.follow_up_queue.snapshot(allocator);
+    }
+
+    pub fn takeSteeringMessages(self: *Agent, allocator: std.mem.Allocator) ![]types.AgentMessage {
+        return try self.steering_queue.takeAll(allocator);
+    }
+
+    pub fn takeFollowUpMessages(self: *Agent, allocator: std.mem.Allocator) ![]types.AgentMessage {
+        return try self.follow_up_queue.takeAll(allocator);
+    }
+
     pub fn hasQueuedMessages(self: *const Agent) bool {
         return self.steering_queue.hasItems() or self.follow_up_queue.hasItems();
     }
@@ -545,7 +586,7 @@ fn emitAgentEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     try self.processEvent(event);
 }
 
-fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !types.AgentMessage {
+pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !types.AgentMessage {
     return switch (message) {
         .user => |user| .{ .user = .{
             .role = try allocator.dupe(u8, user.role),
@@ -576,7 +617,7 @@ fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !type
     };
 }
 
-fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage) void {
+pub fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage) void {
     switch (message.*) {
         .user => |*user| {
             allocator.free(user.role);
@@ -601,7 +642,7 @@ fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage) voi
     }
 }
 
-fn cloneMessageSlice(allocator: std.mem.Allocator, messages: []const types.AgentMessage) ![]types.AgentMessage {
+pub fn cloneMessageSlice(allocator: std.mem.Allocator, messages: []const types.AgentMessage) ![]types.AgentMessage {
     const cloned = try allocator.alloc(types.AgentMessage, messages.len);
     errdefer allocator.free(cloned);
 
@@ -618,7 +659,7 @@ fn cloneMessageSlice(allocator: std.mem.Allocator, messages: []const types.Agent
     return cloned;
 }
 
-fn deinitMessageSlice(allocator: std.mem.Allocator, messages: []types.AgentMessage) void {
+pub fn deinitMessageSlice(allocator: std.mem.Allocator, messages: []types.AgentMessage) void {
     for (messages) |*message| deinitMessage(allocator, message);
 }
 
