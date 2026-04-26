@@ -279,15 +279,11 @@ fn mergeRetry(base: ?session_mod.RetrySettings, overrides: ?session_mod.RetrySet
 }
 
 fn loadAuthTokens(allocator: std.mem.Allocator, io: std.Io, path: []const u8, auth_tokens: *std.StringHashMap([]const u8)) !void {
-    const content = try readOptionalFile(allocator, io, path);
-    defer if (content) |value| allocator.free(value);
-    if (content == null) return;
+    const stored = try auth.readStoredCredentialsObject(allocator, io, path);
+    defer deinitJsonValue(allocator, stored);
+    if (stored != .object) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch return;
-    defer parsed.deinit();
-    if (parsed.value != .object) return;
-
-    var iterator = parsed.value.object.iterator();
+    var iterator = stored.object.iterator();
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const object = entry.value_ptr.object;
