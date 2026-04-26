@@ -61,6 +61,21 @@ pub const AvailableModel = struct {
     max_tokens: u32,
 };
 
+pub const ConfiguredCredentials = struct {
+    auth_tokens: ?*const std.StringHashMap([]const u8) = null,
+    provider_api_keys: ?*const std.StringHashMap([]const u8) = null,
+
+    pub fn lookup(self: ConfiguredCredentials, provider: []const u8) ?[]const u8 {
+        if (self.auth_tokens) |auth_tokens| {
+            if (auth_tokens.get(provider)) |value| return value;
+        }
+        if (self.provider_api_keys) |provider_api_keys| {
+            if (provider_api_keys.get(provider)) |value| return value;
+        }
+        return null;
+    }
+};
+
 pub fn resolveProviderConfig(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
@@ -100,6 +115,7 @@ pub fn listAvailableModels(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     current_model: ?ai.Model,
+    configured_credentials: ConfiguredCredentials,
 ) ![]AvailableModel {
     const summaries = try ai.model_registry.listSummaries(allocator);
     defer allocator.free(summaries);
@@ -108,15 +124,12 @@ pub fn listAvailableModels(
     errdefer models.deinit(allocator);
 
     for (summaries) |summary| {
+        const credentials_available = try hasProviderCredentials(allocator, env_map, summary.provider, configured_credentials);
         try models.append(allocator, .{
             .provider = summary.provider,
             .model_id = summary.id,
             .display_name = summary.name,
-            .available = if (current_model) |model|
-                modelMatchesReference(model, summary.provider, summary.id) or
-                    try hasProviderCredentials(allocator, env_map, summary.provider)
-            else
-                try hasProviderCredentials(allocator, env_map, summary.provider),
+            .available = credentials_available,
             .reasoning = summary.reasoning,
             .supports_images = hasInputType(summary.input_types, "image"),
             .context_window = summary.context_window,
@@ -137,7 +150,7 @@ pub fn listAvailableModels(
                 .provider = model.provider,
                 .model_id = model.id,
                 .display_name = model.name,
-                .available = true,
+                .available = try hasProviderCredentials(allocator, env_map, model.provider, configured_credentials),
                 .reasoning = model.reasoning,
                 .supports_images = hasInputType(model.input_types, "image"),
                 .context_window = model.context_window,
@@ -148,6 +161,35 @@ pub fn listAvailableModels(
 
     std.mem.sort(AvailableModel, models.items, {}, lessThanAvailableModel);
     return try models.toOwnedSlice(allocator);
+}
+
+pub fn filterConfiguredModels(
+    allocator: std.mem.Allocator,
+    available: []const AvailableModel,
+) ![]AvailableModel {
+    var filtered = std.ArrayList(AvailableModel).empty;
+    errdefer filtered.deinit(allocator);
+
+    for (available) |entry| {
+        if (entry.available) try filtered.append(allocator, entry);
+    }
+
+    return try filtered.toOwnedSlice(allocator);
+}
+
+pub fn findInitialDefaultModel(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    configured_credentials: ConfiguredCredentials,
+) !?ai.Model {
+    for (ai.model_registry.builtInProviderConfigs()) |provider| {
+        if (std.mem.eql(u8, provider.provider, "faux")) continue;
+        if (!try hasProviderCredentials(allocator, env_map, provider.provider, configured_credentials)) continue;
+
+        const model_id = provider.default_model_id orelse provider.provider;
+        return ai.model_registry.find(provider.provider, model_id) orelse fallbackModel(provider, model_id);
+    }
+    return null;
 }
 
 pub fn filterAvailableModels(
@@ -460,8 +502,11 @@ fn hasProviderCredentials(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     provider: []const u8,
+    configured_credentials: ConfiguredCredentials,
 ) !bool {
     if (std.mem.eql(u8, provider, "faux")) return true;
+    if (shouldForceFauxProvider(env_map, provider)) return true;
+    if (configured_credentials.lookup(provider) != null) return true;
 
     const api_key = try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider);
     defer if (api_key) |value| allocator.free(value);
@@ -536,7 +581,7 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
         return "API key required. Use --api-key or set KIMI_API_KEY.";
     }
     if (std.mem.eql(u8, provider, "kimi")) {
-        return "API key required. Use --api-key or set KIMI_API_KEY.";
+        return "API key required. Use --api-key or set MOONSHOT_API_KEY.";
     }
     return "API credentials required. Use --api-key or configure the provider environment variables.";
 }
@@ -638,7 +683,7 @@ test "listAvailableModels enumerates all built-in providers" {
     defer env_map.deinit();
 
     const current_model = ai.model_registry.find("faux", "faux-1").?;
-    const models = try listAvailableModels(allocator, &env_map, current_model);
+    const models = try listAvailableModels(allocator, &env_map, current_model, .{});
     defer allocator.free(models);
 
     var found_openai = false;
@@ -720,7 +765,7 @@ test "listAvailableModels does not treat GEMINI_API_KEY as google-gemini-cli aut
     try env_map.put("GEMINI_API_KEY", "gemini-key");
 
     const current_model = ai.model_registry.find("faux", "faux-1").?;
-    const models = try listAvailableModels(allocator, &env_map, current_model);
+    const models = try listAvailableModels(allocator, &env_map, current_model, .{});
     defer allocator.free(models);
 
     var saw_google = false;
@@ -741,6 +786,76 @@ test "listAvailableModels does not treat GEMINI_API_KEY as google-gemini-cli aut
     try std.testing.expect(saw_google_gemini_cli);
 }
 
+test "listAvailableModels treats configured credentials as available" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var auth_tokens = std.StringHashMap([]const u8).init(allocator);
+    defer auth_tokens.deinit();
+    try auth_tokens.put("kimi", "stored-kimi-key");
+
+    const models = try listAvailableModels(allocator, &env_map, null, .{ .auth_tokens = &auth_tokens });
+    defer allocator.free(models);
+
+    var saw_kimi = false;
+    for (models) |entry| {
+        if (std.mem.eql(u8, entry.provider, "kimi") and std.mem.eql(u8, entry.model_id, "kimi-k2.6")) {
+            saw_kimi = true;
+            try std.testing.expect(entry.available);
+        }
+    }
+
+    try std.testing.expect(saw_kimi);
+}
+
+test "findInitialDefaultModel uses configured kimi credentials" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var auth_tokens = std.StringHashMap([]const u8).init(allocator);
+    defer auth_tokens.deinit();
+    try auth_tokens.put("kimi", "stored-kimi-key");
+
+    const model = (try findInitialDefaultModel(allocator, &env_map, .{ .auth_tokens = &auth_tokens })).?;
+    try std.testing.expectEqualStrings("kimi", model.provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", model.id);
+}
+
+test "KIMI_API_KEY configures kimi-coding only" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("KIMI_API_KEY", "kimi-key");
+
+    const models = try listAvailableModels(allocator, &env_map, null, .{});
+    defer allocator.free(models);
+
+    var saw_kimi = false;
+    var saw_kimi_coding = false;
+    for (models) |entry| {
+        if (std.mem.eql(u8, entry.provider, "kimi") and std.mem.eql(u8, entry.model_id, "kimi-k2.6")) {
+            saw_kimi = true;
+            try std.testing.expect(!entry.available);
+        }
+        if (std.mem.eql(u8, entry.provider, "kimi-coding") and std.mem.eql(u8, entry.model_id, "kimi-for-coding")) {
+            saw_kimi_coding = true;
+            try std.testing.expect(entry.available);
+        }
+    }
+
+    try std.testing.expect(saw_kimi);
+    try std.testing.expect(saw_kimi_coding);
+
+    const model = (try findInitialDefaultModel(allocator, &env_map, .{})).?;
+    try std.testing.expectEqualStrings("kimi-coding", model.provider);
+    try std.testing.expectEqualStrings("kimi-for-coding", model.id);
+}
+
 test "resolveProviderErrorMessage guides google-gemini-cli users to login" {
     try std.testing.expectEqualStrings(
         "OAuth authentication required. Use /login to authenticate with Google Cloud Code Assist.",
@@ -754,7 +869,7 @@ test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patte
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    const available = try listAvailableModels(allocator, &env_map, ai.model_registry.find("faux", "faux-1").?);
+    const available = try listAvailableModels(allocator, &env_map, ai.model_registry.find("faux", "faux-1").?, .{});
     defer allocator.free(available);
 
     const anthropic_only = try filterAvailableModels(allocator, available, &.{"anthropic/sonnet"});

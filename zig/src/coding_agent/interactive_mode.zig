@@ -61,6 +61,8 @@ pub const RunInteractiveModeOptions = struct {
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
     runtime_config: ?*const config_mod.RuntimeConfig = null,
+    offline: bool = false,
+    verbose: bool = false,
 };
 
 const ChatKind = enum {
@@ -360,9 +362,12 @@ const AppState = struct {
         defer self.mutex.unlock(self.io);
 
         switch (event.event_type) {
-            .agent_start => try self.replaceLabelLocked(&self.status, "streaming"),
+            .agent_start => try self.replaceLabelLocked(&self.status, "waiting for LLM"),
             .agent_end => {
-                if (std.mem.eql(u8, self.status, "streaming")) {
+                if (std.mem.eql(u8, self.status, "streaming") or
+                    std.mem.eql(u8, self.status, "thinking") or
+                    std.mem.eql(u8, self.status, "waiting for LLM"))
+                {
                     try self.replaceLabelLocked(&self.status, "idle");
                 }
             },
@@ -372,12 +377,19 @@ const AppState = struct {
                         try self.appendItemLocked(.assistant, "");
                         self.last_streaming_assistant_index = self.items.items.len - 1;
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
-                        try self.replaceLabelLocked(&self.status, "streaming");
+                        try self.replaceLabelLocked(&self.status, "waiting for LLM");
                     },
                     else => {},
                 };
             },
             .message_update => {
+                if (event.assistant_message_event) |assistant_event| {
+                    switch (assistant_event.event_type) {
+                        .thinking_start, .thinking_delta => try self.replaceLabelLocked(&self.status, "thinking"),
+                        .text_start, .text_delta => try self.replaceLabelLocked(&self.status, "streaming"),
+                        else => {},
+                    }
+                }
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant_message| {
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
@@ -1179,7 +1191,7 @@ const PromptWorker = struct {
         result catch |err| {
             const message = std.fmt.allocPrint(allocator, "error: {s}", .{@errorName(err)}) catch return;
             defer allocator.free(message);
-            self.app_state.setStatus(message) catch {};
+            self.app_state.appendError(message) catch {};
         };
     }
 };
@@ -1899,6 +1911,7 @@ fn handleInputKey(
             session,
             session_dir,
             options.model_patterns,
+            live_resources.runtime_config,
             app_state,
             overlay,
             prompt_worker_active,
@@ -2352,11 +2365,11 @@ fn handleModelSlashCommand(
     overlay: *?SelectorOverlay,
 ) !void {
     const search = argument orelse {
-        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns);
+        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
         return;
     };
 
-    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), options.model_patterns);
+    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
     defer allocator.free(available);
 
     for (available) |entry| {
@@ -2386,7 +2399,7 @@ fn handleModelSlashCommand(
     const message = try std.fmt.allocPrint(allocator, "No exact model match for {s}; opening model selector", .{search});
     defer allocator.free(message);
     try app_state.appendInfo(message);
-    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns);
+    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
 }
 
 fn handleSessionSlashCommand(
@@ -2616,7 +2629,7 @@ fn beginLoginFlow(
 
         const intro = try std.fmt.allocPrint(
             allocator,
-            "{s} login started. Open the browser URL below and paste the final redirect URL into the prompt.",
+            "{s} login started. Open the browser URL below. If the localhost callback page says connection refused, copy that full address-bar URL and paste it into the prompt.",
             .{provider.name},
         );
         defer allocator.free(intro);
@@ -2625,7 +2638,7 @@ fn beginLoginFlow(
         if (browser_session.kind == .google_gemini_cli) {
             try app_state.appendInfo("You will be prompted for a Google Cloud project ID after the redirect is accepted.");
         }
-        try app_state.setStatus("Paste the final redirect URL and press Enter, or Esc to cancel");
+        try app_state.setStatus("Paste the localhost callback URL and press Enter, or Esc to cancel");
         auth_flow.* = .{ .browser_redirect = .{ .session = browser_session } };
         return;
     }
@@ -3623,8 +3636,9 @@ fn loadModelOverlay(
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
     model_patterns: ?[]const []const u8,
+    runtime_config: ?*const config_mod.RuntimeConfig,
 ) !SelectorOverlay {
-    const available = try loadSelectableModels(allocator, env_map, current_model, model_patterns);
+    const available = try loadSelectableModels(allocator, env_map, current_model, model_patterns, runtime_config);
     defer allocator.free(available);
 
     const choices = try allocator.alloc(ModelChoice, available.len);
@@ -3680,27 +3694,18 @@ fn loadSelectableModels(
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
     model_patterns: ?[]const []const u8,
+    runtime_config: ?*const config_mod.RuntimeConfig,
 ) ![]provider_config.AvailableModel {
-    const available = try provider_config.listAvailableModels(allocator, env_map, current_model);
-    errdefer allocator.free(available);
+    const available = try provider_config.listAvailableModels(allocator, env_map, current_model, configuredCredentials(runtime_config));
+    defer allocator.free(available);
 
-    const patterns = model_patterns orelse return available;
-    const filtered = try provider_config.filterAvailableModels(allocator, available, patterns);
-    allocator.free(available);
+    const configured = try provider_config.filterConfiguredModels(allocator, available);
+    errdefer allocator.free(configured);
 
-    if (filtered.len != 0) return filtered;
-
-    allocator.free(filtered);
-    return allocator.dupe(provider_config.AvailableModel, &[_]provider_config.AvailableModel{.{
-        .provider = current_model.provider,
-        .model_id = current_model.id,
-        .display_name = current_model.name,
-        .available = true,
-        .reasoning = current_model.reasoning,
-        .supports_images = modelSupportsInput(current_model.input_types, "image"),
-        .context_window = current_model.context_window,
-        .max_tokens = current_model.max_tokens,
-    }});
+    const patterns = model_patterns orelse return configured;
+    const filtered = try provider_config.filterAvailableModels(allocator, configured, patterns);
+    allocator.free(configured);
+    return filtered;
 }
 
 fn modelSupportsInput(input_types: []const []const u8, expected: []const u8) bool {
@@ -4731,6 +4736,7 @@ fn handleAppAction(
     session: *session_mod.AgentSession,
     session_dir: []const u8,
     model_patterns: ?[]const []const u8,
+    runtime_config: ?*const config_mod.RuntimeConfig,
     app_state: *AppState,
     overlay: *?SelectorOverlay,
     prompt_worker_active: *bool,
@@ -4760,9 +4766,19 @@ fn handleAppAction(
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
-            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns);
+            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns, runtime_config);
         },
     }
+}
+
+fn configuredCredentials(runtime_config: ?*const config_mod.RuntimeConfig) provider_config.ConfiguredCredentials {
+    if (runtime_config) |value| {
+        return .{
+            .auth_tokens = &value.auth_tokens,
+            .provider_api_keys = &value.provider_api_keys,
+        };
+    }
+    return .{};
 }
 
 fn configuredApiKeyForProvider(runtime_config: ?*const config_mod.RuntimeConfig, provider_name: []const u8) ?[]const u8 {
@@ -5570,6 +5586,7 @@ test "handleInputKey respects configured exit binding" {
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
 
     var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
@@ -8176,6 +8193,7 @@ test "loadSelectableModels respects CLI model patterns" {
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
 
     const current_model = ai.model_registry.find("faux", "faux-1").?;
     const filtered = try loadSelectableModels(
@@ -8183,6 +8201,7 @@ test "loadSelectableModels respects CLI model patterns" {
         &env_map,
         current_model,
         &.{"anthropic/sonnet:high"},
+        null,
     );
     defer allocator.free(filtered);
 

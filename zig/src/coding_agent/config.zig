@@ -128,6 +128,7 @@ pub fn loadRuntimeConfig(
     var auth_tokens = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitStringMap(allocator, &auth_tokens);
     try loadAuthTokens(allocator, io, auth_path, &auth_tokens);
+    try loadLegacySettingsApiKeys(allocator, io, global_settings_path, &auth_tokens);
 
     var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitStringMap(allocator, &provider_api_keys);
@@ -290,6 +291,26 @@ fn loadAuthTokens(allocator: std.mem.Allocator, io: std.Io, path: []const u8, au
             defer allocator.free(api_key);
             try putOwnedString(auth_tokens, allocator, entry.key_ptr.*, api_key);
         }
+    }
+}
+
+fn loadLegacySettingsApiKeys(allocator: std.mem.Allocator, io: std.Io, path: []const u8, auth_tokens: *std.StringHashMap([]const u8)) !void {
+    const content = try readOptionalFile(allocator, io, path);
+    defer if (content) |value| allocator.free(value);
+    if (content == null) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    const api_keys = parsed.value.object.get("apiKeys") orelse return;
+    if (api_keys != .object) return;
+
+    var iterator = api_keys.object.iterator();
+    while (iterator.next()) |entry| {
+        if (auth_tokens.contains(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.* != .string) continue;
+        try putOwnedString(auth_tokens, allocator, entry.key_ptr.*, entry.value_ptr.string);
     }
 }
 
@@ -932,6 +953,41 @@ test "runtime config loads auth and custom models from agent files" {
     const local_model = ai.model_registry.find("local-openai", "llama-3.3-70b").?;
     try std.testing.expectEqualStrings("Local Llama 3.3 70B", local_model.name);
     try std.testing.expect(local_model.headers != null);
+}
+
+test "runtime config reads legacy settings api keys" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "apiKeys": {
+        \\    "kimi": "legacy-kimi-key"
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfig(allocator, std.testing.io, &env_map, project_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    try std.testing.expectEqualStrings("legacy-kimi-key", runtime.lookupApiKey("kimi").?);
 }
 
 test "runtime config honors PI_CODING_AGENT_DIR and loads keybindings" {

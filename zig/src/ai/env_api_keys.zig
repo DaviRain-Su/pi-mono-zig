@@ -107,7 +107,7 @@ fn resolveEnvVar(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "fireworks")) return "FIREWORKS_API_KEY";
     if (std.mem.eql(u8, provider, "opencode")) return "OPENCODE_API_KEY";
     if (std.mem.eql(u8, provider, "opencode-go")) return "OPENCODE_API_KEY";
-    if (std.mem.eql(u8, provider, "kimi")) return "KIMI_API_KEY";
+    if (std.mem.eql(u8, provider, "kimi")) return "MOONSHOT_API_KEY";
     if (std.mem.eql(u8, provider, "kimi-coding")) return "KIMI_API_KEY";
     return null;
 }
@@ -133,6 +133,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
     try env_map.put("HF_TOKEN", "hf-key");
     try env_map.put("FIREWORKS_API_KEY", "fireworks-key");
     try env_map.put("OPENCODE_API_KEY", "opencode-key");
+    try env_map.put("MOONSHOT_API_KEY", "moonshot-key");
     try env_map.put("KIMI_API_KEY", "kimi-key");
     try env_map.put("COPILOT_GITHUB_TOKEN", "copilot-token");
     try env_map.put("GH_TOKEN", "gh-token");
@@ -166,7 +167,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
         .{ .provider = "fireworks", .expected = "fireworks-key" },
         .{ .provider = "opencode", .expected = "opencode-key" },
         .{ .provider = "opencode-go", .expected = "opencode-key" },
-        .{ .provider = "kimi", .expected = "kimi-key" },
+        .{ .provider = "kimi", .expected = "moonshot-key" },
         .{ .provider = "kimi-coding", .expected = "kimi-key" },
         .{ .provider = "github-copilot", .expected = "copilot-token" },
         .{ .provider = "anthropic", .expected = "anthropic-oauth-token" },

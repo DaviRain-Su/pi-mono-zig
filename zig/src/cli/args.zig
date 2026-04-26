@@ -52,6 +52,11 @@ pub const Args = struct {
     mode: Mode = .text,
     tools: ?[]const []const u8 = null,
     no_tools: bool = false,
+    no_builtin_tools: bool = false,
+    no_context_files: bool = false,
+    offline: bool = false,
+    verbose: bool = false,
+    @"export": ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
     prompt: ?[]const u8 = null,
@@ -189,6 +194,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             result.tools = try parseToolList(allocator, argv[i]);
         } else if (std.mem.eql(u8, arg, "--no-tools")) {
             result.no_tools = true;
+        } else if (std.mem.eql(u8, arg, "--no-builtin-tools") or std.mem.eql(u8, arg, "-nbt")) {
+            result.no_builtin_tools = true;
         } else if (std.mem.eql(u8, arg, "--system-prompt") or std.mem.eql(u8, arg, "--system") or std.mem.eql(u8, arg, "-s")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
@@ -197,6 +204,16 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             result.append_system_prompt = argv[i];
+        } else if (std.mem.eql(u8, arg, "--no-context-files") or std.mem.eql(u8, arg, "-nc")) {
+            result.no_context_files = true;
+        } else if (std.mem.eql(u8, arg, "--offline")) {
+            result.offline = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            result.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--export")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingOptionValue;
+            result.@"export" = argv[i];
         } else if (std.mem.startsWith(u8, arg, "@")) {
             try file_args_builder.append(allocator, arg[1..]);
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -272,8 +289,13 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --mode <text|json|rpc>         Output mode (default: text)
         \\  --tools <names>                Comma-separated tool allowlist
         \\  --no-tools                     Disable built-in tools by default
+        \\  --no-builtin-tools, -nbt       Disable built-in tools by default but keep custom tools enabled
         \\  --system-prompt <text>         Replace the default system prompt
         \\  --append-system-prompt <text>  Append text to the system prompt
+        \\  --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
+        \\  --export <file>                Export session file to HTML or JSONL and exit
+        \\  --verbose                      Force verbose startup
+        \\  --offline                      Disable startup network operations
         \\  --help, -h                     Show this help
         \\  --version, -v                  Show version
         \\
@@ -374,6 +396,12 @@ test "parse args supports expected CLI flags" {
         "--tools",
         "read, grep,ls",
         "--no-tools",
+        "--no-builtin-tools",
+        "--no-context-files",
+        "--offline",
+        "--verbose",
+        "--export",
+        "session.jsonl",
         "@prompt.md",
         "@image.png",
         "Summarize the repository",
@@ -410,6 +438,11 @@ test "parse args supports expected CLI flags" {
     try std.testing.expect(args.print);
     try std.testing.expectEqual(Mode.json, args.mode);
     try std.testing.expect(args.no_tools);
+    try std.testing.expect(args.no_builtin_tools);
+    try std.testing.expect(args.no_context_files);
+    try std.testing.expect(args.offline);
+    try std.testing.expect(args.verbose);
+    try std.testing.expectEqualStrings("session.jsonl", args.@"export".?);
     try std.testing.expectEqualStrings("Summarize the repository", args.prompt.?);
     try std.testing.expectEqual(@as(usize, 2), args.file_args.?.len);
     try std.testing.expectEqualStrings("prompt.md", args.file_args.?[0]);
@@ -537,6 +570,11 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-builtin-tools, -nbt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-context-files, -nc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--export <file>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--verbose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--offline") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--help, -h") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "[@files...] [prompt]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") != null);
