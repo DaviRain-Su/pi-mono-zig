@@ -169,6 +169,9 @@ fn mapThinkingLevelToAnthropicEffort(
 const RecordingState = struct {
     stream_calls: usize = 0,
     stream_simple_calls: usize = 0,
+    saw_model_api: ?[]const u8 = null,
+    saw_model_provider: ?[]const u8 = null,
+    saw_model_id: ?[]const u8 = null,
     saw_max_tokens: ?u32 = null,
     saw_temperature: ?f32 = null,
     saw_api_key: ?[]const u8 = null,
@@ -197,6 +200,9 @@ fn recordingStream(
     _ = allocator;
     _ = io;
     recording_state.stream_calls += 1;
+    recording_state.saw_model_api = model.api;
+    recording_state.saw_model_provider = model.provider;
+    recording_state.saw_model_id = model.id;
     if (options) |stream_options| {
         recording_state.saw_max_tokens = stream_options.max_tokens;
         recording_state.saw_temperature = stream_options.temperature;
@@ -326,6 +332,65 @@ test "stream routes to registered provider" {
     try std.testing.expectEqualStrings("hello from stream", result.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
     try std.testing.expectEqual(@as(usize, 0), recording_state.stream_simple_calls);
+}
+
+test "phase4 provider expansion models route through shared api streams" {
+    api_registry.resetForTesting();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "openai-completions",
+        .stream = recordingStream,
+        .stream_simple = recordingStreamSimple,
+    });
+    try api_registry.register(.{
+        .api = "anthropic-messages",
+        .stream = recordingStream,
+        .stream_simple = recordingStreamSimple,
+    });
+
+    const cases = [_]struct {
+        provider: []const u8,
+        expected_api: []const u8,
+    }{
+        .{ .provider = "xai", .expected_api = "openai-completions" },
+        .{ .provider = "groq", .expected_api = "openai-completions" },
+        .{ .provider = "cerebras", .expected_api = "openai-completions" },
+        .{ .provider = "openrouter", .expected_api = "openai-completions" },
+        .{ .provider = "vercel-ai-gateway", .expected_api = "anthropic-messages" },
+        .{ .provider = "zai", .expected_api = "openai-completions" },
+        .{ .provider = "minimax", .expected_api = "anthropic-messages" },
+        .{ .provider = "huggingface", .expected_api = "openai-completions" },
+        .{ .provider = "fireworks", .expected_api = "anthropic-messages" },
+        .{ .provider = "opencode", .expected_api = "openai-completions" },
+    };
+
+    for (cases) |case| {
+        resetRecordingState();
+        recording_state.response_text = case.provider;
+
+        const provider_config = model_registry.getProviderConfig(case.provider).?;
+        const model = model_registry.find(case.provider, provider_config.default_model_id.?).?;
+
+        var stream_instance = try stream(
+            std.testing.allocator,
+            std.Io.failing,
+            model,
+            .{ .messages = &[_]types.Message{} },
+            null,
+        );
+        defer stream_instance.deinit();
+        while (stream_instance.next()) |_| {}
+
+        const result = stream_instance.result().?;
+        try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
+        try std.testing.expectEqualStrings(case.expected_api, recording_state.saw_model_api.?);
+        try std.testing.expectEqualStrings(case.provider, recording_state.saw_model_provider.?);
+        try std.testing.expectEqualStrings(provider_config.default_model_id.?, recording_state.saw_model_id.?);
+        try std.testing.expectEqualStrings(case.provider, result.content[0].text.text);
+        try std.testing.expectEqualStrings(case.provider, result.provider);
+        try std.testing.expectEqualStrings(case.expected_api, result.api);
+    }
 }
 
 test "streamSimple maps simple options and routes through stream" {

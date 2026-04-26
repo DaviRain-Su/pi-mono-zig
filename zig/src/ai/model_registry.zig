@@ -722,6 +722,41 @@ test "built-in models are registered at startup" {
     try std.testing.expectEqualStrings("accounts/fireworks/models/kimi-k2p6", fireworks_provider.default_model_id.?);
 }
 
+test "phase4 provider expansion registers configs and default models" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const cases = [_]struct {
+        provider: []const u8,
+        api: []const u8,
+        base_url: []const u8,
+        default_model_id: []const u8,
+    }{
+        .{ .provider = "xai", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .default_model_id = "grok-4.20-0309-reasoning" },
+        .{ .provider = "groq", .api = "openai-completions", .base_url = "https://api.groq.com/openai/v1", .default_model_id = "openai/gpt-oss-120b" },
+        .{ .provider = "cerebras", .api = "openai-completions", .base_url = "https://api.cerebras.ai/v1", .default_model_id = "zai-glm-4.7" },
+        .{ .provider = "openrouter", .api = "openai-completions", .base_url = "https://openrouter.ai/api/v1", .default_model_id = "moonshotai/kimi-k2.6" },
+        .{ .provider = "vercel-ai-gateway", .api = "anthropic-messages", .base_url = "https://ai-gateway.vercel.sh", .default_model_id = "zai/glm-5.1" },
+        .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/paas/v4", .default_model_id = "glm-5.1" },
+        .{ .provider = "minimax", .api = "anthropic-messages", .base_url = "https://api.minimax.io/anthropic", .default_model_id = "MiniMax-M2.7" },
+        .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
+        .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
+        .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
+    };
+
+    for (cases) |case| {
+        const provider = getProviderConfig(case.provider).?;
+        try std.testing.expectEqualStrings(case.api, provider.api);
+        try std.testing.expectEqualStrings(case.base_url, provider.base_url);
+        try std.testing.expectEqualStrings(case.default_model_id, provider.default_model_id.?);
+
+        const model = find(case.provider, case.default_model_id).?;
+        try std.testing.expectEqualStrings(case.provider, model.provider);
+        try std.testing.expectEqualStrings(case.api, model.api);
+        try std.testing.expectEqualStrings(case.base_url, model.base_url);
+    }
+}
+
 test "model lookup by id returns unique built-in model" {
     resetForTesting();
     defer resetForTesting();
