@@ -80,7 +80,7 @@ pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "settings", .description = "Open settings editor" },
     .{ .name = "model", .description = "Select model (opens selector UI)", .argument_hint = "<provider/model>" },
     .{ .name = "scoped-models", .description = "Select from the scoped model cycling list" },
-    .{ .name = "export", .description = "Export session transcript", .argument_hint = "<path.json|path.md>" },
+    .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl/.json/.md)", .argument_hint = "<path.html|path.jsonl>" },
     .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
     .{ .name = "share", .description = "Copy a shareable markdown transcript" },
     .{ .name = "copy", .description = "Copy last assistant message" },
@@ -1800,17 +1800,23 @@ pub fn handleExportSlashCommand(
 ) !void {
     const output_path = if (argument) |raw_path| normalizePathArgument(raw_path) else null;
     const exported_path = if (output_path) |path| blk: {
+        if (std.mem.endsWith(u8, path, ".html")) {
+            break :blk try session_advanced.exportToHtml(allocator, io, session, path);
+        }
+        if (std.mem.endsWith(u8, path, ".jsonl")) {
+            break :blk try session_advanced.exportToJsonl(allocator, io, session, path);
+        }
         if (std.mem.endsWith(u8, path, ".json")) {
             break :blk try session_advanced.exportToJson(allocator, io, session, path);
         }
         if (std.mem.endsWith(u8, path, ".md")) {
             break :blk try session_advanced.exportToMarkdown(allocator, io, session, path);
         }
-        const message = try std.fmt.allocPrint(allocator, "Unsupported export path: {s}. Use .json or .md.", .{path});
+        const message = try std.fmt.allocPrint(allocator, "Unsupported export path: {s}. Use .html, .jsonl, .json, or .md.", .{path});
         defer allocator.free(message);
         try app_state.appendError(message);
         return;
-    } else try session_advanced.exportToMarkdown(allocator, io, session, null);
+    } else try session_advanced.exportToHtml(allocator, io, session, null);
     defer allocator.free(exported_path);
 
     const message = try std.fmt.allocPrint(allocator, "Session exported to {s}", .{exported_path});
