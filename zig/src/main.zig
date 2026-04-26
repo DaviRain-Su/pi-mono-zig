@@ -98,7 +98,14 @@ fn runCliWithInput(
     defer if (provided_stdin == null) detected_stdin.deinit(allocator);
 
     if (options.list_models) {
-        return try output.printModelList(allocator, io, env_map, options.list_models_search, stdout);
+        return try output.printModelList(
+            allocator,
+            io,
+            env_map,
+            options.list_models_search,
+            startupNetworkOperationsEnabled(&options, env_map),
+            stdout,
+        );
     }
 
     if (options.fork != null and

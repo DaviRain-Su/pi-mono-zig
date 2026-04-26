@@ -185,6 +185,7 @@ pub const ToolResultMessage = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     content: []const ContentBlock,
+    details: ?std.json.Value = null,
     is_error: bool = false,
     timestamp: i64,
 };
@@ -277,6 +278,8 @@ pub const Model = struct {
     provider: Provider,
     base_url: []const u8,
     reasoning: bool = false,
+    tool_calling: bool = true,
+    loaded: bool = false,
     input_types: []const []const u8, // "text", "image"
     cost: ModelCost = .{},
     context_window: u32,
