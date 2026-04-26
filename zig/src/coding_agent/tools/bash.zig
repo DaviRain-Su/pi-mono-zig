@@ -427,7 +427,7 @@ fn buildStreamingPreview(
     elapsed_ns: i128,
 ) ![]u8 {
     var truncation_result = try truncate.truncateTail(allocator, output, .{});
-    errdefer truncation_result.deinit(allocator);
+    defer truncation_result.deinit(allocator);
 
     var preview = if (truncation_result.content.len == 0)
         try allocator.dupe(u8, "Running...")
@@ -465,10 +465,6 @@ fn buildStreamingPreview(
 
     const rendered = try std.mem.concat(allocator, u8, &[_][]const u8{ preview, elapsed_note });
     allocator.free(preview);
-
-    if (!truncation_result.truncated) {
-        truncation_result.deinit(allocator);
-    }
     return rendered;
 }
 
@@ -756,6 +752,33 @@ test "bash tool truncates large output and exposes the temp path" {
         result.content[0].text.text,
         1,
         full_output_path,
+    ));
+}
+
+test "buildStreamingPreview frees truncation buffers for truncated output" {
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(std.testing.allocator);
+
+    for (0..truncate.DEFAULT_MAX_LINES + 1) |index| {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "line {d}\n", .{index});
+        defer std.testing.allocator.free(line);
+        try output.appendSlice(std.testing.allocator, line);
+    }
+
+    const preview = try buildStreamingPreview(std.testing.allocator, output.items, 1_500_000_000);
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        preview,
+        1,
+        "[Streaming last",
+    ));
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        preview,
+        1,
+        "[Running... 1.5s elapsed]",
     ));
 }
 
