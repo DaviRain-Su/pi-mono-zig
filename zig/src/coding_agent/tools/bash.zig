@@ -35,6 +35,7 @@ pub const BashExecutionResult = struct {
 
 pub const BashUpdateCallback = *const fn (
     context: ?*anyopaque,
+    // Borrowed for the duration of the callback. Clone any owned fields before retaining them.
     result: BashExecutionResult,
 ) anyerror!void;
 

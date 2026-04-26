@@ -37,6 +37,7 @@ pub const AgentToolResult = struct {
 
 pub const AgentToolUpdateCallback = *const fn (
     context: ?*anyopaque,
+    // Borrowed for the duration of the callback. Clone any owned fields before retaining them.
     partial_result: AgentToolResult,
 ) anyerror!void;
 
