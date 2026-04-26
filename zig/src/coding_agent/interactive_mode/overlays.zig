@@ -40,7 +40,7 @@ pub const SelectorOverlay = union(enum) {
             .info => self.info.title,
             .settings_editor => self.settings_editor.title,
             .session => "Session selector",
-            .model => "Model selector",
+            .model => self.model.title,
             .tree => "Session tree",
             .auth => if (self.auth.mode == .login) "Login" else "Logout",
         };
@@ -117,6 +117,7 @@ pub const ModelChoice = struct {
 };
 
 pub const ModelOverlay = struct {
+    title: []const u8 = "Model selector",
     choices: []ModelChoice,
     items: []tui.SelectItem,
     list: tui.SelectList,
@@ -525,6 +526,71 @@ pub fn loadModelOverlay(
 
     return .{
         .model = .{
+            .title = "Model selector",
+            .choices = choices,
+            .items = items,
+            .list = .{
+                .items = items,
+                .selected_index = selected_index,
+                .max_visible = 12,
+            },
+        },
+    };
+}
+
+pub fn loadScopedModelOverlay(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    current_model: ai.Model,
+    model_patterns: ?[]const []const u8,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) !SelectorOverlay {
+    const patterns = model_patterns orelse return error.NoScopedModelPatterns;
+    if (patterns.len == 0) return error.NoScopedModelPatterns;
+
+    const available = try loadSelectableModels(allocator, env_map, current_model, patterns, runtime_config);
+    defer allocator.free(available);
+
+    if (available.len == 0) return error.NoScopedModelsAvailable;
+
+    const choices = try allocator.alloc(ModelChoice, available.len);
+    errdefer {
+        for (choices) |choice| {
+            allocator.free(choice.provider);
+            allocator.free(choice.model_id);
+        }
+        allocator.free(choices);
+    }
+
+    const items = try allocator.alloc(tui.SelectItem, available.len);
+    errdefer {
+        for (items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(items);
+    }
+
+    var selected_index: usize = 0;
+    for (available, 0..) |entry, index| {
+        choices[index] = .{
+            .provider = try allocator.dupe(u8, entry.provider),
+            .model_id = try allocator.dupe(u8, entry.model_id),
+        };
+        items[index] = .{
+            .value = try allocator.dupe(u8, entry.model_id),
+            .label = try allocator.dupe(u8, entry.display_name),
+            .description = try allocator.dupe(u8, entry.provider),
+        };
+        if (std.mem.eql(u8, entry.provider, current_model.provider) and std.mem.eql(u8, entry.model_id, current_model.id)) {
+            selected_index = index;
+        }
+    }
+
+    return .{
+        .model = .{
+            .title = "Scoped model selector",
             .choices = choices,
             .items = items,
             .list = .{
