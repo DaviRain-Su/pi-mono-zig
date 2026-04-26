@@ -23,6 +23,8 @@ const input_dispatch = @import("interactive_mode/input_dispatch.zig");
 
 pub const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 pub const LiveResources = shared.LiveResources;
+pub const ToolRuntime = shared.ToolRuntime;
+pub const AppContext = shared.AppContext;
 pub const currentSessionLabel = shared.currentSessionLabel;
 pub const configuredCredentials = shared.configuredCredentials;
 pub const configuredApiKeyForProvider = shared.configuredApiKeyForProvider;
@@ -185,32 +187,6 @@ pub const legacyAppActionForKey = input_dispatch.legacyAppActionForKey;
 pub const isLegacyAppActionKey = input_dispatch.isLegacyAppActionKey;
 pub const handleAppAction = input_dispatch.handleAppAction;
 
-pub const ToolRuntime = struct {
-    cwd: []const u8,
-    io: std.Io,
-};
-
-/// Process-global tool runtime bridge for interactive mode.
-///
-/// `buildAgentTools()` registers plain `agent.types.ExecuteToolFn` callbacks, so the per-session `cwd`
-/// and `std.Io` handle needed by the tool implementations cannot be threaded through as parameters.
-/// Interactive mode therefore publishes that context here before starting agent work so tool callbacks in
-/// this module can reach the shared runtime without changing the agent/tool API surface.
-///
-/// Thread-safety model: interactive mode owns this slot on a single thread, writes it once during setup,
-/// only performs read-only access while the session is active, and clears it during teardown. It is global
-/// mutable state because the execute callback ABI has no user-data parameter, not because multiple runtimes
-/// are expected to coexist.
-var global_tool_runtime: ?ToolRuntime = null;
-
-pub fn setToolRuntime(runtime: ToolRuntime) void {
-    global_tool_runtime = runtime;
-}
-
-pub fn clearToolRuntime() void {
-    global_tool_runtime = null;
-}
-
 pub fn runInteractiveMode(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -220,6 +196,8 @@ pub fn runInteractiveMode(
 ) !u8 {
     var live_resources = LiveResources.init(options);
     defer live_resources.deinit(allocator);
+
+    var app_context = AppContext.init(options.cwd, io);
 
     var current_provider = provider_config.resolveProviderConfig(
         allocator,
@@ -235,13 +213,7 @@ pub fn runInteractiveMode(
     };
     defer current_provider.deinit(allocator);
 
-    setToolRuntime(.{
-        .cwd = options.cwd,
-        .io = io,
-    });
-    defer clearToolRuntime();
-
-    var built_tools = try buildAgentTools(allocator, options.selected_tools);
+    var built_tools = try buildAgentTools(allocator, &app_context, options.selected_tools);
     defer built_tools.deinit();
 
     var session = try openInitialSession(
@@ -394,6 +366,7 @@ pub fn runInteractiveMode(
                         subscriber,
                         &should_exit,
                         &input_buffer,
+                        &app_context,
                         &live_resources,
                     ),
                     .need_more_bytes => break,
@@ -419,6 +392,7 @@ pub fn runInteractiveMode(
                 subscriber,
                 &should_exit,
                 &input_buffer,
+                        &app_context,
                 &live_resources,
             );
             while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
@@ -442,6 +416,7 @@ pub fn runInteractiveMode(
                         subscriber,
                         &should_exit,
                         &input_buffer,
+                        &app_context,
                         &live_resources,
                     ),
                     .need_more_bytes => break,
@@ -464,20 +439,20 @@ pub const BuiltTools = struct {
     }
 };
 
-pub fn buildAgentTools(allocator: std.mem.Allocator, selected_tools: ?[]const []const u8) !BuiltTools {
+pub fn buildAgentTools(allocator: std.mem.Allocator, app_context: *AppContext, selected_tools: ?[]const []const u8) !BuiltTools {
     var items = std.ArrayList(agent.AgentTool).empty;
     errdefer {
         for (items.items) |item| common.deinitJsonValue(allocator, item.parameters);
         items.deinit(allocator);
     }
 
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.ReadTool.name, tools.ReadTool.description, try tools.ReadTool.schema(allocator), runReadTool);
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.BashTool.name, tools.BashTool.description, try tools.BashTool.schema(allocator), runBashTool);
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.WriteTool.name, tools.WriteTool.description, try tools.WriteTool.schema(allocator), runWriteTool);
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.EditTool.name, tools.EditTool.description, try tools.EditTool.schema(allocator), runEditTool);
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.GrepTool.name, tools.GrepTool.description, try tools.GrepTool.schema(allocator), runGrepTool);
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.FindTool.name, tools.FindTool.description, try tools.FindTool.schema(allocator), runFindTool);
-    try appendToolIfEnabled(allocator, &items, selected_tools, tools.LsTool.name, tools.LsTool.description, try tools.LsTool.schema(allocator), runLsTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.ReadTool.name, tools.ReadTool.description, try tools.ReadTool.schema(allocator), runReadTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.BashTool.name, tools.BashTool.description, try tools.BashTool.schema(allocator), runBashTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.WriteTool.name, tools.WriteTool.description, try tools.WriteTool.schema(allocator), runWriteTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.EditTool.name, tools.EditTool.description, try tools.EditTool.schema(allocator), runEditTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.GrepTool.name, tools.GrepTool.description, try tools.GrepTool.schema(allocator), runGrepTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.FindTool.name, tools.FindTool.description, try tools.FindTool.schema(allocator), runFindTool);
+    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.LsTool.name, tools.LsTool.description, try tools.LsTool.schema(allocator), runLsTool);
 
     return .{
         .allocator = allocator,
@@ -488,6 +463,7 @@ pub fn buildAgentTools(allocator: std.mem.Allocator, selected_tools: ?[]const []
 fn appendToolIfEnabled(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(agent.AgentTool),
+    app_context: *AppContext,
     selected_tools: ?[]const []const u8,
     name: []const u8,
     description: []const u8,
@@ -514,7 +490,20 @@ fn appendToolIfEnabled(
         .label = name,
         .parameters = schema,
         .execute = execute,
+        .execute_context = app_context,
     });
+}
+
+test "buildAgentTools threads app context into execute callbacks" {
+    var app_context = AppContext.init("/tmp", std.testing.io);
+    var built_tools = try buildAgentTools(std.testing.allocator, &app_context, &[_][]const u8{"read", "bash"});
+    defer built_tools.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), built_tools.items.len);
+    for (built_tools.items) |tool| {
+        try std.testing.expect(tool.execute != null);
+        try std.testing.expect(tool.execute_context == @as(?*anyopaque, @ptrCast(&app_context)));
+    }
 }
 
 pub fn openInitialSession(
@@ -624,19 +613,20 @@ pub fn openInitialSession(
     );
 }
 
-fn getToolRuntime() ToolRuntime {
-    return global_tool_runtime orelse @panic("tool runtime not configured");
+fn getAppContext(tool_context: ?*anyopaque) !*AppContext {
+    return @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
 }
 
 fn runReadTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.ReadArgs{
         .path = try getRequiredString(params, "path"),
         .offset = getOptionalUsize(params, "offset"),
@@ -650,11 +640,12 @@ fn runBashTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.BashArgs{
         .command = try getRequiredString(params, "command"),
         .timeout_seconds = getOptionalU64(params, "timeout_seconds"),
@@ -667,11 +658,12 @@ fn runWriteTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.WriteArgs{
         .path = try getRequiredString(params, "path"),
         .content = try getRequiredString(params, "content"),
@@ -684,11 +676,12 @@ fn runEditTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     var parsed_args_storage = try tools.edit.parseArguments(allocator, params);
     defer parsed_args_storage.deinit(allocator);
     const edit_args = parsed_args_storage.toArgs();
@@ -700,11 +693,12 @@ fn runGrepTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.GrepArgs{
         .pattern = try getRequiredString(params, "pattern"),
         .path = getOptionalString(params, "path"),
@@ -722,11 +716,12 @@ fn runFindTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.FindArgs{
         .pattern = try getRequiredString(params, "pattern"),
         .path = getOptionalString(params, "path"),
@@ -740,11 +735,12 @@ fn runLsTool(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    const runtime = getToolRuntime();
+    const runtime = (try getAppContext(tool_context)).tool_runtime;
     const args = tools.LsArgs{
         .path = getOptionalString(params, "path"),
         .limit = getOptionalUsize(params, "limit"),
@@ -3262,13 +3258,8 @@ test "interactive tool conversation renders tool lines and persists session entr
     var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
-    setToolRuntime(.{
-        .cwd = root_dir,
-        .io = std.testing.io,
-    });
-    defer clearToolRuntime();
-
-    var built_tools = try buildAgentTools(allocator, &[_][]const u8{"read"});
+    var app_context = AppContext.init(root_dir, std.testing.io);
+    var built_tools = try buildAgentTools(allocator, &app_context, &[_][]const u8{"read"});
     defer built_tools.deinit();
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{

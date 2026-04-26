@@ -765,6 +765,7 @@ fn executePreparedToolCallInternal(
         allocator,
         prepared.tool_call.id,
         prepared.args,
+        prepared.tool.execute_context,
         signal,
         on_update_context,
         on_update,
@@ -1193,11 +1194,12 @@ fn capturingEchoToolExecute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
     on_update_context: ?*anyopaque,
     on_update: ?types.AgentToolUpdateCallback,
 ) !types.AgentToolResult {
-    const result = try echoToolExecute(allocator, tool_call_id, params, signal, on_update_context, on_update);
+    const result = try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
     const capture = active_tool_result_content_capture orelse return result;
 
     capture.content_ptr = result.content.ptr;
@@ -1304,6 +1306,7 @@ fn echoToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    _: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?types.AgentToolUpdateCallback,
@@ -1319,18 +1322,20 @@ fn countedEchoToolExecute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
     on_update_context: ?*anyopaque,
     on_update: ?types.AgentToolUpdateCallback,
 ) !types.AgentToolResult {
     block_execute_count += 1;
-    return try echoToolExecute(allocator, tool_call_id, params, signal, on_update_context, on_update);
+    return try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
 }
 
 fn failingToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     _: std.json.Value,
+    _: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?types.AgentToolUpdateCallback,
@@ -1350,6 +1355,7 @@ fn parallelAwareEchoToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    _: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?types.AgentToolUpdateCallback,

@@ -31,6 +31,7 @@ const logoutProviderById = slash_commands.logoutProviderById;
 const cancelAuthFlow = slash_commands.cancelAuthFlow;
 const submitAuthFlowInput = slash_commands.submitAuthFlowInput;
 const BUILTIN_SLASH_COMMANDS = slash_commands.BUILTIN_SLASH_COMMANDS;
+const AppContext = shared.AppContext;
 
 pub fn handleInputKey(
     allocator: std.mem.Allocator,
@@ -502,6 +503,7 @@ pub fn dispatchInputEvent(
     subscriber: agent.AgentSubscriber,
     should_exit: *bool,
     input_buffer: *std.ArrayList(u8),
+    app_context: *AppContext,
     live_resources: *LiveResources,
 ) !void {
     switch (parsed.event) {
@@ -538,9 +540,15 @@ pub fn dispatchInputEvent(
             }
             _ = try editor.handlePaste(content);
         },
-        .protocol => {},
+        .protocol => |protocol| handleProtocolEvent(app_context, protocol),
     }
     consumeInputBytes(input_buffer, parsed.consumed);
+}
+
+fn handleProtocolEvent(app_context: *AppContext, protocol: tui.keys.ProtocolEvent) void {
+    switch (protocol) {
+        .kitty_keyboard => app_context.kitty_protocol_active = true,
+    }
 }
 
 pub fn consumeInputBytes(buffer: *std.ArrayList(u8), consumed: usize) void {
@@ -617,4 +625,13 @@ pub fn handleAppAction(
             overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns, runtime_config);
         },
     }
+}
+
+test "protocol events update kitty state through app context" {
+    var app_context = AppContext.init("/tmp", std.testing.io);
+    try std.testing.expect(!app_context.kitty_protocol_active);
+
+    handleProtocolEvent(&app_context, .{ .kitty_keyboard = 31 });
+
+    try std.testing.expect(app_context.kitty_protocol_active);
 }

@@ -125,16 +125,6 @@ const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 const KITTY_PROTOCOL_RESPONSE_PREFIX = "\x1b[?";
 
-var kitty_protocol_active = false;
-
-pub fn setKittyProtocolActive(active: bool) void {
-    kitty_protocol_active = active;
-}
-
-pub fn isKittyProtocolActive() bool {
-    return kitty_protocol_active;
-}
-
 pub fn parseInputEvent(input: []const u8) ?InputParseResult {
     return parseInputEventWithMode(input, .buffering);
 }
@@ -245,7 +235,6 @@ fn parseKittyProtocolResponse(input: []const u8, mode: ParseMode) ?InputParseRes
     }
 
     const flags = std.fmt.parseInt(u16, sequence[KITTY_PROTOCOL_RESPONSE_PREFIX.len .. sequence.len - 1], 10) catch return null;
-    setKittyProtocolActive(true);
     return .{
         .parsed = .{
             .event = .{ .protocol = .{ .kitty_keyboard = flags } },
@@ -742,12 +731,8 @@ test "parseInputEvent assembles split UTF-8 codepoints across reads" {
 }
 
 test "parse kitty protocol response as a control event" {
-    setKittyProtocolActive(false);
-    defer setKittyProtocolActive(false);
-
     const result = parseInputEvent("\x1b[?31u").?;
     try std.testing.expect(result == .parsed);
-    try std.testing.expect(isKittyProtocolActive());
     try std.testing.expectEqual(@as(usize, 6), result.parsed.consumed);
 
     switch (result.parsed.event) {

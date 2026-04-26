@@ -84,8 +84,12 @@ pub const RuntimeConfig = struct {
     }
 
     pub fn lookupApiKey(self: *const RuntimeConfig, provider: []const u8) ?[]const u8 {
-        if (self.auth_tokens.get(provider)) |value| return value;
-        if (self.provider_api_keys.get(provider)) |value| return value;
+        if (self.auth_tokens.get(provider)) |value| {
+            if (isNonEmptyCredentialValue(value)) return value;
+        }
+        if (self.provider_api_keys.get(provider)) |value| {
+            if (isNonEmptyCredentialValue(value)) return value;
+        }
         return null;
     }
 
@@ -759,6 +763,10 @@ fn readOptionalFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         error.FileNotFound => null,
         else => return err,
     };
+}
+
+fn isNonEmptyCredentialValue(value: []const u8) bool {
+    return std.mem.trim(u8, value, &std.ascii.whitespace).len > 0;
 }
 
 fn putOwnedString(map: *std.StringHashMap([]const u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {

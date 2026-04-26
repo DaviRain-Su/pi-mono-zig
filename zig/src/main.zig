@@ -170,13 +170,8 @@ fn runCliWithInput(
     defer provider_runtime.deinit(allocator);
 
     if (app_mode != .interactive) {
-        coding_agent.interactive_mode.setToolRuntime(.{
-            .cwd = cwd,
-            .io = io,
-        });
-        defer coding_agent.interactive_mode.clearToolRuntime();
-
-        var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, selected_tools);
+        var app_context = coding_agent.interactive_mode.AppContext.init(cwd, io);
+        var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, &app_context, selected_tools);
         defer built_tools.deinit();
 
         var session = try coding_agent.interactive_mode.openInitialSession(
@@ -418,7 +413,8 @@ test "effectiveToolSelection disables built-in tools when requested" {
     try std.testing.expectEqualStrings("read", explicit_selection[0]);
     try std.testing.expectEqualStrings("ls", explicit_selection[1]);
 
-    var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, no_builtin_selection);
+    var app_context = coding_agent.interactive_mode.AppContext.init("/tmp", std.testing.io);
+    var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, &app_context, no_builtin_selection);
     defer built_tools.deinit();
     try std.testing.expectEqual(@as(usize, 0), built_tools.items.len);
 }
