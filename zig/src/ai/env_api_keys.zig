@@ -44,24 +44,24 @@ pub fn getEnvApiKeyFromMap(
 
     if (std.mem.eql(u8, provider, "google-vertex")) {
         if (env_map.get("GOOGLE_CLOUD_API_KEY")) |api_key| {
-            return try allocator.dupe(u8, api_key);
+            if (isNonEmptyCredentialValue(api_key)) return try allocator.dupe(u8, api_key);
         }
 
-        const has_credentials = env_map.get("GOOGLE_APPLICATION_CREDENTIALS") != null;
-        const has_project = env_map.get("GOOGLE_CLOUD_PROJECT") != null or env_map.get("GCLOUD_PROJECT") != null;
-        const has_location = env_map.get("GOOGLE_CLOUD_LOCATION") != null;
+        const has_credentials = envMapHasNonEmpty(env_map, "GOOGLE_APPLICATION_CREDENTIALS");
+        const has_project = envMapHasNonEmpty(env_map, "GOOGLE_CLOUD_PROJECT") or envMapHasNonEmpty(env_map, "GCLOUD_PROJECT");
+        const has_location = envMapHasNonEmpty(env_map, "GOOGLE_CLOUD_LOCATION");
         if (has_credentials and has_project and has_location) {
             return try allocator.dupe(u8, AUTHENTICATED_SENTINEL);
         }
     }
 
     if (std.mem.eql(u8, provider, "amazon-bedrock")) {
-        const has_standard_keys = env_map.get("AWS_ACCESS_KEY_ID") != null and env_map.get("AWS_SECRET_ACCESS_KEY") != null;
-        const has_alt_auth = env_map.get("AWS_PROFILE") != null or
-            env_map.get("AWS_BEARER_TOKEN_BEDROCK") != null or
-            env_map.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != null or
-            env_map.get("AWS_CONTAINER_CREDENTIALS_FULL_URI") != null or
-            env_map.get("AWS_WEB_IDENTITY_TOKEN_FILE") != null;
+        const has_standard_keys = envMapHasNonEmpty(env_map, "AWS_ACCESS_KEY_ID") and envMapHasNonEmpty(env_map, "AWS_SECRET_ACCESS_KEY");
+        const has_alt_auth = envMapHasNonEmpty(env_map, "AWS_PROFILE") or
+            envMapHasNonEmpty(env_map, "AWS_BEARER_TOKEN_BEDROCK") or
+            envMapHasNonEmpty(env_map, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") or
+            envMapHasNonEmpty(env_map, "AWS_CONTAINER_CREDENTIALS_FULL_URI") or
+            envMapHasNonEmpty(env_map, "AWS_WEB_IDENTITY_TOKEN_FILE");
         if (has_standard_keys or has_alt_auth) {
             return try allocator.dupe(u8, AUTHENTICATED_SENTINEL);
         }
@@ -69,7 +69,7 @@ pub fn getEnvApiKeyFromMap(
 
     const env_var = resolveEnvVar(provider) orelse return null;
     if (env_map.get(env_var)) |value| {
-        return try allocator.dupe(u8, value);
+        if (isNonEmptyCredentialValue(value)) return try allocator.dupe(u8, value);
     }
 
     return null;
@@ -82,10 +82,19 @@ fn firstEnvValue(
 ) !?[]u8 {
     for (keys) |key| {
         if (env_map.get(key)) |value| {
-            return try allocator.dupe(u8, value);
+            if (isNonEmptyCredentialValue(value)) return try allocator.dupe(u8, value);
         }
     }
     return null;
+}
+
+fn envMapHasNonEmpty(env_map: *const std.process.Environ.Map, key: []const u8) bool {
+    const value = env_map.get(key) orelse return false;
+    return isNonEmptyCredentialValue(value);
+}
+
+fn isNonEmptyCredentialValue(value: []const u8) bool {
+    return std.mem.trim(u8, value, &std.ascii.whitespace).len > 0;
 }
 
 fn resolveEnvVar(provider: []const u8) ?[]const u8 {
@@ -199,4 +208,40 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
         defer if (missing) |resolved| allocator.free(resolved);
         try std.testing.expect(missing == null);
     }
+}
+
+test "getEnvApiKey ignores blank credential values" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("OPENAI_API_KEY", "");
+    try env_map.put("KIMI_API_KEY", "   ");
+    try env_map.put("ANTHROPIC_OAUTH_TOKEN", "");
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
+    try env_map.put("AWS_PROFILE", "");
+    try env_map.put("GOOGLE_APPLICATION_CREDENTIALS", " ");
+    try env_map.put("GOOGLE_CLOUD_PROJECT", "project-1");
+    try env_map.put("GOOGLE_CLOUD_LOCATION", "us-central1");
+
+    const openai = try getEnvApiKeyFromMap(allocator, &env_map, "openai");
+    defer if (openai) |value| allocator.free(value);
+    try std.testing.expect(openai == null);
+
+    const kimi_coding = try getEnvApiKeyFromMap(allocator, &env_map, "kimi-coding");
+    defer if (kimi_coding) |value| allocator.free(value);
+    try std.testing.expect(kimi_coding == null);
+
+    const anthropic = try getEnvApiKeyFromMap(allocator, &env_map, "anthropic");
+    defer if (anthropic) |value| allocator.free(value);
+    try std.testing.expectEqualStrings("anthropic-key", anthropic.?);
+
+    const bedrock = try getEnvApiKeyFromMap(allocator, &env_map, "amazon-bedrock");
+    defer if (bedrock) |value| allocator.free(value);
+    try std.testing.expect(bedrock == null);
+
+    const vertex = try getEnvApiKeyFromMap(allocator, &env_map, "google-vertex");
+    defer if (vertex) |value| allocator.free(value);
+    try std.testing.expect(vertex == null);
 }

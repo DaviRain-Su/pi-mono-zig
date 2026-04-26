@@ -49,6 +49,7 @@ pub const ExecuteToolFn = *const fn (
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     params: std.json.Value,
+    tool_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
     on_update_context: ?*anyopaque,
     on_update: ?AgentToolUpdateCallback,
@@ -89,6 +90,7 @@ pub const AgentTool = struct {
     parameters: std.json.Value,
     prepare_arguments: ?PrepareArgumentsFn = null,
     execute: ?ExecuteToolFn = null,
+    execute_context: ?*anyopaque = null,
     execution_mode: ?ToolExecutionMode = null,
 };
 

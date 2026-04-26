@@ -1697,6 +1697,7 @@ fn abortableToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     _: std.json.Value,
+    _: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?types.AgentToolUpdateCallback,

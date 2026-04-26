@@ -341,6 +341,7 @@ fn testReadToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
+    _: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?agent.types.AgentToolUpdateCallback,

@@ -1,5 +1,4 @@
 const std = @import("std");
-const keys = @import("keys.zig");
 
 pub const Size = struct {
     width: usize,
@@ -58,8 +57,6 @@ pub const Terminal = struct {
         try self.backend.enterRawMode();
         errdefer self.backend.restoreMode() catch {};
 
-        keys.setKittyProtocolActive(false);
-
         try self.backend.write(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR ++ KITTY_KEYBOARD_QUERY ++ KITTY_KEYBOARD_ENABLE);
         errdefer self.backend.write(ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
 
@@ -71,7 +68,6 @@ pub const Terminal = struct {
     pub fn stop(self: *Terminal) void {
         if (!self.started) return;
 
-        keys.setKittyProtocolActive(false);
         self.backend.write(ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
         self.backend.restoreMode() catch {};
         self.started = false;

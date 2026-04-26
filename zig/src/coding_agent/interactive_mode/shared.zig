@@ -7,6 +7,25 @@ const provider_config = @import("../provider_config.zig");
 const resources_mod = @import("../resources.zig");
 const session_mod = @import("../session.zig");
 
+pub const ToolRuntime = struct {
+    cwd: []const u8,
+    io: std.Io,
+};
+
+pub const AppContext = struct {
+    tool_runtime: ToolRuntime,
+    kitty_protocol_active: bool = false,
+
+    pub fn init(cwd: []const u8, io: std.Io) AppContext {
+        return .{
+            .tool_runtime = .{
+                .cwd = cwd,
+                .io = io,
+            },
+        };
+    }
+};
+
 pub const RunInteractiveModeOptions = struct {
     cwd: []const u8,
     system_prompt: []const u8,
