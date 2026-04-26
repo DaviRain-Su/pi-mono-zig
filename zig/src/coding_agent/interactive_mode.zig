@@ -251,8 +251,10 @@ pub fn runInteractiveMode(
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &session);
 
-    var backend = NativeTerminalBackend{ .env_map = env_map };
-    var terminal = tui.Terminal.init(backend.backend());
+    var terminal = tui.Terminal.initNative(.{
+        .io = io,
+        .env_map = env_map,
+    });
     try terminal.start();
     defer terminal.stop();
 
@@ -1502,6 +1504,251 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &live_resources,
     );
     try std.testing.expect(should_exit);
+}
+
+test "screen renders queued messages and the dequeue hint" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+    try state.appendQueuedMessage(.steering, "queued steer");
+    try state.appendQueuedMessage(.follow_up, "queued follow-up");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 12,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 80, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued steer"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Alt+Up to edit queued messages"));
+}
+
+test "submitEditorText queues steering messages while streaming" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "ignored");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+    session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("queued steer");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = true;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try submitEditorText(
+        allocator,
+        std.testing.io,
+        &env_map,
+        editor.text(),
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), session.agent.steeringQueueLen());
+    try std.testing.expectEqual(@as(usize, 0), session.agent.followUpQueueLen());
+    try std.testing.expectEqualStrings("", editor.text());
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqual(@as(usize, 1), state.queued_steering.items.len);
+    try std.testing.expectEqualStrings("queued steering message", state.status);
+}
+
+test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued drafts" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "ignored");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+    session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("queued follow-up");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = true;
+    var should_exit = false;
+    var input_buffer = std.ArrayList(u8).empty;
+    defer input_buffer.deinit(allocator);
+    var app_context = AppContext.init("/tmp/project", std.testing.io);
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{
+            .event = .{ .key = .enter },
+            .consumed = 1,
+            .modifiers = .{ .alt = true },
+        },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &input_buffer,
+        &app_context,
+        &live_resources,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), session.agent.steeringQueueLen());
+    try std.testing.expectEqual(@as(usize, 1), session.agent.followUpQueueLen());
+    try std.testing.expectEqualStrings("", editor.text());
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqual(@as(usize, 1), state.queued_follow_up.items.len);
+    state.mutex.unlock(state.io);
+
+    const queued_image = ai.ImageContent{
+        .data = try allocator.dupe(u8, "AQID"),
+        .mime_type = try allocator.dupe(u8, "image/png"),
+    };
+    defer {
+        allocator.free(queued_image.data);
+        allocator.free(queued_image.mime_type);
+    }
+    try session.followUp("image follow-up", &.{queued_image});
+    try state.appendQueuedMessage(.follow_up, "image follow-up");
+
+    _ = try editor.handlePaste("current draft");
+
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{
+            .event = .{ .key = .up },
+            .consumed = 1,
+            .modifiers = .{ .alt = true },
+        },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &input_buffer,
+        &app_context,
+        &live_resources,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), session.agent.followUpQueueLen());
+    try std.testing.expectEqualStrings("queued follow-up\n\nimage follow-up\n\ncurrent draft", editor.text());
+    const restored_images = try state.clonePendingEditorImages(allocator);
+    defer deinitImageContents(allocator, restored_images);
+    try std.testing.expectEqual(@as(usize, 1), restored_images.len);
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqual(@as(usize, 0), state.queued_follow_up.items.len);
+    try std.testing.expectEqualStrings("Restored 2 queued messages to the editor", state.status);
 }
 
 test "parseSlashCommand recognizes builtins and arguments" {
