@@ -10,6 +10,7 @@ const session_mod = @import("../session.zig");
 const shared = @import("shared.zig");
 const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
+const clipboard_image = @import("clipboard_image.zig");
 const prompt_worker_mod = @import("prompt_worker.zig");
 const slash_commands = @import("slash_commands.zig");
 const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
@@ -204,7 +205,7 @@ pub fn handleInputKey(
         switch (key) {
             .escape => {
                 cancelAuthFlow(allocator, auth_flow, app_state) catch {};
-                clearEditor(editor);
+                clearEditor(app_state, editor);
                 return;
             },
             .enter => {
@@ -258,6 +259,10 @@ pub fn handleInputKey(
     }
 
     if (resolveAppAction(live_resources.keybindings, key)) |action| {
+        if (action == .paste_image) {
+            try handlePasteImageAction(allocator, io, env_map, app_state);
+            return;
+        }
         try handleAppAction(
             allocator,
             io,
@@ -367,7 +372,7 @@ pub fn submitEditorText(
             should_exit,
             live_resources,
         );
-        clearEditor(editor);
+        clearEditor(app_state, editor);
         return;
     }
 
@@ -377,7 +382,7 @@ pub fn submitEditorText(
     if (trimmed.len > 0 and trimmed[0] == '/' and std.mem.eql(u8, expanded, trimmed)) {
         const message = try std.fmt.allocPrint(allocator, "Unknown slash command: {s}", .{trimmed});
         defer allocator.free(message);
-        clearEditor(editor);
+        clearEditor(app_state, editor);
         try app_state.appendError(message);
         return;
     }
@@ -387,14 +392,37 @@ pub fn submitEditorText(
         return;
     }
 
-    try prompt_worker.start(allocator, session, app_state, expanded, &.{});
+    const prompt_images = try app_state.clonePendingEditorImages(allocator);
+    defer prompt_worker_mod.deinitImageContents(allocator, prompt_images);
+
+    try prompt_worker.start(allocator, session, app_state, expanded, prompt_images);
     prompt_worker_active.* = true;
-    clearEditor(editor);
+    clearEditor(app_state, editor);
     try app_state.setStatus("thinking");
 }
 
-pub fn clearEditor(editor: *tui.Editor) void {
+fn handlePasteImageAction(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    app_state: *AppState,
+) !void {
+    var image = (try clipboard_image.readClipboardImage(allocator, io, env_map)) orelse return;
+    defer image.deinit(allocator);
+
+    const encoded = try clipboard_image.encodeImageContent(allocator, image);
+    errdefer {
+        var encoded_copy = encoded;
+        clipboard_image.deinitImageContent(allocator, &encoded_copy);
+    }
+
+    try app_state.appendPendingEditorImage(encoded);
+    try app_state.setStatus("clipboard image pasted");
+}
+
+pub fn clearEditor(app_state: *AppState, editor: *tui.Editor) void {
     editor.reset();
+    app_state.clearPendingEditorImages();
 }
 
 pub fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]tui.SelectItem {
@@ -574,6 +602,7 @@ pub fn legacyAppActionForKey(key: tui.Key) ?keybindings_mod.Action {
             'l' => .clear,
             's' => .open_sessions,
             'p' => .open_models,
+            'v' => .paste_image,
             else => null,
         },
         .escape => .exit,
@@ -625,6 +654,7 @@ pub fn handleAppAction(
             }
             overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns, runtime_config);
         },
+        .paste_image => {},
     }
 }
 
@@ -635,4 +665,8 @@ test "protocol events update kitty state through app context" {
     handleProtocolEvent(&app_context, .{ .kitty_keyboard = 31 });
 
     try std.testing.expect(app_context.kitty_protocol_active);
+}
+
+test "legacy app actions include clipboard image paste" {
+    try std.testing.expectEqual(keybindings_mod.Action.paste_image, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
 }

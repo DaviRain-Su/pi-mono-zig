@@ -20,6 +20,7 @@ const rendering = @import("interactive_mode/rendering.zig");
 const prompt_worker_mod = @import("interactive_mode/prompt_worker.zig");
 const slash_commands = @import("interactive_mode/slash_commands.zig");
 const input_dispatch = @import("interactive_mode/input_dispatch.zig");
+const clipboard_image = @import("interactive_mode/clipboard_image.zig");
 
 pub const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 pub const LiveResources = shared.LiveResources;
@@ -909,7 +910,37 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(renderedLinesContain(lines.items, "Session: session.jsonl"));
     try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S sessions • Ctrl+P models • Ctrl+C interrupt • Ctrl+D exit • Ctrl+L clear"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+V paste image"));
+}
+
+test "interactive mode renders pending clipboard image placeholders in the prompt area" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+    try state.appendPendingEditorImage(.{
+        .data = try allocator.dupe(u8, "AQID"),
+        .mime_type = try allocator.dupe(u8, "image/png"),
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
+    try std.testing.expect(renderedLinesContain(lines.items, "[image 1: image/png]"));
 }
 
 test "interactive mode renders submitted user messages through a mock backend" {
@@ -2938,6 +2969,202 @@ test "submitEditorText resets editor autocomplete state after submit" {
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
     try std.testing.expectEqualStrings("thinking", state.status);
+}
+
+test "handleInputKey pastes a clipboard image into the pending prompt attachments" {
+    const allocator = std.testing.allocator;
+
+    const ReaderStub = struct {
+        fn read(_: ?*anyopaque, alloc: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map) !?clipboard_image.ClipboardImage {
+            _ = io;
+            _ = env_map;
+            return .{
+                .bytes = try alloc.dupe(u8, &[_]u8{ 0x01, 0x02, 0x03 }),
+                .mime_type = try alloc.dupe(u8, "image/png"),
+            };
+        }
+    };
+
+    const previous_context = clipboard_image.clipboard_image_reader_context;
+    const previous_fn = clipboard_image.clipboard_image_reader_fn;
+    clipboard_image.clipboard_image_reader_context = null;
+    clipboard_image.clipboard_image_reader_fn = ReaderStub.read;
+    defer {
+        clipboard_image.clipboard_image_reader_context = previous_context;
+        clipboard_image.clipboard_image_reader_fn = previous_fn;
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "clipboard");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'v' },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    const pending = try state.clonePendingEditorImages(allocator);
+    defer deinitImageContents(allocator, pending);
+
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqualStrings("AQID", pending[0].data);
+    try std.testing.expectEqualStrings("image/png", pending[0].mime_type);
+    try std.testing.expectEqualStrings("", editor.text());
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqualStrings("clipboard image pasted", state.status);
+}
+
+test "submitEditorText includes pending clipboard images and clears the draft attachments" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "submitted");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.appendPendingEditorImage(.{
+        .data = try allocator.dupe(u8, "AQID"),
+        .mime_type = try allocator.dupe(u8, "image/png"),
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("describe this image");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    defer if (prompt_worker_active) prompt_worker.join(allocator);
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try submitEditorText(
+        allocator,
+        std.testing.io,
+        &env_map,
+        editor.text(),
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(prompt_worker_active);
+    prompt_worker.join(allocator);
+    prompt_worker_active = false;
+
+    const pending_after_submit = try state.clonePendingEditorImages(allocator);
+    defer deinitImageContents(allocator, pending_after_submit);
+    try std.testing.expectEqual(@as(usize, 0), pending_after_submit.len);
+
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 1);
+    switch (messages[0]) {
+        .user => |user_message| {
+            try std.testing.expectEqual(@as(usize, 2), user_message.content.len);
+            try std.testing.expectEqualStrings("describe this image", user_message.content[0].text.text);
+            try std.testing.expectEqualStrings("image/png", user_message.content[1].image.mime_type);
+            try std.testing.expectEqualStrings("AQID", user_message.content[1].image.data);
+        },
+        else => return error.ExpectedUserMessage,
+    }
 }
 
 test "reload slash command refreshes the selected theme from disk" {
