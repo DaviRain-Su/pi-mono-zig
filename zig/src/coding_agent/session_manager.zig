@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const tui = @import("tui");
 const common = @import("tools/common.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
@@ -194,6 +195,99 @@ pub const SessionTreeNode = struct {
             .children = &.{},
             .label = null,
             .label_timestamp = null,
+        };
+    }
+};
+
+pub const SessionSearchInfo = struct {
+    path: []const u8,
+    id: []const u8,
+    cwd: []const u8,
+    name: ?[]const u8 = null,
+    parent_session: ?[]const u8 = null,
+    created_timestamp: []const u8,
+    modified_timestamp: []const u8,
+    message_count: usize,
+    first_message: []const u8,
+    all_messages_text: []const u8,
+    search_text: []const u8,
+
+    pub fn deinit(self: *SessionSearchInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.id);
+        allocator.free(self.cwd);
+        if (self.name) |name| allocator.free(name);
+        if (self.parent_session) |parent_session| allocator.free(parent_session);
+        allocator.free(self.created_timestamp);
+        allocator.free(self.modified_timestamp);
+        allocator.free(self.first_message);
+        allocator.free(self.all_messages_text);
+        allocator.free(self.search_text);
+        self.* = undefined;
+    }
+};
+
+pub const SessionSearchSortMode = enum {
+    recent,
+    relevance,
+};
+
+pub const SessionSearchNameFilter = enum {
+    all,
+    named,
+};
+
+pub const SessionSearchField = enum {
+    any,
+    name,
+    content,
+    cwd,
+    id,
+};
+
+pub const SessionSearchTokenKind = enum {
+    fuzzy,
+    phrase,
+};
+
+pub const SessionSearchToken = struct {
+    field: SessionSearchField = .any,
+    kind: SessionSearchTokenKind,
+    value: []const u8,
+};
+
+pub const ParsedSessionSearchQuery = struct {
+    tokens: []const SessionSearchToken,
+
+    pub fn deinit(self: *ParsedSessionSearchQuery, allocator: std.mem.Allocator) void {
+        allocator.free(self.tokens);
+        self.* = .{
+            .tokens = &.{},
+        };
+    }
+};
+
+pub const SessionSearchMatch = struct {
+    session_index: usize,
+    score: i32,
+};
+
+pub const SessionSearchOptions = struct {
+    sort_mode: SessionSearchSortMode = .relevance,
+    name_filter: SessionSearchNameFilter = .all,
+};
+
+pub const SessionSearchResults = struct {
+    sessions: []const SessionSearchInfo,
+    matches: []const SessionSearchMatch,
+
+    pub fn deinit(self: *SessionSearchResults, allocator: std.mem.Allocator) void {
+        for (@constCast(self.sessions)) |*session| session.deinit(allocator);
+        allocator.free(@constCast(self.sessions));
+        allocator.free(@constCast(self.matches));
+        self.* = .{
+            .sessions = &.{},
+            .matches = &.{},
         };
     }
 };
@@ -886,6 +980,437 @@ pub fn findMostRecentSession(
 
     if (best_name) |name| {
         return try std.fs.path.join(allocator, &[_][]const u8{ session_dir, name });
+    }
+
+    return null;
+}
+
+pub fn listAllSessionsUnder(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: []const u8,
+) ![]SessionSearchInfo {
+    var sessions = std.ArrayList(SessionSearchInfo).empty;
+    errdefer {
+        for (sessions.items) |*session| session.deinit(allocator);
+        sessions.deinit(allocator);
+    }
+
+    collectSessionsUnder(allocator, io, root_dir, &sessions) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    std.mem.sort(SessionSearchInfo, sessions.items, {}, struct {
+        fn lessThan(_: void, lhs: SessionSearchInfo, rhs: SessionSearchInfo) bool {
+            const modified_order = std.mem.order(u8, lhs.modified_timestamp, rhs.modified_timestamp);
+            if (modified_order != .eq) return modified_order == .gt;
+            return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+        }
+    }.lessThan);
+
+    return try sessions.toOwnedSlice(allocator);
+}
+
+pub fn parseSessionSearchQuery(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+) !ParsedSessionSearchQuery {
+    var tokens = std.ArrayList(SessionSearchToken).empty;
+    errdefer tokens.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < query.len) {
+        while (index < query.len and std.ascii.isWhitespace(query[index])) : (index += 1) {}
+        if (index >= query.len) break;
+
+        var field: SessionSearchField = .any;
+        if (detectSessionSearchField(query[index..])) |match| {
+            field = match.field;
+            index += match.consumed;
+        }
+
+        if (index >= query.len) break;
+
+        if (query[index] == '"') {
+            index += 1;
+            const start = index;
+            while (index < query.len and query[index] != '"') : (index += 1) {}
+            const value = std.mem.trim(u8, query[start..@min(index, query.len)], &std.ascii.whitespace);
+            if (value.len > 0) {
+                try tokens.append(allocator, .{
+                    .field = field,
+                    .kind = .phrase,
+                    .value = value,
+                });
+            }
+            if (index < query.len and query[index] == '"') index += 1;
+            continue;
+        }
+
+        const start = index;
+        while (index < query.len and !std.ascii.isWhitespace(query[index])) : (index += 1) {}
+        const value = std.mem.trim(u8, query[start..index], &std.ascii.whitespace);
+        if (value.len == 0) continue;
+
+        try tokens.append(allocator, .{
+            .field = field,
+            .kind = .fuzzy,
+            .value = value,
+        });
+    }
+
+    return .{
+        .tokens = try tokens.toOwnedSlice(allocator),
+    };
+}
+
+pub fn filterAndSortSessions(
+    allocator: std.mem.Allocator,
+    sessions: []const SessionSearchInfo,
+    query: []const u8,
+    options: SessionSearchOptions,
+) ![]SessionSearchMatch {
+    const trimmed_query = std.mem.trim(u8, query, &std.ascii.whitespace);
+    var parsed = try parseSessionSearchQuery(allocator, trimmed_query);
+    defer parsed.deinit(allocator);
+
+    var matches = std.ArrayList(SessionSearchMatch).empty;
+    errdefer matches.deinit(allocator);
+
+    for (sessions, 0..) |session, index| {
+        if (!matchesSessionNameFilter(session, options.name_filter)) continue;
+        if (trimmed_query.len == 0) {
+            try matches.append(allocator, .{
+                .session_index = index,
+                .score = 0,
+            });
+            continue;
+        }
+
+        const result = matchSessionSearchQuery(session, parsed);
+        if (!result.matches) continue;
+
+        try matches.append(allocator, .{
+            .session_index = index,
+            .score = result.score,
+        });
+    }
+
+    if (trimmed_query.len > 0 and options.sort_mode == .relevance) {
+        std.mem.sort(SessionSearchMatch, matches.items, sessions, struct {
+            fn lessThan(all_sessions: []const SessionSearchInfo, lhs: SessionSearchMatch, rhs: SessionSearchMatch) bool {
+                if (lhs.score != rhs.score) return lhs.score < rhs.score;
+
+                const lhs_session = all_sessions[lhs.session_index];
+                const rhs_session = all_sessions[rhs.session_index];
+                const modified_order = std.mem.order(u8, lhs_session.modified_timestamp, rhs_session.modified_timestamp);
+                if (modified_order != .eq) return modified_order == .gt;
+                return std.mem.order(u8, lhs_session.path, rhs_session.path) == .lt;
+            }
+        }.lessThan);
+    }
+
+    return try matches.toOwnedSlice(allocator);
+}
+
+pub fn searchSessionsUnder(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: []const u8,
+    query: []const u8,
+    options: SessionSearchOptions,
+) !SessionSearchResults {
+    const sessions = try listAllSessionsUnder(allocator, io, root_dir);
+    errdefer {
+        for (@constCast(sessions)) |*session| session.deinit(allocator);
+        allocator.free(@constCast(sessions));
+    }
+
+    const matches = try filterAndSortSessions(allocator, sessions, query, options);
+    errdefer allocator.free(matches);
+
+    return .{
+        .sessions = sessions,
+        .matches = matches,
+    };
+}
+
+fn collectSessionsUnder(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: []const u8,
+    sessions: *std.ArrayList(SessionSearchInfo),
+) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(io, root_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        const child_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, entry.name });
+        defer allocator.free(child_path);
+
+        switch (entry.kind) {
+            .directory => try collectSessionsUnder(allocator, io, child_path, sessions),
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+                const session_info = buildSessionSearchInfo(allocator, io, child_path) catch continue;
+                try sessions.append(allocator, session_info);
+            },
+            else => {},
+        }
+    }
+}
+
+fn buildSessionSearchInfo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_file: []const u8,
+) !SessionSearchInfo {
+    var manager = try SessionManager.openWithWarningWriter(allocator, io, session_file, null, null);
+    defer manager.deinit();
+
+    const header = manager.getHeader();
+
+    var all_messages = std.ArrayList(u8).empty;
+    defer all_messages.deinit(allocator);
+
+    var first_message: ?[]u8 = null;
+    defer if (first_message) |message| allocator.free(message);
+
+    var message_count: usize = 0;
+    var modified_timestamp = header.timestamp;
+
+    for (manager.getEntries()) |entry| {
+        modified_timestamp = entry.timestamp();
+
+        switch (entry) {
+            .message => |message_entry| {
+                message_count += 1;
+                try appendMessageSearchText(&all_messages, allocator, message_entry.message);
+
+                if (first_message == null and message_entry.message == .user) {
+                    first_message = try blocksToSearchTextAlloc(allocator, message_entry.message.user.content);
+                }
+            },
+            .compaction => |compaction_entry| try appendMessageSearchText(&all_messages, allocator, compaction_entry.message),
+            .branch_summary => |branch_summary_entry| try appendSearchText(&all_messages, allocator, branch_summary_entry.summary),
+            .custom_message => |custom_message_entry| try appendCustomMessageContentSearchText(&all_messages, allocator, custom_message_entry.content),
+            else => {},
+        }
+    }
+
+    const owned_name = if (manager.getSessionName()) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (owned_name) |name| allocator.free(name);
+
+    const owned_path = try allocator.dupe(u8, session_file);
+    errdefer allocator.free(owned_path);
+    const owned_id = try allocator.dupe(u8, header.id);
+    errdefer allocator.free(owned_id);
+    const owned_cwd = try allocator.dupe(u8, header.cwd);
+    errdefer allocator.free(owned_cwd);
+    const owned_parent_session = if (header.parent_session) |parent_session|
+        try allocator.dupe(u8, parent_session)
+    else
+        null;
+    errdefer if (owned_parent_session) |parent_session| allocator.free(parent_session);
+    const owned_created = try allocator.dupe(u8, header.timestamp);
+    errdefer allocator.free(owned_created);
+    const owned_modified = try allocator.dupe(u8, modified_timestamp);
+    errdefer allocator.free(owned_modified);
+    const owned_first_message = if (first_message) |message|
+        try allocator.dupe(u8, message)
+    else
+        try allocator.dupe(u8, "(no messages)");
+    errdefer allocator.free(owned_first_message);
+    const owned_all_messages = try allocator.dupe(u8, all_messages.items);
+    errdefer allocator.free(owned_all_messages);
+    const search_text = try std.fmt.allocPrint(
+        allocator,
+        "{s} {s} {s} {s}",
+        .{
+            header.id,
+            owned_name orelse "",
+            all_messages.items,
+            header.cwd,
+        },
+    );
+    errdefer allocator.free(search_text);
+
+    return .{
+        .path = owned_path,
+        .id = owned_id,
+        .cwd = owned_cwd,
+        .name = owned_name,
+        .parent_session = owned_parent_session,
+        .created_timestamp = owned_created,
+        .modified_timestamp = owned_modified,
+        .message_count = message_count,
+        .first_message = owned_first_message,
+        .all_messages_text = owned_all_messages,
+        .search_text = search_text,
+    };
+}
+
+fn appendMessageSearchText(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    message: agent.AgentMessage,
+) !void {
+    switch (message) {
+        .user => |user_message| try appendContentBlocksSearchText(out, allocator, user_message.content),
+        .assistant => |assistant_message| try appendContentBlocksSearchText(out, allocator, assistant_message.content),
+        .tool_result => |tool_result| try appendContentBlocksSearchText(out, allocator, tool_result.content),
+    }
+}
+
+fn appendCustomMessageContentSearchText(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    content: CustomMessageContent,
+) !void {
+    switch (content) {
+        .text => |text| try appendSearchText(out, allocator, text),
+        .blocks => |blocks| try appendContentBlocksSearchText(out, allocator, blocks),
+    }
+}
+
+fn appendContentBlocksSearchText(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    blocks: []const ai.ContentBlock,
+) !void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| try appendSearchText(out, allocator, text.text),
+            .thinking => |thinking| try appendSearchText(out, allocator, thinking.thinking),
+            .image => {},
+        }
+    }
+}
+
+fn appendSearchText(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    if (out.items.len > 0) try out.append(allocator, ' ');
+    try out.appendSlice(allocator, trimmed);
+}
+
+fn blocksToSearchTextAlloc(
+    allocator: std.mem.Allocator,
+    blocks: []const ai.ContentBlock,
+) !?[]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    try appendContentBlocksSearchText(&out, allocator, blocks);
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(allocator);
+}
+
+fn detectSessionSearchField(query: []const u8) ?struct {
+    field: SessionSearchField,
+    consumed: usize,
+} {
+    const prefix_matches = [_]struct {
+        prefix: []const u8,
+        field: SessionSearchField,
+    }{
+        .{ .prefix = "name:", .field = .name },
+        .{ .prefix = "content:", .field = .content },
+        .{ .prefix = "cwd:", .field = .cwd },
+        .{ .prefix = "id:", .field = .id },
+    };
+
+    inline for (prefix_matches) |candidate| {
+        if (std.mem.startsWith(u8, query, candidate.prefix)) {
+            return .{
+                .field = candidate.field,
+                .consumed = candidate.prefix.len,
+            };
+        }
+    }
+
+    return null;
+}
+
+fn matchesSessionNameFilter(session: SessionSearchInfo, filter: SessionSearchNameFilter) bool {
+    return switch (filter) {
+        .all => true,
+        .named => if (session.name) |name|
+            std.mem.trim(u8, name, &std.ascii.whitespace).len > 0
+        else
+            false,
+    };
+}
+
+const SessionSearchMatchResult = struct {
+    matches: bool,
+    score: i32,
+};
+
+fn matchSessionSearchQuery(
+    session: SessionSearchInfo,
+    query: ParsedSessionSearchQuery,
+) SessionSearchMatchResult {
+    if (query.tokens.len == 0) return .{ .matches = true, .score = 0 };
+
+    var total_score: i32 = 0;
+    for (query.tokens) |token| {
+        const text = switch (token.field) {
+            .any => session.search_text,
+            .name => session.name orelse "",
+            .content => session.all_messages_text,
+            .cwd => session.cwd,
+            .id => session.id,
+        };
+
+        switch (token.kind) {
+            .phrase => {
+                const match_index = indexOfCaseInsensitive(text, token.value) orelse return .{
+                    .matches = false,
+                    .score = 0,
+                };
+                total_score += @as(i32, @intCast(match_index * 10));
+            },
+            .fuzzy => {
+                const match = tui.components.autocomplete.fuzzyMatch(token.value, text);
+                if (!match.matches) {
+                    return .{
+                        .matches = false,
+                        .score = 0,
+                    };
+                }
+                total_score += match.score;
+            },
+        }
+    }
+
+    return .{
+        .matches = true,
+        .score = total_score,
+    };
+}
+
+fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matched = true;
+        var needle_index: usize = 0;
+        while (needle_index < needle.len) : (needle_index += 1) {
+            if (std.ascii.toLower(haystack[start + needle_index]) != std.ascii.toLower(needle[needle_index])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return start;
     }
 
     return null;
@@ -2132,6 +2657,19 @@ fn assistantTextMessage(
     } };
 }
 
+fn sessionSearchTestModel() ai.Model {
+    return .{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+}
+
 fn countJsonLines(bytes: []const u8) usize {
     var count: usize = 0;
     for (bytes) |byte| {
@@ -2614,4 +3152,142 @@ test "session manager supports branching and branch navigation" {
     defer resumed_branch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), resumed_branch.messages.len);
     try std.testing.expectEqualStrings("second", resumed_branch.messages[1].assistant.content[0].text.text);
+}
+
+test "session search query parser supports field prefixes and phrases" {
+    var parsed = try parseSessionSearchQuery(
+        std.testing.allocator,
+        "name:\"Night Shift\" content:panic cwd:/tmp/project id:session-1",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), parsed.tokens.len);
+    try std.testing.expectEqual(SessionSearchField.name, parsed.tokens[0].field);
+    try std.testing.expectEqual(SessionSearchTokenKind.phrase, parsed.tokens[0].kind);
+    try std.testing.expectEqualStrings("Night Shift", parsed.tokens[0].value);
+    try std.testing.expectEqual(SessionSearchField.content, parsed.tokens[1].field);
+    try std.testing.expectEqualStrings("panic", parsed.tokens[1].value);
+    try std.testing.expectEqual(SessionSearchField.cwd, parsed.tokens[2].field);
+    try std.testing.expectEqualStrings("/tmp/project", parsed.tokens[2].value);
+    try std.testing.expectEqual(SessionSearchField.id, parsed.tokens[3].field);
+    try std.testing.expectEqualStrings("session-1", parsed.tokens[3].value);
+}
+
+test "session search scans all session files and ranks name and content matches by relevance" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_relative = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "search-root",
+    });
+    defer std.testing.allocator.free(root_relative);
+    const search_root = try makeAbsoluteTestPath(std.testing.allocator, root_relative);
+    defer std.testing.allocator.free(search_root);
+
+    const project_a_sessions = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        search_root,
+        "project-a",
+        ".pi",
+        "sessions",
+    });
+    defer std.testing.allocator.free(project_a_sessions);
+    const project_b_sessions = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        search_root,
+        "project-b",
+        ".pi",
+        "sessions",
+    });
+    defer std.testing.allocator.free(project_b_sessions);
+
+    const model = sessionSearchTestModel();
+
+    var night_shift = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project-a", project_a_sessions);
+    defer night_shift.deinit();
+    _ = try night_shift.appendSessionInfo("Night Shift");
+
+    var night_shift_user = try userTextMessage(std.testing.allocator, "investigate auth timeout", 1);
+    defer deinitMessage(std.testing.allocator, &night_shift_user);
+    _ = try night_shift.appendMessage(night_shift_user);
+
+    var night_shift_assistant = try assistantTextMessage(std.testing.allocator, "auth retry fixed after inspecting logs", model, 2);
+    defer deinitMessage(std.testing.allocator, &night_shift_assistant);
+    _ = try night_shift.appendMessage(night_shift_assistant);
+
+    const night_shift_path = try std.testing.allocator.dupe(u8, night_shift.getSessionFile().?);
+    defer std.testing.allocator.free(night_shift_path);
+
+    var parser_panic = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project-b", project_b_sessions);
+    defer parser_panic.deinit();
+
+    var parser_user = try userTextMessage(std.testing.allocator, "parser panic while compiling release build", 3);
+    defer deinitMessage(std.testing.allocator, &parser_user);
+    _ = try parser_panic.appendMessage(parser_user);
+
+    var parser_assistant = try assistantTextMessage(std.testing.allocator, "panic came from stale generated parser output", model, 4);
+    defer deinitMessage(std.testing.allocator, &parser_assistant);
+    _ = try parser_panic.appendMessage(parser_assistant);
+
+    const parser_path = try std.testing.allocator.dupe(u8, parser_panic.getSessionFile().?);
+    defer std.testing.allocator.free(parser_path);
+
+    var checklist = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project-b", project_b_sessions);
+    defer checklist.deinit();
+
+    var checklist_user = try userTextMessage(std.testing.allocator, "night shift release checklist", 5);
+    defer deinitMessage(std.testing.allocator, &checklist_user);
+    _ = try checklist.appendMessage(checklist_user);
+
+    var checklist_assistant = try assistantTextMessage(std.testing.allocator, "review migrations and smoke tests", model, 6);
+    defer deinitMessage(std.testing.allocator, &checklist_assistant);
+    _ = try checklist.appendMessage(checklist_assistant);
+
+    const checklist_path = try std.testing.allocator.dupe(u8, checklist.getSessionFile().?);
+    defer std.testing.allocator.free(checklist_path);
+
+    const all_sessions = try listAllSessionsUnder(std.testing.allocator, std.testing.io, search_root);
+    defer {
+        for (@constCast(all_sessions)) |*session| session.deinit(std.testing.allocator);
+        std.testing.allocator.free(@constCast(all_sessions));
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), all_sessions.len);
+
+    var name_results = try searchSessionsUnder(std.testing.allocator, std.testing.io, search_root, "name:\"Night Shift\"", .{});
+    defer name_results.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), name_results.matches.len);
+    const name_match = name_results.sessions[name_results.matches[0].session_index];
+    try std.testing.expectEqualStrings("Night Shift", name_match.name.?);
+    try std.testing.expectEqualStrings(night_shift_path, name_match.path);
+
+    var content_results = try searchSessionsUnder(std.testing.allocator, std.testing.io, search_root, "content:\"parser panic\"", .{});
+    defer content_results.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), content_results.matches.len);
+    const content_match = content_results.sessions[content_results.matches[0].session_index];
+    try std.testing.expectEqualStrings(parser_path, content_match.path);
+    try std.testing.expect(std.mem.indexOf(u8, content_match.all_messages_text, "parser panic") != null);
+
+    var relevance_results = try searchSessionsUnder(std.testing.allocator, std.testing.io, search_root, "night shift", .{});
+    defer relevance_results.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), relevance_results.matches.len);
+    const first_relevance = relevance_results.sessions[relevance_results.matches[0].session_index];
+    const second_relevance = relevance_results.sessions[relevance_results.matches[1].session_index];
+    try std.testing.expectEqualStrings(night_shift_path, first_relevance.path);
+    try std.testing.expectEqualStrings(checklist_path, second_relevance.path);
+
+    const named_only = try filterAndSortSessions(
+        std.testing.allocator,
+        all_sessions,
+        "",
+        .{ .sort_mode = .recent, .name_filter = .named },
+    );
+    defer std.testing.allocator.free(named_only);
+
+    try std.testing.expectEqual(@as(usize, 1), named_only.len);
+    try std.testing.expectEqualStrings(night_shift_path, all_sessions[named_only[0].session_index].path);
 }
