@@ -3,6 +3,7 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const api_registry = @import("api_registry.zig");
 pub const model_registry = @import("model_registry.zig");
+pub const model_discovery = @import("model_discovery.zig");
 pub const json_parse = @import("json_parse.zig");
 pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("providers/bedrock.zig");
     _ = @import("providers/register_builtins.zig");
     _ = @import("model_registry.zig");
+    _ = @import("model_discovery.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
     _ = @import("providers/faux.zig");

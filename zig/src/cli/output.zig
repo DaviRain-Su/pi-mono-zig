@@ -74,9 +74,12 @@ pub fn printModelList(
     io: std.Io,
     env_map: *const std.process.Environ.Map,
     search: ?[]const u8,
+    discover_models: bool,
     stdout: *std.Io.Writer,
 ) !u8 {
-    var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, ".");
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, io, env_map, ".", .{
+        .discover_models = discover_models,
+    });
     defer runtime_config.deinit();
 
     const available = try coding_agent.provider_config.listAvailableModels(allocator, env_map, null, .{
@@ -109,6 +112,8 @@ pub fn printModelList(
         context: []u8,
         max_out: []u8,
         thinking: []const u8,
+        tools: []const u8,
+        loaded: []const u8,
         images: []const u8,
     };
 
@@ -126,6 +131,8 @@ pub fn printModelList(
     var context_width = "context".len;
     var max_out_width = "max-out".len;
     var thinking_width = "thinking".len;
+    var tools_width = "tools".len;
+    var loaded_width = "loaded".len;
     var images_width = "images".len;
 
     for (filtered, 0..) |entry, index| {
@@ -140,6 +147,8 @@ pub fn printModelList(
             .context = context,
             .max_out = max_out,
             .thinking = if (entry.reasoning) "yes" else "no",
+            .tools = if (entry.tool_calling) "yes" else "no",
+            .loaded = if (entry.loaded) "yes" else "no",
             .images = if (entry.supports_images) "yes" else "no",
         };
 
@@ -148,6 +157,8 @@ pub fn printModelList(
         context_width = @max(context_width, rows[index].context.len);
         max_out_width = @max(max_out_width, rows[index].max_out.len);
         thinking_width = @max(thinking_width, rows[index].thinking.len);
+        tools_width = @max(tools_width, rows[index].tools.len);
+        loaded_width = @max(loaded_width, rows[index].loaded.len);
         images_width = @max(images_width, rows[index].images.len);
     }
 
@@ -163,6 +174,10 @@ pub fn printModelList(
         max_out_width,
         "thinking",
         thinking_width,
+        "tools",
+        tools_width,
+        "loaded",
+        loaded_width,
         "images",
         images_width,
     );
@@ -180,6 +195,10 @@ pub fn printModelList(
             max_out_width,
             row.thinking,
             thinking_width,
+            row.tools,
+            tools_width,
+            row.loaded,
+            loaded_width,
             row.images,
             images_width,
         );
@@ -215,6 +234,10 @@ fn writeTableRow(
     max_out_width: usize,
     thinking: []const u8,
     thinking_width: usize,
+    tools: []const u8,
+    tools_width: usize,
+    loaded: []const u8,
+    loaded_width: usize,
     images: []const u8,
     images_width: usize,
 ) !void {
@@ -227,6 +250,10 @@ fn writeTableRow(
     try writePadded(stdout, max_out, max_out_width);
     try stdout.writeAll("  ");
     try writePadded(stdout, thinking, thinking_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, tools, tools_width);
+    try stdout.writeAll("  ");
+    try writePadded(stdout, loaded, loaded_width);
     try stdout.writeAll("  ");
     try writePadded(stdout, images, images_width);
     try stdout.writeByte('\n');

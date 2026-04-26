@@ -37,7 +37,10 @@ pub fn prepareCliRuntime(
     options: *const cli.Args,
     selected_tools: ?[]const []const u8,
 ) !PreparedCliRuntime {
-    var runtime_config = try config_mod.loadRuntimeConfig(allocator, io, env_map, cwd);
+    const startup_network_enabled = bootstrap.startupNetworkOperationsEnabled(options, env_map);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, io, env_map, cwd, .{
+        .discover_models = startup_network_enabled,
+    });
     errdefer runtime_config.deinit();
 
     var resource_bundle = try resources_mod.loadResourceBundle(allocator, io, .{
@@ -61,8 +64,6 @@ pub fn prepareCliRuntime(
     else
         try context_files_mod.loadContextFiles(allocator, io, cwd);
     errdefer context_files_mod.deinitContextFiles(allocator, context_files);
-
-    _ = bootstrap.startupNetworkOperationsEnabled(options, env_map);
 
     const current_date = try currentDateString(allocator, io);
     defer allocator.free(current_date);

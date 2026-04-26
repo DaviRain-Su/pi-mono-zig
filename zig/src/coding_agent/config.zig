@@ -102,11 +102,27 @@ pub const RuntimeConfig = struct {
     }
 };
 
+pub const RuntimeConfigLoadOptions = struct {
+    discover_models: bool = true,
+};
+
 pub fn loadRuntimeConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
     env_map: *const std.process.Environ.Map,
     cwd: []const u8,
+) !RuntimeConfig {
+    return loadRuntimeConfigWithOptions(allocator, io, env_map, cwd, .{
+        .discover_models = !isTruthyEnvFlag(env_map.get("PI_OFFLINE")),
+    });
+}
+
+pub fn loadRuntimeConfigWithOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    options: RuntimeConfigLoadOptions,
 ) !RuntimeConfig {
     const agent_dir = try resolveAgentDir(allocator, env_map);
     errdefer allocator.free(agent_dir);
@@ -139,7 +155,7 @@ pub fn loadRuntimeConfig(
 
     var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitStringMap(allocator, &provider_api_keys);
-    try loadModelsConfig(allocator, io, models_path, &provider_api_keys);
+    try loadModelsConfig(allocator, io, models_path, &provider_api_keys, options.discover_models);
 
     var keybindings = try keybindings_mod.loadFromFile(allocator, io, keybindings_path);
     errdefer keybindings.deinit();
@@ -154,6 +170,14 @@ pub fn loadRuntimeConfig(
         .provider_api_keys = provider_api_keys,
         .keybindings = keybindings,
     };
+}
+
+fn isTruthyEnvFlag(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.ascii.eqlIgnoreCase(text, "1") or
+        std.ascii.eqlIgnoreCase(text, "true") or
+        std.ascii.eqlIgnoreCase(text, "yes") or
+        std.ascii.eqlIgnoreCase(text, "on");
 }
 
 fn loadMergedSettings(allocator: std.mem.Allocator, io: std.Io, global_path: []const u8, project_path: []const u8) !Settings {
@@ -317,7 +341,13 @@ fn loadLegacySettingsApiKeys(allocator: std.mem.Allocator, io: std.Io, path: []c
     }
 }
 
-fn loadModelsConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8, provider_api_keys: *std.StringHashMap([]const u8)) !void {
+fn loadModelsConfig(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    provider_api_keys: *std.StringHashMap([]const u8),
+    discover_models: bool,
+) !void {
     const registry = ai.model_registry.getDefault();
     const content = try readOptionalFile(allocator, io, path);
     defer if (content) |value| allocator.free(value);
@@ -337,23 +367,27 @@ fn loadModelsConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
         const provider_object = provider_entry.value_ptr.object;
         const existing_provider = registry.getProviderConfig(provider_name);
 
-        if (provider_object.get("apiKey")) |api_key_value| {
-            if (api_key_value == .string) {
-                try putOwnedString(provider_api_keys, allocator, provider_name, api_key_value.string);
-            }
-        }
-
-        const provider_api = if (provider_object.get("api")) |api_value|
-            if (api_value == .string) api_value.string else if (existing_provider) |descriptor| descriptor.api else null
-        else if (existing_provider) |descriptor|
-            descriptor.api
+        const provider_api_key: ?[]const u8 = if (provider_object.get("apiKey")) |api_key_value|
+            if (api_key_value == .string) api_key_value.string else null
         else
             null;
+        if (provider_api_key) |api_key| {
+            try putOwnedString(provider_api_keys, allocator, provider_name, api_key);
+        }
 
         const provider_base_url = if (provider_object.get("baseUrl")) |base_url_value|
             if (base_url_value == .string) base_url_value.string else if (existing_provider) |descriptor| descriptor.base_url else null
         else if (existing_provider) |descriptor|
             descriptor.base_url
+        else
+            null;
+
+        const provider_api = if (provider_object.get("api")) |api_value|
+            if (api_value == .string) api_value.string else if (existing_provider) |descriptor| descriptor.api else null
+        else if (existing_provider) |descriptor|
+            descriptor.api
+        else if (provider_base_url) |base_url|
+            if (isLocalBaseUrl(base_url)) @as([]const u8, "openai-completions") else null
         else
             null;
 
@@ -382,6 +416,23 @@ fn loadModelsConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
         }
 
         const resolved_provider = ai.model_registry.getProviderConfig(provider_name);
+        const discovery_config = parseModelDiscoveryConfig(provider_object.get("discoverModels") orelse provider_object.get("modelDiscovery"));
+        if (shouldDiscoverProviderModels(discover_models, provider_base_url, models_value, discovery_config)) {
+            if (resolved_provider) |provider| {
+                _ = ai.model_discovery.discoverAndRegister(allocator, io, registry, provider, .{
+                    .kind = discovery_config.kind,
+                    .models_url = discovery_config.models_url,
+                    .loaded_models_url = discovery_config.loaded_models_url,
+                    .api_key = provider_api_key,
+                }) catch {};
+
+                if (provider.default_model_id == null) {
+                    if (registry.firstModelIdForProvider(provider_name)) |default_model_id| {
+                        ai.model_registry.setProviderDefaultModel(provider_name, default_model_id) catch {};
+                    }
+                }
+            }
+        }
 
         if (models_value) |value| {
             if (value == .array) {
@@ -426,6 +477,8 @@ fn loadModelsConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
                             model.reasoning
                         else
                             false,
+                        .tool_calling = parseBoolField(model_object.get("toolCalling") orelse model_object.get("tool_calling"), if (existing_model) |model| model.tool_calling else true),
+                        .loaded = parseBoolField(model_object.get("loaded"), if (existing_model) |model| model.loaded else false),
                         .input_types = input_types,
                         .cost = parseCost(model_object.get("cost"), existing_model),
                         .context_window = parseU32Field(model_object.get("contextWindow"), if (existing_model) |model| model.context_window else DEFAULT_CONTEXT_WINDOW),
@@ -445,6 +498,110 @@ fn loadModelsConfig(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
             }
         }
     }
+}
+
+const ParsedModelDiscoveryConfig = struct {
+    explicit: bool = false,
+    enabled: bool = true,
+    kind: ai.model_discovery.DiscoveryKind = .auto,
+    models_url: ?[]const u8 = null,
+    loaded_models_url: ?[]const u8 = null,
+};
+
+fn parseModelDiscoveryConfig(value: ?std.json.Value) ParsedModelDiscoveryConfig {
+    const discovery_value = value orelse return .{};
+    switch (discovery_value) {
+        .bool => |enabled| return .{ .explicit = true, .enabled = enabled },
+        .string => |kind| return .{ .explicit = true, .kind = parseDiscoveryKind(kind) },
+        .object => |object| {
+            return .{
+                .explicit = true,
+                .enabled = parseBoolField(object.get("enabled"), true),
+                .kind = parseDiscoveryKind(getStringField(object, "kind") orelse getStringField(object, "type") orelse "auto"),
+                .models_url = getStringField(object, "modelsUrl") orelse getStringField(object, "models_url") orelse getStringField(object, "url"),
+                .loaded_models_url = getStringField(object, "loadedModelsUrl") orelse getStringField(object, "loaded_models_url") orelse getStringField(object, "loadedUrl") orelse getStringField(object, "loaded_url"),
+            };
+        },
+        else => return .{ .explicit = true, .enabled = false },
+    }
+}
+
+fn shouldDiscoverProviderModels(
+    startup_network_enabled: bool,
+    provider_base_url: ?[]const u8,
+    models_value: ?std.json.Value,
+    config: ParsedModelDiscoveryConfig,
+) bool {
+    if (!startup_network_enabled) return false;
+    const base_url = provider_base_url orelse return false;
+    if (config.explicit) return config.enabled;
+    if (modelsValueHasEntries(models_value)) return false;
+    return isLocalBaseUrl(base_url);
+}
+
+fn modelsValueHasEntries(value: ?std.json.Value) bool {
+    const models_value = value orelse return false;
+    return models_value == .array and models_value.array.items.len > 0;
+}
+
+fn parseDiscoveryKind(value: []const u8) ai.model_discovery.DiscoveryKind {
+    if (std.ascii.eqlIgnoreCase(value, "openai")) return .openai;
+    if (std.ascii.eqlIgnoreCase(value, "openai-compatible")) return .openai;
+    if (std.ascii.eqlIgnoreCase(value, "ollama")) return .ollama;
+    if (std.ascii.eqlIgnoreCase(value, "pi")) return .pi;
+    return .auto;
+}
+
+fn isLocalBaseUrl(value: []const u8) bool {
+    return containsIgnoreCase(value, "localhost") or
+        containsIgnoreCase(value, "127.0.0.1") or
+        containsIgnoreCase(value, "0.0.0.0") or
+        containsIgnoreCase(value, "[::1]");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn getStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+fn parseBoolField(value: ?std.json.Value, default_value: bool) bool {
+    const field = value orelse return default_value;
+    return switch (field) {
+        .bool => |boolean| boolean,
+        .integer => |integer| integer != 0,
+        .string => |text| parseBoolText(text) orelse default_value,
+        else => default_value,
+    };
+}
+
+fn parseBoolText(text: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(text, "true") or
+        std.ascii.eqlIgnoreCase(text, "yes") or
+        std.ascii.eqlIgnoreCase(text, "on") or
+        std.mem.eql(u8, text, "1"))
+    {
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(text, "false") or
+        std.ascii.eqlIgnoreCase(text, "no") or
+        std.ascii.eqlIgnoreCase(text, "off") or
+        std.mem.eql(u8, text, "0"))
+    {
+        return false;
+    }
+    return null;
 }
 
 fn parseInputTypes(allocator: std.mem.Allocator, value: ?std.json.Value, existing_model: ?ai.Model) ![]const []const u8 {
@@ -925,6 +1082,14 @@ test "runtime config loads auth and custom models from agent files" {
         \\          }
         \\        }
         \\      ]
+        \\    },
+        \\    "local-default": {
+        \\      "baseUrl": "http://localhost:1234/v1",
+        \\      "models": [
+        \\        {
+        \\          "id": "local-default-model"
+        \\        }
+        \\      ]
         \\    }
         \\  }
         \\}
@@ -960,6 +1125,13 @@ test "runtime config loads auth and custom models from agent files" {
     const local_model = ai.model_registry.find("local-openai", "llama-3.3-70b").?;
     try std.testing.expectEqualStrings("Local Llama 3.3 70B", local_model.name);
     try std.testing.expect(local_model.headers != null);
+
+    const local_default_provider = ai.model_registry.getProviderConfig("local-default").?;
+    try std.testing.expectEqualStrings("openai-completions", local_default_provider.api);
+    try std.testing.expectEqualStrings("local-default-model", local_default_provider.default_model_id.?);
+    const local_default_model = ai.model_registry.find("local-default", "local-default-model").?;
+    try std.testing.expectEqualStrings("openai-completions", local_default_model.api);
+    try std.testing.expect(runtime.lookupApiKey("local-default") == null);
 }
 
 test "runtime config reads legacy settings api keys" {

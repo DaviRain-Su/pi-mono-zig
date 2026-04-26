@@ -779,9 +779,11 @@ fn buildRequestHeaders(
     try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
 
     const api_key = if (options) |opts| opts.api_key orelse "" else "";
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_header);
-    try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+    if (std.mem.trim(u8, api_key, &std.ascii.whitespace).len > 0) {
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+        defer allocator.free(auth_header);
+        try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+    }
 
     try mergeHeaders(allocator, &headers, model.headers);
     if (options) |stream_options| {
@@ -1425,6 +1427,10 @@ test "buildRequestHeaders merges model and option headers" {
     try std.testing.expectEqualStrings("model", headers.get("X-Model").?);
     try std.testing.expectEqualStrings("option", headers.get("X-Option").?);
     try std.testing.expectEqualStrings("option", headers.get("X-Shared").?);
+
+    var anonymous_headers = try buildRequestHeaders(allocator, model, .{});
+    defer deinitOwnedHeaders(allocator, &anonymous_headers);
+    try std.testing.expect(anonymous_headers.get("Authorization") == null);
 }
 
 test "buildRequestPayload transforms orphaned tool calls and normalizes ids" {

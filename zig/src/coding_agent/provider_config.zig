@@ -57,6 +57,8 @@ pub const AvailableModel = struct {
     display_name: []const u8,
     available: bool,
     reasoning: bool,
+    tool_calling: bool,
+    loaded: bool,
     supports_images: bool,
     context_window: u32,
     max_tokens: u32,
@@ -99,15 +101,16 @@ pub fn resolveProviderConfig(
     }
 
     const provider_descriptor = descriptor.?;
-    const resolved_api_key = try auth.resolveApiKey(allocator, env_map, provider, api_key_override, configured_api_key) orelse
-        return error.MissingApiKey;
+    const resolved_api_key = try auth.resolveApiKey(allocator, env_map, provider, api_key_override, configured_api_key);
+    if (resolved_api_key == null and !isLocalBaseUrl(provider_descriptor.base_url)) return error.MissingApiKey;
+
     const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
     const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(provider_descriptor, model_id);
 
     return .{
         .model = model,
-        .api_key = resolved_api_key.api_key,
-        .owned_api_key = resolved_api_key.owned_api_key,
+        .api_key = if (resolved_api_key) |api_key| api_key.api_key else null,
+        .owned_api_key = if (resolved_api_key) |api_key| api_key.owned_api_key else null,
     };
 }
 
@@ -132,6 +135,8 @@ pub fn listAvailableModels(
             .display_name = summary.name,
             .available = is_current or credentials_available,
             .reasoning = summary.reasoning,
+            .tool_calling = summary.tool_calling,
+            .loaded = summary.loaded,
             .supports_images = hasInputType(summary.input_types, "image"),
             .context_window = summary.context_window,
             .max_tokens = summary.max_tokens,
@@ -153,6 +158,8 @@ pub fn listAvailableModels(
                 .display_name = model.name,
                 .available = true,
                 .reasoning = model.reasoning,
+                .tool_calling = model.tool_calling,
+                .loaded = model.loaded,
                 .supports_images = hasInputType(model.input_types, "image"),
                 .context_window = model.context_window,
                 .max_tokens = model.max_tokens,
@@ -511,10 +518,22 @@ fn hasProviderCredentials(
 ) !bool {
     if (shouldForceFauxProvider(env_map, provider)) return true;
     if (configured_credentials.lookup(provider) != null) return true;
+    if (!std.mem.eql(u8, provider, "faux")) {
+        if (ai.model_registry.getProviderConfig(provider)) |descriptor| {
+            if (isLocalBaseUrl(descriptor.base_url)) return true;
+        }
+    }
 
     const api_key = try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider);
     defer if (api_key) |value| allocator.free(value);
     return api_key != null;
+}
+
+fn isLocalBaseUrl(value: []const u8) bool {
+    return containsIgnoreCase(value, "localhost") or
+        containsIgnoreCase(value, "127.0.0.1") or
+        containsIgnoreCase(value, "0.0.0.0") or
+        containsIgnoreCase(value, "[::1]");
 }
 
 fn missingApiKeyMessage(provider: []const u8) []const u8 {
@@ -885,6 +904,48 @@ test "KIMI_API_KEY configures kimi-coding only" {
     const model = (try findInitialDefaultModel(allocator, &env_map, .{})).?;
     try std.testing.expectEqualStrings("kimi-coding", model.provider);
     try std.testing.expectEqualStrings("kimi-for-coding", model.id);
+}
+
+test "local custom providers do not require api keys" {
+    const allocator = std.testing.allocator;
+    defer ai.model_registry.resetForTesting();
+
+    try ai.model_registry.registerProvider(.{
+        .provider = "local-noauth",
+        .api = "openai-completions",
+        .base_url = "http://localhost:1234/v1",
+        .default_model_id = "local-model",
+    });
+    try ai.model_registry.registerModel(.{
+        .id = "local-model",
+        .name = "Local Model",
+        .api = "openai-completions",
+        .provider = "local-noauth",
+        .base_url = "http://localhost:1234/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 4096,
+        .max_tokens = 1024,
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const models = try listAvailableModels(allocator, &env_map, null, .{});
+    defer allocator.free(models);
+
+    var saw_local = false;
+    for (models) |entry| {
+        if (std.mem.eql(u8, entry.provider, "local-noauth") and std.mem.eql(u8, entry.model_id, "local-model")) {
+            saw_local = true;
+            try std.testing.expect(entry.available);
+        }
+    }
+    try std.testing.expect(saw_local);
+
+    var resolved = try resolveProviderConfig(allocator, &env_map, "local-noauth", null, null, null);
+    defer resolved.deinit(allocator);
+    try std.testing.expectEqualStrings("local-model", resolved.model.id);
+    try std.testing.expect(resolved.api_key == null);
 }
 
 test "blank configured credentials do not make models selectable" {

@@ -13,6 +13,8 @@ pub const ModelDefinition = struct {
     id: []const u8,
     name: []const u8,
     reasoning: bool = false,
+    tool_calling: bool = true,
+    loaded: bool = false,
     input_types: []const []const u8,
     cost: types.ModelCost = .{},
     context_window: u32,
@@ -51,6 +53,8 @@ pub const ModelSummary = struct {
     name: []const u8,
     provider: []const u8,
     reasoning: bool,
+    tool_calling: bool,
+    loaded: bool,
     input_types: []const []const u8,
     context_window: u32,
     max_tokens: u32,
@@ -137,6 +141,8 @@ pub const ModelRegistry = struct {
             .provider = provider.provider,
             .base_url = provider.base_url,
             .reasoning = definition.reasoning,
+            .tool_calling = definition.tool_calling,
+            .loaded = definition.loaded,
             .input_types = definition.input_types,
             .cost = definition.cost,
             .context_window = definition.context_window,
@@ -234,6 +240,34 @@ pub const ModelRegistry = struct {
         return if (self.providers.get(provider)) |entry| entry.config else null;
     }
 
+    pub fn setProviderDefaultModel(self: *ModelRegistry, provider: []const u8, model_id: []const u8) RegisterError!void {
+        const entry = self.providers.getPtr(provider) orelse return error.UnknownProvider;
+        const owned_model_id = try self.allocator.dupe(u8, model_id);
+        if (entry.config.default_model_id) |existing| self.allocator.free(existing);
+        entry.config.default_model_id = owned_model_id;
+    }
+
+    pub fn firstModelIdForProvider(self: *const ModelRegistry, provider: []const u8) ?[]const u8 {
+        for (self.models.items) |entry| {
+            if (std.mem.eql(u8, entry.model.provider, provider)) return entry.model.id;
+        }
+        return null;
+    }
+
+    pub fn setModelLoaded(self: *ModelRegistry, provider: []const u8, model_id: []const u8, loaded: bool) bool {
+        if (self.findModelIndex(provider, model_id)) |index| {
+            self.models.items[index].model.loaded = loaded;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn clearLoadedForProvider(self: *ModelRegistry, provider: []const u8) void {
+        for (self.models.items) |*entry| {
+            if (std.mem.eql(u8, entry.model.provider, provider)) entry.model.loaded = false;
+        }
+    }
+
     pub fn count(self: *const ModelRegistry) usize {
         return self.models.items.len;
     }
@@ -250,6 +284,8 @@ pub const ModelRegistry = struct {
                 .name = entry.model.name,
                 .provider = entry.model.provider,
                 .reasoning = entry.model.reasoning,
+                .tool_calling = entry.model.tool_calling,
+                .loaded = entry.model.loaded,
                 .input_types = entry.model.input_types,
                 .context_window = entry.model.context_window,
                 .max_tokens = entry.model.max_tokens,
@@ -349,6 +385,22 @@ pub fn getProviderConfig(provider: []const u8) ?ProviderConfig {
     return getDefault().getProviderConfig(provider);
 }
 
+pub fn setProviderDefaultModel(provider: []const u8, model_id: []const u8) RegisterError!void {
+    return getDefault().setProviderDefaultModel(provider, model_id);
+}
+
+pub fn firstModelIdForProvider(provider: []const u8) ?[]const u8 {
+    return getDefault().firstModelIdForProvider(provider);
+}
+
+pub fn setModelLoaded(provider: []const u8, model_id: []const u8, loaded: bool) bool {
+    return getDefault().setModelLoaded(provider, model_id, loaded);
+}
+
+pub fn clearLoadedForProvider(provider: []const u8) void {
+    getDefault().clearLoadedForProvider(provider);
+}
+
 pub fn builtInProviderConfigs() []const ProviderConfig {
     return BUILT_IN_PROVIDER_CONFIGS[0..];
 }
@@ -401,6 +453,8 @@ fn cloneModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!Mo
             .provider = owned_provider,
             .base_url = owned_base_url,
             .reasoning = model.reasoning,
+            .tool_calling = model.tool_calling,
+            .loaded = model.loaded,
             .input_types = owned_input_types,
             .cost = model.cost,
             .context_window = model.context_window,
