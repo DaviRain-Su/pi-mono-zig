@@ -3,6 +3,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const auth = @import("auth.zig");
 const keybindings_mod = @import("keybindings.zig");
+const migrations = @import("migrations.zig");
 const resources_mod = @import("resources.zig");
 const session_mod = @import("session.zig");
 
@@ -108,6 +109,8 @@ pub fn loadRuntimeConfig(
     cwd: []const u8,
 ) !RuntimeConfig {
     const agent_dir = try resolveAgentDir(allocator, env_map);
+    errdefer allocator.free(agent_dir);
+    try migrations.run(allocator, io, agent_dir);
 
     const global_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(global_settings_path);
@@ -1039,4 +1042,52 @@ test "runtime config honors PI_CODING_AGENT_DIR and loads keybindings" {
     try std.testing.expectEqual(keybindings_mod.Action.clear, runtime.keybindings.actionForKey(.{ .ctrl = 'x' }).?);
     try std.testing.expect(runtime.keybindings.actionForKey(.{ .ctrl = 'l' }) == null);
     try std.testing.expectEqual(keybindings_mod.Action.exit, runtime.keybindings.actionForKey(.{ .ctrl = 'q' }).?);
+}
+
+test "loadRuntimeConfig runs one-time migrations before loading credentials" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "apiKeys": {
+        \\    "openai": "migrated-openai-key"
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".pi", "agent", "auth.json" });
+    defer allocator.free(auth_path);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".pi", "agent", "settings.json" });
+    defer allocator.free(settings_path);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfig(allocator, std.testing.io, &env_map, project_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    try std.testing.expectEqualStrings("migrated-openai-key", runtime.lookupApiKey("openai").?);
+
+    const auth_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(auth_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, auth_bytes, "\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, auth_bytes, "\"migrated-openai-key\"") != null);
+
+    const settings_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(settings_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, settings_bytes, "\"apiKeys\"") == null);
 }
