@@ -1,6 +1,8 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const mutation_queue = @import("file_mutation_queue.zig");
+const write_mod = @import("write.zig");
 
 const utf8_bom = "\xEF\xBB\xBF";
 
@@ -108,6 +110,9 @@ pub const EditTool = struct {
 
         const absolute_path = try common.resolvePath(allocator, self.cwd, args.path);
         defer allocator.free(absolute_path);
+
+        var mutation_guard = try mutation_queue.acquire(self.io, absolute_path);
+        defer mutation_guard.release();
 
         const raw_content = std.Io.Dir.readFileAlloc(.cwd(), self.io, absolute_path, allocator, .unlimited) catch |err| {
             const message = switch (err) {
@@ -392,6 +397,37 @@ fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
+const QueuedEditThreadContext = struct {
+    path: []const u8,
+    success: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *QueuedEditThreadContext) void {
+        var result = EditTool.init(".", std.testing.io).execute(std.heap.page_allocator, .{
+            .path = self.path,
+            .edits = &[_]Edit{.{
+                .old_text = "original",
+                .new_text = "edited",
+            }},
+        }) catch unreachable;
+        defer result.deinit(std.heap.page_allocator);
+        self.success.store(!result.is_error, .seq_cst);
+    }
+};
+
+const QueuedWriteThreadContext = struct {
+    path: []const u8,
+    success: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *QueuedWriteThreadContext) void {
+        var result = write_mod.WriteTool.init(".", std.testing.io).execute(std.heap.page_allocator, .{
+            .path = self.path,
+            .content = "replacement\n",
+        }) catch unreachable;
+        defer result.deinit(std.heap.page_allocator);
+        self.success.store(!result.is_error, .seq_cst);
+    }
+};
+
 fn validateEdits(
     allocator: std.mem.Allocator,
     normalized_content: []const u8,
@@ -554,6 +590,48 @@ test "edit tool replaces matching text in a file" {
     const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("before new text after", written);
+}
+
+test "edit and write share the same queued mutation order for one file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "mixed.txt",
+        .data = "original\n",
+    });
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "mixed.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var held_guard = try mutation_queue.acquire(std.testing.io, absolute_path);
+
+    var edit_context = QueuedEditThreadContext{ .path = absolute_path };
+    const edit_thread = try std.Thread.spawn(.{}, QueuedEditThreadContext.run, .{&edit_context});
+
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+
+    var write_context = QueuedWriteThreadContext{ .path = absolute_path };
+    const write_thread = try std.Thread.spawn(.{}, QueuedWriteThreadContext.run, .{&write_context});
+
+    held_guard.release();
+
+    edit_thread.join();
+    write_thread.join();
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+
+    try std.testing.expect(edit_context.success.load(.seq_cst));
+    try std.testing.expect(write_context.success.load(.seq_cst));
+    try std.testing.expectEqualStrings("replacement\n", written);
 }
 
 test "edit tool returns an error when the search text is not found" {

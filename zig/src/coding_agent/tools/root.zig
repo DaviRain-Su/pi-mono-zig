@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const common = @import("common.zig");
+pub const file_mutation_queue = @import("file_mutation_queue.zig");
 pub const truncate = @import("truncate.zig");
 pub const read = @import("read.zig");
 pub const bash = @import("bash.zig");
@@ -58,6 +59,7 @@ pub const LsTool = ls.LsTool;
 
 test {
     _ = @import("common.zig");
+    _ = @import("file_mutation_queue.zig");
     _ = @import("truncate.zig");
     _ = @import("read.zig");
     _ = @import("bash.zig");
