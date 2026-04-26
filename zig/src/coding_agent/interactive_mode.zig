@@ -614,20 +614,26 @@ fn runBashTool(
         .timeout_seconds = getOptionalU64(params, "timeout_seconds"),
     };
     var update_forward = BashToolUpdateForwardContext{
+        .allocator = allocator,
         .downstream_context = on_update_context,
         .downstream = on_update,
     };
-    const result = try tools.BashTool.init(runtime.cwd, runtime.io).executeWithUpdates(
+    var result = try tools.BashTool.init(runtime.cwd, runtime.io).executeWithUpdates(
         allocator,
         args,
         signal,
         &update_forward,
         forwardBashToolUpdate,
     );
-    return .{ .content = result.content };
+    defer if (result.details) |*details| details.deinit(allocator);
+    return .{
+        .content = result.content,
+        .details = if (result.details) |details| try tools.bash.detailsToJsonValue(allocator, details) else null,
+    };
 }
 
 const BashToolUpdateForwardContext = struct {
+    allocator: std.mem.Allocator,
     downstream_context: ?*anyopaque,
     downstream: ?agent.types.AgentToolUpdateCallback,
 };
@@ -638,10 +644,15 @@ fn forwardBashToolUpdate(
 ) !void {
     const forward_context: *BashToolUpdateForwardContext = @ptrCast(@alignCast(context.?));
     const callback = forward_context.downstream orelse return;
+    const details = if (result.details) |details_value|
+        try tools.bash.detailsToJsonValue(forward_context.allocator, details_value)
+    else
+        null;
+    defer if (details) |details_value| common.deinitJsonValue(forward_context.allocator, details_value);
 
     const partial = agent.AgentToolResult{
         .content = result.content,
-        .details = null,
+        .details = details,
     };
 
     try callback(forward_context.downstream_context, partial);
@@ -4384,6 +4395,96 @@ test "interactive tool conversation renders tool lines and persists session entr
     try std.testing.expectEqualStrings("The file says: secret note", context.messages[3].assistant.content[0].text.text);
 }
 
+test "interactive bash tool conversation preserves structured details" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    try env_map.put("PI_FAUX_TOOL_NAME", "bash");
+    try env_map.put("PI_FAUX_TOOL_ARGS_JSON", "{\"command\":\"seq 3000\",\"timeout_seconds\":1}");
+    try env_map.put("PI_FAUX_TOOL_FINAL_RESPONSE", "The command completed");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var app_context = AppContext.init(root_dir, std.testing.io);
+    var built_tools = try buildAgentTools(allocator, &app_context, &[_][]const u8{"bash"});
+    defer built_tools.deinit();
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+        .tools = built_tools.items,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter(current_provider.model.id, currentSessionLabel(&session));
+
+    const subscriber = agent.AgentSubscriber{
+        .context = &state,
+        .callback = handleAppAgentEvent,
+    };
+    try session.agent.subscribe(subscriber);
+    defer _ = session.agent.unsubscribe(subscriber);
+
+    try session.prompt("run bash");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 24,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 240, &lines);
+
+    var saw_bash_output = false;
+    for (lines.items) |line| {
+        if (std.mem.indexOf(u8, line, "3000") != null) saw_bash_output = true;
+    }
+    try std.testing.expect(saw_bash_output);
+
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+
+    var reopened = try session_manager_mod.SessionManager.open(allocator, std.testing.io, session_file, root_dir);
+    defer reopened.deinit();
+
+    var context = try reopened.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqualStrings("bash", context.messages[2].tool_result.tool_name);
+    try std.testing.expect(context.messages[2].tool_result.details != null);
+    const details = context.messages[2].tool_result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 0), details.get("exit_code").?.integer);
+    try std.testing.expectEqual(false, details.get("timed_out").?.bool);
+    try std.testing.expect(details.get("full_output_path") != null);
+    try std.testing.expect(details.get("truncation") != null);
+    try std.testing.expectEqualStrings("lines", details.get("truncation").?.object.get("truncated_by").?.string);
+    try std.testing.expect(details.get("truncation").?.object.get("total_lines").?.integer >= 3000);
+    const full_output_path = details.get("full_output_path").?.string;
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, full_output_path) catch {};
+    try std.testing.expect(std.mem.startsWith(u8, full_output_path, "/tmp/pi-bash-"));
+}
+
 test "handleCopySlashCommand copies the last assistant message to the clipboard" {
     const allocator = std.testing.allocator;
 
@@ -4890,6 +4991,7 @@ test "forwardBashToolUpdate borrows streaming content without freeing it twice" 
     defer capture.deinit();
 
     var context = BashToolUpdateForwardContext{
+        .allocator = allocator,
         .downstream_context = &capture,
         .downstream = Capture.collect,
     };
