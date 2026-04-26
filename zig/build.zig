@@ -23,6 +23,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const external_tool_check_step = addExternalToolCheckStep(b);
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -48,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    tui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
