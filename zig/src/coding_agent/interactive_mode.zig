@@ -3942,7 +3942,7 @@ test "handleInputKey starts a fresh session for slash new command" {
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "New session started") != null);
 }
 
-test "handleInputKey exports session transcript to explicit markdown and json paths" {
+test "handleInputKey exports session transcript to explicit html and jsonl paths" {
     const allocator = std.testing.allocator;
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -3958,10 +3958,10 @@ test "handleInputKey exports session transcript to explicit markdown and json pa
     defer allocator.free(root_dir);
     const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
-    const markdown_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "session export.md" });
-    defer allocator.free(markdown_path);
-    const json_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "session export.json" });
-    defer allocator.free(json_path);
+    const html_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "session export.html" });
+    defer allocator.free(html_path);
+    const jsonl_path = try std.fs.path.join(allocator, &[_][]const u8{ root_dir, "session export.jsonl" });
+    defer allocator.free(jsonl_path);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = root_dir,
@@ -4012,9 +4012,9 @@ test "handleInputKey exports session transcript to explicit markdown and json pa
     };
     var live_resources = LiveResources.init(options);
 
-    const markdown_command = try std.fmt.allocPrint(allocator, "/export \"{s}\"", .{markdown_path});
-    defer allocator.free(markdown_command);
-    _ = try editor.handlePaste(markdown_command);
+    const html_command = try std.fmt.allocPrint(allocator, "/export \"{s}\"", .{html_path});
+    defer allocator.free(html_command);
+    _ = try editor.handlePaste(html_command);
     try handleInputKey(
         allocator,
         std.testing.io,
@@ -4036,15 +4036,16 @@ test "handleInputKey exports session transcript to explicit markdown and json pa
         &live_resources,
     );
 
-    const markdown_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, markdown_path, allocator, .limited(1024 * 1024));
-    defer allocator.free(markdown_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "# Session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "export prompt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, markdown_bytes, "export reply") != null);
+    const html_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, html_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(html_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "<!DOCTYPE html>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "theme-toggle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "export prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "export reply") != null);
 
-    const json_command = try std.fmt.allocPrint(allocator, "/export \"{s}\"", .{json_path});
-    defer allocator.free(json_command);
-    _ = try editor.handlePaste(json_command);
+    const jsonl_command = try std.fmt.allocPrint(allocator, "/export \"{s}\"", .{jsonl_path});
+    defer allocator.free(jsonl_command);
+    _ = try editor.handlePaste(jsonl_command);
     try handleInputKey(
         allocator,
         std.testing.io,
@@ -4066,11 +4067,11 @@ test "handleInputKey exports session transcript to explicit markdown and json pa
         &live_resources,
     );
 
-    const json_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, json_path, allocator, .limited(1024 * 1024));
-    defer allocator.free(json_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"header\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"entries\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_bytes, "\"export prompt\"") != null);
+    const jsonl_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, jsonl_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(jsonl_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl_bytes, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl_bytes, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl_bytes, "\"export prompt\"") != null);
 }
 
 test "app state streams assistant updates and records tool results" {
