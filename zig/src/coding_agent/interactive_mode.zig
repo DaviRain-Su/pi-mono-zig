@@ -258,6 +258,9 @@ pub fn runInteractiveMode(
     try terminal.start();
     defer terminal.stop();
 
+    var input_loop = try terminal.initInputLoop(allocator, io, env_map);
+    defer input_loop.deinit();
+
     var renderer = tui.Renderer.init(allocator, &terminal);
     defer renderer.deinit();
 
@@ -351,47 +354,15 @@ pub fn runInteractiveMode(
 
         if (should_exit and !prompt_worker_active) break;
 
-        if (try pollForInput()) {
-            var read_buffer: [64]u8 = undefined;
-            const bytes_read = std.posix.read(0, &read_buffer) catch 0;
-            if (bytes_read == 0) {
-                should_exit = true;
-                continue;
-            }
-            try input_buffer.appendSlice(allocator, read_buffer[0..bytes_read]);
-            while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
-                switch (result) {
-                    .parsed => |parsed| try dispatchInputEvent(
-                        allocator,
-                        io,
-                        env_map,
-                        parsed,
-                        &session,
-                        &current_provider,
-                        options.session_dir,
-                        options,
-                        built_tools.items,
-                        &app_state,
-                        &editor,
-                        &overlay,
-                        &auth_flow,
-                        &prompt_worker,
-                        &prompt_worker_active,
-                        subscriber,
-                        &should_exit,
-                        &input_buffer,
-                        &app_context,
-                        &live_resources,
-                    ),
-                    .need_more_bytes => break,
-                }
-            }
-        } else if (tui.keys.flushInputEvent(input_buffer.items)) |parsed| {
+        var handled_input = false;
+        while (try input_loop.tryInputEvent()) |event| {
+            defer event.deinit(allocator);
+            handled_input = true;
             try dispatchInputEvent(
                 allocator,
                 io,
                 env_map,
-                parsed,
+                event.parsed,
                 &session,
                 &current_provider,
                 options.session_dir,
@@ -409,33 +380,9 @@ pub fn runInteractiveMode(
                 &app_context,
                 &live_resources,
             );
-            while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
-                switch (result) {
-                    .parsed => |next_parsed| try dispatchInputEvent(
-                        allocator,
-                        io,
-                        env_map,
-                        next_parsed,
-                        &session,
-                        &current_provider,
-                        options.session_dir,
-                        options,
-                        built_tools.items,
-                        &app_state,
-                        &editor,
-                        &overlay,
-                        &auth_flow,
-                        &prompt_worker,
-                        &prompt_worker_active,
-                        subscriber,
-                        &should_exit,
-                        &input_buffer,
-                        &app_context,
-                        &live_resources,
-                    ),
-                    .need_more_bytes => break,
-                }
-            }
+        }
+        if (!handled_input) {
+            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
         }
     }
 

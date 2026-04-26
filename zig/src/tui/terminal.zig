@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
+const keys = @import("keys.zig");
 
 pub const Size = struct {
     width: usize,
@@ -222,7 +223,162 @@ pub const Terminal = struct {
             .native => |*native| native.resize_pending.store(true, .seq_cst),
         }
     }
+
+    pub fn initInputLoop(
+        self: *Terminal,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env_map: *const std.process.Environ.Map,
+    ) !*InputLoop {
+        return switch (self.state) {
+            .backend => error.UnsupportedTerminalBackend,
+            .native => |*native| {
+                if (native.tty) |*tty| {
+                    return try InputLoop.init(allocator, io, env_map, tty);
+                }
+                return error.TerminalNotStarted;
+            },
+        };
+    }
 };
+
+pub const LoopEvent = union(enum) {
+    key_press: vaxis.Key,
+    key_release: vaxis.Key,
+    paste_start,
+    paste_end,
+    paste: []const u8,
+};
+
+pub const InputLoopResult = struct {
+    parsed: keys.ParsedInput,
+    owned_paste: ?[]const u8 = null,
+
+    pub fn deinit(self: InputLoopResult, allocator: std.mem.Allocator) void {
+        if (self.owned_paste) |paste| allocator.free(paste);
+    }
+};
+
+pub const InputLoop = struct {
+    allocator: std.mem.Allocator,
+    vaxis_state: *vaxis.Vaxis,
+    loop: vaxis.Loop(LoopEvent),
+    paste_buffer: std.ArrayList(u8) = .empty,
+    paste_active: bool = false,
+    started: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env_map: *const std.process.Environ.Map,
+        tty: *vaxis.Tty,
+    ) !*InputLoop {
+        const result = try allocator.create(InputLoop);
+        errdefer allocator.destroy(result);
+
+        const vaxis_state = try allocator.create(vaxis.Vaxis);
+        errdefer allocator.destroy(vaxis_state);
+
+        vaxis_state.* = try vaxis.init(io, allocator, @constCast(env_map), .{});
+        errdefer vaxis_state.deinit(allocator, tty.writer());
+
+        result.* = .{
+            .allocator = allocator,
+            .vaxis_state = vaxis_state,
+            .loop = vaxis.Loop(LoopEvent).init(io, tty, vaxis_state),
+        };
+        errdefer result.paste_buffer.deinit(allocator);
+
+        try result.loop.start();
+        result.started = true;
+        return result;
+    }
+
+    pub fn deinit(self: *InputLoop) void {
+        const allocator = self.allocator;
+        self.paste_buffer.deinit(self.allocator);
+        if (self.started) self.loop.stop();
+        self.vaxis_state.deinit(self.allocator, self.loop.tty.writer());
+        allocator.destroy(self.vaxis_state);
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    pub fn tryInputEvent(self: *InputLoop) !?InputLoopResult {
+        while (try self.loop.tryEvent()) |event| {
+            if (try processLoopEvent(self.allocator, &self.paste_buffer, &self.paste_active, event)) |result| {
+                return result;
+            }
+        }
+        return null;
+    }
+};
+
+fn processLoopEvent(
+    allocator: std.mem.Allocator,
+    paste_buffer: *std.ArrayList(u8),
+    paste_active: *bool,
+    event: LoopEvent,
+) !?InputLoopResult {
+    switch (event) {
+        .key_press => |key| {
+            if (paste_active.*) {
+                try appendPasteKeyText(allocator, paste_buffer, key);
+                return null;
+            }
+            const parsed = keys.parsedInputFromVaxisKey(key, .press) orelse return null;
+            return .{ .parsed = parsed };
+        },
+        .key_release => |key| {
+            if (paste_active.*) return null;
+            const parsed = keys.parsedInputFromVaxisKey(key, .release) orelse return null;
+            return .{ .parsed = parsed };
+        },
+        .paste_start => {
+            paste_active.* = true;
+            paste_buffer.clearRetainingCapacity();
+            return null;
+        },
+        .paste_end => {
+            if (!paste_active.*) return null;
+            paste_active.* = false;
+            const owned = try allocator.dupe(u8, paste_buffer.items);
+            paste_buffer.clearRetainingCapacity();
+            return .{
+                .parsed = keys.parsedPasteInput(owned),
+                .owned_paste = owned,
+            };
+        },
+        .paste => |text| {
+            return .{
+                .parsed = keys.parsedPasteInput(text),
+                .owned_paste = text,
+            };
+        },
+    }
+}
+
+fn appendPasteKeyText(
+    allocator: std.mem.Allocator,
+    paste_buffer: *std.ArrayList(u8),
+    key: vaxis.Key,
+) !void {
+    if (key.text) |text| {
+        try paste_buffer.appendSlice(allocator, text);
+        return;
+    }
+
+    switch (key.codepoint) {
+        vaxis.Key.enter, vaxis.Key.kp_enter => try paste_buffer.append(allocator, '\r'),
+        vaxis.Key.tab => try paste_buffer.append(allocator, '\t'),
+        else => {
+            if (key.codepoint < 0x20) return;
+            var encoded: [4]u8 = undefined;
+            const length = std.unicode.utf8Encode(key.codepoint, &encoded) catch return;
+            try paste_buffer.appendSlice(allocator, encoded[0..length]);
+        },
+    }
+}
 
 pub fn readSizeWithVaxis(_: ?*anyopaque, tty: *vaxis.Tty) ?Size {
     const winsize = tty.getWinsize() catch return null;
@@ -293,6 +449,80 @@ const MockBackend = struct {
         return self.size;
     }
 };
+
+test "processLoopEvent maps vaxis key presses to parsed input events" {
+    var paste_buffer = std.ArrayList(u8).empty;
+    defer paste_buffer.deinit(std.testing.allocator);
+    var paste_active = false;
+
+    const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .key_press = .{
+            .codepoint = 'a',
+            .text = "a",
+        },
+    })).?;
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .key = .{ .printable = keys.PrintableKey.fromSlice("a") } },
+        .consumed = 0,
+    }, result.parsed);
+}
+
+test "processLoopEvent aggregates bracketed paste content from libvaxis events" {
+    var paste_buffer = std.ArrayList(u8).empty;
+    defer paste_buffer.deinit(std.testing.allocator);
+    var paste_active = false;
+
+    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .paste_start)) == null);
+    try std.testing.expect(paste_active);
+
+    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .key_press = .{
+            .codepoint = 'h',
+            .text = "h",
+        },
+    })) == null);
+    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .key_press = .{
+            .codepoint = vaxis.Key.enter,
+        },
+    })) == null);
+    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .key_press = .{
+            .codepoint = 'i',
+            .text = "i",
+        },
+    })) == null);
+
+    const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .paste_end)).?;
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!paste_active);
+    try std.testing.expectEqualStrings("h\ri", result.owned_paste.?);
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .paste = result.owned_paste.? },
+        .consumed = 0,
+    }, result.parsed);
+}
+
+test "processLoopEvent forwards owned libvaxis paste events" {
+    var paste_buffer = std.ArrayList(u8).empty;
+    defer paste_buffer.deinit(std.testing.allocator);
+    var paste_active = false;
+
+    const text = try std.testing.allocator.dupe(u8, "clipboard");
+    const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .paste = text,
+    })).?;
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("clipboard", result.owned_paste.?);
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .paste = result.owned_paste.? },
+        .consumed = 0,
+    }, result.parsed);
+}
 
 test "terminal enters raw mode on startup and restores on exit" {
     var backend = MockBackend{};

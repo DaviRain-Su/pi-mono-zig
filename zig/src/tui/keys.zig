@@ -1,4 +1,5 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 
 pub const PrintableKey = struct {
     bytes: [4]u8 = [_]u8{0} ** 4,
@@ -258,6 +259,64 @@ fn parsedWithDetails(key: Key, consumed: usize, modifiers: KeyModifiers, event_t
     };
 }
 
+pub fn parsedInputFromParsedKey(parsed_key: ParsedKey) ParsedInput {
+    return .{
+        .event = .{ .key = parsed_key.key },
+        .consumed = parsed_key.consumed,
+        .modifiers = parsed_key.modifiers,
+        .event_type = parsed_key.event_type,
+    };
+}
+
+pub fn parsedPasteInput(paste: []const u8) ParsedInput {
+    return .{
+        .event = .{ .paste = paste },
+        .consumed = 0,
+    };
+}
+
+pub fn parsedKeyFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedKey {
+    const modifiers = keyModifiersFromVaxis(vaxis_key.mods);
+    const result = buildParsedKeyFromCodepoint(
+        vaxis_key.codepoint,
+        if (vaxis_key.shifted_codepoint) |shifted_codepoint|
+            @as(u32, shifted_codepoint)
+        else
+            null,
+        modifiers,
+        event_type,
+        0,
+    ) orelse return null;
+    return switch (result) {
+        .parsed => |parsed_key| canonicalizeVaxisParsedKey(parsed_key),
+        .need_more_bytes => unreachable,
+    };
+}
+
+pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedInput {
+    const parsed_key = parsedKeyFromVaxisKey(vaxis_key, event_type) orelse return null;
+    return parsedInputFromParsedKey(parsed_key);
+}
+
+fn keyModifiersFromVaxis(modifiers: vaxis.Key.Modifiers) KeyModifiers {
+    return .{
+        .shift = modifiers.shift,
+        .alt = modifiers.alt,
+        .ctrl = modifiers.ctrl,
+        .super = modifiers.super,
+    };
+}
+
+fn canonicalizeVaxisParsedKey(parsed_key: ParsedKey) ParsedKey {
+    var canonical = parsed_key;
+    switch (canonical.key) {
+        .ctrl, .ctrl_left, .ctrl_right => canonical.modifiers.ctrl = false,
+        .shift_tab => canonical.modifiers.shift = false,
+        else => {},
+    }
+    return canonical;
+}
+
 fn parseEscapeSequence(input: []const u8, mode: ParseMode) ParseResult {
     if (input.len == 1) {
         return switch (mode) {
@@ -499,6 +558,28 @@ fn buildParsedKeyFromCodepoint(
         13, 57414 => .enter,
         27 => .escape,
         127 => .backspace,
+        vaxis.Key.insert => .insert,
+        vaxis.Key.delete => .delete,
+        vaxis.Key.left => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_left else .left,
+        vaxis.Key.right => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_right else .right,
+        vaxis.Key.up => .up,
+        vaxis.Key.down => .down,
+        vaxis.Key.page_up => .page_up,
+        vaxis.Key.page_down => .page_down,
+        vaxis.Key.home => .home,
+        vaxis.Key.end => .end,
+        vaxis.Key.f1 => .f1,
+        vaxis.Key.f2 => .f2,
+        vaxis.Key.f3 => .f3,
+        vaxis.Key.f4 => .f4,
+        vaxis.Key.f5 => .f5,
+        vaxis.Key.f6 => .f6,
+        vaxis.Key.f7 => .f7,
+        vaxis.Key.f8 => .f8,
+        vaxis.Key.f9 => .f9,
+        vaxis.Key.f10 => .f10,
+        vaxis.Key.f11 => .f11,
+        vaxis.Key.f12 => .f12,
         57399...57413, 57415, 57416 => printableKeyFromCodepoint(effective_codepoint) orelse return null,
         57417 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_left else .left,
         57418 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_right else .right,
@@ -783,4 +864,45 @@ test "parse modifyOtherKeys and kitty special-key modifiers" {
             .event_type = .repeat,
         },
     }, parseKey("\x1b[5;9:2~").?);
+}
+
+test "parsedInputFromVaxisKey preserves ctrl modifiers and release events" {
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 'c',
+        .mods = .{ .ctrl = true },
+    }, .release).?;
+
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .ctrl = 'c' } },
+        .consumed = 0,
+        .event_type = .release,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey maps special keys with modifiers" {
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = vaxis.Key.left,
+        .mods = .{ .ctrl = true },
+    }, .press).?;
+
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .ctrl_left },
+        .consumed = 0,
+        .event_type = .press,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey prefers shifted printable codepoints" {
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 'a',
+        .shifted_codepoint = 'A',
+        .mods = .{ .shift = true },
+    }, .press).?;
+
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice("A") } },
+        .consumed = 0,
+        .modifiers = .{ .shift = true },
+        .event_type = .press,
+    }, result);
 }
