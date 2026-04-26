@@ -277,8 +277,16 @@ pub fn parsedPasteInput(paste: []const u8) ParsedInput {
 
 pub fn parsedKeyFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedKey {
     const modifiers = keyModifiersFromVaxis(vaxis_key.mods);
+    if (ctrlShortcutFromVaxisKey(vaxis_key, modifiers)) |ctrl| {
+        return .{
+            .key = .{ .ctrl = ctrl },
+            .consumed = 0,
+            .event_type = event_type,
+        };
+    }
+
     const result = buildParsedKeyFromCodepoint(
-        vaxis_key.codepoint,
+        preferredVaxisCodepoint(vaxis_key, modifiers),
         if (vaxis_key.shifted_codepoint) |shifted_codepoint|
             @as(u32, shifted_codepoint)
         else
@@ -298,6 +306,32 @@ pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?
     return parsedInputFromParsedKey(parsed_key);
 }
 
+fn preferredVaxisCodepoint(vaxis_key: vaxis.Key, modifiers: KeyModifiers) u32 {
+    if (modifiers.ctrl or modifiers.alt or modifiers.super) {
+        if (vaxis_key.base_layout_codepoint) |base_layout_codepoint| {
+            return base_layout_codepoint;
+        }
+    }
+    return vaxis_key.codepoint;
+}
+
+fn ctrlShortcutFromVaxisKey(vaxis_key: vaxis.Key, modifiers: KeyModifiers) ?u8 {
+    if (!modifiers.ctrl or modifiers.alt or modifiers.shift or modifiers.super) return null;
+
+    if (vaxis_key.codepoint == vaxis.Key.delete) return 'd';
+
+    const shortcut_modifiers: vaxis.Key.Modifiers = .{ .ctrl = true };
+
+    inline for ('a'..('z' + 1)) |letter| {
+        if (vaxis_key.matchShortcut(letter, shortcut_modifiers)) return @intCast(letter);
+    }
+    inline for ('0'..('9' + 1)) |digit| {
+        if (vaxis_key.matchShortcut(digit, shortcut_modifiers)) return @intCast(digit);
+    }
+
+    return null;
+}
+
 fn keyModifiersFromVaxis(modifiers: vaxis.Key.Modifiers) KeyModifiers {
     return .{
         .shift = modifiers.shift,
@@ -309,12 +343,28 @@ fn keyModifiersFromVaxis(modifiers: vaxis.Key.Modifiers) KeyModifiers {
 
 fn canonicalizeVaxisParsedKey(parsed_key: ParsedKey) ParsedKey {
     var canonical = parsed_key;
+    canonical.key = canonicalizeLegacyVaxisAltNavigation(canonical.key, canonical.modifiers);
     switch (canonical.key) {
         .ctrl, .ctrl_left, .ctrl_right => canonical.modifiers.ctrl = false,
         .shift_tab => canonical.modifiers.shift = false,
         else => {},
     }
     return canonical;
+}
+
+fn canonicalizeLegacyVaxisAltNavigation(key: Key, modifiers: KeyModifiers) Key {
+    if (!modifiers.alt or modifiers.shift or modifiers.ctrl or modifiers.super) return key;
+    switch (key) {
+        .printable => |printable| {
+            const text = printable.slice();
+            if (std.mem.eql(u8, text, "b") or std.mem.eql(u8, text, "B")) return .left;
+            if (std.mem.eql(u8, text, "f") or std.mem.eql(u8, text, "F")) return .right;
+            if (std.mem.eql(u8, text, "p") or std.mem.eql(u8, text, "P")) return .up;
+            if (std.mem.eql(u8, text, "n") or std.mem.eql(u8, text, "N")) return .down;
+            return key;
+        },
+        else => return key,
+    }
 }
 
 fn parseEscapeSequence(input: []const u8, mode: ParseMode) ParseResult {
@@ -598,6 +648,10 @@ fn buildParsedKeyFromCodepoint(
 }
 
 fn keyFromCodepoint(codepoint: u32, modifiers: KeyModifiers) ?Key {
+    if (asciiControlKeyFromCodepoint(codepoint)) |ctrl| {
+        return .{ .ctrl = ctrl };
+    }
+
     switch (codepoint) {
         9 => return .tab,
         13 => return .enter,
@@ -612,6 +666,16 @@ fn keyFromCodepoint(codepoint: u32, modifiers: KeyModifiers) ?Key {
     }
 
     return printableKeyFromCodepoint(codepoint);
+}
+
+fn asciiControlKeyFromCodepoint(codepoint: u32) ?u8 {
+    return switch (codepoint) {
+        0x01...0x07 => @intCast('a' + (codepoint - 1)),
+        0x0B, 0x0C => @intCast('a' + (codepoint - 1)),
+        0x0E...0x1A => @intCast('a' + (codepoint - 1)),
+        0x1C...0x1F => @intCast('a' + (codepoint - 1)),
+        else => null,
+    };
 }
 
 fn printableKeyFromCodepoint(codepoint: u32) ?Key {
@@ -879,6 +943,46 @@ test "parsedInputFromVaxisKey preserves ctrl modifiers and release events" {
     }, result);
 }
 
+test "parsedInputFromVaxisKey maps ascii control bytes to ctrl keys" {
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 0x04,
+    }, .press).?;
+
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .ctrl = 'd' } },
+        .consumed = 0,
+        .event_type = .press,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey prefers base layout codepoint for ctrl shortcuts" {
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = '\\',
+        .base_layout_codepoint = 'd',
+        .mods = .{ .ctrl = true },
+    }, .press).?;
+
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .ctrl = 'd' } },
+        .consumed = 0,
+        .event_type = .press,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey maps ctrl shortcut matches from libvaxis special keys" {
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = vaxis.Key.delete,
+        .base_layout_codepoint = 'd',
+        .mods = .{ .ctrl = true },
+    }, .press).?;
+
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .ctrl = 'd' } },
+        .consumed = 0,
+        .event_type = .press,
+    }, result);
+}
+
 test "parsedInputFromVaxisKey maps special keys with modifiers" {
     const result = parsedInputFromVaxisKey(.{
         .codepoint = vaxis.Key.left,
@@ -890,6 +994,30 @@ test "parsedInputFromVaxisKey maps special keys with modifiers" {
         .consumed = 0,
         .event_type = .press,
     }, result);
+}
+
+test "parsedInputFromVaxisKey maps legacy alt navigation aliases from libvaxis" {
+    const up = parsedInputFromVaxisKey(.{
+        .codepoint = 'p',
+        .mods = .{ .alt = true },
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .up },
+        .consumed = 0,
+        .modifiers = .{ .alt = true },
+        .event_type = .press,
+    }, up);
+
+    const left = parsedInputFromVaxisKey(.{
+        .codepoint = 'b',
+        .mods = .{ .alt = true },
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .left },
+        .consumed = 0,
+        .modifiers = .{ .alt = true },
+        .event_type = .press,
+    }, left);
 }
 
 test "parsedInputFromVaxisKey prefers shifted printable codepoints" {
