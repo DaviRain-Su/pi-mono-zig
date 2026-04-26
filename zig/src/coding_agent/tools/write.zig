@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const mutation_queue = @import("file_mutation_queue.zig");
 
 pub const WriteArgs = struct {
     path: []const u8,
@@ -70,6 +71,9 @@ pub const WriteTool = struct {
         const absolute_path = try common.resolvePath(allocator, self.cwd, args.path);
         defer allocator.free(absolute_path);
 
+        var mutation_guard = try mutation_queue.acquire(self.io, absolute_path);
+        defer mutation_guard.release();
+
         common.writeFileAbsolute(self.io, absolute_path, args.content, true) catch |err| {
             const message = try std.fmt.allocPrint(allocator, "Failed to write {s}: {s}", .{ args.path, @errorName(err) });
             defer allocator.free(message);
@@ -126,6 +130,21 @@ fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8)
 fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
+
+const QueuedWriteThreadContext = struct {
+    path: []const u8,
+    content: []const u8,
+    success: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *QueuedWriteThreadContext) void {
+        var result = WriteTool.init(".", std.testing.io).execute(std.heap.page_allocator, .{
+            .path = self.path,
+            .content = self.content,
+        }) catch unreachable;
+        defer result.deinit(std.heap.page_allocator);
+        self.success.store(!result.is_error, .seq_cst);
+    }
+};
 
 test "write tool creates a new file with the requested content" {
     var tmp = std.testing.tmpDir(.{});
@@ -185,6 +204,49 @@ test "write tool overwrites an existing file" {
 
     const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("after", written);
+}
+
+test "write tool waits for an earlier queued mutation before replacing the file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "queued.txt",
+        .data = "before",
+    });
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "queued.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var held_guard = try mutation_queue.acquire(std.testing.io, absolute_path);
+
+    var context = QueuedWriteThreadContext{
+        .path = absolute_path,
+        .content = "after",
+    };
+    const thread = try std.Thread.spawn(.{}, QueuedWriteThreadContext.run, .{&context});
+
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+
+    const before_release = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(before_release);
+    try std.testing.expectEqualStrings("before", before_release);
+
+    held_guard.release();
+
+    thread.join();
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, absolute_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(context.success.load(.seq_cst));
     try std.testing.expectEqualStrings("after", written);
 }
 
