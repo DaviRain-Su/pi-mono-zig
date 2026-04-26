@@ -85,7 +85,6 @@ pub const AnthropicProvider = struct {
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
-        errdefer deinitOwnedHeaders(allocator, &headers);
         defer deinitOwnedHeaders(allocator, &headers);
         try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
         try putOwnedHeader(allocator, &headers, "Accept", "application/json");
@@ -518,6 +517,88 @@ test "parse anthropic stream emits text events" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqualStrings("Hello", done.message.?.content[0].text.text);
+}
+
+test "parse anthropic stream handles compact data fields and provider errors" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: error\n" ++
+        "data:{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    const error_event = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expectEqualStrings("invalid_request_error: bad request", error_event.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+}
+
+test "parse anthropic stream returns error for empty successful stream" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    const error_event = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expectEqualStrings("Provider returned an empty assistant response", error_event.error_message.?);
 }
 
 test "parse anthropic stream emits tool call and thinking events" {
@@ -1031,14 +1112,13 @@ fn parseSseStreamLines(
             return;
         }
 
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) {
             if (try processAnthropicSseEvent(
                 allocator,
                 stream_ptr,
                 sse_event.items,
                 sse_data.items,
-                model,
                 &output,
                 &content_blocks,
                 &tool_calls,
@@ -1061,7 +1141,6 @@ fn parseSseStreamLines(
             stream_ptr,
             sse_event.items,
             sse_data.items,
-            model,
             &output,
             &content_blocks,
             &tool_calls,
@@ -1121,7 +1200,6 @@ fn processAnthropicSseEvent(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     sse_event: []const u8,
     data: []const u8,
-    model: types.Model,
     output: *types.AssistantMessage,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
@@ -1355,11 +1433,17 @@ fn handleContentBlockDelta(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     value: std.json.Value,
 ) !void {
-    const entry = try findActiveBlock(active_blocks, value);
+    const index_value = value.object.get("index") orelse return AnthropicError.InvalidAnthropicChunk;
+    if (index_value != .integer) return AnthropicError.InvalidAnthropicChunk;
+    const anthropic_index: usize = @intCast(index_value.integer);
     const delta_value = value.object.get("delta") orelse return AnthropicError.InvalidAnthropicChunk;
     if (delta_value != .object) return AnthropicError.InvalidAnthropicChunk;
     const delta_type = delta_value.object.get("type") orelse return AnthropicError.InvalidAnthropicChunk;
     if (delta_type != .string) return AnthropicError.InvalidAnthropicChunk;
+    var entry = if (findActiveBlockIndex(active_blocks, anthropic_index)) |found_index|
+        &active_blocks.items[found_index]
+    else
+        try createImplicitActiveBlock(allocator, active_blocks, stream_ptr, anthropic_index, delta_type.string);
 
     if (std.mem.eql(u8, delta_type.string, "text_delta")) {
         const text_value = delta_value.object.get("text") orelse return AnthropicError.InvalidAnthropicChunk;
@@ -1416,6 +1500,39 @@ fn handleContentBlockDelta(
         });
         return;
     }
+}
+
+fn createImplicitActiveBlock(
+    allocator: std.mem.Allocator,
+    active_blocks: *std.ArrayList(BlockEntry),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    anthropic_index: usize,
+    delta_type: []const u8,
+) !*BlockEntry {
+    const event_index = active_blocks.items.len;
+    if (std.mem.eql(u8, delta_type, "text_delta")) {
+        try active_blocks.append(allocator, .{
+            .anthropic_index = anthropic_index,
+            .event_index = event_index,
+            .block = .{ .text = std.ArrayList(u8).empty },
+        });
+        stream_ptr.push(.{ .event_type = .text_start, .content_index = @intCast(event_index) });
+        return &active_blocks.items[active_blocks.items.len - 1];
+    }
+    if (std.mem.eql(u8, delta_type, "thinking_delta") or std.mem.eql(u8, delta_type, "signature_delta")) {
+        try active_blocks.append(allocator, .{
+            .anthropic_index = anthropic_index,
+            .event_index = event_index,
+            .block = .{ .thinking = .{
+                .text = std.ArrayList(u8).empty,
+                .signature = null,
+                .redacted = false,
+            } },
+        });
+        stream_ptr.push(.{ .event_type = .thinking_start, .content_index = @intCast(event_index) });
+        return &active_blocks.items[active_blocks.items.len - 1];
+    }
+    return AnthropicError.InvalidAnthropicChunk;
 }
 
 fn handleContentBlockStop(
@@ -1476,12 +1593,6 @@ fn handleContentBlockStop(
             });
         },
     }
-}
-
-fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-    return null;
 }
 
 fn getAnthropicCompat(model: types.Model) AnthropicCompat {
