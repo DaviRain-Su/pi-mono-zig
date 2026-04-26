@@ -361,6 +361,22 @@ fn streamAssistantResponse(
                     );
                 }
             },
+            .thinking_start, .thinking_delta, .thinking_end => {
+                const template = if (partial_template) |value| value else ai.AssistantMessage{
+                    .content = &[_]ai.ContentBlock{},
+                    .api = config.model.api,
+                    .provider = config.model.provider,
+                    .model = config.model.id,
+                    .usage = ai.Usage.init(),
+                    .stop_reason = .stop,
+                    .timestamp = 0,
+                };
+                try emit(emit_context, .{
+                    .event_type = .message_update,
+                    .message = .{ .assistant = template },
+                    .assistant_message_event = event,
+                });
+            },
             .done, .error_event => {
                 const final_message = event.message orelse stream.result() orelse return AgentLoopError.MissingAssistantResult;
                 if (!saw_message_start) {

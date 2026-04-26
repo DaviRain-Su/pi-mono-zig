@@ -1,0 +1,287 @@
+const std = @import("std");
+const ai = @import("ai");
+
+pub const ASSISTANT_PREFIX = "Pi:";
+
+pub fn formatPrefixedBlocks(allocator: std.mem.Allocator, prefix: []const u8, blocks: []const ai.ContentBlock) ![]u8 {
+    const body = try blocksToText(allocator, blocks);
+    defer allocator.free(body);
+    return if (body.len == 0)
+        std.fmt.allocPrint(allocator, "{s}:", .{prefix})
+    else
+        std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, body });
+}
+
+pub fn formatAssistantMessage(allocator: std.mem.Allocator, message: ai.AssistantMessage) ![]u8 {
+    const body = try blocksToText(allocator, message.content);
+    defer allocator.free(body);
+    if (body.len > 0) {
+        return allocator.dupe(u8, body);
+    }
+    if (message.stop_reason == .error_reason) {
+        return try std.fmt.allocPrint(allocator, "Error: {s}", .{message.error_message orelse "unknown error"});
+    }
+    if (message.stop_reason == .aborted) {
+        return try allocator.dupe(u8, "[interrupted]");
+    }
+    return try allocator.dupe(u8, "");
+}
+
+pub fn formatToolCall(allocator: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]u8 {
+    if (std.mem.eql(u8, name, "read")) return formatReadToolCall(allocator, args);
+    if (std.mem.eql(u8, name, "write")) return formatWriteToolCall(allocator, args);
+    if (std.mem.eql(u8, name, "edit")) return formatEditToolCall(allocator, args);
+    if (isGateLikeTool(name)) return formatGateToolCall(allocator, name, args);
+
+    const json = try std.json.Stringify.valueAlloc(allocator, args, .{});
+    defer allocator.free(json);
+    return try std.fmt.allocPrint(allocator, "Tool {s}: {s}", .{ name, json });
+}
+
+pub fn formatToolResult(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    blocks: []const ai.ContentBlock,
+    is_error: bool,
+) ![]u8 {
+    const body = try blocksToText(allocator, blocks);
+    defer allocator.free(body);
+    const prefix = if (isGateLikeTool(name) or (is_error and looksLikeGateMessage(body)))
+        "Gate blocked"
+    else if (is_error)
+        "Tool error"
+    else if (std.mem.eql(u8, name, "read"))
+        "Read result"
+    else if (std.mem.eql(u8, name, "write"))
+        "Write result"
+    else if (std.mem.eql(u8, name, "edit"))
+        "Edit result"
+    else
+        "Tool result";
+    return if (body.len == 0)
+        std.fmt.allocPrint(allocator, "{s} {s}", .{ prefix, name })
+    else if ((std.mem.eql(u8, prefix, "Tool result") or std.mem.eql(u8, prefix, "Tool error")) and
+        std.mem.indexOfScalar(u8, body, '\n') == null)
+        std.fmt.allocPrint(allocator, "{s} {s}: {s}", .{ prefix, name, body })
+    else
+        std.fmt.allocPrint(allocator, "{s} {s}:\n{s}", .{ prefix, name, body });
+}
+
+fn formatReadToolCall(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
+    const path = getStringArg(args, "path") orelse "(missing path)";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try appendPrint(&out, allocator, "Read {s}", .{path});
+    if (getIntegerArg(args, "offset")) |offset| {
+        try appendPrint(&out, allocator, " from line {d}", .{offset});
+    }
+    if (getIntegerArg(args, "limit")) |limit| {
+        try appendPrint(&out, allocator, " limit {d}", .{limit});
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn formatWriteToolCall(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
+    const path = getStringArg(args, "path") orelse "(missing path)";
+    const content = getStringArg(args, "content") orelse "";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try appendPrint(&out, allocator, "Write {s}\n+++ new\n", .{path});
+    try appendPrefixedPreview(&out, allocator, "+", content);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn formatEditToolCall(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
+    const path = getStringArg(args, "path") orelse "(missing path)";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try appendPrint(&out, allocator, "Edit {s}", .{path});
+    var rendered_edit = false;
+
+    if (args == .object) {
+        if (args.object.get("edits")) |edits_value| {
+            if (edits_value == .array) {
+                for (edits_value.array.items, 0..) |edit_value, index| {
+                    if (edit_value != .object) continue;
+                    const old_text = getObjectString(edit_value.object, "oldText") orelse getObjectString(edit_value.object, "old_text") orelse "";
+                    const new_text = getObjectString(edit_value.object, "newText") orelse getObjectString(edit_value.object, "new_text") orelse "";
+                    try appendEditPreview(&out, allocator, index + 1, old_text, new_text);
+                    rendered_edit = true;
+                }
+            }
+        }
+
+        const legacy_old = getObjectString(args.object, "oldText") orelse getObjectString(args.object, "old_text");
+        const legacy_new = getObjectString(args.object, "newText") orelse getObjectString(args.object, "new_text");
+        if (legacy_old != null or legacy_new != null) {
+            try appendEditPreview(&out, allocator, 1, legacy_old orelse "", legacy_new orelse "");
+            rendered_edit = true;
+        }
+    }
+
+    if (!rendered_edit) {
+        try out.appendSlice(allocator, "\n(no edit preview)");
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn formatGateToolCall(allocator: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]u8 {
+    const json = try std.json.Stringify.valueAlloc(allocator, args, .{});
+    defer allocator.free(json);
+    return try std.fmt.allocPrint(allocator, "Gate {s}: {s}", .{ name, json });
+}
+
+fn appendEditPreview(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    index: usize,
+    old_text: []const u8,
+    new_text: []const u8,
+) !void {
+    try appendPrint(out, allocator, "\n@@ edit {d} @@\n--- old\n", .{index});
+    try appendPrefixedPreview(out, allocator, "-", old_text);
+    try out.appendSlice(allocator, "+++ new\n");
+    try appendPrefixedPreview(out, allocator, "+", new_text);
+}
+
+fn appendPrefixedPreview(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    text: []const u8,
+) !void {
+    const max_lines = 24;
+    const max_bytes = 4096;
+    if (text.len == 0) {
+        try appendPrint(out, allocator, "{s}(empty)\n", .{prefix});
+        return;
+    }
+
+    var written_lines: usize = 0;
+    var written_bytes: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (written_lines >= max_lines or written_bytes >= max_bytes) {
+            try appendPrint(out, allocator, "{s}... truncated preview ...\n", .{prefix});
+            return;
+        }
+        const remaining_bytes = max_bytes - written_bytes;
+        const visible = if (line.len > remaining_bytes) line[0..remaining_bytes] else line;
+        try appendPrint(out, allocator, "{s}{s}\n", .{ prefix, visible });
+        written_lines += 1;
+        written_bytes += visible.len;
+        if (visible.len < line.len) {
+            try appendPrint(out, allocator, "{s}... truncated preview ...\n", .{prefix});
+            return;
+        }
+    }
+}
+
+fn appendPrint(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn getStringArg(value: std.json.Value, key: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    return getObjectString(value.object, key);
+}
+
+fn getIntegerArg(value: std.json.Value, key: []const u8) ?i64 {
+    if (value != .object) return null;
+    const raw = value.object.get(key) orelse return null;
+    return switch (raw) {
+        .integer => |integer| integer,
+        else => null,
+    };
+}
+
+fn getObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const raw = object.get(key) orelse return null;
+    return switch (raw) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+fn isGateLikeTool(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "gate") != null or
+        std.mem.indexOf(u8, name, "permission") != null or
+        std.mem.indexOf(u8, name, "approval") != null;
+}
+
+fn looksLikeGateMessage(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "blocked") != null or
+        std.mem.indexOf(u8, body, "denied") != null or
+        std.mem.indexOf(u8, body, "permission") != null;
+}
+
+pub fn blocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (blocks, 0..) |block, index| {
+        if (index > 0) try out.appendSlice(allocator, "\n");
+        switch (block) {
+            .text => |text| try out.appendSlice(allocator, text.text),
+            .thinking => |thinking| try out.appendSlice(allocator, thinking.thinking),
+            .image => |image| {
+                const note = try std.fmt.allocPrint(allocator, "[image:{s}:{d}]", .{ image.mime_type, image.data.len });
+                defer allocator.free(note);
+                try out.appendSlice(allocator, note);
+            },
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+test "formatToolCall renders read arguments as a concise status line" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"README.md\",\"offset\":2,\"limit\":5}", .{});
+    defer parsed.deinit();
+
+    const rendered = try formatToolCall(allocator, "read", parsed.value);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Read README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "from line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "{\"path\"") == null);
+}
+
+test "formatToolCall renders write and edit previews as comparisons" {
+    const allocator = std.testing.allocator;
+    const write_args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"notes.txt\",\"content\":\"before\\nafter\"}", .{});
+    defer write_args.deinit();
+
+    const write_rendered = try formatToolCall(allocator, "write", write_args.value);
+    defer allocator.free(write_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, write_rendered, "Write notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_rendered, "+++ new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_rendered, "+before") != null);
+
+    const edit_args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"notes.txt\",\"oldText\":\"old line\",\"newText\":\"new line\"}", .{});
+    defer edit_args.deinit();
+
+    const edit_rendered = try formatToolCall(allocator, "edit", edit_args.value);
+    defer allocator.free(edit_rendered);
+    try std.testing.expect(std.mem.indexOf(u8, edit_rendered, "Edit notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edit_rendered, "--- old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edit_rendered, "-old line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edit_rendered, "+new line") != null);
+}
+
+test "formatToolResult highlights gate denials" {
+    const allocator = std.testing.allocator;
+    const blocks = [_]ai.ContentBlock{.{ .text = .{ .text = "permission denied by gate" } }};
+
+    const rendered = try formatToolResult(allocator, "write", &blocks, true);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Gate blocked write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "permission denied") != null);
+}
