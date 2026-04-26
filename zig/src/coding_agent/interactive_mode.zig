@@ -134,6 +134,12 @@ pub const switchModel = slash_commands.switchModel;
 pub const handleModelSlashCommand = slash_commands.handleModelSlashCommand;
 pub const handleScopedModelsSlashCommand = slash_commands.handleScopedModelsSlashCommand;
 pub const handleSessionSlashCommand = slash_commands.handleSessionSlashCommand;
+pub const ChangelogView = slash_commands.ChangelogView;
+pub const handleChangelogSlashCommand = slash_commands.handleChangelogSlashCommand;
+pub const parseChangelogView = slash_commands.parseChangelogView;
+pub const buildChangelogMarkdown = slash_commands.buildChangelogMarkdown;
+pub const resolveChangelogPath = slash_commands.resolveChangelogPath;
+pub const extractLatestVersionSection = slash_commands.extractLatestVersionSection;
 pub const handleNameSlashCommand = slash_commands.handleNameSlashCommand;
 pub const handleLabelSlashCommand = slash_commands.handleLabelSlashCommand;
 pub const resolveCurrentLabelTargetId = slash_commands.resolveCurrentLabelTargetId;
@@ -1503,6 +1509,10 @@ test "parseSlashCommand recognizes builtins and arguments" {
 
     const logout_command = parseSlashCommand("/logout").?;
     try std.testing.expectEqual(SlashCommandKind.logout, logout_command.kind);
+
+    const changelog_command = parseSlashCommand("/changelog condensed").?;
+    try std.testing.expectEqual(SlashCommandKind.changelog, changelog_command.kind);
+    try std.testing.expectEqualStrings("condensed", changelog_command.argument.?);
 
     const new_command = parseSlashCommand("/new").?;
     try std.testing.expectEqual(SlashCommandKind.new, new_command.kind);
@@ -3123,6 +3133,140 @@ test "handleInputKey shows session stats for slash session command" {
     try std.testing.expect(std.mem.indexOf(u8, info, "Messages: user=1, assistant=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, info, "Tokens: input=11, output=7, cache_read=2, cache_write=1, total=21") != null);
     try std.testing.expect(std.mem.indexOf(u8, info, "Context:") != null);
+}
+
+test "buildChangelogMarkdown returns full file and condensed latest entry" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "CHANGELOG.md",
+        .data =
+        \\# Changelog
+        \\
+        \\## [Unreleased]
+        \\- WIP
+        \\
+        \\## [1.2.0]
+        \\- Added /changelog
+        \\
+        \\## [1.1.0]
+        \\- Older entry
+        ,
+    });
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+
+    const full = try buildChangelogMarkdown(allocator, std.testing.io, root_dir, .full);
+    defer allocator.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "# Changelog") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "## [1.1.0]") != null);
+
+    const condensed = try buildChangelogMarkdown(allocator, std.testing.io, root_dir, .condensed);
+    defer allocator.free(condensed);
+    try std.testing.expect(std.mem.indexOf(u8, condensed, "## [1.2.0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, condensed, "## [1.1.0]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, condensed, "# Changelog") == null);
+}
+
+test "handleInputKey appends condensed changelog markdown for slash changelog command" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "CHANGELOG.md",
+        .data =
+        \\# Changelog
+        \\
+        \\## [2.0.0]
+        \\- Added markdown changelog rendering
+        \\
+        \\## [1.9.0]
+        \\- Older release
+        ,
+    });
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("/changelog condensed");
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+    var live_resources = LiveResources.init(options);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqual(@as(usize, 0), editor.text().len);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqual(ChatKind.markdown, state.items.items[state.items.items.len - 1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "## [2.0.0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "## [1.9.0]") == null);
+    try std.testing.expectEqualStrings("showing condensed changelog", state.status);
 }
 
 test "session overlays use persisted session names and labels" {
