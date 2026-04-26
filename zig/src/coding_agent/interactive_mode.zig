@@ -54,6 +54,9 @@ pub const AuthOverlay = overlays.AuthOverlay;
 pub const AuthFlow = overlays.AuthFlow;
 pub const PendingBrowserRedirect = overlays.PendingBrowserRedirect;
 pub const PendingGoogleProject = overlays.PendingGoogleProject;
+pub const PendingApiKeyEntry = overlays.PendingApiKeyEntry;
+pub const isApiKeyLoginProvider = auth.isApiKeyLoginProvider;
+pub const getApiKeyProviderDisplayName = auth.getApiKeyProviderDisplayName;
 pub const loadAuthOverlay = overlays.loadAuthOverlay;
 pub const loadSettingsEditorOverlay = overlays.loadSettingsEditorOverlay;
 pub const loadHotkeysOverlay = overlays.loadHotkeysOverlay;
@@ -886,11 +889,11 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(backend.restored);
     try std.testing.expectEqualStrings(
-        tui.Terminal.ALT_SCREEN_ENABLE ++ tui.Terminal.BRACKETED_PASTE_ENABLE ++ tui.Terminal.HIDE_CURSOR ++ tui.Terminal.KITTY_KEYBOARD_QUERY ++ tui.Terminal.KITTY_KEYBOARD_ENABLE,
+        tui.Terminal.ALT_SCREEN_ENABLE ++ tui.Terminal.BRACKETED_PASTE_ENABLE ++ tui.Terminal.HIDE_CURSOR ++ tui.Terminal.AUTO_WRAP_DISABLE ++ tui.Terminal.KITTY_KEYBOARD_QUERY ++ tui.Terminal.KITTY_KEYBOARD_ENABLE,
         backend.writes.items[0],
     );
     try std.testing.expectEqualStrings(
-        tui.Terminal.ALT_SCREEN_DISABLE ++ tui.Terminal.BRACKETED_PASTE_DISABLE ++ tui.Terminal.KITTY_KEYBOARD_DISABLE ++ tui.Terminal.SHOW_CURSOR,
+        tui.Terminal.AUTO_WRAP_ENABLE ++ tui.Terminal.ALT_SCREEN_DISABLE ++ tui.Terminal.BRACKETED_PASTE_DISABLE ++ tui.Terminal.KITTY_KEYBOARD_DISABLE ++ tui.Terminal.SHOW_CURSOR,
         backend.writes.items[backend.writes.items.len - 1],
     );
     try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));
@@ -987,6 +990,43 @@ test "interactive mode renders streaming assistant updates through a mock backen
 
     try std.testing.expect(renderedLinesContain(lines.items, ASSISTANT_PREFIX));
     try std.testing.expect(renderedLinesContain(lines.items, "streaming reply"));
+    try std.testing.expectEqualStrings("streaming", state.status);
+}
+
+test "interactive mode renders thinking placeholder before assistant text" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setFooter("faux-1", "session.jsonl");
+
+    try state.handleAgentEvent(.{ .event_type = .agent_start });
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .user = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }},
+            .timestamp = 1,
+        } },
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "You: hello"));
+    try std.testing.expect(renderedLinesContain(lines.items, ASSISTANT_PREFIX));
+    try std.testing.expect(renderedLinesContain(lines.items, "Thinking..."));
     try std.testing.expectEqualStrings("thinking", state.status);
 }
 
@@ -1487,8 +1527,18 @@ test "handleLoginSlashCommand opens auth provider selector" {
     try std.testing.expect(overlay != null);
     try std.testing.expect(overlay.? == .auth);
     try std.testing.expectEqual(AuthOverlayMode.login, overlay.?.auth.mode);
-    try std.testing.expectEqual(@as(usize, 3), overlay.?.auth.items.len);
+    try std.testing.expect(overlay.?.auth.items.len > 3);
     try std.testing.expectEqualStrings("anthropic", overlay.?.auth.items[0].value);
+
+    var saw_openai = false;
+    for (overlay.?.auth.items) |item| {
+        if (std.mem.eql(u8, item.value, "openai")) {
+            saw_openai = true;
+            try std.testing.expectEqualStrings("OpenAI", item.label);
+            try std.testing.expectEqualStrings("API key login", item.description.?);
+        }
+    }
+    try std.testing.expect(saw_openai);
 }
 
 test "beginLoginFlow starts anthropic oauth prompt state" {
@@ -1535,7 +1585,7 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
         slash_commands.open_browser_fn = previous_browser_open_fn;
     }
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", &state, &slash_commands.test_auth_flow);
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
 
     try std.testing.expect(slash_commands.test_auth_flow != null);
     try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
@@ -1570,7 +1620,7 @@ test "beginLoginFlow shows oauth.json guidance when oauth client config is missi
         slash_commands.test_auth_flow = null;
     };
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", &state, &slash_commands.test_auth_flow);
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
 
     try std.testing.expect(slash_commands.test_auth_flow == null);
 
@@ -1578,6 +1628,32 @@ test "beginLoginFlow shows oauth.json guidance when oauth client config is missi
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "oauth.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "\"anthropic\"") != null);
+}
+
+test "beginLoginFlow starts API key prompt state for built-in provider" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    slash_commands.test_auth_flow = null;
+    defer if (slash_commands.test_auth_flow) |*value| {
+        value.deinit(allocator);
+        slash_commands.test_auth_flow = null;
+    };
+
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "openai", null, &state, &slash_commands.test_auth_flow);
+
+    try std.testing.expect(slash_commands.test_auth_flow != null);
+    try std.testing.expect(slash_commands.test_auth_flow.? == .api_key);
+    try std.testing.expectEqualStrings("openai", slash_commands.test_auth_flow.?.api_key.provider_id);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "OpenAI API key login started") != null);
 }
 
 test "persistLoginCredential writes auth.json for slash login flows" {
@@ -1655,6 +1731,84 @@ test "persistLoginCredential writes auth.json for slash login flows" {
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"anthropic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"oauth-access-token\"") != null);
     try std.testing.expectEqualStrings("oauth-access-token", live_resources.runtime_config.?.lookupApiKey("anthropic").?);
+}
+
+test "submitAuthFlowInput stores API key credentials for built-in providers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    var auth_flow: ?AuthFlow = .{ .api_key = .{
+        .provider_id = "openai",
+        .provider_name = "OpenAI",
+    } };
+    defer if (auth_flow) |*value| value.deinit(allocator);
+
+    try submitAuthFlowInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        "openai-api-key",
+        &session,
+        &current_provider,
+        options,
+        &state,
+        &editor,
+        &auth_flow,
+        &live_resources,
+    );
+
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"type\": \"api_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"key\": \"openai-api-key\"") != null);
+    try std.testing.expect(auth_flow == null);
+    try std.testing.expectEqualStrings("openai-api-key", live_resources.runtime_config.?.lookupApiKey("openai").?);
 }
 
 test "loadEditorAutocompleteItems includes slash command help text" {
