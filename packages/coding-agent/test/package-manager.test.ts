@@ -203,6 +203,16 @@ Content`,
 			// Should NOT find helper.ts (not declared in manifest)
 			expect(result.extensions.some((r) => pathEndsWith(r.path, "helper.ts"))).toBe(false);
 		});
+
+		it("should ignore local package directories without package resources", async () => {
+			const pkgDir = join(tempDir, "empty-package");
+			mkdirSync(pkgDir, { recursive: true });
+			settingsManager.setPackages([pkgDir]);
+
+			const result = await packageManager.resolve();
+
+			expect(result.extensions.some((r) => r.path === pkgDir)).toBe(false);
+		});
 	});
 
 	describe(".agents/skills auto-discovery", () => {

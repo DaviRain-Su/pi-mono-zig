@@ -1257,10 +1257,7 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			if (stats.isDirectory()) {
 				metadata.baseDir = resolved;
-				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata);
-				if (!resources) {
-					this.addResource(accumulator.extensions, resolved, metadata, true);
-				}
+				this.collectPackageResources(resolved, accumulator, filter, metadata);
 			}
 		} catch {
 			return;
