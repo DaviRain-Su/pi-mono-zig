@@ -33,6 +33,11 @@ pub const BashExecutionResult = struct {
     }
 };
 
+pub const BashUpdateCallback = *const fn (
+    context: ?*anyopaque,
+    result: BashExecutionResult,
+) anyerror!void;
+
 pub const BashTool = struct {
     cwd: []const u8,
     io: std.Io,
@@ -82,6 +87,17 @@ pub const BashTool = struct {
         allocator: std.mem.Allocator,
         args: BashArgs,
         signal: ?*const std.atomic.Value(bool),
+    ) !BashExecutionResult {
+        return self.executeWithUpdates(allocator, args, signal, null, null);
+    }
+
+    pub fn executeWithUpdates(
+        self: BashTool,
+        allocator: std.mem.Allocator,
+        args: BashArgs,
+        signal: ?*const std.atomic.Value(bool),
+        on_update_context: ?*anyopaque,
+        on_update: ?BashUpdateCallback,
     ) !BashExecutionResult {
         var cwd_dir = std.Io.Dir.openDirAbsolute(self.io, self.cwd, .{}) catch |err| {
             const message = try std.fmt.allocPrint(allocator, "Working directory does not exist: {s} ({s})", .{ self.cwd, @errorName(err) });
@@ -139,8 +155,30 @@ pub const BashTool = struct {
         const started_at = std.Io.Clock.now(.awake, self.io).nanoseconds;
         var timed_out = false;
         var aborted = false;
+        var last_reported_generation: u64 = 0;
+        var last_progress_report_ns = started_at;
 
         while (!wait_state.done.load(.seq_cst)) {
+            if (on_update != null) {
+                const now_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
+                const generation = reader_state.generation.load(.seq_cst);
+                const should_emit = generation != last_reported_generation or
+                    now_ns - last_progress_report_ns >= 200 * std.time.ns_per_ms;
+                if (should_emit) {
+                    const snapshot = try reader_state.snapshot(allocator);
+                    defer allocator.free(snapshot);
+                    try emitStreamingUpdate(
+                        allocator,
+                        snapshot,
+                        now_ns - started_at,
+                        on_update_context,
+                        on_update,
+                    );
+                    last_reported_generation = generation;
+                    last_progress_report_ns = now_ns;
+                }
+            }
+
             if (args.timeout_seconds) |timeout_seconds| {
                 const elapsed_ns: u128 = @intCast(std.Io.Clock.now(.awake, self.io).nanoseconds - started_at);
                 if (elapsed_ns >= @as(u128, timeout_seconds) * std.time.ns_per_s) {
@@ -284,8 +322,10 @@ const OutputReaderState = struct {
     allocator: std.mem.Allocator,
     file: std.Io.File,
     io: std.Io,
+    mutex: std.Io.Mutex = .init,
     output: std.ArrayList(u8),
     err: ?anyerror = null,
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     fn init(allocator: std.mem.Allocator, file: std.Io.File, io: std.Io) OutputReaderState {
         return .{
@@ -299,6 +339,19 @@ const OutputReaderState = struct {
     fn deinit(self: *OutputReaderState) void {
         self.output.deinit(self.allocator);
         self.file.close(self.io);
+    }
+
+    fn append(self: *OutputReaderState, bytes: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.output.appendSlice(self.allocator, bytes);
+        _ = self.generation.fetchAdd(1, .seq_cst);
+    }
+
+    fn snapshot(self: *OutputReaderState, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return allocator.dupe(u8, self.output.items);
     }
 };
 
@@ -318,7 +371,7 @@ fn readOutputThread(state: *OutputReaderState) void {
             return;
         };
         if (bytes_read == 0) return;
-        state.output.appendSlice(state.allocator, buffer[0..bytes_read]) catch |err| {
+        state.append(buffer[0..bytes_read]) catch |err| {
             state.err = err;
             return;
         };
@@ -344,6 +397,78 @@ fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
         .exited => |code| code,
         else => null,
     };
+}
+
+fn emitStreamingUpdate(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    elapsed_ns: i128,
+    on_update_context: ?*anyopaque,
+    on_update: ?BashUpdateCallback,
+) !void {
+    const callback = on_update orelse return;
+    const preview_text = try buildStreamingPreview(allocator, output, elapsed_ns);
+    defer allocator.free(preview_text);
+
+    var preview = BashExecutionResult{
+        .content = try common.makeTextContent(allocator, preview_text),
+        .details = null,
+        .is_error = false,
+    };
+    defer preview.deinit(allocator);
+
+    try callback(on_update_context, preview);
+}
+
+fn buildStreamingPreview(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    elapsed_ns: i128,
+) ![]u8 {
+    var truncation_result = try truncate.truncateTail(allocator, output, .{});
+    errdefer truncation_result.deinit(allocator);
+
+    var preview = if (truncation_result.content.len == 0)
+        try allocator.dupe(u8, "Running...")
+    else
+        try allocator.dupe(u8, truncation_result.content);
+
+    if (truncation_result.truncated) {
+        const note = if (truncation_result.truncated_by.? == .lines)
+            try std.fmt.allocPrint(
+                allocator,
+                "\n\n[Streaming last {d} of {d} lines while command runs]",
+                .{ truncation_result.output_lines, truncation_result.total_lines },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "\n\n[Streaming last {d} lines ({d} byte window) while command runs]",
+                .{ truncation_result.output_lines, truncate.DEFAULT_MAX_BYTES },
+            );
+        defer allocator.free(note);
+
+        const with_note = try std.mem.concat(allocator, u8, &[_][]const u8{ preview, note });
+        defer allocator.free(with_note);
+        allocator.free(preview);
+        preview = try allocator.dupe(u8, with_note);
+    }
+
+    const elapsed_ms: u64 = @intCast(@divTrunc(@max(elapsed_ns, 0), std.time.ns_per_ms));
+    const elapsed_note = try std.fmt.allocPrint(
+        allocator,
+        "\n\n[Running... {d}.{d:0>1}s elapsed]",
+        .{ elapsed_ms / std.time.ms_per_s, (elapsed_ms % std.time.ms_per_s) / 100 },
+    );
+    defer allocator.free(elapsed_note);
+
+    const rendered = try std.mem.concat(allocator, u8, &[_][]const u8{ preview, elapsed_note });
+    allocator.free(preview);
+
+    if (!truncation_result.truncated) {
+        truncation_result.deinit(allocator);
+    }
+    return rendered;
 }
 
 const SecureTempFile = struct {
@@ -459,6 +584,25 @@ fn processExists(allocator: std.mem.Allocator, pid: std.posix.pid_t) !bool {
     };
 }
 
+const StreamingUpdateCollector = struct {
+    allocator: std.mem.Allocator,
+    updates: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *StreamingUpdateCollector) void {
+        for (self.updates.items) |update| self.allocator.free(update);
+        self.updates.deinit(self.allocator);
+    }
+};
+
+fn collectStreamingUpdate(context: ?*anyopaque, result: BashExecutionResult) !void {
+    const collector: *StreamingUpdateCollector = @ptrCast(@alignCast(context.?));
+    const text = switch (result.content[0]) {
+        .text => |content| content.text,
+        else => return error.UnexpectedContentBlock,
+    };
+    try collector.updates.append(collector.allocator, try collector.allocator.dupe(u8, text));
+}
+
 test "bash tool executes a command and returns stdout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -476,6 +620,46 @@ test "bash tool executes a command and returns stdout" {
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("hello\n", result.content[0].text.text);
     try std.testing.expect(result.details.?.exit_code.? == 0);
+}
+
+test "bash tool streams partial output updates for long-running commands" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const joined_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(joined_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, joined_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var collector = StreamingUpdateCollector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var result = try BashTool.init(absolute_path, std.testing.io).executeWithUpdates(
+        std.testing.allocator,
+        .{
+            .command = "printf 'first\\n'; sleep 0.2; printf 'second\\n'; sleep 0.2; printf 'third\\n'",
+        },
+        null,
+        &collector,
+        collectStreamingUpdate,
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(collector.updates.items.len >= 2);
+
+    var saw_first_only = false;
+    var saw_running_note = false;
+    for (collector.updates.items) |update| {
+        if (std.mem.indexOf(u8, update, "Running...") != null) saw_running_note = true;
+        if (std.mem.indexOf(u8, update, "first") != null and std.mem.indexOf(u8, update, "third") == null) {
+            saw_first_only = true;
+        }
+    }
+
+    try std.testing.expect(saw_first_only);
+    try std.testing.expect(saw_running_note);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "third") != null);
 }
 
 test "bash tool captures stderr and exit code on failure" {

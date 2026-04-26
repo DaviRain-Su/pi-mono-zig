@@ -253,6 +253,17 @@ fn runLoop(
     });
 }
 
+fn mapThinkingLevel(level: types.ThinkingLevel) ?ai.types.ThinkingLevel {
+    return switch (level) {
+        .off => null,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+}
+
 fn streamAssistantResponse(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -284,6 +295,7 @@ fn streamAssistantResponse(
         .api_key = config.api_key,
         .session_id = config.session_id,
         .signal = signal,
+        .reasoning = if (config.reasoning) |reasoning| mapThinkingLevel(reasoning) else null,
     };
 
     const active_stream_fn = stream_fn orelse ai.streamSimple;
@@ -812,7 +824,7 @@ fn runParallelToolTask(task: *ParallelToolTask) void {
 
 fn collectParallelToolUpdate(context: ?*anyopaque, partial_result: types.AgentToolResult) !void {
     const task: *ParallelToolTask = @ptrCast(@alignCast(context.?));
-    try task.updates.append(task.arena.allocator(), partial_result);
+    try task.updates.append(task.arena.allocator(), try cloneToolResult(partial_result, task.arena.allocator()));
 }
 
 fn finalizeExecutedToolCall(

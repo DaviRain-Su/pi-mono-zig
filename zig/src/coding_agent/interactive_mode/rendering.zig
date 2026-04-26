@@ -7,6 +7,7 @@ const keybindings_mod = @import("../keybindings.zig");
 const resources_mod = @import("../resources.zig");
 const session_mod = @import("../session.zig");
 const session_advanced = @import("../session_advanced.zig");
+const common = @import("../tools/common.zig");
 const shared = @import("shared.zig");
 const formatting = @import("formatting.zig");
 const overlays = @import("overlays.zig");
@@ -43,6 +44,11 @@ pub const FooterUsageTotals = struct {
     cost: f64 = 0,
 };
 
+const ActiveToolUpdate = struct {
+    tool_call_id: []u8,
+    item_index: usize,
+};
+
 pub const AppState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -59,6 +65,10 @@ pub const AppState = struct {
     context_tokens: ?u32 = null,
     context_percent: ?f64 = null,
     context_unknown: bool = false,
+    queued_steering: std.ArrayList([]u8) = .empty,
+    queued_follow_up: std.ArrayList([]u8) = .empty,
+    pending_editor_images: std.ArrayList(ai.ImageContent) = .empty,
+    active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
@@ -75,6 +85,13 @@ pub const AppState = struct {
     }
 
     pub fn deinit(self: *AppState) void {
+        self.clearPendingEditorImagesLocked();
+        self.pending_editor_images.deinit(self.allocator);
+        self.clearActiveToolUpdatesLocked();
+        self.active_tool_updates.deinit(self.allocator);
+        self.clearQueuedMessagesLocked();
+        self.queued_steering.deinit(self.allocator);
+        self.queued_follow_up.deinit(self.allocator);
         for (self.items.items) |item| self.allocator.free(item.text);
         self.items.deinit(self.allocator);
         self.allocator.free(self.status);
@@ -84,11 +101,66 @@ pub const AppState = struct {
         self.* = undefined;
     }
 
+    pub fn appendPendingEditorImage(self: *AppState, image: ai.ImageContent) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.pending_editor_images.append(self.allocator, image);
+    }
+
+    pub fn clearPendingEditorImages(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.clearPendingEditorImagesLocked();
+    }
+
+    pub fn clonePendingEditorImages(self: *AppState, allocator: std.mem.Allocator) ![]ai.ImageContent {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.pending_editor_images.items.len == 0) return &.{};
+
+        const cloned = try allocator.alloc(ai.ImageContent, self.pending_editor_images.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (cloned[0..initialized]) |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            }
+            allocator.free(cloned);
+        }
+
+        for (self.pending_editor_images.items, 0..) |image, index| {
+            cloned[index] = .{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            };
+            initialized += 1;
+        }
+        return cloned;
+    }
+
     pub fn clearDisplay(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.visible_start_index = self.items.items.len;
         self.replaceLabelLocked(&self.status, "display cleared") catch {};
+    }
+
+    pub fn appendQueuedMessage(self: *AppState, mode: QueueDisplayMode, text: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const target = switch (mode) {
+            .steering => &self.queued_steering,
+            .follow_up => &self.queued_follow_up,
+        };
+        try target.append(self.allocator, try self.allocator.dupe(u8, text));
+    }
+
+    pub fn clearQueuedMessages(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.clearQueuedMessagesLocked();
     }
 
     pub fn setFooter(self: *AppState, model_label: []const u8, session_label: []const u8) !void {
@@ -154,6 +226,9 @@ pub const AppState = struct {
         self.items.clearRetainingCapacity();
         self.visible_start_index = 0;
         self.last_streaming_assistant_index = null;
+        self.clearPendingEditorImagesLocked();
+        self.clearActiveToolUpdatesLocked();
+        self.clearQueuedMessagesLocked();
 
         try self.replaceLabelLocked(&self.status, "idle");
         try self.replaceLabelLocked(&self.model_label, session.agent.getModel().id);
@@ -262,6 +337,7 @@ pub const AppState = struct {
             .message_end => {
                 if (event.message) |message| switch (message) {
                     .user => |user_message| {
+                        self.removeQueuedMessageLocked(userMessageText(user_message));
                         const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
                         defer self.allocator.free(rendered);
                         try self.appendItemLocked(.user, rendered);
@@ -311,6 +387,18 @@ pub const AppState = struct {
                 const tool_name = event.tool_name orelse "tool";
                 const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
                 defer self.allocator.free(status_text);
+                if (event.tool_call_id) |tool_call_id| {
+                    if (event.partial_result) |partial_result| {
+                        const rendered = try formatToolResult(self.allocator, tool_name, partial_result.content, false);
+                        defer self.allocator.free(rendered);
+                        if (self.activeToolUpdateIndexLocked(tool_call_id)) |index| {
+                            try self.replaceItemTextLocked(index, rendered);
+                        } else {
+                            try self.appendItemLocked(.tool_result, rendered);
+                            try self.setActiveToolUpdateLocked(tool_call_id, self.items.items.len - 1);
+                        }
+                    }
+                }
                 try self.replaceLabelLocked(&self.status, status_text);
             },
             .tool_execution_end => {
@@ -318,7 +406,15 @@ pub const AppState = struct {
                 const result = event.result orelse return;
                 const rendered = try formatToolResult(self.allocator, tool_name, result.content, event.is_error orelse false);
                 defer self.allocator.free(rendered);
-                try self.appendItemLocked(.tool_result, rendered);
+                if (event.tool_call_id) |tool_call_id| {
+                    if (self.takeActiveToolUpdateIndexLocked(tool_call_id)) |index| {
+                        try self.replaceItemTextLocked(index, rendered);
+                    } else {
+                        try self.appendItemLocked(.tool_result, rendered);
+                    }
+                } else {
+                    try self.appendItemLocked(.tool_result, rendered);
+                }
                 try self.replaceLabelLocked(&self.status, "thinking");
             },
             else => {},
@@ -364,6 +460,9 @@ pub const AppState = struct {
         if (index >= self.items.items.len) return;
         self.allocator.free(self.items.items[index].text);
         _ = self.items.orderedRemove(index);
+        for (self.active_tool_updates.items) |*entry| {
+            if (entry.item_index > index) entry.item_index -= 1;
+        }
         if (self.visible_start_index > self.items.items.len) {
             self.visible_start_index = self.items.items.len;
         }
@@ -414,6 +513,67 @@ pub const AppState = struct {
         self.context_tokens = 0;
         self.context_percent = 0.0;
     }
+
+    fn clearPendingEditorImagesLocked(self: *AppState) void {
+        for (self.pending_editor_images.items) |image| {
+            self.allocator.free(image.data);
+            self.allocator.free(image.mime_type);
+        }
+        self.pending_editor_images.clearRetainingCapacity();
+    }
+
+    fn clearActiveToolUpdatesLocked(self: *AppState) void {
+        for (self.active_tool_updates.items) |entry| self.allocator.free(entry.tool_call_id);
+        self.active_tool_updates.clearRetainingCapacity();
+    }
+
+    fn activeToolUpdateIndexLocked(self: *AppState, tool_call_id: []const u8) ?usize {
+        for (self.active_tool_updates.items) |entry| {
+            if (std.mem.eql(u8, entry.tool_call_id, tool_call_id)) return entry.item_index;
+        }
+        return null;
+    }
+
+    fn setActiveToolUpdateLocked(self: *AppState, tool_call_id: []const u8, item_index: usize) !void {
+        for (self.active_tool_updates.items) |*entry| {
+            if (std.mem.eql(u8, entry.tool_call_id, tool_call_id)) {
+                entry.item_index = item_index;
+                return;
+            }
+        }
+        try self.active_tool_updates.append(self.allocator, .{
+            .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
+            .item_index = item_index,
+        });
+    }
+
+    fn takeActiveToolUpdateIndexLocked(self: *AppState, tool_call_id: []const u8) ?usize {
+        for (self.active_tool_updates.items, 0..) |entry, index| {
+            if (!std.mem.eql(u8, entry.tool_call_id, tool_call_id)) continue;
+            const item_index = entry.item_index;
+            self.allocator.free(entry.tool_call_id);
+            _ = self.active_tool_updates.orderedRemove(index);
+            return item_index;
+        }
+        return null;
+    }
+
+    fn clearQueuedMessagesLocked(self: *AppState) void {
+        for (self.queued_steering.items) |text| self.allocator.free(text);
+        self.queued_steering.clearRetainingCapacity();
+        for (self.queued_follow_up.items) |text| self.allocator.free(text);
+        self.queued_follow_up.clearRetainingCapacity();
+    }
+
+    fn removeQueuedMessageLocked(self: *AppState, text: []const u8) void {
+        if (removeQueuedTextFromList(self.allocator, &self.queued_steering, text)) return;
+        _ = removeQueuedTextFromList(self.allocator, &self.queued_follow_up, text);
+    }
+};
+
+pub const QueueDisplayMode = enum {
+    steering,
+    follow_up,
 };
 
 pub const ScreenComponent = struct {
@@ -462,7 +622,10 @@ pub const ScreenComponent = struct {
 
         var prompt_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &prompt_lines);
-        try renderPromptLines(allocator, self.theme, self.editor, width, &prompt_lines);
+        try renderPromptLines(allocator, self.theme, self.editor, self.state.pending_editor_images.items, width, &prompt_lines);
+        var queued_lines = tui.LineList.empty;
+        defer freeLinesSafe(allocator, &queued_lines);
+        try renderQueuedMessageLines(allocator, self.keybindings, self.theme, self.state, width, &queued_lines);
         const footer_line = try formatFooterLine(allocator, self.theme, self.state, width);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
@@ -472,7 +635,7 @@ pub const ScreenComponent = struct {
         defer freeLinesSafe(allocator, &autocomplete_lines);
         try self.editor.renderAutocompleteInto(allocator, width, &autocomplete_lines);
 
-        const reserved_lines: usize = prompt_lines.items.len + 2 + autocomplete_lines.items.len;
+        const reserved_lines: usize = prompt_lines.items.len + queued_lines.items.len + 2 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
         const chat_component = BorrowedLinesComponent{ .lines = chat_lines.items };
         const chat_viewport = tui.Viewport{
@@ -481,6 +644,9 @@ pub const ScreenComponent = struct {
             .anchor = .bottom,
         };
         try chat_viewport.renderInto(allocator, width, lines);
+        for (queued_lines.items) |line| {
+            try tui.component.appendOwnedLine(lines, allocator, line);
+        }
         for (prompt_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
@@ -954,6 +1120,7 @@ pub fn renderPromptLines(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
+    pending_images: []const ai.ImageContent,
     width: usize,
     lines: *tui.LineList,
 ) !void {
@@ -980,6 +1147,27 @@ pub fn renderPromptLines(
             try builder.appendSlice(allocator, if (index == 0) INPUT_PROMPT_PREFIX else continuation_prefix);
         }
         try builder.appendSlice(allocator, editor_line);
+
+        const fitted = try fitLine(allocator, builder.items, width);
+        defer allocator.free(fitted);
+        try tui.component.appendOwnedLine(lines, allocator, fitted);
+        builder.deinit(allocator);
+    }
+
+    for (pending_images, 0..) |image, index| {
+        const placeholder_text = try std.fmt.allocPrint(allocator, "[image {d}: {s}]", .{ index + 1, image.mime_type });
+        defer allocator.free(placeholder_text);
+
+        var builder = std.ArrayList(u8).empty;
+        errdefer builder.deinit(allocator);
+        try builder.appendSlice(allocator, continuation_prefix);
+        if (theme) |active_theme| {
+            const themed_placeholder = try active_theme.applyAlloc(allocator, .prompt, placeholder_text);
+            defer allocator.free(themed_placeholder);
+            try builder.appendSlice(allocator, themed_placeholder);
+        } else {
+            try builder.appendSlice(allocator, placeholder_text);
+        }
 
         const fitted = try fitLine(allocator, builder.items, width);
         defer allocator.free(fitted);
@@ -1101,17 +1289,23 @@ pub fn formatHintsLine(
     defer allocator.free(open_sessions);
     const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
     defer allocator.free(open_models);
+    const queue_follow_up = try actionLabel(allocator, keybindings, .queue_follow_up, "Alt+Enter");
+    defer allocator.free(queue_follow_up);
+    const dequeue_messages = try actionLabel(allocator, keybindings, .dequeue_messages, "Alt+Up");
+    defer allocator.free(dequeue_messages);
     const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Ctrl+C");
     defer allocator.free(interrupt);
     const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
     defer allocator.free(exit);
     const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+L");
     defer allocator.free(clear);
+    const paste_image = try actionLabel(allocator, keybindings, .paste_image, "Ctrl+V");
+    defer allocator.free(paste_image);
 
     const line = try std.fmt.allocPrint(
         allocator,
-        "{s} sessions • {s} models • {s} interrupt • {s} exit • {s} clear",
-        .{ open_sessions, open_models, interrupt, exit, clear },
+        "{s} sessions • {s} models • {s} paste image • {s} queue • {s} dequeue • {s} interrupt • {s} exit • {s} clear",
+        .{ open_sessions, open_models, paste_image, queue_follow_up, dequeue_messages, interrupt, exit, clear },
     );
     defer allocator.free(line);
     const fitted = try fitLine(allocator, line, width);
@@ -1235,6 +1429,70 @@ pub fn handleAppAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void 
     try app_state.handleAgentEvent(event);
 }
 
+fn removeQueuedTextFromList(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList([]u8),
+    text: []const u8,
+) bool {
+    for (items.items, 0..) |queued_text, index| {
+        if (std.mem.eql(u8, queued_text, text)) {
+            allocator.free(queued_text);
+            _ = items.orderedRemove(index);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn userMessageText(message: ai.types.UserMessage) []const u8 {
+    for (message.content) |block| {
+        switch (block) {
+            .text => |text| return text.text,
+            else => {},
+        }
+    }
+    return "";
+}
+
+pub fn renderQueuedMessageLines(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    state: *const AppState,
+    width: usize,
+    lines: *tui.LineList,
+) !void {
+    if (state.queued_steering.items.len == 0 and state.queued_follow_up.items.len == 0) return;
+
+    const blank = try fitLine(allocator, "", width);
+    defer allocator.free(blank);
+    try tui.component.appendOwnedLine(lines, allocator, blank);
+
+    for (state.queued_steering.items) |queued| {
+        const line = try std.fmt.allocPrint(allocator, "Steering: {s}", .{queued});
+        defer allocator.free(line);
+        const themed = try applyThemeAlloc(allocator, theme, .status, line);
+        defer allocator.free(themed);
+        try tui.ansi.wrapTextWithAnsi(allocator, themed, width, lines);
+    }
+
+    for (state.queued_follow_up.items) |queued| {
+        const line = try std.fmt.allocPrint(allocator, "Follow-up: {s}", .{queued});
+        defer allocator.free(line);
+        const themed = try applyThemeAlloc(allocator, theme, .status, line);
+        defer allocator.free(themed);
+        try tui.ansi.wrapTextWithAnsi(allocator, themed, width, lines);
+    }
+
+    const dequeue_label = try actionLabel(allocator, keybindings, .dequeue_messages, "Alt+Up");
+    defer allocator.free(dequeue_label);
+    const hint = try std.fmt.allocPrint(allocator, "↳ {s} to edit queued messages", .{dequeue_label});
+    defer allocator.free(hint);
+    const themed_hint = try applyThemeAlloc(allocator, theme, .status, hint);
+    defer allocator.free(themed_hint);
+    try tui.ansi.wrapTextWithAnsi(allocator, themed_hint, width, lines);
+}
+
 pub const InteractiveModeTestBackend = struct {
     size: tui.Size,
     entered_raw: bool = false,
@@ -1355,4 +1613,50 @@ test "renderChatItemInto renders markdown chat items without assistant prefix" {
     try std.testing.expect(renderedLinesContain(lines.items, "Changelog"));
     try std.testing.expect(renderedLinesContain(lines.items, "• "));
     try std.testing.expect(!renderedLinesContain(lines.items, ASSISTANT_PREFIX));
+}
+
+test "app state replaces streaming tool updates with the final tool result" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const partial_blocks = try allocator.alloc(ai.ContentBlock, 1);
+    defer common.deinitContentBlocks(allocator, partial_blocks);
+    partial_blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, "line 1\n\n[Running... 0.1s elapsed]") } };
+
+    const final_blocks = try allocator.alloc(ai.ContentBlock, 1);
+    defer common.deinitContentBlocks(allocator, final_blocks);
+    final_blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, "line 1\nline 2") } };
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_start,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .args = .null,
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_update,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .partial_result = .{
+            .content = partial_blocks,
+            .details = null,
+        },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .result = .{
+            .content = final_blocks,
+            .details = null,
+        },
+        .is_error = false,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), state.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "Running...") == null);
+    try std.testing.expectEqualStrings("thinking", state.status);
 }
