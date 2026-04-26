@@ -13,6 +13,7 @@ const overlays = @import("overlays.zig");
 const currentSessionLabel = shared.currentSessionLabel;
 const SelectorOverlay = overlays.SelectorOverlay;
 const ASSISTANT_PREFIX = formatting.ASSISTANT_PREFIX;
+const ASSISTANT_THINKING_TEXT = "Thinking...";
 const formatPrefixedBlocks = formatting.formatPrefixedBlocks;
 const formatAssistantMessage = formatting.formatAssistantMessage;
 const formatToolCall = formatting.formatToolCall;
@@ -22,6 +23,7 @@ pub const ChatKind = enum {
     welcome,
     info,
     @"error",
+    markdown,
     user,
     assistant,
     tool_call,
@@ -123,9 +125,16 @@ pub const AppState = struct {
         try self.appendItemLocked(.info, text);
     }
 
+    pub fn appendMarkdown(self: *AppState, text: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.appendItemLocked(.markdown, text);
+    }
+
     pub fn appendError(self: *AppState, text: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.removeAssistantThinkingItemLocked();
         try self.appendItemLocked(.@"error", text);
         try self.replaceLabelLocked(&self.status, text);
     }
@@ -212,8 +221,7 @@ pub const AppState = struct {
             .message_start => {
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant_message| {
-                        try self.appendItemLocked(.assistant, "");
-                        self.last_streaming_assistant_index = self.items.items.len - 1;
+                        try self.ensureAssistantThinkingItemLocked();
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         try self.replaceLabelLocked(&self.status, "thinking");
                     },
@@ -223,7 +231,8 @@ pub const AppState = struct {
             .message_update => {
                 if (event.assistant_message_event) |assistant_event| {
                     switch (assistant_event.event_type) {
-                        .thinking_start, .thinking_delta, .text_start, .text_delta => try self.replaceLabelLocked(&self.status, "thinking"),
+                        .thinking_start, .thinking_delta, .thinking_end => try self.replaceLabelLocked(&self.status, "thinking"),
+                        .text_start, .text_delta, .text_end => try self.replaceLabelLocked(&self.status, "streaming"),
                         else => {},
                     }
                 }
@@ -232,9 +241,13 @@ pub const AppState = struct {
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         const rendered = try formatAssistantMessage(self.allocator, assistant_message);
                         defer self.allocator.free(rendered);
-                        if (self.last_streaming_assistant_index == null and rendered.len == 0) return;
-                        if (event.assistant_message_event == null and rendered.len > 0) {
-                            try self.replaceLabelLocked(&self.status, "thinking");
+                        if (rendered.len == 0) {
+                            if (self.last_streaming_assistant_index) |_| return;
+                            try self.ensureAssistantThinkingItemLocked();
+                            return;
+                        }
+                        if (event.assistant_message_event == null) {
+                            try self.replaceLabelLocked(&self.status, "streaming");
                         }
                         const target_index = self.last_streaming_assistant_index orelse blk: {
                             try self.appendItemLocked(.assistant, rendered);
@@ -252,6 +265,9 @@ pub const AppState = struct {
                         const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
                         defer self.allocator.free(rendered);
                         try self.appendItemLocked(.user, rendered);
+                        if (std.mem.eql(u8, self.status, "thinking")) {
+                            try self.ensureAssistantThinkingItemLocked();
+                        }
                     },
                     .assistant => |assistant_message| {
                         self.addUsageLocked(assistant_message.usage);
@@ -306,6 +322,28 @@ pub const AppState = struct {
                 try self.replaceLabelLocked(&self.status, "thinking");
             },
             else => {},
+        }
+    }
+
+    pub fn ensureAssistantThinkingItemLocked(self: *AppState) !void {
+        if (self.last_streaming_assistant_index) |index| {
+            if (index < self.items.items.len and self.items.items[index].kind == .assistant and self.items.items[index].text.len == 0) {
+                try self.replaceItemTextLocked(index, ASSISTANT_THINKING_TEXT);
+            }
+            return;
+        }
+
+        try self.appendItemLocked(.assistant, ASSISTANT_THINKING_TEXT);
+        self.last_streaming_assistant_index = self.items.items.len - 1;
+    }
+
+    pub fn removeAssistantThinkingItemLocked(self: *AppState) void {
+        const index = self.last_streaming_assistant_index orelse return;
+        self.last_streaming_assistant_index = null;
+        if (index >= self.items.items.len) return;
+        const item = self.items.items[index];
+        if (item.kind == .assistant and std.mem.eql(u8, item.text, ASSISTANT_THINKING_TEXT)) {
+            self.removeItemLocked(index);
         }
     }
 
@@ -1102,6 +1140,7 @@ pub fn themeChatItem(
         .welcome => .welcome,
         .info => .status,
         .@"error" => .@"error",
+        .markdown => .markdown_text,
         .user => .user,
         .assistant => .assistant,
         .tool_call => .tool_call,
@@ -1118,6 +1157,7 @@ pub fn renderChatItemInto(
 ) !void {
     switch (item.kind) {
         .assistant => try renderAssistantChatItemInto(allocator, width, theme, item.text, lines),
+        .markdown => try renderMarkdownChatItemInto(allocator, width, theme, item.text, lines),
         else => {
             const themed_item = try themeChatItem(allocator, theme, item);
             defer allocator.free(themed_item);
@@ -1139,6 +1179,20 @@ pub fn renderAssistantChatItemInto(
 
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
 
+    const markdown = tui.Markdown{
+        .text = text,
+        .theme = theme,
+    };
+    try markdown.renderInto(allocator, width, lines);
+}
+
+pub fn renderMarkdownChatItemInto(
+    allocator: std.mem.Allocator,
+    width: usize,
+    theme: ?*const resources_mod.Theme,
+    text: []const u8,
+    lines: *tui.LineList,
+) !void {
     const markdown = tui.Markdown{
         .text = text,
         .theme = theme,
@@ -1279,4 +1333,26 @@ pub fn renderedLinesContain(lines: []const []const u8, needle: []const u8) bool 
         if (std.mem.indexOf(u8, line, needle) != null) return true;
     }
     return false;
+}
+
+test "renderChatItemInto renders markdown chat items without assistant prefix" {
+    const allocator = std.testing.allocator;
+
+    var lines = tui.LineList.empty;
+    defer tui.component.freeLines(allocator, &lines);
+
+    const text = try allocator.dupe(u8,
+        \\# Changelog
+        \\- Added /changelog
+    );
+    defer allocator.free(text);
+
+    try renderChatItemInto(allocator, 40, null, .{
+        .kind = .markdown,
+        .text = text,
+    }, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "Changelog"));
+    try std.testing.expect(renderedLinesContain(lines.items, "• "));
+    try std.testing.expect(!renderedLinesContain(lines.items, ASSISTANT_PREFIX));
 }

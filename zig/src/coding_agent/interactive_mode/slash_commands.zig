@@ -50,6 +50,7 @@ pub const SlashCommandKind = enum {
     hotkeys,
     label,
     session,
+    changelog,
     tree,
     fork,
     clone,
@@ -85,6 +86,7 @@ pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "copy", .description = "Copy last assistant message" },
     .{ .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
     .{ .name = "session", .description = "Show session info and stats" },
+    .{ .name = "changelog", .description = "Show CHANGELOG.md", .argument_hint = "<full|condensed>" },
     .{ .name = "hotkeys", .description = "Show keyboard shortcut help" },
     .{ .name = "fork", .description = "Create a new fork from the latest user message" },
     .{ .name = "clone", .description = "Duplicate the current session at the current position" },
@@ -154,6 +156,7 @@ pub fn parseSlashCommand(text: []const u8) ?SlashCommand {
     if (std.mem.eql(u8, command_name, "hotkeys")) return .{ .kind = .hotkeys, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "label")) return .{ .kind = .label, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "session")) return .{ .kind = .session, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "changelog")) return .{ .kind = .changelog, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "tree")) return .{ .kind = .tree, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "fork")) return .{ .kind = .fork, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "clone")) return .{ .kind = .clone, .argument = argument, .raw = text };
@@ -241,6 +244,7 @@ pub fn handleSlashCommand(
         .hotkeys => overlay.* = try loadHotkeysOverlay(allocator, live_resources.keybindings),
         .label => try handleLabelSlashCommand(allocator, session, command.argument, app_state),
         .session => try handleSessionSlashCommand(allocator, session, app_state),
+        .changelog => try handleChangelogSlashCommand(allocator, io, session, command.argument, app_state),
         .tree => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before opening the session tree");
@@ -543,6 +547,216 @@ pub fn handleSessionSlashCommand(
     const info = try formatSessionInfo(allocator, session);
     defer allocator.free(info);
     try app_state.appendInfo(info);
+}
+
+pub const ChangelogView = enum {
+    full,
+    condensed,
+};
+
+pub fn handleChangelogSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const session_mod.AgentSession,
+    argument: ?[]const u8,
+    app_state: *AppState,
+) !void {
+    const view = parseChangelogView(argument) catch {
+        try app_state.appendError("Usage: /changelog [full|condensed]");
+        return;
+    };
+
+    const markdown = buildChangelogMarkdown(allocator, io, session.cwd, view) catch |err| switch (err) {
+        error.FileNotFound => {
+            try app_state.appendError("CHANGELOG.md not found");
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(markdown);
+
+    try app_state.appendMarkdown(markdown);
+
+    const status = try std.fmt.allocPrint(allocator, "showing {s} changelog", .{@tagName(view)});
+    defer allocator.free(status);
+    try app_state.setStatus(status);
+}
+
+pub fn parseChangelogView(argument: ?[]const u8) !ChangelogView {
+    const raw = argument orelse return .full;
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, value, "full")) return .full;
+    if (std.mem.eql(u8, value, "condensed")) return .condensed;
+    return error.InvalidChangelogView;
+}
+
+pub fn buildChangelogMarkdown(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    view: ChangelogView,
+) ![]u8 {
+    const changelog_path = try resolveChangelogPath(allocator, io, cwd) orelse return error.FileNotFound;
+    defer allocator.free(changelog_path);
+
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, changelog_path, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(content);
+
+    switch (view) {
+        .full => return allocator.dupe(u8, content),
+        .condensed => {
+            if (extractLatestVersionSection(content)) |section| {
+                return allocator.dupe(u8, section);
+            }
+            return allocator.dupe(u8, content);
+        },
+    }
+}
+
+pub fn resolveChangelogPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+) !?[]u8 {
+    var current = try allocator.dupe(u8, cwd);
+    errdefer allocator.free(current);
+
+    while (true) {
+        const package_candidate = try std.fs.path.join(allocator, &[_][]const u8{ current, "packages/coding-agent/CHANGELOG.md" });
+        if (pathExists(io, package_candidate)) {
+            allocator.free(current);
+            return package_candidate;
+        }
+        allocator.free(package_candidate);
+
+        const local_candidate = try std.fs.path.join(allocator, &[_][]const u8{ current, "CHANGELOG.md" });
+        if (pathExists(io, local_candidate)) {
+            allocator.free(current);
+            return local_candidate;
+        }
+        allocator.free(local_candidate);
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
+    allocator.free(current);
+
+    const source_dir = std.fs.path.dirname(@src().file) orelse ".";
+    const fallback = try std.fs.path.resolve(allocator, &[_][]const u8{
+        source_dir,
+        "../../../../packages/coding-agent/CHANGELOG.md",
+    });
+    if (pathExists(io, fallback)) return fallback;
+    allocator.free(fallback);
+    return null;
+}
+
+pub fn findNearestRelativeFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start_dir: []const u8,
+    relative_path: []const u8,
+) !?[]u8 {
+    var current = try allocator.dupe(u8, start_dir);
+    errdefer allocator.free(current);
+
+    while (true) {
+        const candidate = try std.fs.path.join(allocator, &[_][]const u8{ current, relative_path });
+        if (pathExists(io, candidate)) {
+            allocator.free(current);
+            return candidate;
+        }
+        allocator.free(candidate);
+
+        const parent = std.fs.path.dirname(current) orelse {
+            allocator.free(current);
+            return null;
+        };
+        if (std.mem.eql(u8, parent, current)) {
+            allocator.free(current);
+            return null;
+        }
+
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
+}
+
+pub fn pathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch return false;
+    return true;
+}
+
+pub fn extractLatestVersionSection(content: []const u8) ?[]const u8 {
+    var offset: usize = 0;
+    var current_start: ?usize = null;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const line_start = offset;
+        offset += line.len + 1;
+        const trimmed = trimCarriageReturn(line);
+        if (!isVersionHeading(trimmed)) continue;
+
+        if (current_start) |start| {
+            return trimTrailingNewlines(content[start..line_start]);
+        }
+        current_start = line_start;
+    }
+
+    if (current_start) |start| {
+        return trimTrailingNewlines(content[start..]);
+    }
+    return null;
+}
+
+pub fn isVersionHeading(line: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, "## ")) return false;
+
+    var index: usize = 3;
+    while (index < line.len and line[index] == ' ') : (index += 1) {}
+    if (index < line.len and line[index] == '[') index += 1;
+
+    const first_len = consumeDigits(line, index);
+    if (first_len == 0) return false;
+    index += first_len;
+    if (index >= line.len or line[index] != '.') return false;
+    index += 1;
+
+    const second_len = consumeDigits(line, index);
+    if (second_len == 0) return false;
+    index += second_len;
+    if (index >= line.len or line[index] != '.') return false;
+    index += 1;
+
+    const third_len = consumeDigits(line, index);
+    if (third_len == 0) return false;
+    index += third_len;
+
+    if (index < line.len and line[index] == ']') index += 1;
+    return true;
+}
+
+fn consumeDigits(text: []const u8, start: usize) usize {
+    var index = start;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+    return index - start;
+}
+
+fn trimCarriageReturn(text: []const u8) []const u8 {
+    if (text.len > 0 and text[text.len - 1] == '\r') return text[0 .. text.len - 1];
+    return text;
+}
+
+fn trimTrailingNewlines(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) : (end -= 1) {}
+    return text[0..end];
 }
 
 pub fn handleNameSlashCommand(
