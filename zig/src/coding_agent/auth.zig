@@ -32,6 +32,9 @@ const AUTH_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.Io.File.
     std.Io.File.Permissions.fromMode(0o600)
 else
     .default_file;
+const AUTH_LOCK_SUFFIX = ".lock";
+const AUTH_LOCK_RETRY_DELAY_MS: i64 = 20;
+const AUTH_LOCK_MAX_ATTEMPTS: usize = 250;
 
 pub const OAuthClientCredentials = struct {
     client_id: []u8,
@@ -80,6 +83,18 @@ pub const StoredCredential = union(enum) {
         }
         self.* = undefined;
     }
+};
+
+pub const CredentialSource = enum {
+    stored,
+    runtime,
+    environment,
+};
+
+pub const ResolvedApiKey = struct {
+    api_key: []const u8,
+    source: CredentialSource,
+    owned_api_key: ?[]u8 = null,
 };
 
 pub const BrowserLoginKind = enum {
@@ -467,26 +482,67 @@ pub fn buildApiKeyFromStoredEntry(
     return null;
 }
 
+pub fn resolveApiKey(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider_id: []const u8,
+    runtime_override: ?[]const u8,
+    stored_api_key: ?[]const u8,
+) !?ResolvedApiKey {
+    if (runtime_override) |value| {
+        if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) {
+            return .{
+                .api_key = value,
+                .source = .runtime,
+            };
+        }
+    }
+
+    if (stored_api_key) |value| {
+        if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) {
+            return .{
+                .api_key = value,
+                .source = .stored,
+            };
+        }
+    }
+
+    const env_api_key = try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider_id);
+    if (env_api_key) |value| {
+        return .{
+            .api_key = value,
+            .source = .environment,
+            .owned_api_key = value,
+        };
+    }
+
+    return null;
+}
+
+pub fn readStoredCredentialsObject(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    auth_path: []const u8,
+) !std.json.Value {
+    var lock = try AuthFileLock.acquire(allocator, io, auth_path);
+    defer lock.release(io);
+    return readAuthFileObjectUnlocked(allocator, io, auth_path);
+}
+
 pub fn listStoredProviders(
     allocator: std.mem.Allocator,
     io: std.Io,
     auth_path: []const u8,
 ) ![]ProviderInfo {
-    const content = std.Io.Dir.readFileAlloc(.cwd(), io, auth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return allocator.alloc(ProviderInfo, 0),
-        else => return allocator.alloc(ProviderInfo, 0),
-    };
-    defer allocator.free(content);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return allocator.alloc(ProviderInfo, 0);
-    defer parsed.deinit();
-    if (parsed.value != .object) return allocator.alloc(ProviderInfo, 0);
+    const stored = try readStoredCredentialsObject(allocator, io, auth_path);
+    defer common.deinitJsonValue(allocator, stored);
+    if (stored != .object) return allocator.alloc(ProviderInfo, 0);
 
     var providers = std.ArrayList(ProviderInfo).empty;
     errdefer providers.deinit(allocator);
 
     for (SUPPORTED_PROVIDERS) |provider| {
-        if (parsed.value.object.get(provider.id)) |entry| {
+        if (stored.object.get(provider.id)) |entry| {
             if (entry == .object) try providers.append(allocator, provider);
         }
     }
@@ -501,7 +557,10 @@ pub fn upsertStoredCredential(
     provider_id: []const u8,
     credential: *const StoredCredential,
 ) !void {
-    const existing = try readAuthFileObject(allocator, io, auth_path);
+    var lock = try AuthFileLock.acquire(allocator, io, auth_path);
+    defer lock.release(io);
+
+    const existing = try readAuthFileObjectUnlocked(allocator, io, auth_path);
     defer common.deinitJsonValue(allocator, existing);
 
     var next_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
@@ -523,7 +582,7 @@ pub fn upsertStoredCredential(
     }
 
     try next_object.put(allocator, try allocator.dupe(u8, provider_id), try credentialToJson(allocator, credential));
-    try writeAuthObject(allocator, io, auth_path, next_object);
+    try writeAuthObjectUnlocked(allocator, io, auth_path, next_object);
 }
 
 pub fn removeStoredCredential(
@@ -532,7 +591,10 @@ pub fn removeStoredCredential(
     auth_path: []const u8,
     provider_id: []const u8,
 ) !bool {
-    const existing = try readAuthFileObject(allocator, io, auth_path);
+    var lock = try AuthFileLock.acquire(allocator, io, auth_path);
+    defer lock.release(io);
+
+    const existing = try readAuthFileObjectUnlocked(allocator, io, auth_path);
     defer common.deinitJsonValue(allocator, existing);
     if (existing != .object) return false;
 
@@ -562,7 +624,7 @@ pub fn removeStoredCredential(
         return false;
     }
 
-    try writeAuthObject(allocator, io, auth_path, next_object);
+    try writeAuthObjectUnlocked(allocator, io, auth_path, next_object);
     return true;
 }
 
@@ -607,7 +669,51 @@ fn credentialToJson(allocator: std.mem.Allocator, credential: *const StoredCrede
     return .{ .object = object };
 }
 
-fn readAuthFileObject(allocator: std.mem.Allocator, io: std.Io, auth_path: []const u8) !std.json.Value {
+const AuthFileLock = struct {
+    allocator: std.mem.Allocator,
+    lock_path: []u8,
+
+    fn acquire(allocator: std.mem.Allocator, io: std.Io, auth_path: []const u8) !AuthFileLock {
+        try ensureAuthStorageParentDir(io, auth_path);
+
+        const lock_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ auth_path, AUTH_LOCK_SUFFIX });
+        errdefer allocator.free(lock_path);
+
+        if (std.fs.path.dirname(lock_path)) |parent_dir| {
+            try std.Io.Dir.createDirPath(.cwd(), io, parent_dir);
+        }
+
+        var attempt: usize = 0;
+        while (attempt < AUTH_LOCK_MAX_ATTEMPTS) : (attempt += 1) {
+            std.Io.Dir.createDir(.cwd(), io, lock_path, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    _ = io.sleep(.fromMilliseconds(AUTH_LOCK_RETRY_DELAY_MS), .awake) catch {};
+                    continue;
+                },
+                else => return err,
+            };
+
+            return .{
+                .allocator = allocator,
+                .lock_path = lock_path,
+            };
+        }
+
+        return error.AuthStorageLockTimeout;
+    }
+
+    fn release(self: *AuthFileLock, io: std.Io) void {
+        std.Io.Dir.deleteDir(.cwd(), io, self.lock_path) catch {};
+        self.allocator.free(self.lock_path);
+    }
+};
+
+fn ensureAuthStorageParentDir(io: std.Io, auth_path: []const u8) !void {
+    const parent_dir = std.fs.path.dirname(auth_path) orelse return;
+    try std.Io.Dir.createDirPath(.cwd(), io, parent_dir);
+}
+
+fn readAuthFileObjectUnlocked(allocator: std.mem.Allocator, io: std.Io, auth_path: []const u8) !std.json.Value {
     const content = std.Io.Dir.readFileAlloc(.cwd(), io, auth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) },
         else => return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) },
@@ -625,7 +731,7 @@ fn readAuthFileObject(allocator: std.mem.Allocator, io: std.Io, auth_path: []con
     return try common.cloneJsonValue(allocator, parsed.value);
 }
 
-fn writeAuthObject(
+fn writeAuthObjectUnlocked(
     allocator: std.mem.Allocator,
     io: std.Io,
     auth_path: []const u8,
@@ -1342,6 +1448,46 @@ test "buildApiKeyFromStoredEntry encodes google oauth credentials as provider js
     try std.testing.expect(std.mem.indexOf(u8, api_key, "\"projectId\":\"project-123\"") != null);
 }
 
+test "resolveApiKey prefers runtime overrides over stored and environment credentials" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "env-openai-key");
+
+    const resolved = (try resolveApiKey(
+        allocator,
+        &env_map,
+        "openai",
+        "runtime-openai-key",
+        "stored-openai-key",
+    )).?;
+    defer if (resolved.owned_api_key) |value| allocator.free(value);
+
+    try std.testing.expectEqual(CredentialSource.runtime, resolved.source);
+    try std.testing.expectEqualStrings("runtime-openai-key", resolved.api_key);
+    try std.testing.expect(resolved.owned_api_key == null);
+}
+
+test "resolveApiKey falls back to stored then environment credentials" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "env-openai-key");
+
+    const stored = (try resolveApiKey(allocator, &env_map, "openai", null, "stored-openai-key")).?;
+    defer if (stored.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.stored, stored.source);
+    try std.testing.expectEqualStrings("stored-openai-key", stored.api_key);
+
+    const env_only = (try resolveApiKey(allocator, &env_map, "openai", "   ", null)).?;
+    defer if (env_only.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.environment, env_only.source);
+    try std.testing.expectEqualStrings("env-openai-key", env_only.api_key);
+    try std.testing.expect(env_only.owned_api_key != null);
+}
+
 test "upsertStoredCredential and listStoredProviders persist oauth state" {
     const allocator = std.testing.allocator;
 
@@ -1381,6 +1527,94 @@ test "upsertStoredCredential and listStoredProviders persist oauth state" {
     if (@hasDecl(@TypeOf(stat.permissions), "toMode")) {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
     }
+}
+
+test "auth storage lock serializes concurrent writes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const auth_path = try std.fs.path.resolve(allocator, &[_][]const u8{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "agent",
+        "auth.json",
+    });
+    defer allocator.free(auth_path);
+    const started_path = try std.fs.path.resolve(allocator, &[_][]const u8{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "started.txt",
+    });
+    defer allocator.free(started_path);
+
+    var lock = try AuthFileLock.acquire(allocator, std.testing.io, auth_path);
+    var lock_held = true;
+    defer if (lock_held) lock.release(std.testing.io);
+
+    const thread = try std.Thread.spawn(.{}, persistCredentialInThread, .{PersistCredentialThreadArgs{
+        .auth_path = auth_path,
+        .started_path = started_path,
+    }});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var saw_start = false;
+    var attempt: usize = 0;
+    while (attempt < 50) : (attempt += 1) {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, started_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                _ = std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        saw_start = true;
+        break;
+    }
+    try std.testing.expect(saw_start);
+
+    const blocked_content = std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (blocked_content) |value| allocator.free(value);
+    try std.testing.expect(blocked_content == null);
+
+    lock.release(std.testing.io);
+    lock_held = false;
+    thread.join();
+    thread_joined = true;
+
+    const persisted = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"thread-key\"") != null);
+}
+
+const PersistCredentialThreadArgs = struct {
+    auth_path: []const u8,
+    started_path: []const u8,
+};
+
+fn persistCredentialInThread(args: PersistCredentialThreadArgs) !void {
+    const allocator = std.heap.page_allocator;
+
+    try common.writeFileAbsolute(std.testing.io, args.started_path, "started", true);
+
+    var credential = StoredCredential{
+        .api_key = try allocator.dupe(u8, "thread-key"),
+    };
+    defer credential.deinit(allocator);
+
+    try upsertStoredCredential(allocator, std.testing.io, args.auth_path, "anthropic", &credential);
 }
 
 fn makeAuthTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {

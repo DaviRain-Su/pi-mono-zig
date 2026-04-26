@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const auth = @import("auth.zig");
 const common = @import("tools/common.zig");
 
 const faux = ai.providers.faux;
@@ -98,28 +99,15 @@ pub fn resolveProviderConfig(
     }
 
     const provider_descriptor = descriptor.?;
-    const owned_api_key = if (api_key_override == null)
-        try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider)
-    else
-        null;
-    errdefer if (owned_api_key) |api_key| allocator.free(api_key);
-
-    const override_api_key = if (api_key_override) |value|
-        if (isNonEmptyCredentialValue(value)) value else null
-    else
-        null;
-    const stored_api_key = if (configured_api_key) |value|
-        if (isNonEmptyCredentialValue(value)) value else null
-    else
-        null;
-    const api_key = override_api_key orelse stored_api_key orelse owned_api_key orelse return error.MissingApiKey;
+    const resolved_api_key = try auth.resolveApiKey(allocator, env_map, provider, api_key_override, configured_api_key) orelse
+        return error.MissingApiKey;
     const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
     const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(provider_descriptor, model_id);
 
     return .{
         .model = model,
-        .api_key = api_key,
-        .owned_api_key = owned_api_key,
+        .api_key = resolved_api_key.api_key,
+        .owned_api_key = resolved_api_key.owned_api_key,
     };
 }
 
@@ -652,6 +640,27 @@ test "resolveProviderConfig uses configured api key when env is missing" {
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
+    try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+}
+
+test "resolveProviderConfig prefers runtime override over stored and environment credentials" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "env-openai-key");
+
+    var resolved = try resolveProviderConfig(
+        allocator,
+        &env_map,
+        "openai",
+        null,
+        "runtime-openai-key",
+        "stored-openai-key",
+    );
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqualStrings("runtime-openai-key", resolved.api_key.?);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
 }
 
