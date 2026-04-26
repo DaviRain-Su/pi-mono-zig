@@ -392,7 +392,7 @@ pub fn runInteractiveMode(
                 subscriber,
                 &should_exit,
                 &input_buffer,
-                        &app_context,
+                &app_context,
                 &live_resources,
             );
             while (tui.keys.parseInputEvent(input_buffer.items)) |result| {
@@ -496,7 +496,7 @@ fn appendToolIfEnabled(
 
 test "buildAgentTools threads app context into execute callbacks" {
     var app_context = AppContext.init("/tmp", std.testing.io);
-    var built_tools = try buildAgentTools(std.testing.allocator, &app_context, &[_][]const u8{"read", "bash"});
+    var built_tools = try buildAgentTools(std.testing.allocator, &app_context, &[_][]const u8{ "read", "bash" });
     defer built_tools.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), built_tools.items.len);
