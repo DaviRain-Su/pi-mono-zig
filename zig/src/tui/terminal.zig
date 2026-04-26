@@ -297,7 +297,14 @@ pub const InputLoop = struct {
     pub fn deinit(self: *InputLoop) void {
         const allocator = self.allocator;
         self.paste_buffer.deinit(self.allocator);
-        if (self.started) self.loop.stop();
+        if (self.started) {
+            self.loop.should_quit = true;
+            if (self.loop.thread) |*thread| {
+                _ = thread.cancel(self.loop.io);
+                self.loop.thread = null;
+                self.loop.should_quit = false;
+            }
+        }
         self.vaxis_state.deinit(self.allocator, self.loop.tty.writer());
         allocator.destroy(self.vaxis_state);
         self.* = undefined;
