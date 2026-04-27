@@ -1,4 +1,7 @@
 const std = @import("std");
+const dark_theme = @import("themes/dark.zig");
+const light_theme = @import("themes/light.zig");
+const codex_theme = @import("themes/codex.zig");
 
 pub const ThemeColor = enum(u8) {
     primary,
@@ -41,6 +44,12 @@ pub const ThemeToken = enum(u8) {
     markdown_rule,
     overlay_title,
     overlay_hint,
+    prompt_glyph,
+    prompt_border,
+    task_header,
+    task_header_accent,
+    task_header_separator,
+    terminal_badge,
 };
 
 pub const StyleSpec = struct {
@@ -142,11 +151,20 @@ pub const Theme = struct {
     styles: [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec = defaultThemeStyles(),
 
     pub fn initDefault(allocator: std.mem.Allocator) !Theme {
-        return initNamed(allocator, "dark", defaultDarkPalette());
+        return initNamed(allocator, "dark", dark_theme.palette());
     }
 
     pub fn initLight(allocator: std.mem.Allocator) !Theme {
-        return initNamed(allocator, "light", defaultLightPalette());
+        return initNamed(allocator, "light", light_theme.palette());
+    }
+
+    pub fn initCodex(allocator: std.mem.Allocator) !Theme {
+        var theme = try initNamed(allocator, "codex", codex_theme.palette());
+        errdefer theme.deinit(allocator);
+        try theme.setDerivedStyle(allocator, .prompt_glyph, .{ .fg = theme.colors.get(.primary), .bold = true });
+        try theme.setDerivedStyle(allocator, .task_header_accent, .{ .fg = theme.colors.get(.primary), .bold = true });
+        try theme.setDerivedStyle(allocator, .terminal_badge, .{ .fg = theme.colors.get(.primary), .bold = true });
+        return theme;
     }
 
     pub fn clone(self: Theme, allocator: std.mem.Allocator) !Theme {
@@ -210,10 +228,18 @@ pub const Theme = struct {
         try self.setDerivedStyle(allocator, .markdown_rule, .{ .fg = self.colors.get(.border) });
         try self.setDerivedStyle(allocator, .overlay_title, .{ .fg = self.colors.get(.primary), .bold = true });
         try self.setDerivedStyle(allocator, .overlay_hint, .{ .fg = self.colors.get(.muted) });
+        try self.setDerivedStyle(allocator, .prompt_glyph, .{ .fg = self.colors.get(.primary), .bold = true });
+        try self.setDerivedStyle(allocator, .prompt_border, .{ .fg = self.colors.get(.border) });
+        try self.setDerivedStyle(allocator, .task_header, .{ .fg = self.colors.get(.muted) });
+        try self.setDerivedStyle(allocator, .task_header_accent, .{ .fg = self.colors.get(.primary), .bold = true });
+        try self.setDerivedStyle(allocator, .task_header_separator, .{ .fg = self.colors.get(.border) });
+        try self.setDerivedStyle(allocator, .terminal_badge, .{ .fg = self.colors.get(.muted) });
     }
 
     fn setDerivedStyle(self: *Theme, allocator: std.mem.Allocator, token: ThemeToken, style: StyleTemplate) !void {
-        self.styles[@intFromEnum(token)] = try style.owned(allocator);
+        const index = @intFromEnum(token);
+        self.styles[index].deinit(allocator);
+        self.styles[index] = try style.owned(allocator);
     }
 };
 
@@ -241,7 +267,7 @@ const StyleTemplate = struct {
     }
 };
 
-const PaletteTemplate = struct {
+pub const PaletteTemplate = struct {
     primary: []const u8,
     secondary: []const u8,
     success: []const u8,
@@ -252,34 +278,6 @@ const PaletteTemplate = struct {
     border: []const u8,
     muted: []const u8,
 };
-
-fn defaultDarkPalette() PaletteTemplate {
-    return .{
-        .primary = "#7aa2f7",
-        .secondary = "#bb9af7",
-        .success = "#9ece6a",
-        .warning = "#e0af68",
-        .@"error" = "#f7768e",
-        .background = "#1a1b26",
-        .foreground = "#c0caf5",
-        .border = "#414868",
-        .muted = "#7f849c",
-    };
-}
-
-fn defaultLightPalette() PaletteTemplate {
-    return .{
-        .primary = "#3451b2",
-        .secondary = "#6f42c1",
-        .success = "#2f8f4e",
-        .warning = "#a05a00",
-        .@"error" = "#c1392b",
-        .background = "#f6f8fa",
-        .foreground = "#1f2328",
-        .border = "#afb8c1",
-        .muted = "#57606a",
-    };
-}
 
 fn initNamed(allocator: std.mem.Allocator, name: []const u8, palette: PaletteTemplate) !Theme {
     var theme = Theme{
@@ -298,4 +296,41 @@ fn initNamed(allocator: std.mem.Allocator, name: []const u8, palette: PaletteTem
     try theme.setColor(allocator, .muted, palette.muted);
     try theme.applyDerivedStyles(allocator);
     return theme;
+}
+
+test "theme palette modules expose dark light and codex palettes" {
+    const dark = dark_theme.palette();
+    const light = light_theme.palette();
+    const codex = codex_theme.palette();
+
+    try std.testing.expectEqualStrings("#7aa2f7", dark.primary);
+    try std.testing.expectEqualStrings("#3451b2", light.primary);
+    try std.testing.expectEqualStrings("#d18b50", codex.primary);
+    try std.testing.expectEqualStrings("#0f1012", codex.background);
+}
+
+test "codex theme and new token fallbacks derive non-default styles" {
+    var dark = try Theme.initDefault(std.testing.allocator);
+    defer dark.deinit(std.testing.allocator);
+    var codex = try Theme.initCodex(std.testing.allocator);
+    defer codex.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("codex", codex.name);
+    try std.testing.expectEqualStrings("#d18b50", codex.colors.primary.?);
+    try std.testing.expectEqualStrings("#0f1012", codex.colors.background.?);
+    try std.testing.expectEqualStrings("#d18b50", codex.styles[@intFromEnum(ThemeToken.prompt_glyph)].fg.?);
+    try std.testing.expectEqualStrings("#d18b50", codex.styles[@intFromEnum(ThemeToken.task_header_accent)].fg.?);
+
+    const fallback_tokens = [_]ThemeToken{
+        .prompt_glyph,
+        .prompt_border,
+        .task_header,
+        .task_header_accent,
+        .task_header_separator,
+        .terminal_badge,
+    };
+    for (fallback_tokens) |token| {
+        const spec = dark.styles[@intFromEnum(token)];
+        try std.testing.expect(spec.fg != null or spec.bg != null or spec.bold or spec.italic or spec.underline);
+    }
 }

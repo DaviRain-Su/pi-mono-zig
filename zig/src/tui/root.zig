@@ -46,6 +46,7 @@ pub const ThemeColor = theme.ThemeColor;
 pub const ThemeColors = theme.ThemeColors;
 pub const ThemeToken = theme.ThemeToken;
 pub const StyleSpec = theme.StyleSpec;
+pub const PaletteTemplate = theme.PaletteTemplate;
 pub const styleFor = style.styleFor;
 pub const OverlayAnchor = tui.OverlayAnchor;
 pub const OverlayMargin = tui.OverlayMargin;

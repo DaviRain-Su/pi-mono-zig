@@ -415,8 +415,11 @@ pub fn loadResourceBundle(
     if (findThemeIndex(all_themes.items, "light") == null) {
         try all_themes.append(allocator, try Theme.initLight(allocator));
     }
+    if (findThemeIndex(all_themes.items, "codex") == null) {
+        try all_themes.append(allocator, try Theme.initCodex(allocator));
+    }
 
-    const selected_name = options.project.theme orelse options.global.theme;
+    const selected_name = envThemeName(options.env_map) orelse options.project.theme orelse options.global.theme;
     const selected_index = findThemeIndex(all_themes.items, selected_name) orelse findThemeIndex(all_themes.items, "dark") orelse 0;
     const terminal_name = try detectTerminalName(allocator, options.env_map);
     errdefer allocator.free(terminal_name);
@@ -430,6 +433,13 @@ pub fn loadResourceBundle(
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
         .terminal_name = terminal_name,
     };
+}
+
+fn envThemeName(env_map: ?*const std.process.Environ.Map) ?[]const u8 {
+    const raw = if (env_map) |map| map.get("PI_THEME") else return null;
+    const value = raw orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
 }
 
 fn detectTerminalName(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) ![]u8 {
@@ -1229,6 +1239,8 @@ fn loadThemeFromFile(allocator: std.mem.Allocator, io: std.Io, resource: Resolve
 
     var theme = if (std.mem.eql(u8, base_theme_name, "light"))
         try Theme.initLight(allocator)
+    else if (std.mem.eql(u8, base_theme_name, "codex"))
+        try Theme.initCodex(allocator)
     else
         try Theme.initDefault(allocator);
     errdefer theme.deinit(allocator);
@@ -1484,6 +1496,12 @@ fn parseThemeToken(name: []const u8) ?ThemeToken {
     if (std.mem.eql(u8, name, "markdownRule")) return .markdown_rule;
     if (std.mem.eql(u8, name, "overlayTitle")) return .overlay_title;
     if (std.mem.eql(u8, name, "overlayHint")) return .overlay_hint;
+    if (std.mem.eql(u8, name, "promptGlyph")) return .prompt_glyph;
+    if (std.mem.eql(u8, name, "promptBorder")) return .prompt_border;
+    if (std.mem.eql(u8, name, "taskHeader")) return .task_header;
+    if (std.mem.eql(u8, name, "taskHeaderAccent")) return .task_header_accent;
+    if (std.mem.eql(u8, name, "taskHeaderSeparator")) return .task_header_separator;
+    if (std.mem.eql(u8, name, "terminalBadge")) return .terminal_badge;
     return null;
 }
 
@@ -1905,16 +1923,68 @@ test "loadResourceBundle loads skills templates and themes with selected theme" 
     try std.testing.expectEqualStrings("Pi:", styled);
 }
 
-test "default themes include dark and light palettes" {
+test "loadResourceBundle exposes built-in dark light and codex themes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    var bundle = try loadResourceBundle(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    try std.testing.expect(findThemeIndex(bundle.themes, "dark") != null);
+    try std.testing.expect(findThemeIndex(bundle.themes, "light") != null);
+    try std.testing.expect(findThemeIndex(bundle.themes, "codex") != null);
+}
+
+test "PI_THEME env var selects built-in codex over settings theme" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_THEME", "codex");
+
+    var bundle = try loadResourceBundle(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .env_map = &env_map,
+        .project = .{ .theme = "light" },
+    });
+    defer bundle.deinit(allocator);
+
+    try std.testing.expectEqualStrings("codex", bundle.selectedTheme().name);
+}
+
+test "default themes include dark light and codex palettes" {
     const allocator = std.testing.allocator;
 
     var dark = try Theme.initDefault(allocator);
     defer dark.deinit(allocator);
     var light = try Theme.initLight(allocator);
     defer light.deinit(allocator);
+    var codex = try Theme.initCodex(allocator);
+    defer codex.deinit(allocator);
 
     try std.testing.expectEqualStrings("dark", dark.name);
     try std.testing.expectEqualStrings("light", light.name);
+    try std.testing.expectEqualStrings("codex", codex.name);
+    try std.testing.expectEqualStrings("#d18b50", codex.colors.primary.?);
+    try std.testing.expectEqualStrings("#0f1012", codex.colors.background.?);
+    try std.testing.expectEqualStrings("#d18b50", codex.styles[@intFromEnum(ThemeToken.prompt_glyph)].fg.?);
 
     const dark_prompt = try dark.applyAlloc(allocator, .prompt, "> ");
     defer allocator.free(dark_prompt);
