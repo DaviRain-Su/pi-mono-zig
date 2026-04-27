@@ -354,12 +354,15 @@ pub fn getDefault() *ModelRegistry {
     return &default_registry.?;
 }
 
-pub fn resetForTesting() void {
+pub fn clearDefault() void {
     if (default_registry) |*registry| {
         registry.deinit();
         default_registry = null;
     }
 }
+
+/// Deprecated test-only alias. Production code should call clearDefault().
+pub const resetForTesting = clearDefault;
 
 pub fn find(provider: []const u8, model_id: []const u8) ?types.Model {
     return getDefault().find(provider, model_id);

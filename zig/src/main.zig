@@ -240,6 +240,7 @@ fn runCliWithInput(
                 },
                 .{
                     .mode = if (app_mode == .json) .json else .text,
+                    .config_errors = prepared.runtime_config.errors,
                 },
                 stdout,
                 stderr,
@@ -253,6 +254,7 @@ fn runCliWithInput(
             initial_input.prompt.?,
             .{
                 .mode = if (app_mode == .json) .json else .text,
+                .config_errors = prepared.runtime_config.errors,
             },
             stdout,
             stderr,

@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const auth = @import("auth.zig");
+const config_errors = @import("config_errors.zig");
 const keybindings_mod = @import("keybindings.zig");
 const migrations = @import("migrations.zig");
 const resources_mod = @import("resources.zig");
@@ -13,6 +14,10 @@ const DEFAULT_RESERVE_TOKENS = 4096;
 const DEFAULT_KEEP_RECENT_TOKENS = 20000;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_BASE_DELAY_MS = 1000;
+
+pub const ConfigError = config_errors.ConfigError;
+pub const ConfigErrorSource = config_errors.Source;
+pub const configErrorSourceName = config_errors.sourceName;
 
 pub const Settings = struct {
     default_provider: ?[]u8 = null,
@@ -72,6 +77,7 @@ pub const RuntimeConfig = struct {
     auth_tokens: std.StringHashMap([]const u8),
     provider_api_keys: std.StringHashMap([]const u8),
     keybindings: keybindings_mod.Keybindings,
+    errors: []ConfigError = &.{},
 
     pub fn deinit(self: *RuntimeConfig) void {
         self.allocator.free(self.agent_dir);
@@ -81,6 +87,7 @@ pub const RuntimeConfig = struct {
         deinitStringMap(self.allocator, &self.auth_tokens);
         deinitStringMap(self.allocator, &self.provider_api_keys);
         self.keybindings.deinit();
+        config_errors.deinitSlice(self.allocator, self.errors);
         self.* = undefined;
     }
 
@@ -139,11 +146,14 @@ pub fn loadRuntimeConfigWithOptions(
     const keybindings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "keybindings.json" });
     defer allocator.free(keybindings_path);
 
-    ai.model_registry.resetForTesting();
+    ai.model_registry.clearDefault();
 
-    var global_settings = try loadSettingsFile(allocator, io, global_settings_path);
+    var errors = std.ArrayList(ConfigError).empty;
+    errdefer config_errors.deinitList(allocator, &errors);
+
+    var global_settings = try loadSettingsFile(allocator, io, global_settings_path, &errors, .settings);
     errdefer global_settings.deinit(allocator);
-    var project_settings = try loadSettingsFile(allocator, io, project_settings_path);
+    var project_settings = try loadSettingsFile(allocator, io, project_settings_path, &errors, .settings);
     errdefer project_settings.deinit(allocator);
     var settings = try mergeSettings(allocator, global_settings, project_settings);
     errdefer settings.deinit(allocator);
@@ -151,14 +161,17 @@ pub fn loadRuntimeConfigWithOptions(
     var auth_tokens = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitStringMap(allocator, &auth_tokens);
     try loadAuthTokens(allocator, io, auth_path, &auth_tokens);
-    try loadLegacySettingsApiKeys(allocator, io, global_settings_path, &auth_tokens);
+    try loadLegacySettingsApiKeys(allocator, io, global_settings_path, &auth_tokens, &errors);
 
     var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitStringMap(allocator, &provider_api_keys);
-    try loadModelsConfig(allocator, io, models_path, &provider_api_keys, options.discover_models);
+    try loadModelsConfig(allocator, io, models_path, &provider_api_keys, options.discover_models, &errors);
 
     var keybindings = try keybindings_mod.loadFromFile(allocator, io, keybindings_path);
     errdefer keybindings.deinit();
+
+    const owned_errors = try errors.toOwnedSlice(allocator);
+    errdefer config_errors.deinitSlice(allocator, owned_errors);
 
     return .{
         .allocator = allocator,
@@ -169,6 +182,7 @@ pub fn loadRuntimeConfigWithOptions(
         .auth_tokens = auth_tokens,
         .provider_api_keys = provider_api_keys,
         .keybindings = keybindings,
+        .errors = owned_errors,
     };
 }
 
@@ -181,22 +195,47 @@ fn isTruthyEnvFlag(value: ?[]const u8) bool {
 }
 
 fn loadMergedSettings(allocator: std.mem.Allocator, io: std.Io, global_path: []const u8, project_path: []const u8) !Settings {
-    var global = try loadSettingsFile(allocator, io, global_path);
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+    var global = try loadSettingsFile(allocator, io, global_path, &errors, .settings);
     defer global.deinit(allocator);
-    var project = try loadSettingsFile(allocator, io, project_path);
+    var project = try loadSettingsFile(allocator, io, project_path, &errors, .settings);
     defer project.deinit(allocator);
     return mergeSettings(allocator, global, project);
 }
 
-fn loadSettingsFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Settings {
-    var result = Settings{};
+fn loadSettingsFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+) !Settings {
+    const result = Settings{};
     const content = try readOptionalFile(allocator, io, path);
     defer if (content) |value| allocator.free(value);
     if (content == null) return result;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch return result;
+    return parseSettingsContent(allocator, path, content.?, errors, source);
+}
+
+fn parseSettingsContent(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    content: []const u8,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+) !Settings {
+    var result = Settings{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch |err| {
+        try config_errors.appendError(allocator, errors, source, path, err);
+        return result;
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return result;
+    if (parsed.value != .object) {
+        try config_errors.appendMessage(allocator, errors, source, path, "expected JSON object");
+        return result;
+    }
 
     if (parsed.value.object.get("defaultProvider")) |value| {
         if (value == .string) result.default_provider = try allocator.dupe(u8, value.string);
@@ -321,12 +360,21 @@ fn loadAuthTokens(allocator: std.mem.Allocator, io: std.Io, path: []const u8, au
     }
 }
 
-fn loadLegacySettingsApiKeys(allocator: std.mem.Allocator, io: std.Io, path: []const u8, auth_tokens: *std.StringHashMap([]const u8)) !void {
+fn loadLegacySettingsApiKeys(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    auth_tokens: *std.StringHashMap([]const u8),
+    errors: *std.ArrayList(ConfigError),
+) !void {
     const content = try readOptionalFile(allocator, io, path);
     defer if (content) |value| allocator.free(value);
     if (content == null) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch return;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch |err| {
+        try config_errors.appendError(allocator, errors, .legacy_settings, path, err);
+        return;
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return;
 
@@ -347,15 +395,22 @@ fn loadModelsConfig(
     path: []const u8,
     provider_api_keys: *std.StringHashMap([]const u8),
     discover_models: bool,
+    errors: *std.ArrayList(ConfigError),
 ) !void {
     const registry = ai.model_registry.getDefault();
     const content = try readOptionalFile(allocator, io, path);
     defer if (content) |value| allocator.free(value);
     if (content == null) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch return;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch |err| {
+        try config_errors.appendError(allocator, errors, .models, path, err);
+        return;
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return;
+    if (parsed.value != .object) {
+        try config_errors.appendMessage(allocator, errors, .models, path, "expected JSON object");
+        return;
+    }
 
     const providers_value = parsed.value.object.get("providers") orelse return;
     if (providers_value != .object) return;
@@ -412,7 +467,7 @@ fn loadModelsConfig(
                 .api = provider_api.?,
                 .base_url = provider_base_url.?,
                 .default_model_id = first_model_id orelse if (existing_provider) |descriptor| descriptor.default_model_id else null,
-            }) catch {};
+            }) catch |err| try config_errors.appendError(allocator, errors, .register_provider, path, err);
         }
 
         const resolved_provider = ai.model_registry.getProviderConfig(provider_name);
@@ -424,11 +479,11 @@ fn loadModelsConfig(
                     .models_url = discovery_config.models_url,
                     .loaded_models_url = discovery_config.loaded_models_url,
                     .api_key = provider_api_key,
-                }) catch {};
+                }) catch |err| try config_errors.appendError(allocator, errors, .discovery, path, err);
 
                 if (provider.default_model_id == null) {
                     if (registry.firstModelIdForProvider(provider_name)) |default_model_id| {
-                        ai.model_registry.setProviderDefaultModel(provider_name, default_model_id) catch {};
+                        ai.model_registry.setProviderDefaultModel(provider_name, default_model_id) catch |err| try config_errors.appendError(allocator, errors, .set_default_model, path, err);
                     }
                 }
             }
@@ -493,7 +548,7 @@ fn loadModelsConfig(
                     if (headers) |*map| deinitStringMap(allocator, map);
                     if (compat) |value_compat| deinitJsonValue(allocator, value_compat);
 
-                    register_result catch {};
+                    register_result catch |err| try config_errors.appendError(allocator, errors, .register_model, path, err);
                 }
             }
         }
@@ -1021,6 +1076,7 @@ test "runtime config merges global and project settings with nested overrides" {
     try std.testing.expectEqual(agent.ThinkingLevel.low, runtime.settings.default_thinking_level.?);
     try std.testing.expectEqual(@as(usize, 3), runtime.settings.editor_padding_x.?);
     try std.testing.expectEqual(@as(usize, 9), runtime.settings.autocomplete_max_visible.?);
+    try std.testing.expectEqual(@as(usize, 0), runtime.errors.len);
     try std.testing.expect(runtime.settings.compaction != null);
     try std.testing.expectEqual(false, runtime.settings.compaction.?.enabled);
     try std.testing.expectEqual(@as(u32, 1200), runtime.settings.compaction.?.reserve_tokens);
@@ -1262,4 +1318,124 @@ test "loadRuntimeConfig runs one-time migrations before loading credentials" {
     const settings_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .limited(1024 * 1024));
     defer allocator.free(settings_bytes);
     try std.testing.expect(std.mem.indexOf(u8, settings_bytes, "\"apiKeys\"") == null);
+}
+
+test "runtime config collects malformed settings without aborting" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data = "{ malformed",
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfig(allocator, std.testing.io, &env_map, project_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    try std.testing.expect(runtime.errors.len >= 1);
+    try std.testing.expectEqual(ConfigErrorSource.settings, runtime.errors[0].source);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.errors[0].message, "SyntaxError") != null or
+        std.mem.indexOf(u8, runtime.errors[0].message, "Unexpected") != null);
+}
+
+test "runtime config parse helpers keep OOM hard" {
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(std.testing.allocator, &errors);
+
+    var failing_allocator_state = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_allocator = failing_allocator_state.allocator();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseSettingsContent(failing_allocator, "settings.json", "{}", &errors, .settings),
+    );
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+}
+
+test "runtime config collects legacy settings and models parse failures" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "settings.json",
+        .data = "{ malformed",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models.json",
+        .data = "{ malformed",
+    });
+
+    const settings_path = try makeTmpPath(allocator, tmp, "settings.json");
+    defer allocator.free(settings_path);
+    const models_path = try makeTmpPath(allocator, tmp, "models.json");
+    defer allocator.free(models_path);
+
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+
+    var auth_tokens = std.StringHashMap([]const u8).init(allocator);
+    defer auth_tokens.deinit();
+    try loadLegacySettingsApiKeys(allocator, std.testing.io, settings_path, &auth_tokens, &errors);
+
+    var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
+    defer deinitStringMap(allocator, &provider_api_keys);
+    try loadModelsConfig(allocator, std.testing.io, models_path, &provider_api_keys, false, &errors);
+
+    try std.testing.expectEqual(@as(usize, 2), errors.items.len);
+    try std.testing.expectEqual(ConfigErrorSource.legacy_settings, errors.items[0].source);
+    try std.testing.expectEqual(ConfigErrorSource.models, errors.items[1].source);
+}
+
+test "runtime config collects model discovery failures" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models.json",
+        .data =
+        \\{
+        \\  "providers": {
+        \\    "local-fail": {
+        \\      "api": "openai-completions",
+        \\      "baseUrl": "http://127.0.0.1:1/v1",
+        \\      "discoverModels": true
+        \\    }
+        \\  }
+        \\}
+        ,
+    });
+
+    const models_path = try makeTmpPath(allocator, tmp, "models.json");
+    defer allocator.free(models_path);
+
+    ai.model_registry.clearDefault();
+    defer ai.model_registry.resetForTesting();
+
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+    var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
+    defer deinitStringMap(allocator, &provider_api_keys);
+
+    try loadModelsConfig(allocator, std.testing.io, models_path, &provider_api_keys, true, &errors);
+
+    var saw_discovery = false;
+    for (errors.items) |config_error| {
+        if (config_error.source == .discovery) saw_discovery = true;
+    }
+    try std.testing.expect(saw_discovery);
 }

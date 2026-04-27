@@ -1,11 +1,23 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const config_errors = @import("config_errors.zig");
 const common = @import("tools/common.zig");
 
 pub fn stringifyAgentEventLine(allocator: std.mem.Allocator, event: agent.AgentEvent) ![]u8 {
-    const value = try agentEventToJsonValue(allocator, event);
+    return stringifyAgentEventLineWithConfigErrors(allocator, event, &.{});
+}
+
+pub fn stringifyAgentEventLineWithConfigErrors(
+    allocator: std.mem.Allocator,
+    event: agent.AgentEvent,
+    errors: []const config_errors.ConfigError,
+) ![]u8 {
+    var value = try agentEventToJsonValue(allocator, event);
     defer common.deinitJsonValue(allocator, value);
+    if (event.event_type == .agent_start) {
+        try putField(&value.object, allocator, "config_errors", try configErrorsToJsonValue(allocator, errors));
+    }
     try validateAgentEventJson(allocator, value);
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
 }
@@ -144,7 +156,11 @@ fn validateAgentEventValue(allocator: std.mem.Allocator, value: std.json.Value, 
     const object = try asObject(allocator, value, path);
     const event_type = try requireStringField(allocator, object, path, "type");
 
-    if (std.mem.eql(u8, event_type, "agent_start") or std.mem.eql(u8, event_type, "turn_start")) return;
+    if (std.mem.eql(u8, event_type, "agent_start")) {
+        if (object.get("config_errors")) |errors| try validateConfigErrors(allocator, errors, path);
+        return;
+    }
+    if (std.mem.eql(u8, event_type, "turn_start")) return;
 
     if (std.mem.eql(u8, event_type, "agent_end")) {
         try validateMessagesField(allocator, object, path, "messages");
@@ -474,6 +490,20 @@ fn validateAgentToolResultField(allocator: std.mem.Allocator, object: std.json.O
     try validateContentArray(allocator, try requireField(result_object, allocator, path, "content"), path, "content", .tool_result);
 }
 
+fn validateConfigErrors(allocator: std.mem.Allocator, value: std.json.Value, parent_path: []const u8) !void {
+    const path = try fieldPath(allocator, parent_path, "config_errors");
+    defer allocator.free(path);
+    const array = try asArray(allocator, value, path);
+    for (array.items, 0..) |item, index| {
+        const item_path = try indexPath(allocator, path, index);
+        defer allocator.free(item_path);
+        const object = try asObject(allocator, item, item_path);
+        _ = try requireStringField(allocator, object, item_path, "source");
+        _ = try requireStringField(allocator, object, item_path, "path");
+        _ = try requireStringField(allocator, object, item_path, "message");
+    }
+}
+
 fn requireField(object: std.json.ObjectMap, allocator: std.mem.Allocator, parent_path: []const u8, field_name: []const u8) !std.json.Value {
     return object.get(field_name) orelse {
         try missingField(allocator, parent_path, field_name);
@@ -639,6 +669,22 @@ fn agentToolResultToJsonValue(allocator: std.mem.Allocator, result: agent.AgentT
     }
 
     return .{ .object = object };
+}
+
+fn configErrorsToJsonValue(allocator: std.mem.Allocator, errors: []const config_errors.ConfigError) !std.json.Value {
+    var array = std.json.Array.init(allocator);
+    errdefer array.deinit();
+
+    for (errors) |config_error| {
+        var object = try initObject(allocator);
+        errdefer common.deinitJsonValue(allocator, .{ .object = object });
+        try putStringField(&object, allocator, "source", config_errors.sourceName(config_error.source));
+        try putStringField(&object, allocator, "path", config_error.path);
+        try putStringField(&object, allocator, "message", config_error.message);
+        try array.append(.{ .object = object });
+    }
+
+    return .{ .array = array };
 }
 
 fn messagesToJsonValue(allocator: std.mem.Allocator, messages: []const agent.AgentMessage) !std.json.Value {
