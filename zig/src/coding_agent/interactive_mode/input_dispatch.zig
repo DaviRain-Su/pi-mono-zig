@@ -25,6 +25,7 @@ const handleSlashCommand = slash_commands.handleSlashCommand;
 const saveSettingsEditorOverlay = slash_commands.saveSettingsEditorOverlay;
 const switchSession = slash_commands.switchSession;
 const switchModel = slash_commands.switchModel;
+const applyThemeByName = slash_commands.applyThemeByName;
 const navigateTree = slash_commands.navigateTree;
 const beginLoginFlow = slash_commands.beginLoginFlow;
 const logoutProviderById = slash_commands.logoutProviderById;
@@ -105,6 +106,7 @@ pub fn handleInputKey(
             .info => &overlay_value.info.list,
             .session => &overlay_value.session.list,
             .model => &overlay_value.model.list,
+            .theme => &overlay_value.theme.list,
             .tree => &overlay_value.tree.list,
             .auth => &overlay_value.auth.list,
             else => unreachable,
@@ -152,6 +154,17 @@ pub fn handleInputKey(
                             options,
                             live_resources.runtime_config,
                             app_state,
+                        );
+                    },
+                    .theme => |theme_overlay| {
+                        try applyThemeByName(
+                            allocator,
+                            io,
+                            env_map,
+                            options.cwd,
+                            theme_overlay.choices[index].name,
+                            app_state,
+                            live_resources,
                         );
                     },
                     .tree => |tree_overlay| {

@@ -20,6 +20,7 @@ pub const SelectorOverlay = union(enum) {
     settings_editor: SettingsEditorOverlay,
     session: SessionOverlay,
     model: ModelOverlay,
+    theme: ThemeOverlay,
     tree: TreeOverlay,
     auth: AuthOverlay,
 
@@ -29,6 +30,7 @@ pub const SelectorOverlay = union(enum) {
             .settings_editor => |*overlay| overlay.deinit(allocator),
             .session => |*overlay| overlay.deinit(allocator),
             .model => |*overlay| overlay.deinit(allocator),
+            .theme => |*overlay| overlay.deinit(allocator),
             .tree => |*overlay| overlay.deinit(allocator),
             .auth => |*overlay| overlay.deinit(allocator),
         }
@@ -41,6 +43,7 @@ pub const SelectorOverlay = union(enum) {
             .settings_editor => self.settings_editor.title,
             .session => "Session selector",
             .model => self.model.title,
+            .theme => "Theme selector",
             .tree => "Session tree",
             .auth => if (self.auth.mode == .login) "Login" else "Logout",
         };
@@ -127,6 +130,28 @@ pub const ModelOverlay = struct {
             allocator.free(choice.provider);
             allocator.free(choice.model_id);
         }
+        allocator.free(self.choices);
+        for (self.items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+pub const ThemeChoice = struct {
+    name: []u8,
+};
+
+pub const ThemeOverlay = struct {
+    choices: []ThemeChoice,
+    items: []tui.SelectItem,
+    list: tui.SelectList,
+
+    pub fn deinit(self: *ThemeOverlay, allocator: std.mem.Allocator) void {
+        for (self.choices) |choice| allocator.free(choice.name);
         allocator.free(self.choices);
         for (self.items) |item| {
             allocator.free(@constCast(item.value));
@@ -533,6 +558,55 @@ pub fn loadModelOverlay(
     return .{
         .model = .{
             .title = "Model selector",
+            .choices = choices,
+            .items = items,
+            .list = .{
+                .items = items,
+                .selected_index = selected_index,
+                .max_visible = 12,
+            },
+        },
+    };
+}
+
+pub fn loadThemeOverlay(
+    allocator: std.mem.Allocator,
+    themes: []const resources_mod.Theme,
+    active_theme: ?*const resources_mod.Theme,
+) !SelectorOverlay {
+    const choices = try allocator.alloc(ThemeChoice, themes.len);
+    errdefer {
+        for (choices) |choice| allocator.free(choice.name);
+        allocator.free(choices);
+    }
+
+    const items = try allocator.alloc(tui.SelectItem, themes.len);
+    errdefer {
+        for (items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(items);
+    }
+
+    const active_name = if (active_theme) |theme| theme.name else "";
+    var selected_index: usize = 0;
+    for (themes, 0..) |theme, index| {
+        const is_active = std.mem.eql(u8, theme.name, active_name);
+        choices[index] = .{
+            .name = try allocator.dupe(u8, theme.name),
+        };
+        items[index] = .{
+            .value = try allocator.dupe(u8, theme.name),
+            .label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ if (is_active) "✓" else " ", theme.name }),
+            .description = try allocator.dupe(u8, if (is_active) "active theme" else "available theme"),
+        };
+        if (is_active) selected_index = index;
+    }
+
+    return .{
+        .theme = .{
             .choices = choices,
             .items = items,
             .list = .{

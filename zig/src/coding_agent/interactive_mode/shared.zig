@@ -58,6 +58,7 @@ pub const LiveResources = struct {
     prompt_templates: []const resources_mod.PromptTemplate,
     theme: ?*const resources_mod.Theme,
     terminal_name: []const u8,
+    runtime_theme_name: ?[]u8 = null,
     owned_runtime_config: ?config_mod.RuntimeConfig = null,
     owned_resource_bundle: ?resources_mod.ResourceBundle = null,
 
@@ -72,6 +73,14 @@ pub const LiveResources = struct {
     }
 
     pub fn deinit(self: *LiveResources, allocator: std.mem.Allocator) void {
+        self.deinitOwnedResources(allocator);
+        if (self.runtime_theme_name) |name| {
+            allocator.free(name);
+            self.runtime_theme_name = null;
+        }
+    }
+
+    fn deinitOwnedResources(self: *LiveResources, allocator: std.mem.Allocator) void {
         if (self.owned_resource_bundle) |*bundle| {
             bundle.deinit(allocator);
             self.owned_resource_bundle = null;
@@ -82,6 +91,34 @@ pub const LiveResources = struct {
         }
     }
 
+    pub fn ensureOwnedBundle(
+        self: *LiveResources,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env_map: *const std.process.Environ.Map,
+        cwd: []const u8,
+    ) !void {
+        if (self.owned_resource_bundle != null and self.owned_runtime_config != null) return;
+        _ = try self.reload(allocator, io, env_map, cwd);
+    }
+
+    pub fn applyTheme(
+        self: *LiveResources,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env_map: *const std.process.Environ.Map,
+        cwd: []const u8,
+        theme_name: []const u8,
+    ) !void {
+        try self.ensureOwnedBundle(allocator, io, env_map, cwd);
+        const bundle = &self.owned_resource_bundle.?;
+        if (resources_mod.findThemeIndex(bundle.themes, theme_name) == null) return error.ThemeNotFound;
+
+        try self.setRuntimeThemeName(allocator, theme_name);
+        bundle.selected_theme_index = self.resolveSelectedThemeIndex(env_map);
+        self.theme = bundle.selectedTheme();
+    }
+
     pub fn reload(
         self: *LiveResources,
         allocator: std.mem.Allocator,
@@ -89,6 +126,12 @@ pub const LiveResources = struct {
         env_map: *const std.process.Environ.Map,
         cwd: []const u8,
     ) ![]const resources_mod.Diagnostic {
+        const runtime_theme_copy = if (self.runtime_theme_name) |name|
+            try allocator.dupe(u8, name)
+        else
+            null;
+        errdefer if (runtime_theme_copy) |name| allocator.free(name);
+
         var next_runtime = try config_mod.loadRuntimeConfig(allocator, io, env_map, cwd);
         errdefer next_runtime.deinit();
 
@@ -97,11 +140,14 @@ pub const LiveResources = struct {
             .agent_dir = next_runtime.agent_dir,
             .global = settingsResources(next_runtime.global_settings),
             .project = settingsResources(next_runtime.project_settings),
+            .runtime_theme = runtime_theme_copy,
             .env_map = env_map,
         });
         errdefer next_bundle.deinit(allocator);
 
-        self.deinit(allocator);
+        self.deinitOwnedResources(allocator);
+        if (self.runtime_theme_name) |name| allocator.free(name);
+        self.runtime_theme_name = runtime_theme_copy;
         self.owned_runtime_config = next_runtime;
         self.owned_resource_bundle = next_bundle;
         self.runtime_config = &self.owned_runtime_config.?;
@@ -110,6 +156,31 @@ pub const LiveResources = struct {
         self.theme = self.owned_resource_bundle.?.selectedTheme();
         self.terminal_name = self.owned_resource_bundle.?.terminal_name;
         return self.owned_resource_bundle.?.diagnostics;
+    }
+
+    fn setRuntimeThemeName(
+        self: *LiveResources,
+        allocator: std.mem.Allocator,
+        theme_name: []const u8,
+    ) !void {
+        const next = try allocator.dupe(u8, theme_name);
+        if (self.runtime_theme_name) |old| allocator.free(old);
+        self.runtime_theme_name = next;
+    }
+
+    fn resolveSelectedThemeIndex(
+        self: *const LiveResources,
+        env_map: *const std.process.Environ.Map,
+    ) usize {
+        const bundle = &self.owned_resource_bundle.?;
+        const runtime_config = &self.owned_runtime_config.?;
+        return resources_mod.resolveThemeIndex(
+            bundle.themes,
+            env_map,
+            self.runtime_theme_name,
+            runtime_config.project_settings.theme,
+            runtime_config.global_settings.theme,
+        );
     }
 };
 
