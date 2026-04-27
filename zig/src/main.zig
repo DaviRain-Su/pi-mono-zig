@@ -283,6 +283,7 @@ fn runCliWithInput(
             .prompt_templates = prepared.resource_bundle.prompt_templates,
             .keybindings = &prepared.runtime_config.keybindings,
             .theme = prepared.resource_bundle.selectedTheme(),
+            .terminal_name = prepared.resource_bundle.terminal_name,
             .runtime_config = &prepared.runtime_config,
             .offline = options.offline,
             .verbose = options.verbose,

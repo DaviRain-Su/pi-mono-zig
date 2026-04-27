@@ -903,6 +903,7 @@ pub const ScreenComponent = struct {
     overlay: ?*SelectorOverlay = null,
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
+    terminal_name: []const u8 = "term",
     after_snapshot_hook: ?RenderHook = null,
 
     pub fn component(self: *const ScreenComponent) tui.Component {
@@ -955,6 +956,9 @@ pub const ScreenComponent = struct {
         var queued_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &queued_lines);
         try renderQueuedMessageLines(allocator, self.keybindings, self.theme, &snapshot, width, &queued_lines);
+        var task_panel_lines = tui.LineList.empty;
+        defer freeLinesSafe(allocator, &task_panel_lines);
+        try renderTaskPanelLines(allocator, self.theme, &snapshot, width, &task_panel_lines);
         const footer_line = try formatFooterLine(allocator, self.theme, &snapshot, width);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
@@ -964,7 +968,7 @@ pub const ScreenComponent = struct {
         defer freeLinesSafe(allocator, &autocomplete_lines);
         try self.editor.renderAutocompleteInto(allocator, width, &autocomplete_lines);
 
-        const reserved_lines: usize = prompt_lines.items.len + queued_lines.items.len + 2 + autocomplete_lines.items.len;
+        const reserved_lines: usize = task_panel_lines.items.len + prompt_lines.items.len + queued_lines.items.len + 2 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
         const chat_component = BorrowedLineListComponent{ .lines = chat_lines.items };
         const chat_viewport = tui.Viewport{
@@ -972,6 +976,9 @@ pub const ScreenComponent = struct {
             .height = chat_capacity,
             .anchor = .bottom,
         };
+        for (task_panel_lines.items) |line| {
+            try tui.component.appendOwnedLine(lines, allocator, line);
+        }
         try chat_viewport.renderInto(allocator, width, lines);
         for (queued_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
@@ -1019,11 +1026,24 @@ pub const ScreenComponent = struct {
         );
         const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
-        const reserved_lines: usize = prompt_height + queued_height + 2 + autocomplete_height;
+        const reserved_lines: usize = TOP_PANEL_HEIGHT + prompt_height + queued_height + 2 + autocomplete_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
         var row: usize = 0;
+        if (row < window.height) {
+            const panel_window = window.child(.{
+                .y_off = @intCast(row),
+                .height = @intCast(@min(TOP_PANEL_HEIGHT, @as(usize, window.height) - row)),
+            });
+            _ = try drawTaskPanel(panel_window, .{
+                .window = panel_window,
+                .arena = ctx.arena,
+                .theme = self.theme,
+            }, self.theme, &snapshot);
+        }
+        row += TOP_PANEL_HEIGHT;
+
         try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity);
         row += chat_capacity;
 
@@ -1127,6 +1147,46 @@ fn drawFittedLine(
         .text = text,
         .style = style,
     }, .{ .wrap = .none });
+}
+
+fn drawTaskPanel(
+    window: tui.vaxis.Window,
+    ctx: tui.DrawContext,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+) !tui.DrawSize {
+    const panel_height = @min(TOP_PANEL_HEIGHT, @as(usize, window.height));
+    const border_style = styleForToken(theme, .box_border);
+    const content_style = styleForToken(theme, .footer);
+    const panel_inner = if (window.width >= 2 and window.height >= 2)
+        window.child(.{
+            .height = @intCast(panel_height),
+            .border = .{
+                .where = .all,
+                .style = border_style,
+                .glyphs = .single_rounded,
+            },
+        })
+    else
+        window.child(.{ .height = @intCast(panel_height) });
+
+    panel_inner.fill(.{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = content_style,
+    });
+
+    if (panel_inner.height > 0) {
+        const content = try formatTaskHeaderText(ctx.arena, snapshot, @as(usize, panel_inner.width));
+        _ = panel_inner.printSegment(.{
+            .text = content,
+            .style = content_style,
+        }, .{ .wrap = .none });
+    }
+
+    return .{
+        .width = window.width,
+        .height = @intCast(panel_height),
+    };
 }
 
 fn drawWrappedText(
@@ -2024,6 +2084,7 @@ pub fn freeLinesSafe(allocator: std.mem.Allocator, lines: *tui.LineList) void {
 }
 
 pub const INPUT_PROMPT_PREFIX = "> ";
+const TOP_PANEL_HEIGHT: usize = 3;
 const PROMPT_BOX_HEIGHT: usize = 3;
 const PROMPT_BORDER_TOP_ROWS: usize = 1;
 const PROMPT_GLYPH_WIDTH: usize = 2;
@@ -2035,6 +2096,35 @@ fn promptEditorWidth(width: usize) usize {
 
 fn promptEditorOffsetX(width: usize) usize {
     return @min(width, PROMPT_BORDER_TOP_ROWS + PROMPT_GLYPH_WIDTH);
+}
+
+pub fn renderTaskPanelLines(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    lines: *tui.LineList,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch_allocator = arena.allocator();
+
+    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
+        .rows = TOP_PANEL_HEIGHT,
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(scratch_allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawTaskPanel(window, .{
+        .window = window,
+        .arena = scratch_allocator,
+        .theme = theme,
+    }, theme, snapshot);
+    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
 }
 
 pub fn renderPromptLines(
@@ -2079,6 +2169,50 @@ pub fn formatFooterLine(
     return try applyThemeAlloc(allocator, theme, .footer, fitted);
 }
 
+pub fn formatTaskHeaderText(
+    allocator: std.mem.Allocator,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+) ![]u8 {
+    const session_label = nonEmptyOr(snapshot.session_label, "(unsaved)");
+    const status_label = nonEmptyOr(snapshot.status, "idle");
+    const model_label = nonEmptyOr(snapshot.model_label, "unknown");
+    const provider_label = nonEmptyOr(snapshot.provider_label, "unknown");
+
+    const title = try std.fmt.allocPrint(allocator, "pi · {s}", .{session_label});
+    defer allocator.free(title);
+
+    const single_line_status = try sanitizeSingleLineStatusAlloc(allocator, status_label);
+    defer allocator.free(single_line_status);
+    const meta = try std.fmt.allocPrint(
+        allocator,
+        "Status: {s} · Model: {s} · Provider: {s}",
+        .{ single_line_status, model_label, provider_label },
+    );
+    defer allocator.free(meta);
+
+    const title_width = tui.ansi.visibleWidth(title);
+    const meta_width = tui.ansi.visibleWidth(meta);
+    if (width > 0 and title_width + 1 + meta_width <= width) {
+        var builder = std.ArrayList(u8).empty;
+        errdefer builder.deinit(allocator);
+        try builder.appendSlice(allocator, title);
+        const padding = width - title_width - meta_width;
+        try builder.appendNTimes(allocator, ' ', padding);
+        try builder.appendSlice(allocator, meta);
+        return builder.toOwnedSlice(allocator);
+    }
+
+    const combined = try std.fmt.allocPrint(allocator, "{s} · {s}", .{ title, meta });
+    defer allocator.free(combined);
+    return try fitLine(allocator, combined, width);
+}
+
+fn nonEmptyOr(value: ?[]const u8, fallback: []const u8) []const u8 {
+    const text = value orelse return fallback;
+    return if (text.len > 0) text else fallback;
+}
+
 pub fn formatFooterText(
     allocator: std.mem.Allocator,
     snapshot: *const RenderStateSnapshot,
@@ -2100,22 +2234,6 @@ pub fn formatFooterText(
     const session_text = try std.fmt.allocPrint(allocator, "Session: {s}", .{compact_session_label});
     defer allocator.free(session_text);
     try appendFooterPart(allocator, &builder, &needs_separator, session_text);
-    const single_line_status = try sanitizeSingleLineStatusAlloc(allocator, snapshot.status.?);
-    defer allocator.free(single_line_status);
-    const status_text = try std.fmt.allocPrint(allocator, "Status: {s}", .{single_line_status});
-    defer allocator.free(status_text);
-    try appendFooterPart(allocator, &builder, &needs_separator, status_text);
-    if (snapshot.provider_label) |provider_label| {
-        if (provider_label.len > 0 and !std.mem.eql(u8, provider_label, "unknown")) {
-            const provider_text = try std.fmt.allocPrint(
-                allocator,
-                "Provider: {s} ({s})",
-                .{ provider_label, snapshot.provider_status.? },
-            );
-            defer allocator.free(provider_text);
-            try appendFooterPart(allocator, &builder, &needs_separator, provider_text);
-        }
-    }
 
     if (snapshot.queued_steering.len > 0 or snapshot.queued_follow_up.len > 0) {
         const queue_text = try formatQueueSummary(allocator, snapshot.queued_steering.len, snapshot.queued_follow_up.len);
@@ -2173,10 +2291,6 @@ pub fn formatFooterText(
         defer allocator.free(context_text);
         try appendFooterPart(allocator, &builder, &needs_separator, context_text);
     }
-
-    const model_text = try std.fmt.allocPrint(allocator, "Model: {s}", .{snapshot.model_label.?});
-    defer allocator.free(model_text);
-    try appendFooterPart(allocator, &builder, &needs_separator, model_text);
 
     const fitted = try fitLine(allocator, builder.items, width);
     return fitted;
@@ -2720,6 +2834,72 @@ test "drawPromptLines shows overflow indicator on bottom border" {
     try std.testing.expect(std.mem.indexOf(u8, text, "↓ more") != null);
 }
 
+test "screen draw renders top task panel and shifts chat below it" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const model = ai.model_registry.find("faux", "faux-1").?;
+    try state.setFooterDetails(model, "demo-2026-04-27", null, "Faux", "env");
+    try state.setStatus("ready");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 100, 8);
+    defer screen.deinit(std.testing.allocator);
+
+    try tui.test_helpers.expectCell(&screen, 0, 0, "╭", .{});
+    try tui.test_helpers.expectCell(&screen, 0, 2, "╰", .{});
+
+    const rendered = try tui.test_helpers.screenToString(&screen);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "pi · demo-2026-04-27") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Status: ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Model: faux-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Provider: Faux") != null);
+
+    const row_three = screen.readCell(0, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("W", row_three.char.grapheme);
+}
+
+test "task header owns status model provider while footer excludes them" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const model = ai.model_registry.find("openai", "gpt-5.4").?;
+    try state.setFooterDetails(model, "session.jsonl", "zig-implementation", "OpenAI", "env");
+    try state.setStatus("missing key\nset OPENAI_API_KEY");
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    const header = try formatTaskHeaderText(allocator, &snapshot, 140);
+    defer allocator.free(header);
+    try std.testing.expect(std.mem.indexOf(u8, header, "pi · session.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Status: missing key set OPENAI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Model: gpt-5.4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Provider: OpenAI") != null);
+
+    const footer = try formatFooterText(allocator, &snapshot, 140);
+    defer allocator.free(footer);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Branch: zig-implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Session: session.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Status:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Model:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
+}
+
 pub const InteractiveModeTestBackend = struct {
     size: tui.Size,
     entered_raw: bool = false,
@@ -2992,7 +3172,7 @@ test "screen rendering releases app state lock before expensive rendering work" 
     try std.testing.expect(!renderedLinesContain(render_context.lines.items, "updated while rendering"));
 }
 
-test "formatFooterLine shows provider auth status and sanitizes multiline status text" {
+test "formatFooterLine excludes provider auth status after task header split" {
     const allocator = std.testing.allocator;
 
     var state = try AppState.init(allocator, std.testing.io);
@@ -3008,8 +3188,10 @@ test "formatFooterLine shows provider auth status and sanitizes multiline status
     const footer = try formatFooterLine(allocator, null, &snapshot, 240);
     defer allocator.free(footer);
 
-    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: OpenAI (env)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "Status: missing key set OPENAI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Session: session.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Status:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Model:") == null);
 }
 
 test "screen draw stacks autocomplete below the prompt editor child window" {
@@ -3032,15 +3214,15 @@ test "screen draw stacks autocomplete below the prompt editor child window" {
     var screen_component = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 11,
     };
 
-    var screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 20, 8);
+    var screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 20, 11);
     defer screen.deinit(std.testing.allocator);
 
-    try tui.test_helpers.expectCell(&screen, 0, 1, "╭", .{});
+    try tui.test_helpers.expectCell(&screen, 0, 4, "╭", .{});
 
-    const selected = screen.readCell(@intCast(promptEditorOffsetX(20) + 2), 4) orelse return error.TestUnexpectedResult;
+    const selected = screen.readCell(@intCast(promptEditorOffsetX(20) + 2), 7) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("r", selected.char.grapheme);
     try std.testing.expect(selected.style.reverse);
 }
@@ -3093,11 +3275,11 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     var screen_component = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 16,
+        .height = 20,
         .keybindings = &keybindings,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 160, .height = 16 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 160, .height = 20 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen_component, &backend);

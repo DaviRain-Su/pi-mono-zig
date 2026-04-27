@@ -46,6 +46,7 @@ pub const RunInteractiveModeOptions = struct {
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
+    terminal_name: []const u8 = "term",
     runtime_config: ?*const config_mod.RuntimeConfig = null,
     offline: bool = false,
     verbose: bool = false,
@@ -56,6 +57,7 @@ pub const LiveResources = struct {
     keybindings: ?*const keybindings_mod.Keybindings,
     prompt_templates: []const resources_mod.PromptTemplate,
     theme: ?*const resources_mod.Theme,
+    terminal_name: []const u8,
     owned_runtime_config: ?config_mod.RuntimeConfig = null,
     owned_resource_bundle: ?resources_mod.ResourceBundle = null,
 
@@ -65,6 +67,7 @@ pub const LiveResources = struct {
             .keybindings = options.keybindings,
             .prompt_templates = options.prompt_templates,
             .theme = options.theme,
+            .terminal_name = if (options.terminal_name.len > 0) options.terminal_name else "term",
         };
     }
 
@@ -94,6 +97,7 @@ pub const LiveResources = struct {
             .agent_dir = next_runtime.agent_dir,
             .global = settingsResources(next_runtime.global_settings),
             .project = settingsResources(next_runtime.project_settings),
+            .env_map = env_map,
         });
         errdefer next_bundle.deinit(allocator);
 
@@ -104,6 +108,7 @@ pub const LiveResources = struct {
         self.keybindings = &self.owned_runtime_config.?.keybindings;
         self.prompt_templates = self.owned_resource_bundle.?.prompt_templates;
         self.theme = self.owned_resource_bundle.?.selectedTheme();
+        self.terminal_name = self.owned_resource_bundle.?.terminal_name;
         return self.owned_resource_bundle.?.diagnostics;
     }
 };

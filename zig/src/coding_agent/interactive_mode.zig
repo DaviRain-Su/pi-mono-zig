@@ -287,6 +287,7 @@ pub fn runInteractiveMode(
         .editor = &editor,
         .keybindings = live_resources.keybindings,
         .theme = live_resources.theme,
+        .terminal_name = live_resources.terminal_name,
     };
 
     var overlay: ?SelectorOverlay = null;
@@ -338,6 +339,7 @@ pub fn runInteractiveMode(
         screen.overlay = if (overlay) |*value| value else null;
         screen.keybindings = live_resources.keybindings;
         screen.theme = live_resources.theme;
+        screen.terminal_name = live_resources.terminal_name;
 
         if (overlay) |*overlay_value| {
             const overlay_tag = std.meta.activeTag(overlay_value.*);
@@ -529,7 +531,7 @@ test "screen renders welcome prompt footer and tool lines" {
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 10,
+        .height = 14,
     };
 
     var lines = tui.LineList.empty;
@@ -537,7 +539,9 @@ test "screen renders welcome prompt footer and tool lines" {
     try screen.renderInto(allocator, 40, &lines);
 
     try std.testing.expect(lines.items.len >= 3);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "Welcome to pi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
+    try std.testing.expect(renderedLinesContain(lines.items, "pi · session.jsonl"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi"));
     try std.testing.expect(renderedLinesContain(lines.items, "╭"));
     try std.testing.expect(renderedLinesContain(lines.items, "> w"));
     try std.testing.expect(renderedLinesContain(lines.items, "╰"));
@@ -557,10 +561,10 @@ test "interactive mode startup renders welcome message footer and hints through 
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 10,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 10 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
@@ -714,10 +718,10 @@ test "interactive mode renders pending clipboard image placeholders in the promp
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 12,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
@@ -748,10 +752,10 @@ test "interactive mode renders submitted user messages through a mock backend" {
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 12,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
@@ -803,10 +807,10 @@ test "interactive mode renders streaming assistant updates through a mock backen
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 12,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
@@ -839,10 +843,10 @@ test "interactive mode renders thinking placeholder before assistant text" {
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 12,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
@@ -886,10 +890,10 @@ test "interactive mode renders tool execution details through a mock backend" {
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 12,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
@@ -4053,16 +4057,15 @@ test "app state aggregates usage totals and footer renders git branch stats" {
     defer allocator.free(footer);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Branch: zig-implementation") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Session: session.jsonl") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "Status: idle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: Faux (local)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: Faux (local)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Status:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "↑11") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "↓7") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "R2") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "W1") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "$0.420") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 0.0%/128k") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "Model: faux-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Model:") == null);
 
     try state.appendQueuedMessage(.steering, "queued steer");
     try state.appendQueuedMessage(.follow_up, "queued follow-up");

@@ -55,6 +55,7 @@ pub fn prepareCliRuntime(
         .cli_skills = options.skills orelse &.{},
         .cli_prompts = options.prompt_templates orelse &.{},
         .cli_themes = options.themes orelse &.{},
+        .env_map = env_map,
         .include_default_extensions = !options.no_extensions,
         .include_default_skills = !options.no_skills,
         .include_default_prompts = !options.no_prompt_templates,

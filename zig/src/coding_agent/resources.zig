@@ -212,6 +212,7 @@ pub const ResourceBundle = struct {
     themes: []Theme,
     selected_theme_index: usize,
     diagnostics: []Diagnostic,
+    terminal_name: []u8,
 
     pub fn deinit(self: *ResourceBundle, allocator: std.mem.Allocator) void {
         for (self.extensions) |*item| item.deinit(allocator);
@@ -224,6 +225,7 @@ pub const ResourceBundle = struct {
         allocator.free(self.themes);
         for (self.diagnostics) |*item| item.deinit(allocator);
         allocator.free(self.diagnostics);
+        allocator.free(self.terminal_name);
         self.* = undefined;
     }
 
@@ -241,6 +243,7 @@ pub const ResolveResourcesOptions = struct {
     cli_skills: []const []const u8 = &.{},
     cli_prompts: []const []const u8 = &.{},
     cli_themes: []const []const u8 = &.{},
+    env_map: ?*const std.process.Environ.Map = null,
     include_default_extensions: bool = true,
     include_default_skills: bool = true,
     include_default_prompts: bool = true,
@@ -415,6 +418,8 @@ pub fn loadResourceBundle(
 
     const selected_name = options.project.theme orelse options.global.theme;
     const selected_index = findThemeIndex(all_themes.items, selected_name) orelse findThemeIndex(all_themes.items, "dark") orelse 0;
+    const terminal_name = try detectTerminalName(allocator, options.env_map);
+    errdefer allocator.free(terminal_name);
 
     return .{
         .extensions = try extensions.toOwnedSlice(allocator),
@@ -423,7 +428,20 @@ pub fn loadResourceBundle(
         .themes = try all_themes.toOwnedSlice(allocator),
         .selected_theme_index = selected_index,
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
+        .terminal_name = terminal_name,
     };
+}
+
+fn detectTerminalName(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) ![]u8 {
+    const raw = if (env_map) |map| map.get("TERM_PROGRAM") else null;
+    if (raw) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) {
+            const lower = try allocator.alloc(u8, trimmed.len);
+            return std.ascii.lowerString(lower, trimmed);
+        }
+    }
+    return try allocator.dupe(u8, "term");
 }
 
 pub fn formatSkillsForPrompt(allocator: std.mem.Allocator, skills: []const Skill) ![]u8 {
@@ -1850,10 +1868,14 @@ test "loadResourceBundle loads skills templates and themes with selected theme" 
     defer allocator.free(cwd);
     const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("TERM_PROGRAM", "Ghostty");
 
     var bundle = try loadResourceBundle(allocator, std.testing.io, .{
         .cwd = cwd,
         .agent_dir = agent_dir,
+        .env_map = &env_map,
         .project = .{
             .skills = &.{"skills"},
             .prompts = &.{"prompts"},
@@ -1868,6 +1890,7 @@ test "loadResourceBundle loads skills templates and themes with selected theme" 
     try std.testing.expectEqual(@as(usize, 1), bundle.prompt_templates.len);
     try std.testing.expectEqualStrings("fix", bundle.prompt_templates[0].name);
     try std.testing.expectEqualStrings("night", bundle.selectedTheme().name);
+    try std.testing.expectEqualStrings("ghostty", bundle.terminal_name);
 
     const expanded = try expandPromptTemplate(allocator, "/fix parser bug", bundle.prompt_templates);
     defer allocator.free(expanded);
