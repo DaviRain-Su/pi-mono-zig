@@ -850,12 +850,10 @@ fn renderVisualLine(
             try builder.appendSlice(allocator, line[0..clamped]);
             if (clamped < line.len) {
                 const cluster = ansi.nextDisplayCluster(line, clamped);
-                try builder.appendSlice(allocator, "\x1b[7m");
                 try builder.appendSlice(allocator, line[clamped..cluster.end]);
-                try builder.appendSlice(allocator, "\x1b[0m");
                 try builder.appendSlice(allocator, line[cluster.end..]);
             } else {
-                try builder.appendSlice(allocator, "\x1b[7m \x1b[0m");
+                try builder.append(allocator, ' ');
             }
         } else {
             try builder.appendSlice(allocator, line);

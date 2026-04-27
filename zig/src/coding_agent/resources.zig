@@ -1879,8 +1879,7 @@ test "loadResourceBundle loads skills templates and themes with selected theme" 
 
     const styled = try bundle.selectedTheme().applyAlloc(allocator, .assistant, "Pi:");
     defer allocator.free(styled);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[1m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "Pi:") != null);
+    try std.testing.expectEqualStrings("Pi:", styled);
 }
 
 test "default themes include dark and light palettes" {
@@ -1899,8 +1898,8 @@ test "default themes include dark and light palettes" {
     const light_prompt = try light.applyAlloc(allocator, .prompt, "> ");
     defer allocator.free(light_prompt);
 
-    try std.testing.expect(std.mem.indexOf(u8, dark_prompt, "\x1b[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, light_prompt, "\x1b[") != null);
+    try std.testing.expectEqualStrings("> ", dark_prompt);
+    try std.testing.expectEqualStrings("> ", light_prompt);
 }
 
 test "theme files can override palette colors and component tokens" {

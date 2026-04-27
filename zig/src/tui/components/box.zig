@@ -5,7 +5,7 @@ const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
-const vaxis_adapter_mod = @import("../vaxis_adapter.zig");
+const cell_rows = @import("../cell_rows.zig");
 const resources_mod = @import("../theme.zig");
 
 pub const BorderStyle = enum {
@@ -92,7 +92,7 @@ pub const Box = struct {
         for (self.children.items) |child| {
             try child.renderInto(ctx.arena, @max(@as(usize, content_window.width), 1), &child_lines);
         }
-        try vaxis_adapter_mod.renderLineListToWindow(content_window, child_lines.items, ctx.arena);
+        try cell_rows.renderLineListToWindow(content_window, child_lines.items, ctx.arena);
 
         return .{ .width = window.width, .height = window.height };
     }

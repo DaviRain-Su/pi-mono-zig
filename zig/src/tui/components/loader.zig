@@ -329,7 +329,7 @@ fn renderWrappedText(
 
     var wrapped = component_mod.LineList.empty;
     defer component_mod.freeLines(allocator, &wrapped);
-    try ansi.wrapTextWithAnsi(allocator, text, content_width, &wrapped);
+    try ansi.wrapTextAlloc(allocator, text, content_width, &wrapped);
 
     const blank_line = try allocator.alloc(u8, effective_width);
     defer allocator.free(blank_line);

@@ -7,7 +7,7 @@ const layout = @import("../layout.zig");
 const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
 const resources_mod = @import("../theme.zig");
-const vaxis_adapter_mod = @import("../vaxis_adapter.zig");
+const cell_rows = @import("../cell_rows.zig");
 
 pub const Viewport = struct {
     child: component_mod.Component,
@@ -286,7 +286,7 @@ fn renderLegacyChildToScreen(
 
     const window = draw_mod.rootWindow(&screen);
     window.clear();
-    try vaxis_adapter_mod.renderLineListToWindow(window, child_lines.items, allocator);
+    try cell_rows.renderLineListToWindow(window, child_lines.items, allocator);
 
     return .{
         .screen = try cloneScreen(allocator, &screen, width, screen_height),

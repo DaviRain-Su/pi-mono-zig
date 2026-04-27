@@ -169,21 +169,9 @@ pub const Theme = struct {
     }
 
     pub fn applyAlloc(self: *const Theme, allocator: std.mem.Allocator, token: ThemeToken, text: []const u8) ![]u8 {
-        const style = self.styles[@intFromEnum(token)];
-        if (style.fg == null and style.bg == null and !style.bold and !style.italic and !style.underline) {
-            return allocator.dupe(u8, text);
-        }
-
-        var builder = std.ArrayList(u8).empty;
-        errdefer builder.deinit(allocator);
-        if (style.bold) try builder.appendSlice(allocator, "\x1b[1m");
-        if (style.italic) try builder.appendSlice(allocator, "\x1b[3m");
-        if (style.underline) try builder.appendSlice(allocator, "\x1b[4m");
-        if (style.fg) |value| try appendColorAnsi(allocator, &builder, value, true);
-        if (style.bg) |value| try appendColorAnsi(allocator, &builder, value, false);
-        try builder.appendSlice(allocator, text);
-        try builder.appendSlice(allocator, "\x1b[0m");
-        return try builder.toOwnedSlice(allocator);
+        _ = self;
+        _ = token;
+        return allocator.dupe(u8, text);
     }
 
     pub fn setColor(self: *Theme, allocator: std.mem.Allocator, color: ThemeColor, value: []const u8) !void {
@@ -310,37 +298,4 @@ fn initNamed(allocator: std.mem.Allocator, name: []const u8, palette: PaletteTem
     try theme.setColor(allocator, .muted, palette.muted);
     try theme.applyDerivedStyles(allocator);
     return theme;
-}
-
-fn appendColorAnsi(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), value: []const u8, foreground: bool) !void {
-    if (parseNamedColor(value)) |named| {
-        const prefix = if (foreground) "\x1b[3" else "\x1b[4";
-        const color_text = try std.fmt.allocPrint(allocator, "{s}{d}m", .{ prefix, named });
-        defer allocator.free(color_text);
-        try builder.appendSlice(allocator, color_text);
-        return;
-    }
-    if (value.len == 7 and value[0] == '#') {
-        const r = std.fmt.parseInt(u8, value[1..3], 16) catch return;
-        const g = std.fmt.parseInt(u8, value[3..5], 16) catch return;
-        const b = std.fmt.parseInt(u8, value[5..7], 16) catch return;
-        const ansi_text = if (foreground)
-            try std.fmt.allocPrint(allocator, "\x1b[38;2;{d};{d};{d}m", .{ r, g, b })
-        else
-            try std.fmt.allocPrint(allocator, "\x1b[48;2;{d};{d};{d}m", .{ r, g, b });
-        defer allocator.free(ansi_text);
-        try builder.appendSlice(allocator, ansi_text);
-    }
-}
-
-fn parseNamedColor(value: []const u8) ?u8 {
-    if (std.mem.eql(u8, value, "black")) return 0;
-    if (std.mem.eql(u8, value, "red")) return 1;
-    if (std.mem.eql(u8, value, "green")) return 2;
-    if (std.mem.eql(u8, value, "yellow")) return 3;
-    if (std.mem.eql(u8, value, "blue")) return 4;
-    if (std.mem.eql(u8, value, "magenta")) return 5;
-    if (std.mem.eql(u8, value, "cyan")) return 6;
-    if (std.mem.eql(u8, value, "white")) return 7;
-    return null;
 }
