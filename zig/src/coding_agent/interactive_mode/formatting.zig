@@ -183,30 +183,14 @@ fn appendPrefixedPreview(
     prefix: []const u8,
     text: []const u8,
 ) !void {
-    const max_lines = 24;
-    const max_bytes = 4096;
     if (text.len == 0) {
         try appendPrint(out, allocator, "{s}(empty)\n", .{prefix});
         return;
     }
 
-    var written_lines: usize = 0;
-    var written_bytes: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (written_lines >= max_lines or written_bytes >= max_bytes) {
-            try appendPrint(out, allocator, "{s}... truncated preview ...\n", .{prefix});
-            return;
-        }
-        const remaining_bytes = max_bytes - written_bytes;
-        const visible = if (line.len > remaining_bytes) line[0..remaining_bytes] else line;
-        try appendPrint(out, allocator, "{s}{s}\n", .{ prefix, visible });
-        written_lines += 1;
-        written_bytes += visible.len;
-        if (visible.len < line.len) {
-            try appendPrint(out, allocator, "{s}... truncated preview ...\n", .{prefix});
-            return;
-        }
+        try appendPrint(out, allocator, "{s}{s}\n", .{ prefix, line });
     }
 }
 
@@ -228,6 +212,24 @@ fn getIntegerArg(value: std.json.Value, key: []const u8) ?i64 {
         .integer => |integer| integer,
         else => null,
     };
+}
+
+test "tool result formatting preserves long previews for renderer collapse" {
+    const allocator = std.testing.allocator;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    for (0..50) |index| {
+        try appendPrint(&body, allocator, "line {d}\n", .{index + 1});
+    }
+
+    const blocks = [_]ai.ContentBlock{.{ .text = .{ .text = body.items } }};
+    const formatted = try formatToolResultWithExpansion(allocator, "bash", &blocks, false, null, false);
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "line 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "line 50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "truncated preview") == null);
 }
 
 fn getObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {

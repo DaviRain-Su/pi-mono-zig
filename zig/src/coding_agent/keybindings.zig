@@ -11,6 +11,7 @@ pub const Action = enum(u8) {
     dequeue_messages,
     paste_image,
     chat_scroll_to_tail,
+    toggle_expand_all,
 };
 
 pub const KeySpec = union(enum) {
@@ -96,6 +97,7 @@ const DEFINITIONS = [_]BindingDefinition{
     .{ .action = .dequeue_messages, .id = "app.message.dequeue", .defaults = &.{"alt+up"} },
     .{ .action = .paste_image, .id = "app.clipboard.pasteImage", .defaults = &.{"ctrl+v"} },
     .{ .action = .chat_scroll_to_tail, .id = "app.chat.scrollToTail", .defaults = &.{"ctrl+g"} },
+    .{ .action = .toggle_expand_all, .id = "app.chat.toggleExpandAll", .defaults = &.{"ctrl+r"} },
 };
 
 pub const Keybindings = struct {
@@ -258,6 +260,7 @@ test "keybindings use defaults and allow overrides from file" {
     try std.testing.expectEqual(Action.dequeue_messages, defaults.actionForKeyWithModifiers(.up, .{ .alt = true }).?);
     try std.testing.expectEqual(Action.paste_image, defaults.actionForKey(.{ .ctrl = 'v' }).?);
     try std.testing.expectEqual(Action.chat_scroll_to_tail, defaults.actionForKey(.{ .ctrl = 'g' }).?);
+    try std.testing.expectEqual(Action.toggle_expand_all, defaults.actionForKey(.{ .ctrl = 'r' }).?);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -271,7 +274,8 @@ test "keybindings use defaults and allow overrides from file" {
         \\  "app.message.followUp": "alt+up",
         \\  "app.message.dequeue": "alt+enter",
         \\  "app.clipboard.pasteImage": "ctrl+y",
-        \\  "app.chat.scrollToTail": "ctrl+z"
+        \\  "app.chat.scrollToTail": "ctrl+z",
+        \\  "app.chat.toggleExpandAll": "ctrl+9"
         \\}
         ,
     });
@@ -292,4 +296,6 @@ test "keybindings use defaults and allow overrides from file" {
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'v' }) == null);
     try std.testing.expectEqual(Action.chat_scroll_to_tail, loaded.actionForKey(.{ .ctrl = 'z' }).?);
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'g' }) == null);
+    try std.testing.expectEqual(Action.toggle_expand_all, loaded.actionForKey(.{ .ctrl = '9' }).?);
+    try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'r' }) == null);
 }

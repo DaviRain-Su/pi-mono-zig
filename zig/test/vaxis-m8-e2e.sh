@@ -195,10 +195,12 @@ PY
     --env "PI_FAUX_RESPONSE=$SCROLL_RESPONSE"
   tuistory -s "$SESSION" type "$name smoke"
   tuistory -s "$SESSION" press enter
-  tuistory -s "$SESSION" wait "$name scroll tail" --timeout 8000
+  tuistory -s "$SESSION" wait "Ctrl+R 展开" --timeout 8000
   terminal_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-  snapshot_contains "$terminal_snapshot" "$name scroll tail"
+  snapshot_contains "$terminal_snapshot" "Ctrl+R 展开"
   snapshot_contains "$terminal_snapshot" "$badge"
+  tuistory -s "$SESSION" press ctrl r
+  tuistory -s "$SESSION" wait "$name scroll tail" --timeout 8000
   tuistory -s "$SESSION" scroll --x 10 --y 6 up 6
   tuistory -s "$SESSION" wait-idle --timeout 3000
   scrolled_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
