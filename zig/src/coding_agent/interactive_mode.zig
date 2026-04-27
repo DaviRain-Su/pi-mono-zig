@@ -340,10 +340,11 @@ pub fn runInteractiveMode(
         screen.keybindings = live_resources.keybindings;
         screen.theme = live_resources.theme;
         screen.terminal_name = live_resources.terminal_name;
+        const now_ms = nowMilliseconds();
+        screen.now_ms = now_ms;
 
         if (overlay) |*overlay_value| {
             const overlay_tag = std.meta.activeTag(overlay_value.*);
-            const now_ms = nowMilliseconds();
             if (last_overlay_tag == null or last_overlay_tag.? != overlay_tag) {
                 overlay_opened_at_ms = now_ms;
             }
