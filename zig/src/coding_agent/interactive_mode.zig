@@ -536,7 +536,7 @@ test "screen renders welcome prompt footer and tool lines" {
 
     var lines = tui.LineList.empty;
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 40, &lines);
+    try screen.renderInto(allocator, 80, &lines);
 
     try std.testing.expect(lines.items.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
@@ -924,7 +924,7 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
 
     var lines = tui.LineList.empty;
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 12, &lines);
+    try screen.renderInto(allocator, 60, &lines);
 
     try std.testing.expect(lines.items.len >= 5);
     var saw_prompt_border = false;

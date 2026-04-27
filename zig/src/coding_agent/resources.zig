@@ -469,15 +469,51 @@ pub fn resolveThemeIndex(
 }
 
 fn detectTerminalName(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) ![]u8 {
-    const raw = if (env_map) |map| map.get("TERM_PROGRAM") else null;
-    if (raw) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len > 0) {
-            const lower = try allocator.alloc(u8, trimmed.len);
-            return std.ascii.lowerString(lower, trimmed);
-        }
+    const map = env_map orelse return try allocator.dupe(u8, "term");
+
+    if (nonEmptyEnv(map, "TMUX") != null) return try allocator.dupe(u8, "tmux");
+
+    if (nonEmptyEnv(map, "TERM_PROGRAM")) |term_program| {
+        if (std.ascii.eqlIgnoreCase(term_program, "Apple_Terminal")) return try allocator.dupe(u8, "terminal");
+        if (std.ascii.eqlIgnoreCase(term_program, "iTerm.app")) return try allocator.dupe(u8, "iterm");
+        if (std.ascii.eqlIgnoreCase(term_program, "Ghostty")) return try allocator.dupe(u8, "ghostty");
+        if (std.ascii.eqlIgnoreCase(term_program, "WezTerm")) return try allocator.dupe(u8, "wezterm");
+        if (std.ascii.eqlIgnoreCase(term_program, "vscode")) return try allocator.dupe(u8, "vscode");
+        if (std.ascii.eqlIgnoreCase(term_program, "Hyper")) return try allocator.dupe(u8, "hyper");
+        if (std.ascii.eqlIgnoreCase(term_program, "tabby")) return try allocator.dupe(u8, "tabby");
+        if (std.ascii.eqlIgnoreCase(term_program, "kitty")) return try allocator.dupe(u8, "kitty");
+        if (std.ascii.eqlIgnoreCase(term_program, "Alacritty")) return try allocator.dupe(u8, "alacritty");
+
+        const lower = try allocator.alloc(u8, term_program.len);
+        return std.ascii.lowerString(lower, term_program);
     }
+
+    if (nonEmptyEnv(map, "KITTY_WINDOW_ID") != null) return try allocator.dupe(u8, "kitty");
+    if (nonEmptyEnv(map, "ALACRITTY_LOG") != null) return try allocator.dupe(u8, "alacritty");
+    if (nonEmptyEnv(map, "WT_SESSION") != null) return try allocator.dupe(u8, "wt");
+
+    if (nonEmptyEnv(map, "ConEmuANSI")) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "ON")) return try allocator.dupe(u8, "conemu");
+    }
+    if (nonEmptyEnv(map, "TERMINAL_EMULATOR")) |value| {
+        if (std.mem.startsWith(u8, value, "JetBrains")) return try allocator.dupe(u8, "jetbrains");
+    }
+
+    if (nonEmptyEnv(map, "TERM")) |term| {
+        if (std.mem.startsWith(u8, term, "alacritty")) return try allocator.dupe(u8, "alacritty");
+        if (std.mem.startsWith(u8, term, "xterm-kitty")) return try allocator.dupe(u8, "kitty");
+        if (std.mem.startsWith(u8, term, "screen")) return try allocator.dupe(u8, "screen");
+        if (std.mem.startsWith(u8, term, "tmux")) return try allocator.dupe(u8, "tmux");
+        if (std.mem.startsWith(u8, term, "xterm")) return try allocator.dupe(u8, "xterm");
+    }
+
     return try allocator.dupe(u8, "term");
+}
+
+fn nonEmptyEnv(env_map: *const std.process.Environ.Map, key: []const u8) ?[]const u8 {
+    const value = env_map.get(key) orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
 }
 
 pub fn formatSkillsForPrompt(allocator: std.mem.Allocator, skills: []const Skill) ![]u8 {
@@ -1968,6 +2004,54 @@ test "loadResourceBundle exposes built-in dark light and codex themes" {
     try std.testing.expect(findThemeIndex(bundle.themes, "dark") != null);
     try std.testing.expect(findThemeIndex(bundle.themes, "light") != null);
     try std.testing.expect(findThemeIndex(bundle.themes, "codex") != null);
+}
+
+test "detectTerminalName maps documented terminal fallback chain" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct {
+        key: []const u8,
+        value: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .key = "TERM_PROGRAM", .value = "Apple_Terminal", .expected = "terminal" },
+        .{ .key = "TERM_PROGRAM", .value = "iTerm.app", .expected = "iterm" },
+        .{ .key = "TERM_PROGRAM", .value = "Ghostty", .expected = "ghostty" },
+        .{ .key = "TERM_PROGRAM", .value = "WezTerm", .expected = "wezterm" },
+        .{ .key = "TERM_PROGRAM", .value = "vscode", .expected = "vscode" },
+        .{ .key = "TERM_PROGRAM", .value = "kitty", .expected = "kitty" },
+        .{ .key = "TERM_PROGRAM", .value = "Alacritty", .expected = "alacritty" },
+    };
+
+    for (cases) |case| {
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put(case.key, case.value);
+        const detected = try detectTerminalName(allocator, &env_map);
+        defer allocator.free(detected);
+        try std.testing.expectEqualStrings(case.expected, detected);
+    }
+
+    var kitty_env = std.process.Environ.Map.init(allocator);
+    defer kitty_env.deinit();
+    try kitty_env.put("KITTY_WINDOW_ID", "42");
+    const detected = try detectTerminalName(allocator, &kitty_env);
+    defer allocator.free(detected);
+    try std.testing.expectEqualStrings("kitty", detected);
+
+    var term_env = std.process.Environ.Map.init(allocator);
+    defer term_env.deinit();
+    try term_env.put("TERM", "xterm-256color");
+    const term_detected = try detectTerminalName(allocator, &term_env);
+    defer allocator.free(term_detected);
+    try std.testing.expectEqualStrings("xterm", term_detected);
+
+    var empty_env = std.process.Environ.Map.init(allocator);
+    defer empty_env.deinit();
+    const fallback = try detectTerminalName(allocator, &empty_env);
+    defer allocator.free(fallback);
+    try std.testing.expectEqualStrings("term", fallback);
 }
 
 test "PI_THEME env var selects built-in codex over settings theme" {
