@@ -79,7 +79,7 @@ pub const VaxisAdapter = struct {
         return self.frame_arenas[self.active_frame].allocator();
     }
 
-    fn beginFrame(self: *VaxisAdapter, size: terminal_mod.Size) !vaxis.Window {
+    pub fn beginFrame(self: *VaxisAdapter, size: terminal_mod.Size) !vaxis.Window {
         try self.ensureSize(size);
         self.advanceFrame();
 
@@ -91,7 +91,7 @@ pub const VaxisAdapter = struct {
         return window;
     }
 
-    fn finishFrame(self: *VaxisAdapter) !void {
+    pub fn finishFrame(self: *VaxisAdapter) !void {
         try self.vx.render(self.tty);
     }
 
