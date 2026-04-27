@@ -1433,3 +1433,14 @@ test "editor applies theme colors to content and autocomplete without ansi parsi
     const description = autocomplete_screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
     try std.testing.expect(description.style.reverse == false);
 }
+
+test "editor accepts multi-byte grapheme via PrintableKey" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("你好") });
+
+    try std.testing.expectEqualStrings("你好", editor.text());
+}

@@ -4,10 +4,13 @@ const vaxis = @import("vaxis");
 const ESC = "\x1b";
 
 pub const PrintableKey = struct {
-    bytes: [4]u8 = [_]u8{0} ** 4,
-    len: u3 = 0,
+    pub const max_bytes: usize = 32;
+
+    bytes: [max_bytes]u8 = [_]u8{0} ** max_bytes,
+    len: u8 = 0,
 
     pub fn fromSlice(input: []const u8) PrintableKey {
+        std.debug.assert(input.len <= max_bytes);
         var key = PrintableKey{
             .len = @intCast(input.len),
         };
@@ -102,6 +105,10 @@ pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?
         return parsedKeyInput(.{ .ctrl = ctrl }, .{}, event_type);
     }
 
+    if (printableKeyFromVaxisText(vaxis_key, modifiers)) |printable_key| {
+        return parsedKeyInput(printable_key, modifiers, event_type);
+    }
+
     var key = keyFromVaxisCodepoint(
         preferredVaxisCodepoint(vaxis_key, modifiers),
         if (vaxis_key.shifted_codepoint) |shifted_codepoint|
@@ -119,6 +126,26 @@ pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?
     }
 
     return parsedKeyInput(key, modifiers, event_type);
+}
+
+/// When vaxis provides a `text` field (kitty CSI u text-as-codepoints, or grapheme
+/// cluster aggregation in legacy ground state), prefer it over the synthesized codepoint
+/// for printable input. This is required for:
+///   - IME-committed CJK text (Ghostty sends kitty CSI u with codepoint=0 + text)
+///   - Multi-codepoint graphemes (ZWJ emoji, regional-indicator flags) where vaxis
+///     reports `codepoint=Key.multicodepoint` (0x110001) plus the joined text.
+fn printableKeyFromVaxisText(vaxis_key: vaxis.Key, modifiers: KeyModifiers) ?Key {
+    const text = vaxis_key.text orelse return null;
+    if (text.len == 0 or text.len > PrintableKey.max_bytes) return null;
+    // Don't override ctrl/alt/super shortcuts (those are handled elsewhere).
+    if (modifiers.ctrl or modifiers.alt or modifiers.super) return null;
+    // Reject control bytes and pure ASCII whose codepoint path already yields the
+    // correct mapping (printable ASCII, tab, enter, etc.).
+    if (text.len == 1) {
+        const b = text[0];
+        if (b < 0x20 or b == 0x7F) return null;
+    }
+    return .{ .printable = PrintableKey.fromSlice(text) };
 }
 
 fn parsedKeyInput(key: Key, modifiers: KeyModifiers, event_type: KeyEventType) ParsedInput {
@@ -435,5 +462,84 @@ test "parsedInputFromVaxisKey prefers shifted printable codepoints" {
         .consumed = 0,
         .modifiers = .{ .shift = true },
         .event_type = .press,
+    }, result);
+}
+
+// Regressions for kitty-keyboard / IME text input. See AGENTS.md notes on
+// Ghostty CJK breakage: vaxis emits a key event with `codepoint=0` (or
+// `Key.multicodepoint`) plus the typed bytes in `text`. Without honouring
+// `text` we drop or corrupt the input.
+test "parsedInputFromVaxisKey honours vaxis text for kitty CJK codepoint" {
+    // Ghostty kitty CSI u "你" (U+4F60) with text-as-codepoint set.
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 0x4F60,
+        .text = "你",
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice("你") } },
+        .consumed = 0,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey honours IME text with zero codepoint" {
+    // Ghostty IME commit: kitty CSI 0;;text u, i.e. cp=0 + multi-codepoint text.
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 0,
+        .text = "你好",
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice("你好") } },
+        .consumed = 0,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey honours multicodepoint text for ZWJ emoji" {
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = vaxis.Key.multicodepoint,
+        .text = family,
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice(family) } },
+        .consumed = 0,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey honours multicodepoint text for regional flag" {
+    const flag = "\u{1F1FA}\u{1F1F8}"; // 🇺🇸
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = vaxis.Key.multicodepoint,
+        .text = flag,
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice(flag) } },
+        .consumed = 0,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey ignores text for ascii control bytes" {
+    // ascii ctrl path must not be hijacked by the text-preferring branch.
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 0x04,
+        .text = "\x04",
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .ctrl = 'd' } },
+        .consumed = 0,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey does not use text when ctrl/alt held" {
+    // Alt+f must still map to .right via the alt-navigation canonicaliser even if
+    // vaxis includes "f" in the text field.
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 'f',
+        .text = "f",
+        .mods = .{ .alt = true },
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .right },
+        .consumed = 0,
+        .modifiers = .{ .alt = true },
     }, result);
 }
