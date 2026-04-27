@@ -1054,11 +1054,14 @@ test "editor accepts typed characters and renders content with a native cursor" 
     var editor = Editor.init(allocator);
     defer editor.deinit();
 
-    const inputs = [_][]const u8{ "h", "e", "l", "l", "o" };
-    for (inputs) |input| {
-        const parsed = keys.parseKey(input).?;
-        try std.testing.expect(parsed == .parsed);
-        try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(parsed.parsed.key));
+    for ([_]keys.Key{
+        .{ .printable = keys.PrintableKey.fromSlice("h") },
+        .{ .printable = keys.PrintableKey.fromSlice("e") },
+        .{ .printable = keys.PrintableKey.fromSlice("l") },
+        .{ .printable = keys.PrintableKey.fromSlice("l") },
+        .{ .printable = keys.PrintableKey.fromSlice("o") },
+    }) |key| {
+        try std.testing.expectEqual(HandleResult.handled, try editor.handleKey(key));
     }
 
     try std.testing.expectEqualStrings("hello", editor.text());

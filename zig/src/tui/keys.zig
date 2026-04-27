@@ -1,6 +1,7 @@
 const std = @import("std");
-const ESC = "\x1b";
 const vaxis = @import("vaxis");
+
+const ESC = "\x1b";
 
 pub const PrintableKey = struct {
     bytes: [4]u8 = [_]u8{0} ** 4,
@@ -51,9 +52,6 @@ pub const Key = union(enum) {
     f10,
     f11,
     f12,
-    bracketed_paste_start,
-    bracketed_paste_end,
-    unknown_escape,
 };
 
 pub const KeyModifiers = packed struct(u8) {
@@ -66,29 +64,12 @@ pub const KeyModifiers = packed struct(u8) {
     pub fn hasAny(self: KeyModifiers) bool {
         return self.shift or self.alt or self.ctrl or self.super;
     }
-
-    pub fn fromCsiModifierParameter(parameter: u16) KeyModifiers {
-        const bits = if (parameter > 0) parameter - 1 else 0;
-        return .{
-            .shift = (bits & 1) != 0,
-            .alt = (bits & 2) != 0,
-            .ctrl = (bits & 4) != 0,
-            .super = (bits & 8) != 0,
-        };
-    }
 };
 
 pub const KeyEventType = enum {
     press,
     repeat,
     release,
-};
-
-pub const ParsedKey = struct {
-    key: Key,
-    consumed: usize,
-    modifiers: KeyModifiers = .{},
-    event_type: KeyEventType = .press,
 };
 
 pub const ProtocolEvent = union(enum) {
@@ -108,167 +89,6 @@ pub const ParsedInput = struct {
     event_type: KeyEventType = .press,
 };
 
-pub const ParseResult = union(enum) {
-    parsed: ParsedKey,
-    need_more_bytes,
-};
-
-pub const InputParseResult = union(enum) {
-    parsed: ParsedInput,
-    need_more_bytes,
-};
-
-const ParseMode = enum {
-    buffering,
-    flush,
-};
-
-const BRACKETED_PASTE_START = ESC ++ "[200~";
-const BRACKETED_PASTE_END = ESC ++ "[201~";
-const KITTY_PROTOCOL_RESPONSE_PREFIX = ESC ++ "[?";
-
-pub fn parseInputEvent(input: []const u8) ?InputParseResult {
-    return parseInputEventWithMode(input, .buffering);
-}
-
-pub fn flushInputEvent(input: []const u8) ?ParsedInput {
-    const result = parseInputEventWithMode(input, .flush) orelse return null;
-    return switch (result) {
-        .parsed => |parsed_input| parsed_input,
-        .need_more_bytes => null,
-    };
-}
-
-pub fn parseKey(input: []const u8) ?ParseResult {
-    return parseKeyWithMode(input, .buffering);
-}
-
-pub fn flushKey(input: []const u8) ?ParsedKey {
-    const result = parseKeyWithMode(input, .flush) orelse return null;
-    return switch (result) {
-        .parsed => |parsed_key| parsed_key,
-        .need_more_bytes => null,
-    };
-}
-
-fn parseKeyWithMode(input: []const u8, mode: ParseMode) ?ParseResult {
-    if (input.len == 0) return null;
-
-    const first = input[0];
-    if (first == '\r' or first == '\n') {
-        return parsed(.enter, 1);
-    }
-
-    switch (first) {
-        0x09 => return parsed(.tab, 1),
-        0x7f, 0x08 => return parsed(.backspace, 1),
-        0x1b => return parseEscapeSequence(input, mode),
-        0x01...0x07, 0x0b, 0x0c, 0x0e...0x1a, 0x1c...0x1f => return parsed(.{ .ctrl = @as(u8, 'a') + first - 1 }, 1),
-        else => {},
-    }
-
-    if (first < 0x20) return null;
-
-    const sequence_len = std.unicode.utf8ByteSequenceLength(first) catch 1;
-    if (input.len < sequence_len) {
-        return .need_more_bytes;
-    }
-
-    return parsed(.{ .printable = PrintableKey.fromSlice(input[0..sequence_len]) }, sequence_len);
-}
-
-fn parseInputEventWithMode(input: []const u8, mode: ParseMode) ?InputParseResult {
-    if (input.len == 0) return null;
-
-    if (parseKittyProtocolResponse(input, mode)) |protocol_result| {
-        return protocol_result;
-    }
-
-    if (matchesBracketedPastePrefix(input)) {
-        return .need_more_bytes;
-    }
-
-    if (std.mem.startsWith(u8, input, BRACKETED_PASTE_START)) {
-        const content_start = BRACKETED_PASTE_START.len;
-        const end_relative = std.mem.indexOf(u8, input[content_start..], BRACKETED_PASTE_END) orelse return .need_more_bytes;
-        const content_end = content_start + end_relative;
-        return .{
-            .parsed = .{
-                .event = .{ .paste = input[content_start..content_end] },
-                .consumed = content_end + BRACKETED_PASTE_END.len,
-            },
-        };
-    }
-
-    const result = parseKeyWithMode(input, mode) orelse return null;
-    return switch (result) {
-        .parsed => |parsed_key| .{
-            .parsed = .{
-                .event = .{ .key = parsed_key.key },
-                .consumed = parsed_key.consumed,
-                .modifiers = parsed_key.modifiers,
-                .event_type = parsed_key.event_type,
-            },
-        },
-        .need_more_bytes => .need_more_bytes,
-    };
-}
-
-fn matchesBracketedPastePrefix(input: []const u8) bool {
-    return input.len < BRACKETED_PASTE_START.len and std.mem.startsWith(u8, BRACKETED_PASTE_START, input);
-}
-
-fn parseKittyProtocolResponse(input: []const u8, mode: ParseMode) ?InputParseResult {
-    if (!std.mem.startsWith(u8, input, KITTY_PROTOCOL_RESPONSE_PREFIX)) return null;
-
-    const sequence_len = findCsiSequenceLength(input) orelse {
-        return switch (mode) {
-            .buffering => .need_more_bytes,
-            .flush => null,
-        };
-    };
-
-    const sequence = input[0..sequence_len];
-    if (sequence[sequence.len - 1] != 'u') return null;
-    if (sequence.len <= KITTY_PROTOCOL_RESPONSE_PREFIX.len + 1) return null;
-
-    for (sequence[KITTY_PROTOCOL_RESPONSE_PREFIX.len .. sequence.len - 1]) |byte| {
-        if (!std.ascii.isDigit(byte)) return null;
-    }
-
-    const flags = std.fmt.parseInt(u16, sequence[KITTY_PROTOCOL_RESPONSE_PREFIX.len .. sequence.len - 1], 10) catch return null;
-    return .{
-        .parsed = .{
-            .event = .{ .protocol = .{ .kitty_keyboard = flags } },
-            .consumed = sequence.len,
-        },
-    };
-}
-
-fn parsed(key: Key, consumed: usize) ParseResult {
-    return parsedWithDetails(key, consumed, .{}, .press);
-}
-
-fn parsedWithDetails(key: Key, consumed: usize, modifiers: KeyModifiers, event_type: KeyEventType) ParseResult {
-    return .{
-        .parsed = .{
-            .key = key,
-            .consumed = consumed,
-            .modifiers = modifiers,
-            .event_type = event_type,
-        },
-    };
-}
-
-pub fn parsedInputFromParsedKey(parsed_key: ParsedKey) ParsedInput {
-    return .{
-        .event = .{ .key = parsed_key.key },
-        .consumed = parsed_key.consumed,
-        .modifiers = parsed_key.modifiers,
-        .event_type = parsed_key.event_type,
-    };
-}
-
 pub fn parsedPasteInput(paste: []const u8) ParsedInput {
     return .{
         .event = .{ .paste = paste },
@@ -276,35 +96,38 @@ pub fn parsedPasteInput(paste: []const u8) ParsedInput {
     };
 }
 
-pub fn parsedKeyFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedKey {
-    const modifiers = keyModifiersFromVaxis(vaxis_key.mods);
+pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedInput {
+    var modifiers = keyModifiersFromVaxis(vaxis_key.mods);
     if (ctrlShortcutFromVaxisKey(vaxis_key, modifiers)) |ctrl| {
-        return .{
-            .key = .{ .ctrl = ctrl },
-            .consumed = 0,
-            .event_type = event_type,
-        };
+        return parsedKeyInput(.{ .ctrl = ctrl }, .{}, event_type);
     }
 
-    const result = buildParsedKeyFromCodepoint(
+    var key = keyFromVaxisCodepoint(
         preferredVaxisCodepoint(vaxis_key, modifiers),
         if (vaxis_key.shifted_codepoint) |shifted_codepoint|
             @as(u32, shifted_codepoint)
         else
             null,
         modifiers,
-        event_type,
-        0,
     ) orelse return null;
-    return switch (result) {
-        .parsed => |parsed_key| canonicalizeVaxisParsedKey(parsed_key),
-        .need_more_bytes => unreachable,
-    };
+
+    key = canonicalizeLegacyVaxisAltNavigation(key, modifiers);
+    switch (key) {
+        .ctrl, .ctrl_left, .ctrl_right => modifiers.ctrl = false,
+        .shift_tab => modifiers.shift = false,
+        else => {},
+    }
+
+    return parsedKeyInput(key, modifiers, event_type);
 }
 
-pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedInput {
-    const parsed_key = parsedKeyFromVaxisKey(vaxis_key, event_type) orelse return null;
-    return parsedInputFromParsedKey(parsed_key);
+fn parsedKeyInput(key: Key, modifiers: KeyModifiers, event_type: KeyEventType) ParsedInput {
+    return .{
+        .event = .{ .key = key },
+        .consumed = 0,
+        .modifiers = modifiers,
+        .event_type = event_type,
+    };
 }
 
 fn preferredVaxisCodepoint(vaxis_key: vaxis.Key, modifiers: KeyModifiers) u32 {
@@ -342,17 +165,6 @@ fn keyModifiersFromVaxis(modifiers: vaxis.Key.Modifiers) KeyModifiers {
     };
 }
 
-fn canonicalizeVaxisParsedKey(parsed_key: ParsedKey) ParsedKey {
-    var canonical = parsed_key;
-    canonical.key = canonicalizeLegacyVaxisAltNavigation(canonical.key, canonical.modifiers);
-    switch (canonical.key) {
-        .ctrl, .ctrl_left, .ctrl_right => canonical.modifiers.ctrl = false,
-        .shift_tab => canonical.modifiers.shift = false,
-        else => {},
-    }
-    return canonical;
-}
-
 fn canonicalizeLegacyVaxisAltNavigation(key: Key, modifiers: KeyModifiers) Key {
     if (!modifiers.alt or modifiers.shift or modifiers.ctrl or modifiers.super) return key;
     switch (key) {
@@ -368,243 +180,14 @@ fn canonicalizeLegacyVaxisAltNavigation(key: Key, modifiers: KeyModifiers) Key {
     }
 }
 
-fn parseEscapeSequence(input: []const u8, mode: ParseMode) ParseResult {
-    if (input.len == 1) {
-        return switch (mode) {
-            .buffering => .need_more_bytes,
-            .flush => parsed(.escape, 1),
-        };
-    }
-
-    return switch (input[1]) {
-        '[' => parseCsiSequence(input, mode),
-        'O' => parseSs3Sequence(input, mode),
-        else => parseMetaEscapeSequence(input, mode),
-    };
-}
-
-fn parseCsiSequence(input: []const u8, mode: ParseMode) ParseResult {
-    const sequence_len = findCsiSequenceLength(input) orelse {
-        return switch (mode) {
-            .buffering => .need_more_bytes,
-            .flush => parsed(.unknown_escape, input.len),
-        };
-    };
-
-    return parseCompleteCsiSequence(input[0..sequence_len]);
-}
-
-fn findCsiSequenceLength(input: []const u8) ?usize {
-    var index: usize = 2;
-    while (index < input.len) : (index += 1) {
-        const byte = input[index];
-        if (byte >= 0x40 and byte <= 0x7e) return index + 1;
-    }
-    return null;
-}
-
-fn parseCompleteCsiSequence(sequence: []const u8) ParseResult {
-    if (parseKittyCsiUSequence(sequence)) |result| return result;
-    if (parseModifyOtherKeysSequence(sequence)) |result| return result;
-    if (parseParameterizedSpecialSequence(sequence)) |result| return result;
-
-    if (std.mem.eql(u8, sequence, ESC ++ "[A")) return parsed(.up, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[B")) return parsed(.down, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[C")) return parsed(.right, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[D")) return parsed(.left, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[1;5C") or std.mem.eql(u8, sequence, ESC ++ "[5C")) return parsed(.ctrl_right, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[1;5D") or std.mem.eql(u8, sequence, ESC ++ "[5D")) return parsed(.ctrl_left, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[H") or std.mem.eql(u8, sequence, ESC ++ "[1~") or std.mem.eql(u8, sequence, ESC ++ "[7~")) {
-        return parsed(.home, sequence.len);
-    }
-    if (std.mem.eql(u8, sequence, ESC ++ "[F") or std.mem.eql(u8, sequence, ESC ++ "[4~") or std.mem.eql(u8, sequence, ESC ++ "[8~")) {
-        return parsed(.end, sequence.len);
-    }
-    if (std.mem.eql(u8, sequence, ESC ++ "[Z")) return parsed(.shift_tab, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[2~")) return parsed(.insert, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[3~")) return parsed(.delete, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[5~") or std.mem.eql(u8, sequence, ESC ++ "[[5~")) return parsed(.page_up, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[6~") or std.mem.eql(u8, sequence, ESC ++ "[[6~")) return parsed(.page_down, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[200~")) return parsed(.bracketed_paste_start, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[201~")) return parsed(.bracketed_paste_end, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[11~") or std.mem.eql(u8, sequence, ESC ++ "[[A")) return parsed(.f1, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[12~") or std.mem.eql(u8, sequence, ESC ++ "[[B")) return parsed(.f2, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[13~") or std.mem.eql(u8, sequence, ESC ++ "[[C")) return parsed(.f3, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[14~") or std.mem.eql(u8, sequence, ESC ++ "[[D")) return parsed(.f4, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[15~") or std.mem.eql(u8, sequence, ESC ++ "[[E")) return parsed(.f5, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[17~")) return parsed(.f6, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[18~")) return parsed(.f7, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[19~")) return parsed(.f8, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[20~")) return parsed(.f9, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[21~")) return parsed(.f10, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[23~")) return parsed(.f11, sequence.len);
-    if (std.mem.eql(u8, sequence, ESC ++ "[24~")) return parsed(.f12, sequence.len);
-    return parsed(.unknown_escape, sequence.len);
-}
-
-const ParsedNumber = struct {
-    value: u32,
-    end: usize,
-};
-
-fn parseUnsignedDecimal(input: []const u8, start: usize) ?ParsedNumber {
-    if (start >= input.len or !std.ascii.isDigit(input[start])) return null;
-
-    var end = start;
-    while (end < input.len and std.ascii.isDigit(input[end])) : (end += 1) {}
-
-    const value = std.fmt.parseInt(u32, input[start..end], 10) catch return null;
-    return .{ .value = value, .end = end };
-}
-
-fn parseEventType(value: u32) KeyEventType {
-    return switch (value) {
-        2 => .repeat,
-        3 => .release,
-        else => .press,
-    };
-}
-
-fn parseKittyCsiUSequence(sequence: []const u8) ?ParseResult {
-    if (sequence.len < 4 or sequence[sequence.len - 1] != 'u') return null;
-    if (!std.mem.startsWith(u8, sequence, ESC ++ "[")) return null;
-    if (sequence[2] == '?') return null;
-
-    var index: usize = 2;
-    const codepoint = parseUnsignedDecimal(sequence, index) orelse return null;
-    index = codepoint.end;
-
-    var shifted_codepoint: ?u32 = null;
-    if (index < sequence.len and sequence[index] == ':') {
-        index += 1;
-        if (parseUnsignedDecimal(sequence, index)) |shifted| {
-            shifted_codepoint = shifted.value;
-            index = shifted.end;
-        }
-
-        if (index < sequence.len and sequence[index] == ':') {
-            index += 1;
-            if (parseUnsignedDecimal(sequence, index)) |base_layout| {
-                index = base_layout.end;
-            }
-        }
-    }
-
-    var modifier_parameter: u16 = 1;
-    var event_type: KeyEventType = .press;
-    if (index < sequence.len and sequence[index] == ';') {
-        const modifier = parseUnsignedDecimal(sequence, index + 1) orelse return null;
-        modifier_parameter = std.math.cast(u16, modifier.value) orelse return null;
-        index = modifier.end;
-
-        if (index < sequence.len and sequence[index] == ':') {
-            const event_value = parseUnsignedDecimal(sequence, index + 1) orelse return null;
-            event_type = parseEventType(event_value.value);
-            index = event_value.end;
-        }
-    }
-
-    if (index != sequence.len - 1) return null;
-    return buildParsedKeyFromCodepoint(
-        codepoint.value,
-        shifted_codepoint,
-        KeyModifiers.fromCsiModifierParameter(modifier_parameter),
-        event_type,
-        sequence.len,
-    );
-}
-
-fn parseModifyOtherKeysSequence(sequence: []const u8) ?ParseResult {
-    if (sequence.len < 8 or sequence[sequence.len - 1] != '~') return null;
-    if (!std.mem.startsWith(u8, sequence, ESC ++ "[27;")) return null;
-
-    var index: usize = 5;
-    const modifier = parseUnsignedDecimal(sequence, index) orelse return null;
-    index = modifier.end;
-    if (index >= sequence.len or sequence[index] != ';') return null;
-
-    const codepoint = parseUnsignedDecimal(sequence, index + 1) orelse return null;
-    index = codepoint.end;
-    if (index != sequence.len - 1) return null;
-
-    return buildParsedKeyFromCodepoint(
-        codepoint.value,
-        null,
-        KeyModifiers.fromCsiModifierParameter(std.math.cast(u16, modifier.value) orelse return null),
-        .press,
-        sequence.len,
-    );
-}
-
-fn parseParameterizedSpecialSequence(sequence: []const u8) ?ParseResult {
-    if (!std.mem.startsWith(u8, sequence, ESC ++ "[")) return null;
-
-    const final = sequence[sequence.len - 1];
-    if (final != 'A' and final != 'B' and final != 'C' and final != 'D' and final != 'H' and final != 'F' and final != '~')
-        return null;
-
-    var index: usize = 2;
-    const first = parseUnsignedDecimal(sequence, index) orelse return null;
-    index = first.end;
-    if (index >= sequence.len or sequence[index] != ';') return null;
-
-    const modifier = parseUnsignedDecimal(sequence, index + 1) orelse return null;
-    index = modifier.end;
-
-    var event_type: KeyEventType = .press;
-    if (index < sequence.len - 1 and sequence[index] == ':') {
-        const event_value = parseUnsignedDecimal(sequence, index + 1) orelse return null;
-        event_type = parseEventType(event_value.value);
-        index = event_value.end;
-    }
-
-    if (index != sequence.len - 1) return null;
-
-    const modifiers = KeyModifiers.fromCsiModifierParameter(std.math.cast(u16, modifier.value) orelse return null);
-    const key: Key = switch (final) {
-        'A' => .up,
-        'B' => .down,
-        'C' => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_right else .right,
-        'D' => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_left else .left,
-        'H' => .home,
-        'F' => .end,
-        '~' => switch (first.value) {
-            2 => .insert,
-            3 => .delete,
-            5 => .page_up,
-            6 => .page_down,
-            7 => .home,
-            8 => .end,
-            11 => .f1,
-            12 => .f2,
-            13 => .f3,
-            14 => .f4,
-            15 => .f5,
-            17 => .f6,
-            18 => .f7,
-            19 => .f8,
-            20 => .f9,
-            21 => .f10,
-            23 => .f11,
-            24 => .f12,
-            else => return null,
-        },
-        else => return null,
-    };
-
-    return parsedWithDetails(key, sequence.len, modifiers, event_type);
-}
-
-fn buildParsedKeyFromCodepoint(
+fn keyFromVaxisCodepoint(
     codepoint: u32,
     shifted_codepoint: ?u32,
     modifiers: KeyModifiers,
-    event_type: KeyEventType,
-    consumed: usize,
-) ?ParseResult {
+) ?Key {
     const effective_codepoint = normalizeFunctionalCodepoint(if (modifiers.shift and shifted_codepoint != null) shifted_codepoint.? else codepoint);
 
-    const key: Key = switch (effective_codepoint) {
+    return switch (effective_codepoint) {
         9 => if (modifiers.shift and !modifiers.alt and !modifiers.ctrl and !modifiers.super) .shift_tab else .tab,
         13, 57414 => .enter,
         27 => .escape,
@@ -631,7 +214,7 @@ fn buildParsedKeyFromCodepoint(
         vaxis.Key.f10 => .f10,
         vaxis.Key.f11 => .f11,
         vaxis.Key.f12 => .f12,
-        57399...57413, 57415, 57416 => printableKeyFromCodepoint(effective_codepoint) orelse return null,
+        57399...57413, 57415, 57416 => printableKeyFromCodepoint(effective_codepoint),
         57417 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_left else .left,
         57418 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_right else .right,
         57419 => .up,
@@ -642,10 +225,8 @@ fn buildParsedKeyFromCodepoint(
         57424 => .end,
         57425 => .insert,
         57426 => .delete,
-        else => keyFromCodepoint(effective_codepoint, modifiers) orelse return null,
+        else => keyFromCodepoint(effective_codepoint, modifiers),
     };
-
-    return parsedWithDetails(key, consumed, modifiers, event_type);
 }
 
 fn keyFromCodepoint(codepoint: u32, modifiers: KeyModifiers) ?Key {
@@ -717,218 +298,39 @@ fn normalizeFunctionalCodepoint(codepoint: u32) u32 {
     };
 }
 
-fn parseSs3Sequence(input: []const u8, mode: ParseMode) ParseResult {
-    if (input.len < 3) {
-        return switch (mode) {
-            .buffering => .need_more_bytes,
-            .flush => parsed(.unknown_escape, input.len),
-        };
+test "vaxis.Parser emits bracketed paste boundary events" {
+    var parser: vaxis.Parser = .{};
+
+    const start = try parser.parse(ESC ++ "[200~", std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), start.n);
+    switch (start.event.?) {
+        .paste_start => {},
+        else => return error.ExpectedPasteStart,
     }
 
-    return switch (input[2]) {
-        'A' => parsed(.up, 3),
-        'B' => parsed(.down, 3),
-        'C' => parsed(.right, 3),
-        'D' => parsed(.left, 3),
-        'c' => parsed(.ctrl_right, 3),
-        'd' => parsed(.ctrl_left, 3),
-        'H' => parsed(.home, 3),
-        'F' => parsed(.end, 3),
-        'P' => parsed(.f1, 3),
-        'Q' => parsed(.f2, 3),
-        'R' => parsed(.f3, 3),
-        'S' => parsed(.f4, 3),
-        else => parsed(.unknown_escape, 3),
+    const end = try parser.parse(ESC ++ "[201~", std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), end.n);
+    switch (end.event.?) {
+        .paste_end => {},
+        else => return error.ExpectedPasteEnd,
+    }
+}
+
+test "parsedInputFromVaxisKey maps key events emitted by vaxis.Parser" {
+    var parser: vaxis.Parser = .{};
+    const result = try parser.parse("a", std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), result.n);
+
+    const key = switch (result.event.?) {
+        .key_press => |key| key,
+        else => return error.ExpectedKeyPress,
     };
-}
+    const parsed = parsedInputFromVaxisKey(key, .press).?;
 
-fn parseMetaEscapeSequence(input: []const u8, mode: ParseMode) ParseResult {
-    const sequence_len = 1 + (std.unicode.utf8ByteSequenceLength(input[1]) catch 1);
-    if (input.len < sequence_len) {
-        return switch (mode) {
-            .buffering => .need_more_bytes,
-            .flush => parsed(.unknown_escape, input.len),
-        };
-    }
-    return parsed(.unknown_escape, sequence_len);
-}
-
-test "parse printable keys" {
-    const ascii = parseKey("a").?;
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .{ .printable = PrintableKey.fromSlice("a") },
-            .consumed = 1,
-        },
-    }, ascii);
-
-    const utf8 = parseKey("é").?;
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .{ .printable = PrintableKey.fromSlice("é") },
-            .consumed = 2,
-        },
-    }, utf8);
-}
-
-test "parse arrow keys from escape sequences" {
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .up, .consumed = 3 } }, parseKey(ESC ++ "[A").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .down, .consumed = 3 } }, parseKey("\x1bOB").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .right, .consumed = 3 } }, parseKey(ESC ++ "[C").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .left, .consumed = 3 } }, parseKey("\x1bOD").?);
-}
-
-test "parse enter backspace and ctrl sequences" {
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .enter, .consumed = 1 } }, parseKey("\r").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .tab, .consumed = 1 } }, parseKey("\t").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .backspace, .consumed = 1 } }, parseKey("\x7f").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .{ .ctrl = 'c' }, .consumed = 1 } }, parseKey("\x03").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .{ .ctrl = 'd' }, .consumed = 1 } }, parseKey("\x04").?);
-}
-
-test "split escape sequences request more bytes before parsing" {
-    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey("\x1b").?);
-    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey(ESC ++ "[").?);
-    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey(ESC ++ "[20").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f9, .consumed = 5 } }, parseKey(ESC ++ "[20~").?);
-}
-
-test "flushKey resolves standalone escape and discards incomplete escape sequences" {
-    try std.testing.expectEqualDeep(ParsedKey{ .key = .escape, .consumed = 1 }, flushKey("\x1b").?);
-    try std.testing.expectEqualDeep(ParsedKey{ .key = .unknown_escape, .consumed = 2 }, flushKey(ESC ++ "[").?);
-}
-
-test "flushKey keeps incomplete UTF-8 buffered until the sequence is complete" {
-    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey("\xc3").?);
-    try std.testing.expect(flushKey("\xc3") == null);
-    try std.testing.expectEqualDeep(ParsedKey{
-        .key = .{ .printable = PrintableKey.fromSlice("é") },
-        .consumed = 2,
-    }, flushKey("é").?);
-}
-
-test "parse home end function and bracketed paste sequences" {
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .home, .consumed = 3 } }, parseKey("\x1bOH").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .end, .consumed = 3 } }, parseKey("\x1bOF").?);
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .ctrl_left,
-            .consumed = 6,
-            .modifiers = .{ .ctrl = true },
-        },
-    }, parseKey(ESC ++ "[1;5D").?);
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .ctrl_right,
-            .consumed = 6,
-            .modifiers = .{ .ctrl = true },
-        },
-    }, parseKey(ESC ++ "[1;5C").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_left, .consumed = 3 } }, parseKey("\x1bOd").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_right, .consumed = 3 } }, parseKey("\x1bOc").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .page_up, .consumed = 4 } }, parseKey(ESC ++ "[5~").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f1, .consumed = 3 } }, parseKey("\x1bOP").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f12, .consumed = 5 } }, parseKey(ESC ++ "[24~").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .bracketed_paste_start, .consumed = 6 } }, parseKey(ESC ++ "[200~").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .bracketed_paste_end, .consumed = 6 } }, parseKey(ESC ++ "[201~").?);
-}
-
-test "parseInputEvent returns bracketed paste content as a single event" {
-    const input = ESC ++ "[200~hello\nworld" ++ ESC ++ "[201~!";
-    const result = parseInputEvent(input).?;
-    try std.testing.expect(result == .parsed);
-    try std.testing.expectEqual(@as(usize, 23), result.parsed.consumed);
-    switch (result.parsed.event) {
-        .paste => |content| try std.testing.expectEqualStrings("hello\nworld", content),
-        else => return error.UnexpectedKey,
-    }
-}
-
-test "parseInputEvent waits for a complete bracketed paste" {
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent(ESC ++ "[20").?);
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent(ESC ++ "[200~partial").?);
-    try std.testing.expect(flushInputEvent(ESC ++ "[200~partial") == null);
-}
-
-test "parseInputEvent assembles split UTF-8 codepoints across reads" {
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\xc3").?);
-    try std.testing.expect(flushInputEvent("\xc3") == null);
-
-    const two_byte = parseInputEvent("é").?;
-    try std.testing.expect(two_byte == .parsed);
-    try std.testing.expectEqual(@as(usize, 2), two_byte.parsed.consumed);
-    switch (two_byte.parsed.event) {
-        .key => |key| try std.testing.expectEqualDeep(Key{ .printable = PrintableKey.fromSlice("é") }, key),
-        else => return error.UnexpectedPaste,
-    }
-
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\xf0\x9f").?);
-    try std.testing.expect(flushInputEvent("\xf0\x9f") == null);
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\xf0\x9f\x99").?);
-    try std.testing.expect(flushInputEvent("\xf0\x9f\x99") == null);
-
-    const four_byte = parseInputEvent("🙂").?;
-    try std.testing.expect(four_byte == .parsed);
-    try std.testing.expectEqual(@as(usize, 4), four_byte.parsed.consumed);
-    switch (four_byte.parsed.event) {
-        .key => |key| try std.testing.expectEqualDeep(Key{ .printable = PrintableKey.fromSlice("🙂") }, key),
-        else => return error.UnexpectedPaste,
-    }
-}
-
-test "parse kitty protocol response as a control event" {
-    const result = parseInputEvent(ESC ++ "[?31u").?;
-    try std.testing.expect(result == .parsed);
-    try std.testing.expectEqual(@as(usize, 6), result.parsed.consumed);
-
-    switch (result.parsed.event) {
-        .protocol => |protocol| switch (protocol) {
-            .kitty_keyboard => |flags| try std.testing.expectEqual(@as(u16, 31), flags),
-        },
-        else => return error.ExpectedProtocolEvent,
-    }
-}
-
-test "parse kitty CSI-u modifiers and release events" {
-    const result = parseKey(ESC ++ "[1;5:3D").?;
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .ctrl_left,
-            .consumed = 8,
-            .modifiers = .{ .ctrl = true },
-            .event_type = .release,
-        },
-    }, result);
-}
-
-test "parse kitty CSI-u printable keys with shifted alternate codepoints" {
-    const result = parseKey(ESC ++ "[97:65;2u").?;
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .{ .printable = PrintableKey.fromSlice("A") },
-            .consumed = 10,
-            .modifiers = .{ .shift = true },
-        },
-    }, result);
-}
-
-test "parse modifyOtherKeys and kitty special-key modifiers" {
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .enter,
-            .consumed = 10,
-            .modifiers = .{ .alt = true },
-        },
-    }, parseKey(ESC ++ "[27;3;13~").?);
-
-    try std.testing.expectEqualDeep(ParseResult{
-        .parsed = .{
-            .key = .page_up,
-            .consumed = 8,
-            .modifiers = .{ .super = true },
-            .event_type = .repeat,
-        },
-    }, parseKey(ESC ++ "[5;9:2~").?);
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice("a") } },
+        .consumed = 0,
+    }, parsed);
 }
 
 test "parsedInputFromVaxisKey preserves ctrl modifiers and release events" {
