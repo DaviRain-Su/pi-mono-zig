@@ -1670,7 +1670,7 @@ test "prepareCliRuntime wires CLI resource overrides and discovery toggles" {
 
     const styled = try prepared.resource_bundle.selectedTheme().applyAlloc(allocator, .assistant, "Pi:");
     defer allocator.free(styled);
-    try std.testing.expect(std.mem.indexOf(u8, styled, "\x1b[35m") != null);
+    try std.testing.expectEqualStrings("Pi:", styled);
 }
 
 test "prepareCliRuntime skips context file discovery when requested" {

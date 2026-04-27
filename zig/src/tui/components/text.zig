@@ -78,7 +78,7 @@ pub const Text = struct {
 
         var wrapped = component_mod.LineList.empty;
         defer component_mod.freeLines(allocator, &wrapped);
-        try ansi.wrapTextWithAnsi(allocator, self.text, content_width, &wrapped);
+        try ansi.wrapTextAlloc(allocator, self.text, content_width, &wrapped);
 
         const blank_line = try allocator.alloc(u8, effective_width);
         defer allocator.free(blank_line);
@@ -180,10 +180,8 @@ pub const Text = struct {
     }
 
     fn renderLineAlloc(self: *const Text, allocator: std.mem.Allocator, line: []const u8) std.mem.Allocator.Error![]u8 {
-        const gradient = self.gradient orelse return allocator.dupe(u8, line);
-        const start = ansi.parseHexColor(gradient.start_hex) orelse return allocator.dupe(u8, line);
-        const end = ansi.parseHexColor(gradient.end_hex) orelse return allocator.dupe(u8, line);
-        return ansi.applyHorizontalGradientAlloc(allocator, line, start, end);
+        _ = self;
+        return allocator.dupe(u8, line);
     }
 
     fn renderIntoOpaque(

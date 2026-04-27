@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
@@ -1833,164 +1832,6 @@ pub fn overlayPanelOptions(size: tui.Size, progress: f32) tui.OverlayOptions {
     };
 }
 
-pub const NativeTerminalBackend = struct {
-    env_map: *const std.process.Environ.Map,
-    stdin_fd: std.posix.fd_t = 0,
-    stdout_fd: std.posix.fd_t = 1,
-    original_termios: ?std.posix.termios = null,
-    cached_size: tui.Size = .{ .width = 80, .height = 24 },
-    resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    previous_sigwinch: ?std.posix.Sigaction = null,
-    resize_signal_installed: bool = false,
-    read_terminal_size_fn: *const fn (context: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size = readTerminalSizeWithIoctl,
-    read_terminal_size_context: ?*anyopaque = null,
-
-    pub fn backend(self: *NativeTerminalBackend) tui.Backend {
-        return .{
-            .ptr = self,
-            .enterRawModeFn = enterRawMode,
-            .restoreModeFn = restoreMode,
-            .writeFn = write,
-            .getSizeFn = getSize,
-        };
-    }
-
-    pub fn enterRawMode(ptr: *anyopaque) !void {
-        const self: *NativeTerminalBackend = @ptrCast(@alignCast(ptr));
-        const current = try std.posix.tcgetattr(self.stdin_fd);
-        self.original_termios = current;
-        const raw = tui.terminal.makeRawMode(current);
-        try std.posix.tcsetattr(self.stdin_fd, .NOW, raw);
-        self.cached_size = self.readSize();
-        self.resize_pending.store(false, .seq_cst);
-        self.installResizeHandler();
-    }
-
-    pub fn restoreMode(ptr: *anyopaque) !void {
-        const self: *NativeTerminalBackend = @ptrCast(@alignCast(ptr));
-        self.uninstallResizeHandler();
-        if (self.original_termios) |term| {
-            try std.posix.tcsetattr(self.stdin_fd, .NOW, term);
-        }
-    }
-
-    pub fn write(ptr: *anyopaque, bytes: []const u8) !void {
-        const self: *NativeTerminalBackend = @ptrCast(@alignCast(ptr));
-        var offset: usize = 0;
-        while (offset < bytes.len) {
-            const written = std.c.write(self.stdout_fd, bytes.ptr + offset, bytes.len - offset);
-            if (written <= 0) return error.WriteFailed;
-            offset += @intCast(written);
-        }
-    }
-
-    pub fn getSize(ptr: *anyopaque) !tui.Size {
-        const self: *NativeTerminalBackend = @ptrCast(@alignCast(ptr));
-        self.refreshSizeIfPending();
-        return self.cached_size;
-    }
-
-    pub fn readSize(self: *NativeTerminalBackend) tui.Size {
-        if (self.read_terminal_size_fn(self.read_terminal_size_context, self.stdout_fd)) |size| {
-            return normalizeTerminalSize(size, self.cached_size);
-        }
-
-        const columns = parseEnvSize(self.env_map.get("COLUMNS")) orelse self.cached_size.width;
-        const lines = parseEnvSize(self.env_map.get("LINES")) orelse self.cached_size.height;
-        return .{
-            .width = if (columns == 0) 80 else columns,
-            .height = if (lines == 0) 24 else lines,
-        };
-    }
-
-    pub fn refreshSizeIfPending(self: *NativeTerminalBackend) void {
-        if (!self.resize_pending.swap(false, .seq_cst)) return;
-        self.cached_size = self.readSize();
-    }
-
-    pub fn installResizeHandler(self: *NativeTerminalBackend) void {
-        if (!supportsResizeSignals()) return;
-
-        const action: std.posix.Sigaction = .{
-            .handler = .{ .sigaction = handleSigwinch },
-            .mask = std.posix.sigemptyset(),
-            .flags = std.posix.SA.SIGINFO | std.posix.SA.RESTART,
-        };
-
-        var previous: std.posix.Sigaction = undefined;
-        std.posix.sigaction(.WINCH, &action, &previous);
-        self.previous_sigwinch = previous;
-        self.resize_signal_installed = true;
-        active_resize_backend = self;
-    }
-
-    pub fn uninstallResizeHandler(self: *NativeTerminalBackend) void {
-        if (!self.resize_signal_installed or !supportsResizeSignals()) return;
-
-        if (self.previous_sigwinch) |previous| {
-            std.posix.sigaction(.WINCH, &previous, null);
-        }
-        if (active_resize_backend == self) {
-            active_resize_backend = null;
-        }
-        self.previous_sigwinch = null;
-        self.resize_signal_installed = false;
-    }
-};
-
-/// Process-global pointer to the native terminal backend that should receive `SIGWINCH` notifications.
-///
-/// POSIX signal handlers must use a plain C callback (`handleSigwinch`) and cannot capture `self`, so the
-/// active backend is published here instead of being passed as a parameter. The handler only reads this
-/// pointer and atomically sets `resize_pending`; the interactive-mode thread remains responsible for calling
-/// `readSize()`, updating `cached_size`, and installing/removing the handler.
-///
-/// Thread-safety model: this relies on single-owner discipline rather than shared mutable access. Only one
-/// interactive backend may install the resize handler at a time, and the only cross-context mutation is the
-/// atomic `resize_pending` flag on the backend instance.
-pub var active_resize_backend: ?*NativeTerminalBackend = null;
-
-pub fn supportsResizeSignals() bool {
-    return switch (builtin.os.tag) {
-        .windows, .wasi, .emscripten, .freestanding => false,
-        else => true,
-    };
-}
-
-pub fn handleSigwinch(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
-    _ = info;
-    _ = ctx_ptr;
-    if (sig != .WINCH) return;
-    if (active_resize_backend) |backend| {
-        backend.resize_pending.store(true, .seq_cst);
-    }
-}
-
-pub fn readTerminalSizeWithIoctl(_: ?*anyopaque, fd: std.posix.fd_t) ?tui.Size {
-    var winsize: std.posix.winsize = undefined;
-    while (true) switch (std.posix.errno(std.posix.system.ioctl(fd, std.posix.T.IOCGWINSZ, @intFromPtr(&winsize)))) {
-        .SUCCESS => return .{
-            .width = winsize.col,
-            .height = winsize.row,
-        },
-        .INTR => continue,
-        else => return null,
-    };
-}
-
-pub fn normalizeTerminalSize(size: tui.Size, fallback: tui.Size) tui.Size {
-    return .{
-        .width = if (size.width == 0)
-            if (fallback.width == 0) 80 else fallback.width
-        else
-            size.width,
-        .height = if (size.height == 0)
-            if (fallback.height == 0) 24 else fallback.height
-        else
-            size.height,
-    };
-}
-
 pub fn rebuildAppStateFromSession(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2168,7 +2009,7 @@ pub fn renderPromptLines(
         .arena = scratch_allocator,
         .theme = theme,
     }, theme, editor, pending_images);
-    try tui.vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, width, rendered.height, lines);
+    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
 }
 
 pub fn formatFooterLine(
@@ -2425,7 +2266,7 @@ pub fn renderChatItemInto(
     const window = tui.draw.rootWindow(&screen);
     window.clear();
     const rendered = try drawChatItem(window, scratch_allocator, theme, item, 0);
-    try tui.vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, width, rendered, lines);
+    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered, lines);
 }
 
 pub fn renderAssistantChatItemInto(
@@ -2538,7 +2379,7 @@ pub fn renderQueuedMessageLines(
         .arena = scratch_allocator,
         .theme = theme,
     }, keybindings, theme, snapshot);
-    try tui.vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, width, rendered.height, lines);
+    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
 }
 
 fn cloneChatItems(allocator: std.mem.Allocator, items: []const ChatItem) ![]ChatItem {
@@ -2746,16 +2587,12 @@ pub fn renderScreenWithMockBackend(
     try terminal.start();
     defer terminal.stop();
 
-    var renderer = tui.Renderer.init(allocator, &terminal);
-    defer renderer.deinit();
-
-    try renderer.render(screen.component());
+    var rendered = try tui.test_helpers.renderToScreen(screen.drawComponent(), backend.size.width, backend.size.height);
+    defer rendered.deinit(std.testing.allocator);
 
     var lines = tui.LineList.empty;
     errdefer freeLinesSafe(allocator, &lines);
-    for (renderer.previous_lines.items) |line| {
-        try lines.append(allocator, try allocator.dupe(u8, line));
-    }
+    try tui.cell_rows.appendAllocatingScreenRowsAsPlainLines(allocator, &rendered, backend.size.width, backend.size.height, &lines);
     return lines;
 }
 
@@ -2777,14 +2614,20 @@ pub fn renderScreenWithMockBackendAndOverlay(
         .theme = screen.theme,
         .max_height = overlayPanelMaxHeight(screen.height),
     };
-    _ = try renderer.showOverlay(panel.component(), overlayPanelOptions(backend.size, 1.0));
-    try renderer.render(screen.component());
+    _ = try renderer.showDrawOverlay(panel.drawComponent(), overlayPanelOptions(backend.size, 1.0));
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var vx = try tui.vaxis.init(std.testing.io, allocator, &env_map, .{});
+    defer vx.deinit(allocator, &writer.writer);
+
+    try renderer.renderToVaxis(screen.drawComponent(), &vx, &writer.writer);
 
     var lines = tui.LineList.empty;
     errdefer freeLinesSafe(allocator, &lines);
-    for (renderer.previous_lines.items) |line| {
-        try lines.append(allocator, try allocator.dupe(u8, line));
-    }
+    try tui.cell_rows.appendAllocatingScreenRowsAsPlainLines(allocator, &vx.screen_last, backend.size.width, backend.size.height, &lines);
     return lines;
 }
 

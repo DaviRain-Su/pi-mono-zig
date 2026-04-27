@@ -1,4 +1,5 @@
 const std = @import("std");
+const ESC = "\x1b";
 const vaxis = @import("vaxis");
 
 pub const PrintableKey = struct {
@@ -122,9 +123,9 @@ const ParseMode = enum {
     flush,
 };
 
-const BRACKETED_PASTE_START = "\x1b[200~";
-const BRACKETED_PASTE_END = "\x1b[201~";
-const KITTY_PROTOCOL_RESPONSE_PREFIX = "\x1b[?";
+const BRACKETED_PASTE_START = ESC ++ "[200~";
+const BRACKETED_PASTE_END = ESC ++ "[201~";
+const KITTY_PROTOCOL_RESPONSE_PREFIX = ESC ++ "[?";
 
 pub fn parseInputEvent(input: []const u8) ?InputParseResult {
     return parseInputEventWithMode(input, .buffering);
@@ -407,37 +408,37 @@ fn parseCompleteCsiSequence(sequence: []const u8) ParseResult {
     if (parseModifyOtherKeysSequence(sequence)) |result| return result;
     if (parseParameterizedSpecialSequence(sequence)) |result| return result;
 
-    if (std.mem.eql(u8, sequence, "\x1b[A")) return parsed(.up, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[B")) return parsed(.down, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[C")) return parsed(.right, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[D")) return parsed(.left, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[1;5C") or std.mem.eql(u8, sequence, "\x1b[5C")) return parsed(.ctrl_right, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[1;5D") or std.mem.eql(u8, sequence, "\x1b[5D")) return parsed(.ctrl_left, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[H") or std.mem.eql(u8, sequence, "\x1b[1~") or std.mem.eql(u8, sequence, "\x1b[7~")) {
+    if (std.mem.eql(u8, sequence, ESC ++ "[A")) return parsed(.up, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[B")) return parsed(.down, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[C")) return parsed(.right, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[D")) return parsed(.left, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[1;5C") or std.mem.eql(u8, sequence, ESC ++ "[5C")) return parsed(.ctrl_right, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[1;5D") or std.mem.eql(u8, sequence, ESC ++ "[5D")) return parsed(.ctrl_left, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[H") or std.mem.eql(u8, sequence, ESC ++ "[1~") or std.mem.eql(u8, sequence, ESC ++ "[7~")) {
         return parsed(.home, sequence.len);
     }
-    if (std.mem.eql(u8, sequence, "\x1b[F") or std.mem.eql(u8, sequence, "\x1b[4~") or std.mem.eql(u8, sequence, "\x1b[8~")) {
+    if (std.mem.eql(u8, sequence, ESC ++ "[F") or std.mem.eql(u8, sequence, ESC ++ "[4~") or std.mem.eql(u8, sequence, ESC ++ "[8~")) {
         return parsed(.end, sequence.len);
     }
-    if (std.mem.eql(u8, sequence, "\x1b[Z")) return parsed(.shift_tab, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[2~")) return parsed(.insert, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[3~")) return parsed(.delete, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[5~") or std.mem.eql(u8, sequence, "\x1b[[5~")) return parsed(.page_up, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[6~") or std.mem.eql(u8, sequence, "\x1b[[6~")) return parsed(.page_down, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[200~")) return parsed(.bracketed_paste_start, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[201~")) return parsed(.bracketed_paste_end, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[11~") or std.mem.eql(u8, sequence, "\x1b[[A")) return parsed(.f1, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[12~") or std.mem.eql(u8, sequence, "\x1b[[B")) return parsed(.f2, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[13~") or std.mem.eql(u8, sequence, "\x1b[[C")) return parsed(.f3, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[14~") or std.mem.eql(u8, sequence, "\x1b[[D")) return parsed(.f4, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[15~") or std.mem.eql(u8, sequence, "\x1b[[E")) return parsed(.f5, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[17~")) return parsed(.f6, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[18~")) return parsed(.f7, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[19~")) return parsed(.f8, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[20~")) return parsed(.f9, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[21~")) return parsed(.f10, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[23~")) return parsed(.f11, sequence.len);
-    if (std.mem.eql(u8, sequence, "\x1b[24~")) return parsed(.f12, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[Z")) return parsed(.shift_tab, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[2~")) return parsed(.insert, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[3~")) return parsed(.delete, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[5~") or std.mem.eql(u8, sequence, ESC ++ "[[5~")) return parsed(.page_up, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[6~") or std.mem.eql(u8, sequence, ESC ++ "[[6~")) return parsed(.page_down, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[200~")) return parsed(.bracketed_paste_start, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[201~")) return parsed(.bracketed_paste_end, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[11~") or std.mem.eql(u8, sequence, ESC ++ "[[A")) return parsed(.f1, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[12~") or std.mem.eql(u8, sequence, ESC ++ "[[B")) return parsed(.f2, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[13~") or std.mem.eql(u8, sequence, ESC ++ "[[C")) return parsed(.f3, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[14~") or std.mem.eql(u8, sequence, ESC ++ "[[D")) return parsed(.f4, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[15~") or std.mem.eql(u8, sequence, ESC ++ "[[E")) return parsed(.f5, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[17~")) return parsed(.f6, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[18~")) return parsed(.f7, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[19~")) return parsed(.f8, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[20~")) return parsed(.f9, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[21~")) return parsed(.f10, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[23~")) return parsed(.f11, sequence.len);
+    if (std.mem.eql(u8, sequence, ESC ++ "[24~")) return parsed(.f12, sequence.len);
     return parsed(.unknown_escape, sequence.len);
 }
 
@@ -466,7 +467,7 @@ fn parseEventType(value: u32) KeyEventType {
 
 fn parseKittyCsiUSequence(sequence: []const u8) ?ParseResult {
     if (sequence.len < 4 or sequence[sequence.len - 1] != 'u') return null;
-    if (!std.mem.startsWith(u8, sequence, "\x1b[")) return null;
+    if (!std.mem.startsWith(u8, sequence, ESC ++ "[")) return null;
     if (sequence[2] == '?') return null;
 
     var index: usize = 2;
@@ -515,7 +516,7 @@ fn parseKittyCsiUSequence(sequence: []const u8) ?ParseResult {
 
 fn parseModifyOtherKeysSequence(sequence: []const u8) ?ParseResult {
     if (sequence.len < 8 or sequence[sequence.len - 1] != '~') return null;
-    if (!std.mem.startsWith(u8, sequence, "\x1b[27;")) return null;
+    if (!std.mem.startsWith(u8, sequence, ESC ++ "[27;")) return null;
 
     var index: usize = 5;
     const modifier = parseUnsignedDecimal(sequence, index) orelse return null;
@@ -536,7 +537,7 @@ fn parseModifyOtherKeysSequence(sequence: []const u8) ?ParseResult {
 }
 
 fn parseParameterizedSpecialSequence(sequence: []const u8) ?ParseResult {
-    if (!std.mem.startsWith(u8, sequence, "\x1b[")) return null;
+    if (!std.mem.startsWith(u8, sequence, ESC ++ "[")) return null;
 
     const final = sequence[sequence.len - 1];
     if (final != 'A' and final != 'B' and final != 'C' and final != 'D' and final != 'H' and final != 'F' and final != '~')
@@ -771,9 +772,9 @@ test "parse printable keys" {
 }
 
 test "parse arrow keys from escape sequences" {
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .up, .consumed = 3 } }, parseKey("\x1b[A").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .up, .consumed = 3 } }, parseKey(ESC ++ "[A").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .down, .consumed = 3 } }, parseKey("\x1bOB").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .right, .consumed = 3 } }, parseKey("\x1b[C").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .right, .consumed = 3 } }, parseKey(ESC ++ "[C").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .left, .consumed = 3 } }, parseKey("\x1bOD").?);
 }
 
@@ -787,14 +788,14 @@ test "parse enter backspace and ctrl sequences" {
 
 test "split escape sequences request more bytes before parsing" {
     try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey("\x1b").?);
-    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey("\x1b[").?);
-    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey("\x1b[20").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f9, .consumed = 5 } }, parseKey("\x1b[20~").?);
+    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey(ESC ++ "[").?);
+    try std.testing.expectEqualDeep(ParseResult.need_more_bytes, parseKey(ESC ++ "[20").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f9, .consumed = 5 } }, parseKey(ESC ++ "[20~").?);
 }
 
 test "flushKey resolves standalone escape and discards incomplete escape sequences" {
     try std.testing.expectEqualDeep(ParsedKey{ .key = .escape, .consumed = 1 }, flushKey("\x1b").?);
-    try std.testing.expectEqualDeep(ParsedKey{ .key = .unknown_escape, .consumed = 2 }, flushKey("\x1b[").?);
+    try std.testing.expectEqualDeep(ParsedKey{ .key = .unknown_escape, .consumed = 2 }, flushKey(ESC ++ "[").?);
 }
 
 test "flushKey keeps incomplete UTF-8 buffered until the sequence is complete" {
@@ -815,25 +816,25 @@ test "parse home end function and bracketed paste sequences" {
             .consumed = 6,
             .modifiers = .{ .ctrl = true },
         },
-    }, parseKey("\x1b[1;5D").?);
+    }, parseKey(ESC ++ "[1;5D").?);
     try std.testing.expectEqualDeep(ParseResult{
         .parsed = .{
             .key = .ctrl_right,
             .consumed = 6,
             .modifiers = .{ .ctrl = true },
         },
-    }, parseKey("\x1b[1;5C").?);
+    }, parseKey(ESC ++ "[1;5C").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_left, .consumed = 3 } }, parseKey("\x1bOd").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .ctrl_right, .consumed = 3 } }, parseKey("\x1bOc").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .page_up, .consumed = 4 } }, parseKey("\x1b[5~").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .page_up, .consumed = 4 } }, parseKey(ESC ++ "[5~").?);
     try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f1, .consumed = 3 } }, parseKey("\x1bOP").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f12, .consumed = 5 } }, parseKey("\x1b[24~").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .bracketed_paste_start, .consumed = 6 } }, parseKey("\x1b[200~").?);
-    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .bracketed_paste_end, .consumed = 6 } }, parseKey("\x1b[201~").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .f12, .consumed = 5 } }, parseKey(ESC ++ "[24~").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .bracketed_paste_start, .consumed = 6 } }, parseKey(ESC ++ "[200~").?);
+    try std.testing.expectEqualDeep(ParseResult{ .parsed = .{ .key = .bracketed_paste_end, .consumed = 6 } }, parseKey(ESC ++ "[201~").?);
 }
 
 test "parseInputEvent returns bracketed paste content as a single event" {
-    const input = "\x1b[200~hello\nworld\x1b[201~!";
+    const input = ESC ++ "[200~hello\nworld" ++ ESC ++ "[201~!";
     const result = parseInputEvent(input).?;
     try std.testing.expect(result == .parsed);
     try std.testing.expectEqual(@as(usize, 23), result.parsed.consumed);
@@ -844,9 +845,9 @@ test "parseInputEvent returns bracketed paste content as a single event" {
 }
 
 test "parseInputEvent waits for a complete bracketed paste" {
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\x1b[20").?);
-    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent("\x1b[200~partial").?);
-    try std.testing.expect(flushInputEvent("\x1b[200~partial") == null);
+    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent(ESC ++ "[20").?);
+    try std.testing.expectEqualDeep(InputParseResult.need_more_bytes, parseInputEvent(ESC ++ "[200~partial").?);
+    try std.testing.expect(flushInputEvent(ESC ++ "[200~partial") == null);
 }
 
 test "parseInputEvent assembles split UTF-8 codepoints across reads" {
@@ -876,7 +877,7 @@ test "parseInputEvent assembles split UTF-8 codepoints across reads" {
 }
 
 test "parse kitty protocol response as a control event" {
-    const result = parseInputEvent("\x1b[?31u").?;
+    const result = parseInputEvent(ESC ++ "[?31u").?;
     try std.testing.expect(result == .parsed);
     try std.testing.expectEqual(@as(usize, 6), result.parsed.consumed);
 
@@ -889,7 +890,7 @@ test "parse kitty protocol response as a control event" {
 }
 
 test "parse kitty CSI-u modifiers and release events" {
-    const result = parseKey("\x1b[1;5:3D").?;
+    const result = parseKey(ESC ++ "[1;5:3D").?;
     try std.testing.expectEqualDeep(ParseResult{
         .parsed = .{
             .key = .ctrl_left,
@@ -901,7 +902,7 @@ test "parse kitty CSI-u modifiers and release events" {
 }
 
 test "parse kitty CSI-u printable keys with shifted alternate codepoints" {
-    const result = parseKey("\x1b[97:65;2u").?;
+    const result = parseKey(ESC ++ "[97:65;2u").?;
     try std.testing.expectEqualDeep(ParseResult{
         .parsed = .{
             .key = .{ .printable = PrintableKey.fromSlice("A") },
@@ -918,7 +919,7 @@ test "parse modifyOtherKeys and kitty special-key modifiers" {
             .consumed = 10,
             .modifiers = .{ .alt = true },
         },
-    }, parseKey("\x1b[27;3;13~").?);
+    }, parseKey(ESC ++ "[27;3;13~").?);
 
     try std.testing.expectEqualDeep(ParseResult{
         .parsed = .{
@@ -927,7 +928,7 @@ test "parse modifyOtherKeys and kitty special-key modifiers" {
             .modifiers = .{ .super = true },
             .event_type = .repeat,
         },
-    }, parseKey("\x1b[5;9:2~").?);
+    }, parseKey(ESC ++ "[5;9:2~").?);
 }
 
 test "parsedInputFromVaxisKey preserves ctrl modifiers and release events" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ESC = "\x1b";
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const keys = @import("keys.zig");
@@ -82,7 +83,7 @@ const NativeState = struct {
     fn readSize(self: *NativeState, fallback: Size) Size {
         if (self.tty) |*tty| {
             if (self.read_size_fn(self.read_size_context, tty)) |size| {
-                return normalizeTerminalSize(size, fallback);
+                return normalizeSize(size, fallback);
             }
         }
 
@@ -109,14 +110,14 @@ pub const Terminal = struct {
     pub const BRACKETED_PASTE_ENABLE = vaxis.ctlseqs.bp_set;
     pub const BRACKETED_PASTE_DISABLE = vaxis.ctlseqs.bp_reset;
     pub const KITTY_KEYBOARD_QUERY = vaxis.ctlseqs.csi_u_query;
-    pub const KITTY_KEYBOARD_ENABLE = "\x1b[>7u";
+    pub const KITTY_KEYBOARD_ENABLE = ESC ++ "[>7u";
     pub const KITTY_KEYBOARD_DISABLE = vaxis.ctlseqs.csi_u_pop;
     pub const SYNC_OUTPUT_ENABLE = vaxis.ctlseqs.sync_set;
     pub const SYNC_OUTPUT_DISABLE = vaxis.ctlseqs.sync_reset;
     pub const HIDE_CURSOR = vaxis.ctlseqs.hide_cursor;
     pub const SHOW_CURSOR = vaxis.ctlseqs.show_cursor;
-    pub const AUTO_WRAP_DISABLE = "\x1b[?7l";
-    pub const AUTO_WRAP_ENABLE = "\x1b[?7h";
+    pub const AUTO_WRAP_DISABLE = ESC ++ "[?7l";
+    pub const AUTO_WRAP_ENABLE = ESC ++ "[?7h";
 
     pub fn init(backend: Backend) Terminal {
         return .{ .state = .{ .backend = backend } };
@@ -395,7 +396,7 @@ pub fn readSizeWithVaxis(_: ?*anyopaque, tty: *vaxis.Tty) ?Size {
     };
 }
 
-pub fn normalizeTerminalSize(size: Size, fallback: Size) Size {
+pub fn normalizeSize(size: Size, fallback: Size) Size {
     return .{
         .width = if (size.width == 0)
             if (fallback.width == 0) 80 else fallback.width

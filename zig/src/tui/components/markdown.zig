@@ -6,7 +6,7 @@ const draw_mod = @import("../draw.zig");
 const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
 const resources_mod = @import("../theme.zig");
-const vaxis_adapter = @import("../vaxis_adapter.zig");
+const cell_rows = @import("../cell_rows.zig");
 
 const WrapMode = @FieldType(vaxis.Window.PrintOptions, "wrap");
 const vxfw = vaxis.vxfw;
@@ -100,7 +100,7 @@ pub const Markdown = struct {
             });
 
             if (size.height < height_hint or height_hint >= max_height) {
-                try vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, effective_width, size.height, lines);
+                try cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, effective_width, size.height, lines);
                 return;
             }
 

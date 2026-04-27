@@ -4,7 +4,7 @@ const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 
-pub const RenderMode = enum {
+pub const ImageDisplayMode = enum {
     placeholder,
     ascii,
 };
@@ -40,7 +40,7 @@ pub const Image = struct {
     filename: ?[]const u8 = null,
     max_width_cells: ?usize = null,
     max_height_cells: ?usize = null,
-    mode: RenderMode = .placeholder,
+    mode: ImageDisplayMode = .placeholder,
     ascii_art: ?[]const u8 = null,
     kitty_image: ?KittyImage = null,
     padding_x: usize = 0,
