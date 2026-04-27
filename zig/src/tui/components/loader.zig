@@ -1,7 +1,10 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
+const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
+const test_helpers = @import("../test_helpers.zig");
 
 pub const LoaderStyle = enum {
     spinner,
@@ -31,6 +34,13 @@ pub const Loader = struct {
         return .{
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    pub fn drawComponent(self: *const Loader) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
         };
     }
 
@@ -78,6 +88,17 @@ pub const Loader = struct {
         return indicator_frames[self.frame_index % indicator_frames.len];
     }
 
+    pub fn draw(
+        self: *const Loader,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        window.clear();
+        const display = try self.displayText(ctx.arena);
+        const rendered_height = drawWrappedSegment(window, display, self.padding_x, self.padding_y, self.padding_y, .{});
+        return .{ .width = window.width, .height = @intCast(rendered_height) };
+    }
+
     pub fn renderInto(
         self: *const Loader,
         allocator: std.mem.Allocator,
@@ -97,6 +118,15 @@ pub const Loader = struct {
     ) std.mem.Allocator.Error!void {
         const self: *const Loader = @ptrCast(@alignCast(ptr));
         try self.renderInto(allocator, width, lines);
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const Loader = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
     }
 
     fn displayText(self: *const Loader, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -152,6 +182,13 @@ pub const CancellableLoader = struct {
         };
     }
 
+    pub fn drawComponent(self: *const CancellableLoader) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
+        };
+    }
+
     pub fn signal(self: *CancellableLoader) *std.atomic.Value(bool) {
         return &self.abort_signal;
     }
@@ -177,6 +214,33 @@ pub const CancellableLoader = struct {
         }
     }
 
+    pub fn draw(
+        self: *const CancellableLoader,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        window.clear();
+        const display = try self.loader.displayText(ctx.arena);
+        const loader_height = drawWrappedSegment(
+            window,
+            display,
+            self.loader.padding_x,
+            self.loader.padding_y,
+            self.loader.padding_y,
+            .{},
+        );
+        if (!self.show_cancel_hint or loader_height >= window.height) {
+            return .{ .width = window.width, .height = @intCast(loader_height) };
+        }
+
+        const hint_window = window.child(.{
+            .y_off = @intCast(loader_height),
+            .height = window.height - @as(u16, @intCast(loader_height)),
+        });
+        const hint_height = drawWrappedSegment(hint_window, self.cancel_hint, self.loader.padding_x, 0, 0, .{ .dim = true });
+        return .{ .width = window.width, .height = @intCast(@min(@as(usize, window.height), loader_height + hint_height)) };
+    }
+
     pub fn renderInto(
         self: *const CancellableLoader,
         allocator: std.mem.Allocator,
@@ -185,10 +249,7 @@ pub const CancellableLoader = struct {
     ) std.mem.Allocator.Error!void {
         try self.loader.renderInto(allocator, width, lines);
         if (!self.show_cancel_hint) return;
-
-        const hint = try std.fmt.allocPrint(allocator, "\x1b[2m{s}\x1b[0m", .{self.cancel_hint});
-        defer allocator.free(hint);
-        try renderWrappedText(allocator, hint, width, self.loader.padding_x, 0, lines);
+        try renderWrappedText(allocator, self.cancel_hint, width, self.loader.padding_x, 0, lines);
     }
 
     fn renderIntoOpaque(
@@ -199,6 +260,15 @@ pub const CancellableLoader = struct {
     ) std.mem.Allocator.Error!void {
         const self: *const CancellableLoader = @ptrCast(@alignCast(ptr));
         try self.renderInto(allocator, width, lines);
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const CancellableLoader = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
     }
 };
 
@@ -213,6 +283,37 @@ const DEFAULT_GROW_FRAMES = [_][]const u8{ "▁", "▃", "▄", "▆", "█", "�
 
 fn resolvedIntervalMs(interval_ms: u32) u64 {
     return if (interval_ms == 0) DEFAULT_INTERVAL_MS else interval_ms;
+}
+
+fn drawWrappedSegment(
+    window: vaxis.Window,
+    text: []const u8,
+    padding_x: usize,
+    padding_top: usize,
+    padding_bottom: usize,
+    style: vaxis.Cell.Style,
+) usize {
+    const pad_x: u16 = @intCast(@min(padding_x, window.width));
+    const pad_top: u16 = @intCast(@min(padding_top, window.height));
+    const pad_bottom: u16 = @intCast(@min(padding_bottom, window.height - pad_top));
+    if (window.width <= pad_x * 2 or window.height <= pad_top + pad_bottom) {
+        return @min(window.height, pad_top + pad_bottom);
+    }
+
+    const inner = window.child(.{
+        .x_off = @intCast(pad_x),
+        .y_off = @intCast(pad_top),
+        .width = window.width - pad_x * 2,
+        .height = window.height - pad_top - pad_bottom,
+    });
+    const result = inner.printSegment(.{ .text = text, .style = style }, .{ .wrap = .grapheme });
+    return @min(window.height, pad_top + renderedLineCount(result, text.len > 0, inner.height) + pad_bottom);
+}
+
+fn renderedLineCount(result: vaxis.Window.PrintResult, had_text: bool, max_height: u16) usize {
+    if (!had_text or max_height == 0) return 0;
+    if (result.overflow) return max_height;
+    return @min(max_height, result.row + if (result.col > 0) @as(u16, 1) else 0);
 }
 
 fn renderWrappedText(
@@ -256,37 +357,25 @@ fn renderWrappedText(
     }
 }
 
-fn renderLines(
-    allocator: std.mem.Allocator,
-    component: component_mod.Component,
-    width: usize,
-) !component_mod.LineList {
-    var lines = component_mod.LineList.empty;
-    errdefer component_mod.freeLines(allocator, &lines);
-    try component.renderInto(allocator, width, &lines);
-    return lines;
-}
-
 test "loader renders animated spinner frames" {
-    const allocator = std.testing.allocator;
-
     var loader = Loader{ .message = "Loading..." };
 
-    var first = try renderLines(allocator, loader.component(), 18);
-    defer component_mod.freeLines(allocator, &first);
-    try std.testing.expectEqual(@as(usize, 1), first.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, first.items[0], "⠋ Loading...") != null);
+    {
+        var screen = try test_helpers.renderToScreen(loader.drawComponent(), 18, 1);
+        defer screen.deinit(std.testing.allocator);
+        try test_helpers.expectCell(&screen, 0, 0, "⠋", .{});
+        try test_helpers.expectCell(&screen, 2, 0, "L", .{});
+    }
 
     loader.advanceFrame();
-    var second = try renderLines(allocator, loader.component(), 18);
-    defer component_mod.freeLines(allocator, &second);
-    try std.testing.expect(std.mem.indexOf(u8, second.items[0], "⠙ Loading...") != null);
-    try std.testing.expect(!std.mem.eql(u8, first.items[0], second.items[0]));
+    {
+        var screen = try test_helpers.renderToScreen(loader.drawComponent(), 18, 1);
+        defer screen.deinit(std.testing.allocator);
+        try test_helpers.expectCell(&screen, 0, 0, "⠙", .{});
+    }
 }
 
 test "loader supports alternate styles and elapsed time frame selection" {
-    const allocator = std.testing.allocator;
-
     var loader = Loader{
         .message = "Syncing",
         .indicator = .{
@@ -296,42 +385,52 @@ test "loader supports alternate styles and elapsed time frame selection" {
     };
     loader.setElapsedMs(240);
 
-    var builtin = try renderLines(allocator, loader.component(), 16);
-    defer component_mod.freeLines(allocator, &builtin);
-    try std.testing.expect(std.mem.indexOf(u8, builtin.items[0], "... Syncing") != null);
+    {
+        var screen = try test_helpers.renderToScreen(loader.drawComponent(), 16, 1);
+        defer screen.deinit(std.testing.allocator);
+
+        const rendered = try test_helpers.screenToString(&screen);
+        defer std.testing.allocator.free(rendered);
+        try std.testing.expect(std.mem.startsWith(u8, rendered, "... Syncing"));
+    }
 
     loader.setFrames(&[_][]const u8{ "[   ]", "[=  ]", "[== ]", "[===]" });
     loader.setFrameIndex(2);
 
-    var custom = try renderLines(allocator, loader.component(), 18);
-    defer component_mod.freeLines(allocator, &custom);
-    try std.testing.expect(std.mem.indexOf(u8, custom.items[0], "[== ] Syncing") != null);
+    {
+        var screen = try test_helpers.renderToScreen(loader.drawComponent(), 18, 1);
+        defer screen.deinit(std.testing.allocator);
+
+        const custom = try test_helpers.screenToString(&screen);
+        defer std.testing.allocator.free(custom);
+        try std.testing.expect(std.mem.startsWith(u8, custom, "[== ] Syncing"));
+    }
 }
 
 test "loader includes additional spinner style presets" {
-    const allocator = std.testing.allocator;
-
     var loader = Loader{
         .message = "Polishing",
         .indicator = .{ .style = .arc },
         .frame_index = 2,
     };
 
-    var arc = try renderLines(allocator, loader.component(), 16);
-    defer component_mod.freeLines(allocator, &arc);
-    try std.testing.expect(std.mem.indexOf(u8, arc.items[0], "◝ Polishing") != null);
+    {
+        var screen = try test_helpers.renderToScreen(loader.drawComponent(), 16, 1);
+        defer screen.deinit(std.testing.allocator);
+        try test_helpers.expectCell(&screen, 0, 0, "◝", .{});
+    }
 
     loader.setStyle(.grow);
     loader.setFrameIndex(4);
 
-    var grow = try renderLines(allocator, loader.component(), 16);
-    defer component_mod.freeLines(allocator, &grow);
-    try std.testing.expect(std.mem.indexOf(u8, grow.items[0], "█ Polishing") != null);
+    {
+        var screen = try test_helpers.renderToScreen(loader.drawComponent(), 16, 1);
+        defer screen.deinit(std.testing.allocator);
+        try test_helpers.expectCell(&screen, 0, 0, "█", .{});
+    }
 }
 
-test "cancellable loader renders cancel hint and aborts on escape" {
-    const allocator = std.testing.allocator;
-
+test "cancellable loader renders dim cancel hint and aborts on escape" {
     var callback_count = std.atomic.Value(u32).init(0);
     const CallbackContext = struct {
         fn onAbort(context: ?*anyopaque) void {
@@ -352,12 +451,11 @@ test "cancellable loader renders cancel hint and aborts on escape" {
         },
     };
 
-    var lines = try renderLines(allocator, loader.component(), 24);
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreen(loader.drawComponent(), 24, 2);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "| Working") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "Esc to cancel") != null);
+    try test_helpers.expectCell(&screen, 0, 0, "|", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "E", .{ .dim = true });
     try std.testing.expectEqual(CancellableHandleResult.ignored, loader.handleKey(.enter));
     try std.testing.expect(!loader.aborted());
 

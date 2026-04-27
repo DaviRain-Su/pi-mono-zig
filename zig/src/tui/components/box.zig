@@ -1,6 +1,11 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
+const draw_mod = @import("../draw.zig");
+const style_mod = @import("../style.zig");
+const test_helpers = @import("../test_helpers.zig");
+const vaxis_adapter_mod = @import("../vaxis_adapter.zig");
 const resources_mod = @import("../theme.zig");
 
 pub const BorderStyle = enum {
@@ -53,6 +58,43 @@ pub const Box = struct {
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
         };
+    }
+
+    pub fn drawComponent(self: *const Box) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
+        };
+    }
+
+    pub fn draw(
+        self: *const Box,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        if (self.children.items.len == 0) {
+            return .{ .width = window.width, .height = 0 };
+        }
+
+        window.clear();
+        const active_theme = ctx.theme orelse self.theme;
+        const bordered = if (self.borderStyle(active_theme)) |border|
+            window.child(.{ .border = border })
+        else
+            window;
+        bordered.clear();
+
+        const content_window = innerWindow(bordered, self.padding_x, self.padding_y) orelse {
+            return .{ .width = window.width, .height = window.height };
+        };
+
+        var child_lines = component_mod.LineList.empty;
+        for (self.children.items) |child| {
+            try child.renderInto(ctx.arena, @max(@as(usize, content_window.width), 1), &child_lines);
+        }
+        try vaxis_adapter_mod.renderLineListToWindow(content_window, child_lines.items, ctx.arena);
+
+        return .{ .width = window.width, .height = window.height };
     }
 
     pub fn renderInto(
@@ -132,6 +174,20 @@ pub const Box = struct {
         try component_mod.appendOwnedLine(lines, allocator, bottom_border);
     }
 
+    fn borderStyle(self: *const Box, theme: ?*const resources_mod.Theme) ?vaxis.Window.BorderOptions {
+        if (self.border_style == .none) return null;
+        return .{
+            .where = .all,
+            .style = if (theme) |active_theme| style_mod.styleFor(active_theme, .box_border) else .{},
+            .glyphs = switch (self.border_style) {
+                .none => unreachable,
+                .single => if (self.corner_style == .rounded) .single_rounded else .single_square,
+                .double => .{ .custom = .{ "╔", "═", "╗", "║", "╝", "╚" } },
+                .thick => .{ .custom = .{ "┏", "━", "┓", "┃", "┛", "┗" } },
+            },
+        };
+    }
+
     fn borderGlyphs(self: *const Box) BorderGlyphs {
         return switch (self.border_style) {
             .none => .{
@@ -188,7 +244,28 @@ pub const Box = struct {
         const self: *const Box = @ptrCast(@alignCast(ptr));
         try self.renderInto(allocator, width, lines);
     }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const Box = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
+    }
 };
+
+fn innerWindow(window: vaxis.Window, padding_x: usize, padding_y: usize) ?vaxis.Window {
+    const pad_x: u16 = @intCast(@min(padding_x, window.width));
+    const pad_y: u16 = @intCast(@min(padding_y, window.height));
+    if (window.width <= pad_x * 2 or window.height <= pad_y * 2) return null;
+    return window.child(.{
+        .x_off = @intCast(pad_x),
+        .y_off = @intCast(pad_y),
+        .width = window.width - pad_x * 2,
+        .height = window.height - pad_y * 2,
+    });
+}
 
 fn renderBorderLine(
     allocator: std.mem.Allocator,
@@ -236,8 +313,6 @@ fn renderInteriorLine(
 }
 
 test "box renders nested text with outer padding" {
-    const allocator = std.testing.allocator;
-
     const text = @import("text.zig").Text{
         .text = "hello",
         .padding_x = 0,
@@ -245,25 +320,22 @@ test "box renders nested text with outer padding" {
     };
 
     var box = Box.init(1, 1);
-    defer box.deinit(allocator);
-    try box.addChild(allocator, text.component());
+    defer box.deinit(std.testing.allocator);
+    box.border_style = .none;
+    try box.addChild(std.testing.allocator, text.component());
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreen(box.drawComponent(), 8, 3);
+    defer screen.deinit(std.testing.allocator);
 
-    try box.renderInto(allocator, 8, &lines);
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
 
-    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqualStrings("        ", lines.items[0]);
-    try std.testing.expectEqualStrings(" hello  ", lines.items[1]);
-    try std.testing.expectEqualStrings("        ", lines.items[2]);
+    try std.testing.expectEqualStrings("        \n hello  \n        ", rendered);
 }
 
-test "box renders themed borders when a theme is provided" {
-    const allocator = std.testing.allocator;
-
-    var theme = try resources_mod.Theme.initDefault(allocator);
-    defer theme.deinit(allocator);
+test "box renders themed borders via vaxis child windows" {
+    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
+    defer theme.deinit(std.testing.allocator);
 
     const text = @import("text.zig").Text{
         .text = "hello",
@@ -272,28 +344,22 @@ test "box renders themed borders when a theme is provided" {
     };
 
     var box = Box.init(1, 0);
-    defer box.deinit(allocator);
+    defer box.deinit(std.testing.allocator);
     box.theme = &theme;
-    try box.addChild(allocator, text.component());
+    try box.addChild(std.testing.allocator, text.component());
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreenWithTheme(box.drawComponent(), 9, 3, &theme);
+    defer screen.deinit(std.testing.allocator);
 
-    try box.renderInto(allocator, 9, &lines);
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
 
-    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "┌") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "│") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[2], "┘") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[") != null);
+    try std.testing.expectEqualStrings("┌───────┐\n│ hello │\n└───────┘", rendered);
+    try test_helpers.expectCell(&screen, 0, 0, "┌", style_mod.styleFor(&theme, .box_border));
+    try test_helpers.expectCell(&screen, 8, 2, "┘", style_mod.styleFor(&theme, .box_border));
 }
 
 test "box supports rounded, double, and thick border styles" {
-    const allocator = std.testing.allocator;
-
-    var theme = try resources_mod.Theme.initDefault(allocator);
-    defer theme.deinit(allocator);
-
     const text = @import("text.zig").Text{
         .text = "polish",
         .padding_x = 0,
@@ -301,38 +367,32 @@ test "box supports rounded, double, and thick border styles" {
     };
 
     var rounded = Box.init(1, 0);
-    defer rounded.deinit(allocator);
-    rounded.theme = &theme;
+    defer rounded.deinit(std.testing.allocator);
     rounded.corner_style = .rounded;
-    try rounded.addChild(allocator, text.component());
+    try rounded.addChild(std.testing.allocator, text.component());
 
-    var rounded_lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &rounded_lines);
-    try rounded.renderInto(allocator, 12, &rounded_lines);
-    try std.testing.expect(std.mem.indexOf(u8, rounded_lines.items[0], "╭") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rounded_lines.items[2], "╯") != null);
+    var rounded_screen = try test_helpers.renderToScreen(rounded.drawComponent(), 12, 3);
+    defer rounded_screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&rounded_screen, 0, 0, "╭", .{});
+    try test_helpers.expectCell(&rounded_screen, 11, 2, "╯", .{});
 
     var double = Box.init(1, 0);
-    defer double.deinit(allocator);
-    double.theme = &theme;
+    defer double.deinit(std.testing.allocator);
     double.border_style = .double;
-    try double.addChild(allocator, text.component());
+    try double.addChild(std.testing.allocator, text.component());
 
-    var double_lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &double_lines);
-    try double.renderInto(allocator, 12, &double_lines);
-    try std.testing.expect(std.mem.indexOf(u8, double_lines.items[0], "╔") != null);
-    try std.testing.expect(std.mem.indexOf(u8, double_lines.items[1], "║") != null);
+    var double_screen = try test_helpers.renderToScreen(double.drawComponent(), 12, 3);
+    defer double_screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&double_screen, 0, 0, "╔", .{});
+    try test_helpers.expectCell(&double_screen, 0, 1, "║", .{});
 
     var thick = Box.init(1, 0);
-    defer thick.deinit(allocator);
-    thick.theme = &theme;
+    defer thick.deinit(std.testing.allocator);
     thick.border_style = .thick;
-    try thick.addChild(allocator, text.component());
+    try thick.addChild(std.testing.allocator, text.component());
 
-    var thick_lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &thick_lines);
-    try thick.renderInto(allocator, 12, &thick_lines);
-    try std.testing.expect(std.mem.indexOf(u8, thick_lines.items[0], "┏") != null);
-    try std.testing.expect(std.mem.indexOf(u8, thick_lines.items[1], "┃") != null);
+    var thick_screen = try test_helpers.renderToScreen(thick.drawComponent(), 12, 3);
+    defer thick_screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&thick_screen, 0, 0, "┏", .{});
+    try test_helpers.expectCell(&thick_screen, 0, 1, "┃", .{});
 }

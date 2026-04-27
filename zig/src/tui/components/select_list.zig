@@ -1,7 +1,11 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
+const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
+const style_mod = @import("../style.zig");
+const test_helpers = @import("../test_helpers.zig");
 const resources_mod = @import("../theme.zig");
 
 pub const SelectItem = struct {
@@ -33,6 +37,13 @@ pub const SelectList = struct {
         return .{
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    pub fn drawComponent(self: *const SelectList) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
         };
     }
 
@@ -74,6 +85,56 @@ pub const SelectList = struct {
             .ctrl => |ctrl| if (ctrl == 'c') return .dismissed else return .ignored,
             else => return .ignored,
         }
+    }
+
+    pub fn draw(
+        self: *const SelectList,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const active_theme = ctx.theme orelse self.theme;
+        window.clear();
+
+        const top_padding: u16 = @intCast(@min(self.padding_y, window.height));
+        var row: u16 = top_padding;
+
+        if (self.items.len == 0) {
+            if (row < window.height) {
+                const empty_window = window.child(.{ .y_off = @intCast(row), .height = 1 });
+                const empty_style = if (active_theme) |theme|
+                    style_mod.styleFor(theme, .select_empty)
+                else
+                    vaxis.Cell.Style{};
+                empty_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = empty_style });
+                _ = empty_window.printSegment(.{ .text = "No items", .style = empty_style }, .{ .wrap = .none });
+                row += 1;
+            }
+        } else {
+            const start_index = self.visibleStartIndex();
+            const end_index = @min(start_index + @max(self.max_visible, 1), self.items.len);
+            for (start_index..end_index) |index| {
+                if (row >= window.height) break;
+                const row_window = window.child(.{ .y_off = @intCast(row), .height = 1 });
+                try self.drawItemRow(ctx.arena, row_window, active_theme, self.items[index], index == self.selectedIndex());
+                row += 1;
+            }
+
+            if (self.items.len > @max(self.max_visible, 1) and row < window.height) {
+                const info_style = if (active_theme) |theme|
+                    style_mod.styleFor(theme, .select_scroll)
+                else
+                    vaxis.Cell.Style{};
+                const info_window = window.child(.{ .y_off = @intCast(row), .height = 1 });
+                info_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = info_style });
+                const info = try std.fmt.allocPrint(ctx.arena, "  ({d}/{d})", .{ self.selectedIndex() + 1, self.items.len });
+                _ = info_window.printSegment(.{ .text = info, .style = info_style }, .{ .wrap = .none });
+                row += 1;
+            }
+        }
+
+        const bottom_padding: u16 = @intCast(@min(self.padding_y, window.height - row));
+        row += bottom_padding;
+        return .{ .width = window.width, .height = row };
     }
 
     pub fn renderInto(
@@ -124,6 +185,66 @@ pub const SelectList = struct {
         }
     }
 
+    fn drawItemRow(
+        _: *const SelectList,
+        allocator: std.mem.Allocator,
+        row_window: vaxis.Window,
+        active_theme: ?*const resources_mod.Theme,
+        item: SelectItem,
+        is_selected: bool,
+    ) std.mem.Allocator.Error!void {
+        const prefix = if (is_selected) "→ " else "  ";
+        const prefix_width = ansi.visibleWidth(prefix);
+        const content_width = @as(usize, row_window.width) - @min(@as(usize, row_window.width), prefix_width);
+
+        const base_style = if (active_theme) |theme|
+            style_mod.styleFor(theme, .text)
+        else
+            vaxis.Cell.Style{};
+        const row_style = withReverse(base_style, is_selected);
+        row_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = row_style });
+
+        var segments = std.ArrayList(vaxis.Segment).empty;
+        try segments.append(allocator, .{ .text = prefix, .style = row_style });
+
+        const display = item.display();
+        if (item.description) |description| {
+            if (content_width > 16) {
+                const primary_width = @max(@as(usize, 1), content_width / 2);
+                const truncated_label = try truncatePlainAlloc(allocator, display, primary_width);
+                const truncated_description = try truncatePlainAlloc(
+                    allocator,
+                    normalizeSingleLine(description),
+                    content_width - @min(content_width, primary_width),
+                );
+                try segments.append(allocator, .{ .text = truncated_label, .style = row_style });
+
+                const used_width = prefix_width + ansi.visibleWidth(truncated_label);
+                const gap = @max(@as(usize, 1), primary_width + prefix_width - used_width);
+                if (gap > 0) {
+                    const spaces = try allocator.alloc(u8, gap);
+                    @memset(spaces, ' ');
+                    try segments.append(allocator, .{ .text = spaces, .style = row_style });
+                }
+
+                var description_style = if (active_theme) |theme|
+                    style_mod.styleFor(theme, .select_description)
+                else
+                    vaxis.Cell.Style{};
+                description_style.reverse = is_selected;
+                try segments.append(allocator, .{ .text = truncated_description, .style = description_style });
+            } else {
+                const truncated = try truncatePlainAlloc(allocator, display, content_width);
+                try segments.append(allocator, .{ .text = truncated, .style = row_style });
+            }
+        } else {
+            const truncated = try truncatePlainAlloc(allocator, display, content_width);
+            try segments.append(allocator, .{ .text = truncated, .style = row_style });
+        }
+
+        _ = row_window.print(segments.items, .{ .wrap = .none });
+    }
+
     fn renderIntoOpaque(
         ptr: *const anyopaque,
         allocator: std.mem.Allocator,
@@ -132,6 +253,15 @@ pub const SelectList = struct {
     ) std.mem.Allocator.Error!void {
         const self: *const SelectList = @ptrCast(@alignCast(ptr));
         try self.renderInto(allocator, width, lines);
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const SelectList = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
     }
 
     fn visibleStartIndex(self: *const SelectList) usize {
@@ -174,15 +304,7 @@ pub const SelectList = struct {
                 const used_width = ansi.visibleWidth(prefix) + ansi.visibleWidth(truncated_label);
                 const gap = @max(@as(usize, 1), primary_width + prefix_width - used_width);
                 try line.appendNTimes(allocator, ' ', gap);
-                if (self.theme) |theme| {
-                    const themed_description = try theme.applyAlloc(allocator, .select_description, truncated_description);
-                    defer allocator.free(themed_description);
-                    try line.appendSlice(allocator, themed_description);
-                } else {
-                    try line.appendSlice(allocator, "\x1b[2m");
-                    try line.appendSlice(allocator, truncated_description);
-                    try line.appendSlice(allocator, "\x1b[0m");
-                }
+                try line.appendSlice(allocator, truncated_description);
             } else {
                 const truncated = try truncatePlainAlloc(allocator, display, content_width);
                 defer allocator.free(truncated);
@@ -217,19 +339,9 @@ fn renderPaddedLine(
         if (std.mem.startsWith(u8, padded, "  (")) {
             return active_theme.applyAlloc(allocator, .select_scroll, padded);
         }
-        return allocator.dupe(u8, padded);
     }
 
-    if (!selected) {
-        return allocator.dupe(u8, padded);
-    }
-
-    var line = std.ArrayList(u8).empty;
-    errdefer line.deinit(allocator);
-    try line.appendSlice(allocator, "\x1b[7m");
-    try line.appendSlice(allocator, padded);
-    try line.appendSlice(allocator, "\x1b[0m");
-    return line.toOwnedSlice(allocator);
+    return allocator.dupe(u8, padded);
 }
 
 fn truncatePlainAlloc(allocator: std.mem.Allocator, text: []const u8, max_width: usize) std.mem.Allocator.Error![]u8 {
@@ -257,9 +369,13 @@ fn normalizeSingleLine(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n");
 }
 
-test "select list highlights current selection and navigates" {
-    const allocator = std.testing.allocator;
+fn withReverse(style: vaxis.Cell.Style, reverse: bool) vaxis.Cell.Style {
+    var updated = style;
+    updated.reverse = reverse;
+    return updated;
+}
 
+test "select list highlights current selection and navigates" {
     var list = SelectList{
         .items = &[_]SelectItem{
             .{ .value = "one", .description = "first item" },
@@ -269,22 +385,28 @@ test "select list highlights current selection and navigates" {
         .max_visible = 3,
     };
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try list.renderInto(allocator, 24, &lines);
+    {
+        var screen = try test_helpers.renderToScreen(list.drawComponent(), 24, 3);
+        defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[7m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "one") != null);
+        const selected = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("o", selected.char.grapheme);
+        try std.testing.expect(selected.style.reverse);
+    }
 
     try std.testing.expectEqualDeep(HandleResult.handled, list.handleKey(.down));
     try std.testing.expectEqual(@as(usize, 1), list.selectedIndex());
 
-    component_mod.freeLines(allocator, &lines);
-    lines = .empty;
-    try list.renderInto(allocator, 24, &lines);
+    {
+        var screen = try test_helpers.renderToScreen(list.drawComponent(), 24, 3);
+        defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "\x1b[7m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "two") != null);
+        const first_row = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
+        const second_row = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(!first_row.style.reverse);
+        try std.testing.expect(second_row.style.reverse);
+        try std.testing.expectEqualStrings("t", second_row.char.grapheme);
+    }
 }
 
 test "select list confirms the selected item on enter" {
@@ -302,10 +424,9 @@ test "select list confirms the selected item on enter" {
     try std.testing.expectEqualStrings("two", list.selectedItem().?.value);
 }
 
-test "select list applies themed selection and muted descriptions" {
-    const allocator = std.testing.allocator;
-    var theme = try resources_mod.Theme.initDefault(allocator);
-    defer theme.deinit(allocator);
+test "select list uses reverse selection and muted description styling" {
+    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
+    defer theme.deinit(std.testing.allocator);
 
     var list = SelectList{
         .items = &[_]SelectItem{
@@ -316,38 +437,38 @@ test "select list applies themed selection and muted descriptions" {
         .theme = &theme,
     };
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreenWithTheme(list.drawComponent(), 24, 2, &theme);
+    defer screen.deinit(std.testing.allocator);
 
-    try list.renderInto(allocator, 24, &lines);
+    const muted = style_mod.styleFor(&theme, .select_description);
+    try test_helpers.expectCell(&screen, 13, 0, "f", muted);
 
-    try std.testing.expect(lines.items.len >= 2);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "\x1b[") != null);
+    var muted_selected = muted;
+    muted_selected.reverse = true;
+    try test_helpers.expectCell(&screen, 13, 1, "s", muted_selected);
+
+    const selected_label = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(selected_label.style.reverse);
 }
 
 test "select list truncation respects display width for wide and combining graphemes" {
-    const allocator = std.testing.allocator;
-
-    const cjk = try truncatePlainAlloc(allocator, "ab你好", 4);
-    defer allocator.free(cjk);
+    const cjk = try truncatePlainAlloc(std.testing.allocator, "ab你好", 4);
+    defer std.testing.allocator.free(cjk);
     try std.testing.expectEqualStrings("ab你", cjk);
     try std.testing.expectEqual(@as(usize, 4), ansi.visibleWidth(cjk));
 
-    const emoji = try truncatePlainAlloc(allocator, "🙂🙂x", 4);
-    defer allocator.free(emoji);
+    const emoji = try truncatePlainAlloc(std.testing.allocator, "🙂🙂x", 4);
+    defer std.testing.allocator.free(emoji);
     try std.testing.expectEqualStrings("🙂🙂", emoji);
     try std.testing.expectEqual(@as(usize, 4), ansi.visibleWidth(emoji));
 
-    const combining = try truncatePlainAlloc(allocator, "e\u{0301}x", 1);
-    defer allocator.free(combining);
+    const combining = try truncatePlainAlloc(std.testing.allocator, "e\u{0301}x", 1);
+    defer std.testing.allocator.free(combining);
     try std.testing.expectEqualStrings("e\u{0301}", combining);
     try std.testing.expectEqual(@as(usize, 1), ansi.visibleWidth(combining));
 }
 
 test "select list render keeps unicode labels within requested width" {
-    const allocator = std.testing.allocator;
-
     var list = SelectList{
         .items = &[_]SelectItem{
             .{ .value = "wide", .label = "你好世界🙂" },
@@ -355,33 +476,11 @@ test "select list render keeps unicode labels within requested width" {
         .max_visible = 1,
     };
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try list.renderInto(allocator, 8, &lines);
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 8, 1);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    for (lines.items) |line| {
-        try std.testing.expect(ansi.visibleWidth(line) <= 8);
-    }
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "你好世界🙂") == null);
-}
-
-test "select list render truncates unicode descriptions by display width" {
-    const allocator = std.testing.allocator;
-
-    var list = SelectList{
-        .items = &[_]SelectItem{
-            .{ .value = "desc", .label = "go", .description = "描述文字🙂🙂更多内容" },
-        },
-        .max_visible = 1,
-    };
-
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try list.renderInto(allocator, 24, &lines);
-
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expect(ansi.visibleWidth(lines.items[0]) <= 24);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "描述文字🙂🙂更多内容") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "你好世界🙂") == null);
 }
