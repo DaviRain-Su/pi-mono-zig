@@ -545,7 +545,7 @@ test "screen renders welcome prompt footer and tool lines" {
     try std.testing.expect(renderedLinesContain(lines.items, "╭"));
     try std.testing.expect(renderedLinesContain(lines.items, "> w"));
     try std.testing.expect(renderedLinesContain(lines.items, "╰"));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Session: session.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "Session: session.jsonl") != null);
 }
 
 test "interactive mode startup renders welcome message footer and hints through a mock backend" {
@@ -587,7 +587,8 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(renderedLinesContain(lines.items, "Session: session.jsonl"));
     try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+V paste image"));
+    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Alt+⏎ queue"));
 }
 
 test "appendVerboseStartupState adds startup banner and scoped model listing" {
@@ -937,7 +938,7 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     try std.testing.expect(saw_prompt_border);
     try std.testing.expect(saw_prompt_glyph);
     try std.testing.expect(saw_overflow);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Session:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "TERM") != null);
 }
 
 test "screen renders themed output and custom keybinding hints" {

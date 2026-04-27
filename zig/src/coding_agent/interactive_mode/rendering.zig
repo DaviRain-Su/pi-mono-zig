@@ -959,7 +959,7 @@ pub const ScreenComponent = struct {
         var task_panel_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &task_panel_lines);
         try renderTaskPanelLines(allocator, self.theme, &snapshot, width, &task_panel_lines);
-        const footer_line = try formatFooterLine(allocator, self.theme, &snapshot, width);
+        const footer_line = try formatFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
         defer allocator.free(hints_line);
@@ -989,8 +989,8 @@ pub const ScreenComponent = struct {
         for (autocomplete_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
-        try tui.component.appendOwnedLine(lines, allocator, footer_line);
         try tui.component.appendOwnedLine(lines, allocator, hints_line);
+        try tui.component.appendOwnedLine(lines, allocator, footer_line);
     }
 
     pub fn drawOpaque(
@@ -1109,11 +1109,11 @@ pub const ScreenComponent = struct {
         row += autocomplete_height;
 
         if (row < window.height) {
-            drawFittedLine(window, row, footer_text, styleForToken(self.theme, .footer));
+            drawFittedLine(window, row, hints_text, styleForToken(self.theme, .prompt));
         }
         row += 1;
         if (row < window.height) {
-            drawFittedLine(window, row, hints_text, styleForToken(self.theme, .status));
+            try drawFooterWithTerminal(window, row, footer_text, self.terminal_name, self.theme, ctx.arena);
         }
         row += 1;
 
@@ -1147,6 +1147,49 @@ fn drawFittedLine(
         .text = text,
         .style = style,
     }, .{ .wrap = .none });
+}
+
+fn drawFooterWithTerminal(
+    window: tui.vaxis.Window,
+    row: usize,
+    footer_text: []const u8,
+    terminal_name: []const u8,
+    theme: ?*const resources_mod.Theme,
+    allocator: std.mem.Allocator,
+) !void {
+    if (row >= window.height) return;
+    const footer_style = styleForToken(theme, .footer);
+    const badge_style = styleForToken(theme, .status);
+    const line_window = window.child(.{
+        .y_off = @intCast(row),
+        .height = 1,
+    });
+    line_window.fill(.{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = footer_style,
+    });
+
+    const badge = try formatTerminalBadge(allocator, terminal_name);
+    const badge_width = tui.ansi.visibleWidth(badge);
+    const available_width = @as(usize, line_window.width);
+    const footer_width = if (available_width > badge_width + 1) available_width - badge_width - 1 else available_width;
+    const compact_footer_text = std.mem.trimEnd(u8, footer_text, " ");
+    const fitted_footer = try fitLine(allocator, compact_footer_text, footer_width);
+
+    _ = line_window.printSegment(.{
+        .text = fitted_footer,
+        .style = footer_style,
+    }, .{ .wrap = .none });
+
+    if (badge_width > 0 and available_width > badge_width + 1) {
+        _ = line_window.printSegment(.{
+            .text = badge,
+            .style = badge_style,
+        }, .{
+            .wrap = .none,
+            .col_offset = @intCast(available_width - badge_width),
+        });
+    }
 }
 
 fn drawTaskPanel(
@@ -2169,6 +2212,18 @@ pub fn formatFooterLine(
     return try applyThemeAlloc(allocator, theme, .footer, fitted);
 }
 
+pub fn formatFooterLineWithTerminal(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    terminal_name: []const u8,
+    width: usize,
+) ![]u8 {
+    const fitted = try formatFooterTextWithTerminal(allocator, snapshot, terminal_name, width);
+    defer allocator.free(fitted);
+    return try applyThemeAlloc(allocator, theme, .footer, fitted);
+}
+
 pub fn formatTaskHeaderText(
     allocator: std.mem.Allocator,
     snapshot: *const RenderStateSnapshot,
@@ -2296,6 +2351,46 @@ pub fn formatFooterText(
     return fitted;
 }
 
+pub fn formatFooterTextWithTerminal(
+    allocator: std.mem.Allocator,
+    snapshot: *const RenderStateSnapshot,
+    terminal_name: []const u8,
+    width: usize,
+) ![]u8 {
+    if (width == 0) return allocator.dupe(u8, "");
+
+    const badge = try formatTerminalBadge(allocator, terminal_name);
+    defer allocator.free(badge);
+    const badge_width = tui.ansi.visibleWidth(badge);
+    if (badge_width == 0 or width <= badge_width + 1) {
+        return formatFooterText(allocator, snapshot, width);
+    }
+
+    const footer_width = width - badge_width - 1;
+    const footer_text = try formatFooterText(allocator, snapshot, footer_width);
+    defer allocator.free(footer_text);
+
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+    try builder.appendSlice(allocator, footer_text);
+    const current_width = tui.ansi.visibleWidth(builder.items);
+    if (width > current_width + badge_width) {
+        try builder.appendNTimes(allocator, ' ', width - current_width - badge_width);
+    }
+    try builder.appendSlice(allocator, badge);
+    return builder.toOwnedSlice(allocator);
+}
+
+fn formatTerminalBadge(allocator: std.mem.Allocator, terminal_name: []const u8) ![]u8 {
+    const source = if (terminal_name.len > 0) terminal_name else "term";
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+    for (source) |byte| {
+        try builder.append(allocator, std.ascii.toUpper(byte));
+    }
+    return builder.toOwnedSlice(allocator);
+}
+
 pub fn appendFooterPart(
     allocator: std.mem.Allocator,
     builder: *std.ArrayList(u8),
@@ -2349,7 +2444,7 @@ pub fn formatHintsLine(
 ) ![]u8 {
     const fitted = try formatHintsText(allocator, keybindings, width);
     defer allocator.free(fitted);
-    return try applyThemeAlloc(allocator, theme, .status, fitted);
+    return try applyThemeAlloc(allocator, theme, .prompt, fitted);
 }
 
 pub fn formatHintsText(
@@ -2361,27 +2456,29 @@ pub fn formatHintsText(
     defer allocator.free(open_sessions);
     const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
     defer allocator.free(open_models);
-    const queue_follow_up = try actionLabel(allocator, keybindings, .queue_follow_up, "Alt+Enter");
+    const queue_label = try actionLabel(allocator, keybindings, .queue_follow_up, "Alt+Enter");
+    defer allocator.free(queue_label);
+    const queue_follow_up = try hintKeyLabel(allocator, queue_label);
     defer allocator.free(queue_follow_up);
-    const dequeue_messages = try actionLabel(allocator, keybindings, .dequeue_messages, "Alt+Up");
-    defer allocator.free(dequeue_messages);
     const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Ctrl+C");
     defer allocator.free(interrupt);
     const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
     defer allocator.free(exit);
-    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+L");
-    defer allocator.free(clear);
-    const paste_image = try actionLabel(allocator, keybindings, .paste_image, "Ctrl+V");
-    defer allocator.free(paste_image);
 
     const line = try std.fmt.allocPrint(
         allocator,
-        "{s} sessions • {s} models • {s} paste image • {s} queue • {s} dequeue • {s} interrupt • {s} exit • {s} clear",
-        .{ open_sessions, open_models, paste_image, queue_follow_up, dequeue_messages, interrupt, exit, clear },
+        "⏎ send · {s} queue · {s} sessions · {s} models · {s} interrupt · {s} exit",
+        .{ queue_follow_up, open_sessions, open_models, interrupt, exit },
     );
     defer allocator.free(line);
     const fitted = try fitLine(allocator, line, width);
     return fitted;
+}
+
+fn hintKeyLabel(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
+    if (std.mem.eql(u8, label, "Enter")) return allocator.dupe(u8, "⏎");
+    if (std.mem.eql(u8, label, "Alt+Enter")) return allocator.dupe(u8, "Alt+⏎");
+    return allocator.dupe(u8, label);
 }
 
 pub fn actionLabel(
@@ -2900,6 +2997,75 @@ test "task header owns status model provider while footer excludes them" {
     try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
 }
 
+test "prompt m2 renders hints above compact footer with distinct styles and terminal badge" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const model = ai.model_registry.find("faux", "faux-1").?;
+    try state.setFooterDetails(model, "demo-session.jsonl", "zig-implementation", "Faux", "env");
+    state.usage_totals = .{
+        .input = 1200,
+        .output = 345,
+    };
+    state.context_window = 128000;
+    state.context_percent = 12.5;
+
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 14,
+        .theme = &theme,
+        .terminal_name = "ghostty",
+    };
+
+    var screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 100, 14);
+    defer screen.deinit(std.testing.allocator);
+
+    const rendered = try tui.test_helpers.screenToString(&screen);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ queue · Ctrl+S sessions · Ctrl+P models · Ctrl+C interrupt · Ctrl+D exit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "GHOSTTY") != null);
+
+    const prompt_top = screen.readCell(0, 9) orelse return error.TestUnexpectedResult;
+    const hint_first = screen.readCell(0, 12) orelse return error.TestUnexpectedResult;
+    const footer_first = screen.readCell(0, 13) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("╭", prompt_top.char.grapheme);
+    try std.testing.expectEqualStrings("⏎", hint_first.char.grapheme);
+    try std.testing.expectEqualStrings("B", footer_first.char.grapheme);
+    try std.testing.expect(!std.meta.eql(hint_first.style, footer_first.style));
+
+    const footer_session_label = try allocator.dupe(u8, "demo-session.jsonl");
+    defer allocator.free(footer_session_label);
+    const footer_git_branch = try allocator.dupe(u8, "zig-implementation");
+    defer allocator.free(footer_git_branch);
+    const footer = try formatFooterTextWithTerminal(allocator, &.{
+        .session_label = footer_session_label,
+        .git_branch = footer_git_branch,
+        .usage_totals = .{ .input = 1200, .output = 345 },
+        .context_window = 128000,
+        .context_percent = 12.5,
+    }, "ghostty", 100);
+    defer allocator.free(footer);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Branch: zig-implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Session:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "↑1.2k") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "↓345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 12.5%/128k") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "GHOSTTY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Status:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Model:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
+}
+
 pub const InteractiveModeTestBackend = struct {
     size: tui.Size,
     entered_raw: bool = false,
@@ -3290,8 +3456,7 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "> pending prompt"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S sessions"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+V paste image"));
+    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send · Alt+⏎ queue · Ctrl+S sessions · Ctrl+P models · Ctrl+C interrupt · Ctrl+D exit"));
     try std.testing.expect(renderedLinesContain(lines.items, "Faux"));
     try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
