@@ -32,20 +32,38 @@ const UpdateEmitterContext = struct {
     tool_call: ai.ToolCall,
 };
 
+const ParallelToolEmitter = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+
+    fn emitUpdate(self: *ParallelToolEmitter, event: types.AgentEvent) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.emit(self.emit_context, event);
+    }
+};
+
 const ParallelToolTask = struct {
     arena: std.heap.ArenaAllocator,
     prepared: PreparedToolCall,
     signal: ?*const std.atomic.Value(bool),
-    updates: std.ArrayList(types.AgentToolResult),
+    emitter: *ParallelToolEmitter,
     result: ?types.AgentToolResult = null,
     is_error: bool = false,
 
-    fn init(parent_allocator: std.mem.Allocator, prepared: PreparedToolCall, signal: ?*const std.atomic.Value(bool)) ParallelToolTask {
+    fn init(
+        parent_allocator: std.mem.Allocator,
+        prepared: PreparedToolCall,
+        signal: ?*const std.atomic.Value(bool),
+        emitter: *ParallelToolEmitter,
+    ) ParallelToolTask {
         return .{
             .arena = std.heap.ArenaAllocator.init(parent_allocator),
             .prepared = prepared,
             .signal = signal,
-            .updates = .empty,
+            .emitter = emitter,
         };
     }
 
@@ -195,6 +213,7 @@ fn runLoop(
             if (has_more_tool_calls) {
                 const executed_tool_results = try executeToolCalls(
                     allocator,
+                    io,
                     current_context,
                     assistant,
                     tool_calls,
@@ -373,7 +392,13 @@ fn streamAssistantResponse(
                     );
                 }
             },
-            .thinking_start, .thinking_delta, .thinking_end => {
+            .thinking_start,
+            .thinking_delta,
+            .thinking_end,
+            .toolcall_start,
+            .toolcall_delta,
+            .toolcall_end,
+            => {
                 const template = if (partial_template) |value| value else ai.AssistantMessage{
                     .content = &[_]ai.ContentBlock{},
                     .api = config.model.api,
@@ -403,7 +428,6 @@ fn streamAssistantResponse(
                 });
                 return final_message;
             },
-            else => {},
         }
     }
 
@@ -438,6 +462,7 @@ fn isAbortRequested(signal: ?*const std.atomic.Value(bool)) bool {
 
 fn executeToolCalls(
     allocator: std.mem.Allocator,
+    io: std.Io,
     current_context: types.AgentContext,
     assistant_message: ai.AssistantMessage,
     tool_calls: []const ai.ToolCall,
@@ -459,6 +484,7 @@ fn executeToolCalls(
     if (config.tool_execution == .sequential or has_sequential_tool) {
         return executeToolCallsSequential(
             allocator,
+            io,
             current_context,
             assistant_message,
             tool_calls,
@@ -471,6 +497,7 @@ fn executeToolCalls(
 
     return executeToolCallsParallel(
         allocator,
+        io,
         current_context,
         assistant_message,
         tool_calls,
@@ -483,6 +510,7 @@ fn executeToolCalls(
 
 fn executeToolCallsSequential(
     allocator: std.mem.Allocator,
+    _: std.Io,
     current_context: types.AgentContext,
     assistant_message: ai.AssistantMessage,
     tool_calls: []const ai.ToolCall,
@@ -553,6 +581,7 @@ fn executeToolCallsSequential(
 
 fn executeToolCallsParallel(
     allocator: std.mem.Allocator,
+    io: std.Io,
     current_context: types.AgentContext,
     assistant_message: ai.AssistantMessage,
     tool_calls: []const ai.ToolCall,
@@ -615,8 +644,14 @@ fn executeToolCallsParallel(
     const threads = try allocator.alloc(std.Thread, task_count);
     defer allocator.free(threads);
 
+    var parallel_emitter = ParallelToolEmitter{
+        .io = io,
+        .emit_context = emit_context,
+        .emit = emit,
+    };
+
     for (prepared_calls.items, 0..) |prepared_tool, index| {
-        tasks[index] = ParallelToolTask.init(allocator, prepared_tool, signal);
+        tasks[index] = ParallelToolTask.init(allocator, prepared_tool, signal, &parallel_emitter);
         threads[index] = try std.Thread.spawn(.{}, runParallelToolTask, .{&tasks[index]});
     }
 
@@ -628,16 +663,6 @@ fn executeToolCallsParallel(
     }
 
     for (tasks) |*task| {
-        for (task.updates.items) |update| {
-            try emit(emit_context, .{
-                .event_type = .tool_execution_update,
-                .tool_call_id = task.prepared.tool_call.id,
-                .tool_name = task.prepared.tool_call.name,
-                .args = task.prepared.tool_call.arguments,
-                .partial_result = update,
-            });
-        }
-
         const executed = ExecutedToolCallOutcome{
             .result = if (task.result) |result|
                 try cloneToolResult(result, allocator)
@@ -811,7 +836,7 @@ fn runParallelToolTask(task: *ParallelToolTask) void {
         task.prepared,
         task.signal,
         task,
-        collectParallelToolUpdate,
+        emitParallelToolUpdate,
     ) catch {
         task.result = createErrorToolResult(task.arena.allocator(), "Parallel tool execution failed") catch unreachable;
         task.is_error = true;
@@ -822,9 +847,15 @@ fn runParallelToolTask(task: *ParallelToolTask) void {
     task.is_error = outcome.is_error;
 }
 
-fn collectParallelToolUpdate(context: ?*anyopaque, partial_result: types.AgentToolResult) !void {
+fn emitParallelToolUpdate(context: ?*anyopaque, partial_result: types.AgentToolResult) !void {
     const task: *ParallelToolTask = @ptrCast(@alignCast(context.?));
-    try task.updates.append(task.arena.allocator(), try cloneToolResult(partial_result, task.arena.allocator()));
+    try task.emitter.emitUpdate(.{
+        .event_type = .tool_execution_update,
+        .tool_call_id = task.prepared.tool_call.id,
+        .tool_name = task.prepared.tool_call.name,
+        .args = task.prepared.tool_call.arguments,
+        .partial_result = partial_result,
+    });
 }
 
 fn finalizeExecutedToolCall(
@@ -1257,9 +1288,50 @@ const ToolExecutionCapture = struct {
     }
 };
 
+const ParallelStreamingCapture = struct {
+    main_thread_id: std.Thread.Id,
+    slow_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_fast_update_before_slow_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_update_off_main_thread: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    invalid_main_thread_event: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    concurrent_callback_entry: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    update_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    in_callback: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 fn captureToolEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     const capture: *ToolExecutionCapture = @ptrCast(@alignCast(context.?));
     try capture.events.append(capture.allocator, event);
+}
+
+fn captureParallelStreamingEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *ParallelStreamingCapture = @ptrCast(@alignCast(context.?));
+    const current_thread_id = std.Thread.getCurrentId();
+    switch (event.event_type) {
+        .tool_execution_start, .tool_execution_end => {
+            if (current_thread_id != capture.main_thread_id) {
+                capture.invalid_main_thread_event.store(true, .seq_cst);
+            }
+        },
+        .tool_execution_update => {
+            if (capture.in_callback.swap(true, .seq_cst)) {
+                capture.concurrent_callback_entry.store(true, .seq_cst);
+            }
+            defer capture.in_callback.store(false, .seq_cst);
+
+            if (current_thread_id != capture.main_thread_id) {
+                capture.saw_update_off_main_thread.store(true, .seq_cst);
+            }
+            _ = capture.update_count.fetchAdd(1, .seq_cst);
+            if (event.tool_call_id) |tool_call_id| {
+                if (std.mem.eql(u8, tool_call_id, "fast") and !capture.slow_done.load(.seq_cst)) {
+                    capture.saw_fast_update_before_slow_done.store(true, .seq_cst);
+                }
+            }
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        },
+        else => {},
+    }
 }
 
 fn ignoreEvent(_: ?*anyopaque, _: types.AgentEvent) !void {}
@@ -1310,6 +1382,46 @@ fn ownedDeltaStreamForAgentLoopTest(
             .timestamp = 1,
         },
     });
+    return stream;
+}
+
+fn toolCallStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+) !ai.event_stream.AssistantMessageEventStream {
+    const result_allocator = std.heap.page_allocator;
+    var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
+    try args_object.put(
+        result_allocator,
+        try result_allocator.dupe(u8, "command"),
+        .{ .string = try result_allocator.dupe(u8, "echo hi") },
+    );
+    const tool_calls = try result_allocator.alloc(ai.ToolCall, 1);
+    tool_calls[0] = .{
+        .id = try result_allocator.dupe(u8, "tool-1"),
+        .name = try result_allocator.dupe(u8, "bash"),
+        .arguments = .{ .object = args_object },
+    };
+    const final_message = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .tool_calls = tool_calls,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+    };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    stream.push(.{ .event_type = .start, .message = final_message });
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 0 });
+    stream.push(.{ .event_type = .toolcall_delta, .content_index = 0, .delta = "{\"command\":\"echo hi\"}" });
+    stream.push(.{ .event_type = .toolcall_end, .content_index = 0, .tool_call = tool_calls[0] });
+    stream.push(.{ .event_type = .done, .message = final_message });
     return stream;
 }
 
@@ -1385,6 +1497,56 @@ fn parallelAwareEchoToolExecute(
         allocator,
         try std.fmt.allocPrint(allocator, "echoed: {s}", .{value}),
     );
+}
+
+fn streamingParallelToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const capture: *ParallelStreamingCapture = @ptrCast(@alignCast(tool_context.?));
+    const value = try getStringArg(params, "value");
+    if (std.mem.eql(u8, value, "slow")) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+        capture.slow_done.store(true, .seq_cst);
+    } else {
+        if (on_update) |callback| {
+            const update = try textToolResult(
+                allocator,
+                try std.fmt.allocPrint(allocator, "{s} update", .{tool_call_id}),
+            );
+            try callback(on_update_context, update);
+        }
+    }
+    return try textToolResult(
+        allocator,
+        try std.fmt.allocPrint(allocator, "{s} done", .{value}),
+    );
+}
+
+fn stressStreamingParallelToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    _: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    if (on_update) |callback| {
+        for (0..100) |index| {
+            const update = try textToolResult(
+                allocator,
+                try std.fmt.allocPrint(allocator, "{s}:{d}", .{ tool_call_id, index }),
+            );
+            try callback(on_update_context, update);
+        }
+    }
+    return try textToolResult(allocator, try std.fmt.allocPrint(allocator, "{s} done", .{tool_call_id}));
 }
 
 fn blockBeforeToolCall(
@@ -1716,6 +1878,57 @@ test "streamAssistantResponse frees owned streaming deltas after consumption" {
     try std.testing.expectEqualStrings("streamed response", assistant.content[0].text.text);
 }
 
+test "route-a m1 streamAssistantResponse emits toolcall message updates" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:toolcall-stream",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const assistant = try streamAssistantResponse(
+        std.testing.allocator,
+        std.Io.failing,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = passthroughConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        toolCallStreamForAgentLoopTest,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), assistant.tool_calls.?.len);
+    const expected = [_]ai.EventType{ .toolcall_start, .toolcall_delta, .toolcall_end };
+    var next_expected: usize = 0;
+    for (capture.events.items) |event| {
+        if (event.event_type != .message_update) continue;
+        const assistant_event = event.assistant_message_event orelse continue;
+        if (assistant_event.event_type == .toolcall_start or
+            assistant_event.event_type == .toolcall_delta or
+            assistant_event.event_type == .toolcall_end)
+        {
+            try std.testing.expect(next_expected < expected.len);
+            try std.testing.expectEqual(expected[next_expected], assistant_event.event_type);
+            next_expected += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.len, next_expected);
+}
+
 test "runAgentLoop executes multiple tool calls in parallel and emits tool results in source order" {
     const faux = ai.providers.faux;
     const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
@@ -1819,6 +2032,7 @@ test "executeToolCallsParallel returns tool result content that survives task ar
 
     const results = try executeToolCallsParallel(
         std.testing.allocator,
+        std.testing.io,
         .{
             .system_prompt = "",
             .messages = &.{},
@@ -1878,6 +2092,148 @@ test "executeToolCallsParallel returns tool result content that survives task ar
     try std.testing.expect(results[0].content.ptr != capture.content_ptr.?);
     try std.testing.expect(results[0].content[0].text.text.ptr != capture.text_ptr.?);
     try std.testing.expectEqualStrings("echoed: hello", results[0].content[0].text.text);
+}
+
+test "route-a m1 parallel tool updates emit before join and only updates leave main thread" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const fast_args = try jsonStringObject(arena.allocator(), "value", "fast");
+    const slow_args = try jsonStringObject(arena.allocator(), "value", "slow");
+    const tool_calls = try arena.allocator().alloc(ai.ToolCall, 2);
+    tool_calls[0] = .{ .id = "fast", .name = "stream", .arguments = fast_args };
+    tool_calls[1] = .{ .id = "slow", .name = "stream", .arguments = slow_args };
+
+    var capture = ParallelStreamingCapture{ .main_thread_id = std.Thread.getCurrentId() };
+    const tool = types.AgentTool{
+        .name = "stream",
+        .description = "Streaming test tool",
+        .label = "Stream",
+        .parameters = .null,
+        .execute_context = &capture,
+        .execute = streamingParallelToolExecute,
+    };
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .content = &.{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-model",
+            .usage = ai.Usage.init(),
+            .stop_reason = .tool_use,
+            .timestamp = 1,
+        },
+        tool_calls,
+        .{
+            .model = .{
+                .id = "faux-model",
+                .name = "Faux Model",
+                .api = "faux",
+                .provider = "faux",
+                .base_url = "http://localhost",
+                .input_types = &[_][]const u8{"text"},
+                .context_window = 1024,
+                .max_tokens = 256,
+            },
+            .tool_execution = .parallel,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureParallelStreamingEvent,
+        null,
+    );
+    defer {
+        for (results) |result| {
+            deinitContentBlocks(std.testing.allocator, result.content);
+            std.testing.allocator.free(result.content);
+        }
+        std.testing.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expect(capture.saw_fast_update_before_slow_done.load(.seq_cst));
+    try std.testing.expect(capture.saw_update_off_main_thread.load(.seq_cst));
+    try std.testing.expect(!capture.invalid_main_thread_event.load(.seq_cst));
+}
+
+test "route-a m1 parallel emitter serializes concurrent update callbacks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const tool_calls = try arena.allocator().alloc(ai.ToolCall, 4);
+    for (tool_calls, 0..) |*tool_call, index| {
+        tool_call.* = .{
+            .id = try std.fmt.allocPrint(arena.allocator(), "tool-{d}", .{index}),
+            .name = "stress",
+            .arguments = .null,
+        };
+    }
+
+    var capture = ParallelStreamingCapture{ .main_thread_id = std.Thread.getCurrentId() };
+    const tool = types.AgentTool{
+        .name = "stress",
+        .description = "Stress streaming test tool",
+        .label = "Stress",
+        .parameters = .null,
+        .execute_context = &capture,
+        .execute = stressStreamingParallelToolExecute,
+    };
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .content = &.{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-model",
+            .usage = ai.Usage.init(),
+            .stop_reason = .tool_use,
+            .timestamp = 1,
+        },
+        tool_calls,
+        .{
+            .model = .{
+                .id = "faux-model",
+                .name = "Faux Model",
+                .api = "faux",
+                .provider = "faux",
+                .base_url = "http://localhost",
+                .input_types = &[_][]const u8{"text"},
+                .context_window = 1024,
+                .max_tokens = 256,
+            },
+            .tool_execution = .parallel,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureParallelStreamingEvent,
+        null,
+    );
+    defer {
+        for (results) |result| {
+            deinitContentBlocks(std.testing.allocator, result.content);
+            std.testing.allocator.free(result.content);
+        }
+        std.testing.allocator.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqual(@as(usize, 400), capture.update_count.load(.seq_cst));
+    try std.testing.expect(!capture.concurrent_callback_entry.load(.seq_cst));
 }
 
 test "runAgentLoop executes tool calls sequentially when configured" {
