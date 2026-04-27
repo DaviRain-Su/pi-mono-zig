@@ -1,10 +1,13 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("ansi.zig");
+const component_mod = @import("component.zig");
 const draw_mod = @import("draw.zig");
 const spacer_mod = @import("components/spacer.zig");
 const terminal_mod = @import("terminal.zig");
 const theme_mod = @import("theme.zig");
+
+const RESET = "\x1b[0m";
 
 pub const VaxisAdapter = struct {
     allocator: std.mem.Allocator,
@@ -114,6 +117,45 @@ pub fn renderLineListToWindow(window: vaxis.Window, lines: []const []const u8, a
     const height = @min(lines.len, window.height);
     for (0..height) |row| {
         try renderAnsiLine(window, @intCast(row), lines[row], allocator);
+    }
+}
+
+pub fn appendScreenRowsAsAnsiLines(
+    allocator: std.mem.Allocator,
+    screen: *vaxis.Screen,
+    width: usize,
+    height: usize,
+    lines: *component_mod.LineList,
+) std.mem.Allocator.Error!void {
+    const row_count = @min(height, @as(usize, screen.height));
+    const col_count = @min(width, @as(usize, screen.width));
+    for (0..row_count) |row| {
+        var builder = std.ArrayList(u8).empty;
+        errdefer builder.deinit(allocator);
+
+        var current_style: vaxis.Cell.Style = .{};
+        var col: usize = 0;
+        while (col < col_count) {
+            var cell = screen.readCell(@intCast(col), @intCast(row)) orelse vaxis.Cell{};
+            if (cell.char.grapheme.len == 0) {
+                cell.char = .{
+                    .grapheme = " ",
+                    .width = 1,
+                };
+            }
+
+            try appendStyleTransition(allocator, &builder, &current_style, cell.style);
+            try builder.appendSlice(allocator, cell.char.grapheme);
+
+            const step = @max(@as(usize, 1), cell.char.width);
+            col += step;
+        }
+
+        if (!std.meta.eql(current_style, vaxis.Cell.Style{})) {
+            try builder.appendSlice(allocator, RESET);
+        }
+
+        try lines.append(allocator, try builder.toOwnedSlice(allocator));
     }
 }
 
@@ -271,6 +313,71 @@ fn ansiSequenceLength(text: []const u8, start: usize) ?usize {
     }
 }
 
+fn appendStyleTransition(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    current_style: *vaxis.Cell.Style,
+    next_style: vaxis.Cell.Style,
+) std.mem.Allocator.Error!void {
+    if (std.meta.eql(current_style.*, next_style)) return;
+
+    if (!std.meta.eql(current_style.*, vaxis.Cell.Style{}) or std.meta.eql(next_style, vaxis.Cell.Style{})) {
+        try builder.appendSlice(allocator, RESET);
+    }
+    if (std.meta.eql(next_style, vaxis.Cell.Style{})) {
+        current_style.* = .{};
+        return;
+    }
+
+    try appendStyleCodes(allocator, builder, next_style);
+    current_style.* = next_style;
+}
+
+fn appendStyleCodes(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    style: vaxis.Cell.Style,
+) std.mem.Allocator.Error!void {
+    if (style.bold) try builder.appendSlice(allocator, "\x1b[1m");
+    if (style.dim) try builder.appendSlice(allocator, "\x1b[2m");
+    if (style.italic) try builder.appendSlice(allocator, "\x1b[3m");
+    switch (style.ul_style) {
+        .off => {},
+        .single => try builder.appendSlice(allocator, "\x1b[4m"),
+        .double => try builder.appendSlice(allocator, "\x1b[21m"),
+        .curly => try builder.appendSlice(allocator, "\x1b[4:3m"),
+        .dotted => try builder.appendSlice(allocator, "\x1b[4:4m"),
+        .dashed => try builder.appendSlice(allocator, "\x1b[4:5m"),
+    }
+    if (style.blink) try builder.appendSlice(allocator, "\x1b[5m");
+    if (style.reverse) try builder.appendSlice(allocator, "\x1b[7m");
+    if (style.invisible) try builder.appendSlice(allocator, "\x1b[8m");
+    if (style.strikethrough) try builder.appendSlice(allocator, "\x1b[9m");
+    try appendColorCodes(allocator, builder, "48", style.bg);
+    try appendColorCodes(allocator, builder, "38", style.fg);
+}
+
+fn appendColorCodes(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    prefix: []const u8,
+    color: vaxis.Cell.Color,
+) std.mem.Allocator.Error!void {
+    switch (color) {
+        .default => {},
+        .index => |index| {
+            var buffer: [32]u8 = undefined;
+            const rendered = std.fmt.bufPrint(&buffer, "\x1b[{s};5;{}m", .{ prefix, index }) catch unreachable;
+            try builder.appendSlice(allocator, rendered);
+        },
+        .rgb => |rgb| {
+            var buffer: [48]u8 = undefined;
+            const rendered = std.fmt.bufPrint(&buffer, "\x1b[{s};2;{};{};{}m", .{ prefix, rgb[0], rgb[1], rgb[2] }) catch unreachable;
+            try builder.appendSlice(allocator, rendered);
+        },
+    }
+}
+
 test "renderLineListToWindow maps ANSI SGR sequences to libvaxis cell styles" {
     const allocator = std.testing.allocator;
 
@@ -308,4 +415,67 @@ test "renderLineListToWindow maps ANSI SGR sequences to libvaxis cell styles" {
     try std.testing.expectEqualStrings("Y", yo.char.grapheme);
     try std.testing.expectEqual(vaxis.Cell.Style.Underline.single, yo.style.ul_style);
     try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 1, 2, 3 } }, yo.style.bg);
+}
+
+test "appendScreenRowsAsAnsiLines round trips styled cells through ANSI text" {
+    const allocator = std.testing.allocator;
+
+    var source = try vaxis.Screen.init(allocator, .{
+        .rows = 1,
+        .cols = 4,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer source.deinit(allocator);
+
+    source.writeCell(0, 0, .{
+        .char = .{ .grapheme = "H", .width = 1 },
+        .style = .{
+            .bold = true,
+            .fg = .{ .index = 196 },
+        },
+    });
+    source.writeCell(1, 0, .{
+        .char = .{ .grapheme = "i", .width = 1 },
+        .style = .{
+            .italic = true,
+            .bg = .{ .rgb = .{ 1, 2, 3 } },
+        },
+    });
+
+    var lines = component_mod.LineList.empty;
+    defer component_mod.freeLines(allocator, &lines);
+    try appendScreenRowsAsAnsiLines(allocator, &source, 4, 1, &lines);
+
+    var target = try vaxis.Screen.init(allocator, .{
+        .rows = 1,
+        .cols = 4,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer target.deinit(allocator);
+
+    const target_window: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = target.width,
+        .height = target.height,
+        .screen = &target,
+    };
+    target_window.clear();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try renderLineListToWindow(target_window, lines.items, arena.allocator());
+
+    const hi = target.readCell(0, 0).?;
+    try std.testing.expectEqualStrings("H", hi.char.grapheme);
+    try std.testing.expect(hi.style.bold);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .index = 196 }, hi.style.fg);
+
+    const italic = target.readCell(1, 0).?;
+    try std.testing.expectEqualStrings("i", italic.char.grapheme);
+    try std.testing.expect(italic.style.italic);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 1, 2, 3 } }, italic.style.bg);
 }
