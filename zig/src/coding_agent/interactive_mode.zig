@@ -2152,6 +2152,184 @@ test "settings editor overlay saves settings.json and reloads runtime settings" 
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"theme\": \"light\"") != null);
 }
 
+test "theme slash command is registered switches immediately and persists selection" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "repo");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions"),
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    defer allocator.free(options.session_dir);
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    const parsed = slash_commands.parseSlashCommand("/theme codex") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(slash_commands.SlashCommandKind.theme, parsed.kind);
+    try std.testing.expectEqualStrings("codex", parsed.argument.?);
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    try slash_commands.handleThemeSlashCommand(
+        allocator,
+        std.testing.io,
+        &env_map,
+        root_dir,
+        parsed.argument,
+        &state,
+        &overlay,
+        &live_resources,
+    );
+
+    try std.testing.expectEqualStrings("codex", live_resources.theme.?.name);
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"theme\": \"codex\"") != null);
+}
+
+test "theme overlay lists all themes with active marker and enter activates selection" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "repo");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    try slash_commands.handleThemeSlashCommand(
+        allocator,
+        std.testing.io,
+        &env_map,
+        root_dir,
+        null,
+        &state,
+        &overlay,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .theme);
+    var saw_dark = false;
+    var saw_light = false;
+    var saw_codex = false;
+    var light_index: usize = 0;
+    for (overlay.?.theme.items, 0..) |item, index| {
+        if (std.mem.eql(u8, item.value, "dark")) {
+            saw_dark = true;
+            try std.testing.expect(std.mem.indexOf(u8, item.label, "✓") != null);
+        }
+        if (std.mem.eql(u8, item.value, "light")) {
+            saw_light = true;
+            light_index = index;
+        }
+        if (std.mem.eql(u8, item.value, "codex")) saw_codex = true;
+    }
+    try std.testing.expect(saw_dark and saw_light and saw_codex);
+
+    overlay.?.theme.list.setSelectedIndex(light_index);
+
+    var prompt_worker = PromptWorker{
+        .session = &session,
+        .app_state = &state,
+    };
+    var prompt_worker_active = false;
+    var should_exit = false;
+    var auth_flow: ?AuthFlow = null;
+    defer if (auth_flow) |*value| value.deinit(allocator);
+    const subscriber = agent.AgentSubscriber{
+        .context = null,
+        .callback = struct {
+            fn callback(_: ?*anyopaque, _: agent.AgentEvent) !void {}
+        }.callback,
+    };
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqualStrings("light", live_resources.theme.?.name);
+}
+
 test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
     const allocator = std.testing.allocator;
 

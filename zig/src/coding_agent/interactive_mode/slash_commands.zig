@@ -33,6 +33,7 @@ const loadHotkeysOverlay = overlays.loadHotkeysOverlay;
 const loadSettingsEditorOverlay = overlays.loadSettingsEditorOverlay;
 const loadSessionOverlay = overlays.loadSessionOverlay;
 const loadModelOverlay = overlays.loadModelOverlay;
+const loadThemeOverlay = overlays.loadThemeOverlay;
 const loadScopedModelOverlay = overlays.loadScopedModelOverlay;
 const loadTreeOverlay = overlays.loadTreeOverlay;
 const AppState = rendering.AppState;
@@ -42,6 +43,7 @@ const updateAppFooterFromSession = rendering.updateAppFooterFromSession;
 pub const SlashCommandKind = enum {
     settings,
     model,
+    theme,
     scoped_models,
     import,
     share,
@@ -79,6 +81,7 @@ pub const BuiltinSlashCommand = struct {
 pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "settings", .description = "Open settings editor" },
     .{ .name = "model", .description = "Select model (opens selector UI)", .argument_hint = "<provider/model>" },
+    .{ .name = "theme", .description = "Switch active theme (no arg opens selector UI)", .argument_hint = "<name>" },
     .{ .name = "scoped-models", .description = "Select from the scoped model cycling list" },
     .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl/.json/.md)", .argument_hint = "<path.html|path.jsonl>" },
     .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
@@ -148,6 +151,7 @@ pub fn parseSlashCommand(text: []const u8) ?SlashCommand {
 
     if (std.mem.eql(u8, command_name, "settings")) return .{ .kind = .settings, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
+    if (std.mem.eql(u8, command_name, "theme")) return .{ .kind = .theme, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "scoped-models")) return .{ .kind = .scoped_models, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "import")) return .{ .kind = .import, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "share")) return .{ .kind = .share, .argument = argument, .raw = text };
@@ -208,6 +212,16 @@ pub fn handleSlashCommand(
             live_resources.runtime_config,
             app_state,
             overlay,
+        ),
+        .theme => try handleThemeSlashCommand(
+            allocator,
+            io,
+            env_map,
+            options.cwd,
+            command.argument,
+            app_state,
+            overlay,
+            live_resources,
         ),
         .scoped_models => try handleScopedModelsSlashCommand(
             allocator,
@@ -520,6 +534,134 @@ pub fn handleModelSlashCommand(
     defer allocator.free(message);
     try app_state.appendInfo(message);
     overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
+}
+
+pub fn handleThemeSlashCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    argument: ?[]const u8,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    live_resources: *LiveResources,
+) !void {
+    try live_resources.ensureOwnedBundle(allocator, io, env_map, cwd);
+
+    if (argument) |raw_name| {
+        try applyThemeByName(allocator, io, env_map, cwd, raw_name, app_state, live_resources);
+        return;
+    }
+
+    const bundle = &live_resources.owned_resource_bundle.?;
+    overlay.* = try loadThemeOverlay(allocator, bundle.themes, live_resources.theme);
+}
+
+pub fn applyThemeByName(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    raw_name: []const u8,
+    app_state: *AppState,
+    live_resources: *LiveResources,
+) !void {
+    const theme_name = std.mem.trim(u8, raw_name, " \t\r\n");
+    if (theme_name.len == 0) {
+        try app_state.appendError("Usage: /theme <name>");
+        return;
+    }
+
+    live_resources.applyTheme(allocator, io, env_map, cwd, theme_name) catch |err| switch (err) {
+        error.ThemeNotFound => {
+            const message = try std.fmt.allocPrint(allocator, "Unknown theme `{s}`", .{theme_name});
+            defer allocator.free(message);
+            try app_state.appendError(message);
+            return;
+        },
+        else => return err,
+    };
+
+    const runtime_config = live_resources.runtime_config orelse {
+        try app_state.setStatus("theme switched for this session");
+        return;
+    };
+    try persistGlobalThemeSelection(allocator, io, runtime_config, theme_name);
+    try replaceRuntimeSettingsTheme(allocator, &live_resources.owned_runtime_config.?, theme_name);
+
+    const active_theme_name = if (live_resources.theme) |theme| theme.name else theme_name;
+    const message = try std.fmt.allocPrint(allocator, "Theme switched to {s}", .{active_theme_name});
+    defer allocator.free(message);
+    try app_state.setStatus(message);
+}
+
+fn persistGlobalThemeSelection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: *const config_mod.RuntimeConfig,
+    theme_name: []const u8,
+) !void {
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    const content = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (content) |value| allocator.free(value);
+
+    var next_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const next_value: std.json.Value = .{ .object = next_object };
+        common.deinitJsonValue(allocator, next_value);
+    }
+
+    if (content) |settings_content| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, settings_content, .{}) catch null;
+        defer if (parsed) |*value| value.deinit();
+        if (parsed) |parsed_value| {
+            if (parsed_value.value == .object) {
+                var iterator = parsed_value.value.object.iterator();
+                while (iterator.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "theme")) continue;
+                    try next_object.put(
+                        allocator,
+                        try allocator.dupe(u8, entry.key_ptr.*),
+                        try common.cloneJsonValue(allocator, entry.value_ptr.*),
+                    );
+                }
+            }
+        }
+    }
+
+    try next_object.put(
+        allocator,
+        try allocator.dupe(u8, "theme"),
+        .{ .string = try allocator.dupe(u8, theme_name) },
+    );
+
+    const next_value: std.json.Value = .{ .object = next_object };
+    defer common.deinitJsonValue(allocator, next_value);
+
+    const serialized = try std.json.Stringify.valueAlloc(allocator, next_value, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, settings_path, serialized, true);
+}
+
+fn replaceRuntimeSettingsTheme(
+    allocator: std.mem.Allocator,
+    runtime_config: *config_mod.RuntimeConfig,
+    theme_name: []const u8,
+) !void {
+    const next_global = try allocator.dupe(u8, theme_name);
+    errdefer allocator.free(next_global);
+    const next_effective = try allocator.dupe(u8, theme_name);
+    errdefer allocator.free(next_effective);
+
+    if (runtime_config.global_settings.theme) |old| allocator.free(old);
+    runtime_config.global_settings.theme = next_global;
+    if (runtime_config.settings.theme) |old| allocator.free(old);
+    runtime_config.settings.theme = next_effective;
 }
 
 pub fn handleScopedModelsSlashCommand(

@@ -1825,6 +1825,7 @@ pub const OverlayPanelComponent = struct {
                     .info => |*info_overlay| &info_overlay.list,
                     .session => |*session_overlay| &session_overlay.list,
                     .model => |*model_overlay| &model_overlay.list,
+                    .theme => |*theme_overlay| &theme_overlay.list,
                     .tree => |*tree_overlay| &tree_overlay.list,
                     .auth => |*auth_overlay| &auth_overlay.list,
                     else => unreachable,
@@ -1906,6 +1907,7 @@ pub const OverlayPanelComponent = struct {
                         .info => |*info_overlay| &info_overlay.list,
                         .session => |*session_overlay| &session_overlay.list,
                         .model => |*model_overlay| &model_overlay.list,
+                        .theme => |*theme_overlay| &theme_overlay.list,
                         .tree => |*tree_overlay| &tree_overlay.list,
                         .auth => |*auth_overlay| &auth_overlay.list,
                         else => unreachable,
@@ -3065,6 +3067,54 @@ test "prompt m2 renders hints above compact footer with distinct styles and term
     try std.testing.expect(std.mem.indexOf(u8, footer, "Status:") == null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Model:") == null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
+}
+
+test "screen draw re-reads theme after runtime switch without stale structural cells" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const model = ai.model_registry.find("faux", "faux-1").?;
+    try state.setFooterDetails(model, "demo-session.jsonl", "zig-implementation", "Faux", "env");
+
+    var dark = try resources_mod.Theme.initDefault(allocator);
+    defer dark.deinit(allocator);
+    var codex = try resources_mod.Theme.initCodex(allocator);
+    defer codex.deinit(allocator);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("hello");
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 14,
+        .theme = &dark,
+        .terminal_name = "ghostty",
+    };
+
+    var dark_screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 100, 14);
+    defer dark_screen.deinit(std.testing.allocator);
+    const dark_glyph = dark_screen.readCell(1, 10) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(">", dark_glyph.char.grapheme);
+    try std.testing.expectEqual(styleForToken(&dark, .prompt_glyph), dark_glyph.style);
+
+    const dark_text = try tui.test_helpers.screenToString(&dark_screen);
+    defer allocator.free(dark_text);
+
+    screen_component.theme = &codex;
+    var codex_screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 100, 14);
+    defer codex_screen.deinit(std.testing.allocator);
+    const codex_glyph = codex_screen.readCell(1, 10) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(">", codex_glyph.char.grapheme);
+    try std.testing.expectEqual(styleForToken(&codex, .prompt_glyph), codex_glyph.style);
+    try std.testing.expect(!std.meta.eql(dark_glyph.style, codex_glyph.style));
+
+    const codex_text = try tui.test_helpers.screenToString(&codex_screen);
+    defer allocator.free(codex_text);
+    try std.testing.expectEqualStrings(dark_text, codex_text);
 }
 
 pub const InteractiveModeTestBackend = struct {
