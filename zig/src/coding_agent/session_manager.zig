@@ -2667,6 +2667,26 @@ fn assistantTextMessage(
     } };
 }
 
+fn toolResultTextMessage(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    text: []const u8,
+    timestamp: i64,
+) !agent.AgentMessage {
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    return .{ .tool_result = .{
+        .role = try allocator.dupe(u8, "toolResult"),
+        .tool_call_id = try allocator.dupe(u8, tool_call_id),
+        .tool_name = try allocator.dupe(u8, tool_name),
+        .content = blocks,
+        .details = null,
+        .is_error = false,
+        .timestamp = timestamp,
+    } };
+}
+
 fn sessionSearchTestModel() ai.Model {
     return .{
         .id = "faux-session",
@@ -2761,15 +2781,22 @@ test "session manager persists messages to jsonl and resumes from disk" {
     defer deinitMessage(std.testing.allocator, &assistant);
     _ = try manager.appendMessage(assistant);
 
+    const tool_result_timestamp = agent.nowMilliseconds();
+    try std.testing.expect(tool_result_timestamp > 0);
+    var tool_result = try toolResultTextMessage(std.testing.allocator, "tool-1", "bash", "tool output", tool_result_timestamp);
+    defer deinitMessage(std.testing.allocator, &tool_result);
+    _ = try manager.appendMessage(tool_result);
+
     const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
     defer std.testing.allocator.free(session_file);
 
     const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(written);
 
-    try std.testing.expectEqual(@as(usize, 3), countJsonLines(written));
+    try std.testing.expectEqual(@as(usize, 4), countJsonLines(written));
     try std.testing.expect(std.mem.containsAtLeast(u8, written, 1, "\"role\":\"user\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, written, 1, "\"role\":\"assistant\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, written, 1, "\"role\":\"toolResult\""));
 
     var reopened = try SessionManager.open(std.testing.allocator, std.testing.io, session_file, null);
     defer reopened.deinit();
@@ -2777,9 +2804,11 @@ test "session manager persists messages to jsonl and resumes from disk" {
     var context = try reopened.buildSessionContext(std.testing.allocator);
     defer context.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
     try std.testing.expectEqualStrings("hello", context.messages[0].user.content[0].text.text);
     try std.testing.expectEqualStrings("world", context.messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("tool output", context.messages[2].tool_result.content[0].text.text);
+    try std.testing.expectEqual(tool_result_timestamp, context.messages[2].tool_result.timestamp);
     try std.testing.expectEqualStrings("faux", context.model.?.provider);
     try std.testing.expectEqualStrings("faux-session", context.model.?.model_id);
 }

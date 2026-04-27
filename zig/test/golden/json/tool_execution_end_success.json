@@ -1,0 +1,18 @@
+{
+  "isError": false,
+  "result": {
+    "content": [
+      {
+        "text": "tool output",
+        "type": "text"
+      }
+    ],
+    "details": {
+      "exitCode": 0,
+      "timedOut": false
+    }
+  },
+  "toolCallId": "tool-1",
+  "toolName": "bash",
+  "type": "tool_execution_end"
+}

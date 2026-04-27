@@ -888,6 +888,265 @@ fn putFloatField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key:
     try putField(object, allocator, key, .{ .float = value });
 }
 
+fn expectGoldenJson(comptime name: []const u8, actual: []const u8) !void {
+    const path = "test/golden/json/" ++ name ++ ".json";
+    const expected_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(expected_bytes);
+    var expected = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, expected_bytes, .{});
+    defer expected.deinit();
+    var actual_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
+    defer actual_parsed.deinit();
+
+    try std.testing.expect(jsonValuesEqual(expected.value, actual_parsed.value));
+}
+
+fn expectGoldenAgentEvent(comptime name: []const u8, event: agent.AgentEvent) !void {
+    const line = try stringifyAgentEventLine(std.testing.allocator, event);
+    defer std.testing.allocator.free(line);
+    try expectGoldenJson(name, line);
+}
+
+fn jsonValuesEqual(expected: std.json.Value, actual: std.json.Value) bool {
+    return switch (expected) {
+        .null => actual == .null,
+        .bool => |expected_bool| actual == .bool and actual.bool == expected_bool,
+        .integer => |expected_integer| switch (actual) {
+            .integer => |actual_integer| actual_integer == expected_integer,
+            .float => |actual_float| actual_float == @as(f64, @floatFromInt(expected_integer)),
+            .number_string => |actual_number| numberStringEqualsInteger(actual_number, expected_integer),
+            else => false,
+        },
+        .float => |expected_float| switch (actual) {
+            .integer => |actual_integer| expected_float == @as(f64, @floatFromInt(actual_integer)),
+            .float => |actual_float| actual_float == expected_float,
+            .number_string => |actual_number| numberStringEqualsFloat(actual_number, expected_float),
+            else => false,
+        },
+        .number_string => |expected_number| switch (actual) {
+            .integer => |actual_integer| numberStringEqualsInteger(expected_number, actual_integer),
+            .float => |actual_float| numberStringEqualsFloat(expected_number, actual_float),
+            .number_string => |actual_number| std.mem.eql(u8, expected_number, actual_number),
+            else => false,
+        },
+        .string => |expected_string| actual == .string and std.mem.eql(u8, expected_string, actual.string),
+        .array => |expected_array| blk: {
+            if (actual != .array or expected_array.items.len != actual.array.items.len) break :blk false;
+            for (expected_array.items, actual.array.items) |expected_item, actual_item| {
+                if (!jsonValuesEqual(expected_item, actual_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |expected_object| blk: {
+            if (actual != .object or expected_object.count() != actual.object.count()) break :blk false;
+            var iterator = expected_object.iterator();
+            while (iterator.next()) |entry| {
+                const actual_value = actual.object.get(entry.key_ptr.*) orelse break :blk false;
+                if (!jsonValuesEqual(entry.value_ptr.*, actual_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn numberStringEqualsInteger(number_string: []const u8, integer: i64) bool {
+    const parsed = std.fmt.parseInt(i64, number_string, 10) catch return false;
+    return parsed == integer;
+}
+
+fn numberStringEqualsFloat(number_string: []const u8, float: f64) bool {
+    const parsed = std.fmt.parseFloat(f64, number_string) catch return false;
+    return parsed == float;
+}
+
+test "expectGoldenJson compares objects recursively without key-order sensitivity" {
+    try expectGoldenJson("order_insensitive_helper", "{\"outer\":{\"z\":true,\"a\":[1,{\"b\":\"c\"}]},\"n\":2}");
+    var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"a\":1}", .{});
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"a\":2}", .{});
+    defer right.deinit();
+    try std.testing.expect(!jsonValuesEqual(left.value, right.value));
+}
+
+test "route-a m3 JSON wire golden corpus covers every envelope variant" {
+    const allocator = std.testing.allocator;
+
+    var args_object = try initObject(allocator);
+    defer common.deinitJsonValue(allocator, .{ .object = args_object });
+    try putStringField(&args_object, allocator, "command", "printf 'hello\\nworld'");
+    try putBoolField(&args_object, allocator, "stream", true);
+    const args_value: std.json.Value = .{ .object = args_object };
+
+    var details_object = try initObject(allocator);
+    defer common.deinitJsonValue(allocator, .{ .object = details_object });
+    try putIntField(&details_object, allocator, "exitCode", 0);
+    try putBoolField(&details_object, allocator, "timedOut", false);
+    const details_value: std.json.Value = .{ .object = details_object };
+
+    var error_details_object = try initObject(allocator);
+    defer common.deinitJsonValue(allocator, .{ .object = error_details_object });
+    try putIntField(&error_details_object, allocator, "exitCode", 2);
+    try putBoolField(&error_details_object, allocator, "timedOut", false);
+    const error_details_value: std.json.Value = .{ .object = error_details_object };
+
+    const user_content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "hello\nworld" } },
+        .{ .image = .{ .data = "aGVsbG8=", .mime_type = "image/png" } },
+    };
+    const assistant_text_content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "partial text" } },
+    };
+    const assistant_rich_content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "final text" } },
+        .{ .thinking = .{ .thinking = "reasoning", .signature = "sig-1" } },
+    };
+    const tool_result_content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "tool output" } },
+    };
+    const partial_tool_result_content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "line 1\nline 2" } },
+        .{ .image = .{ .data = "iVBORw0KGgo=", .mime_type = "image/png" } },
+    };
+    const error_tool_result_content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "command failed" } },
+    };
+
+    const tool_call = ai.ToolCall{
+        .id = "tool-1",
+        .name = "bash",
+        .arguments = args_value,
+    };
+    const tool_calls = [_]ai.ToolCall{tool_call};
+
+    const assistant_message = ai.AssistantMessage{
+        .content = assistant_rich_content[0..],
+        .tool_calls = tool_calls[0..],
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 3, .output = 5, .cache_read = 7, .cache_write = 11, .total_tokens = 26 },
+        .stop_reason = .tool_use,
+        .timestamp = 2002,
+    };
+    const assistant_text_message = ai.AssistantMessage{
+        .content = assistant_text_content[0..],
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 3, .output = 5, .total_tokens = 8 },
+        .stop_reason = .stop,
+        .timestamp = 2001,
+    };
+    const aborted_message = ai.AssistantMessage{
+        .content = assistant_text_content[0..],
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 3, .output = 1, .total_tokens = 4 },
+        .stop_reason = .aborted,
+        .error_message = "aborted",
+        .timestamp = 2003,
+    };
+    const tool_result_message = agent.types.ToolResultMessage{
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .content = tool_result_content[0..],
+        .details = details_value,
+        .is_error = false,
+        .timestamp = 3001,
+    };
+    const partial_tool_result = agent.types.AgentToolResult{
+        .content = partial_tool_result_content[0..],
+        .details = details_value,
+    };
+    const success_tool_result = agent.types.AgentToolResult{
+        .content = tool_result_content[0..],
+        .details = details_value,
+    };
+    const error_tool_result = agent.types.AgentToolResult{
+        .content = error_tool_result_content[0..],
+        .details = error_details_value,
+    };
+
+    try expectGoldenAgentEvent("agent_start", .{ .event_type = .agent_start });
+    try expectGoldenAgentEvent("turn_start", .{ .event_type = .turn_start });
+    try expectGoldenAgentEvent("message_start_user", .{
+        .event_type = .message_start,
+        .message = .{ .user = .{ .content = user_content[0..], .timestamp = 1001 } },
+    });
+    try expectGoldenAgentEvent("message_start_assistant", .{
+        .event_type = .message_start,
+        .message = .{ .assistant = assistant_message },
+    });
+    try expectGoldenAgentEvent("message_update_text_delta", .{
+        .event_type = .message_update,
+        .message = .{ .assistant = assistant_text_message },
+        .assistant_message_event = .{ .event_type = .text_delta, .content_index = 0, .delta = "partial", .message = assistant_text_message },
+    });
+    try expectGoldenAgentEvent("message_update_thinking_delta", .{
+        .event_type = .message_update,
+        .message = .{ .assistant = assistant_message },
+        .assistant_message_event = .{ .event_type = .thinking_delta, .content_index = 1, .delta = "reason", .message = assistant_message },
+    });
+    try expectGoldenAgentEvent("message_update_toolcall_delta", .{
+        .event_type = .message_update,
+        .message = .{ .assistant = assistant_message },
+        .assistant_message_event = .{ .event_type = .toolcall_delta, .content_index = 2, .delta = "{\"command\":\"printf\"}", .message = assistant_message },
+    });
+    try expectGoldenAgentEvent("message_update_abort_error", .{
+        .event_type = .message_update,
+        .message = .{ .assistant = aborted_message },
+        .assistant_message_event = .{ .event_type = .error_event, .message = aborted_message },
+    });
+    try expectGoldenAgentEvent("message_end_assistant", .{
+        .event_type = .message_end,
+        .message = .{ .assistant = assistant_message },
+    });
+    try expectGoldenAgentEvent("message_end_tool_result", .{
+        .event_type = .message_end,
+        .message = .{ .tool_result = tool_result_message },
+    });
+    try expectGoldenAgentEvent("tool_execution_start", .{
+        .event_type = .tool_execution_start,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .args = args_value,
+    });
+    try expectGoldenAgentEvent("tool_execution_update_partial", .{
+        .event_type = .tool_execution_update,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .args = args_value,
+        .partial_result = partial_tool_result,
+    });
+    try expectGoldenAgentEvent("tool_execution_end_success", .{
+        .event_type = .tool_execution_end,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .result = success_tool_result,
+        .is_error = false,
+    });
+    try expectGoldenAgentEvent("tool_execution_end_error", .{
+        .event_type = .tool_execution_end,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .result = error_tool_result,
+        .is_error = true,
+    });
+    try expectGoldenAgentEvent("turn_end", .{
+        .event_type = .turn_end,
+        .message = .{ .assistant = assistant_message },
+        .tool_results = &[_]agent.types.ToolResultMessage{tool_result_message},
+    });
+    try expectGoldenAgentEvent("agent_end", .{
+        .event_type = .agent_end,
+        .messages = &[_]agent.AgentMessage{
+            .{ .user = .{ .content = user_content[0..], .timestamp = 1001 } },
+            .{ .assistant = assistant_message },
+            .{ .tool_result = tool_result_message },
+        },
+    });
+}
+
 test "validateAgentEventJson reports contextual schema errors" {
     const allocator = std.testing.allocator;
 

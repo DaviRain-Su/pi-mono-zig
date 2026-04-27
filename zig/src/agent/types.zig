@@ -5,6 +5,12 @@ pub const AgentMessage = ai.Message;
 pub const AgentToolCall = ai.ToolCall;
 pub const ToolResultMessage = ai.types.ToolResultMessage;
 
+pub fn nowMilliseconds() i64 {
+    var now: std.c.timeval = undefined;
+    _ = std.c.gettimeofday(&now, null);
+    return @as(i64, @intCast(now.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(now.usec)), std.time.us_per_ms);
+}
+
 pub const ThinkingLevel = enum {
     off,
     minimal,
@@ -205,6 +211,16 @@ pub const AgentSubscriber = struct {
 test "thinking levels include off" {
     try std.testing.expectEqual(ThinkingLevel.off, .off);
     try std.testing.expectEqual(ToolExecutionMode.parallel, .parallel);
+}
+
+test "nowMilliseconds returns current epoch milliseconds" {
+    const before = nowMilliseconds();
+    const actual = nowMilliseconds();
+    const after = nowMilliseconds();
+
+    try std.testing.expect(actual > 0);
+    try std.testing.expect(actual >= before - 2000);
+    try std.testing.expect(actual <= after + 2000);
 }
 
 test "agent event type includes single turn lifecycle variants" {

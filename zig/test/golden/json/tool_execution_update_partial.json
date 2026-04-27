@@ -1,0 +1,26 @@
+{
+  "args": {
+    "command": "printf 'hello\\nworld'",
+    "stream": true
+  },
+  "partialResult": {
+    "content": [
+      {
+        "text": "line 1\nline 2",
+        "type": "text"
+      },
+      {
+        "data": "iVBORw0KGgo=",
+        "mimeType": "image/png",
+        "type": "image"
+      }
+    ],
+    "details": {
+      "exitCode": 0,
+      "timedOut": false
+    }
+  },
+  "toolCallId": "tool-1",
+  "toolName": "bash",
+  "type": "tool_execution_update"
+}
