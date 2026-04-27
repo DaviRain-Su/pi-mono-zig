@@ -14,6 +14,14 @@ pub const ResolveProviderError = error{
     InvalidFauxToolArguments,
 };
 
+pub const ProviderAuthStatus = enum {
+    missing,
+    local,
+    runtime,
+    stored,
+    environment,
+};
+
 const OwnedFauxMessage = struct {
     blocks: []faux.FauxContentBlock,
 
@@ -37,6 +45,7 @@ pub const ResolvedProviderConfig = struct {
     model: ai.Model,
     api_key: ?[]const u8,
     owned_api_key: ?[]u8 = null,
+    auth_status: ProviderAuthStatus = .missing,
     faux_registration: ?faux.FauxProviderRegistration = null,
     owned_faux_messages: ?[]OwnedFauxMessage = null,
 
@@ -56,6 +65,7 @@ pub const AvailableModel = struct {
     model_id: []const u8,
     display_name: []const u8,
     available: bool,
+    auth_status: ProviderAuthStatus,
     reasoning: bool,
     tool_calling: bool,
     loaded: bool,
@@ -106,11 +116,16 @@ pub fn resolveProviderConfig(
 
     const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
     const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(provider_descriptor, model_id);
+    const auth_status: ProviderAuthStatus = if (resolved_api_key) |api_key|
+        authStatusFromSource(api_key.source)
+    else
+        .local;
 
     return .{
         .model = model,
         .api_key = if (resolved_api_key) |api_key| api_key.api_key else null,
         .owned_api_key = if (resolved_api_key) |api_key| api_key.owned_api_key else null,
+        .auth_status = auth_status,
     };
 }
 
@@ -128,12 +143,14 @@ pub fn listAvailableModels(
 
     for (summaries) |summary| {
         const is_current = if (current_model) |model| modelMatchesReference(model, summary.provider, summary.id) else false;
-        const credentials_available = try hasProviderCredentials(allocator, env_map, summary.provider, configured_credentials);
+        const auth_status = try resolveAvailableProviderAuthStatus(allocator, env_map, summary.provider, configured_credentials);
+        const credentials_available = auth_status != .missing;
         try models.append(allocator, .{
             .provider = summary.provider,
             .model_id = summary.id,
             .display_name = summary.name,
             .available = is_current or credentials_available,
+            .auth_status = auth_status,
             .reasoning = summary.reasoning,
             .tool_calling = summary.tool_calling,
             .loaded = summary.loaded,
@@ -157,6 +174,7 @@ pub fn listAvailableModels(
                 .model_id = model.id,
                 .display_name = model.name,
                 .available = true,
+                .auth_status = .missing,
                 .reasoning = model.reasoning,
                 .tool_calling = model.tool_calling,
                 .loaded = model.loaded,
@@ -231,6 +249,30 @@ pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const 
         error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
         error.InvalidFauxToolArguments => "Invalid PI_FAUX_TOOL_ARGS_JSON. Expected a JSON object or value.",
         else => @errorName(err),
+    };
+}
+
+pub fn providerDisplayName(provider: []const u8) []const u8 {
+    if (auth.findSupportedProviderByAuthType(provider, .api_key)) |supported| return supported.name;
+    if (auth.findSupportedProvider(provider)) |supported| return supported.name;
+    return provider;
+}
+
+pub fn providerAuthStatusLabel(status: ProviderAuthStatus) []const u8 {
+    return switch (status) {
+        .missing => "needs auth",
+        .local => "local",
+        .runtime => "--api-key",
+        .stored => "saved",
+        .environment => "env",
+    };
+}
+
+fn authStatusFromSource(source: auth.CredentialSource) ProviderAuthStatus {
+    return switch (source) {
+        .runtime => .runtime,
+        .stored => .stored,
+        .environment => .environment,
     };
 }
 
@@ -440,6 +482,7 @@ fn resolveFauxProvider(
     return .{
         .model = registration.getModel(),
         .api_key = null,
+        .auth_status = .local,
         .faux_registration = registration,
         .owned_faux_messages = owned_messages,
     };
@@ -516,17 +559,7 @@ fn hasProviderCredentials(
     provider: []const u8,
     configured_credentials: ConfiguredCredentials,
 ) !bool {
-    if (shouldForceFauxProvider(env_map, provider)) return true;
-    if (configured_credentials.lookup(provider) != null) return true;
-    if (!std.mem.eql(u8, provider, "faux")) {
-        if (ai.model_registry.getProviderConfig(provider)) |descriptor| {
-            if (isLocalBaseUrl(descriptor.base_url)) return true;
-        }
-    }
-
-    const api_key = try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider);
-    defer if (api_key) |value| allocator.free(value);
-    return api_key != null;
+    return (try resolveAvailableProviderAuthStatus(allocator, env_map, provider, configured_credentials)) != .missing;
 }
 
 fn isLocalBaseUrl(value: []const u8) bool {
@@ -536,77 +569,103 @@ fn isLocalBaseUrl(value: []const u8) bool {
         containsIgnoreCase(value, "[::1]");
 }
 
+fn resolveAvailableProviderAuthStatus(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    configured_credentials: ConfiguredCredentials,
+) !ProviderAuthStatus {
+    if (shouldForceFauxProvider(env_map, provider)) return .local;
+    if (configured_credentials.lookup(provider) != null) return .stored;
+    if (!std.mem.eql(u8, provider, "faux")) {
+        if (ai.model_registry.getProviderConfig(provider)) |descriptor| {
+            if (isLocalBaseUrl(descriptor.base_url)) return .local;
+        }
+    }
+
+    const api_key = try ai.env_api_keys.getEnvApiKeyFromMap(allocator, env_map, provider);
+    defer if (api_key) |value| allocator.free(value);
+    if (api_key != null) return .environment;
+    return .missing;
+}
+
 fn missingApiKeyMessage(provider: []const u8) []const u8 {
-    if (std.mem.eql(u8, provider, "openai") or
-        std.mem.eql(u8, provider, "openai-responses") or
-        std.mem.eql(u8, provider, "openai-codex"))
-    {
-        return "API key required. Use --api-key or set OPENAI_API_KEY.";
+    if (std.mem.eql(u8, provider, "openai")) {
+        return "OpenAI credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai to save a key.";
+    }
+    if (std.mem.eql(u8, provider, "openai-responses")) {
+        return "OpenAI Responses credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-responses to save a key.";
+    }
+    if (std.mem.eql(u8, provider, "openai-codex")) {
+        return "OpenAI Codex credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-codex to save a key.";
     }
     if (std.mem.eql(u8, provider, "azure-openai-responses")) {
-        return "API key required. Use --api-key or set AZURE_OPENAI_API_KEY.";
+        return "Azure OpenAI credentials required.\nSet AZURE_OPENAI_API_KEY, pass --api-key, or run /login azure-openai-responses to save a key.";
     }
     if (std.mem.eql(u8, provider, "google")) {
-        return "API key required. Use --api-key or set GEMINI_API_KEY.";
+        return "Google Gemini credentials required.\nSet GEMINI_API_KEY, pass --api-key, or run /login google to save a key.";
     }
     if (std.mem.eql(u8, provider, "google-gemini-cli")) {
-        return "OAuth authentication required. Use /login to authenticate with Google Cloud Code Assist.";
+        return "Google Cloud Code Assist credentials required.\nRun /login google-gemini-cli. Paid tiers may also require GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID.";
     }
     if (std.mem.eql(u8, provider, "google-vertex")) {
-        return "Credentials required. Use --api-key, set GOOGLE_CLOUD_API_KEY, or configure GOOGLE_APPLICATION_CREDENTIALS with GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION.";
+        return "Google Vertex AI credentials required.\nSet GOOGLE_CLOUD_API_KEY, or configure GOOGLE_APPLICATION_CREDENTIALS with GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION. /login google-vertex can also store an API key.";
     }
     if (std.mem.eql(u8, provider, "anthropic")) {
-        return "API key required. Use --api-key or set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN.";
+        return "Anthropic credentials required.\nSet ANTHROPIC_OAUTH_TOKEN or ANTHROPIC_API_KEY, pass --api-key, or run /login anthropic.";
     }
     if (std.mem.eql(u8, provider, "github-copilot")) {
-        return "API key required. Use --api-key or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.";
+        return "GitHub Copilot credentials required.\nRun /login github-copilot, or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.";
     }
     if (std.mem.eql(u8, provider, "amazon-bedrock")) {
-        return "Credentials required. Use --api-key or configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or another supported AWS auth source.";
+        return "Amazon Bedrock credentials required.\nRun /login amazon-bedrock to store a proxy/API key, or configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, AWS_BEARER_TOKEN_BEDROCK, or another supported AWS auth source.";
     }
     if (std.mem.eql(u8, provider, "mistral")) {
-        return "API key required. Use --api-key or set MISTRAL_API_KEY.";
+        return "Mistral credentials required.\nSet MISTRAL_API_KEY, pass --api-key, or run /login mistral.";
     }
     if (std.mem.eql(u8, provider, "groq")) {
-        return "API key required. Use --api-key or set GROQ_API_KEY.";
+        return "Groq credentials required.\nSet GROQ_API_KEY, pass --api-key, or run /login groq.";
     }
     if (std.mem.eql(u8, provider, "cerebras")) {
-        return "API key required. Use --api-key or set CEREBRAS_API_KEY.";
+        return "Cerebras credentials required.\nSet CEREBRAS_API_KEY, pass --api-key, or run /login cerebras.";
     }
     if (std.mem.eql(u8, provider, "xai")) {
-        return "API key required. Use --api-key or set XAI_API_KEY.";
+        return "xAI credentials required.\nSet XAI_API_KEY, pass --api-key, or run /login xai.";
     }
     if (std.mem.eql(u8, provider, "openrouter")) {
-        return "API key required. Use --api-key or set OPENROUTER_API_KEY.";
+        return "OpenRouter credentials required.\nSet OPENROUTER_API_KEY, pass --api-key, or run /login openrouter.";
     }
     if (std.mem.eql(u8, provider, "vercel-ai-gateway")) {
-        return "API key required. Use --api-key or set AI_GATEWAY_API_KEY.";
+        return "Vercel AI Gateway credentials required.\nSet AI_GATEWAY_API_KEY, pass --api-key, or run /login vercel-ai-gateway.";
     }
     if (std.mem.eql(u8, provider, "zai")) {
-        return "API key required. Use --api-key or set ZAI_API_KEY.";
+        return "ZAI credentials required.\nSet ZAI_API_KEY, pass --api-key, or run /login zai.";
     }
     if (std.mem.eql(u8, provider, "minimax")) {
-        return "API key required. Use --api-key or set MINIMAX_API_KEY.";
+        return "MiniMax credentials required.\nSet MINIMAX_API_KEY, pass --api-key, or run /login minimax.";
     }
     if (std.mem.eql(u8, provider, "minimax-cn")) {
-        return "API key required. Use --api-key or set MINIMAX_CN_API_KEY.";
+        return "MiniMax (China) credentials required.\nSet MINIMAX_CN_API_KEY, pass --api-key, or run /login minimax-cn.";
     }
     if (std.mem.eql(u8, provider, "huggingface")) {
-        return "API key required. Use --api-key or set HF_TOKEN.";
+        return "Hugging Face credentials required.\nSet HF_TOKEN, pass --api-key, or run /login huggingface.";
     }
     if (std.mem.eql(u8, provider, "fireworks")) {
-        return "API key required. Use --api-key or set FIREWORKS_API_KEY.";
+        return "Fireworks credentials required.\nSet FIREWORKS_API_KEY, pass --api-key, or run /login fireworks.";
     }
-    if (std.mem.eql(u8, provider, "opencode") or std.mem.eql(u8, provider, "opencode-go")) {
-        return "API key required. Use --api-key or set OPENCODE_API_KEY.";
+    if (std.mem.eql(u8, provider, "opencode")) {
+        return "OpenCode Zen credentials required.\nSet OPENCODE_API_KEY, pass --api-key, or run /login opencode.";
+    }
+    if (std.mem.eql(u8, provider, "opencode-go")) {
+        return "OpenCode Go credentials required.\nSet OPENCODE_API_KEY, pass --api-key, or run /login opencode-go.";
     }
     if (std.mem.eql(u8, provider, "kimi-coding")) {
-        return "API key required. Use --api-key or set KIMI_API_KEY.";
+        return "Kimi For Coding credentials required.\nSet KIMI_API_KEY, pass --api-key, or run /login kimi-coding.";
     }
     if (std.mem.eql(u8, provider, "kimi")) {
-        return "API key required. Use --api-key or set MOONSHOT_API_KEY.";
+        return "Kimi credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login kimi.";
     }
-    return "API credentials required. Use --api-key or configure the provider environment variables.";
+    return "Provider credentials required.\nPass --api-key, run /login <provider>, or configure the provider environment variables.";
 }
 
 test "resolveProviderConfig uses canonical defaults from model registry" {
@@ -659,6 +718,7 @@ test "resolveProviderConfig uses configured api key when env is missing" {
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
+    try std.testing.expectEqual(ProviderAuthStatus.stored, resolved.auth_status);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
 }
 
@@ -679,6 +739,7 @@ test "resolveProviderConfig prefers runtime override over stored and environment
     );
     defer resolved.deinit(allocator);
 
+    try std.testing.expectEqual(ProviderAuthStatus.runtime, resolved.auth_status);
     try std.testing.expectEqualStrings("runtime-openai-key", resolved.api_key.?);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
 }
@@ -980,10 +1041,27 @@ test "blank configured credentials do not make models selectable" {
 }
 
 test "resolveProviderErrorMessage guides google-gemini-cli users to login" {
-    try std.testing.expectEqualStrings(
-        "OAuth authentication required. Use /login to authenticate with Google Cloud Code Assist.",
-        resolveProviderErrorMessage(error.MissingApiKey, "google-gemini-cli"),
-    );
+    const message = resolveProviderErrorMessage(error.MissingApiKey, "google-gemini-cli");
+    try std.testing.expect(std.mem.indexOf(u8, message, "/login google-gemini-cli") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "GOOGLE_CLOUD_PROJECT") != null);
+}
+
+test "resolveProviderErrorMessage includes provider-specific env and login guidance" {
+    const openai = resolveProviderErrorMessage(error.MissingApiKey, "openai");
+    try std.testing.expect(std.mem.indexOf(u8, openai, "OPENAI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openai, "/login openai") != null);
+
+    const openai_responses = resolveProviderErrorMessage(error.MissingApiKey, "openai-responses");
+    try std.testing.expect(std.mem.indexOf(u8, openai_responses, "OpenAI Responses credentials required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openai_responses, "/login openai-responses") != null);
+
+    const opencode_go = resolveProviderErrorMessage(error.MissingApiKey, "opencode-go");
+    try std.testing.expect(std.mem.indexOf(u8, opencode_go, "OpenCode Go credentials required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opencode_go, "/login opencode-go") != null);
+
+    const copilot = resolveProviderErrorMessage(error.MissingApiKey, "github-copilot");
+    try std.testing.expect(std.mem.indexOf(u8, copilot, "COPILOT_GITHUB_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot, "/login github-copilot") != null);
 }
 
 test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patterns" {
