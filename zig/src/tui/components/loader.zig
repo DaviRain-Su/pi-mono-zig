@@ -272,8 +272,8 @@ pub const CancellableLoader = struct {
     }
 };
 
-const DEFAULT_INTERVAL_MS: u64 = 80;
-const DEFAULT_SPINNER_FRAMES = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+pub const DEFAULT_INTERVAL_MS: u64 = 80;
+pub const DEFAULT_SPINNER_FRAMES = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 const DEFAULT_DOT_FRAMES = [_][]const u8{ ".", "..", "..." };
 const DEFAULT_PULSE_FRAMES = [_][]const u8{ "●○○", "○●○", "○○●" };
 const DEFAULT_LINE_FRAMES = [_][]const u8{ "-", "\\", "|", "/" };

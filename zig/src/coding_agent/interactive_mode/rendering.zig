@@ -36,6 +36,8 @@ pub const ChatKind = enum {
 pub const ChatItem = struct {
     kind: ChatKind,
     text: []u8,
+    start_ms: ?i64 = null,
+    frozen_frame_index: ?usize = null,
 };
 
 pub const PendingEditorImage = struct {
@@ -117,6 +119,8 @@ const ActiveToolUpdate = struct {
     tool_call_id: []u8,
     item_index: usize,
 };
+
+const ClockNowMsFn = *const fn (?*anyopaque) i64;
 
 const CLIPBOARD_PASTE_PROGRESS_MIN_MS: i64 = 120;
 
@@ -246,6 +250,8 @@ pub const AppState = struct {
     active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
     tool_output_expanded: bool = false,
     clipboard_paste: ClipboardPasteTask,
+    clock_context: ?*anyopaque = null,
+    clock_now_ms_fn: ClockNowMsFn = systemNowMilliseconds,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
@@ -342,6 +348,13 @@ pub const AppState = struct {
 
     pub fn clipboardPasteInProgress(self: *const AppState) bool {
         return self.clipboard_paste.isActive();
+    }
+
+    pub fn setClockForTesting(self: *AppState, context: ?*anyopaque, now_ms_fn: ClockNowMsFn) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.clock_context = context;
+        self.clock_now_ms_fn = now_ms_fn;
     }
 
     pub fn clonePendingEditorImages(self: *AppState, allocator: std.mem.Allocator) ![]ai.ImageContent {
@@ -665,6 +678,7 @@ pub const AppState = struct {
                         .thinking_end => {
                             handled_thinking_event = true;
                             try self.replaceLabelLocked(&self.status, "thinking");
+                            self.freezeStreamingThinkingItemLocked();
                             self.last_streaming_thinking_index = null;
                         },
                         .text_start, .text_delta, .text_end => try self.replaceLabelLocked(&self.status, "streaming"),
@@ -721,6 +735,7 @@ pub const AppState = struct {
                             try self.appendItemLocked(.assistant, rendered);
                         }
                         self.last_streaming_assistant_index = null;
+                        self.freezeStreamingThinkingItemLocked();
                         self.last_streaming_thinking_index = null;
 
                         switch (assistant_message.stop_reason) {
@@ -812,8 +827,15 @@ pub const AppState = struct {
             if (index < self.items.items.len and self.items.items[index].kind == .thinking) return;
         }
 
-        try self.appendItemLocked(.thinking, "");
+        try self.appendStreamingThinkingItemLocked("");
         self.last_streaming_thinking_index = self.items.items.len - 1;
+    }
+
+    fn freezeStreamingThinkingItemLocked(self: *AppState) void {
+        const index = self.last_streaming_thinking_index orelse return;
+        if (index >= self.items.items.len or self.items.items[index].kind != .thinking) return;
+        if (self.items.items[index].frozen_frame_index != null) return;
+        self.items.items[index].frozen_frame_index = thinkingFrameIndex(self.items.items[index], self.currentNowMsLocked());
     }
 
     pub fn appendThinkingDeltaLocked(self: *AppState, delta: []const u8) !void {
@@ -859,12 +881,33 @@ pub const AppState = struct {
     }
 
     pub fn appendItemLocked(self: *AppState, kind: ChatKind, text: []const u8) !void {
+        const frozen_frame_index: ?usize = if (kind == .thinking) 0 else null;
+        try self.appendItemWithTimingLocked(kind, text, null, frozen_frame_index);
+    }
+
+    fn appendStreamingThinkingItemLocked(self: *AppState, text: []const u8) !void {
+        try self.appendItemWithTimingLocked(.thinking, text, self.currentNowMsLocked(), null);
+    }
+
+    fn appendItemWithTimingLocked(
+        self: *AppState,
+        kind: ChatKind,
+        text: []const u8,
+        start_ms: ?i64,
+        frozen_frame_index: ?usize,
+    ) !void {
         const was_at_tail = self.chat_scroll_offset == 0;
         try self.items.append(self.allocator, .{
             .kind = kind,
             .text = try self.allocator.dupe(u8, text),
+            .start_ms = start_ms,
+            .frozen_frame_index = frozen_frame_index,
         });
         if (was_at_tail) self.chat_scroll_offset = 0;
+    }
+
+    fn currentNowMsLocked(self: *const AppState) i64 {
+        return self.clock_now_ms_fn(self.clock_context);
     }
 
     pub fn appendToItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
@@ -1055,6 +1098,7 @@ pub const ScreenComponent = struct {
     state: *AppState,
     editor: *tui.Editor,
     height: usize = 24,
+    now_ms: i64 = 0,
     overlay: ?*SelectorOverlay = null,
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
@@ -1102,7 +1146,7 @@ pub const ScreenComponent = struct {
         if (self.after_snapshot_hook) |hook| hook.run();
 
         for (snapshot.items) |item| {
-            try renderChatItemInto(allocator, @max(width, 1), self.theme, item, &chat_lines);
+            try renderChatItemIntoAt(allocator, @max(width, 1), self.theme, item, self.now_ms, &chat_lines);
         }
 
         var prompt_lines = tui.LineList.empty;
@@ -1207,7 +1251,7 @@ pub const ScreenComponent = struct {
         }
         row += task_panel_height;
 
-        const chat_metrics = try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity, snapshot.chat_scroll_offset);
+        const chat_metrics = try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity, snapshot.chat_scroll_offset, self.now_ms);
         self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
         row += chat_capacity;
 
@@ -1715,6 +1759,7 @@ fn drawChatViewport(
     start_row: usize,
     height: usize,
     chat_scroll_offset: usize,
+    now_ms: i64,
 ) !ChatViewportMetrics {
     if (start_row >= window.height or height == 0) return .{ .rendered_height = 0, .visible_height = 0 };
 
@@ -1731,7 +1776,7 @@ fn drawChatViewport(
 
     const scratch_window = tui.draw.rootWindow(&screen);
     scratch_window.clear();
-    const rendered = try drawChatItems(scratch_window, allocator, theme, items);
+    const rendered = try drawChatItems(scratch_window, allocator, theme, items, now_ms);
     const rendered_height = @min(@as(usize, rendered.height), @as(usize, screen.height));
     const max_offset = rendered_height -| visible_height;
     const offset = @min(chat_scroll_offset, max_offset);
@@ -1786,11 +1831,12 @@ fn drawChatItems(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
     items: []const ChatItem,
+    now_ms: i64,
 ) !tui.DrawSize {
     var row: usize = 0;
     for (items) |item| {
         if (row >= window.height) break;
-        row += try drawChatItem(window, allocator, theme, item, row);
+        row += try drawChatItem(window, allocator, theme, item, row, now_ms);
     }
     return .{
         .width = window.width,
@@ -1804,6 +1850,7 @@ fn drawChatItem(
     theme: ?*const resources_mod.Theme,
     item: ChatItem,
     start_row: usize,
+    now_ms: i64,
 ) !usize {
     const remaining_height = @as(usize, window.height) -| start_row;
     if (remaining_height == 0) return 0;
@@ -1837,8 +1884,54 @@ fn drawChatItem(
             });
             return @as(usize, size.height);
         },
+        .thinking => return drawThinkingChatItem(child, theme, item, now_ms),
         else => return drawWrappedText(child, 0, item.text, styleForToken(theme, chatToken(item.kind))),
     }
+}
+
+fn drawThinkingChatItem(
+    window: tui.vaxis.Window,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    now_ms: i64,
+) usize {
+    if (window.height == 0 or window.width == 0) return 0;
+
+    const glyph_style = styleForToken(theme, .role_thinking_glyph);
+    const text_style = styleForToken(theme, .role_thinking);
+    const glyph = thinkingFrameGlyph(item, now_ms);
+    window.writeCell(0, 0, .{
+        .char = .{ .grapheme = glyph, .width = 1 },
+        .style = glyph_style,
+    });
+    if (window.width > 1) {
+        window.writeCell(1, 0, .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = text_style,
+        });
+    }
+
+    if (window.width <= 2 or item.text.len == 0) return 1;
+
+    const text_window = window.child(.{
+        .x_off = 2,
+        .width = window.width - 2,
+    });
+    return @max(@as(usize, 1), drawWrappedText(text_window, 0, item.text, text_style));
+}
+
+fn thinkingFrameGlyph(item: ChatItem, now_ms: i64) []const u8 {
+    var loader = tui.Loader{};
+    loader.setFrameIndex(thinkingFrameIndex(item, now_ms));
+    return loader.currentFrame();
+}
+
+fn thinkingFrameIndex(item: ChatItem, now_ms: i64) usize {
+    if (item.frozen_frame_index) |index| return index;
+    const start_ms = item.start_ms orelse now_ms;
+    const elapsed_i64 = @max(now_ms - start_ms, 0);
+    var loader = tui.Loader{};
+    return loader.frameIndexForElapsed(@intCast(elapsed_i64));
 }
 
 fn chatToken(kind: ChatKind) resources_mod.ThemeToken {
@@ -1861,6 +1954,7 @@ fn estimateChatRows(items: []const ChatItem, width: usize) usize {
         rows += switch (item.kind) {
             .assistant => 1 + estimateWrappedRows(item.text, width) + 8,
             .markdown => estimateWrappedRows(item.text, width) + 8,
+            .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item.text, width - 2)),
             else => estimateWrappedRows(item.text, width),
         };
     }
@@ -2197,6 +2291,10 @@ pub fn nowMilliseconds() i64 {
     var now: std.c.timeval = undefined;
     _ = std.c.gettimeofday(&now, null);
     return @as(i64, @intCast(now.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(now.usec)), std.time.us_per_ms);
+}
+
+fn systemNowMilliseconds(_: ?*anyopaque) i64 {
+    return nowMilliseconds();
 }
 
 pub fn overlayPanelOptions(size: tui.Size, progress: f32) tui.OverlayOptions {
@@ -2897,6 +2995,17 @@ pub fn renderChatItemInto(
     item: ChatItem,
     lines: *tui.LineList,
 ) !void {
+    try renderChatItemIntoAt(allocator, width, theme, item, 0, lines);
+}
+
+pub fn renderChatItemIntoAt(
+    allocator: std.mem.Allocator,
+    width: usize,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    now_ms: i64,
+    lines: *tui.LineList,
+) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch_allocator = arena.allocator();
@@ -2912,7 +3021,7 @@ pub fn renderChatItemInto(
 
     const window = tui.draw.rootWindow(&screen);
     window.clear();
-    const rendered = try drawChatItem(window, scratch_allocator, theme, item, 0);
+    const rendered = try drawChatItem(window, scratch_allocator, theme, item, 0, now_ms);
     try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered, lines);
 }
 
@@ -3043,6 +3152,8 @@ fn cloneChatItems(allocator: std.mem.Allocator, items: []const ChatItem) ![]Chat
         cloned[index] = .{
             .kind = item.kind,
             .text = try allocator.dupe(u8, item.text),
+            .start_ms = item.start_ms,
+            .frozen_frame_index = item.frozen_frame_index,
         };
         initialized += 1;
     }
@@ -3777,7 +3888,7 @@ test "drawChatViewport honors scroll offset and overlays overflow indicators" {
     const window = tui.draw.rootWindow(&screen);
     window.clear();
 
-    const metrics = try drawChatViewport(arena.allocator(), null, items[0..], window, 0, 12, 5);
+    const metrics = try drawChatViewport(arena.allocator(), null, items[0..], window, 0, 12, 5, 0);
     try std.testing.expectEqual(@as(usize, 30), metrics.rendered_height);
     try std.testing.expectEqual(@as(usize, 12), metrics.visible_height);
 
@@ -3840,6 +3951,182 @@ test "roles m0 thinking deltas append to a thinking chat item" {
     try std.testing.expectEqual(ChatKind.thinking, state.items.items[1].kind);
     try std.testing.expectEqualStrings("internal reasoning", state.items.items[1].text);
     try std.testing.expect(state.last_streaming_thinking_index == null);
+}
+
+const FixedClock = struct {
+    now_ms: i64,
+
+    fn now(context: ?*anyopaque) i64 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        return self.now_ms;
+    }
+};
+
+test "thinking m1 streaming thinking item records start and frozen frame" {
+    const allocator = std.testing.allocator;
+
+    var clock = FixedClock{ .now_ms = 12_000 };
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    state.setClockForTesting(&clock, FixedClock.now);
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .thinking_start },
+    });
+    try std.testing.expectEqual(ChatKind.thinking, state.items.items[1].kind);
+    try std.testing.expectEqual(@as(?i64, 12_000), state.items.items[1].start_ms);
+    try std.testing.expectEqual(@as(?usize, null), state.items.items[1].frozen_frame_index);
+
+    clock.now_ms = 12_000 + @as(i64, @intCast(3 * tui.components.loader.DEFAULT_INTERVAL_MS));
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .thinking_end },
+    });
+
+    try std.testing.expectEqual(@as(?usize, 3), state.items.items[1].frozen_frame_index);
+    try std.testing.expect(state.last_streaming_thinking_index == null);
+}
+
+test "thinking m1 spinner frame derives from injected render clock" {
+    const allocator = std.testing.allocator;
+
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const frames = tui.components.loader.DEFAULT_SPINNER_FRAMES;
+    for (frames, 0..) |frame, index| {
+        var screen = try tui.vaxis.Screen.init(allocator, .{
+            .rows = 2,
+            .cols = 12,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+        defer screen.deinit(allocator);
+
+        const window = tui.draw.rootWindow(&screen);
+        window.clear();
+        const now_ms = 1_000 + @as(i64, @intCast(index * tui.components.loader.DEFAULT_INTERVAL_MS));
+        _ = try drawChatItem(window, arena.allocator(), &theme, .{
+            .kind = .thinking,
+            .text = @constCast("abc"),
+            .start_ms = 1_000,
+        }, 0, now_ms);
+
+        const glyph = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(frame, glyph.char.grapheme);
+        try std.testing.expectEqual(styleForToken(&theme, .role_thinking_glyph), glyph.style);
+        const spacer = screen.readCell(1, 0) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(" ", spacer.char.grapheme);
+        const body = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("a", body.char.grapheme);
+        try std.testing.expectEqual(styleForToken(&theme, .role_thinking), body.style);
+    }
+}
+
+test "thinking m1 frozen frame ignores later render clock" {
+    const allocator = std.testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var early_screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 1,
+        .cols = 8,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer early_screen.deinit(allocator);
+    var late_screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 1,
+        .cols = 8,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer late_screen.deinit(allocator);
+
+    const item = ChatItem{
+        .kind = .thinking,
+        .text = @constCast("done"),
+        .start_ms = 5_000,
+        .frozen_frame_index = 4,
+    };
+
+    const early_window = tui.draw.rootWindow(&early_screen);
+    early_window.clear();
+    _ = try drawChatItem(early_window, arena.allocator(), null, item, 0, 5_000);
+    const early_glyph = early_screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+
+    const late_window = tui.draw.rootWindow(&late_screen);
+    late_window.clear();
+    _ = try drawChatItem(late_window, arena.allocator(), null, item, 0, 15_000);
+    const late_glyph = late_screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings(tui.components.loader.DEFAULT_SPINNER_FRAMES[4], early_glyph.char.grapheme);
+    try std.testing.expectEqualStrings(early_glyph.char.grapheme, late_glyph.char.grapheme);
+}
+
+test "thinking m1 continuation rows are indented without repeating glyph" {
+    const allocator = std.testing.allocator;
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 5,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    _ = try drawChatItem(window, arena.allocator(), null, .{
+        .kind = .thinking,
+        .text = @constCast("abcdef"),
+        .start_ms = 0,
+    }, 0, 0);
+
+    const first_glyph = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(tui.components.loader.DEFAULT_SPINNER_FRAMES[0], first_glyph.char.grapheme);
+    const continuation_col0 = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
+    const continuation_col1 = screen.readCell(1, 1) orelse return error.TestUnexpectedResult;
+    const continuation_text = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(continuation_col0.char.grapheme.len == 0 or std.mem.eql(u8, continuation_col0.char.grapheme, " "));
+    try std.testing.expect(continuation_col1.char.grapheme.len == 0 or std.mem.eql(u8, continuation_col1.char.grapheme, " "));
+    try std.testing.expectEqualStrings("d", continuation_text.char.grapheme);
+}
+
+test "thinking m1 finalized thinking renders identically across clocks" {
+    const allocator = std.testing.allocator;
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.appendItemLocked(.thinking, "stable private thought");
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+        .now_ms = 1_000,
+    };
+
+    var first = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 60, 8);
+    defer first.deinit(std.testing.allocator);
+    const first_text = try tui.test_helpers.screenToString(&first);
+    defer allocator.free(first_text);
+
+    screen_component.now_ms = 20_000;
+    var second = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 60, 8);
+    defer second.deinit(std.testing.allocator);
+    const second_text = try tui.test_helpers.screenToString(&second);
+    defer allocator.free(second_text);
+
+    try std.testing.expectEqualStrings(first_text, second_text);
 }
 
 test "roles m0 rebuildFromSession preserves thinking before assistant text" {
@@ -3913,11 +4200,11 @@ test "roles m0 drawChatItem applies role styles to representative cells" {
 
     const window = tui.draw.rootWindow(&screen);
     window.clear();
-    _ = try drawChatItems(window, arena.allocator(), &theme, &items);
+    _ = try drawChatItems(window, arena.allocator(), &theme, &items, 0);
 
     const user = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
     const assistant = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
-    const thinking = screen.readCell(0, 3) orelse return error.TestUnexpectedResult;
+    const thinking = screen.readCell(2, 3) orelse return error.TestUnexpectedResult;
     const tool_call = screen.readCell(0, 4) orelse return error.TestUnexpectedResult;
     const tool_result = screen.readCell(0, 5) orelse return error.TestUnexpectedResult;
 
