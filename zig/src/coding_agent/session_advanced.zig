@@ -808,7 +808,7 @@ fn writeToolCallHtml(writer: *std.Io.Writer, allocator: std.mem.Allocator, tool_
 }
 
 fn writeToolResultHtml(writer: *std.Io.Writer, allocator: std.mem.Allocator, tool_result: anytype) !void {
-    const summary = try formatting.formatToolResult(allocator, tool_result.tool_name, tool_result.content, tool_result.is_error);
+    const summary = try formatting.formatToolResult(allocator, tool_result.tool_name, tool_result.content, tool_result.is_error, tool_result.details);
     defer allocator.free(summary);
 
     try writer.writeAll("<article class=\"tool-entry tool-result\"><h3><span class=\"badge ");
