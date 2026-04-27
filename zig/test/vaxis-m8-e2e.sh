@@ -79,7 +79,7 @@ launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
   --env "PI_FAUX_TOOL_FINAL_RESPONSE=# M8 assistant response\n\n- tool path rendered\n\nThe file says: m8 secret note"
 
 startup_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-snapshot_contains "$startup_snapshot" "Input:"
+snapshot_contains "$startup_snapshot" "> "
 snapshot_contains "$startup_snapshot" "Model:"
 
 tuistory -s "$SESSION" type "what is in the file?"
@@ -126,7 +126,7 @@ tuistory -s "$SESSION" press alt enter
 tuistory -s "$SESSION" wait "queued follow-up" --timeout 5000
 queue_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
 snapshot_contains "$queue_snapshot" "queued follow-up"
-snapshot_contains "$queue_snapshot" "Alt+Enter queue"
+snapshot_contains "$queue_snapshot" "Alt+⏎ queue"
 
 tuistory -s "$SESSION" press ctrl v
 tuistory -s "$SESSION" wait "clipboard" --timeout 8000
@@ -168,14 +168,14 @@ tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 log "cross-terminal environment smoke profiles"
 for profile in \
-  "generic-xterm|xterm-256color|" \
-  "ghostty|xterm-ghostty|ghostty" \
-  "wezterm|xterm-256color|WezTerm" \
-  "iterm2|xterm-256color|iTerm.app" \
-  "kitty|xterm-kitty|kitty" \
-  "alacritty|alacritty|Alacritty"
+  "generic-xterm|xterm-256color||XTERM" \
+  "ghostty|xterm-ghostty|ghostty|GHOSTTY" \
+  "wezterm|xterm-256color|WezTerm|WEZTERM" \
+  "iterm2|xterm-256color|iTerm.app|ITERM" \
+  "kitty|xterm-kitty|kitty|KITTY" \
+  "alacritty|alacritty|Alacritty|ALACRITTY"
 do
-  IFS='|' read -r name term term_program <<<"$profile"
+  IFS='|' read -r name term term_program badge <<<"$profile"
   make_case_dirs "terminal-$name"
   T_PROJECT="$TMP_ROOT/terminal-$name/project"
   T_HOME="$TMP_ROOT/terminal-$name/home"
@@ -189,6 +189,7 @@ do
   tuistory -s "$SESSION" wait "$name smoke ok" --timeout 8000
   terminal_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
   snapshot_contains "$terminal_snapshot" "$name smoke ok"
+  snapshot_contains "$terminal_snapshot" "$badge"
   tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 done
 
