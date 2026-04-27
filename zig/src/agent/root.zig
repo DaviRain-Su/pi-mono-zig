@@ -20,6 +20,7 @@ pub const ToolExecutionMode = types.ToolExecutionMode;
 pub const QueueMode = agent.QueueMode;
 pub const PendingMessageQueue = agent.PendingMessageQueue;
 pub const DEFAULT_MODEL = agent.DEFAULT_MODEL;
+pub const nowMilliseconds = types.nowMilliseconds;
 pub const cloneMessage = agent.cloneMessage;
 pub const cloneMessageSlice = agent.cloneMessageSlice;
 pub const deinitMessage = agent.deinitMessage;

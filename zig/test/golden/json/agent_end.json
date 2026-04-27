@@ -1,0 +1,79 @@
+{
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "hello\nworld",
+          "type": "text"
+        },
+        {
+          "data": "aGVsbG8=",
+          "mimeType": "image/png",
+          "type": "image"
+        }
+      ],
+      "role": "user",
+      "timestamp": 1001
+    },
+    {
+      "api": "faux",
+      "content": [
+        {
+          "text": "final text",
+          "type": "text"
+        },
+        {
+          "thinking": "reasoning",
+          "thinkingSignature": "sig-1",
+          "type": "thinking"
+        },
+        {
+          "arguments": {
+            "command": "printf 'hello\\nworld'",
+            "stream": true
+          },
+          "id": "tool-1",
+          "name": "bash",
+          "type": "toolCall"
+        }
+      ],
+      "model": "faux-1",
+      "provider": "faux",
+      "role": "assistant",
+      "stopReason": "toolUse",
+      "timestamp": 2002,
+      "usage": {
+        "cacheRead": 7,
+        "cacheWrite": 11,
+        "cost": {
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "input": 0,
+          "output": 0,
+          "total": 0
+        },
+        "input": 3,
+        "output": 5,
+        "totalTokens": 26
+      }
+    },
+    {
+      "content": [
+        {
+          "text": "tool output",
+          "type": "text"
+        }
+      ],
+      "details": {
+        "exitCode": 0,
+        "timedOut": false
+      },
+      "isError": false,
+      "role": "toolResult",
+      "timestamp": 3001,
+      "toolCallId": "tool-1",
+      "toolName": "bash"
+    }
+  ],
+  "type": "agent_end"
+}

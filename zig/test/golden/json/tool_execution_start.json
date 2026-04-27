@@ -1,0 +1,9 @@
+{
+  "args": {
+    "command": "printf 'hello\\nworld'",
+    "stream": true
+  },
+  "toolCallId": "tool-1",
+  "toolName": "bash",
+  "type": "tool_execution_start"
+}

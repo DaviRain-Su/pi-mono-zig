@@ -1,0 +1,18 @@
+{
+  "message": {
+    "content": [
+      {
+        "text": "hello\nworld",
+        "type": "text"
+      },
+      {
+        "data": "aGVsbG8=",
+        "mimeType": "image/png",
+        "type": "image"
+      }
+    ],
+    "role": "user",
+    "timestamp": 1001
+  },
+  "type": "message_start"
+}

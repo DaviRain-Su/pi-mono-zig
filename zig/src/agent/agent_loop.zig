@@ -417,7 +417,7 @@ fn streamAssistantResponse(
                     .model = config.model.id,
                     .usage = ai.Usage.init(),
                     .stop_reason = .stop,
-                    .timestamp = 0,
+                    .timestamp = types.nowMilliseconds(),
                 };
                 try emit(emit_context, .{
                     .event_type = .message_update,
@@ -966,7 +966,7 @@ fn emitToolCallOutcome(
         .content = result.content,
         .details = result.details,
         .is_error = is_error,
-        .timestamp = 0,
+        .timestamp = types.nowMilliseconds(),
     };
 
     try emit(emit_context, .{
@@ -1827,6 +1827,7 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     var capture = ToolExecutionCapture.init(std.testing.allocator);
     defer capture.deinit();
 
+    const start_ms = types.nowMilliseconds();
     const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
     const result = try runAgentLoop(
         arena.allocator(),
@@ -1852,6 +1853,10 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     try std.testing.expectEqualStrings("echo", result[2].tool_result.tool_name);
     try std.testing.expectEqualStrings("echoed: hello", result[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("done", result[3].assistant.content[0].text.text);
+    const end_ms = types.nowMilliseconds();
+    try std.testing.expect(result[2].tool_result.timestamp > 0);
+    try std.testing.expect(result[2].tool_result.timestamp >= start_ms - 2000);
+    try std.testing.expect(result[2].tool_result.timestamp <= end_ms + 2000);
 
     var saw_tool_start = false;
     var saw_tool_end = false;

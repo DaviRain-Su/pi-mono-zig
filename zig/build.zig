@@ -131,21 +131,26 @@ pub fn build(b: *std.Build) void {
     run_main_tests.step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_main_tests.step);
 
-    const cross_area_tests = b.addSystemCommand(&.{"bash"});
-    cross_area_tests.addFileArg(b.path("test/cross-area-flows.sh"));
-    cross_area_tests.step.dependOn(b.getInstallStep());
+    if (target.result.os.tag != .windows) {
+        const cross_area_tests = b.addSystemCommand(&.{"bash"});
+        cross_area_tests.addFileArg(b.path("test/cross-area-flows.sh"));
+        cross_area_tests.step.dependOn(b.getInstallStep());
 
-    const cross_area_test_step = b.step("test-cross-area", "Run compiled-binary cross-area integration tests");
-    cross_area_test_step.dependOn(external_tool_check_step);
-    cross_area_test_step.dependOn(&cross_area_tests.step);
+        const cross_area_test_step = b.step("test-cross-area", "Run compiled-binary cross-area integration tests");
+        cross_area_test_step.dependOn(external_tool_check_step);
+        cross_area_test_step.dependOn(&cross_area_tests.step);
 
-    const vaxis_m8_tests = b.addSystemCommand(&.{"bash"});
-    vaxis_m8_tests.addFileArg(b.path("test/vaxis-m8-e2e.sh"));
-    vaxis_m8_tests.step.dependOn(b.getInstallStep());
+        const vaxis_m8_tests = b.addSystemCommand(&.{"bash"});
+        vaxis_m8_tests.addFileArg(b.path("test/vaxis-m8-e2e.sh"));
+        vaxis_m8_tests.step.dependOn(b.getInstallStep());
 
-    const vaxis_m8_test_step = b.step("test-vaxis-m8-e2e", "Run vaxis M8 tuistory integration tests");
-    vaxis_m8_test_step.dependOn(external_tool_check_step);
-    vaxis_m8_test_step.dependOn(&vaxis_m8_tests.step);
+        const vaxis_m8_test_step = b.step("test-vaxis-m8-e2e", "Run vaxis M8 tuistory integration tests");
+        vaxis_m8_test_step.dependOn(external_tool_check_step);
+        vaxis_m8_test_step.dependOn(&vaxis_m8_tests.step);
+    } else {
+        _ = b.step("test-cross-area", "Skipped on Windows target");
+        _ = b.step("test-vaxis-m8-e2e", "Skipped on Windows target");
+    }
 
     const coding_agent_rendering_mod = b.createModule(.{
         .root_source_file = b.path("src/coding_agent/interactive_mode_rendering_test_root.zig"),

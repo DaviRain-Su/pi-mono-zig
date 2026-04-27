@@ -1,0 +1,20 @@
+{
+  "message": {
+    "content": [
+      {
+        "text": "tool output",
+        "type": "text"
+      }
+    ],
+    "details": {
+      "exitCode": 0,
+      "timedOut": false
+    },
+    "isError": false,
+    "role": "toolResult",
+    "timestamp": 3001,
+    "toolCallId": "tool-1",
+    "toolName": "bash"
+  },
+  "type": "message_end"
+}
