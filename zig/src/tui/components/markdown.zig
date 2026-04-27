@@ -9,6 +9,7 @@ const resources_mod = @import("../theme.zig");
 const vaxis_adapter = @import("../vaxis_adapter.zig");
 
 const WrapMode = @FieldType(vaxis.Window.PrintOptions, "wrap");
+const vxfw = vaxis.vxfw;
 
 const MARKDOWN_TEXT_FALLBACK_STYLE: vaxis.Cell.Style = .{};
 const LINK_FALLBACK_STYLE: vaxis.Cell.Style = .{
@@ -316,7 +317,7 @@ fn flushParagraphLines(
         joined,
         null,
     );
-    return drawWrappedSegments(window, start_row, segments, .word, null);
+    return drawWrappedSegments(allocator, window, start_row, segments, .word, null);
 }
 
 fn drawHeadingLine(
@@ -335,7 +336,7 @@ fn drawHeadingLine(
         base_style = mergeStyles(base_style, .{ .ul_style = .single });
     }
     const segments = try buildInlineSegments(allocator, theme, base_style, heading.text, null);
-    return drawWrappedSegments(window, start_row, segments, .word, null);
+    return drawWrappedSegments(allocator, window, start_row, segments, .word, null);
 }
 
 fn drawHorizontalRule(
@@ -440,12 +441,12 @@ fn drawCodeBlock(
         const fence_segments = [_]vaxis.Segment{.{ .text = fence, .style = border_style }};
 
         var rows: usize = 0;
-        rows += drawWrappedSegments(block_window, rows, &fence_segments, .word, null);
+        rows += try drawWrappedSegments(allocator, block_window, rows, &fence_segments, .word, null);
         for (code_lines) |code_line| {
             const code_segments = [_]vaxis.Segment{.{ .text = code_line, .style = code_style }};
-            rows += drawWrappedSegments(block_window, rows, &code_segments, .grapheme, null);
+            rows += try drawWrappedSegments(allocator, block_window, rows, &code_segments, .grapheme, null);
         }
-        rows += drawWrappedSegments(block_window, rows, &[_]vaxis.Segment{.{ .text = "```", .style = border_style }}, .word, null);
+        rows += try drawWrappedSegments(allocator, block_window, rows, &[_]vaxis.Segment{.{ .text = "```", .style = border_style }}, .word, null);
         return rows;
     }
 
@@ -477,7 +478,7 @@ fn drawCodeBlock(
                 @max(@as(usize, 1), measureSegmentsHeight(content_window, &segments, .grapheme));
             drawRepeatedText(block_window, row_cursor, row_height, scaffold, border_style);
             if (code_line.len != 0) {
-                _ = drawSegments(content_window, &segments, .grapheme, null);
+                _ = try drawSegments(allocator, content_window, &segments, .grapheme, null);
             }
             row_cursor += row_height;
         }
@@ -510,7 +511,7 @@ fn drawTableBlock(
             header_line,
             null,
         );
-        return drawWrappedSegments(window, start_row, segments, .word, null);
+        return drawWrappedSegments(allocator, window, start_row, segments, .word, null);
     }
 
     const row_cells = try allocator.alloc([]const []const u8, row_lines.len);
@@ -609,7 +610,7 @@ fn drawTableRow(
             .height = @intCast(@min(row_height, remaining)),
         });
         if (cell_segments[index].len != 0) {
-            _ = drawSegments(cell_window, cell_segments[index], .word, null);
+            _ = try drawSegments(allocator, cell_window, cell_segments[index], .word, null);
         }
     }
 
@@ -626,7 +627,6 @@ fn drawPrefixedSegments(
     body_segments: []const vaxis.Segment,
     fill_style: ?vaxis.Cell.Style,
 ) std.mem.Allocator.Error!usize {
-    _ = allocator;
     if (window.width == 0 or start_row >= window.height) return 0;
 
     const block_window = window.child(.{
@@ -648,7 +648,7 @@ fn drawPrefixedSegments(
 
     const row_count = @max(@as(usize, 1), measureSegmentsHeight(content_window, body_segments, .word));
     drawPrefixRows(prefix_window, row_count, first_prefix, continuation_prefix);
-    _ = drawSegments(content_window, body_segments, .word, fill_style);
+    _ = try drawSegments(allocator, content_window, body_segments, .word, fill_style);
     return row_count;
 }
 
@@ -669,32 +669,71 @@ fn drawPrefixRows(
 }
 
 fn drawWrappedSegments(
+    allocator: std.mem.Allocator,
     window: vaxis.Window,
     start_row: usize,
     segments: []const vaxis.Segment,
     wrap: WrapMode,
     fill_style: ?vaxis.Cell.Style,
-) usize {
+) std.mem.Allocator.Error!usize {
     if (window.width == 0 or start_row >= window.height) return 0;
     const block_window = window.child(.{
         .y_off = @intCast(start_row),
         .height = window.height - @as(u16, @intCast(start_row)),
     });
-    return drawSegments(block_window, segments, wrap, fill_style);
+    return drawSegments(allocator, block_window, segments, wrap, fill_style);
 }
 
 fn drawSegments(
+    allocator: std.mem.Allocator,
     window: vaxis.Window,
     segments: []const vaxis.Segment,
     wrap: WrapMode,
     fill_style: ?vaxis.Cell.Style,
-) usize {
+) std.mem.Allocator.Error!usize {
     if (window.width == 0 or window.height == 0 or segments.len == 0) return 0;
 
     const height = @max(@as(usize, 1), measureSegmentsHeight(window, segments, wrap));
     if (fill_style) |style| fillRows(window, style, height);
-    const result = window.print(segments, .{ .wrap = wrap });
-    return renderedLineCount(result, true, window.height);
+
+    if (wrap == .grapheme) {
+        const result = window.print(segments, .{ .wrap = wrap });
+        return renderedLineCount(result, true, window.height);
+    }
+
+    var rich_text = richTextForSegments(segments, wrap, fill_style);
+    const widget = rich_text.widget();
+    const surface = try widget.draw(draw_mod.vxfwDrawContext(window, allocator));
+    renderRichTextSurface(surface, window, fill_style != null);
+    return @min(@as(usize, surface.size.height), @as(usize, window.height));
+}
+
+fn richTextForSegments(
+    segments: []const vaxis.Segment,
+    wrap: WrapMode,
+    fill_style: ?vaxis.Cell.Style,
+) vxfw.RichText {
+    return .{
+        .text = segments,
+        .base_style = fill_style orelse .{},
+        .softwrap = wrap != .none,
+        .overflow = if (wrap == .none) .clip else .ellipsis,
+        .width_basis = .parent,
+    };
+}
+
+fn renderRichTextSurface(surface: vxfw.Surface, window: vaxis.Window, render_blank_cells: bool) void {
+    if (surface.buffer.len == 0) return;
+    for (surface.buffer, 0..) |cell, index| {
+        if (!render_blank_cells and cell.char.grapheme.len == 0) continue;
+        const row = index / surface.size.width;
+        const col = index % surface.size.width;
+        winWriteCell(window, col, row, cell);
+    }
+}
+
+fn winWriteCell(window: vaxis.Window, col: usize, row: usize, cell: vaxis.Cell) void {
+    window.writeCell(@intCast(col), @intCast(row), cell);
 }
 
 fn drawSegmentsNoWrap(window: vaxis.Window, segments: []const vaxis.Segment) void {
@@ -1281,6 +1320,32 @@ test "markdown renders inline styles as cell styles" {
     try test_helpers.expectCell(&screen, 5, 0, "i", mergeStyles(style_mod.styleFor(&theme, .markdown_text), .{ .italic = true }));
     try test_helpers.expectCell(&screen, 12, 0, "c", style_mod.styleFor(&theme, .markdown_code));
     try test_helpers.expectCell(&screen, 17, 0, "l", style_mod.styleFor(&theme, .markdown_link));
+}
+
+test "markdown rich text segments delegate through vxfw RichText" {
+    const segments = [_]vaxis.Segment{
+        .{ .text = "hello " },
+        .{ .text = "vxfw", .style = .{ .bold = true } },
+    };
+    var rich_text = richTextForSegments(&segments, .word, null);
+    const widget = rich_text.widget();
+
+    try std.testing.expectEqual(@intFromPtr(&rich_text), @intFromPtr(widget.userdata));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const surface = try widget.draw(.{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 8, .height = 2 },
+        .cell_size = .{ .width = 0, .height = 0 },
+    });
+
+    try std.testing.expectEqual(@as(u16, 8), surface.size.width);
+    try std.testing.expectEqual(@as(u16, 2), surface.size.height);
+    try std.testing.expectEqualStrings("v", surface.readCell(0, 1).char.grapheme);
+    try std.testing.expect(surface.readCell(0, 1).style.bold);
 }
 
 test "markdown renders headings lists blockquotes rules and code blocks with cell styles" {
