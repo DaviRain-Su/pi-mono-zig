@@ -870,7 +870,7 @@ pub const ScreenComponent = struct {
 
         const reserved_lines: usize = prompt_lines.items.len + queued_lines.items.len + 2 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
-        const chat_component = BorrowedLinesComponent{ .lines = chat_lines.items };
+        const chat_component = BorrowedLineListComponent{ .lines = chat_lines.items };
         const chat_viewport = tui.Viewport{
             .child = chat_component.component(),
             .height = chat_capacity,
@@ -900,10 +900,10 @@ const RenderHook = struct {
     }
 };
 
-pub const BorrowedLinesComponent = struct {
+const BorrowedLineListComponent = struct {
     lines: []const []u8,
 
-    pub fn component(self: *const BorrowedLinesComponent) tui.Component {
+    pub fn component(self: *const BorrowedLineListComponent) tui.Component {
         return .{
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
@@ -916,12 +916,55 @@ pub const BorrowedLinesComponent = struct {
         width: usize,
         lines: *tui.LineList,
     ) std.mem.Allocator.Error!void {
-        const self: *const BorrowedLinesComponent = @ptrCast(@alignCast(ptr));
+        const self: *const BorrowedLineListComponent = @ptrCast(@alignCast(ptr));
         for (self.lines) |line| {
             const fitted = try fitLine(allocator, line, width);
             defer allocator.free(fitted);
             try tui.component.appendOwnedLine(lines, allocator, fitted);
         }
+    }
+};
+
+pub const BorrowedCellRow = struct {
+    cells: []const tui.vaxis.Cell,
+};
+
+pub const BorrowedLinesComponent = struct {
+    rows: []const BorrowedCellRow,
+
+    pub fn drawComponent(self: *const BorrowedLinesComponent) tui.DrawComponent {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
+        };
+    }
+
+    pub fn draw(
+        self: *const BorrowedLinesComponent,
+        window: tui.vaxis.Window,
+        _: tui.DrawContext,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        window.clear();
+        const row_count = @min(self.rows.len, @as(usize, window.height));
+        for (self.rows[0..row_count], 0..) |row, row_index| {
+            const col_count = @min(row.cells.len, @as(usize, window.width));
+            for (row.cells[0..col_count], 0..) |cell, col| {
+                window.writeCell(@intCast(col), @intCast(row_index), cell);
+            }
+        }
+        return .{
+            .width = window.width,
+            .height = @intCast(row_count),
+        };
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: tui.vaxis.Window,
+        ctx: tui.DrawContext,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        const self: *const BorrowedLinesComponent = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
     }
 };
 
@@ -2199,4 +2242,28 @@ test "formatFooterLine shows provider auth status and sanitizes multiline status
 
     try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: OpenAI (env)") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Status: missing key set OPENAI_API_KEY") != null);
+}
+
+test "borrowed lines component draws stored cell rows without ansi strings" {
+    const selected_style = tui.vaxis.Cell.Style{ .reverse = true };
+    const first_row = [_]tui.vaxis.Cell{
+        .{ .char = .{ .grapheme = "A", .width = 1 }, .style = selected_style },
+        .{ .char = .{ .grapheme = "B", .width = 1 } },
+    };
+    const second_row = [_]tui.vaxis.Cell{
+        .{ .char = .{ .grapheme = "C", .width = 1 } },
+    };
+    const borrowed = BorrowedLinesComponent{
+        .rows = &[_]BorrowedCellRow{
+            .{ .cells = &first_row },
+            .{ .cells = &second_row },
+        },
+    };
+
+    var screen = try tui.test_helpers.renderToScreen(borrowed.drawComponent(), 3, 2);
+    defer screen.deinit(std.testing.allocator);
+
+    try tui.test_helpers.expectCell(&screen, 0, 0, "A", selected_style);
+    try tui.test_helpers.expectCell(&screen, 1, 0, "B", .{});
+    try tui.test_helpers.expectCell(&screen, 0, 1, "C", .{});
 }
