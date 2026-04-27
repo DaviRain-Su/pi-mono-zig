@@ -1,0 +1,62 @@
+name: Zig CI
+
+on:
+  push:
+    branches: [main, zig-implementation]
+    paths:
+      - "zig/**"
+      - ".github/workflows/zig-ci.yml"
+  pull_request:
+    branches: [main, zig-implementation]
+    paths:
+      - "zig/**"
+      - ".github/workflows/zig-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: zig-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: zig
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Install system tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep fd-find
+          # Debian/Ubuntu ships fd as fdfind; symlink so build.zig finds `fd`
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install system tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep fd
+
+      - name: Verify external tools
+        run: |
+          rg --version
+          fd --version
+          zig version
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test

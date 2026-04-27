@@ -364,14 +364,80 @@ Content-Length: <bytes>\r\n
 - 单扩展抛错：host 端 try/catch 包住，不传染。
 - 协议错误：N 次后视为异常重启。
 
-#### 7.B.10 测试策略
+#### 7.B.10 热重载
+
+进程模式**完整支持热重载**，能力上对齐甚至超过 TS 版。三档：
+
+**档 1：单个扩展热重载（最常用，不重启 Bun）**
+
+```
+Zig → extensions/unload { id }
+        ↓
+Bun host:
+  1. 调扩展 onDeactivate() 钩子
+  2. 从注册表移除该扩展的 tool / command / provider
+  3. 清掉 import / require cache 里它的模块
+        ↓
+Zig → extensions/load { id }
+        ↓
+Bun host:
+  1. 重新 import 入口
+  2. 调 onActivate()
+  3. 重新 register/*
+```
+
+要点：
+- Bun ESM 用动态 `import(...?v=<bumped>)` 强制重新解析；CJS 用 `delete require.cache[...]`
+- 扩展若需要保留状态，自己实现 `serialize()` / `restore()`，由 host 在 unload→load 之间转交
+
+**档 2：全部扩展热重载**：遍历 `extensions/list`，逐个 unload + load。
+适合配置或扩展列表变更。
+
+**档 3：整个 Bun 子进程重启（drain & swap）**
+
+进程边界送的额外能力：
+
+```
+Zig:
+  1. 标记当前 Bun 子进程为 "draining"
+  2. 等待 in-flight RPC 完成（或超时强杀）
+  3. SIGTERM 老进程
+  4. spawn 新 Bun 子进程
+  5. 重新 host/initialize + 重载扩展集合
+  6. 切换 Zig 端 client 句柄
+```
+
+优势：
+- 彻底干净：清空 JS 内存泄漏 / 奇怪状态 / Bun 自身 bug
+- **能换 Bun 版本**：下载新二进制后重启即生效
+- 调试友好：用户 `/reload-extensions --hard` 一键归零
+
+**触发方式**（建议都实现）：
+
+1. 手动：slash 命令 `/reload-extensions [name]` 或 `/reload-extensions --hard`
+2. 文件监听：扩展目录变化自动重载（宿主侧 `inotify` / `fsevents` 即可）
+3. 包管理后：`pi install/update <pkg>` 完成自动 reload 对应扩展
+4. 崩溃自愈：Bun 子进程异常退出 → Zig 自动 spawn 新进程 + 恢复扩展集合
+
+**与 TS 版能力对比**：
+
+| 能力 | TS 版 | Zig + Bun 子进程 |
+|---|---|---|
+| 单扩展热重载 | ✅ | ✅ |
+| 全部扩展热重载 | ✅ | ✅ |
+| 整个 runtime 重启 | ⚠️ 等于重启自己 | ✅ 更干净（进程边界） |
+| 崩溃自愈 | ❌ runtime 崩 = 进程崩 | ✅ 白送 |
+
+**额外工期**：约 **1 周**（合并进 §7.B.11 的 "Bun 子进程生命周期"，从 1 周扩到 1.5–2 周）。
+
+#### 7.B.11 测试策略
 
 - 协议层：Mock host 回放
 - 集成层：hello-world 扩展跑通 6 类场景
 - 回归层：从 TS 仓库选 3–5 个真实扩展冒烟
 - 性能层：单 RPC < 5ms，流式 chunk 延迟 < 10ms
 
-#### 7.B.11 阶段 1 工期细分
+#### 7.B.12 阶段 1 工期细分
 
 | 子任务 | 估时 |
 |---|---|

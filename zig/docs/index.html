@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pi Agent · Zig</title>
+<meta name="description" content="A high-performance coding agent rewritten in Zig. Native binary, low memory, compatible with the existing TS extension ecosystem." />
+<style>
+  :root[data-theme="dark"] {
+    --bg: #0b0d12;
+    --bg-soft: #11141b;
+    --panel: #161a23;
+    --border: #232938;
+    --text: #e6e8ee;
+    --text-dim: #9ba3b4;
+    --accent: #f7a41d;
+    --accent-soft: #f7a41d22;
+    --green: #7ee787;
+    --red: #ff7b72;
+    --code-bg: #0d1117;
+    --shadow: 0 0 0 4px var(--bg);
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff;
+    --bg-soft: #f6f8fa;
+    --panel: #ffffff;
+    --border: #d8dee4;
+    --text: #1f2328;
+    --text-dim: #59636e;
+    --accent: #d97706;
+    --accent-soft: #d9770622;
+    --green: #1a7f37;
+    --red: #cf222e;
+    --code-bg: #f6f8fa;
+    --shadow: 0 0 0 4px var(--bg);
+  }
+  :root {
+    --radius: 10px;
+    --max: 1100px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.65;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    transition: background 0.2s, color 0.2s;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    overflow-x: auto;
+    line-height: 1.55;
+  }
+  pre code { background: transparent; padding: 0; border: none; }
+
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .inner {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px;
+  }
+  nav .brand {
+    font-weight: 700; font-size: 1.05rem;
+    display: flex; align-items: center; gap: 10px;
+  }
+  nav .brand .logo {
+    width: 22px; height: 22px;
+    background: var(--accent);
+    border-radius: 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #0b0d12;
+    font-weight: 900; font-size: 0.8rem;
+  }
+  nav .links { display: flex; gap: 22px; flex-wrap: wrap; }
+  nav .links a { color: var(--text-dim); font-size: 0.92rem; }
+  nav .links a:hover { color: var(--text); text-decoration: none; }
+
+  .toggles { display: flex; gap: 8px; align-items: center; }
+  .toggle-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .toggle-btn:hover { color: var(--text); border-color: var(--text-dim); }
+  .toggle-btn.active { color: var(--accent); border-color: var(--accent); }
+
+  section { padding: 72px 24px; }
+  .wrap { max-width: var(--max); margin: 0 auto; }
+
+  .hero {
+    background: radial-gradient(1200px 500px at 20% -10%, var(--accent-soft), transparent 60%);
+    padding: 88px 24px 64px;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero h1 {
+    font-size: clamp(2rem, 5vw, 3.4rem);
+    margin: 0 0 16px;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+  }
+  .hero h1 .accent { color: var(--accent); }
+  .hero p.lead {
+    font-size: clamp(1rem, 2vw, 1.2rem);
+    color: var(--text-dim);
+    max-width: 720px;
+    margin: 0 0 28px;
+  }
+  .hero .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    display: inline-block;
+    padding: 11px 22px;
+    border-radius: 8px;
+    font-weight: 600; font-size: 0.95rem;
+    border: 1px solid transparent;
+    transition: transform 0.05s ease, background 0.15s;
+    cursor: pointer; font-family: inherit;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .btn-primary { background: var(--accent); color: #0b0d12; }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-ghost { border-color: var(--border); color: var(--text); background: transparent; }
+  .btn-ghost:hover { border-color: var(--text-dim); }
+
+  .hero .meta {
+    margin-top: 28px;
+    display: flex; flex-wrap: wrap; gap: 18px;
+    font-size: 0.88rem; color: var(--text-dim);
+  }
+  .hero .meta span::before {
+    content: "▸"; color: var(--accent); margin-right: 6px;
+  }
+
+  h2 { font-size: 1.7rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 + .sub { color: var(--text-dim); margin-bottom: 28px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px 22px;
+    transition: border-color 0.15s, transform 0.05s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card h3 { margin: 0 0 8px; font-size: 1.05rem; color: var(--accent); }
+  .card p { margin: 0; color: var(--text-dim); font-size: 0.94rem; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  th, td {
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.94rem;
+  }
+  th {
+    background: var(--bg-soft);
+    color: var(--text-dim);
+    font-weight: 600; font-size: 0.86rem;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  .bar {
+    display: inline-block; height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    width: 110px; position: relative;
+    vertical-align: middle; margin-right: 8px;
+  }
+  .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  .bar.green > span { background: var(--green); }
+  .bar.red > span { background: var(--red); }
+
+  .timeline {
+    border-left: 2px solid var(--border);
+    padding-left: 24px; margin-left: 8px;
+  }
+  .step { position: relative; margin-bottom: 28px; }
+  .step::before {
+    content: ""; position: absolute;
+    left: -32px; top: 6px;
+    width: 12px; height: 12px;
+    background: var(--accent); border-radius: 50%;
+    box-shadow: var(--shadow);
+  }
+  .step h4 { margin: 0 0 4px; font-size: 1.05rem; }
+  .step .when {
+    display: inline-block;
+    font-size: 0.78rem; color: var(--accent);
+    background: var(--accent-soft);
+    padding: 2px 10px; border-radius: 999px;
+    margin-bottom: 8px;
+  }
+  .step p { margin: 0; color: var(--text-dim); font-size: 0.94rem; }
+
+  .arch pre { font-size: 0.82rem; line-height: 1.4; }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 32px 24px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.88rem;
+  }
+  footer a { color: var(--text-dim); }
+
+  @media (max-width: 720px) {
+    section { padding: 56px 18px; }
+    .hero { padding: 64px 18px 48px; }
+    nav .inner { flex-wrap: wrap; }
+    nav .links { order: 3; width: 100%; justify-content: center; }
+  }
+
+  /* i18n: hide non-active language */
+  [data-en], [data-zh] { display: none; }
+  html[lang="zh-CN"] [data-zh] { display: inline; }
+  html[lang="en"]    [data-en] { display: inline; }
+  /* block-level overrides: re-show as block where needed */
+  html[lang="zh-CN"] p[data-zh],
+  html[lang="zh-CN"] h1[data-zh],
+  html[lang="zh-CN"] h2[data-zh],
+  html[lang="zh-CN"] h3[data-zh],
+  html[lang="zh-CN"] h4[data-zh],
+  html[lang="zh-CN"] li[data-zh],
+  html[lang="zh-CN"] td[data-zh],
+  html[lang="zh-CN"] div[data-zh] { display: block; }
+  html[lang="zh-CN"] td[data-zh] { display: table-cell; }
+  html[lang="zh-CN"] li[data-zh] { display: list-item; }
+  html[lang="en"] p[data-en],
+  html[lang="en"] h1[data-en],
+  html[lang="en"] h2[data-en],
+  html[lang="en"] h3[data-en],
+  html[lang="en"] h4[data-en],
+  html[lang="en"] li[data-en],
+  html[lang="en"] td[data-en],
+  html[lang="en"] div[data-en] { display: block; }
+  html[lang="en"] td[data-en] { display: table-cell; }
+  html[lang="en"] li[data-en] { display: list-item; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="inner">
+    <div class="brand">
+      <span class="logo">Z</span>
+      Pi Agent
+      <span style="color:var(--text-dim);font-weight:400;font-size:0.85em;">· Zig</span>
+    </div>
+    <div class="links">
+      <a href="#features"><span data-zh>特性</span><span data-en>Features</span></a>
+      <a href="#parity"><span data-zh>进度</span><span data-en>Status</span></a>
+      <a href="#architecture"><span data-zh>架构</span><span data-en>Architecture</span></a>
+      <a href="#roadmap"><span data-zh>路线图</span><span data-en>Roadmap</span></a>
+      <a href="REVIEW.md"><span data-zh>详细 Review</span><span data-en>Full Review</span></a>
+    </div>
+    <div class="toggles">
+      <button class="toggle-btn" id="lang-toggle" title="Language">
+        <span data-zh>EN</span><span data-en>中</span>
+      </button>
+      <button class="toggle-btn" id="theme-toggle" title="Theme">
+        <span id="theme-icon">🌙</span>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="wrap">
+    <h1 data-zh>用 <span class="accent">Zig</span> 重写的<br/>高性能 coding agent</h1>
+    <h1 data-en>A high-performance<br/>coding agent in <span class="accent">Zig</span></h1>
+
+    <p class="lead" data-zh>
+      原生二进制、低内存、毫秒级启动；保留与 TypeScript 版本完整的能力 ——
+      包括交互式 TUI、多 provider、session、工具链与扩展生态。
+    </p>
+    <p class="lead" data-en>
+      Native binary, low memory, sub-second startup. Keeps full feature parity with
+      the TypeScript version — interactive TUI, multi-provider, sessions, tools,
+      and extension ecosystem.
+    </p>
+
+    <div class="cta">
+      <a href="#getting-started" class="btn btn-primary">
+        <span data-zh>快速开始</span><span data-en>Get started</span>
+      </a>
+      <a href="https://github.com/davirain-su/pi-mono-zig" class="btn btn-ghost">GitHub →</a>
+    </div>
+
+    <div class="meta">
+      <span data-zh>独立可用度 ≈ 90%</span><span data-en>Standalone ready ≈ 90%</span>
+      <span data-zh>核心 runtime parity 89%</span><span data-en>Core runtime parity 89%</span>
+      <span data-zh>JSON event wire 93%</span><span data-en>JSON event wire 93%</span>
+      <span data-zh>25+ 内置 provider</span><span data-en>25+ built-in providers</span>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <h2 data-zh>为什么选 Zig 版？</h2>
+    <h2 data-en>Why the Zig rewrite?</h2>
+    <p class="sub" data-zh>不是为了重写而重写，是为了把 coding agent 跑得更轻、更快、更可控。</p>
+    <p class="sub" data-en>Not a rewrite for its own sake — to make the coding agent lighter, faster, more controllable.</p>
+
+    <div class="grid">
+      <div class="card">
+        <h3 data-zh>原生二进制</h3><h3 data-en>Native binary</h3>
+        <p data-zh>单文件分发，启动从秒级降到毫秒级。无 Node、无 V8 启动开销。</p>
+        <p data-en>Single-file distribution. Startup goes from seconds to milliseconds. No Node, no V8 cold start.</p>
+      </div>
+      <div class="card">
+        <h3 data-zh>低内存占用</h3><h3 data-en>Low memory</h3>
+        <p data-zh>显式内存所有权，长会话不再吃光内存。空闲态开销显著低于 Node 版。</p>
+        <p data-en>Explicit ownership. Long sessions no longer eat memory. Idle footprint far below the Node version.</p>
+      </div>
+      <div class="card">
+        <h3 data-zh>真·并行 Tool 执行</h3><h3 data-en>True parallel tools</h3>
+        <p data-zh>基于 Zig 线程模型的并行 tool 调度，配合流式更新链路。</p>
+        <p data-en>Parallel tool scheduling on Zig threads, paired with a streaming update pipeline.</p>
+      </div>
+      <div class="card">
+        <h3 data-zh>完整交互式 TUI</h3><h3 data-en>Full interactive TUI</h3>
+        <p data-zh>差分渲染、Unicode 宽度、剪贴板图片、scoped models、changelog 等都已实现。</p>
+        <p data-en>Diff rendering, Unicode width, clipboard images, scoped models, changelog, all in.</p>
+      </div>
+      <div class="card">
+        <h3 data-zh>多 Provider & OAuth</h3><h3 data-en>Multi-provider & OAuth</h3>
+        <p data-zh>OpenAI / Anthropic / Mistral / Kimi / Google / Bedrock / Azure 等 25+ provider；
+        Anthropic / GitHub Copilot / Gemini 真实 OAuth 已可用。</p>
+        <p data-en>25+ providers including OpenAI, Anthropic, Mistral, Kimi, Google, Bedrock, Azure.
+        Real OAuth flows for Anthropic, GitHub Copilot, and Gemini are working.</p>
+      </div>
+      <div class="card">
+        <h3 data-zh>兼容 TS 扩展生态</h3><h3 data-en>TS extension compat</h3>
+        <p data-zh>通过 Bun 子进程 + JSON-RPC 复用既有 TS 扩展，零迁移成本。
+        热重载、崩溃自愈、版本锁定全套支持。</p>
+        <p data-en>Reuse existing TS extensions via a Bun subprocess + JSON-RPC. Zero migration.
+        Hot-reload, crash recovery, and version locking included.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="parity" style="background: var(--bg-soft);">
+  <div class="wrap">
+    <h2 data-zh>与 TypeScript 版的能力对齐</h2>
+    <h2 data-en>Parity with the TypeScript version</h2>
+
+    <p class="sub" data-zh>第三轮 Review 数据。完整内容见 <a href="REVIEW.md">REVIEW.md</a>。</p>
+    <p class="sub" data-en>Numbers from the third review pass. Full details in <a href="REVIEW.md">REVIEW.md</a>.</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th><span data-zh>模块</span><span data-en>Area</span></th>
+          <th>Parity</th>
+          <th><span data-zh>状态</span><span data-en>Status</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span data-zh>Agent 核心 loop / runtime</span><span data-en>Agent core loop / runtime</span></td>
+          <td><span class="bar green"><span style="width:89%"></span></span> 89%</td>
+          <td><span data-zh>steering / tool / hook / abort 全部就绪</span><span data-en>steering / tool / hook / abort all in place</span></td>
+        </tr>
+        <tr>
+          <td>JSON mode / event wire</td>
+          <td><span class="bar green"><span style="width:93%"></span></span> 93%</td>
+          <td><span data-zh>校验 + 富 schema</span><span data-en>validation + rich schema</span></td>
+        </tr>
+        <tr>
+          <td>CLI / bootstrap</td>
+          <td><span class="bar green"><span style="width:89%"></span></span> 89%</td>
+          <td><span data-zh>主流 flag 已对齐</span><span data-en>major flags aligned</span></td>
+        </tr>
+        <tr>
+          <td><span data-zh>内置 tools</span><span data-en>Built-in tools</span></td>
+          <td><span class="bar green"><span style="width:87%"></span></span> 87%</td>
+          <td>read / bash / edit / write / grep / find / ls</td>
+        </tr>
+        <tr>
+          <td>TUI / interactive</td>
+          <td><span class="bar green"><span style="width:86%"></span></span> 86%</td>
+          <td><span data-zh>多模块拆分，渲染锁优化</span><span data-en>multi-module split, render lock optimized</span></td>
+        </tr>
+        <tr>
+          <td><span data-zh>Sessions / 分支 / 导出</span><span data-en>Sessions / branching / export</span></td>
+          <td><span class="bar green"><span style="width:84%"></span></span> 84%</td>
+          <td><span data-zh>session v3 + 分支 + 跨 provider 续会话</span><span data-en>session v3 + branching + cross-provider continuation</span></td>
+        </tr>
+        <tr>
+          <td>Providers / auth / model registry</td>
+          <td><span class="bar green"><span style="width:78%"></span></span> 78%</td>
+          <td><span data-zh>25+ provider，真实 OAuth</span><span data-en>25+ providers, real OAuth</span></td>
+        </tr>
+        <tr>
+          <td><span data-zh>RPC 协议兼容</span><span data-en>RPC protocol compat</span></td>
+          <td><span class="bar red"><span style="width:30%"></span></span> 30%</td>
+          <td><span data-zh>独立 JSON-RPC OK，TS-JSONL 控制面待做</span><span data-en>standalone JSON-RPC ok; TS JSONL control plane pending</span></td>
+        </tr>
+        <tr>
+          <td><span data-zh>扩展 / 包管理 / 自定义 UI</span><span data-en>Extensions / packages / custom UI</span></td>
+          <td><span class="bar red"><span style="width:12%"></span></span> 12%</td>
+          <td><span data-zh>路线 B 阶段 1 主目标</span><span data-en>main target of Plan B Stage 1</span></td>
+        </tr>
+        <tr>
+          <td>MCP</td>
+          <td><span class="bar red"><span style="width:5%"></span></span> 5%</td>
+          <td><span data-zh>经扩展通道接入</span><span data-en>to be reached via extensions</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <h2 data-zh>架构总览</h2><h2 data-en>Architecture</h2>
+    <p class="sub" data-zh>最终形态：Zig 内核 + 双扩展通道（TS 兼容 + Wasm 原生）。</p>
+    <p class="sub" data-en>Final shape: Zig core + dual extension channels (TS-compat + Wasm native).</p>
+    <div class="arch">
+<pre>
+┌──────────────────────────────────────────────────────┐
+│              Pi Agent · Zig main process              │
+│                                                      │
+│   ┌──────────────────────────────────────────────┐   │
+│   │  built-in tools · agent loop · TUI · RPC     │   │
+│   │  session manager · provider/auth · CLI       │   │
+│   └──────────────────────────────────────────────┘   │
+│                       │                              │
+│              ┌────────┴────────┐                     │
+│              │   extension     │                     │
+│              │     loader      │                     │
+│              └─┬────────────┬──┘                     │
+│                │            │                        │
+│   ┌────────────▼──┐    ┌────▼─────────────────────┐  │
+│   │ Wasm runtime  │    │ Bun subprocess           │  │
+│   │ native exts   │    │ TS / npm extensions      │  │
+│   │ Zig/Rust/AS   │    │ stdio + JSON-RPC         │  │
+│   └───────────────┘    │ hot-reload · crash heal  │  │
+│                        └──────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
+</pre>
+    </div>
+  </div>
+</section>
+
+<section id="roadmap" style="background: var(--bg-soft);">
+  <div class="wrap">
+    <h2 data-zh>路线图</h2><h2 data-en>Roadmap</h2>
+
+    <p class="sub" data-zh>两条并行路径。路线 A 让 Zig 版独立可用；路线 B 实现完整 TS 替代。</p>
+    <p class="sub" data-en>Two tracks. Plan A gets the Zig version standalone-ready; Plan B is full TS replacement.</p>
+
+    <h3 style="margin-top:32px;color:var(--accent);" data-zh>路线 A · 独立可用版（≈ 1–2 周）</h3>
+    <h3 style="margin-top:32px;color:var(--accent);" data-en>Plan A · Standalone ready (≈ 1–2 weeks)</h3>
+
+    <div class="timeline">
+      <div class="step">
+        <span class="when">S</span>
+        <h4 data-zh>toolcall 流式事件转发</h4>
+        <h4 data-en>Forward toolcall stream events</h4>
+        <p data-zh>补 <code>streamAssistantResponse</code> 的 switch case，让 JSON event 闭环。</p>
+        <p data-en>Add the missing switch cases in <code>streamAssistantResponse</code> to close the JSON-event loop.</p>
+      </div>
+      <div class="step">
+        <span class="when">M</span>
+        <h4 data-zh>agent_loop 并行模式真·流式</h4>
+        <h4 data-en>True live streaming in parallel mode</h4>
+        <p data-zh>把 per-task buffered updates 改成线程安全实时 emit。</p>
+        <p data-en>Replace per-task buffered updates with a thread-safe live emit channel.</p>
+      </div>
+      <div class="step">
+        <span class="when">S</span>
+        <h4 data-zh>去掉生产路径的 resetForTesting()</h4>
+        <h4 data-en>Drop resetForTesting() in production path</h4>
+        <p data-zh>引入显式 <code>clear()</code> / <code>resetToBuiltIns()</code> API。</p>
+        <p data-en>Introduce explicit <code>clear()</code> / <code>resetToBuiltIns()</code> APIs.</p>
+      </div>
+      <div class="step">
+        <span class="when">S–M</span>
+        <h4 data-zh>catch {} → 结构化 error 收集</h4>
+        <h4 data-en>catch {} → structured error collection</h4>
+        <p data-zh>config 错误不再静默吞掉，启动后统一告警。</p>
+        <p data-en>Config errors no longer swallowed; surface them after startup.</p>
+      </div>
+      <div class="step">
+        <span class="when">S–M</span>
+        <h4 data-zh>JSON 输出 golden 兼容性测试</h4>
+        <h4 data-en>JSON output golden tests</h4>
+        <p data-zh>钉死 wire 契约，避免 schema 漂移。</p>
+        <p data-en>Lock the wire contract to prevent schema drift.</p>
+      </div>
+    </div>
+
+    <h3 style="margin-top:48px;color:var(--accent);" data-zh>路线 B · 完整 TS 替代（≈ 12–16 周）</h3>
+    <h3 style="margin-top:48px;color:var(--accent);" data-en>Plan B · Full TS replacement (≈ 12–16 weeks)</h3>
+
+    <div class="timeline">
+      <div class="step">
+        <span class="when" data-zh>阶段 1 · 12–16 周</span>
+        <span class="when" data-en>Stage 1 · 12–16 weeks</span>
+        <h4 data-zh>Bun 作为扩展运行时</h4>
+        <h4 data-en>Bun as extension runtime</h4>
+        <p data-zh>子进程 + JSON-RPC + 热重载 + 包管理；复用 TS / npm 扩展生态。</p>
+        <p data-en>Subprocess + JSON-RPC + hot-reload + package management; reuse the TS / npm ecosystem.</p>
+      </div>
+      <div class="step">
+        <span class="when" data-zh>阶段 2 · 持续</span>
+        <span class="when" data-en>Stage 2 · ongoing</span>
+        <h4 data-zh>把热门扩展原生化</h4>
+        <h4 data-en>Nativize popular extensions</h4>
+        <p data-zh>数据驱动，top N 用 Zig 重写为原生扩展，性能 / 体积 / 独立性提升。</p>
+        <p data-en>Data-driven. Rewrite the top-N extensions in Zig as native ones for perf, size, and independence.</p>
+      </div>
+      <div class="step">
+        <span class="when" data-zh>阶段 3 · 2–3 周</span>
+        <span class="when" data-en>Stage 3 · 2–3 weeks</span>
+        <h4 data-zh>Wasm 原生扩展加载器</h4>
+        <h4 data-en>Wasm-based native extension loader</h4>
+        <p data-zh>Zig / Rust / AssemblyScript 写的扩展通过 Wasm 沙箱热加载。</p>
+        <p data-en>Hot-load extensions written in Zig / Rust / AssemblyScript via a Wasm sandbox.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="getting-started">
+  <div class="wrap">
+    <h2 data-zh>快速开始</h2><h2 data-en>Getting started</h2>
+    <p class="sub" data-zh>单二进制，无需安装运行时。</p>
+    <p class="sub" data-en>Single binary, no runtime to install.</p>
+<pre data-zh><code># 构建
+zig build -Doptimize=ReleaseFast
+
+# 交互模式
+./zig-out/bin/pi-agent
+
+# 一次性 prompt
+./zig-out/bin/pi-agent --prompt "帮我审查 src/main.zig 的内存管理"
+
+# JSON 事件流（机器消费）
+./zig-out/bin/pi-agent --json --prompt "..."
+
+# 查看可用模型
+./zig-out/bin/pi-agent --list-models
+
+# 续上一会话
+./zig-out/bin/pi-agent --continue</code></pre>
+<pre data-en><code># Build
+zig build -Doptimize=ReleaseFast
+
+# Interactive mode
+./zig-out/bin/pi-agent
+
+# One-shot prompt
+./zig-out/bin/pi-agent --prompt "Review memory management in src/main.zig"
+
+# JSON event stream (for machines)
+./zig-out/bin/pi-agent --json --prompt "..."
+
+# List available models
+./zig-out/bin/pi-agent --list-models
+
+# Continue last session
+./zig-out/bin/pi-agent --continue</code></pre>
+  </div>
+</section>
+
+<footer>
+  <div>
+    Pi Agent · Zig ·
+    <a href="REVIEW.md"><span data-zh>完整 Review</span><span data-en>Full Review</span></a> ·
+    <a href="https://github.com/davirain-su/pi-mono-zig">GitHub</a>
+  </div>
+  <div style="margin-top:8px;opacity:0.7;">
+    <span data-zh>Built with ⚡ Zig · 兼容 TypeScript 扩展生态</span>
+    <span data-en>Built with ⚡ Zig · Compatible with the TypeScript extension ecosystem</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  const html = document.documentElement;
+
+  // ---------- theme ----------
+  const themeBtn = document.getElementById('theme-toggle');
+  const themeIcon = document.getElementById('theme-icon');
+  const savedTheme = localStorage.getItem('pi-theme');
+  const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+  const initialTheme = savedTheme || (prefersLight ? 'light' : 'dark');
+  applyTheme(initialTheme);
+
+  themeBtn.addEventListener('click', () => {
+    const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    localStorage.setItem('pi-theme', next);
+  });
+
+  function applyTheme(t) {
+    html.setAttribute('data-theme', t);
+    themeIcon.textContent = t === 'dark' ? '🌙' : '☀️';
+  }
+
+  // ---------- language ----------
+  const langBtn = document.getElementById('lang-toggle');
+  const savedLang = localStorage.getItem('pi-lang');
+  const browserLang = (navigator.language || 'en').toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
+  const initialLang = savedLang || browserLang;
+  applyLang(initialLang);
+
+  langBtn.addEventListener('click', () => {
+    const next = html.getAttribute('lang') === 'zh-CN' ? 'en' : 'zh-CN';
+    applyLang(next);
+    localStorage.setItem('pi-lang', next);
+  });
+
+  function applyLang(l) {
+    html.setAttribute('lang', l);
+    document.title = l === 'zh-CN' ? 'Pi Agent · Zig 实现' : 'Pi Agent · Zig';
+  }
+})();
+</script>
+
+</body>
+</html>
