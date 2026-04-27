@@ -315,6 +315,16 @@ pub const Editor = struct {
             };
         };
 
+        if (content_window.height == 1) {
+            const cursor_col = drawSingleRowViewport(self.buffer.items, self.cursor, content_window, base_style);
+            content_window.showCursor(cursor_col, 0);
+            content_window.setCursorShape(self.cursor_shape);
+            return .{
+                .width = window.width,
+                .height = @min(window.height, @as(u16, @intCast(self.padding_y * 2 + 1))),
+            };
+        }
+
         if (self.buffer.items.len > 0) {
             _ = content_window.printSegment(.{
                 .text = self.buffer.items,
@@ -767,6 +777,32 @@ fn measureCursor(text: []const u8, cursor_index: usize, window: vaxis.Window, st
         .col = result.col,
         .row = @min(result.row, if (window.height == 0) 0 else window.height - 1),
     };
+}
+
+fn drawSingleRowViewport(text: []const u8, cursor_index: usize, window: vaxis.Window, style: vaxis.Cell.Style) u16 {
+    if (text.len == 0 or window.width == 0) return 0;
+
+    const clamped_cursor = @min(cursor_index, text.len);
+    const current_start = lineStart(text, clamped_cursor);
+    const current_end = lineEnd(text, clamped_cursor);
+    const max_left_width = if (window.width > 1) @as(usize, window.width - 1) else 0;
+
+    var start = clamped_cursor;
+    var used_width: usize = 0;
+    while (start > current_start) {
+        const previous = prevCodepointStart(text, start);
+        const cluster = ansi.nextDisplayCluster(text, previous);
+        if (used_width + cluster.width > max_left_width) break;
+        used_width += cluster.width;
+        start = previous;
+    }
+
+    _ = window.printSegment(.{
+        .text = text[start..current_end],
+        .style = style,
+    }, .{ .wrap = .none });
+
+    return @intCast(@min(displayColumn(text, start, clamped_cursor), @as(usize, window.width - 1)));
 }
 
 fn appendWrappedLogicalLine(
@@ -1403,6 +1439,26 @@ test "editor cursor column uses display width for wide graphemes" {
     defer screen.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 5), screen.cursor.col);
+}
+
+test "editor single-row viewport scrolls to keep overflowing cursor visible" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("abcdefghi"));
+
+    var cursor_screen = try renderEditorWithCursor(&editor, 6, 1);
+    defer cursor_screen.deinit(std.testing.allocator);
+
+    try std.testing.expect(cursor_screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 5), cursor_screen.cursor.col);
+
+    var screen = try test_helpers.renderToScreen(editor.drawComponent(), 6, 1);
+    defer screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&screen, 0, 0, "e", .{});
+    try test_helpers.expectCell(&screen, 4, 0, "i", .{});
 }
 
 test "editor applies theme colors to content and autocomplete without ansi parsing assertions" {
