@@ -1,6 +1,8 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 const ansi = @import("ansi.zig");
 const component_mod = @import("component.zig");
+const draw_mod = @import("draw.zig");
 const terminal_mod = @import("terminal.zig");
 const vaxis_adapter_mod = @import("vaxis_adapter.zig");
 
@@ -145,27 +147,47 @@ pub const Renderer = struct {
         self.previous_size = size;
     }
 
-    pub fn renderToVaxis(self: *Renderer, root: component_mod.Component, adapter: *vaxis_adapter_mod.VaxisAdapter) !void {
+    pub fn renderToVaxis(self: *Renderer, root: anytype, adapter: *vaxis_adapter_mod.VaxisAdapter) !void {
         const size = try self.terminal.refreshSize();
+        switch (@TypeOf(root)) {
+            component_mod.Component => {
+                var new_lines = try self.renderLinesForSize(root, size);
+                defer component_mod.freeLines(self.allocator, &new_lines);
 
-        var new_lines = try self.renderLinesForSize(root, size);
-        defer component_mod.freeLines(self.allocator, &new_lines);
+                try adapter.render(size, new_lines.items);
 
-        try adapter.render(size, new_lines.items);
+                self.last_render_stats = .{
+                    .mode = if (self.previous_size == null or self.previous_size.?.width != size.width or self.previous_size.?.height != size.height)
+                        .full
+                    else
+                        .diff,
+                    .changed_line_count = changedLineCount(self.previous_lines.items, new_lines.items),
+                    .payload_bytes = 0,
+                    .frame_bytes = 0,
+                    .synchronized_output = false,
+                };
 
-        self.last_render_stats = .{
-            .mode = if (self.previous_size == null or self.previous_size.?.width != size.width or self.previous_size.?.height != size.height)
-                .full
-            else
-                .diff,
-            .changed_line_count = changedLineCount(self.previous_lines.items, new_lines.items),
-            .payload_bytes = 0,
-            .frame_bytes = 0,
-            .synchronized_output = false,
-        };
-
-        try self.replacePreviousLines(new_lines.items);
-        self.previous_size = size;
+                try self.replacePreviousLines(new_lines.items);
+                self.previous_size = size;
+            },
+            draw_mod.Component => {
+                _ = try adapter.renderComponent(size, root, null);
+                component_mod.freeLines(self.allocator, &self.previous_lines);
+                self.previous_lines = .empty;
+                self.last_render_stats = .{
+                    .mode = if (self.previous_size == null or self.previous_size.?.width != size.width or self.previous_size.?.height != size.height)
+                        .full
+                    else
+                        .diff,
+                    .changed_line_count = 0,
+                    .payload_bytes = 0,
+                    .frame_bytes = 0,
+                    .synchronized_output = false,
+                };
+                self.previous_size = size;
+            },
+            else => @compileError("renderToVaxis expects a legacy tui.Component or tui.draw.Component"),
+        }
     }
 
     fn renderLinesForSize(self: *Renderer, root: component_mod.Component, size: terminal_mod.Size) !component_mod.LineList {
@@ -508,6 +530,31 @@ const TestStaticComponent = struct {
     }
 };
 
+const TestDrawComponent = struct {
+    const sentinel: u8 = 0;
+
+    pub fn component() draw_mod.Component {
+        return .{
+            .ptr = &sentinel,
+            .drawFn = draw,
+        };
+    }
+
+    fn draw(_: *const anyopaque, window: vaxis.Window, ctx: draw_mod.DrawContext) !draw_mod.Size {
+        _ = ctx;
+        window.writeCell(1, 1, .{
+            .char = .{
+                .grapheme = "Z",
+                .width = 1,
+            },
+        });
+        return .{
+            .width = 1,
+            .height = 1,
+        };
+    }
+};
+
 test "differential renderer only redraws changed lines" {
     const allocator = std.testing.allocator;
 
@@ -739,7 +786,7 @@ test "renderer can render composed overlays through the libvaxis adapter" {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
 
-    var vx = try @import("vaxis").init(std.testing.io, allocator, &env_map, .{});
+    var vx = try vaxis.init(std.testing.io, allocator, &env_map, .{});
     defer vx.deinit(allocator, &writer.writer);
 
     var adapter = vaxis_adapter_mod.VaxisAdapter.init(allocator, &vx, &writer.writer);
@@ -751,4 +798,37 @@ test "renderer can render composed overlays through the libvaxis adapter" {
     try std.testing.expectEqualStrings("m", menu_cell.char.grapheme);
     try std.testing.expectEqual(@import("vaxis").Cell.Color{ .rgb = .{ 12, 34, 56 } }, menu_cell.style.fg);
     try std.testing.expect(std.mem.indexOf(u8, renderer.previous_lines.items[1], "menu") != null);
+}
+
+test "renderer can render a draw component through the libvaxis adapter" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 6, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var vx = try @import("vaxis").init(std.testing.io, allocator, &env_map, .{});
+    defer vx.deinit(allocator, &writer.writer);
+
+    var adapter = vaxis_adapter_mod.VaxisAdapter.init(allocator, &vx, &writer.writer);
+    defer adapter.deinit();
+
+    try renderer.renderToVaxis(TestDrawComponent.component(), &adapter);
+
+    const window = vx.window();
+    const drawn_cell = window.readCell(1, 1).?;
+    try std.testing.expectEqualStrings("Z", drawn_cell.char.grapheme);
+    try std.testing.expectEqual(@as(usize, 0), renderer.previous_lines.items.len);
 }
