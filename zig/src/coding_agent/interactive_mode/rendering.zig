@@ -1056,25 +1056,26 @@ pub const ScreenComponent = struct {
         }
         row += prompt_height;
 
-        const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), @as(usize, window.width));
-        const editor_window_width = @max(@as(usize, 1), if (window.width > prefix_width) window.width - @as(u16, @intCast(prefix_width)) else 1);
-        const editor_image_rows = pendingImagesRenderHeight(snapshot.pending_editor_images, editor_window_width);
-        const editor_rows = if (prompt_height > editor_image_rows) prompt_height - editor_image_rows else 1;
-        const editor_window = window.child(.{
-            .x_off = @intCast(prefix_width),
-            .y_off = @intCast(prompt_start_row),
-            .width = @intCast(editor_window_width),
-            .height = @intCast(@max(editor_rows, 1)),
-        });
-        _ = try self.editor.draw(editor_window, .{
-            .window = editor_window,
-            .arena = ctx.arena,
-            .theme = self.theme,
-        });
+        const editor_window_width = promptEditorWidth(width);
+        const editor_x = promptEditorOffsetX(width);
+        const editor_y = prompt_start_row + PROMPT_BORDER_TOP_ROWS;
+        if (editor_y < window.height and @as(usize, window.width) > editor_x) {
+            const editor_window = window.child(.{
+                .x_off = @intCast(editor_x),
+                .y_off = @intCast(editor_y),
+                .width = @intCast(editor_window_width),
+                .height = 1,
+            });
+            _ = try self.editor.draw(editor_window, .{
+                .window = editor_window,
+                .arena = ctx.arena,
+                .theme = self.theme,
+            });
+        }
 
         if (autocomplete_height > 0 and row < window.height) {
             const autocomplete_window = window.child(.{
-                .x_off = @intCast(prefix_width),
+                .x_off = @intCast(editor_x),
                 .y_off = @intCast(row),
                 .width = @intCast(editor_window_width),
                 .height = @intCast(@min(autocomplete_height, @as(usize, window.height) - row)),
@@ -1196,9 +1197,11 @@ fn measurePromptHeight(
     pending_images: []const PendingEditorImage,
     width: usize,
 ) !usize {
-    const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), width);
-    const editor_width = @max(@as(usize, 1), width -| prefix_width);
-    return try measureEditorHeight(allocator, theme, editor, editor_width) + pendingImagesRenderHeight(pending_images, editor_width);
+    _ = allocator;
+    _ = theme;
+    _ = editor;
+    const editor_width = promptEditorWidth(width);
+    return PROMPT_BOX_HEIGHT + pendingImagesRenderHeight(pending_images, editor_width);
 }
 
 fn drawPromptLines(
@@ -1209,17 +1212,42 @@ fn drawPromptLines(
     pending_images: []const PendingEditorImage,
 ) !tui.DrawSize {
     const prompt_style = styleForToken(theme, .prompt);
-    drawFittedLine(window, 0, INPUT_PROMPT_PREFIX, prompt_style);
+    const border_style = styleForToken(theme, .box_border);
+    const editor_width = promptEditorWidth(@as(usize, window.width));
+    const prompt_height = @min(PROMPT_BOX_HEIGHT, @as(usize, window.height));
+    const prompt_inner = if (window.width >= 2 and window.height >= 2)
+        window.child(.{
+            .height = @intCast(prompt_height),
+            .border = .{
+                .where = .all,
+                .style = border_style,
+                .glyphs = .single_rounded,
+            },
+        })
+    else
+        window.child(.{ .height = @intCast(prompt_height) });
+    prompt_inner.clear();
 
-    const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), @as(usize, window.width));
-    const editor_width = @max(@as(usize, 1), @as(usize, window.width) -| prefix_width);
-    const editor_height = try measureEditorHeight(ctx.arena, theme, editor, editor_width);
-    if (prefix_width < window.width) {
-        const editor_window = window.child(.{
-            .x_off = @intCast(prefix_width),
-            .y_off = 0,
+    const full_editor_height = try measureEditorHeight(ctx.arena, theme, editor, editor_width);
+    const has_overflow = full_editor_height > @as(usize, @max(prompt_inner.height, 1));
+
+    if (prompt_inner.height > 0) {
+        for (0..prompt_inner.height) |line_index| {
+            _ = prompt_inner.printSegment(.{
+                .text = INPUT_PROMPT_PREFIX,
+                .style = prompt_style,
+            }, .{
+                .wrap = .none,
+                .row_offset = @intCast(line_index),
+            });
+        }
+    }
+
+    if (@as(usize, prompt_inner.width) > PROMPT_GLYPH_WIDTH) {
+        const editor_window = prompt_inner.child(.{
+            .x_off = @intCast(PROMPT_GLYPH_WIDTH),
             .width = @intCast(editor_width),
-            .height = @intCast(@min(editor_height, @as(usize, window.height))),
+            .height = @max(prompt_inner.height, 1),
         });
         _ = try editor.draw(editor_window, .{
             .window = editor_window,
@@ -1227,17 +1255,33 @@ fn drawPromptLines(
             .theme = theme,
         });
     }
+
+    if (has_overflow and window.height >= PROMPT_BOX_HEIGHT and window.width > 8) {
+        const indicator = "↓ more";
+        const indicator_width = tui.ansi.visibleWidth(indicator);
+        const indicator_col = @max(@as(usize, 1), @as(usize, window.width) -| (indicator_width + 2));
+        _ = window.printSegment(.{
+            .text = indicator,
+            .style = prompt_style,
+        }, .{
+            .wrap = .none,
+            .row_offset = @intCast(PROMPT_BOX_HEIGHT - 1),
+            .col_offset = @intCast(indicator_col),
+        });
+    }
+
+    const prefix_width = promptEditorOffsetX(@as(usize, window.width));
     const blank_prefix = try ctx.arena.alloc(u8, prefix_width);
     @memset(blank_prefix, ' ');
     var image_row: usize = 0;
     for (pending_images, 0..) |image, index| {
         const row_count = pendingImageRenderHeight(image, editor_width);
-        if (editor_height + image_row >= window.height) break;
+        if (PROMPT_BOX_HEIGHT + image_row >= window.height) break;
 
         const continuation_window = window.child(.{
             .x_off = 0,
-            .y_off = @intCast(editor_height + image_row),
-            .height = @intCast(@min(row_count, @as(usize, window.height) -| (editor_height + image_row))),
+            .y_off = @intCast(PROMPT_BOX_HEIGHT + image_row),
+            .height = @intCast(@min(row_count, @as(usize, window.height) -| (PROMPT_BOX_HEIGHT + image_row))),
         });
 
         if (image.kitty_image) |kitty| {
@@ -1266,7 +1310,7 @@ fn drawPromptLines(
     }
     return .{
         .width = window.width,
-        .height = @intCast(@min(editor_height + image_row, @as(usize, window.height))),
+        .height = @intCast(@min(PROMPT_BOX_HEIGHT + image_row, @as(usize, window.height))),
     };
 }
 
@@ -1979,7 +2023,19 @@ pub fn freeLinesSafe(allocator: std.mem.Allocator, lines: *tui.LineList) void {
     tui.component.freeLines(allocator, lines);
 }
 
-pub const INPUT_PROMPT_PREFIX = "Input: ";
+pub const INPUT_PROMPT_PREFIX = "> ";
+const PROMPT_BOX_HEIGHT: usize = 3;
+const PROMPT_BORDER_TOP_ROWS: usize = 1;
+const PROMPT_GLYPH_WIDTH: usize = 2;
+const PROMPT_EDITOR_WIDTH_OVERHEAD: usize = 4;
+
+fn promptEditorWidth(width: usize) usize {
+    return @max(@as(usize, 1), width -| PROMPT_EDITOR_WIDTH_OVERHEAD);
+}
+
+fn promptEditorOffsetX(width: usize) usize {
+    return @min(width, PROMPT_BORDER_TOP_ROWS + PROMPT_GLYPH_WIDTH);
+}
 
 pub fn renderPromptLines(
     allocator: std.mem.Allocator,
@@ -2530,10 +2586,138 @@ test "drawPromptLines places Kitty image cells for transmitted pending images" {
         .arena = arena.allocator(),
     }, null, &editor, &pending);
 
-    const image_col: u16 = @intCast(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX));
-    const image_cell = screen.readCell(image_col, 1) orelse return error.TestUnexpectedResult;
+    const image_col: u16 = @intCast(promptEditorOffsetX(40));
+    const image_cell = screen.readCell(image_col, PROMPT_BOX_HEIGHT) orelse return error.TestUnexpectedResult;
     try std.testing.expect(image_cell.image != null);
     try std.testing.expectEqual(@as(u32, 77), image_cell.image.?.img_id);
+}
+
+test "drawPromptLines renders bordered prompt with glyph prefix" {
+    const allocator = std.testing.allocator;
+
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("hello");
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 20,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    _ = try drawPromptLines(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+        .theme = &theme,
+    }, &theme, &editor, &.{});
+
+    const top_left = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("╭", top_left.char.grapheme);
+    try std.testing.expectEqual(styleForToken(&theme, .box_border), top_left.style);
+
+    const bottom_left = screen.readCell(0, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("╰", bottom_left.char.grapheme);
+    try std.testing.expectEqual(styleForToken(&theme, .box_border), bottom_left.style);
+
+    const glyph = screen.readCell(1, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(">", glyph.char.grapheme);
+    try std.testing.expectEqual(styleForToken(&theme, .prompt), glyph.style);
+
+    const first_text = screen.readCell(3, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("h", first_text.char.grapheme);
+    try std.testing.expectEqual(styleForToken(&theme, .editor), first_text.style);
+}
+
+test "drawPromptLines places cursor after border and glyph offset" {
+    const allocator = std.testing.allocator;
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("hello");
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 20,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    _ = try drawPromptLines(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    }, null, &editor, &.{});
+
+    try std.testing.expect(screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 8), screen.cursor.col);
+    try std.testing.expectEqual(@as(u16, 1), screen.cursor.row);
+}
+
+test "measurePromptHeight uses fixed border height and editor width overhead" {
+    const allocator = std.testing.allocator;
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("a long prompt that would previously grow the prompt area");
+
+    try std.testing.expectEqual(@as(usize, 76), promptEditorWidth(80));
+    try std.testing.expectEqual(@as(usize, 3), try measurePromptHeight(allocator, null, &editor, &.{}, 80));
+}
+
+test "drawPromptLines shows overflow indicator on bottom border" {
+    const allocator = std.testing.allocator;
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("abcdefghi");
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    _ = try drawPromptLines(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    }, null, &editor, &.{});
+
+    var rendered = try tui.vaxis.AllocatingScreen.init(allocator, 12, 3);
+    defer rendered.deinit(allocator);
+    for (0..3) |row| {
+        for (0..12) |col| {
+            const cell = screen.readCell(@intCast(col), @intCast(row)) orelse continue;
+            rendered.writeCell(@intCast(col), @intCast(row), cell);
+        }
+    }
+    const text = try tui.test_helpers.screenToString(&rendered);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "↓ more") != null);
 }
 
 pub const InteractiveModeTestBackend = struct {
@@ -2854,10 +3038,9 @@ test "screen draw stacks autocomplete below the prompt editor child window" {
     var screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 20, 8);
     defer screen.deinit(std.testing.allocator);
 
-    try tui.test_helpers.expectCell(&screen, 0, 2, "I", .{});
+    try tui.test_helpers.expectCell(&screen, 0, 1, "╭", .{});
 
-    const prefix_width = tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX);
-    const selected = screen.readCell(@intCast(prefix_width + 2), 3) orelse return error.TestUnexpectedResult;
+    const selected = screen.readCell(@intCast(promptEditorOffsetX(20) + 2), 4) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("r", selected.char.grapheme);
     try std.testing.expect(selected.style.reverse);
 }
@@ -2910,11 +3093,11 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     var screen_component = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 14,
+        .height = 16,
         .keybindings = &keybindings,
     };
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 160, .height = 14 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 160, .height = 16 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackend(allocator, &screen_component, &backend);
@@ -2924,7 +3107,7 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     try std.testing.expect(renderedLinesContain(lines.items, "Tool read:"));
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Input: pending prompt"));
+    try std.testing.expect(renderedLinesContain(lines.items, "> pending prompt"));
     try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S sessions"));
     try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+V paste image"));
     try std.testing.expect(renderedLinesContain(lines.items, "Faux"));

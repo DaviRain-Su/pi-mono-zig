@@ -529,7 +529,7 @@ test "screen renders welcome prompt footer and tool lines" {
     var screen = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 8,
+        .height = 10,
     };
 
     var lines = tui.LineList.empty;
@@ -538,7 +538,9 @@ test "screen renders welcome prompt footer and tool lines" {
 
     try std.testing.expect(lines.items.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "Welcome to pi") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 3], "Input: w") != null);
+    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
+    try std.testing.expect(renderedLinesContain(lines.items, "> w"));
+    try std.testing.expect(renderedLinesContain(lines.items, "╰"));
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Session: session.jsonl") != null);
 }
 
@@ -575,7 +577,9 @@ test "interactive mode startup renders welcome message footer and hints through 
         backend.writes.items[backend.writes.items.len - 1],
     );
     try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));
-    try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
+    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
+    try std.testing.expect(renderedLinesContain(lines.items, "> "));
+    try std.testing.expect(renderedLinesContain(lines.items, "╰"));
     try std.testing.expect(renderedLinesContain(lines.items, "Session: session.jsonl"));
     try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
@@ -719,7 +723,8 @@ test "interactive mode renders pending clipboard image placeholders in the promp
     var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
     defer freeLinesSafe(allocator, &lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
+    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
+    try std.testing.expect(renderedLinesContain(lines.items, "> "));
     try std.testing.expect(renderedLinesContain(lines.items, "[image 1: image/png]"));
 }
 
@@ -917,16 +922,17 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     try screen.renderInto(allocator, 12, &lines);
 
     try std.testing.expect(lines.items.len >= 5);
-    var saw_input = false;
-    var saw_continuation = false;
+    var saw_prompt_border = false;
+    var saw_prompt_glyph = false;
+    var saw_overflow = false;
     for (lines.items) |line| {
-        if (std.mem.indexOf(u8, line, "Input: ") != null) saw_input = true;
-        if (std.mem.startsWith(u8, line, "       ") and std.mem.indexOf(u8, line, "def") != null) {
-            saw_continuation = true;
-        }
+        if (std.mem.indexOf(u8, line, "╭") != null) saw_prompt_border = true;
+        if (std.mem.indexOf(u8, line, "> ") != null) saw_prompt_glyph = true;
+        if (std.mem.indexOf(u8, line, "↓ more") != null) saw_overflow = true;
     }
-    try std.testing.expect(saw_input);
-    try std.testing.expect(saw_continuation);
+    try std.testing.expect(saw_prompt_border);
+    try std.testing.expect(saw_prompt_glyph);
+    try std.testing.expect(saw_overflow);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 2], "Session:") != null);
 }
 
@@ -1255,7 +1261,8 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
     defer freeLinesSafe(allocator, &lines);
 
     try std.testing.expect(!renderedLinesContain(lines.items, "keep me?"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Input: "));
+    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
+    try std.testing.expect(renderedLinesContain(lines.items, "> "));
     try std.testing.expect(renderedLinesContain(lines.items, "Status: display cleared"));
 
     try handleInputKey(
