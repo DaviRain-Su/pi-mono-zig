@@ -3,6 +3,7 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const common = @import("tools/common.zig");
+const json_event_wire = @import("json_event_wire.zig");
 const session_mod = @import("session.zig");
 
 pub const OutputMode = enum {
@@ -14,17 +15,6 @@ pub const RunPrintModeOptions = struct {
     mode: OutputMode = .text,
     signal: ?*std.atomic.Value(bool) = null,
     install_signal_handlers: bool = true,
-};
-
-const JsonEvent = struct {
-    event_type: []const u8,
-    role: ?[]const u8 = null,
-    text: ?[]const u8 = null,
-    tool_name: ?[]const u8 = null,
-    tool_call_id: ?[]const u8 = null,
-    is_error: ?bool = null,
-    args: ?std.json.Value = null,
-    details: ?std.json.Value = null,
 };
 
 const SignalGuard = struct {
@@ -206,39 +196,7 @@ fn handleJsonAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
 }
 
 fn writeJsonEventLine(allocator: std.mem.Allocator, stdout_writer: *std.Io.Writer, event: agent.AgentEvent) !void {
-    const message_snapshot = if (event.message) |message| try renderAgentMessageText(allocator, message) else null;
-    defer if (message_snapshot) |text| allocator.free(text);
-
-    const result_snapshot = if (event.result) |result| try blocksToText(allocator, result.content) else null;
-    defer if (result_snapshot) |text| allocator.free(text);
-
-    const partial_result_snapshot = if (event.partial_result) |result| try blocksToText(allocator, result.content) else null;
-    defer if (partial_result_snapshot) |text| allocator.free(text);
-
-    const payload = JsonEvent{
-        .event_type = @tagName(event.event_type),
-        .role = if (event.message) |message| switch (message) {
-            .user => "user",
-            .assistant => "assistant",
-            .tool_result => "toolResult",
-        } else null,
-        .text = message_snapshot orelse result_snapshot orelse partial_result_snapshot,
-        .tool_name = event.tool_name,
-        .tool_call_id = event.tool_call_id,
-        .is_error = event.is_error,
-        .args = event.args,
-        .details = if (event.message) |message| switch (message) {
-            .tool_result => |tool_result| tool_result.details,
-            else => null,
-        } else if (event.result) |tool_result|
-            tool_result.details
-        else if (event.partial_result) |tool_result|
-            tool_result.details
-        else
-            null,
-    };
-
-    const line = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    const line = try json_event_wire.stringifyAgentEventLine(allocator, event);
     defer allocator.free(line);
 
     try stdout_writer.print("{s}\n", .{line});
@@ -252,34 +210,6 @@ fn defaultStopReasonMessage(stop_reason: ai.StopReason) []const u8 {
         .tool_use => "Request ended with tool use",
         .error_reason => "Request failed",
         .aborted => "Request was aborted",
-    };
-}
-
-fn blocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    for (blocks, 0..) |block, index| {
-        if (index > 0) try out.appendSlice(allocator, "\n");
-        switch (block) {
-            .text => |text| try out.appendSlice(allocator, text.text),
-            .thinking => |thinking| try out.appendSlice(allocator, thinking.thinking),
-            .image => |image| {
-                const note = try std.fmt.allocPrint(allocator, "[image:{s}:{d}]", .{ image.mime_type, image.data.len });
-                defer allocator.free(note);
-                try out.appendSlice(allocator, note);
-            },
-        }
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn renderAgentMessageText(allocator: std.mem.Allocator, message: agent.AgentMessage) ![]u8 {
-    return switch (message) {
-        .user => |user| try blocksToText(allocator, user.content),
-        .assistant => |assistant| try blocksToText(allocator, assistant.content),
-        .tool_result => |tool_result| try blocksToText(allocator, tool_result.content),
     };
 }
 
@@ -412,6 +342,20 @@ fn testBashToolExecuteWithDetails(
     };
 }
 
+fn testInvalidToolExecuteForJsonSchema(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    const invalid_content = try allocator.alloc(ai.ContentBlock, 1);
+    invalid_content[0] = .{ .thinking = .{ .thinking = "tool results must not contain thinking blocks" } };
+    return .{ .content = invalid_content };
+}
+
 test "print mode text outputs assistant text to stdout" {
     const allocator = std.testing.allocator;
     const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
@@ -506,7 +450,9 @@ test "print mode json outputs valid JSON lines for all events" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
 
-        const event_type = parsed.value.object.get("event_type").?.string;
+        try json_event_wire.validateAgentEventJson(allocator, parsed.value);
+
+        const event_type = parsed.value.object.get("type").?.string;
         if (std.mem.eql(u8, event_type, "agent_start")) saw_agent_start = true;
         if (std.mem.eql(u8, event_type, "agent_end")) saw_agent_end = true;
     }
@@ -592,15 +538,20 @@ test "print mode json includes structured tool details" {
         if (line.len == 0) continue;
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
+        try json_event_wire.validateAgentEventJson(allocator, parsed.value);
 
         const root = parsed.value.object;
-        if (root.get("tool_name")) |tool_name| {
+        const event_type = root.get("type") orelse continue;
+        if (event_type != .string or !std.mem.eql(u8, event_type.string, "tool_execution_end")) continue;
+        if (root.get("toolName")) |tool_name| {
             const tool_name_string = switch (tool_name) {
                 .string => |string| string,
                 else => continue,
             };
             if (!std.mem.eql(u8, tool_name_string, "bash")) continue;
-            const details = root.get("details") orelse continue;
+            const result = root.get("result") orelse continue;
+            if (result != .object) continue;
+            const details = result.object.get("details") orelse continue;
             if (details != .object) continue;
             try std.testing.expectEqual(@as(i64, 7), details.object.get("exit_code").?.integer);
             try std.testing.expectEqual(true, details.object.get("timed_out").?.bool);
@@ -613,6 +564,72 @@ test "print mode json includes structured tool details" {
     }
 
     try std.testing.expect(saw_details);
+}
+
+test "print mode json fails when emitted event violates the wire schema" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try args.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "echo hello") });
+    const args_value = std.json.Value{ .object = args };
+    defer common.deinitJsonValue(allocator, args_value);
+
+    const first_blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    first_blocks[0] = try ai.providers.faux.fauxToolCall(allocator, "bash", args_value, .{ .id = "tool-1" });
+    defer {
+        switch (first_blocks[0]) {
+            .tool_call => |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                common.deinitJsonValue(allocator, tool_call.arguments);
+            },
+            else => {},
+        }
+        allocator.free(first_blocks);
+    }
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(first_blocks, .{ .stop_reason = .tool_use }) },
+    });
+
+    const invalid_tool = agent.AgentTool{
+        .name = "bash",
+        .description = "Emit invalid schema content",
+        .label = "bash",
+        .parameters = .null,
+        .execute = testInvalidToolExecuteForJsonSchema,
+    };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+        .tools = &[_]agent.AgentTool{invalid_tool},
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        "run bash",
+        .{
+            .mode = .json,
+            .install_signal_handlers = false,
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "Error: InvalidJsonSchema\n") != null);
 }
 
 test "print mode returns exit code one and writes stderr on provider error" {

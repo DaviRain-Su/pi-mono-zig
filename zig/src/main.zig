@@ -7,6 +7,7 @@ const input_prep = @import("cli/input_prep.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
+const json_event_wire = @import("coding_agent/json_event_wire.zig");
 
 const VERSION = "0.1.0";
 
@@ -788,14 +789,12 @@ test "cli executable print mode json writes valid JSON lines to stdout" {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
         defer parsed.deinit();
 
-        const event_type = parsed.value.object.get("event_type").?.string;
+        try json_event_wire.validateAgentEventJson(allocator, parsed.value);
+
+        const event_type = parsed.value.object.get("type").?.string;
         if (std.mem.eql(u8, event_type, "agent_start")) saw_agent_start = true;
         if (std.mem.eql(u8, event_type, "agent_end")) saw_agent_end = true;
-        if (parsed.value.object.get("text")) |text_value| {
-            if (text_value == .string and std.mem.eql(u8, text_value.string, "json from cli binary")) {
-                saw_response_text = true;
-            }
-        }
+        if (std.mem.indexOf(u8, line, "json from cli binary") != null) saw_response_text = true;
     }
 
     try std.testing.expect(line_count >= 3);
