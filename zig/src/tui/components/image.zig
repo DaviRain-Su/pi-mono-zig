@@ -1,6 +1,8 @@
 const std = @import("std");
+const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
+const draw_mod = @import("../draw.zig");
 
 pub const RenderMode = enum {
     placeholder,
@@ -10,6 +12,20 @@ pub const RenderMode = enum {
 pub const ImageDimensions = struct {
     width_px: usize,
     height_px: usize,
+};
+
+pub const KittyImage = struct {
+    id: u32,
+    width_px: u16,
+    height_px: u16,
+
+    pub fn fromVaxisImage(image: vaxis.Image) KittyImage {
+        return .{
+            .id = image.id,
+            .width_px = image.width,
+            .height_px = image.height,
+        };
+    }
 };
 
 const RenderSize = struct {
@@ -26,6 +42,7 @@ pub const Image = struct {
     max_height_cells: ?usize = null,
     mode: RenderMode = .placeholder,
     ascii_art: ?[]const u8 = null,
+    kitty_image: ?KittyImage = null,
     padding_x: usize = 0,
     padding_y: usize = 0,
 
@@ -33,6 +50,55 @@ pub const Image = struct {
         return .{
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    pub fn drawComponent(self: *const Image) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
+        };
+    }
+
+    pub fn draw(
+        self: *const Image,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        if (self.kitty_image) |kitty| {
+            const render_width = @min(resolveRenderWidth(self, @as(usize, window.width)), @as(usize, window.width));
+            const max_available_height = @as(usize, window.height) -| self.padding_y * 2;
+            const render_height = @min(resolveKittyRenderHeight(self, render_width), @max(max_available_height, 1));
+
+            if (render_width > 0 and render_height > 0 and self.padding_x < window.width and self.padding_y < window.height) {
+                const child = window.child(.{
+                    .x_off = @intCast(self.padding_x),
+                    .y_off = @intCast(self.padding_y),
+                    .width = @intCast(@min(render_width, @as(usize, window.width) - self.padding_x)),
+                    .height = @intCast(@min(render_height, @as(usize, window.height) - self.padding_y)),
+                });
+                const image = vaxis.Image{
+                    .id = kitty.id,
+                    .width = kitty.width_px,
+                    .height = kitty.height_px,
+                };
+                image.draw(child, .{
+                    .scale = if (window.screen.width_pix > 0 and window.screen.height_pix > 0) .fit else .fill,
+                }) catch {};
+            }
+
+            return .{
+                .width = @intCast(@min(@as(usize, window.width), render_width + self.padding_x * 2)),
+                .height = @intCast(@min(@as(usize, window.height), render_height + self.padding_y * 2)),
+            };
+        }
+
+        var lines = component_mod.LineList.empty;
+        try self.renderInto(ctx.arena, @as(usize, window.width), &lines);
+        drawLinesToWindow(window, lines.items);
+        return .{
+            .width = window.width,
+            .height = @intCast(@min(lines.items.len, @as(usize, window.height))),
         };
     }
 
@@ -87,6 +153,15 @@ pub const Image = struct {
     ) std.mem.Allocator.Error!void {
         const self: *const Image = @ptrCast(@alignCast(ptr));
         try self.renderInto(allocator, width, lines);
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const Image = @ptrCast(@alignCast(ptr));
+        return try self.draw(window, ctx);
     }
 
     fn renderAsciiInto(
@@ -208,6 +283,29 @@ pub const Image = struct {
     }
 };
 
+fn drawLinesToWindow(window: vaxis.Window, lines: []const []const u8) void {
+    for (lines, 0..) |line, row| {
+        if (row >= window.height) break;
+
+        var index: usize = 0;
+        var col: u16 = 0;
+        while (index < line.len and col < window.width) {
+            const cluster = ansi.nextDisplayCluster(line, index);
+            if (cluster.end <= index) break;
+            defer index = cluster.end;
+            if (cluster.width == 0) continue;
+            if (@as(usize, col) + cluster.width > window.width) break;
+            window.writeCell(col, @intCast(row), .{
+                .char = .{
+                    .grapheme = line[index..cluster.end],
+                    .width = @intCast(cluster.width),
+                },
+            });
+            col += @intCast(cluster.width);
+        }
+    }
+}
+
 fn resolveRenderWidth(self: *const Image, width: usize) usize {
     const constrained = self.max_width_cells orelse width;
     return @max(@as(usize, 1), @min(width, constrained));
@@ -251,6 +349,31 @@ fn resolvePlaceholderHeight(self: *const Image, render_width: usize) usize {
     }
 
     return @max(@as(usize, 3), @min(max_height, estimated_height));
+}
+
+fn resolveKittyRenderHeight(self: *const Image, render_width: usize) usize {
+    const max_height = self.max_height_cells orelse 8;
+    if (max_height == 0) return 1;
+
+    if (self.kitty_image) |kitty| {
+        if (kitty.width_px > 0 and kitty.height_px > 0) {
+            const numerator = @as(usize, kitty.height_px) * @max(render_width, 1);
+            const denominator = @as(usize, kitty.width_px) * 2;
+            const estimated = std.math.divCeil(usize, numerator, @max(denominator, 1)) catch 1;
+            return std.math.clamp(estimated, @as(usize, 1), @max(@as(usize, 1), max_height));
+        }
+    }
+
+    if (self.dimensions) |dimensions| {
+        if (dimensions.width_px > 0 and dimensions.height_px > 0) {
+            const numerator = dimensions.height_px * @max(render_width, 1);
+            const denominator = dimensions.width_px * 2;
+            const estimated = std.math.divCeil(usize, numerator, @max(denominator, 1)) catch 1;
+            return std.math.clamp(estimated, @as(usize, 1), @max(@as(usize, 1), max_height));
+        }
+    }
+
+    return @min(max_height, @max(@as(usize, 1), resolvePlaceholderHeight(self, render_width)));
 }
 
 fn estimateRenderHeight(self: *const Image, target_width: usize, source_width: usize, source_height: usize) usize {
@@ -443,6 +566,78 @@ test "image renders provided ASCII art within constraints" {
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     try std.testing.expectEqualStrings("ABD  ", lines.items[0]);
     try std.testing.expectEqualStrings("FGI  ", lines.items[1]);
+}
+
+test "image draw component renders fallback cells when kitty image is absent" {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 4,
+        .cols = 20,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+
+    const image = Image{
+        .mime_type = "image/png",
+        .mode = .ascii,
+        .ascii_art = "AB\nCD",
+        .max_width_cells = 2,
+        .max_height_cells = 2,
+    };
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    _ = try image.drawComponent().draw(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    });
+
+    const first = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("A", first.char.grapheme);
+    try std.testing.expect(first.image == null);
+}
+
+test "image draw component places kitty image cells when available" {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 6,
+        .cols = 20,
+        .x_pixel = 160,
+        .y_pixel = 96,
+    });
+    defer screen.deinit(std.testing.allocator);
+
+    const image = Image{
+        .mime_type = "image/png",
+        .kitty_image = .{
+            .id = 42,
+            .width_px = 64,
+            .height_px = 32,
+        },
+        .max_width_cells = 8,
+        .max_height_cells = 4,
+        .padding_x = 1,
+        .padding_y = 1,
+    };
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const size = try image.drawComponent().draw(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    });
+
+    try std.testing.expect(size.height >= 2);
+    const cell = screen.readCell(1, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cell.image != null);
+    try std.testing.expectEqual(@as(u32, 42), cell.image.?.img_id);
 }
 
 test "image preserves aspect ratio when scaling ascii art" {
