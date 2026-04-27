@@ -1060,6 +1060,51 @@ test "assistant message event JSON covers all nested variants" {
     }
 }
 
+test "route-a m1 stringifies streaming toolcall message updates" {
+    const allocator = std.testing.allocator;
+
+    var args_object = try initObject(allocator);
+    defer common.deinitJsonValue(allocator, .{ .object = args_object });
+    try putStringField(&args_object, allocator, "command", "echo hi");
+    const args_value: std.json.Value = .{ .object = args_object };
+
+    const assistant_message = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 10,
+    };
+    const tool_call = ai.ToolCall{
+        .id = "tool-1",
+        .name = "bash",
+        .arguments = args_value,
+    };
+
+    const assistant_events = [_]ai.AssistantMessageEvent{
+        .{ .event_type = .toolcall_start, .content_index = 0, .message = assistant_message },
+        .{ .event_type = .toolcall_delta, .content_index = 0, .delta = "{\"command\":\"echo hi\"}", .message = assistant_message },
+        .{ .event_type = .toolcall_end, .content_index = 0, .tool_call = tool_call, .message = assistant_message },
+    };
+
+    for (assistant_events) |assistant_event| {
+        const line = try stringifyAgentEventLine(allocator, .{
+            .event_type = .message_update,
+            .message = .{ .assistant = assistant_message },
+            .assistant_message_event = assistant_event,
+        });
+        defer allocator.free(line);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        try validateAgentEventJson(allocator, parsed.value);
+        try std.testing.expectEqualStrings("message_update", parsed.value.object.get("type").?.string);
+        try std.testing.expectEqualStrings(@tagName(assistant_event.event_type), parsed.value.object.get("assistantMessageEvent").?.object.get("type").?.string);
+    }
+}
+
 test "assistant event done reason must match nested message stopReason" {
     const allocator = std.testing.allocator;
     const json =

@@ -38,6 +38,13 @@ pub fn formatToolCall(allocator: std.mem.Allocator, name: []const u8, args: std.
     return try std.fmt.allocPrint(allocator, "Tool {s}: {s}", .{ name, json });
 }
 
+pub fn formatStreamingToolCall(allocator: std.mem.Allocator, name: ?[]const u8, args_fragment: []const u8) ![]u8 {
+    if (name) |tool_name| {
+        return try std.fmt.allocPrint(allocator, "Tool {s}: {s}", .{ tool_name, args_fragment });
+    }
+    return try std.fmt.allocPrint(allocator, "Tool call: {s}", .{args_fragment});
+}
+
 pub fn formatToolResult(
     allocator: std.mem.Allocator,
     name: []const u8,

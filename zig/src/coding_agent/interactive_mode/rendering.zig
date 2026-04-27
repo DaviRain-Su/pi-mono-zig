@@ -19,6 +19,7 @@ const ASSISTANT_THINKING_TEXT = "Thinking...";
 const formatPrefixedBlocks = formatting.formatPrefixedBlocks;
 const formatAssistantMessage = formatting.formatAssistantMessage;
 const formatToolCall = formatting.formatToolCall;
+const formatStreamingToolCall = formatting.formatStreamingToolCall;
 const WHEEL_LINES_PER_NOTCH: usize = 3;
 
 pub const ChatKind = enum {
@@ -118,6 +119,12 @@ pub const RenderStateSnapshot = struct {
 
 const ActiveToolUpdate = struct {
     tool_call_id: []u8,
+    item_index: usize,
+};
+
+const StreamingToolCall = struct {
+    content_index: ?u32,
+    tool_call_id: ?[]u8 = null,
     item_index: usize,
 };
 
@@ -252,6 +259,7 @@ pub const AppState = struct {
     pending_editor_images: std.ArrayList(PendingEditorImage) = .empty,
     retired_kitty_images: std.ArrayList(u32) = .empty,
     active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
+    streaming_tool_calls: std.ArrayList(StreamingToolCall) = .empty,
     tool_output_expanded: bool = false,
     clipboard_paste: ClipboardPasteTask,
     clock_context: ?*anyopaque = null,
@@ -280,6 +288,8 @@ pub const AppState = struct {
         self.retired_kitty_images.deinit(self.allocator);
         self.clearActiveToolUpdatesLocked();
         self.active_tool_updates.deinit(self.allocator);
+        self.clearStreamingToolCallsLocked();
+        self.streaming_tool_calls.deinit(self.allocator);
         self.clipboard_paste.deinit();
         self.clearQueuedMessagesLocked();
         self.queued_steering.deinit(self.allocator);
@@ -601,6 +611,7 @@ pub const AppState = struct {
         self.last_streaming_thinking_index = null;
         self.clearPendingEditorImagesLocked();
         self.clearActiveToolUpdatesLocked();
+        self.clearStreamingToolCallsLocked();
         self.clearQueuedMessagesLocked();
 
         try self.replaceLabelLocked(&self.status, "idle");
@@ -685,6 +696,7 @@ pub const AppState = struct {
             },
             .message_update => {
                 var handled_thinking_event = false;
+                var handled_toolcall_event = false;
                 if (event.assistant_message_event) |assistant_event| {
                     switch (assistant_event.event_type) {
                         .thinking_start => {
@@ -704,10 +716,36 @@ pub const AppState = struct {
                             self.last_streaming_thinking_index = null;
                         },
                         .text_start, .text_delta, .text_end => try self.replaceLabelLocked(&self.status, "streaming"),
+                        .toolcall_start => {
+                            handled_toolcall_event = true;
+                            try self.replaceLabelLocked(&self.status, "streaming");
+                            _ = try self.ensureStreamingToolCallItemLocked(
+                                assistant_event.content_index,
+                                assistant_event.tool_call,
+                            );
+                        },
+                        .toolcall_delta => {
+                            handled_toolcall_event = true;
+                            try self.replaceLabelLocked(&self.status, "streaming");
+                            try self.appendStreamingToolCallDeltaLocked(
+                                assistant_event.content_index,
+                                assistant_event.tool_call,
+                                assistant_event.delta orelse "",
+                            );
+                        },
+                        .toolcall_end => {
+                            handled_toolcall_event = true;
+                            try self.replaceLabelLocked(&self.status, "streaming");
+                            try self.finishStreamingToolCallLocked(
+                                assistant_event.content_index,
+                                assistant_event.tool_call,
+                            );
+                        },
                         else => {},
                     }
                 }
                 if (handled_thinking_event) return;
+                if (handled_toolcall_event) return;
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant_message| {
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
@@ -774,6 +812,14 @@ pub const AppState = struct {
             },
             .tool_execution_start => {
                 const tool_name = event.tool_name orelse "tool";
+                if (event.tool_call_id) |tool_call_id| {
+                    if (self.streamingToolCallItemIndexByIdLocked(tool_call_id) != null) {
+                        const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
+                        defer self.allocator.free(status_text);
+                        try self.replaceLabelLocked(&self.status, status_text);
+                        return;
+                    }
+                }
                 const args_value = event.args orelse .null;
                 const rendered = try formatToolCall(self.allocator, tool_name, args_value);
                 defer self.allocator.free(rendered);
@@ -870,6 +916,58 @@ pub const AppState = struct {
         try self.appendToItemTextLocked(index, delta);
     }
 
+    fn ensureStreamingToolCallItemLocked(
+        self: *AppState,
+        content_index: ?u32,
+        tool_call: ?ai.ToolCall,
+    ) !usize {
+        if (tool_call) |call| {
+            if (self.streamingToolCallItemIndexByIdLocked(call.id)) |index| return index;
+        }
+        if (content_index) |index_value| {
+            if (self.streamingToolCallItemIndexByContentIndexLocked(index_value)) |index| return index;
+        }
+
+        const initial_text = if (tool_call) |call|
+            try formatToolCall(self.allocator, call.name, call.arguments)
+        else
+            try formatStreamingToolCall(self.allocator, null, "");
+        defer self.allocator.free(initial_text);
+
+        try self.appendItemLocked(.tool_call, initial_text);
+        const item_index = self.items.items.len - 1;
+        try self.streaming_tool_calls.append(self.allocator, .{
+            .content_index = content_index,
+            .tool_call_id = if (tool_call) |call| try self.allocator.dupe(u8, call.id) else null,
+            .item_index = item_index,
+        });
+        return item_index;
+    }
+
+    fn appendStreamingToolCallDeltaLocked(
+        self: *AppState,
+        content_index: ?u32,
+        tool_call: ?ai.ToolCall,
+        delta: []const u8,
+    ) !void {
+        const index = try self.ensureStreamingToolCallItemLocked(content_index, tool_call);
+        if (delta.len == 0) return;
+        try self.appendToItemTextLocked(index, delta);
+    }
+
+    fn finishStreamingToolCallLocked(
+        self: *AppState,
+        content_index: ?u32,
+        tool_call: ?ai.ToolCall,
+    ) !void {
+        const call = tool_call orelse return;
+        const index = try self.ensureStreamingToolCallItemLocked(content_index, call);
+        const rendered = try formatToolCall(self.allocator, call.name, call.arguments);
+        defer self.allocator.free(rendered);
+        try self.replaceItemTextLocked(index, rendered);
+        try self.setStreamingToolCallIdLocked(content_index, call.id, index);
+    }
+
     pub fn ensureAssistantThinkingItemLocked(self: *AppState) !void {
         if (self.last_streaming_assistant_index) |index| {
             if (index < self.items.items.len and self.items.items[index].kind == .assistant and self.items.items[index].text.len == 0) {
@@ -954,6 +1052,17 @@ pub const AppState = struct {
         _ = self.items.orderedRemove(index);
         for (self.active_tool_updates.items) |*entry| {
             if (entry.item_index > index) entry.item_index -= 1;
+        }
+        var streaming_index: usize = 0;
+        while (streaming_index < self.streaming_tool_calls.items.len) {
+            const entry = &self.streaming_tool_calls.items[streaming_index];
+            if (entry.item_index == index) {
+                if (entry.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
+                _ = self.streaming_tool_calls.orderedRemove(streaming_index);
+                continue;
+            }
+            if (entry.item_index > index) entry.item_index -= 1;
+            streaming_index += 1;
         }
         adjustOptionalIndexAfterRemove(&self.last_streaming_assistant_index, index);
         adjustOptionalIndexAfterRemove(&self.last_streaming_thinking_index, index);
@@ -1056,6 +1165,64 @@ pub const AppState = struct {
     fn clearActiveToolUpdatesLocked(self: *AppState) void {
         for (self.active_tool_updates.items) |entry| self.allocator.free(entry.tool_call_id);
         self.active_tool_updates.clearRetainingCapacity();
+    }
+
+    fn clearStreamingToolCallsLocked(self: *AppState) void {
+        for (self.streaming_tool_calls.items) |entry| {
+            if (entry.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
+        }
+        self.streaming_tool_calls.clearRetainingCapacity();
+    }
+
+    fn streamingToolCallItemIndexByIdLocked(self: *AppState, tool_call_id: []const u8) ?usize {
+        for (self.streaming_tool_calls.items) |entry| {
+            const entry_id = entry.tool_call_id orelse continue;
+            if (std.mem.eql(u8, entry_id, tool_call_id)) return entry.item_index;
+        }
+        return null;
+    }
+
+    fn streamingToolCallItemIndexByContentIndexLocked(self: *AppState, content_index: u32) ?usize {
+        for (self.streaming_tool_calls.items) |entry| {
+            if (entry.content_index == content_index) return entry.item_index;
+        }
+        return null;
+    }
+
+    fn setStreamingToolCallIdLocked(
+        self: *AppState,
+        content_index: ?u32,
+        tool_call_id: []const u8,
+        item_index: usize,
+    ) !void {
+        for (self.streaming_tool_calls.items) |*entry| {
+            const content_matches = if (content_index) |value|
+                entry.content_index != null and entry.content_index.? == value
+            else
+                false;
+            const id_matches = if (entry.tool_call_id) |entry_id|
+                std.mem.eql(u8, entry_id, tool_call_id)
+            else
+                false;
+            if (!content_matches and !id_matches) continue;
+
+            if (entry.tool_call_id) |entry_id| {
+                if (!std.mem.eql(u8, entry_id, tool_call_id)) {
+                    self.allocator.free(entry_id);
+                    entry.tool_call_id = try self.allocator.dupe(u8, tool_call_id);
+                }
+            } else {
+                entry.tool_call_id = try self.allocator.dupe(u8, tool_call_id);
+            }
+            entry.item_index = item_index;
+            return;
+        }
+
+        try self.streaming_tool_calls.append(self.allocator, .{
+            .content_index = content_index,
+            .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
+            .item_index = item_index,
+        });
     }
 
     fn activeToolUpdateIndexLocked(self: *AppState, tool_call_id: []const u8) ?usize {
@@ -4609,6 +4776,59 @@ test "app state replaces streaming tool updates with the final tool result" {
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "line 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "Running...") == null);
     try std.testing.expectEqualStrings("thinking", state.status);
+}
+
+test "route-a m1 streams tool-call arguments and dedupes execution start" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var args_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    defer common.deinitJsonValue(allocator, .{ .object = args_object });
+    try args_object.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "echo hi") });
+    const tool_call = ai.ToolCall{
+        .id = "tool-1",
+        .name = "bash",
+        .arguments = .{ .object = args_object },
+    };
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .toolcall_start, .content_index = 0 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+    try std.testing.expectEqual(ChatKind.tool_call, state.items.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Tool call:") != null);
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .toolcall_delta, .content_index = 0, .delta = "{\"command\":" },
+    });
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "{\"command\":") != null);
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .toolcall_delta, .content_index = 0, .delta = "\"echo hi\"}" },
+    });
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "\"echo hi\"}") != null);
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .toolcall_end, .content_index = 0, .tool_call = tool_call },
+    });
+    try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Tool bash:") != null);
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_start,
+        .tool_call_id = "tool-1",
+        .tool_name = "bash",
+        .args = .{ .object = args_object },
+    });
+    try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+    try std.testing.expectEqual(ChatKind.tool_call, state.items.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.status, "working: bash") != null);
 }
 
 test "screen rendering releases app state lock before expensive rendering work" {

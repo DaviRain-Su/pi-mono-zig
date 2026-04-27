@@ -180,6 +180,12 @@ pub const AgentEvent = struct {
     is_error: ?bool = null,
 };
 
+/// Agent event sink invoked by the agent loop.
+///
+/// During parallel tool execution this callback may be invoked from worker
+/// threads for `tool_execution_update` events. Callers that write shared state
+/// or output streams must serialize their own access; the agent loop serializes
+/// concurrent worker-thread update emits before calling the supplied callback.
 pub const AgentEventCallback = *const fn (
     context: ?*anyopaque,
     event: AgentEvent,
