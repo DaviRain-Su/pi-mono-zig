@@ -246,6 +246,7 @@ pub fn runInteractiveMode(
     defer _ = bootstrap.session.agent.unsubscribe(subscriber);
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
+    try appendConfigErrorStartupWarning(allocator, live_resources.runtime_config, &app_state);
     try appendVerboseStartupState(
         allocator,
         env_map,
@@ -410,6 +411,37 @@ pub fn runInteractiveMode(
     }
 
     return 0;
+}
+
+fn appendConfigErrorStartupWarning(
+    allocator: std.mem.Allocator,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    app_state: *AppState,
+) !void {
+    const config = runtime_config orelse return;
+    try appendConfigErrorsStartupWarning(allocator, config.errors, app_state);
+}
+
+fn appendConfigErrorsStartupWarning(
+    allocator: std.mem.Allocator,
+    errors: []const config_mod.ConfigError,
+    app_state: *AppState,
+) !void {
+    if (errors.len == 0) return;
+    const first = errors[0];
+    const warning = try std.fmt.allocPrint(
+        allocator,
+        "Config error: {d} issue{s}; first source={s} path={s}: {s}",
+        .{
+            errors.len,
+            if (errors.len == 1) "" else "s",
+            config_mod.configErrorSourceName(first.source),
+            first.path,
+            first.message,
+        },
+    );
+    defer allocator.free(warning);
+    try app_state.appendInfo(warning);
 }
 
 fn appendVerboseStartupState(
@@ -647,6 +679,40 @@ test "appendVerboseStartupState adds startup banner and scoped model listing" {
 
     try std.testing.expect(saw_banner);
     try std.testing.expect(saw_scope);
+}
+
+test "appendConfigErrorsStartupWarning adds nonfatal startup row" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const path = try allocator.dupe(u8, "/tmp/settings.json");
+    defer allocator.free(path);
+    const message = try allocator.dupe(u8, "SyntaxError");
+    defer allocator.free(message);
+    const errors = [_]config_mod.ConfigError{
+        .{
+            .source = .settings,
+            .path = path,
+            .message = message,
+        },
+    };
+
+    try appendConfigErrorsStartupWarning(allocator, &errors, &state);
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    var saw_warning = false;
+    for (snapshot.items) |item| {
+        if (std.mem.indexOf(u8, item.text, "Config error: 1 issue") != null and
+            std.mem.indexOf(u8, item.text, "source=settings") != null)
+        {
+            saw_warning = true;
+        }
+    }
+    try std.testing.expect(saw_warning);
 }
 
 test "tool output details stay collapsed until verbose expansion is enabled" {

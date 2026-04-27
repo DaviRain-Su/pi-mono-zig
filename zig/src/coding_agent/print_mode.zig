@@ -3,6 +3,7 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const common = @import("tools/common.zig");
+const config_mod = @import("config.zig");
 const json_event_wire = @import("json_event_wire.zig");
 const session_mod = @import("session.zig");
 
@@ -15,6 +16,7 @@ pub const RunPrintModeOptions = struct {
     mode: OutputMode = .text,
     signal: ?*std.atomic.Value(bool) = null,
     install_signal_handlers: bool = true,
+    config_errors: []const config_mod.ConfigError = &.{},
 };
 
 const SignalGuard = struct {
@@ -70,6 +72,7 @@ fn handleSigint(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?
 const JsonWriterContext = struct {
     allocator: std.mem.Allocator,
     stdout_writer: *std.Io.Writer,
+    config_errors: []const config_mod.ConfigError,
 };
 
 const AbortWatcher = struct {
@@ -110,6 +113,7 @@ pub fn runPrintMode(
     var json_context = JsonWriterContext{
         .allocator = allocator,
         .stdout_writer = stdout_writer,
+        .config_errors = options.config_errors,
     };
     const json_subscriber = agent.AgentSubscriber{
         .context = &json_context,
@@ -192,11 +196,16 @@ fn exitCodeForMessage(message: ai.AssistantMessage) u8 {
 
 fn handleJsonAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
     const json_context: *JsonWriterContext = @ptrCast(@alignCast(context.?));
-    try writeJsonEventLine(json_context.allocator, json_context.stdout_writer, event);
+    try writeJsonEventLine(json_context.allocator, json_context.stdout_writer, event, json_context.config_errors);
 }
 
-fn writeJsonEventLine(allocator: std.mem.Allocator, stdout_writer: *std.Io.Writer, event: agent.AgentEvent) !void {
-    const line = try json_event_wire.stringifyAgentEventLine(allocator, event);
+fn writeJsonEventLine(
+    allocator: std.mem.Allocator,
+    stdout_writer: *std.Io.Writer,
+    event: agent.AgentEvent,
+    config_errors: []const config_mod.ConfigError,
+) !void {
+    const line = try json_event_wire.stringifyAgentEventLineWithConfigErrors(allocator, event, config_errors);
     defer allocator.free(line);
 
     try stdout_writer.print("{s}\n", .{line});
@@ -423,6 +432,17 @@ test "print mode json outputs valid JSON lines for all events" {
     defer stdout_capture.deinit();
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
+    const config_error_path = try allocator.dupe(u8, "/tmp/settings.json");
+    defer allocator.free(config_error_path);
+    const config_error_message = try allocator.dupe(u8, "SyntaxError");
+    defer allocator.free(config_error_message);
+    const config_error_items = [_]config_mod.ConfigError{
+        .{
+            .source = .settings,
+            .path = config_error_path,
+            .message = config_error_message,
+        },
+    };
 
     const exit_code = try runPrintMode(
         allocator,
@@ -432,6 +452,7 @@ test "print mode json outputs valid JSON lines for all events" {
         .{
             .mode = .json,
             .install_signal_handlers = false,
+            .config_errors = &config_error_items,
         },
         &stdout_capture.writer,
         &stderr_capture.writer,
@@ -443,6 +464,7 @@ test "print mode json outputs valid JSON lines for all events" {
     var lines = std.mem.splitScalar(u8, stdout_capture.writer.buffered(), '\n');
     var saw_agent_start = false;
     var saw_agent_end = false;
+    var saw_config_errors = false;
     var line_count: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -453,12 +475,20 @@ test "print mode json outputs valid JSON lines for all events" {
         try json_event_wire.validateAgentEventJson(allocator, parsed.value);
 
         const event_type = parsed.value.object.get("type").?.string;
-        if (std.mem.eql(u8, event_type, "agent_start")) saw_agent_start = true;
+        if (std.mem.eql(u8, event_type, "agent_start")) {
+            saw_agent_start = true;
+            const config_errors_value = parsed.value.object.get("config_errors").?;
+            try std.testing.expectEqual(@as(usize, 1), config_errors_value.array.items.len);
+            const config_error = config_errors_value.array.items[0].object;
+            try std.testing.expectEqualStrings("settings", config_error.get("source").?.string);
+            saw_config_errors = true;
+        }
         if (std.mem.eql(u8, event_type, "agent_end")) saw_agent_end = true;
     }
 
     try std.testing.expect(line_count >= 3);
     try std.testing.expect(saw_agent_start);
+    try std.testing.expect(saw_config_errors);
     try std.testing.expect(saw_agent_end);
 }
 

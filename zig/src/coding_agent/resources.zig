@@ -1,4 +1,5 @@
 const std = @import("std");
+const config_errors = @import("config_errors.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 
@@ -212,6 +213,7 @@ pub const ResourceBundle = struct {
     themes: []Theme,
     selected_theme_index: usize,
     diagnostics: []Diagnostic,
+    config_errors: []config_errors.ConfigError = &.{},
     terminal_name: []u8,
 
     pub fn deinit(self: *ResourceBundle, allocator: std.mem.Allocator) void {
@@ -225,6 +227,7 @@ pub const ResourceBundle = struct {
         allocator.free(self.themes);
         for (self.diagnostics) |*item| item.deinit(allocator);
         allocator.free(self.diagnostics);
+        config_errors.deinitSlice(allocator, self.config_errors);
         allocator.free(self.terminal_name);
         self.* = undefined;
     }
@@ -393,15 +396,17 @@ pub fn loadResourceBundle(
 
     var diagnostics = std.ArrayList(Diagnostic).empty;
     defer deinitDiagnosticsList(allocator, &diagnostics);
+    var collected_config_errors = std.ArrayList(config_errors.ConfigError).empty;
+    errdefer config_errors.deinitList(allocator, &collected_config_errors);
     for (resolved.diagnostics) |diagnostic| {
         try diagnostics.append(allocator, try cloneDiagnostic(allocator, diagnostic));
     }
 
-    const skills = try loadSkills(allocator, io, resolved.skills, &diagnostics);
+    const skills = try loadSkills(allocator, io, resolved.skills, &diagnostics, &collected_config_errors);
     errdefer deinitSkills(allocator, skills);
-    const templates = try loadPromptTemplates(allocator, io, resolved.prompts, &diagnostics);
+    const templates = try loadPromptTemplates(allocator, io, resolved.prompts, &diagnostics, &collected_config_errors);
     errdefer deinitPromptTemplates(allocator, templates);
-    const themes = try loadThemes(allocator, io, resolved.themes, &diagnostics);
+    const themes = try loadThemes(allocator, io, resolved.themes, &diagnostics, &collected_config_errors);
     errdefer deinitThemes(allocator, themes);
 
     var all_themes = std.ArrayList(Theme).empty;
@@ -429,6 +434,8 @@ pub fn loadResourceBundle(
     );
     const terminal_name = try detectTerminalName(allocator, options.env_map);
     errdefer allocator.free(terminal_name);
+    const owned_config_errors = try collected_config_errors.toOwnedSlice(allocator);
+    errdefer config_errors.deinitSlice(allocator, owned_config_errors);
 
     return .{
         .extensions = try extensions.toOwnedSlice(allocator),
@@ -437,6 +444,7 @@ pub fn loadResourceBundle(
         .themes = try all_themes.toOwnedSlice(allocator),
         .selected_theme_index = selected_index,
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
+        .config_errors = owned_config_errors,
         .terminal_name = terminal_name,
     };
 }
@@ -1154,6 +1162,7 @@ fn loadSkills(
     io: std.Io,
     resources: []const ResolvedResource,
     diagnostics: *std.ArrayList(Diagnostic),
+    errors: *std.ArrayList(config_errors.ConfigError),
 ) ![]Skill {
     var skills = std.ArrayList(Skill).empty;
     errdefer deinitSkillsList(allocator, &skills);
@@ -1162,7 +1171,7 @@ fn loadSkills(
 
     for (resources) |resource| {
         if (!resource.enabled) continue;
-        const skill = try loadSkillFromFile(allocator, io, resource, diagnostics) orelse continue;
+        const skill = try loadSkillFromFile(allocator, io, resource, diagnostics, errors) orelse continue;
         const gop = try seen.getOrPut(skill.name);
         if (gop.found_existing) {
             var duplicate = skill;
@@ -1181,6 +1190,7 @@ fn loadPromptTemplates(
     io: std.Io,
     resources: []const ResolvedResource,
     diagnostics: *std.ArrayList(Diagnostic),
+    errors: *std.ArrayList(config_errors.ConfigError),
 ) ![]PromptTemplate {
     var templates = std.ArrayList(PromptTemplate).empty;
     errdefer deinitPromptTemplatesList(allocator, &templates);
@@ -1189,7 +1199,7 @@ fn loadPromptTemplates(
 
     for (resources) |resource| {
         if (!resource.enabled) continue;
-        const template = try loadPromptTemplateFromFile(allocator, io, resource) orelse continue;
+        const template = try loadPromptTemplateFromFile(allocator, io, resource, errors) orelse continue;
         const gop = try seen.getOrPut(template.name);
         if (gop.found_existing) {
             var duplicate = template;
@@ -1208,6 +1218,7 @@ fn loadThemes(
     io: std.Io,
     resources: []const ResolvedResource,
     diagnostics: *std.ArrayList(Diagnostic),
+    errors: *std.ArrayList(config_errors.ConfigError),
 ) ![]Theme {
     var themes = std.ArrayList(Theme).empty;
     errdefer deinitThemesList(allocator, &themes);
@@ -1216,7 +1227,7 @@ fn loadThemes(
 
     for (resources) |resource| {
         if (!resource.enabled) continue;
-        const theme = try loadThemeFromFile(allocator, io, resource) orelse continue;
+        const theme = try loadThemeFromFile(allocator, io, resource, errors) orelse continue;
         const gop = try seen.getOrPut(theme.name);
         if (gop.found_existing) {
             var duplicate = theme;
@@ -1235,8 +1246,12 @@ fn loadSkillFromFile(
     io: std.Io,
     resource: ResolvedResource,
     diagnostics: *std.ArrayList(Diagnostic),
+    errors: *std.ArrayList(config_errors.ConfigError),
 ) !?Skill {
-    const bytes = readOptionalFile(allocator, io, resource.path) catch return null;
+    const bytes = readOptionalFile(allocator, io, resource.path) catch |err| {
+        try config_errors.appendError(allocator, errors, .skill, resource.path, err);
+        return null;
+    };
     defer if (bytes) |value| allocator.free(value);
     if (bytes == null) return null;
 
@@ -1261,8 +1276,16 @@ fn loadSkillFromFile(
     };
 }
 
-fn loadPromptTemplateFromFile(allocator: std.mem.Allocator, io: std.Io, resource: ResolvedResource) !?PromptTemplate {
-    const bytes = readOptionalFile(allocator, io, resource.path) catch return null;
+fn loadPromptTemplateFromFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    resource: ResolvedResource,
+    errors: *std.ArrayList(config_errors.ConfigError),
+) !?PromptTemplate {
+    const bytes = readOptionalFile(allocator, io, resource.path) catch |err| {
+        try config_errors.appendError(allocator, errors, .prompt, resource.path, err);
+        return null;
+    };
     defer if (bytes) |value| allocator.free(value);
     if (bytes == null) return null;
 
@@ -1285,12 +1308,23 @@ fn loadPromptTemplateFromFile(allocator: std.mem.Allocator, io: std.Io, resource
     };
 }
 
-fn loadThemeFromFile(allocator: std.mem.Allocator, io: std.Io, resource: ResolvedResource) !?Theme {
-    const bytes = readOptionalFile(allocator, io, resource.path) catch return null;
+fn loadThemeFromFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    resource: ResolvedResource,
+    errors: *std.ArrayList(config_errors.ConfigError),
+) !?Theme {
+    const bytes = readOptionalFile(allocator, io, resource.path) catch |err| {
+        try config_errors.appendError(allocator, errors, .theme, resource.path, err);
+        return null;
+    };
     defer if (bytes) |value| allocator.free(value);
     if (bytes == null) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes.?, .{}) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes.?, .{}) catch |err| {
+        try config_errors.appendError(allocator, errors, .theme, resource.path, err);
+        return null;
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
 
@@ -2025,6 +2059,32 @@ test "loadResourceBundle exposes built-in dark light and codex themes" {
     try std.testing.expect(findThemeIndex(bundle.themes, "codex") != null);
 }
 
+test "loadResourceBundle collects malformed theme config errors" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/themes");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.pi/themes/broken.json",
+        .data = "{ malformed",
+    });
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    var bundle = try loadResourceBundle(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .project = .{ .themes = &.{"themes"} },
+    });
+    defer bundle.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), bundle.config_errors.len);
+    try std.testing.expectEqual(config_errors.Source.theme, bundle.config_errors[0].source);
+}
 test "detectTerminalName maps documented terminal fallback chain" {
     const allocator = std.testing.allocator;
 
@@ -2207,7 +2267,9 @@ test "theme files can override palette colors and component tokens" {
     };
     defer resource.deinit(allocator);
 
-    var theme = (try loadThemeFromFile(allocator, std.testing.io, resource)).?;
+    var errors = std.ArrayList(config_errors.ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+    var theme = (try loadThemeFromFile(allocator, std.testing.io, resource, &errors)).?;
     defer theme.deinit(allocator);
 
     try std.testing.expectEqualStrings("dawn", theme.name);
