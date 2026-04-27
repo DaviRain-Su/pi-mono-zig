@@ -289,8 +289,9 @@ tuistory -s "$INTERACTIVE_SESSION" press enter
 tuistory -s "$INTERACTIVE_SESSION" wait "The file says: secret note" --timeout 8000
 tuistory -s "$INTERACTIVE_SESSION" wait-idle --timeout 3000
 interactive_snapshot="$(tuistory -s "$INTERACTIVE_SESSION" snapshot --trim)"
-printf '%s\n' "$interactive_snapshot" | grep -F "Tool read:" >/dev/null
-printf '%s\n' "$interactive_snapshot" | grep -F "Tool result read: secret note" >/dev/null
+printf '%s\n' "$interactive_snapshot" | grep -F "Read $INTERACTIVE_NOTE" >/dev/null
+printf '%s\n' "$interactive_snapshot" | grep -F "Read result read:" >/dev/null
+printf '%s\n' "$interactive_snapshot" | grep -F "secret note" >/dev/null
 printf '%s\n' "$interactive_snapshot" | grep -F "The file says: secret note" >/dev/null
 tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
 
