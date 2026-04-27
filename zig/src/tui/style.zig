@@ -11,6 +11,7 @@ pub fn styleFromSpec(spec: theme_mod.StyleSpec) vaxis.Cell.Style {
         .fg = parseColor(spec.fg),
         .bg = parseColor(spec.bg),
         .bold = spec.bold,
+        .dim = spec.dim,
         .italic = spec.italic,
         .ul_style = if (spec.underline) .single else .off,
     };

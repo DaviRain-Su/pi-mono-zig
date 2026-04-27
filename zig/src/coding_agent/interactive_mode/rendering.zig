@@ -28,6 +28,7 @@ pub const ChatKind = enum {
     markdown,
     user,
     assistant,
+    thinking,
     tool_call,
     tool_result,
 };
@@ -226,6 +227,7 @@ pub const AppState = struct {
     chat_scroll_max_offset: usize = 0,
     chat_region: ChatRegion = .{},
     last_streaming_assistant_index: ?usize = null,
+    last_streaming_thinking_index: ?usize = null,
     status: []u8 = &.{},
     provider_label: []u8 = &.{},
     provider_status: []u8 = &.{},
@@ -561,6 +563,7 @@ pub const AppState = struct {
         self.chat_scroll_max_offset = 0;
         self.chat_region = .{};
         self.last_streaming_assistant_index = null;
+        self.last_streaming_thinking_index = null;
         self.clearPendingEditorImagesLocked();
         self.clearActiveToolUpdatesLocked();
         self.clearQueuedMessagesLocked();
@@ -591,6 +594,7 @@ pub const AppState = struct {
                     try self.appendItemLocked(.user, rendered);
                 },
                 .assistant => |assistant_message| {
+                    try self.appendThinkingBlocksLocked(assistant_message.content);
                     const rendered = try formatAssistantMessage(self.allocator, assistant_message);
                     defer self.allocator.free(rendered);
                     if (rendered.len > 0) {
@@ -638,7 +642,6 @@ pub const AppState = struct {
             .message_start => {
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant_message| {
-                        try self.ensureAssistantThinkingItemLocked();
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         try self.replaceLabelLocked(&self.status, "thinking");
                     },
@@ -646,13 +649,29 @@ pub const AppState = struct {
                 };
             },
             .message_update => {
+                var handled_thinking_event = false;
                 if (event.assistant_message_event) |assistant_event| {
                     switch (assistant_event.event_type) {
-                        .thinking_start, .thinking_delta, .thinking_end => try self.replaceLabelLocked(&self.status, "thinking"),
+                        .thinking_start => {
+                            handled_thinking_event = true;
+                            try self.replaceLabelLocked(&self.status, "thinking");
+                            try self.ensureThinkingItemLocked();
+                        },
+                        .thinking_delta => {
+                            handled_thinking_event = true;
+                            try self.replaceLabelLocked(&self.status, "thinking");
+                            try self.appendThinkingDeltaLocked(assistant_event.delta orelse assistant_event.content orelse "");
+                        },
+                        .thinking_end => {
+                            handled_thinking_event = true;
+                            try self.replaceLabelLocked(&self.status, "thinking");
+                            self.last_streaming_thinking_index = null;
+                        },
                         .text_start, .text_delta, .text_end => try self.replaceLabelLocked(&self.status, "streaming"),
                         else => {},
                     }
                 }
+                if (handled_thinking_event) return;
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant_message| {
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
@@ -702,6 +721,7 @@ pub const AppState = struct {
                             try self.appendItemLocked(.assistant, rendered);
                         }
                         self.last_streaming_assistant_index = null;
+                        self.last_streaming_thinking_index = null;
 
                         switch (assistant_message.stop_reason) {
                             .aborted => try self.replaceLabelLocked(&self.status, "interrupted"),
@@ -777,6 +797,35 @@ pub const AppState = struct {
         }
     }
 
+    fn appendThinkingBlocksLocked(self: *AppState, blocks: []const ai.ContentBlock) !void {
+        for (blocks) |block| switch (block) {
+            .thinking => |thinking| if (thinking.thinking.len > 0) {
+                try self.appendItemLocked(.thinking, thinking.thinking);
+            },
+            else => {},
+        };
+    }
+
+    pub fn ensureThinkingItemLocked(self: *AppState) !void {
+        self.removeAssistantThinkingItemLocked();
+        if (self.last_streaming_thinking_index) |index| {
+            if (index < self.items.items.len and self.items.items[index].kind == .thinking) return;
+        }
+
+        try self.appendItemLocked(.thinking, "");
+        self.last_streaming_thinking_index = self.items.items.len - 1;
+    }
+
+    pub fn appendThinkingDeltaLocked(self: *AppState, delta: []const u8) !void {
+        if (delta.len == 0) {
+            try self.ensureThinkingItemLocked();
+            return;
+        }
+        try self.ensureThinkingItemLocked();
+        const index = self.last_streaming_thinking_index orelse return;
+        try self.appendToItemTextLocked(index, delta);
+    }
+
     pub fn ensureAssistantThinkingItemLocked(self: *AppState) !void {
         if (self.last_streaming_assistant_index) |index| {
             if (index < self.items.items.len and self.items.items[index].kind == .assistant and self.items.items[index].text.len == 0) {
@@ -790,13 +839,23 @@ pub const AppState = struct {
     }
 
     pub fn removeAssistantThinkingItemLocked(self: *AppState) void {
-        const index = self.last_streaming_assistant_index orelse return;
         self.last_streaming_assistant_index = null;
-        if (index >= self.items.items.len) return;
-        const item = self.items.items[index];
-        if (item.kind == .assistant and std.mem.eql(u8, item.text, ASSISTANT_THINKING_TEXT)) {
+        if (self.findAssistantThinkingItemLocked()) |index| {
             self.removeItemLocked(index);
         }
+    }
+
+    fn findAssistantThinkingItemLocked(self: *const AppState) ?usize {
+        if (self.last_streaming_assistant_index) |index| {
+            if (index < self.items.items.len) {
+                const item = self.items.items[index];
+                if (item.kind == .assistant and std.mem.eql(u8, item.text, ASSISTANT_THINKING_TEXT)) return index;
+            }
+        }
+        for (self.items.items, 0..) |item, index| {
+            if (item.kind == .assistant and std.mem.eql(u8, item.text, ASSISTANT_THINKING_TEXT)) return index;
+        }
+        return null;
     }
 
     pub fn appendItemLocked(self: *AppState, kind: ChatKind, text: []const u8) !void {
@@ -806,6 +865,16 @@ pub const AppState = struct {
             .text = try self.allocator.dupe(u8, text),
         });
         if (was_at_tail) self.chat_scroll_offset = 0;
+    }
+
+    pub fn appendToItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
+        if (index >= self.items.items.len or text.len == 0) return;
+        const old = self.items.items[index].text;
+        const combined = try self.allocator.alloc(u8, old.len + text.len);
+        @memcpy(combined[0..old.len], old);
+        @memcpy(combined[old.len..], text);
+        self.allocator.free(old);
+        self.items.items[index].text = combined;
     }
 
     pub fn replaceItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
@@ -821,6 +890,8 @@ pub const AppState = struct {
         for (self.active_tool_updates.items) |*entry| {
             if (entry.item_index > index) entry.item_index -= 1;
         }
+        adjustOptionalIndexAfterRemove(&self.last_streaming_assistant_index, index);
+        adjustOptionalIndexAfterRemove(&self.last_streaming_thinking_index, index);
         if (self.visible_start_index > self.items.items.len) {
             self.visible_start_index = self.items.items.len;
         }
@@ -965,6 +1036,15 @@ pub const AppState = struct {
         _ = removeQueuedTextFromList(self.allocator, &self.queued_follow_up, text);
     }
 };
+
+fn adjustOptionalIndexAfterRemove(index: *?usize, removed_index: usize) void {
+    const current = index.* orelse return;
+    if (current == removed_index) {
+        index.* = null;
+    } else if (current > removed_index) {
+        index.* = current - 1;
+    }
+}
 
 pub const QueueDisplayMode = enum {
     steering,
@@ -1733,7 +1813,7 @@ fn drawChatItem(
     });
     switch (item.kind) {
         .assistant => {
-            var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, styleForToken(theme, .assistant));
+            var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, styleForToken(theme, .role_assistant));
             if (std.mem.trim(u8, item.text, " \t\r\n").len == 0) return row;
             const markdown_window = child.child(.{
                 .y_off = @intCast(row),
@@ -1767,10 +1847,11 @@ fn chatToken(kind: ChatKind) resources_mod.ThemeToken {
         .info => .status,
         .@"error" => .@"error",
         .markdown => .markdown_text,
-        .user => .user,
-        .assistant => .assistant,
-        .tool_call => .tool_call,
-        .tool_result => .tool_result,
+        .user => .role_user,
+        .assistant => .role_assistant,
+        .thinking => .role_thinking,
+        .tool_call => .role_tool_call,
+        .tool_result => .role_tool_result,
     };
 }
 
@@ -2801,10 +2882,11 @@ pub fn themeChatItem(
         .info => .status,
         .@"error" => .@"error",
         .markdown => .markdown_text,
-        .user => .user,
-        .assistant => .assistant,
-        .tool_call => .tool_call,
-        .tool_result => .tool_result,
+        .user => .role_user,
+        .assistant => .role_assistant,
+        .thinking => .role_thinking,
+        .tool_call => .role_tool_call,
+        .tool_result => .role_tool_result,
     }, item.text);
 }
 
@@ -3714,6 +3796,136 @@ test "drawChatViewport honors scroll offset and overlays overflow indicators" {
     try std.testing.expect(std.mem.indexOf(u8, text, "row 24") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "↑ more") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "↓ more") != null);
+}
+
+test "roles m0 thinking deltas append to a thinking chat item" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_start,
+        .message = .{ .assistant = template },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .thinking_start },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .thinking_delta, .delta = "internal " },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .thinking_delta, .delta = "reasoning" },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .message_update,
+        .assistant_message_event = .{ .event_type = .thinking_end },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+    try std.testing.expectEqual(ChatKind.welcome, state.items.items[0].kind);
+    try std.testing.expectEqual(ChatKind.thinking, state.items.items[1].kind);
+    try std.testing.expectEqualStrings("internal reasoning", state.items.items[1].text);
+    try std.testing.expect(state.last_streaming_thinking_index == null);
+}
+
+test "roles m0 rebuildFromSession preserves thinking before assistant text" {
+    const allocator = std.testing.allocator;
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .model = ai.model_registry.find("faux", "faux-1").?,
+    });
+    defer session.deinit();
+
+    const blocks = [_]ai.ContentBlock{
+        .{ .thinking = .{ .thinking = "private chain" } },
+        .{ .text = .{ .text = "public answer" } },
+    };
+    const messages = [_]agent.AgentMessage{.{ .assistant = .{
+        .content = &blocks,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    } }};
+    try session.agent.setMessages(&messages);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try state.rebuildFromSession(&session, null);
+
+    try std.testing.expect(state.items.items.len >= 3);
+    try std.testing.expectEqual(ChatKind.welcome, state.items.items[0].kind);
+    try std.testing.expectEqual(ChatKind.thinking, state.items.items[1].kind);
+    try std.testing.expectEqualStrings("private chain", state.items.items[1].text);
+    try std.testing.expectEqual(ChatKind.assistant, state.items.items[2].kind);
+    try std.testing.expectEqualStrings("public answer", state.items.items[2].text);
+}
+
+test "roles m0 chatToken maps visible roles to role tokens" {
+    try std.testing.expectEqual(resources_mod.ThemeToken.role_user, chatToken(.user));
+    try std.testing.expectEqual(resources_mod.ThemeToken.role_assistant, chatToken(.assistant));
+    try std.testing.expectEqual(resources_mod.ThemeToken.role_thinking, chatToken(.thinking));
+    try std.testing.expectEqual(resources_mod.ThemeToken.role_tool_call, chatToken(.tool_call));
+    try std.testing.expectEqual(resources_mod.ThemeToken.role_tool_result, chatToken(.tool_result));
+}
+
+test "roles m0 drawChatItem applies role styles to representative cells" {
+    const allocator = std.testing.allocator;
+
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 8,
+        .cols = 80,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const items = [_]ChatItem{
+        .{ .kind = .user, .text = @constCast("You: hello") },
+        .{ .kind = .assistant, .text = @constCast("answer") },
+        .{ .kind = .thinking, .text = @constCast("private") },
+        .{ .kind = .tool_call, .text = @constCast("Tool: bash") },
+        .{ .kind = .tool_result, .text = @constCast("output") },
+    };
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    _ = try drawChatItems(window, arena.allocator(), &theme, &items);
+
+    const user = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    const assistant = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
+    const thinking = screen.readCell(0, 3) orelse return error.TestUnexpectedResult;
+    const tool_call = screen.readCell(0, 4) orelse return error.TestUnexpectedResult;
+    const tool_result = screen.readCell(0, 5) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(styleForToken(&theme, .role_user), user.style);
+    try std.testing.expectEqual(styleForToken(&theme, .role_assistant), assistant.style);
+    try std.testing.expectEqual(styleForToken(&theme, .role_thinking), thinking.style);
+    try std.testing.expectEqual(styleForToken(&theme, .role_tool_call), tool_call.style);
+    try std.testing.expectEqual(styleForToken(&theme, .role_tool_result), tool_result.style);
 }
 
 test "renderChatItemInto renders markdown chat items without assistant prefix" {
