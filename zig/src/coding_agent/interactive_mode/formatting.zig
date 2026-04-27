@@ -43,6 +43,18 @@ pub fn formatToolResult(
     name: []const u8,
     blocks: []const ai.ContentBlock,
     is_error: bool,
+    details: ?std.json.Value,
+) ![]u8 {
+    return formatToolResultWithExpansion(allocator, name, blocks, is_error, details, true);
+}
+
+pub fn formatToolResultWithExpansion(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    blocks: []const ai.ContentBlock,
+    is_error: bool,
+    details: ?std.json.Value,
+    expanded: bool,
 ) ![]u8 {
     const body = try blocksToText(allocator, blocks);
     defer allocator.free(body);
@@ -58,13 +70,31 @@ pub fn formatToolResult(
         "Edit result"
     else
         "Tool result";
-    return if (body.len == 0)
+    const base = try if (body.len == 0)
         std.fmt.allocPrint(allocator, "{s} {s}", .{ prefix, name })
     else if ((std.mem.eql(u8, prefix, "Tool result") or std.mem.eql(u8, prefix, "Tool error")) and
         std.mem.indexOfScalar(u8, body, '\n') == null)
         std.fmt.allocPrint(allocator, "{s} {s}: {s}", .{ prefix, name, body })
     else
         std.fmt.allocPrint(allocator, "{s} {s}:\n{s}", .{ prefix, name, body });
+    defer allocator.free(base);
+
+    return try appendToolDetails(allocator, name, base, details, expanded);
+}
+
+fn appendToolDetails(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    base: []const u8,
+    details: ?std.json.Value,
+    expanded: bool,
+) ![]u8 {
+    if (!expanded) return allocator.dupe(u8, base);
+    if (!std.mem.eql(u8, name, "bash")) return allocator.dupe(u8, base);
+    const details_value = details orelse return allocator.dupe(u8, base);
+    const rendered_details = try std.json.Stringify.valueAlloc(allocator, details_value, .{});
+    defer allocator.free(rendered_details);
+    return try std.fmt.allocPrint(allocator, "{s}\nDetails: {s}", .{ base, rendered_details });
 }
 
 fn formatReadToolCall(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
@@ -318,7 +348,7 @@ test "formatToolResult highlights gate denials" {
     const allocator = std.testing.allocator;
     const blocks = [_]ai.ContentBlock{.{ .text = .{ .text = "permission denied by gate" } }};
 
-    const rendered = try formatToolResult(allocator, "write", &blocks, true);
+    const rendered = try formatToolResult(allocator, "write", &blocks, true, null);
     defer allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Gate blocked write") != null);

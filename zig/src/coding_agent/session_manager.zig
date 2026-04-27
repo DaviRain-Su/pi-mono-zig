@@ -1557,6 +1557,7 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !
             .tool_call_id = try allocator.dupe(u8, tool_result.tool_call_id),
             .tool_name = try allocator.dupe(u8, tool_result.tool_name),
             .content = try cloneContentBlocks(allocator, tool_result.content),
+            .details = if (tool_result.details) |details| try common.cloneJsonValue(allocator, details) else null,
             .is_error = tool_result.is_error,
             .timestamp = tool_result.timestamp,
         } },
@@ -1584,6 +1585,7 @@ pub fn deinitMessage(allocator: std.mem.Allocator, message: *agent.AgentMessage)
             allocator.free(tool_result.tool_call_id);
             allocator.free(tool_result.tool_name);
             common.deinitContentBlocks(allocator, tool_result.content);
+            if (tool_result.details) |details| common.deinitJsonValue(allocator, details);
         },
     }
 }
@@ -2007,6 +2009,9 @@ fn messageToJsonValue(allocator: std.mem.Allocator, message: agent.AgentMessage)
             try object.put(allocator, try allocator.dupe(u8, "toolCallId"), .{ .string = try allocator.dupe(u8, tool_result.tool_call_id) });
             try object.put(allocator, try allocator.dupe(u8, "toolName"), .{ .string = try allocator.dupe(u8, tool_result.tool_name) });
             try object.put(allocator, try allocator.dupe(u8, "content"), try contentBlocksToJsonValue(allocator, tool_result.content, null));
+            if (tool_result.details) |details| {
+                try object.put(allocator, try allocator.dupe(u8, "details"), try common.cloneJsonValue(allocator, details));
+            }
             try object.put(allocator, try allocator.dupe(u8, "isError"), .{ .bool = tool_result.is_error });
             try object.put(allocator, try allocator.dupe(u8, "timestamp"), .{ .integer = tool_result.timestamp });
             break :blk .{ .object = object };
@@ -2369,6 +2374,7 @@ fn parseMessageValue(allocator: std.mem.Allocator, value: std.json.Value) !agent
             .tool_call_id = try allocator.dupe(u8, try getRequiredString(object, "toolCallId")),
             .tool_name = try allocator.dupe(u8, try getRequiredString(object, "toolName")),
             .content = try parseGenericContentValue(allocator, object.get("content") orelse return error.InvalidSessionMessage),
+            .details = if (object.get("details")) |details| try common.cloneJsonValue(allocator, details) else null,
             .is_error = getOptionalBool(object, "isError") orelse false,
             .timestamp = try getRequiredI64(object, "timestamp"),
         } };

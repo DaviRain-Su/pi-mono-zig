@@ -115,7 +115,12 @@ pub const BashTool = struct {
         try properties.put(allocator, try allocator.dupe(u8, "timeout_seconds"), try schemaProperty(
             allocator,
             "integer",
-            "Timeout in seconds before the process group is terminated",
+            "Timeout in seconds before the process group is terminated. Accepts either timeout_seconds or timeout.",
+        ));
+        try properties.put(allocator, try allocator.dupe(u8, "timeout"), try schemaProperty(
+            allocator,
+            "integer",
+            "Alias for timeout_seconds. Timeout in seconds before the process group is terminated.",
         ));
 
         var required = std.json.Array.init(allocator);
@@ -356,7 +361,7 @@ pub fn parseArguments(args: std.json.Value) !BashArgs {
     if (args != .object) return error.InvalidToolArguments;
 
     const command = try parseRequiredString(args.object, "command");
-    const timeout_seconds = try getOptionalPositiveInt(args.object, "timeout_seconds");
+    const timeout_seconds = try getOptionalPositiveIntEither(args.object, "timeout_seconds", "timeout");
 
     return .{
         .command = command,
@@ -585,6 +590,10 @@ fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?u64 {
     if (value != .integer) return error.InvalidToolArguments;
     if (value.integer <= 0) return error.InvalidToolArguments;
     return @intCast(value.integer);
+}
+
+fn getOptionalPositiveIntEither(object: std.json.ObjectMap, first: []const u8, second: []const u8) !?u64 {
+    return (try getOptionalPositiveInt(object, first)) orelse try getOptionalPositiveInt(object, second);
 }
 
 fn schemaProperty(
@@ -889,6 +898,33 @@ test "bash tool validates positive timeout_seconds" {
     try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "timeout_seconds"), .{ .integer = 0 });
 
     try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
+}
+
+test "bash tool accepts timeout alias during argument parsing" {
+    var object = try jsonObject(std.testing.allocator);
+    defer {
+        const value = std.json.Value{ .object = object };
+        common.deinitJsonValue(std.testing.allocator, value);
+    }
+
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "command"), .{
+        .string = try std.testing.allocator.dupe(u8, "echo hello"),
+    });
+    try object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "timeout"), .{ .integer = 5 });
+
+    const parsed = try parseArguments(.{ .object = object });
+    try std.testing.expectEqualStrings("echo hello", parsed.command);
+    try std.testing.expectEqual(@as(u64, 5), parsed.timeout_seconds.?);
+}
+
+test "bash tool schema advertises timeout and timeout_seconds" {
+    const value = try BashTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try std.testing.expect(properties.get("timeout_seconds") != null);
+    try std.testing.expect(properties.get("timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, properties.get("timeout_seconds").?.object.get("description").?.string, "timeout") != null);
 }
 
 test "secure temp file remains available after creation" {

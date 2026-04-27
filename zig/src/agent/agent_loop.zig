@@ -922,6 +922,7 @@ fn emitToolCallOutcome(
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .content = result.content,
+        .details = result.details,
         .is_error = is_error,
         .timestamp = 0,
     };
@@ -965,7 +966,7 @@ fn cloneToolResult(
 ) !types.AgentToolResult {
     return .{
         .content = try cloneContentBlocks(allocator, result.content),
-        .details = result.details,
+        .details = if (result.details) |details| try cloneJsonValue(allocator, details) else null,
     };
 }
 

@@ -611,6 +611,7 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
             .tool_call_id = try allocator.dupe(u8, tool_result.tool_call_id),
             .tool_name = try allocator.dupe(u8, tool_result.tool_name),
             .content = try cloneContentBlocks(allocator, tool_result.content),
+            .details = if (tool_result.details) |details| try cloneJsonValue(allocator, details) else null,
             .is_error = tool_result.is_error,
             .timestamp = tool_result.timestamp,
         } },
@@ -638,6 +639,7 @@ pub fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage)
             allocator.free(tool_result.tool_call_id);
             allocator.free(tool_result.tool_name);
             deinitContentBlocks(allocator, tool_result.content);
+            if (tool_result.details) |details| deinitJsonValue(allocator, details);
         },
     }
 }
