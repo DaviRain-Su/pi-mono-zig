@@ -62,4 +62,15 @@ test "styleFor maps representative theme tokens to vaxis styles" {
     const empty = styleFor(&theme, .select_empty);
     try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 127, 132, 156 } }, empty.fg);
     try std.testing.expect(empty.italic);
+
+    const prompt_glyph = styleFor(&theme, .prompt_glyph);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 122, 162, 247 } }, prompt_glyph.fg);
+    try std.testing.expect(prompt_glyph.bold);
+
+    const prompt_border = styleFor(&theme, .prompt_border);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 65, 72, 104 } }, prompt_border.fg);
+
+    const terminal_badge = styleFor(&theme, .terminal_badge);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 127, 132, 156 } }, terminal_badge.fg);
+    try std.testing.expect(!terminal_badge.bold);
 }

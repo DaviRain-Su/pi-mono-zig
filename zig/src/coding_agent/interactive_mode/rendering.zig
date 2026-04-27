@@ -1159,7 +1159,7 @@ fn drawFooterWithTerminal(
 ) !void {
     if (row >= window.height) return;
     const footer_style = styleForToken(theme, .footer);
-    const badge_style = styleForToken(theme, .status);
+    const badge_style = styleForToken(theme, .terminal_badge);
     const line_window = window.child(.{
         .y_off = @intCast(row),
         .height = 1,
@@ -1199,8 +1199,8 @@ fn drawTaskPanel(
     snapshot: *const RenderStateSnapshot,
 ) !tui.DrawSize {
     const panel_height = @min(TOP_PANEL_HEIGHT, @as(usize, window.height));
-    const border_style = styleForToken(theme, .box_border);
-    const content_style = styleForToken(theme, .footer);
+    const border_style = styleForToken(theme, .task_header_separator);
+    const content_style = styleForToken(theme, .task_header);
     const panel_inner = if (window.width >= 2 and window.height >= 2)
         window.child(.{
             .height = @intCast(panel_height),
@@ -1315,7 +1315,8 @@ fn drawPromptLines(
     pending_images: []const PendingEditorImage,
 ) !tui.DrawSize {
     const prompt_style = styleForToken(theme, .prompt);
-    const border_style = styleForToken(theme, .box_border);
+    const glyph_style = styleForToken(theme, .prompt_glyph);
+    const border_style = styleForToken(theme, .prompt_border);
     const editor_width = promptEditorWidth(@as(usize, window.width));
     const prompt_height = @min(PROMPT_BOX_HEIGHT, @as(usize, window.height));
     const prompt_inner = if (window.width >= 2 and window.height >= 2)
@@ -1338,7 +1339,7 @@ fn drawPromptLines(
         for (0..prompt_inner.height) |line_index| {
             _ = prompt_inner.printSegment(.{
                 .text = INPUT_PROMPT_PREFIX,
-                .style = prompt_style,
+                .style = glyph_style,
             }, .{
                 .wrap = .none,
                 .row_offset = @intCast(line_index),
@@ -1365,7 +1366,7 @@ fn drawPromptLines(
         const indicator_col = @max(@as(usize, 1), @as(usize, window.width) -| (indicator_width + 2));
         _ = window.printSegment(.{
             .text = indicator,
-            .style = prompt_style,
+            .style = glyph_style,
         }, .{
             .wrap = .none,
             .row_offset = @intCast(PROMPT_BOX_HEIGHT - 1),
