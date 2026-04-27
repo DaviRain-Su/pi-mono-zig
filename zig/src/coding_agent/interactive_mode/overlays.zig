@@ -483,10 +483,11 @@ pub fn loadModelOverlay(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
+    current_provider: ?*const provider_config.ResolvedProviderConfig,
     model_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
 ) !SelectorOverlay {
-    const available = try loadSelectableModels(allocator, env_map, current_model, model_patterns, runtime_config);
+    const available = try loadSelectableModels(allocator, env_map, current_model, current_provider, model_patterns, runtime_config);
     defer allocator.free(available);
 
     const choices = try allocator.alloc(ModelChoice, available.len);
@@ -510,14 +511,19 @@ pub fn loadModelOverlay(
 
     var selected_index: usize = 0;
     for (available, 0..) |entry, index| {
+        const provider_changed = index == 0 or !std.mem.eql(u8, available[index - 1].provider, entry.provider);
+        const label = try formatModelOverlayLabel(allocator, entry, provider_changed);
+        errdefer allocator.free(label);
+        const description = try formatModelOverlayDescription(allocator, entry);
+        errdefer allocator.free(description);
         choices[index] = .{
             .provider = try allocator.dupe(u8, entry.provider),
             .model_id = try allocator.dupe(u8, entry.model_id),
         };
         items[index] = .{
             .value = try allocator.dupe(u8, entry.model_id),
-            .label = try allocator.dupe(u8, entry.display_name),
-            .description = try allocator.dupe(u8, entry.provider),
+            .label = label,
+            .description = description,
         };
         if (std.mem.eql(u8, entry.provider, current_model.provider) and std.mem.eql(u8, entry.model_id, current_model.id)) {
             selected_index = index;
@@ -542,13 +548,14 @@ pub fn loadScopedModelOverlay(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
+    current_provider: ?*const provider_config.ResolvedProviderConfig,
     model_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
 ) !SelectorOverlay {
     const patterns = model_patterns orelse return error.NoScopedModelPatterns;
     if (patterns.len == 0) return error.NoScopedModelPatterns;
 
-    const available = try loadSelectableModels(allocator, env_map, current_model, patterns, runtime_config);
+    const available = try loadSelectableModels(allocator, env_map, current_model, current_provider, patterns, runtime_config);
     defer allocator.free(available);
 
     if (available.len == 0) return error.NoScopedModelsAvailable;
@@ -574,14 +581,19 @@ pub fn loadScopedModelOverlay(
 
     var selected_index: usize = 0;
     for (available, 0..) |entry, index| {
+        const provider_changed = index == 0 or !std.mem.eql(u8, available[index - 1].provider, entry.provider);
+        const label = try formatModelOverlayLabel(allocator, entry, provider_changed);
+        errdefer allocator.free(label);
+        const description = try formatModelOverlayDescription(allocator, entry);
+        errdefer allocator.free(description);
         choices[index] = .{
             .provider = try allocator.dupe(u8, entry.provider),
             .model_id = try allocator.dupe(u8, entry.model_id),
         };
         items[index] = .{
             .value = try allocator.dupe(u8, entry.model_id),
-            .label = try allocator.dupe(u8, entry.display_name),
-            .description = try allocator.dupe(u8, entry.provider),
+            .label = label,
+            .description = description,
         };
         if (std.mem.eql(u8, entry.provider, current_model.provider) and std.mem.eql(u8, entry.model_id, current_model.id)) {
             selected_index = index;
@@ -606,19 +618,55 @@ pub fn loadSelectableModels(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
+    current_provider: ?*const provider_config.ResolvedProviderConfig,
     model_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
 ) ![]provider_config.AvailableModel {
     const available = try provider_config.listAvailableModels(allocator, env_map, current_model, configuredCredentials(runtime_config));
-    defer allocator.free(available);
+    errdefer allocator.free(available);
+
+    if (current_provider) |resolved_provider| {
+        for (available) |*entry| {
+            if (!std.mem.eql(u8, entry.provider, resolved_provider.model.provider)) continue;
+            entry.auth_status = resolved_provider.auth_status;
+            entry.available = resolved_provider.auth_status != .missing;
+        }
+    }
 
     const configured = try provider_config.filterConfiguredModels(allocator, available);
+    allocator.free(available);
     errdefer allocator.free(configured);
 
     const patterns = model_patterns orelse return configured;
     const filtered = try provider_config.filterAvailableModels(allocator, configured, patterns);
     allocator.free(configured);
     return filtered;
+}
+
+fn formatModelOverlayLabel(
+    allocator: std.mem.Allocator,
+    entry: provider_config.AvailableModel,
+    provider_changed: bool,
+) ![]u8 {
+    if (provider_changed) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s} / {s}",
+            .{ provider_config.providerDisplayName(entry.provider), entry.display_name },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "  {s}", .{entry.display_name});
+}
+
+fn formatModelOverlayDescription(
+    allocator: std.mem.Allocator,
+    entry: provider_config.AvailableModel,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} • {s}",
+        .{ entry.model_id, provider_config.providerAuthStatusLabel(entry.auth_status) },
+    );
 }
 
 pub fn modelSupportsInput(input_types: []const []const u8, expected: []const u8) bool {
@@ -881,4 +929,73 @@ pub fn loadSessionDisplayName(
 
     if (manager.getSessionName()) |name| return allocator.dupe(u8, name);
     return allocator.dupe(u8, fallback_name);
+}
+
+test "loadModelOverlay groups configured providers and omits missing-auth providers" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "openai-key");
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
+
+    const current_model = ai.model_registry.find("openai", "gpt-5.4").?;
+    var overlay = try loadModelOverlay(allocator, &env_map, current_model, null, null, null);
+    defer overlay.deinit(allocator);
+
+    try std.testing.expectEqual(@as(std.meta.Tag(SelectorOverlay), .model), std.meta.activeTag(overlay));
+
+    var saw_anthropic = false;
+    var saw_grouped_openai = false;
+    var saw_grouped_anthropic = false;
+    var saw_google = false;
+    for (overlay.model.items) |item| {
+        if (std.mem.startsWith(u8, item.label, "Anthropic / ")) {
+            saw_grouped_anthropic = true;
+        }
+        if (std.mem.startsWith(u8, item.label, "Google Gemini / ")) {
+            saw_google = true;
+        }
+        if (std.mem.startsWith(u8, item.label, "OpenAI / ")) {
+            saw_grouped_openai = true;
+        }
+        if (std.mem.eql(u8, item.value, "claude-sonnet-4-5")) {
+            saw_anthropic = true;
+        }
+    }
+
+    try std.testing.expect(saw_anthropic);
+    try std.testing.expect(saw_grouped_openai);
+    try std.testing.expect(saw_grouped_anthropic);
+    try std.testing.expect(!saw_google);
+}
+
+test "loadModelOverlay marks current provider models available for runtime api key overrides" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(
+        allocator,
+        &env_map,
+        "openai",
+        "gpt-5.4",
+        "runtime-openai-key",
+        null,
+    );
+    defer current_provider.deinit(allocator);
+
+    var overlay = try loadModelOverlay(allocator, &env_map, current_provider.model, &current_provider, null, null);
+    defer overlay.deinit(allocator);
+
+    var saw_runtime_status = false;
+    var saw_second_openai_model = false;
+    for (overlay.model.items) |item| {
+        if (std.mem.eql(u8, item.value, "gpt-5.5")) saw_second_openai_model = true;
+        if (std.mem.indexOf(u8, item.description.?, "--api-key") != null) saw_runtime_status = true;
+    }
+
+    try std.testing.expect(saw_second_openai_model);
+    try std.testing.expect(saw_runtime_status);
 }

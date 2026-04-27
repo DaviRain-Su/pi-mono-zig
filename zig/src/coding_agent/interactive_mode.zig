@@ -241,6 +241,7 @@ pub fn runInteractiveMode(
 
     var app_state = try AppState.init(allocator, io);
     defer app_state.deinit();
+    app_state.setToolOutputExpanded(options.verbose);
 
     const subscriber = agent.AgentSubscriber{
         .context = &app_state,
@@ -249,7 +250,17 @@ pub fn runInteractiveMode(
     try bootstrap.session.agent.subscribe(subscriber);
     defer _ = bootstrap.session.agent.unsubscribe(subscriber);
 
-    try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session);
+    try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
+    try appendVerboseStartupState(
+        allocator,
+        env_map,
+        options,
+        live_resources.keybindings,
+        live_resources.runtime_config,
+        &bootstrap.session,
+        &bootstrap.current_provider,
+        &app_state,
+    );
 
     var terminal = tui.Terminal.initNative(.{
         .io = io,
@@ -314,6 +325,8 @@ pub fn runInteractiveMode(
             prompt_worker_active = false;
             if (should_exit) break;
         }
+
+        try app_state.pollClipboardPaste();
 
         const size = try terminal.refreshSize();
         screen.height = size.height;
@@ -389,6 +402,95 @@ pub fn runInteractiveMode(
     }
 
     return 0;
+}
+
+fn appendVerboseStartupState(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    options: RunInteractiveModeOptions,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    session: *const session_mod.AgentSession,
+    current_provider: *const provider_config.ResolvedProviderConfig,
+    app_state: *AppState,
+) !void {
+    if (!options.verbose) return;
+
+    const banner = try buildVerboseStartupBanner(allocator, keybindings);
+    defer allocator.free(banner);
+    try app_state.appendInfo(banner);
+
+    const scoped_listing = try buildVerboseScopedModelsListing(
+        allocator,
+        env_map,
+        session.agent.getModel(),
+        current_provider,
+        options.model_patterns,
+        runtime_config,
+    );
+    defer if (scoped_listing) |text| allocator.free(text);
+    if (scoped_listing) |text| {
+        try app_state.appendInfo(text);
+    }
+}
+
+fn buildVerboseStartupBanner(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) ![]u8 {
+    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Ctrl+C");
+    defer allocator.free(interrupt);
+    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+L");
+    defer allocator.free(clear);
+    const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
+    defer allocator.free(exit);
+    const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
+    defer allocator.free(open_models);
+    const open_sessions = try actionLabel(allocator, keybindings, .open_sessions, "Ctrl+S");
+    defer allocator.free(open_sessions);
+    const paste_image = try actionLabel(allocator, keybindings, .paste_image, "Ctrl+V");
+    defer allocator.free(paste_image);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Pi interactive mode (verbose startup)\n{s} interrupt • {s} clear • {s} exit • {s} models • {s} sessions • {s} paste image • / commands • ! bash",
+        .{ interrupt, clear, exit, open_models, open_sessions, paste_image },
+    );
+}
+
+fn buildVerboseScopedModelsListing(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    current_model: ai.Model,
+    current_provider: *const provider_config.ResolvedProviderConfig,
+    model_patterns: ?[]const []const u8,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) !?[]u8 {
+    _ = model_patterns orelse return null;
+
+    const scoped_models = try loadSelectableModels(
+        allocator,
+        env_map,
+        current_model,
+        current_provider,
+        model_patterns,
+        runtime_config,
+    );
+    defer allocator.free(scoped_models);
+    if (scoped_models.len == 0) return null;
+
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+
+    try builder.appendSlice(allocator, "Scoped models (Ctrl+P / /scoped-models): ");
+    for (scoped_models, 0..) |entry, index| {
+        if (index != 0) try builder.appendSlice(allocator, ", ");
+        const label = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.provider, entry.model_id });
+        defer allocator.free(label);
+        try builder.appendSlice(allocator, label);
+    }
+
+    return try builder.toOwnedSlice(allocator);
 }
 
 test "screen renders welcome prompt footer and tool lines" {
@@ -473,6 +575,117 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
     try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+V paste image"));
+}
+
+test "appendVerboseStartupState adds startup banner and scoped model listing" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+
+    try appendVerboseStartupState(
+        allocator,
+        &env_map,
+        .{
+            .cwd = "/tmp",
+            .system_prompt = "sys",
+            .session_dir = "/tmp/sessions",
+            .provider = "faux",
+            .verbose = true,
+            .model_patterns = &.{"anthropic/sonnet:high"},
+        },
+        &keybindings,
+        null,
+        &session,
+        &current_provider,
+        &state,
+    );
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    var saw_banner = false;
+    var saw_scope = false;
+    for (snapshot.items) |item| {
+        if (std.mem.indexOf(u8, item.text, "Pi interactive mode (verbose startup)") != null) saw_banner = true;
+        if (std.mem.indexOf(u8, item.text, "Scoped models (Ctrl+P / /scoped-models):") != null and
+            std.mem.indexOf(u8, item.text, "anthropic/") != null) saw_scope = true;
+    }
+
+    try std.testing.expect(saw_banner);
+    try std.testing.expect(saw_scope);
+}
+
+test "tool output details stay collapsed until verbose expansion is enabled" {
+    const allocator = std.testing.allocator;
+
+    const detail_value = try std.json.parseFromSlice(std.json.Value, allocator, "{\"exit_code\":0,\"timed_out\":false}", .{});
+    defer detail_value.deinit();
+
+    var collapsed_state = try AppState.init(allocator, std.testing.io);
+    defer collapsed_state.deinit();
+    try collapsed_state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_name = "bash",
+        .result = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello from bash" } }},
+            .details = detail_value.value,
+        },
+        .is_error = false,
+    });
+
+    var collapsed_snapshot = try collapsed_state.snapshotForRender(allocator);
+    defer collapsed_snapshot.deinit(allocator);
+
+    var saw_collapsed_body = false;
+    var saw_collapsed_details = false;
+    for (collapsed_snapshot.items) |item| {
+        if (std.mem.indexOf(u8, item.text, "hello from bash") != null) saw_collapsed_body = true;
+        if (std.mem.indexOf(u8, item.text, "Details:") != null) saw_collapsed_details = true;
+    }
+    try std.testing.expect(saw_collapsed_body);
+    try std.testing.expect(!saw_collapsed_details);
+
+    var expanded_state = try AppState.init(allocator, std.testing.io);
+    defer expanded_state.deinit();
+    expanded_state.setToolOutputExpanded(true);
+    try expanded_state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_name = "bash",
+        .result = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello from bash" } }},
+            .details = detail_value.value,
+        },
+        .is_error = false,
+    });
+
+    var expanded_snapshot = try expanded_state.snapshotForRender(allocator);
+    defer expanded_snapshot.deinit(allocator);
+
+    var saw_expanded_details = false;
+    for (expanded_snapshot.items) |item| {
+        if (std.mem.indexOf(u8, item.text, "Details:") != null and
+            std.mem.indexOf(u8, item.text, "\"exit_code\":0") != null) saw_expanded_details = true;
+    }
+    try std.testing.expect(saw_expanded_details);
 }
 
 test "interactive mode renders pending clipboard image placeholders in the prompt area" {
@@ -1091,6 +1304,7 @@ test "screen renders queued messages and the dequeue hint" {
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued steer"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "Alt+Up to edit queued messages"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
 }
 
 test "submitEditorText queues steering messages while streaming" {
@@ -2865,13 +3079,29 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
         &live_resources,
     );
 
+    try std.testing.expect(state.clipboardPasteInProgress());
     const pending = try state.clonePendingEditorImages(allocator);
     defer deinitImageContents(allocator, pending);
 
-    try std.testing.expectEqual(@as(usize, 1), pending.len);
-    try std.testing.expectEqualStrings("AQID", pending[0].data);
-    try std.testing.expectEqualStrings("image/png", pending[0].mime_type);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
     try std.testing.expectEqualStrings("", editor.text());
+
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqualStrings("pasting clipboard image...", state.status);
+    state.mutex.unlock(state.io);
+
+    var attempts: usize = 0;
+    while (state.clipboardPasteInProgress() and attempts < 40) : (attempts += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+        try state.pollClipboardPaste();
+    }
+
+    const completed_pending = try state.clonePendingEditorImages(allocator);
+    defer deinitImageContents(allocator, completed_pending);
+
+    try std.testing.expectEqual(@as(usize, 1), completed_pending.len);
+    try std.testing.expectEqualStrings("AQID", completed_pending[0].data);
+    try std.testing.expectEqualStrings("image/png", completed_pending[0].mime_type);
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
@@ -3760,7 +3990,7 @@ test "app state aggregates usage totals and footer renders git branch stats" {
 
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
-    try state.setFooterDetails(model, "session.jsonl", "zig-implementation");
+    try state.setFooterDetails(model, "session.jsonl", "zig-implementation", "Faux", "local");
 
     try state.handleAgentEvent(.{
         .event_type = .message_start,
@@ -3796,20 +4026,27 @@ test "app state aggregates usage totals and footer renders git branch stats" {
     });
     try state.handleAgentEvent(.{ .event_type = .agent_end });
 
-    state.mutex.lockUncancelable(state.io);
-    defer state.mutex.unlock(state.io);
-    try std.testing.expectEqual(@as(u64, 11), state.usage_totals.input);
-    try std.testing.expectEqual(@as(u64, 7), state.usage_totals.output);
-    try std.testing.expectEqual(@as(u64, 2), state.usage_totals.cache_read);
-    try std.testing.expectEqual(@as(u64, 1), state.usage_totals.cache_write);
-    try std.testing.expectEqual(@as(u32, 14), state.context_tokens.?);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.42), state.usage_totals.cost, @as(f64, 0.0000001));
+    {
+        state.mutex.lockUncancelable(state.io);
+        defer state.mutex.unlock(state.io);
+        try std.testing.expectEqual(@as(u64, 11), state.usage_totals.input);
+        try std.testing.expectEqual(@as(u64, 7), state.usage_totals.output);
+        try std.testing.expectEqual(@as(u64, 2), state.usage_totals.cache_read);
+        try std.testing.expectEqual(@as(u64, 1), state.usage_totals.cache_write);
+        try std.testing.expectEqual(@as(u32, 14), state.context_tokens.?);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.42), state.usage_totals.cost, @as(f64, 0.0000001));
+    }
 
-    const footer = try formatFooterLine(allocator, null, &state, 160);
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    const footer = try formatFooterLine(allocator, null, &snapshot, 160);
     defer allocator.free(footer);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Branch: zig-implementation") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Session: session.jsonl") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Status: idle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: Faux (local)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: Faux (local)") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "↑11") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "↓7") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "R2") != null);
@@ -3817,6 +4054,16 @@ test "app state aggregates usage totals and footer renders git branch stats" {
     try std.testing.expect(std.mem.indexOf(u8, footer, "$0.420") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "ctx 0.0%/128k") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Model: faux-1") != null);
+
+    try state.appendQueuedMessage(.steering, "queued steer");
+    try state.appendQueuedMessage(.follow_up, "queued follow-up");
+
+    var queued_snapshot = try state.snapshotForRender(allocator);
+    defer queued_snapshot.deinit(allocator);
+
+    const queued_footer = try formatFooterLine(allocator, null, &queued_snapshot, 160);
+    defer allocator.free(queued_footer);
+    try std.testing.expect(std.mem.indexOf(u8, queued_footer, "Queue: 1 steering, 1 follow-up") != null);
 }
 
 test "resolveGitBranch reads heads from git directories and gitdir files" {
@@ -4526,6 +4773,7 @@ test "loadSelectableModels respects CLI model patterns" {
         allocator,
         &env_map,
         current_model,
+        null,
         &.{"anthropic/sonnet:high"},
         null,
     );

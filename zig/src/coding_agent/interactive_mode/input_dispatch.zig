@@ -10,7 +10,6 @@ const session_mod = @import("../session.zig");
 const shared = @import("shared.zig");
 const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
-const clipboard_image = @import("clipboard_image.zig");
 const prompt_worker_mod = @import("prompt_worker.zig");
 const slash_commands = @import("slash_commands.zig");
 const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
@@ -269,6 +268,7 @@ pub fn handleInputKey(
             env_map,
             action,
             session,
+            current_provider,
             session_dir,
             options.model_patterns,
             live_resources.runtime_config,
@@ -590,22 +590,12 @@ fn handleDequeueAction(
 }
 
 fn handlePasteImageAction(
-    allocator: std.mem.Allocator,
-    io: std.Io,
+    _: std.mem.Allocator,
+    _: std.Io,
     env_map: *const std.process.Environ.Map,
     app_state: *AppState,
 ) !void {
-    var image = (try clipboard_image.readClipboardImage(allocator, io, env_map)) orelse return;
-    defer image.deinit(allocator);
-
-    const encoded = try clipboard_image.encodeImageContent(allocator, image);
-    errdefer {
-        var encoded_copy = encoded;
-        clipboard_image.deinitImageContent(allocator, &encoded_copy);
-    }
-
-    try app_state.appendPendingEditorImage(encoded);
-    try app_state.setStatus("clipboard image pasted");
+    try app_state.startClipboardPaste(env_map);
 }
 
 pub fn clearEditor(app_state: *AppState, editor: *tui.Editor) void {
@@ -867,6 +857,7 @@ pub fn handleAppAction(
     env_map: *const std.process.Environ.Map,
     action: keybindings_mod.Action,
     session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
     session_dir: []const u8,
     model_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
@@ -899,7 +890,7 @@ pub fn handleAppAction(
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
-            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), model_patterns, runtime_config);
+            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, model_patterns, runtime_config);
         },
         .queue_follow_up, .dequeue_messages => {},
         .paste_image => {},
