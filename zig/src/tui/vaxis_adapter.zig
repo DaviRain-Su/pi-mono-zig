@@ -1,7 +1,10 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("ansi.zig");
+const draw_mod = @import("draw.zig");
+const spacer_mod = @import("components/spacer.zig");
 const terminal_mod = @import("terminal.zig");
+const theme_mod = @import("theme.zig");
 
 pub const VaxisAdapter = struct {
     allocator: std.mem.Allocator,
@@ -28,17 +31,27 @@ pub const VaxisAdapter = struct {
     }
 
     pub fn render(self: *VaxisAdapter, size: terminal_mod.Size, lines: []const []const u8) !void {
-        try self.ensureSize(size);
-        self.advanceFrame();
-
-        self.vx.state.alt_screen = true;
-
-        const window = self.vx.window();
-        window.clear();
-        window.hideCursor();
+        const window = try self.beginFrame(size);
         try renderLineListToWindow(window, lines, self.frameAllocator());
+        try self.renderTrailingSpacer(window, lines.len);
+        try self.finishFrame();
+    }
 
-        try self.vx.render(self.tty);
+    pub fn renderComponent(
+        self: *VaxisAdapter,
+        size: terminal_mod.Size,
+        component: draw_mod.Component,
+        theme: ?*const theme_mod.Theme,
+    ) !draw_mod.Size {
+        const window = try self.beginFrame(size);
+        const ctx: draw_mod.DrawContext = .{
+            .window = window,
+            .arena = self.frameAllocator(),
+            .theme = theme,
+        };
+        const rendered = try component.draw(window, ctx);
+        try self.finishFrame();
+        return rendered;
     }
 
     fn ensureSize(self: *VaxisAdapter, size: terminal_mod.Size) !void {
@@ -59,8 +72,41 @@ pub const VaxisAdapter = struct {
         _ = self.frame_arenas[self.active_frame].reset(.retain_capacity);
     }
 
-    fn frameAllocator(self: *VaxisAdapter) std.mem.Allocator {
+    pub fn frameAllocator(self: *VaxisAdapter) std.mem.Allocator {
         return self.frame_arenas[self.active_frame].allocator();
+    }
+
+    fn beginFrame(self: *VaxisAdapter, size: terminal_mod.Size) !vaxis.Window {
+        try self.ensureSize(size);
+        self.advanceFrame();
+
+        self.vx.state.alt_screen = true;
+
+        const window = self.vx.window();
+        window.clear();
+        window.hideCursor();
+        return window;
+    }
+
+    fn finishFrame(self: *VaxisAdapter) !void {
+        try self.vx.render(self.tty);
+    }
+
+    fn renderTrailingSpacer(self: *VaxisAdapter, window: vaxis.Window, line_count: usize) !void {
+        const rendered_rows: u16 = @intCast(@min(line_count, window.height));
+        if (rendered_rows >= window.height) return;
+
+        const spacer = spacer_mod.Spacer{ .lines = window.height - rendered_rows };
+        const spacer_window = window.child(.{
+            .y_off = @intCast(rendered_rows),
+            .height = window.height - rendered_rows,
+        });
+        const ctx: draw_mod.DrawContext = .{
+            .window = spacer_window,
+            .arena = self.frameAllocator(),
+            .theme = null,
+        };
+        _ = try spacer.drawComponent().draw(spacer_window, ctx);
     }
 };
 

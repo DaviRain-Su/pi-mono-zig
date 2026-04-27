@@ -1,9 +1,12 @@
 pub const vaxis = @import("vaxis");
 pub const ansi = @import("ansi.zig");
 pub const component = @import("component.zig");
+pub const draw = @import("draw.zig");
 pub const keys = @import("keys.zig");
 pub const layout = @import("layout.zig");
+pub const style = @import("style.zig");
 pub const terminal = @import("terminal.zig");
+pub const test_helpers = @import("test_helpers.zig");
 pub const theme = @import("theme.zig");
 pub const tui = @import("tui.zig");
 pub const vaxis_adapter = @import("vaxis_adapter.zig");
@@ -23,6 +26,9 @@ pub const components = struct {
 };
 
 pub const Component = component.Component;
+pub const DrawComponent = draw.Component;
+pub const DrawContext = draw.DrawContext;
+pub const DrawSize = draw.Size;
 pub const LineList = component.LineList;
 pub const Key = keys.Key;
 pub const ParseResult = keys.ParseResult;
@@ -41,6 +47,7 @@ pub const ThemeColor = theme.ThemeColor;
 pub const ThemeColors = theme.ThemeColors;
 pub const ThemeToken = theme.ThemeToken;
 pub const StyleSpec = theme.StyleSpec;
+pub const styleFor = style.styleFor;
 pub const OverlayAnchor = tui.OverlayAnchor;
 pub const OverlayMargin = tui.OverlayMargin;
 pub const OverlayAnimation = tui.OverlayAnimation;
@@ -72,9 +79,12 @@ pub const Viewport = components.viewport.Viewport;
 test {
     _ = @import("ansi.zig");
     _ = @import("component.zig");
+    _ = @import("draw.zig");
     _ = @import("keys.zig");
     _ = @import("layout.zig");
+    _ = @import("style.zig");
     _ = @import("terminal.zig");
+    _ = @import("test_helpers.zig");
     _ = @import("theme.zig");
     _ = @import("tui.zig");
     _ = @import("vaxis_adapter.zig");
