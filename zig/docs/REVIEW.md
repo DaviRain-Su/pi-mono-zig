@@ -1,77 +1,76 @@
 # Zig 实现 Review & 与 TS 版本的 Gap 分析
 
 > 本文档跟踪 `zig/` 下的 Zig 实现与 `packages/coding-agent/`（TS 版）之间的差距。
-> 最近一次更新：完成第二轮 review，覆盖 `interactive_mode/*` 拆分后的状态、`agent/root.zig`、
-> `coding_agent/tools/bash.zig`、`coding_agent/interactive_mode/rendering.zig`。
+> 最近一次更新：第三轮 review，覆盖 `agent/agent_loop.zig`、`ai/model_registry.zig`、
+> `ai/root.zig`、`coding_agent/config.zig`、`coding_agent/print_mode.zig`、`json_event_wire.zig`。
 
 ---
 
 ## 0. 自上次 Review 以来的变化（已完成项）
 
-之前列为 P1 的两个拆分都已完成：
+### 一/二轮列出的硬伤已全部修复
+- ✅ `interactive_mode.zig` 拆出 `shared / formatting / overlays / rendering / prompt_worker / slash_commands / input_dispatch / clipboard_image`
+- ✅ `main.zig` 拆出 `cli/{bootstrap,input_prep,runtime_prep,output}.zig`
+- ✅ CLI flags：`--no-builtin-tools` / `--no-context-files` / `--offline` / `--verbose` / `--export`
+- ✅ slash 命令：`/scoped-models` / `/changelog`
+- ✅ 剪贴板图片粘贴
+- ✅ `AppContext` 替代全局 tool runtime
+- ✅ `bash` 流式 / 超时 / 进程组 / 截断 / 安全 temp 全量输出 / 完整测试
 
-- `interactive_mode.zig` 已拆出多个子模块：
-  - `interactive_mode/shared.zig`
-  - `interactive_mode/formatting.zig`
-  - `interactive_mode/overlays.zig`
-  - `interactive_mode/rendering.zig`
-  - `interactive_mode/prompt_worker.zig`
-  - `interactive_mode/slash_commands.zig`
-  - `interactive_mode/input_dispatch.zig`
-  - `interactive_mode/clipboard_image.zig`
-- `main.zig` 已拆出 `cli/` 下的：
-  - `cli/bootstrap.zig`
-  - `cli/input_prep.zig`
-  - `cli/runtime_prep.zig`
-  - `cli/output.zig`
+### 第三轮列出的硬伤也已全部修复
+- ✅ **bash `details` 已贯通**：`tool_adapters.zig` 的 `runBashTool` / `forwardBashToolUpdate` 都带 `.details`
+- ✅ **bash `timeout` 别名兼容**：`parseArguments` 同时接受 `timeout_seconds` 和 `timeout`
+- ✅ **`interactive_mode.zig` 再拆**：新增 `tool_adapters.zig` 与 `session_bootstrap.zig`
+- ✅ **`rendering.zig` 锁优化**：`snapshotForRender()` 锁内取快照，渲染移到锁外
 
-之前 REVIEW 列为缺失但**现在已实现**的功能：
-
-- CLI flags：`--no-builtin-tools`, `--no-context-files`, `--offline`, `--verbose`, `--export`
-- slash 命令：`/scoped-models`, `/changelog`
-- 剪贴板图片粘贴路径
-- 显式 `AppContext` 替代旧的全局 tool runtime
-- `bash` 的流式输出 / 超时 / 进程组 kill / 截断 / 安全 temp 全量输出捕获 / 完整测试
+### 本轮新落地的大块进展
+- ✅ **`agent/agent_loop.zig`**：真正的 agent runtime —— steering / follow-up drain、assistant 流式、tool 执行、before/after hook、并行/串行、abort 传递
+- ✅ **`ai/model_registry.zig`**：内置 25+ provider 配置，模型目录扩大，scoped/精确匹配、provider 默认模型、`headers` 与 `compat` 字段
+- ✅ **`json_event_wire.zig`**：显式转换 + `validateAgentEventJson` 校验，`assistantMessageEvent` / `partialResult` / `toolResults` / `details` 都有，stop-reason 归一化
+- ✅ **`print_mode.zig`**：JSON 模式订阅链路完整，测试覆盖失败 / abort / 工具 / 跨 provider session continuation
 
 ---
 
 ## 1. 总体结论
 
-- **核心 agent 引擎、内置工具、session、交互式 TUI、auth/providers** 已经接近 TS。
+- **核心 agent runtime / 内置工具 / session / 交互式 TUI / model registry / JSON wire** 已经接近 TS。
 - 真正剩余 gap 集中在 **生态/控制面**：
   - 扩展（extension）运行时
   - 包管理子命令
-  - TS-兼容 JSONL RPC
+  - TS-兼容 JSONL 控制协议（prompt/steer/follow_up/abort/get_messages/get_commands…）
   - 动态 provider / 自定义 UI
   - MCP（经扩展通道）
-- **目标 = 独立可用的 Zig coding agent**：剩余 ≈ **1–3 周**（比上次更短）。
-- **目标 = 完全替代 TS**：剩余 ≈ **6–10+ 周**（几乎不变；剩下全是最贵的生态层）。
+- **目标 = 独立可用的 Zig coding agent**：剩余 ≈ **1–2 周**（较上轮再缩短）。
+- **目标 = 完全替代 TS**：剩余 ≈ **6–10+ 周**（生态层基本没动）。
 
 ---
 
-## 2. 各模块 Parity（更新版）
+## 2. 各模块 Parity（第三轮更新）
 
-| 模块 | 当前 Parity | 变化 | 主要剩余项 |
-|---|---:|---|---|
-| CLI / bootstrap | **88%** | ↑ | 包管理子命令；TS 风格的 unknown-flag 透传；扩展驱动 help |
-| Agent 核心 loop | **82%** | ↑ | 缺扩展 runner / event bus；缺动态 provider/tool 注入 |
-| 内置 tools | **82%** | ↑ | bash 不可插拔；结构化 `details` 未向上贯通；无自定义/扩展 tool |
-| Sessions / 分支 / 导入导出 / 搜索 | **82%** | ↑ | 运行时替换生命周期；扩展感知的 session hook |
-| TUI / interactive | **78%** | ↑↑ | 扩展 widgets / 自定义 editor / footer/header 注入；继续拆分 |
-| JSON mode | **88%** | – | wire/schema 兼容性验证；结构化元数据丰度 |
-| Providers / auth | **68%** | ↑ | 动态 registry；扩展定义的 provider/OAuth |
-| **RPC** | **30%** | – | Zig 是 JSON-RPC 2.0；TS 是自定 JSONL 控制协议 |
-| **扩展 / 包管理 / 自定义 UI** | **12%** | – | loader/runner、commands、tools、providers、UI、包 CLI |
-| **MCP** | **5%** | – | 当前 Zig 实质上没有 MCP runtime/client/server |
+| 模块 | 上轮 | 现在 | 备注 |
+|---|---:|---:|---|
+| CLI / bootstrap | 88% | **89%** | 基本不变 |
+| Agent 核心 loop / runtime | 82% | **89%** ↑↑ | `agent_loop.zig` 落地 |
+| 内置 tools | 82% | **87%** | bash details/timeout 别名修复 |
+| Sessions / 分支 / 导入导出 | 82% | **84%** | print-mode 跨 provider 续会话覆盖 |
+| TUI / interactive | 78% | **85%** ↑ | 又一次拆分 + 渲染锁优化 |
+| **JSON mode / event wire** | 88% | **93%** ↑ | 校验 + 富 schema |
+| Providers / auth / model registry | 68% | **78%** ↑↑ | 注册广度 + 发现机制 |
+| **RPC 协议兼容** | 30% | 30% | TS-JSONL 控制面尚缺 |
+| **扩展 / 包管理 / 自定义 UI** | 12% | 12% | 生态层未动 |
+| **MCP** | 5% | 5% | 未动 |
+
+- **独立可用**：≈ **90%**
+- **完全替代 TS**：功能 ≈ 60–65%，生态层依旧落后
 
 ---
 
 ## 3. 仍明确缺失的内容
 
 ### 3.1 CLI / 包管理
-- 包管理子命令：`install` / `remove` / `uninstall` / `update` / `list` / `config`
+- `install` / `remove` / `uninstall` / `update` / `list` / `config`
 - TS 风格 `unknownFlags` 透传给扩展（Zig 当前对未知 flag 直接报错）
-- 扩展驱动的 help 文本
+- 扩展驱动的 help
 
 ### 3.2 Agent runtime host
 - TS 的 `AgentSessionRuntime` 等 runtime-host 抽象
@@ -79,18 +78,7 @@
 - 扩展 runner 集成 / runtime services 边界
 - 通过扩展的动态 tools / providers / hooks
 
-### 3.3 工具层（具体硬伤）
-- **bash 的结构化 `details` 在 `interactive_mode.zig` 的 adapter 被丢弃**
-  - 内部已算出 `exit_code` / `timed_out` / `full_output_path` / `truncation`
-  - adapter 仅返回 `.content`，TUI/JSON/RPC 拿不到
-- **bash 参数命名不兼容 TS**
-  - Zig: `timeout_seconds`
-  - TS: `timeout`
-  - 应像 grep adapter 那样接受别名
-- bash 仅 POSIX 后端（`/bin/sh` / 进程组 / `/tmp/pi-bash-*`），无 pluggable `BashOperations` / `spawnHook`
-- 无自定义/扩展 tool 路径
-
-### 3.4 TS-兼容 JSONL RPC
+### 3.3 TS-兼容 JSONL RPC
 当前 Zig 是干净的 JSON-RPC 2.0，缺以下控制语义：
 - prompt / steer / follow_up / abort
 - get/set model
@@ -99,86 +87,127 @@
 - `get_messages` / `get_commands`
 - 扩展 UI request/response 通道
 
-### 3.5 扩展 / 包 / 自定义 UI
+### 3.4 扩展 / 包 / 自定义 UI
 - 扩展加载器/运行模型、命令、event bus
 - 自定义 tools / providers / OAuth
 - 扩展 UI requests / widgets / 编辑器 / footer 注入
 - 完整 SDK / embed 故事
 
-### 3.6 TUI 末段
-- 扩展 widgets / 自定义编辑器 / footer/header 注入
-- 自定义 message renderer / tool renderer
-- `rendering.zig` 渲染期持锁过久（建议"锁内取快照、锁外渲染"）
-
-### 3.7 MCP
+### 3.5 MCP
 - 无 client / server / runtime 集成
-- 只有零星的 auth scope 引用，不算支持
 
 ---
 
-## 4. 单文件 Code Review（本轮新增）
+## 4. 第三轮新发现的问题（待修）
 
-### `zig/src/agent/root.zig`
-- **质量：高**。干净的 re-export barrel，稳定 agent 包公共边界。
-- 无明显问题，低风险。
+### 4.1 `agent_loop.zig` 并行模式不是真·流式
+- parallel 模式下每个 task 的 update **被缓冲**，所有线程 join 后才一次性 emit
+- 结果是"并行执行"了但没有"并行流式 UX"
+- **影响**：当前 Zig 版的 JSON/TUI 在并行 tool 场景下体验落后
+- **修法**：把 update 通道改为线程安全的实时 emit，缓冲只在 sequential mode 用
 
-### `zig/src/coding_agent/interactive_mode.zig`
-- **方向正确，但仍偏大**：仍混合 orchestration、tool adapter、session 打开、参数 helper、re-export 墙、tests。
-- 拆分进度估计 **~65–75%**。
-- 下一步最有价值的拆分：tool adapters + session-open/bootstrap helpers。
-- adapter 一致性问题：`grep` 已支持 legacy alias（`ignoreCase` / `ignore_case`），`bash` 没桥接 `timeout` ↔ `timeout_seconds`。
-- 工具结果的 `.details` 没向上贯通。
+### 4.2 toolcall 流式事件未对齐 text/thinking
+- `streamAssistantResponse` 处理了 `text` / `thinking`
+- `toolcall_start / delta / end` 没有同等待遇
+- **影响**：JSON event 的 93% 富度被"差最后一公里"卡住
+- **修法**：在 streaming 路径补 toolcall 三种 event
 
-### `zig/src/coding_agent/interactive_mode/rendering.zig`
-- **拆分成功**：`AppState` 内存所有权、锁纪律、render helpers 都比之前清晰。
-- 主要 caveat：
-  1. `ScreenComponent.renderInto` **在锁内做 chat/prompt/footer/autocomplete 的渲染与分配** —— 工具流较多时会拖慢更新。
-  2. `pub var active_resize_backend` 是进程级单例（signal handler 需要，但仍是可变全局）。
-- 后续可继续拆为：`app_state.zig` / `screen.zig` / `terminal_backend.zig`。
+### 4.3 `coding_agent/config.zig` 在生产路径调 `ai.model_registry.resetForTesting()`
+- 名字带 `forTesting` 的 hook 出现在 runtime 加载路径
+- **影响**：架构异味，多 runtime / embed / 热重载场景下会冲突
+- **修法**：引入显式 `clear()` / `reload()` API，把 testing-only hook 隔离
 
-### `zig/src/coding_agent/tools/bash.zig`
-- **本轮最强的新文件**：测试覆盖好，timeout / 截断 / stderr / 进程组 kill / 流式更新都是真材实料。
-- 主要 caveat：
-  1. POSIX-only 世界观，缺 pluggable backend。
-  2. `details` 计算了但上层没用上。
-  3. `timeout_seconds` 与 TS 的 `timeout` 不兼容。
+### 4.4 `config.zig` 大量 `catch {}` 静默吞错
+- provider 注册 / 模型发现 / 模型注册都被吞掉
+- **影响**：config 配错时用户看不到提示
+- **修法**：收集到 `[]ConfigError` 列表，启动后统一告警；或用 logger 记录
+
+### 4.5 全局可变状态新增项
+- `ai/model_registry.zig` 的 `default_registry` 单例
+- `coding_agent/print_mode.zig` 的 `active_abort_signal`
+- 这些和早先的 `tui/keys.zig::kitty_protocol_active`、
+  `interactive_mode/rendering.zig::active_resize_backend` 同类
+- **修法**：能用显式 context 穿透就别用全局；signal handler 类的可保留但隔离
+
+### 4.6 tool 结果时间戳仍是 0
+- 小问题，但暴露了元数据贯通还有死角
+
+### 4.7 `print_mode.zig` 的 abort watcher 是 2ms 轮询线程
+- 简陋但能用；后续考虑 self-pipe / eventfd
+
+### 4.8 `agent_loop.zig` 的所有权/分配器面广
+- 手动 clone/deinit 多，回归风险高
+- **建议**：加重点测试覆盖 parallel + hook 覆盖 + abort 三类路径
 
 ---
 
-## 5. 内部工程建议（仍适用）
+## 5. 单文件 Code Review（本轮）
+
+### `zig/src/agent/agent_loop.zig`
+- **质量：好，但现在是最该加固的高杠杆文件**。
+- 编排清晰：prompt 入口 / assistant 流式 / tool 准备 / 执行 / 结果定型分得开。
+- hook 点（`before_tool_call` / `after_tool_call` / context transforms）实用且可扩展。
+- 主要问题：见 §4.1 / §4.2 / §4.6 / §4.8。
+
+### `zig/src/ai/model_registry.zig`
+- **质量：好**。clone/deinit 纪律好，匹配 API（精确 / scoped / 默认）实用。
+- 主要问题：
+  - `default_registry` 全局单例（§4.5）
+  - 线性扫描（当前规模 OK）
+  - `isAlias()` / `isBetterMatch()` 模糊匹配略脆，未来会有惊喜
+
+### `zig/src/ai/root.zig`
+- **质量：高**。barrel 干净。
+- 小异味：`providers` 公共面没把 registry 里 25+ 内置 provider 一一镜像，可能让维护者困惑（非功能问题）。
+
+### `zig/src/coding_agent/config.zig`
+- **质量：中–好，但本轮最该清理的文件**。
+- 优点：merged settings、offline-aware discovery、provider override / model list / compat / headers / cost / input types、`lookupApiKey()` 干净合并 auth-token 与 provider-key。
+- 主要问题：
+  - §4.3 `resetForTesting()` 被生产路径调用
+  - §4.4 大量 `catch {}`
+  - 配置加载会改全局 registry —— 多 runtime 场景下隐患
+
+### `zig/src/coding_agent/print_mode.zig`
+- **质量：好**。紧凑、可读，JSON 模式订阅链路完整。
+- 测试覆盖好：失败 / abort / 工具 / 跨 provider session continuation。
+- 小问题：§4.7（轮询 abort）+ §4.5（`active_abort_signal` 全局）。
+
+---
+
+## 6. 内部工程建议（更新版）
 
 ### 已部分完成
 - ~~P1：拆分 `main.zig`~~ ✅
-- ~~P1：拆分 `interactive_mode.zig`~~ 🟡（仍需再拆一次）
+- ~~P1：拆分 `interactive_mode.zig`~~ 🟡（barrel 仍可继续瘦身）
+- ~~P1：bash `details` 贯通 + `timeout` 别名~~ ✅
+- ~~P1：`rendering.zig` 锁优化~~ ✅
 
 ### 仍要做
-- **P2 — 全局可变状态**
-  - `tui/keys.zig` 的 `kitty_protocol_active`
-  - `interactive_mode/rendering.zig` 的 `active_resize_backend`
-  - 建议尽量用显式 context 穿透（`AppContext` 已是好示例）
-- **P3 — TUI API 边角**
-  - `Box` 边框只在 `theme != null` 时渲染：`border_style = .single` 在无 theme 时静默无边框，应解耦或显式报错。
-  - `theme.zig` 颜色解析对非法值静默忽略，应该 fail loudly。
-  - 动态分发使用 `*anyopaque` + `anyerror` 实用但放弃部分编译期保证，注意控制范围。
-- **P4 — 构建脚本**
-  - `test-cross-area` 直接 shell 出 `bash`，Windows 不便携。
-  - 外部工具（`rg`, `fd`）检查范围较广，可缩到真正需要的 step。
+- **P2 — 全局可变状态**（§4.5）
+- **P2 — `resetForTesting` 在生产路径**（§4.3）
+- **P2 — `catch {}` 静默吞错**（§4.4）
+- **P2 — 并行 tool 真·流式**（§4.1）
+- **P2 — toolcall 流式事件补齐**（§4.2）
+- **P3 — JSON 输出 golden 兼容性测试**（钉死 wire 契约）
+- **P3 — TUI API 边角**：`Box` 边框依赖 theme、`theme.zig` 颜色解析静默忽略
+- **P4 — 构建脚本**：`test-cross-area` shell 出 `bash`，Windows 不便携
 
 ---
 
-## 6. 推荐路线图
+## 7. 推荐路线图
 
-### 路线 A：独立 Zig coding agent（**推荐先走完，约 1–3 周**）
+### 路线 A：独立 Zig coding agent（**推荐先走完，约 1–2 周**）
 
 按 ROI 排序：
 
-1. **bash 工具的 `details` 一路透到 TUI/JSON/RPC** —— S，回报大
-2. **bash 参数兼容 `timeout` 别名** —— XS
-3. **再拆一次 `interactive_mode.zig`**（tool adapters + session-open helpers）—— M
-4. **`rendering.zig` 锁内取快照、锁外渲染** —— S–M
-5. **provider / 模型 / auth UX polish** —— M
-6. **JSON 输出契约校验**（与 TS 对齐 schema）—— S–M
-7. **TUI 末段细节**（剪贴板图片体验、队列模式等小项）—— S
+1. **agent_loop 并行模式改真·流式** —— **M**，回报大
+2. **toolcall 流式事件补齐** —— **S**，让 JSON event 真正完整
+3. **去掉 `resetForTesting` 在生产路径**，引入 `clear/reload` —— **S**
+4. **`catch {}` → 结构化 error 收集** —— **S–M**
+5. **JSON 输出 golden 测试** —— **S–M**
+6. **provider/auth UX 末段 polish** —— **M**
+7. **TUI 末段细节**（剪贴板图片体验、队列模式等）—— **S**
 
 ### 路线 B：完全替代 TS（三阶段策略）
 
@@ -186,7 +215,7 @@
 **选型**：Bun（已生产可用，Node API 兼容度远好于 Deno；当前 Bun 的 C embed API 仍在演进，
 所以**先用子进程模式**集成，不内嵌）。
 
-#### 阶段 1：Bun 作为扩展运行时（兼容期，**约 8–13 周**）
+#### 阶段 1：Bun 作为扩展运行时（兼容期，**约 12–16 周**）
 
 让 Zig 宿主 spawn 一个 Bun 子进程跑 `extension-host.ts`，扩展在 Bun 里加载，
 通过 stdio JSON-RPC 与 Zig 通信。这样**Bun 升级 = 兼容性升级**，零维护成本。
@@ -222,11 +251,6 @@
 | **Wasm** | 中 | 沙箱好、跨平台、Zig 工具链天然契合 |
 | 编译期注册（rebuild 才能加） | 低 | 最简单；用户体验差 |
 
-选 Wasm 的理由：
-- Zig 自己支持 wasm32 target，写扩展与写宿主工具链一致。
-- 沙箱、跨平台分发、热加载都天然。
-- 此阶段不再追求"复用 TS 生态"，Wasm 的劣势消失。
-
 #### 最终架构
 
 ```
@@ -247,24 +271,19 @@
 └─────────────────────────────────────────┘
 ```
 
-扩展元数据声明类型（`type: "wasm"` / `type: "node"`），加载器分发即可。
-
 #### 阶段 1+2+3 合计
 
-- 阶段 1：**8–13 周**（约 2–3 个月，含隐藏工作量更可能 **12–16 周**）
+- 阶段 1：**12–16 周**（约 3–4 个月）
 - 阶段 2：持续，无固定工期
 - 阶段 3：**2–3 周**（按需启动）
 
-依赖顺序：阶段 1 必须先完成（否则没扩展生态可用），阶段 2/3 可并行推进。
-**未先做阶段 1 就去做 providers/MCP/UI 会反复返工。**
+依赖顺序：阶段 1 必须先完成。**未先做阶段 1 就去做 providers/MCP/UI 会反复返工。**
 
 ---
 
-### 6.B 路线 B 阶段 1 详细设计
+### 7.B 路线 B 阶段 1 详细设计
 
-下面把阶段 1 拆到可以直接开工的颗粒度。
-
-#### 6.B.1 进程模型
+#### 7.B.1 进程模型
 
 ```
 Zig 宿主进程
@@ -272,98 +291,43 @@ Zig 宿主进程
                  ├─ 加载所有已安装扩展
                  ├─ 维护扩展实例生命周期
                  └─ 通过 stdio 与 Zig 通信
-
-通信通道：
-  - Zig → Bun: 子进程 stdin
-  - Bun → Zig: 子进程 stdout
-  - Bun 日志:   子进程 stderr（Zig 旁路收集）
 ```
 
-要点：
-- **一个 Bun 子进程承载所有扩展**（不是每扩展一进程），扩展之间共享 Bun runtime。
-- 启动时机：Zig 宿主初始化后惰性 spawn，第一次需要扩展时才起。
-- 关闭时机：Zig 宿主退出前发送 `shutdown` 通知，超时则 SIGTERM 强杀。
+- 单 Bun 子进程承载所有扩展，扩展共享 Bun runtime
+- 启动惰性、关闭走 `shutdown` 通知 + 超时 SIGTERM
 
-#### 6.B.2 协议（JSON-RPC over stdio + 长度前缀）
+#### 7.B.2 协议（JSON-RPC over stdio + 长度前缀）
 
-帧格式（避免 stdout 输出乱掉行边界）：
+帧格式（LSP 同款）：
 ```
 Content-Length: <bytes>\r\n
 \r\n
 <json payload>
 ```
 
-这是 LSP 同款帧格式，库现成，调试友好。
+消息类型：Request / Response / Notification（双向都能发）。
 
-消息类型：
-- **Request**（双向都能发）：`{ jsonrpc, id, method, params }`
-- **Response**：`{ jsonrpc, id, result | error }`
-- **Notification**（无 id，无回包）：`{ jsonrpc, method, params }`
+#### 7.B.3 核心方法分类
 
-#### 6.B.3 核心方法分类
+**Zig → Bun**：`host/initialize` `host/shutdown` `extensions/{load,unload,reload,list}` `tool/invoke` `command/run` `provider/complete` `ui/event`
+**Bun → Zig**：`register/{tool,command,provider,oauth,ui}` `session/{append,query}` `agent/emit` `host/{log,fs}` `ui/request`
 
-**Zig → Bun（宿主调扩展）**
-| 方法 | 用途 |
-|---|---|
-| `host/initialize` | 握手、传配置、扩展目录 |
-| `host/shutdown` | 优雅退出 |
-| `extensions/load` | 加载某个扩展 |
-| `extensions/unload` | 卸载某个扩展 |
-| `extensions/reload` | 热重载 |
-| `extensions/list` | 已加载列表 |
-| `tool/invoke` | 调用扩展注册的 tool |
-| `command/run` | 调用扩展注册的 slash command |
-| `provider/complete` | 调用扩展注册的 provider |
-| `ui/event` | 把 UI 事件转发给扩展 |
+注册调用幂等且必须在 `extensions/load` 期间完成。
 
-**Bun → Zig（扩展调宿主）**
-| 方法 | 用途 |
-|---|---|
-| `register/tool` | 扩展声明它提供的 tool |
-| `register/command` | 声明 slash command |
-| `register/provider` | 声明 provider |
-| `register/oauth` | 声明 OAuth 流程 |
-| `register/ui` | 声明 UI widget / footer / header |
-| `session/append` | 写入 session entry |
-| `session/query` | 读 session 历史 |
-| `agent/emit` | 发 event |
-| `host/log` | 日志（Zig 决定怎么输出） |
-| `host/fs` | 受权限控制的 FS 访问 |
-| `ui/request` | 向 TUI 请求（弹 overlay 等） |
+#### 7.B.4 流式与事件
 
-注意：**所有"注册"调用都是幂等的，且必须在 `extensions/load` 处理期间完成**。
-load 返回后注册集合冻结，避免运行期偷偷改 tool 列表。
+`{ stream_id }` + `stream/chunk` / `stream/end` / `stream/cancel` notification。
 
-#### 6.B.4 流式与事件
-
-很多 method 是流式的（tool 输出、provider 流式 token、session entry 增量）。
-方案：
-
-- 对流式调用，response 只回 `{ stream_id }`，后续走 notification：
-  - `stream/chunk` `{ stream_id, data }`
-  - `stream/end` `{ stream_id, ok | error }`
-- 调用方可发 `stream/cancel` `{ stream_id }` 取消。
-
-这样不引入 WebSocket / SSE 复杂度，单 stdio 通道就能跑。
-
-#### 6.B.5 扩展 manifest
-
-每个扩展一个 `package.json` + 一个 `extension.json`：
+#### 7.B.5 扩展 manifest
 
 ```jsonc
-// extension.json
 {
   "id": "my-extension",
   "version": "1.0.0",
-  "type": "node",                  // 阶段 3 后还会有 "wasm"
+  "type": "node",
   "entry": "./dist/index.js",
   "engines": { "pi-agent": "^1.0" },
-  "capabilities": {
-    "tools": ["my_tool"],
-    "commands": ["/my-cmd"],
-    "providers": ["my-provider"],
-    "ui": ["footer"]
-  },
+  "capabilities": { "tools": [...], "commands": [...], "providers": [...], "ui": [...] },
   "permissions": {
     "fs": { "read": ["${workspace}"], "write": [] },
     "net": { "domains": ["api.example.com"] },
@@ -372,118 +336,70 @@ load 返回后注册集合冻结，避免运行期偷偷改 tool 列表。
 }
 ```
 
-`capabilities` 仅作声明，**实际能力以 `register/*` 调用为准**，但宿主可以在 manifest 与
-register 不一致时拒绝加载或告警。
-
-#### 6.B.6 安装路径与 Bun 锁定
+#### 7.B.6 安装路径
 
 ```
 ~/.pi/
-  bun/
-    bun-1.1.x/                    # 自带 Bun，按版本号目录
-  extensions/
-    <ext-id>@<version>/
-      extension.json
-      package.json
-      node_modules/               # 由 bun install 填充
-      dist/
-  extension-host/
-    host.ts                       # Zig 自带的 host 脚本
+  bun/bun-1.1.x/
+  extensions/<ext-id>@<version>/
+  extension-host/host.ts
   config.json
 ```
 
 包管理：`pi install <pkg>` ≈ `cd ~/.pi/extensions/<id> && bun install <pkg>`。
 
-#### 6.B.7 权限模型
+#### 7.B.7 权限模型
 
-扩展权限**默认拒绝**，从三处汇总：
+默认拒绝；汇总自 manifest / `~/.pi/config.json` / 运行时弹窗。
+拦截点：FS（`host/fs`）、Net（Bun `--allow-net`）、Shell（`host/shell`）。
 
-1. `extension.json.permissions` 声明
-2. 用户在 `~/.pi/config.json` 里允许或拒绝
-3. 运行时弹窗（首次访问敏感资源时）
+#### 7.B.8 与 TS 现有扩展 API 对齐
 
-宿主侧拦截点：
-- **FS**：扩展走 `host/fs`，Zig 校验路径白名单
-- **网络**：Bun 启动时通过 `--allow-net=...` 限制（Bun 已支持类 Deno 的权限 flag）
-- **Shell**：扩展不允许直接 `child_process.spawn`，必须走 `host/shell`，Zig 决定是否放行
+核心交付物：**`@pi-agent/sdk`** npm 包。
+开工前先把 TS 现有 SDK 的所有公开签名导出成 `.d.ts`，作为 Zig 宿主实现契约。
 
-#### 6.B.8 与 TS 现有扩展 API 的对齐
+#### 7.B.9 错误处理与崩溃恢复
 
-阶段 1 的核心交付物是一个 **`@pi-agent/sdk`** npm 包，给扩展作者写 TS 时引入：
+- Bun 子进程崩溃：监听退出码 + stderr，标记扩展全 unloaded，TUI 提示。
+- 单扩展抛错：host 端 try/catch 包住，不传染。
+- 协议错误：N 次后视为异常重启。
 
-```ts
-import { defineExtension, defineTool } from "@pi-agent/sdk";
+#### 7.B.10 测试策略
 
-export default defineExtension({
-  id: "my-ext",
-  tools: [
-    defineTool({
-      name: "my_tool",
-      schema: { ... },
-      async run(params, ctx) {
-        ctx.log("hello");
-        return { content: "..." };
-      },
-    }),
-  ],
-});
-```
+- 协议层：Mock host 回放
+- 集成层：hello-world 扩展跑通 6 类场景
+- 回归层：从 TS 仓库选 3–5 个真实扩展冒烟
+- 性能层：单 RPC < 5ms，流式 chunk 延迟 < 10ms
 
-`@pi-agent/sdk` 内部把 `defineTool` 等翻译成 `register/tool` JSON-RPC 调用。
-**TS 现有扩展只要换成这个 SDK，就能在 Zig 宿主下跑**。
-
-如果当前 TS 版的 SDK 已经是同名同 shape，那直接复用，不再造新的。
-**关键动作**：开工前，把 TS 现有 SDK 的所有公开签名导出成 `.d.ts`，作为 Zig 宿主的实现契约。
-
-#### 6.B.9 错误处理与崩溃恢复
-
-- **Bun 子进程崩溃**：Zig 监听退出码，记录 stderr，标记所有扩展为"unloaded"，向 TUI
-  发提示，不影响主流程。
-- **重启策略**：用户主动 `/reload-extensions`，或 Zig 在下一次需要扩展时惰性重启。
-- **单个扩展抛错**：Bun host 用 `try/catch` 包住，回 `error` response，Zig 记录但不
-  传染其他扩展。
-- **协议错误**：收到不识别的 method 回 `MethodNotFound`，不识别的 id 回 `InvalidRequest`。
-  连续 N 次协议错误则视为 host 行为异常，重启。
-
-#### 6.B.10 测试策略
-
-- **协议层**：用 Mock Bun host（一个 Zig 写的回放器）跑契约测试。
-- **集成层**：跑一个真实 hello-world 扩展，覆盖 tool / command / provider / 流式 /
-  错误 / 取消六类场景。
-- **回归层**：从 TS 仓库选 3–5 个真实扩展，作为冒烟用例。
-- **性能层**：单次 RPC < 5ms（本机 stdio），流式 chunk 延迟 < 10ms。
-
-#### 6.B.11 阶段 1 工期细分（修正版）
+#### 7.B.11 阶段 1 工期细分
 
 | 子任务 | 估时 |
 |---|---|
 | 协议（帧格式 + JSON-RPC + 流式 + 取消） | 1 周 |
-| Bun 子进程生命周期（启动/关闭/崩溃恢复） | 1 周 |
+| Bun 子进程生命周期 | 1 周 |
 | Zig 端 binding（method 路由、`host/*` 实现） | 2 周 |
 | TS 端 host.ts + `@pi-agent/sdk` | 2 周 |
-| 权限模型（FS/Net/Shell 拦截） | 1 周 |
-| 包管理（`pi install/remove/update/list/config`） | 1 周 |
-| 扩展 manifest + 安装目录管理 | 0.5 周 |
-| TS 扩展 API 契约对齐（按 `.d.ts` 实现） | 2–3 周 |
+| 权限模型（FS/Net/Shell） | 1 周 |
+| 包管理 CLI | 1 周 |
+| 扩展 manifest + 安装目录 | 0.5 周 |
+| TS 扩展 API 契约对齐 | 2–3 周 |
 | 真实扩展联调（含意外坑） | 2–3 周 |
 | 测试套件 | 1 周 |
 | **合计** | **13.5–16.5 周** |
 
-比初版的 8–13 周更接近真实数字。
-
 ---
 
-## 7. 注意事项
+## 8. 注意事项
 
 - **不要把功能"存在" 当作"wire 兼容"**：JSON mode、RPC 两边都"有"，但协议不同。
-- **Auth 已不是空壳**：Anthropic / GitHub Copilot / Google Gemini CLI 真实 OAuth 已可用，问题在广度和扩展接入。
-- **不要为扩展 parity 过度投入**，除非确实需要。它是最大的时间黑洞，且影响整体架构选型。
-- **bash 是当前最容易拿到 parity 提升的工具**：`details` 透传 + `timeout` 别名两步就能显著改善 TUI/JSON 表现。
+- **Auth 已不是空壳**：Anthropic / GitHub Copilot / Google Gemini CLI 真实 OAuth 已可用。
+- **bash / details / 流式 / 锁优化** 都已修，下一阶段重点是**控制面 + 静默错误**。
+- **TS 是移动靶**：要"零 gap"先锁定一个 TS 版本号作为对齐基线，后续定期 rebase。
 
 ---
 
-## 8. 一句话总结
+## 9. 一句话总结
 
-> Zig 的 coding-agent 内核、交互层、工具与 auth 都已接近 TS；
-> 剩下的真实 gap 是 **TS 的生态层**：扩展运行时、包管理、TS-兼容 JSONL RPC、动态 provider/UI、MCP。
-> 独立可用只剩 1–3 周 polish；要完全替代 TS 仍需 6–10+ 周。
+> Zig 的 coding-agent 内核、交互层、工具、auth、model registry、JSON event wire 都已接近 TS；
+> 剩下的真实 gap 是 **TS 的生态层** 和 **少量并行/静默错误硬伤**。
+> 独立可用只剩 1–2 周 polish；要完全替代 TS 仍需 12–16 周（路线 B 阶段 1）。
