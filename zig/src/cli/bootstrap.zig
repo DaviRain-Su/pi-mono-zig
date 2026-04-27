@@ -40,8 +40,12 @@ pub fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
     return options.tools;
 }
 
+pub fn offlineModeEnabled(options: *const cli.Args, env_map: *const std.process.Environ.Map) bool {
+    return options.offline or isTruthyEnvFlag(env_map.get("PI_OFFLINE"));
+}
+
 pub fn startupNetworkOperationsEnabled(options: *const cli.Args, env_map: *const std.process.Environ.Map) bool {
-    return !options.offline and !isTruthyEnvFlag(env_map.get("PI_OFFLINE"));
+    return !offlineModeEnabled(options, env_map);
 }
 
 fn isTruthyEnvFlag(value: ?[]const u8) bool {
