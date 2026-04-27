@@ -51,6 +51,11 @@ const SignalGuard = struct {
     }
 };
 
+/// Required process-global bridge for POSIX SIGINT handling in print mode.
+/// The C signal handler cannot capture a per-run context pointer, allocate,
+/// or call non-async-signal-safe APIs. It can only reach module-static state
+/// and store to this atomic flag; normal Zig code observes the flag later and
+/// performs the actual abort outside signal-handler context.
 var active_abort_signal: ?*std.atomic.Value(bool) = null;
 
 fn supportsPosixSignals() bool {
@@ -76,6 +81,11 @@ const JsonWriterContext = struct {
 };
 
 const AbortWatcher = struct {
+    // The watcher intentionally polls instead of blocking on a condition:
+    // POSIX signal handlers cannot safely signal Zig condition variables.
+    // A 2ms interval keeps Ctrl+C latency below a visible threshold in
+    // print mode while limiting the loop to the lifetime of one invocation.
+    // A future self-pipe/eventfd design could replace this if wakeups matter.
     io: std.Io,
     signal: *std.atomic.Value(bool),
     done: *std.atomic.Value(bool),

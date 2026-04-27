@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../types.zig");
 const event_stream = @import("../event_stream.zig");
 
@@ -44,6 +45,7 @@ const LazyProviderState = struct {
 
 const BuiltInProviderError = error{
     UnknownBuiltInApi,
+    TestOnlyProviderOverrideUnavailable,
 };
 
 var openai_state = LazyProviderState{};
@@ -58,17 +60,21 @@ var google_gemini_cli_state = LazyProviderState{};
 var google_vertex_state = LazyProviderState{};
 var bedrock_state = LazyProviderState{};
 
-var openai_override: ?ProviderFns = null;
-var kimi_override: ?ProviderFns = null;
-var anthropic_override: ?ProviderFns = null;
-var mistral_override: ?ProviderFns = null;
-var openai_responses_override: ?ProviderFns = null;
-var azure_openai_responses_override: ?ProviderFns = null;
-var openai_codex_responses_override: ?ProviderFns = null;
-var google_override: ?ProviderFns = null;
-var google_gemini_cli_override: ?ProviderFns = null;
-var google_vertex_override: ?ProviderFns = null;
-var bedrock_override: ?ProviderFns = null;
+const Overrides = struct {
+    openai: ?ProviderFns = null,
+    kimi: ?ProviderFns = null,
+    anthropic: ?ProviderFns = null,
+    mistral: ?ProviderFns = null,
+    openai_responses: ?ProviderFns = null,
+    azure_openai_responses: ?ProviderFns = null,
+    openai_codex_responses: ?ProviderFns = null,
+    google: ?ProviderFns = null,
+    google_gemini_cli: ?ProviderFns = null,
+    google_vertex: ?ProviderFns = null,
+    bedrock: ?ProviderFns = null,
+};
+
+var test_overrides = Overrides{};
 
 const BUILT_IN_APIS = [_]types.Api{
     "anthropic-messages",
@@ -169,43 +175,37 @@ pub fn resetLazyState() void {
 }
 
 pub fn clearProviderOverrides() void {
-    openai_override = null;
-    kimi_override = null;
-    anthropic_override = null;
-    mistral_override = null;
-    openai_responses_override = null;
-    azure_openai_responses_override = null;
-    openai_codex_responses_override = null;
-    google_override = null;
-    google_gemini_cli_override = null;
-    google_vertex_override = null;
-    bedrock_override = null;
+    if (builtin.is_test) {
+        test_overrides = .{};
+    }
     resetLazyState();
 }
 
 pub fn setProviderOverride(api: types.Api, provider: ProviderFns) BuiltInProviderError!void {
+    if (!builtin.is_test) return BuiltInProviderError.TestOnlyProviderOverrideUnavailable;
+
     if (std.mem.eql(u8, api, "openai-completions")) {
-        openai_override = provider;
+        test_overrides.openai = provider;
     } else if (std.mem.eql(u8, api, "kimi-completions")) {
-        kimi_override = provider;
+        test_overrides.kimi = provider;
     } else if (std.mem.eql(u8, api, "anthropic-messages")) {
-        anthropic_override = provider;
+        test_overrides.anthropic = provider;
     } else if (std.mem.eql(u8, api, "mistral-conversations")) {
-        mistral_override = provider;
+        test_overrides.mistral = provider;
     } else if (std.mem.eql(u8, api, "openai-responses")) {
-        openai_responses_override = provider;
+        test_overrides.openai_responses = provider;
     } else if (std.mem.eql(u8, api, "azure-openai-responses")) {
-        azure_openai_responses_override = provider;
+        test_overrides.azure_openai_responses = provider;
     } else if (std.mem.eql(u8, api, "openai-codex-responses")) {
-        openai_codex_responses_override = provider;
+        test_overrides.openai_codex_responses = provider;
     } else if (std.mem.eql(u8, api, "google-generative-ai")) {
-        google_override = provider;
+        test_overrides.google = provider;
     } else if (std.mem.eql(u8, api, "google-gemini-cli")) {
-        google_gemini_cli_override = provider;
+        test_overrides.google_gemini_cli = provider;
     } else if (std.mem.eql(u8, api, "google-vertex")) {
-        google_vertex_override = provider;
+        test_overrides.google_vertex = provider;
     } else if (std.mem.eql(u8, api, "bedrock-converse-stream")) {
-        bedrock_override = provider;
+        test_overrides.bedrock = provider;
     } else {
         return BuiltInProviderError.UnknownBuiltInApi;
     }
@@ -249,77 +249,77 @@ fn dispatchLazy(
 }
 
 fn loadOpenAIProvider() ProviderFns {
-    return openai_override orelse .{
+    return (if (builtin.is_test) test_overrides.openai else null) orelse .{
         .stream = openai.OpenAIProvider.stream,
         .stream_simple = openai.OpenAIProvider.streamSimple,
     };
 }
 
 fn loadKimiProvider() ProviderFns {
-    return kimi_override orelse .{
+    return (if (builtin.is_test) test_overrides.kimi else null) orelse .{
         .stream = kimi.KimiProvider.stream,
         .stream_simple = kimi.KimiProvider.streamSimple,
     };
 }
 
 fn loadAnthropicProvider() ProviderFns {
-    return anthropic_override orelse .{
+    return (if (builtin.is_test) test_overrides.anthropic else null) orelse .{
         .stream = anthropic.AnthropicProvider.stream,
         .stream_simple = anthropic.AnthropicProvider.streamSimple,
     };
 }
 
 fn loadMistralProvider() ProviderFns {
-    return mistral_override orelse .{
+    return (if (builtin.is_test) test_overrides.mistral else null) orelse .{
         .stream = mistral.MistralProvider.stream,
         .stream_simple = mistral.MistralProvider.streamSimple,
     };
 }
 
 fn loadOpenAIResponsesProvider() ProviderFns {
-    return openai_responses_override orelse .{
+    return (if (builtin.is_test) test_overrides.openai_responses else null) orelse .{
         .stream = openai_responses.OpenAIResponsesProvider.stream,
         .stream_simple = openai_responses.OpenAIResponsesProvider.streamSimple,
     };
 }
 
 fn loadAzureOpenAIResponsesProvider() ProviderFns {
-    return azure_openai_responses_override orelse .{
+    return (if (builtin.is_test) test_overrides.azure_openai_responses else null) orelse .{
         .stream = azure_openai_responses.AzureOpenAIResponsesProvider.stream,
         .stream_simple = azure_openai_responses.AzureOpenAIResponsesProvider.streamSimple,
     };
 }
 
 fn loadOpenAICodexResponsesProvider() ProviderFns {
-    return openai_codex_responses_override orelse .{
+    return (if (builtin.is_test) test_overrides.openai_codex_responses else null) orelse .{
         .stream = openai_codex_responses.OpenAICodexResponsesProvider.stream,
         .stream_simple = openai_codex_responses.OpenAICodexResponsesProvider.streamSimple,
     };
 }
 
 fn loadGoogleProvider() ProviderFns {
-    return google_override orelse .{
+    return (if (builtin.is_test) test_overrides.google else null) orelse .{
         .stream = google.GoogleProvider.stream,
         .stream_simple = google.GoogleProvider.streamSimple,
     };
 }
 
 fn loadGoogleGeminiCliProvider() ProviderFns {
-    return google_gemini_cli_override orelse .{
+    return (if (builtin.is_test) test_overrides.google_gemini_cli else null) orelse .{
         .stream = google_gemini_cli.GoogleGeminiCliProvider.stream,
         .stream_simple = google_gemini_cli.GoogleGeminiCliProvider.streamSimple,
     };
 }
 
 fn loadGoogleVertexProvider() ProviderFns {
-    return google_vertex_override orelse .{
+    return (if (builtin.is_test) test_overrides.google_vertex else null) orelse .{
         .stream = google_vertex.GoogleVertexProvider.stream,
         .stream_simple = google_vertex.GoogleVertexProvider.streamSimple,
     };
 }
 
 fn loadBedrockProvider() ProviderFns {
-    return bedrock_override orelse .{
+    return (if (builtin.is_test) test_overrides.bedrock else null) orelse .{
         .stream = bedrock.BedrockProvider.stream,
         .stream_simple = bedrock.BedrockProvider.streamSimple,
     };
@@ -911,6 +911,29 @@ test "lazy wrapper loads provider on first stream call" {
     const result = stream_instance.result().?;
     try std.testing.expectEqualStrings("lazy provider response", result.content[0].text.text);
     try std.testing.expect(!isLoaded("anthropic-messages"));
+}
+
+test "provider override fixture clears between same-process uses" {
+    clearProviderOverrides();
+    defer clearProviderOverrides();
+
+    try setProviderOverride("openai-completions", .{
+        .stream = dummyLazyStream,
+        .stream_simple = dummyLazyStream,
+    });
+    try std.testing.expect(test_overrides.openai != null);
+    try std.testing.expect(test_overrides.kimi == null);
+
+    clearProviderOverrides();
+    try std.testing.expect(test_overrides.openai == null);
+    try std.testing.expect(!isLoaded("openai-completions"));
+
+    try setProviderOverride("kimi-completions", .{
+        .stream = dummyLazyStream,
+        .stream_simple = dummyLazyStream,
+    });
+    try std.testing.expect(test_overrides.openai == null);
+    try std.testing.expect(test_overrides.kimi != null);
 }
 
 test "cross-provider handoff payload builders accept tool and thinking contexts" {

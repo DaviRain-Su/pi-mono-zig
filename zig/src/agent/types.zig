@@ -119,17 +119,20 @@ pub const StreamFn = *const fn (
     model: ai.Model,
     context: ai.Context,
     options: ?ai.types.SimpleStreamOptions,
+    stream_context: ?*anyopaque,
 ) anyerror!ai.event_stream.AssistantMessageEventStream;
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
     messages: []const AgentMessage,
+    convert_context: ?*anyopaque,
 ) anyerror![]ai.Message;
 
 pub const TransformContextFn = *const fn (
     allocator: std.mem.Allocator,
     messages: []const AgentMessage,
     signal: ?*const std.atomic.Value(bool),
+    transform_context: ?*anyopaque,
 ) anyerror![]AgentMessage;
 
 pub const PendingMessagesFn = *const fn (
@@ -146,7 +149,10 @@ pub const AgentLoopConfig = struct {
     before_tool_call: ?BeforeToolCallFn = null,
     after_tool_call: ?AfterToolCallFn = null,
     convert_to_llm: ConvertToLlmFn,
+    convert_to_llm_context: ?*anyopaque = null,
     transform_context: ?TransformContextFn = null,
+    transform_context_context: ?*anyopaque = null,
+    stream_context: ?*anyopaque = null,
     get_steering_messages_context: ?*anyopaque = null,
     get_steering_messages: ?PendingMessagesFn = null,
     get_follow_up_messages_context: ?*anyopaque = null,
