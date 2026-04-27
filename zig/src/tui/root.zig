@@ -10,6 +10,7 @@ pub const terminal = @import("terminal.zig");
 pub const test_helpers = @import("test_helpers.zig");
 pub const theme = @import("theme.zig");
 pub const tui = @import("tui.zig");
+pub const visual_parity = @import("visual_parity.zig");
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -86,6 +87,7 @@ test {
     _ = @import("test_helpers.zig");
     _ = @import("theme.zig");
     _ = @import("tui.zig");
+    _ = @import("visual_parity.zig");
     _ = @import("components/autocomplete.zig");
     _ = @import("components/text.zig");
     _ = @import("components/box.zig");

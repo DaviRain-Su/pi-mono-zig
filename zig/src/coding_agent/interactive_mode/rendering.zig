@@ -2885,3 +2885,83 @@ test "borrowed lines component draws stored cell rows without ansi strings" {
     try tui.test_helpers.expectCell(&screen, 1, 0, "B", .{});
     try tui.test_helpers.expectCell(&screen, 0, 1, "C", .{});
 }
+
+test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const model = ai.model_registry.find("faux", "faux-1").?;
+    try state.setFooterDetails(model, "m8-session.jsonl", "zig-implementation", "Faux", "env");
+    try state.setStatus("streaming");
+    try state.appendMarkdown("# M8 heading\n\n- list item\n\n`inline` code");
+    try state.appendInfo("Tool read: {\"path\":\"note.txt\"}");
+    try state.appendQueuedMessage(.steering, "queued during compaction");
+    try state.appendQueuedMessage(.follow_up, "queued follow-up");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("pending prompt");
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 14,
+        .keybindings = &keybindings,
+    };
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 160, .height = 14 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackend(allocator, &screen_component, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "M8 heading"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Tool read:"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Input: pending prompt"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S sessions"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+V paste image"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Faux"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
+}
+
+test "vaxis m8 visual parity snapshot covers overlay composition" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setStatus("overlay open");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 16,
+        .keybindings = &keybindings,
+    };
+
+    var overlay = try overlays.loadHotkeysOverlay(allocator, &keybindings);
+    defer overlay.deinit(allocator);
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 100, .height = 16 } };
+    defer backend.deinit(allocator);
+
+    var lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen_component, &overlay, &backend);
+    defer freeLinesSafe(allocator, &lines);
+
+    try std.testing.expect(renderedLinesContain(lines.items, "Keyboard shortcuts"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+P"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S"));
+}

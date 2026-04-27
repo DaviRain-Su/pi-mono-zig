@@ -139,6 +139,28 @@ pub fn build(b: *std.Build) void {
     cross_area_test_step.dependOn(external_tool_check_step);
     cross_area_test_step.dependOn(&cross_area_tests.step);
 
+    const vaxis_m8_tests = b.addSystemCommand(&.{"bash"});
+    vaxis_m8_tests.addFileArg(b.path("test/vaxis-m8-e2e.sh"));
+    vaxis_m8_tests.step.dependOn(b.getInstallStep());
+
+    const vaxis_m8_test_step = b.step("test-vaxis-m8-e2e", "Run vaxis M8 tuistory integration tests");
+    vaxis_m8_test_step.dependOn(external_tool_check_step);
+    vaxis_m8_test_step.dependOn(&vaxis_m8_tests.step);
+
+    const coding_agent_rendering_mod = b.createModule(.{
+        .root_source_file = b.path("src/coding_agent/interactive_mode_rendering_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    coding_agent_rendering_mod.addImport("ai", ai_mod);
+    coding_agent_rendering_mod.addImport("agent", agent_mod);
+    coding_agent_rendering_mod.addImport("tui", tui_mod);
+
+    const coding_agent_rendering_tests = b.addTest(.{
+        .root_module = coding_agent_rendering_mod,
+    });
+    const run_coding_agent_rendering_tests = b.addRunArtifact(coding_agent_rendering_tests);
+
     const tui_tests = b.addTest(.{
         .root_module = tui_mod,
     });
@@ -148,6 +170,7 @@ pub fn build(b: *std.Build) void {
     const tui_test_step = b.step("test-tui", "Run TUI unit tests only");
     tui_test_step.dependOn(external_tool_check_step);
     tui_test_step.dependOn(&run_tui_tests.step);
+    tui_test_step.dependOn(&run_coding_agent_rendering_tests.step);
 }
 
 fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
