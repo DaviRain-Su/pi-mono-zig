@@ -365,7 +365,11 @@ pub fn runInteractiveMode(
             }
         }
 
-        try renderer.renderToVaxis(screen.component(), &vaxis_adapter);
+        if (overlay == null) {
+            try renderer.renderToVaxis(screen.drawComponent(), &vaxis_adapter);
+        } else {
+            try renderer.renderToVaxis(screen.component(), &vaxis_adapter);
+        }
 
         if (should_exit and !prompt_worker_active) break;
 

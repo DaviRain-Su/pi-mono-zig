@@ -1,9 +1,13 @@
 const std = @import("std");
 const autocomplete = @import("autocomplete.zig");
+const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
+const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
 const select_list = @import("select_list.zig");
+const style_mod = @import("../style.zig");
+const test_helpers = @import("../test_helpers.zig");
 const resources_mod = @import("../theme.zig");
 
 pub const HandleResult = enum {
@@ -26,6 +30,7 @@ pub const Editor = struct {
     cursor: usize = 0,
     padding_x: usize = 0,
     padding_y: usize = 0,
+    cursor_shape: vaxis.Cell.CursorShape = .beam_blink,
     theme: ?*const resources_mod.Theme = null,
     autocomplete_catalog: std.ArrayList(select_list.SelectItem) = .empty,
     autocomplete_matches: []select_list.SelectItem = &.{},
@@ -47,6 +52,13 @@ pub const Editor = struct {
         return .{
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    pub fn drawComponent(self: *const Editor) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
         };
     }
 
@@ -107,6 +119,25 @@ pub const Editor = struct {
     ) std.mem.Allocator.Error!void {
         const list = self.autocomplete_list orelse return;
         try list.renderInto(allocator, width, lines);
+    }
+
+    pub fn drawAutocomplete(
+        self: *const Editor,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const list = self.autocomplete_list orelse {
+            window.clear();
+            return .{ .width = window.width, .height = 0 };
+        };
+        return list.draw(window, ctx);
+    }
+
+    pub fn drawAutocompleteComponent(self: *const Editor) draw_mod.Component {
+        return .{
+            .ptr = self,
+            .drawFn = drawAutocompleteOpaque,
+        };
     }
 
     pub fn setTheme(self: *Editor, theme: ?*const resources_mod.Theme) void {
@@ -261,6 +292,57 @@ pub const Editor = struct {
         }
     }
 
+    pub fn draw(
+        self: *const Editor,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const active_theme = ctx.theme orelse self.theme;
+        const base_style = if (active_theme) |theme|
+            style_mod.styleFor(theme, .editor)
+        else
+            vaxis.Cell.Style{};
+
+        window.fill(.{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = base_style,
+        });
+
+        const content_window = innerWindow(window, self.padding_x, self.padding_y) orelse {
+            return .{
+                .width = window.width,
+                .height = @min(window.height, @as(u16, @intCast(self.padding_y * 2 + 1))),
+            };
+        };
+
+        if (self.buffer.items.len > 0) {
+            _ = content_window.printSegment(.{
+                .text = self.buffer.items,
+                .style = base_style,
+            }, .{ .wrap = .grapheme });
+        }
+
+        const cursor = measureCursor(self.buffer.items, self.cursor, content_window, base_style);
+        const text_height = @max(
+            measureRenderedHeight(self.buffer.items, content_window, base_style),
+            @as(usize, cursor.row) + 1,
+        );
+        content_window.showCursor(cursor.col, cursor.row);
+        content_window.setCursorShape(self.cursor_shape);
+
+        const total_height = @min(
+            window.height,
+            @as(u16, @intCast(@min(
+                @as(usize, std.math.maxInt(u16)),
+                self.padding_y * 2 + text_height,
+            ))),
+        );
+        return .{
+            .width = window.width,
+            .height = total_height,
+        };
+    }
+
     pub fn renderTextInto(
         self: *const Editor,
         allocator: std.mem.Allocator,
@@ -333,6 +415,24 @@ pub const Editor = struct {
     ) std.mem.Allocator.Error!void {
         const self: *const Editor = @ptrCast(@alignCast(ptr));
         try self.renderInto(allocator, width, lines);
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const Editor = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
+    }
+
+    fn drawAutocompleteOpaque(
+        ptr: *const anyopaque,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+    ) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const Editor = @ptrCast(@alignCast(ptr));
+        return self.drawAutocomplete(window, ctx);
     }
 
     fn insertSlice(self: *Editor, slice: []const u8) !void {
@@ -610,6 +710,65 @@ pub const Editor = struct {
     }
 };
 
+fn innerWindow(window: vaxis.Window, padding_x: usize, padding_y: usize) ?vaxis.Window {
+    const pad_x: u16 = @intCast(@min(padding_x, window.width));
+    const pad_y: u16 = @intCast(@min(padding_y, window.height));
+    if (window.width <= pad_x * 2 or window.height <= pad_y * 2) return null;
+    return window.child(.{
+        .x_off = @intCast(pad_x),
+        .y_off = @intCast(pad_y),
+        .width = window.width - pad_x * 2,
+        .height = window.height - pad_y * 2,
+    });
+}
+
+const MeasuredCursor = struct {
+    col: u16,
+    row: u16,
+};
+
+fn measureRenderedHeight(text: []const u8, window: vaxis.Window, style: vaxis.Cell.Style) usize {
+    if (text.len == 0) return 1;
+    const result = window.printSegment(.{
+        .text = text,
+        .style = style,
+    }, .{
+        .wrap = .grapheme,
+        .commit = false,
+    });
+    if (result.overflow) return window.height;
+    return @max(@as(usize, 1), @as(usize, result.row) + 1);
+}
+
+fn measureCursor(text: []const u8, cursor_index: usize, window: vaxis.Window, style: vaxis.Cell.Style) MeasuredCursor {
+    if (text.len == 0) return .{ .col = 0, .row = 0 };
+    const clamped = @min(cursor_index, text.len);
+    if (clamped == 0) return .{ .col = 0, .row = 0 };
+    const result = window.printSegment(.{
+        .text = text[0..clamped],
+        .style = style,
+    }, .{
+        .wrap = .grapheme,
+        .commit = false,
+    });
+    if (result.col >= window.width and window.width > 0) {
+        if (result.row + 1 < window.height) {
+            return .{
+                .col = 0,
+                .row = result.row + 1,
+            };
+        }
+        return .{
+            .col = window.width - 1,
+            .row = @min(result.row, window.height - 1),
+        };
+    }
+    return .{
+        .col = result.col,
+        .row = @min(result.row, if (window.height == 0) 0 else window.height - 1),
+    };
+}
+
 fn appendWrappedLogicalLine(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -868,7 +1027,30 @@ fn isAutocompleteDelimiter(byte: u8) bool {
     };
 }
 
-test "editor accepts typed characters and renders content" {
+fn renderEditorWithCursor(editor: *const Editor, width: usize, height: usize) !vaxis.Screen {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = @intCast(@max(height, 1)),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    errdefer screen.deinit(std.testing.allocator);
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    _ = try editor.draw(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+        .theme = editor.theme,
+    });
+    return screen;
+}
+
+test "editor accepts typed characters and renders content with a native cursor" {
     const allocator = std.testing.allocator;
 
     var editor = Editor.init(allocator);
@@ -884,14 +1066,18 @@ test "editor accepts typed characters and renders content" {
     try std.testing.expectEqualStrings("hello", editor.text());
     try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 5 }, editor.cursorPosition());
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try editor.renderInto(allocator, 8, &lines);
+    var screen = try renderEditorWithCursor(&editor, 8, 1);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 8), ansi.visibleWidth(lines.items[0]));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "\x1b[7m \x1b[0m") != null);
+    try std.testing.expect(screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 0), screen.cursor.row);
+    try std.testing.expectEqual(@as(u16, 5), screen.cursor.col);
+    try std.testing.expectEqual(vaxis.Cell.CursorShape.beam_blink, screen.cursor_shape);
+
+    var rendered = try test_helpers.renderToScreen(editor.drawComponent(), 8, 1);
+    defer rendered.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&rendered, 0, 0, "h", .{});
+    try test_helpers.expectCell(&rendered, 4, 0, "o", .{});
 }
 
 test "editor cursor moves with arrow keys" {
@@ -1067,12 +1253,12 @@ test "editor shows fuzzy-ranked autocomplete suggestions as user types" {
     try std.testing.expect(editor.isShowingAutocomplete());
     try std.testing.expectEqualStrings("read", editor.selectedAutocompleteItem().?.value);
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try editor.renderInto(allocator, 16, &lines);
+    var screen = try test_helpers.renderToScreen(editor.drawAutocompleteComponent(), 16, 4);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expect(lines.items.len >= 2);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "read") != null);
+    const selected = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("r", selected.char.grapheme);
+    try std.testing.expect(selected.style.reverse);
 }
 
 test "editor autocomplete navigates suggestions and applies tab selection" {
@@ -1176,7 +1362,7 @@ test "editor inserts bracketed paste content as a single edit" {
     try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 5 }, editor.cursorPosition());
 }
 
-test "editor renders wrapped multi-line content and tracks wide cursor columns" {
+test "editor renders wrapped multi-line content, wide graphemes, and native cursor position" {
     const allocator = std.testing.allocator;
 
     var editor = Editor.init(allocator);
@@ -1185,16 +1371,22 @@ test "editor renders wrapped multi-line content and tracks wide cursor columns" 
     try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("ab你好🙂\nxy"));
     try std.testing.expectEqual(CursorPosition{ .line = 1, .column = 2 }, editor.cursorPosition());
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try editor.renderTextInto(allocator, 6, &lines);
+    var cursor_screen = try renderEditorWithCursor(&editor, 6, 3);
+    defer cursor_screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqualStrings("ab你好", lines.items[0]);
-    try std.testing.expectEqual(@as(usize, 6), ansi.visibleWidth(lines.items[1]));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "🙂") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[2], "xy") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[2], "\x1b[7m \x1b[0m") != null);
+    try std.testing.expect(cursor_screen.cursor_vis);
+    try std.testing.expectEqual(@as(u16, 2), cursor_screen.cursor.row);
+    try std.testing.expectEqual(@as(u16, 2), cursor_screen.cursor.col);
+
+    var screen = try test_helpers.renderToScreen(editor.drawComponent(), 6, 3);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "a", .{});
+    try test_helpers.expectCell(&screen, 2, 0, "你", .{});
+    try test_helpers.expectCell(&screen, 4, 0, "好", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "🙂", .{});
+    try test_helpers.expectCell(&screen, 0, 2, "x", .{});
+    try test_helpers.expectCell(&screen, 1, 2, "y", .{});
 }
 
 test "editor cursor column uses display width for wide graphemes" {
@@ -1205,9 +1397,14 @@ test "editor cursor column uses display width for wide graphemes" {
 
     try std.testing.expectEqual(HandleResult.handled, try editor.handlePaste("你🙂a"));
     try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 5 }, editor.cursorPosition());
+
+    var screen = try renderEditorWithCursor(&editor, 8, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 5), screen.cursor.col);
 }
 
-test "editor applies theme colors to content and autocomplete" {
+test "editor applies theme colors to content and autocomplete without ansi parsing assertions" {
     const allocator = std.testing.allocator;
 
     var theme = try resources_mod.Theme.initDefault(allocator);
@@ -1223,13 +1420,15 @@ test "editor applies theme colors to content and autocomplete" {
 
     _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("a") });
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try editor.renderInto(allocator, 12, &lines);
+    var editor_screen = try test_helpers.renderToScreenWithTheme(editor.drawComponent(), 12, 1, &theme);
+    defer editor_screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&editor_screen, 0, 0, "a", style_mod.styleFor(&theme, .editor));
 
-    var saw_ansi = false;
-    for (lines.items) |line| {
-        if (std.mem.indexOf(u8, line, "\x1b[") != null) saw_ansi = true;
-    }
-    try std.testing.expect(saw_ansi);
+    var autocomplete_screen = try test_helpers.renderToScreenWithTheme(editor.drawAutocompleteComponent(), 12, 2, &theme);
+    defer autocomplete_screen.deinit(std.testing.allocator);
+
+    const selected = autocomplete_screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(selected.style.reverse);
+    const description = autocomplete_screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(description.style.reverse == false);
 }
