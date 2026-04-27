@@ -796,6 +796,11 @@ pub fn dispatchInputEvent(
             _ = try editor.handlePaste(content);
         },
         .protocol => |protocol| handleProtocolEvent(app_context, protocol),
+        .mouse_wheel => |wheel| {
+            if (overlay.* == null and auth_flow.* == null) {
+                app_state.handleChatMouseWheel(wheel);
+            }
+        },
     }
     consumeInputBytes(input_buffer, parsed.consumed);
 }
@@ -853,6 +858,7 @@ pub fn legacyParsedAppActionForKey(
             's' => .open_sessions,
             'p' => .open_models,
             'v' => .paste_image,
+            'g' => .chat_scroll_to_tail,
             else => null,
         },
         .escape => .exit,
@@ -907,6 +913,7 @@ pub fn handleAppAction(
         },
         .queue_follow_up, .dequeue_messages => {},
         .paste_image => {},
+        .chat_scroll_to_tail => app_state.chatScrollToTail(),
     }
 }
 
@@ -921,4 +928,5 @@ test "protocol events update kitty state through app context" {
 
 test "legacy app actions include clipboard image paste" {
     try std.testing.expectEqual(keybindings_mod.Action.paste_image, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
+    try std.testing.expectEqual(keybindings_mod.Action.chat_scroll_to_tail, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
 }

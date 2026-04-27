@@ -19,6 +19,7 @@ const ASSISTANT_THINKING_TEXT = "Thinking...";
 const formatPrefixedBlocks = formatting.formatPrefixedBlocks;
 const formatAssistantMessage = formatting.formatAssistantMessage;
 const formatToolCall = formatting.formatToolCall;
+const WHEEL_LINES_PER_NOTCH: usize = 3;
 
 pub const ChatKind = enum {
     welcome,
@@ -62,6 +63,23 @@ pub const FooterUsageTotals = struct {
     cost: f64 = 0,
 };
 
+pub const ChatRegion = struct {
+    row_start: usize = 0,
+    row_end: usize = 0,
+    col_start: usize = 0,
+    col_end: usize = 0,
+
+    pub fn contains(self: ChatRegion, row: i16, col: i16) bool {
+        if (row < 0 or col < 0) return false;
+        const row_index: usize = @intCast(row);
+        const col_index: usize = @intCast(col);
+        return row_index >= self.row_start and
+            row_index < self.row_end and
+            col_index >= self.col_start and
+            col_index < self.col_end;
+    }
+};
+
 pub const RenderStateSnapshot = struct {
     items: []ChatItem = &.{},
     status: ?[]u8 = null,
@@ -76,6 +94,7 @@ pub const RenderStateSnapshot = struct {
     queued_steering: [][]u8 = &.{},
     queued_follow_up: [][]u8 = &.{},
     pending_editor_images: []PendingEditorImage = &.{},
+    chat_scroll_offset: usize = 0,
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
         for (self.items) |item| allocator.free(item.text);
@@ -203,6 +222,9 @@ pub const AppState = struct {
     mutex: std.Io.Mutex = .init,
     items: std.ArrayList(ChatItem) = .empty,
     visible_start_index: usize = 0,
+    chat_scroll_offset: usize = 0,
+    chat_scroll_max_offset: usize = 0,
+    chat_region: ChatRegion = .{},
     last_streaming_assistant_index: ?usize = null,
     status: []u8 = &.{},
     provider_label: []u8 = &.{},
@@ -373,6 +395,7 @@ pub const AppState = struct {
             .usage_totals = self.usage_totals,
             .context_window = self.context_window,
             .context_percent = self.context_percent,
+            .chat_scroll_offset = self.chat_scroll_offset,
         };
         errdefer snapshot.deinit(allocator);
 
@@ -395,7 +418,54 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.visible_start_index = self.items.items.len;
+        self.chat_scroll_offset = 0;
         self.replaceLabelLocked(&self.status, "display cleared") catch {};
+    }
+
+    pub fn handleChatMouseWheel(self: *AppState, wheel: tui.keys.MouseWheelInput) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.chat_region.contains(wheel.row, wheel.col)) return;
+        switch (wheel.direction) {
+            .up => self.chat_scroll_offset = @min(
+                self.chat_scroll_offset +| WHEEL_LINES_PER_NOTCH,
+                self.chat_scroll_max_offset,
+            ),
+            .down => self.chat_scroll_offset = self.chat_scroll_offset -| WHEEL_LINES_PER_NOTCH,
+        }
+    }
+
+    pub fn chatScrollToTail(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.chat_scroll_offset = 0;
+    }
+
+    pub fn chatScrollClamp(self: *AppState, max_offset: usize) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.chat_scroll_offset = @min(self.chat_scroll_offset, max_offset);
+        self.chat_scroll_max_offset = max_offset;
+    }
+
+    pub fn updateChatScrollLayout(
+        self: *AppState,
+        total_chat_rows: usize,
+        visible_rows: usize,
+        row_start: usize,
+        width: usize,
+    ) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const max_offset = total_chat_rows -| visible_rows;
+        self.chat_scroll_max_offset = max_offset;
+        self.chat_scroll_offset = @min(self.chat_scroll_offset, max_offset);
+        self.chat_region = .{
+            .row_start = row_start,
+            .row_end = row_start + visible_rows,
+            .col_start = 0,
+            .col_end = width,
+        };
     }
 
     pub fn appendQueuedMessage(self: *AppState, mode: QueueDisplayMode, text: []const u8) !void {
@@ -487,6 +557,9 @@ pub const AppState = struct {
         for (self.items.items) |item| self.allocator.free(item.text);
         self.items.clearRetainingCapacity();
         self.visible_start_index = 0;
+        self.chat_scroll_offset = 0;
+        self.chat_scroll_max_offset = 0;
+        self.chat_region = .{};
         self.last_streaming_assistant_index = null;
         self.clearPendingEditorImagesLocked();
         self.clearActiveToolUpdatesLocked();
@@ -727,10 +800,12 @@ pub const AppState = struct {
     }
 
     pub fn appendItemLocked(self: *AppState, kind: ChatKind, text: []const u8) !void {
+        const was_at_tail = self.chat_scroll_offset == 0;
         try self.items.append(self.allocator, .{
             .kind = kind,
             .text = try self.allocator.dupe(u8, text),
         });
+        if (was_at_tail) self.chat_scroll_offset = 0;
     }
 
     pub fn replaceItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
@@ -971,11 +1046,16 @@ pub const ScreenComponent = struct {
         const hints_height = hintsHeightForWidth(width);
         const reserved_lines: usize = task_panel_lines.items.len + prompt_lines.items.len + queued_lines.items.len + hints_height + 1 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
+        const max_offset = chat_lines.items.len -| chat_capacity;
+        self.state.updateChatScrollLayout(chat_lines.items.len, chat_capacity, task_panel_lines.items.len, width);
         const chat_component = BorrowedLineListComponent{ .lines = chat_lines.items };
         const chat_viewport = tui.Viewport{
             .child = chat_component.component(),
             .height = chat_capacity,
             .anchor = .bottom,
+            .scroll_offset = @min(snapshot.chat_scroll_offset, max_offset),
+            .show_indicators = true,
+            .theme = self.theme,
         };
         for (task_panel_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
@@ -1047,7 +1127,8 @@ pub const ScreenComponent = struct {
         }
         row += task_panel_height;
 
-        try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity);
+        const chat_metrics = try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity, snapshot.chat_scroll_offset);
+        self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
         row += chat_capacity;
 
         if (queued_height > 0 and row < window.height) {
@@ -1541,6 +1622,11 @@ fn drawQueuedMessages(
     };
 }
 
+const ChatViewportMetrics = struct {
+    rendered_height: usize,
+    visible_height: usize,
+};
+
 fn drawChatViewport(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -1548,8 +1634,9 @@ fn drawChatViewport(
     window: tui.vaxis.Window,
     start_row: usize,
     height: usize,
-) !void {
-    if (start_row >= window.height or height == 0) return;
+    chat_scroll_offset: usize,
+) !ChatViewportMetrics {
+    if (start_row >= window.height or height == 0) return .{ .rendered_height = 0, .visible_height = 0 };
 
     const visible_height = @min(height, @as(usize, window.height) - start_row);
     const width = @max(@as(usize, window.width), 1);
@@ -1566,12 +1653,52 @@ fn drawChatViewport(
     scratch_window.clear();
     const rendered = try drawChatItems(scratch_window, allocator, theme, items);
     const rendered_height = @min(@as(usize, rendered.height), @as(usize, screen.height));
-    const src_start = rendered_height -| visible_height;
+    const max_offset = rendered_height -| visible_height;
+    const offset = @min(chat_scroll_offset, max_offset);
+    const src_start = max_offset -| offset;
     const dst = window.child(.{
         .y_off = @intCast(start_row),
         .height = @intCast(visible_height),
     });
     blitScreenRows(&screen, dst, src_start, visible_height);
+    drawChatScrollIndicators(dst, theme, src_start, rendered_height, visible_height);
+    return .{ .rendered_height = rendered_height, .visible_height = visible_height };
+}
+
+fn drawChatScrollIndicators(
+    window: tui.vaxis.Window,
+    theme: ?*const resources_mod.Theme,
+    src_start: usize,
+    rendered_height: usize,
+    visible_height: usize,
+) void {
+    if (visible_height == 0 or window.width == 0) return;
+    const style = styleForToken(theme, .status);
+    if (src_start > 0) {
+        drawChatScrollIndicator(window, 0, "↑ more", style);
+    }
+    if (src_start + visible_height < rendered_height) {
+        drawChatScrollIndicator(window, visible_height - 1, "↓ more", style);
+    }
+}
+
+fn drawChatScrollIndicator(
+    window: tui.vaxis.Window,
+    row: usize,
+    text: []const u8,
+    style: tui.vaxis.Cell.Style,
+) void {
+    if (row >= window.height) return;
+    const text_width = tui.ansi.visibleWidth(text);
+    const col = @as(usize, window.width) -| text_width;
+    _ = window.printSegment(.{
+        .text = text,
+        .style = style,
+    }, .{
+        .wrap = .none,
+        .row_offset = @intCast(row),
+        .col_offset = @intCast(col),
+    });
 }
 
 fn drawChatItems(
@@ -3485,6 +3612,108 @@ pub fn renderedLinesContain(lines: []const []const u8, needle: []const u8) bool 
         if (std.mem.indexOf(u8, line, needle) != null) return true;
     }
     return false;
+}
+
+test "chat scroll wheel updates offset only inside chat region and clamps" {
+    const allocator = std.testing.allocator;
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    state.updateChatScrollLayout(30, 10, 3, 80);
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 20), state.chat_scroll_max_offset);
+
+    state.handleChatMouseWheel(.{ .direction = .up, .row = 0, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    state.handleChatMouseWheel(.{ .direction = .up, .row = 23, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    state.handleChatMouseWheel(.{ .direction = .up, .row = 5, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 3), state.chat_scroll_offset);
+
+    for (0..10) |_| state.handleChatMouseWheel(.{ .direction = .up, .row = 5, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 20), state.chat_scroll_offset);
+
+    state.handleChatMouseWheel(.{ .direction = .down, .row = 5, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 17), state.chat_scroll_offset);
+    for (0..10) |_| state.handleChatMouseWheel(.{ .direction = .down, .row = 5, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+}
+
+test "chat scroll tail clear auto-follow and resize clamp state" {
+    const allocator = std.testing.allocator;
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    state.updateChatScrollLayout(30, 10, 3, 80);
+    state.chat_scroll_offset = 12;
+    state.chatScrollToTail();
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    try state.appendItemLocked(.info, "new tail item");
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    state.chat_scroll_offset = 8;
+    try state.appendItemLocked(.info, "preserve reader position");
+    try std.testing.expectEqual(@as(usize, 8), state.chat_scroll_offset);
+
+    state.updateChatScrollLayout(30, 25, 3, 80);
+    try std.testing.expectEqual(@as(usize, 5), state.chat_scroll_offset);
+
+    state.clearDisplay();
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    state.updateChatScrollLayout(5, 10, 3, 80);
+    state.handleChatMouseWheel(.{ .direction = .up, .row = 5, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+}
+
+test "drawChatViewport honors scroll offset and overlays overflow indicators" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var items: [30]ChatItem = undefined;
+    for (&items, 0..) |*item, index| {
+        item.* = .{
+            .kind = .info,
+            .text = try std.fmt.allocPrint(allocator, "row {d:0>2}", .{index}),
+        };
+    }
+    defer {
+        for (&items) |item| allocator.free(item.text);
+    }
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 12,
+        .cols = 40,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+
+    const metrics = try drawChatViewport(arena.allocator(), null, items[0..], window, 0, 12, 5);
+    try std.testing.expectEqual(@as(usize, 30), metrics.rendered_height);
+    try std.testing.expectEqual(@as(usize, 12), metrics.visible_height);
+
+    var rendered = try tui.vaxis.AllocatingScreen.init(allocator, 40, 12);
+    defer rendered.deinit(allocator);
+    for (0..12) |row| {
+        for (0..40) |col| {
+            const cell = screen.readCell(@intCast(col), @intCast(row)) orelse continue;
+            rendered.writeCell(@intCast(col), @intCast(row), cell);
+        }
+    }
+
+    const text = try tui.test_helpers.screenToString(&rendered);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "row 13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "row 24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "↑ more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "↓ more") != null);
 }
 
 test "renderChatItemInto renders markdown chat items without assistant prefix" {

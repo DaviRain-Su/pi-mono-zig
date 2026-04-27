@@ -79,10 +79,22 @@ pub const ProtocolEvent = union(enum) {
     kitty_keyboard: u16,
 };
 
+pub const MouseWheelDirection = enum {
+    up,
+    down,
+};
+
+pub const MouseWheelInput = struct {
+    direction: MouseWheelDirection,
+    row: i16,
+    col: i16,
+};
+
 pub const InputEvent = union(enum) {
     key: Key,
     paste: []const u8,
     protocol: ProtocolEvent,
+    mouse_wheel: MouseWheelInput,
 };
 
 pub const ParsedInput = struct {
@@ -95,6 +107,23 @@ pub const ParsedInput = struct {
 pub fn parsedPasteInput(paste: []const u8) ParsedInput {
     return .{
         .event = .{ .paste = paste },
+        .consumed = 0,
+    };
+}
+
+pub fn parsedMouseWheelInput(mouse: vaxis.Mouse) ?ParsedInput {
+    if (mouse.type != .press) return null;
+    const direction: MouseWheelDirection = switch (mouse.button) {
+        .wheel_up => .up,
+        .wheel_down => .down,
+        else => return null,
+    };
+    return .{
+        .event = .{ .mouse_wheel = .{
+            .direction = direction,
+            .row = mouse.row,
+            .col = mouse.col,
+        } },
         .consumed = 0,
     };
 }

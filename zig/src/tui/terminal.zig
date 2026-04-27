@@ -112,6 +112,8 @@ pub const Terminal = struct {
     pub const KITTY_KEYBOARD_QUERY = vaxis.ctlseqs.csi_u_query;
     pub const KITTY_KEYBOARD_ENABLE = ESC ++ "[>7u";
     pub const KITTY_KEYBOARD_DISABLE = vaxis.ctlseqs.csi_u_pop;
+    pub const MOUSE_ENABLE = ESC ++ "[?1002h" ++ ESC ++ "[?1006h";
+    pub const MOUSE_DISABLE = ESC ++ "[?1006l" ++ ESC ++ "[?1002l";
     pub const SYNC_OUTPUT_ENABLE = vaxis.ctlseqs.sync_set;
     pub const SYNC_OUTPUT_DISABLE = vaxis.ctlseqs.sync_reset;
     pub const HIDE_CURSOR = vaxis.ctlseqs.hide_cursor;
@@ -142,8 +144,8 @@ pub const Terminal = struct {
                 try backend.enterRawMode();
                 errdefer backend.restoreMode() catch {};
 
-                try backend.write(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR ++ AUTO_WRAP_DISABLE ++ KITTY_KEYBOARD_QUERY ++ KITTY_KEYBOARD_ENABLE);
-                errdefer backend.write(AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
+                try backend.write(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR ++ AUTO_WRAP_DISABLE ++ KITTY_KEYBOARD_QUERY ++ KITTY_KEYBOARD_ENABLE ++ MOUSE_ENABLE);
+                errdefer backend.write(MOUSE_DISABLE ++ AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
 
                 self.current_size = try backend.getSize();
             },
@@ -152,12 +154,12 @@ pub const Terminal = struct {
                 errdefer native.stop();
 
                 const writer = try native.writer();
-                try writer.writeAll(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR ++ AUTO_WRAP_DISABLE ++ KITTY_KEYBOARD_QUERY ++ KITTY_KEYBOARD_ENABLE);
+                try writer.writeAll(ALT_SCREEN_ENABLE ++ BRACKETED_PASTE_ENABLE ++ HIDE_CURSOR ++ AUTO_WRAP_DISABLE ++ KITTY_KEYBOARD_QUERY ++ KITTY_KEYBOARD_ENABLE ++ MOUSE_ENABLE);
                 try writer.flush();
                 errdefer {
                     const stop_writer = native.writer() catch null;
                     if (stop_writer) |w| {
-                        w.writeAll(AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
+                        w.writeAll(MOUSE_DISABLE ++ AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
                         w.flush() catch {};
                     }
                 }
@@ -175,13 +177,13 @@ pub const Terminal = struct {
 
         switch (self.state) {
             .backend => |backend| {
-                backend.write(AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
+                backend.write(MOUSE_DISABLE ++ AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
                 backend.restoreMode() catch {};
             },
             .native => |*native| {
                 const writer = native.writer() catch null;
                 if (writer) |tty_writer| {
-                    tty_writer.writeAll(AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
+                    tty_writer.writeAll(MOUSE_DISABLE ++ AUTO_WRAP_ENABLE ++ ALT_SCREEN_DISABLE ++ BRACKETED_PASTE_DISABLE ++ KITTY_KEYBOARD_DISABLE ++ SHOW_CURSOR) catch {};
                     tty_writer.flush() catch {};
                 }
                 native.stop();
@@ -249,6 +251,7 @@ pub const LoopEvent = union(enum) {
     paste_start,
     paste_end,
     paste: []const u8,
+    mouse: vaxis.Mouse,
 };
 
 pub const InputLoopResult = struct {
@@ -362,6 +365,10 @@ fn processLoopEvent(
                 .parsed = keys.parsedPasteInput(text),
                 .owned_paste = text,
             };
+        },
+        .mouse => |mouse| {
+            const parsed = keys.parsedMouseWheelInput(mouse) orelse return null;
+            return .{ .parsed = parsed };
         },
     }
 }
@@ -532,6 +539,54 @@ test "processLoopEvent forwards owned libvaxis paste events" {
     }, result.parsed);
 }
 
+test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
+    comptime try std.testing.expect(@hasField(LoopEvent, "mouse"));
+
+    var paste_buffer = std.ArrayList(u8).empty;
+    defer paste_buffer.deinit(std.testing.allocator);
+    var paste_active = false;
+
+    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 4,
+            .row = 5,
+            .button = .left,
+            .mods = .{},
+            .type = .press,
+        },
+    })) == null);
+
+    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 4,
+            .row = 5,
+            .button = .wheel_up,
+            .mods = .{},
+            .type = .release,
+        },
+    })) == null);
+
+    const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 7,
+            .row = 8,
+            .button = .wheel_up,
+            .mods = .{},
+            .type = .press,
+        },
+    })).?;
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_wheel = .{
+            .direction = .up,
+            .row = 8,
+            .col = 7,
+        } },
+        .consumed = 0,
+    }, result.parsed);
+}
+
 test "terminal enters raw mode on startup and restores on exit" {
     var backend = MockBackend{};
     defer backend.deinit(std.testing.allocator);
@@ -542,18 +597,23 @@ test "terminal enters raw mode on startup and restores on exit" {
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(terminal.raw_mode_enabled);
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
+        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE,
         backend.writes.items[0],
     );
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1002h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1006h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1003h") == null);
 
     terminal.stop();
 
     try std.testing.expect(backend.restored);
     try std.testing.expect(!terminal.raw_mode_enabled);
     try std.testing.expectEqualStrings(
-        Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
+        Terminal.MOUSE_DISABLE ++ Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         backend.writes.items[1],
     );
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1006l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1002l") != null);
 }
 
 test "terminal restores terminal modes when startup fails after entering alternate screen" {
@@ -569,11 +629,11 @@ test "terminal restores terminal modes when startup fails after entering alterna
     try std.testing.expect(!terminal.raw_mode_enabled);
     try std.testing.expectEqual(@as(usize, 2), backend.writes.items.len);
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
+        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE,
         backend.writes.items[0],
     );
     try std.testing.expectEqualStrings(
-        Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
+        Terminal.MOUSE_DISABLE ++ Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         backend.writes.items[1],
     );
 }

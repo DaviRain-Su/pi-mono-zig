@@ -180,16 +180,33 @@ do
   T_PROJECT="$TMP_ROOT/terminal-$name/project"
   T_HOME="$TMP_ROOT/terminal-$name/home"
   T_AGENT="$TMP_ROOT/terminal-$name/agent"
+  SCROLL_RESPONSE="$(python3 - "$name" <<'PY'
+import sys
+name = sys.argv[1]
+for i in range(1, 46):
+    print(f"{name} scroll line {i:02d}")
+    print()
+print(f"{name} scroll tail")
+PY
+)"
   launch_interactive "$T_PROJECT" "$T_HOME" "$T_AGENT" \
     --env "TERM=$term" \
     --env "TERM_PROGRAM=$term_program" \
-    --env "PI_FAUX_RESPONSE=$name smoke ok"
+    --env "PI_FAUX_RESPONSE=$SCROLL_RESPONSE"
   tuistory -s "$SESSION" type "$name smoke"
   tuistory -s "$SESSION" press enter
-  tuistory -s "$SESSION" wait "$name smoke ok" --timeout 8000
+  tuistory -s "$SESSION" wait "$name scroll tail" --timeout 8000
   terminal_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-  snapshot_contains "$terminal_snapshot" "$name smoke ok"
+  snapshot_contains "$terminal_snapshot" "$name scroll tail"
   snapshot_contains "$terminal_snapshot" "$badge"
+  tuistory -s "$SESSION" scroll --x 10 --y 6 up 6
+  tuistory -s "$SESSION" wait-idle --timeout 3000
+  scrolled_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+  snapshot_contains "$scrolled_snapshot" "↓ more"
+  tuistory -s "$SESSION" press ctrl g
+  tuistory -s "$SESSION" wait-idle --timeout 3000
+  tail_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+  snapshot_contains "$tail_snapshot" "$name scroll tail"
   tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 done
 
