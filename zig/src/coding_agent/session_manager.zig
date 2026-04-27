@@ -9,6 +9,10 @@ pub const BRANCH_SUMMARY_PREFIX =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 pub const BRANCH_SUMMARY_SUFFIX = "</summary>";
 
+/// Process-wide monotonic counter used as entropy for generated session entry
+/// IDs. It intentionally remains global so IDs keep increasing across all
+/// session managers created in this process, and the atomic value keeps that
+/// invariant safe when concurrent prompts append session records.
 var global_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 pub const SessionHeader = struct {

@@ -283,6 +283,17 @@ fn mapThinkingLevel(level: types.ThinkingLevel) ?ai.types.ThinkingLevel {
     };
 }
 
+fn streamSimpleForAgentLoop(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    context: ai.Context,
+    options: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    return try ai.streamSimple(allocator, io, model, context, options);
+}
+
 fn streamAssistantResponse(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -294,11 +305,11 @@ fn streamAssistantResponse(
     stream_fn: ?types.StreamFn,
 ) !ai.AssistantMessage {
     const transformed_messages = if (config.transform_context) |transform|
-        try transform(allocator, context.messages, signal)
+        try transform(allocator, context.messages, signal, config.transform_context_context)
     else
         context.messages;
 
-    const llm_messages = try config.convert_to_llm(allocator, transformed_messages);
+    const llm_messages = try config.convert_to_llm(allocator, transformed_messages, config.convert_to_llm_context);
 
     const llm_tools = if (context.tools.len > 0)
         try convertToolsToLlm(allocator, context.tools)
@@ -317,8 +328,8 @@ fn streamAssistantResponse(
         .reasoning = if (config.reasoning) |reasoning| mapThinkingLevel(reasoning) else null,
     };
 
-    const active_stream_fn = stream_fn orelse ai.streamSimple;
-    var stream = try active_stream_fn(allocator, io, config.model, llm_context, options);
+    const active_stream_fn = stream_fn orelse streamSimpleForAgentLoop;
+    var stream = try active_stream_fn(allocator, io, config.model, llm_context, options, config.stream_context);
     defer stream.deinit();
 
     var partial_template: ?ai.AssistantMessage = null;
@@ -1116,6 +1127,7 @@ fn captureEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
 fn defaultConvertToLlmForTest(
     allocator: std.mem.Allocator,
     messages: []const types.AgentMessage,
+    _: ?*anyopaque,
 ) ![]ai.Message {
     return try allocator.dupe(ai.Message, messages);
 }
@@ -1232,7 +1244,9 @@ const ToolResultContentCapture = struct {
     text_len: usize = 0,
 };
 
-var active_tool_result_content_capture: ?*ToolResultContentCapture = null;
+const ToolResultContentCaptureFixture = struct {
+    capture: ToolResultContentCapture = .{},
+};
 
 fn capturingEchoToolExecute(
     allocator: std.mem.Allocator,
@@ -1244,13 +1258,13 @@ fn capturingEchoToolExecute(
     on_update: ?types.AgentToolUpdateCallback,
 ) !types.AgentToolResult {
     const result = try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
-    const capture = active_tool_result_content_capture orelse return result;
+    const fixture: *ToolResultContentCaptureFixture = @ptrCast(@alignCast(tool_context orelse return result));
 
-    capture.content_ptr = result.content.ptr;
+    fixture.capture.content_ptr = result.content.ptr;
     switch (result.content[0]) {
         .text => |text| {
-            capture.text_ptr = text.text.ptr;
-            capture.text_len = text.text.len;
+            fixture.capture.text_ptr = text.text.ptr;
+            fixture.capture.text_len = text.text.len;
         },
         else => return error.UnexpectedToolResultContent,
     }
@@ -1339,6 +1353,7 @@ fn ignoreEvent(_: ?*anyopaque, _: types.AgentEvent) !void {}
 fn passthroughConvertToLlmForTest(
     _: std.mem.Allocator,
     messages: []const types.AgentMessage,
+    _: ?*anyopaque,
 ) ![]ai.Message {
     return @constCast(messages);
 }
@@ -1349,6 +1364,7 @@ fn ownedDeltaStreamForAgentLoopTest(
     model: ai.Model,
     _: ai.Context,
     _: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
     const result_allocator = std.heap.page_allocator;
     const text = try result_allocator.dupe(u8, "streamed response");
@@ -1391,6 +1407,7 @@ fn toolCallStreamForAgentLoopTest(
     model: ai.Model,
     _: ai.Context,
     _: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
     const result_allocator = std.heap.page_allocator;
     var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
@@ -1425,7 +1442,9 @@ fn toolCallStreamForAgentLoopTest(
     return stream;
 }
 
-var block_execute_count: usize = 0;
+const CountedToolFixture = struct {
+    execute_count: usize = 0,
+};
 
 fn echoToolExecute(
     allocator: std.mem.Allocator,
@@ -1452,7 +1471,8 @@ fn countedEchoToolExecute(
     on_update_context: ?*anyopaque,
     on_update: ?types.AgentToolUpdateCallback,
 ) !types.AgentToolResult {
-    block_execute_count += 1;
+    const fixture: *CountedToolFixture = @ptrCast(@alignCast(tool_context orelse return error.MissingCountedToolFixture));
+    fixture.execute_count += 1;
     return try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
 }
 
@@ -1474,18 +1494,16 @@ const ParallelObservation = struct {
     parallel_observed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
-var active_parallel_observation: ?*ParallelObservation = null;
-
 fn parallelAwareEchoToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     params: std.json.Value,
-    _: ?*anyopaque,
+    tool_context: ?*anyopaque,
     _: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?types.AgentToolUpdateCallback,
 ) !types.AgentToolResult {
-    const observation = active_parallel_observation orelse return error.MissingParallelObservation;
+    const observation: *ParallelObservation = @ptrCast(@alignCast(tool_context orelse return error.MissingParallelObservation));
     const value = try getStringArg(params, "value");
     if (std.mem.eql(u8, value, "first")) {
         yieldForIterations(50_000);
@@ -1949,15 +1967,16 @@ test "runAgentLoop executes multiple tool calls in parallel and emits tool resul
         .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
     });
 
-    var observation = ParallelObservation{};
-    active_parallel_observation = &observation;
-    defer active_parallel_observation = null;
+    const observation = try std.testing.allocator.create(ParallelObservation);
+    defer std.testing.allocator.destroy(observation);
+    observation.* = .{};
 
     const tool = types.AgentTool{
         .name = "echo",
         .description = "Echo input",
         .label = "Echo",
         .parameters = .null,
+        .execute_context = observation,
         .execute = parallelAwareEchoToolExecute,
     };
 
@@ -2018,17 +2037,18 @@ test "executeToolCallsParallel returns tool result content that survives task ar
         .arguments = tool_args,
     };
 
+    const fixture = try std.testing.allocator.create(ToolResultContentCaptureFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
     const tool = types.AgentTool{
         .name = "echo",
         .description = "Echo input",
         .label = "Echo",
         .parameters = .null,
+        .execute_context = fixture,
         .execute = capturingEchoToolExecute,
     };
-
-    var capture = ToolResultContentCapture{};
-    active_tool_result_content_capture = &capture;
-    defer active_tool_result_content_capture = null;
 
     const results = try executeToolCallsParallel(
         std.testing.allocator,
@@ -2075,12 +2095,12 @@ test "executeToolCallsParallel returns tool result content that survives task ar
     }
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expect(capture.content_ptr != null);
-    try std.testing.expect(capture.text_ptr != null);
+    try std.testing.expect(fixture.capture.content_ptr != null);
+    try std.testing.expect(fixture.capture.text_ptr != null);
 
     const scratch_blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
     defer std.testing.allocator.free(scratch_blocks);
-    const scratch_text = try std.testing.allocator.alloc(u8, capture.text_len);
+    const scratch_text = try std.testing.allocator.alloc(u8, fixture.capture.text_len);
     defer std.testing.allocator.free(scratch_text);
     @memset(scratch_text, 'x');
     scratch_blocks[0] = .{
@@ -2089,8 +2109,8 @@ test "executeToolCallsParallel returns tool result content that survives task ar
         },
     };
 
-    try std.testing.expect(results[0].content.ptr != capture.content_ptr.?);
-    try std.testing.expect(results[0].content[0].text.text.ptr != capture.text_ptr.?);
+    try std.testing.expect(results[0].content.ptr != fixture.capture.content_ptr.?);
+    try std.testing.expect(results[0].content[0].text.text.ptr != fixture.capture.text_ptr.?);
     try std.testing.expectEqualStrings("echoed: hello", results[0].content[0].text.text);
 }
 
@@ -2256,15 +2276,16 @@ test "runAgentLoop executes tool calls sequentially when configured" {
         .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
     });
 
-    var observation = ParallelObservation{};
-    active_parallel_observation = &observation;
-    defer active_parallel_observation = null;
+    const observation = try std.testing.allocator.create(ParallelObservation);
+    defer std.testing.allocator.destroy(observation);
+    observation.* = .{};
 
     const tool = types.AgentTool{
         .name = "echo",
         .description = "Echo input",
         .label = "Echo",
         .parameters = .null,
+        .execute_context = observation,
         .execute = parallelAwareEchoToolExecute,
     };
 
@@ -2353,12 +2374,15 @@ test "runAgentLoop lets beforeToolCall block execution" {
         .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
     });
 
-    block_execute_count = 0;
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
     const tool = types.AgentTool{
         .name = "echo",
         .description = "Echo input",
         .label = "Echo",
         .parameters = .null,
+        .execute_context = fixture,
         .execute = countedEchoToolExecute,
     };
 
@@ -2383,7 +2407,7 @@ test "runAgentLoop lets beforeToolCall block execution" {
         null,
     );
 
-    try std.testing.expectEqual(@as(usize, 0), block_execute_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
     try std.testing.expect(result[2].tool_result.is_error);
     try std.testing.expectEqualStrings("blocked by hook", result[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("continued", result[3].assistant.content[0].text.text);

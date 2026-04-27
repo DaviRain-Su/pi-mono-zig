@@ -120,8 +120,11 @@ pub const AgentOptions = struct {
     tool_execution: types.ToolExecutionMode = .parallel,
     io: std.Io = std.Io.failing,
     stream_fn: ?types.StreamFn = null,
+    stream_context: ?*anyopaque = null,
     convert_to_llm: ?types.ConvertToLlmFn = null,
+    convert_to_llm_context: ?*anyopaque = null,
     transform_context: ?types.TransformContextFn = null,
+    transform_context_context: ?*anyopaque = null,
     before_tool_call: ?types.BeforeToolCallFn = null,
     after_tool_call: ?types.AfterToolCallFn = null,
 };
@@ -159,8 +162,11 @@ pub const Agent = struct {
     tool_execution: types.ToolExecutionMode,
     io: std.Io,
     stream_fn: ?types.StreamFn,
+    stream_context: ?*anyopaque,
     convert_to_llm: types.ConvertToLlmFn,
+    convert_to_llm_context: ?*anyopaque,
     transform_context: ?types.TransformContextFn,
+    transform_context_context: ?*anyopaque,
     before_tool_call: ?types.BeforeToolCallFn,
     after_tool_call: ?types.AfterToolCallFn,
     listeners: std.ArrayList(types.AgentSubscriber),
@@ -186,8 +192,11 @@ pub const Agent = struct {
             .tool_execution = options.tool_execution,
             .io = options.io,
             .stream_fn = options.stream_fn,
+            .stream_context = options.stream_context,
             .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlm,
+            .convert_to_llm_context = options.convert_to_llm_context,
             .transform_context = options.transform_context,
+            .transform_context_context = options.transform_context_context,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
             .listeners = .empty,
@@ -520,7 +529,10 @@ pub const Agent = struct {
             .before_tool_call = self.before_tool_call,
             .after_tool_call = self.after_tool_call,
             .convert_to_llm = self.convert_to_llm,
+            .convert_to_llm_context = self.convert_to_llm_context,
             .transform_context = self.transform_context,
+            .transform_context_context = self.transform_context_context,
+            .stream_context = self.stream_context,
             .get_steering_messages_context = @constCast(self),
             .get_steering_messages = drainSteeringMessages,
             .get_follow_up_messages_context = @constCast(self),
@@ -799,6 +811,7 @@ fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,
     messages: []const types.AgentMessage,
+    _: ?*anyopaque,
 ) ![]ai.Message {
     return try allocator.dupe(ai.Message, messages);
 }
@@ -1557,14 +1570,18 @@ const HookObservation = struct {
     convert_calls: usize = 0,
 };
 
-var active_hook_observation: ?*HookObservation = null;
+const HookObservationFixture = struct {
+    observation: HookObservation = .{},
+};
 
 fn transformContextForTest(
     allocator: std.mem.Allocator,
     messages: []const types.AgentMessage,
     _: ?*const std.atomic.Value(bool),
+    transform_context: ?*anyopaque,
 ) ![]types.AgentMessage {
-    const observation = active_hook_observation orelse return error.MissingHookObservation;
+    const fixture: *HookObservationFixture = @ptrCast(@alignCast(transform_context orelse return error.MissingHookObservation));
+    const observation = &fixture.observation;
     observation.transform_calls += 1;
 
     const transformed = try allocator.alloc(types.AgentMessage, messages.len + 1);
@@ -1590,8 +1607,10 @@ fn prefixedUserMessage(
 fn convertToLlmForTest(
     allocator: std.mem.Allocator,
     messages: []const types.AgentMessage,
+    convert_context: ?*anyopaque,
 ) ![]ai.Message {
-    const observation = active_hook_observation orelse return error.MissingHookObservation;
+    const fixture: *HookObservationFixture = @ptrCast(@alignCast(convert_context orelse return error.MissingHookObservation));
+    const observation = &fixture.observation;
     observation.convert_calls += 1;
 
     try std.testing.expectEqual(@as(usize, 2), messages.len);
@@ -1637,21 +1656,23 @@ test "agent applies transformContext before convertToLlm for streaming context o
         .{ .factory = transformedContextFactory },
     });
 
-    var observation = HookObservation{};
-    active_hook_observation = &observation;
-    defer active_hook_observation = null;
+    const fixture = try std.testing.allocator.create(HookObservationFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
 
     var agent = try Agent.init(std.testing.allocator, .{
         .model = registration.getModel(),
         .transform_context = transformContextForTest,
+        .transform_context_context = fixture,
         .convert_to_llm = convertToLlmForTest,
+        .convert_to_llm_context = fixture,
     });
     defer agent.deinit();
 
     try agent.prompt("hello");
 
-    try std.testing.expectEqual(@as(usize, 1), observation.transform_calls);
-    try std.testing.expectEqual(@as(usize, 1), observation.convert_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.observation.transform_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.observation.convert_calls);
     try std.testing.expectEqual(@as(usize, 2), agent.getMessages().len);
     try expectUserText(agent.getMessages()[0], "hello");
     try std.testing.expectEqualStrings("hooks applied", agent.getMessages()[1].assistant.content[0].text.text);
@@ -1733,22 +1754,19 @@ fn waitForAtomicTrue(flag: *const std.atomic.Value(bool)) !void {
     if (!flag.load(.seq_cst)) return error.TestTimeout;
 }
 
-var abortable_tool_started: ?*std.atomic.Value(bool) = null;
-var mid_stream_started: ?*std.atomic.Value(bool) = null;
-
 fn abortableToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     _: std.json.Value,
-    _: ?*anyopaque,
+    tool_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
     _: ?*anyopaque,
     _: ?types.AgentToolUpdateCallback,
 ) !types.AgentToolResult {
     _ = allocator;
 
-    const started = abortable_tool_started orelse return error.MissingAbortableToolObserver;
-    started.store(true, .seq_cst);
+    const capture: *AbortEventCapture = @ptrCast(@alignCast(tool_context orelse return error.MissingAbortableToolObserver));
+    capture.tool_started.store(true, .seq_cst);
 
     var iteration: usize = 0;
     while (iteration < 5_000) : (iteration += 1) {
@@ -1802,10 +1820,11 @@ fn blockingAbortStreamFn(
     model: ai.Model,
     _: ai.Context,
     options: ?ai.types.SimpleStreamOptions,
+    stream_context: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
     var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    const started = mid_stream_started orelse return error.MissingMidStreamObserver;
-    started.store(true, .seq_cst);
+    const capture: *AbortEventCapture = @ptrCast(@alignCast(stream_context orelse return error.MissingMidStreamObserver));
+    capture.assistant_started.store(true, .seq_cst);
 
     const partial = try makeAssistantTextMessage(allocator, model, "", .stop, null);
     stream.push(.{
@@ -1868,20 +1887,21 @@ test "agent abort stops an in-flight stream and clears runtime state" {
         .max_tokens = 256,
     };
 
+    const capture = try std.testing.allocator.create(AbortEventCapture);
+    defer std.testing.allocator.destroy(capture);
+    capture.* = .{};
+
     var agent = try Agent.init(std.testing.allocator, .{
         .model = model,
         .stream_fn = blockingAbortStreamFn,
+        .stream_context = capture,
     });
     defer agent.deinit();
 
-    var capture = AbortEventCapture{};
     try agent.subscribe(.{
-        .context = &capture,
+        .context = capture,
         .callback = captureAbortEvent,
     });
-
-    mid_stream_started = &capture.assistant_started;
-    defer mid_stream_started = null;
 
     var handle = try RunPromptHandle.start(&agent, "hello");
     defer handle.join() catch {};
@@ -1920,11 +1940,16 @@ test "agent abort during tool execution cancels the tool and stops the run" {
         .{ .message = try buildAbortToolCallMessage(arena.allocator()) },
     });
 
+    const capture = try std.testing.allocator.create(AbortEventCapture);
+    defer std.testing.allocator.destroy(capture);
+    capture.* = .{};
+
     const tool = types.AgentTool{
         .name = "wait",
         .description = "Wait for abort",
         .label = "Wait",
         .parameters = .null,
+        .execute_context = capture,
         .execute = abortableToolExecute,
     };
 
@@ -1934,14 +1959,10 @@ test "agent abort during tool execution cancels the tool and stops the run" {
     });
     defer agent.deinit();
 
-    var capture = AbortEventCapture{};
     try agent.subscribe(.{
-        .context = &capture,
+        .context = capture,
         .callback = captureAbortEvent,
     });
-
-    abortable_tool_started = &capture.tool_started;
-    defer abortable_tool_started = null;
 
     var handle = try RunPromptHandle.start(&agent, "hello");
     defer handle.join() catch {};
