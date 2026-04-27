@@ -98,6 +98,7 @@ pub const RenderStateSnapshot = struct {
     queued_follow_up: [][]u8 = &.{},
     pending_editor_images: []PendingEditorImage = &.{},
     chat_scroll_offset: usize = 0,
+    all_expanded: bool = false,
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
         for (self.items) |item| allocator.free(item.text);
@@ -229,7 +230,10 @@ pub const AppState = struct {
     visible_start_index: usize = 0,
     chat_scroll_offset: usize = 0,
     chat_scroll_max_offset: usize = 0,
+    chat_visible_rows: usize = 0,
+    chat_width: usize = 1,
     chat_region: ChatRegion = .{},
+    all_expanded: bool = false,
     last_streaming_assistant_index: ?usize = null,
     last_streaming_thinking_index: ?usize = null,
     status: []u8 = &.{},
@@ -411,6 +415,7 @@ pub const AppState = struct {
             .context_window = self.context_window,
             .context_percent = self.context_percent,
             .chat_scroll_offset = self.chat_scroll_offset,
+            .all_expanded = self.all_expanded,
         };
         errdefer snapshot.deinit(allocator);
 
@@ -463,6 +468,19 @@ pub const AppState = struct {
         self.chat_scroll_max_offset = max_offset;
     }
 
+    pub fn toggleAllExpanded(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const was_at_tail = self.chat_scroll_offset == 0;
+        self.all_expanded = !self.all_expanded;
+        const start_index = @min(self.visible_start_index, self.items.items.len);
+        const total_rows = estimateChatRows(self.items.items[start_index..], @max(self.chat_width, 1), self.all_expanded);
+        const max_offset = total_rows -| self.chat_visible_rows;
+        self.chat_scroll_max_offset = max_offset;
+        self.chat_scroll_offset = if (was_at_tail) 0 else @min(self.chat_scroll_offset, max_offset);
+    }
+
     pub fn updateChatScrollLayout(
         self: *AppState,
         total_chat_rows: usize,
@@ -475,6 +493,8 @@ pub const AppState = struct {
         const max_offset = total_chat_rows -| visible_rows;
         self.chat_scroll_max_offset = max_offset;
         self.chat_scroll_offset = @min(self.chat_scroll_offset, max_offset);
+        self.chat_visible_rows = visible_rows;
+        self.chat_width = @max(width, 1);
         self.chat_region = .{
             .row_start = row_start,
             .row_end = row_start + visible_rows,
@@ -574,6 +594,8 @@ pub const AppState = struct {
         self.visible_start_index = 0;
         self.chat_scroll_offset = 0;
         self.chat_scroll_max_offset = 0;
+        self.chat_visible_rows = 0;
+        self.chat_width = 1;
         self.chat_region = .{};
         self.last_streaming_assistant_index = null;
         self.last_streaming_thinking_index = null;
@@ -1146,7 +1168,16 @@ pub const ScreenComponent = struct {
         if (self.after_snapshot_hook) |hook| hook.run();
 
         for (snapshot.items) |item| {
-            try renderChatItemIntoAt(allocator, @max(width, 1), self.theme, item, self.now_ms, &chat_lines);
+            try renderChatItemIntoWithOptions(
+                allocator,
+                @max(width, 1),
+                self.keybindings,
+                self.theme,
+                item,
+                self.now_ms,
+                snapshot.all_expanded,
+                &chat_lines,
+            );
         }
 
         var prompt_lines = tui.LineList.empty;
@@ -1251,7 +1282,18 @@ pub const ScreenComponent = struct {
         }
         row += task_panel_height;
 
-        const chat_metrics = try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity, snapshot.chat_scroll_offset, self.now_ms);
+        const chat_metrics = try drawChatViewport(
+            ctx.arena,
+            self.keybindings,
+            self.theme,
+            snapshot.items,
+            window,
+            row,
+            chat_capacity,
+            snapshot.chat_scroll_offset,
+            self.now_ms,
+            snapshot.all_expanded,
+        );
         self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
         row += chat_capacity;
 
@@ -1753,6 +1795,7 @@ const ChatViewportMetrics = struct {
 
 fn drawChatViewport(
     allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
     theme: ?*const resources_mod.Theme,
     items: []const ChatItem,
     window: tui.vaxis.Window,
@@ -1760,12 +1803,13 @@ fn drawChatViewport(
     height: usize,
     chat_scroll_offset: usize,
     now_ms: i64,
+    all_expanded: bool,
 ) !ChatViewportMetrics {
     if (start_row >= window.height or height == 0) return .{ .rendered_height = 0, .visible_height = 0 };
 
     const visible_height = @min(height, @as(usize, window.height) - start_row);
     const width = @max(@as(usize, window.width), 1);
-    const scratch_height = @max(visible_height, estimateChatRows(items, width));
+    const scratch_height = @max(visible_height, estimateChatRows(items, width, all_expanded));
     var screen = try tui.vaxis.Screen.init(allocator, .{
         .rows = @intCast(@min(scratch_height, @as(usize, std.math.maxInt(u16)))),
         .cols = window.width,
@@ -1776,7 +1820,7 @@ fn drawChatViewport(
 
     const scratch_window = tui.draw.rootWindow(&screen);
     scratch_window.clear();
-    const rendered = try drawChatItems(scratch_window, allocator, theme, items, now_ms);
+    const rendered = try drawChatItems(scratch_window, allocator, keybindings, theme, items, now_ms, all_expanded);
     const rendered_height = @min(@as(usize, rendered.height), @as(usize, screen.height));
     const max_offset = rendered_height -| visible_height;
     const offset = @min(chat_scroll_offset, max_offset);
@@ -1829,14 +1873,16 @@ fn drawChatScrollIndicator(
 fn drawChatItems(
     window: tui.vaxis.Window,
     allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
     theme: ?*const resources_mod.Theme,
     items: []const ChatItem,
     now_ms: i64,
+    all_expanded: bool,
 ) !tui.DrawSize {
     var row: usize = 0;
     for (items) |item| {
         if (row >= window.height) break;
-        row += try drawChatItem(window, allocator, theme, item, row, now_ms);
+        row += try drawChatItem(window, allocator, keybindings, theme, item, row, now_ms, all_expanded);
     }
     return .{
         .width = window.width,
@@ -1845,6 +1891,53 @@ fn drawChatItems(
 }
 
 fn drawChatItem(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    start_row: usize,
+    now_ms: i64,
+    all_expanded: bool,
+) !usize {
+    const remaining_height = @as(usize, window.height) -| start_row;
+    if (remaining_height == 0) return 0;
+    const child = window.child(.{
+        .y_off = @intCast(start_row),
+        .height = @intCast(remaining_height),
+    });
+    if (!all_expanded) {
+        if (previewThreshold(item.kind)) |threshold| {
+            const full_height_hint = @max(@as(usize, 1), estimateChatItemRowsFull(item, @max(@as(usize, window.width), 1)));
+            var scratch = try tui.vaxis.Screen.init(allocator, .{
+                .rows = @intCast(@min(full_height_hint, @as(usize, std.math.maxInt(u16)))),
+                .cols = window.width,
+                .x_pixel = 0,
+                .y_pixel = 0,
+            });
+            defer scratch.deinit(allocator);
+
+            const scratch_window = tui.draw.rootWindow(&scratch);
+            scratch_window.clear();
+            const rendered_height = @min(
+                try drawChatItemFull(scratch_window, allocator, theme, item, 0, now_ms),
+                @as(usize, scratch.height),
+            );
+            if (rendered_height > threshold) {
+                const preview_rows = @min(threshold, remaining_height);
+                blitScreenRows(&scratch, child, 0, preview_rows);
+                if (threshold < remaining_height) {
+                    try drawCollapseIndicator(child, allocator, keybindings, theme, item.kind, threshold, rendered_height - threshold);
+                }
+                return @min(threshold + 1, remaining_height);
+            }
+        }
+    }
+
+    return drawChatItemFull(child, allocator, theme, item, 0, now_ms);
+}
+
+fn drawChatItemFull(
     window: tui.vaxis.Window,
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -1887,6 +1980,53 @@ fn drawChatItem(
         .thinking => return drawThinkingChatItem(child, theme, item, now_ms),
         else => return drawWrappedText(child, 0, item.text, styleForToken(theme, chatToken(item.kind))),
     }
+}
+
+fn previewThreshold(kind: ChatKind) ?usize {
+    return switch (kind) {
+        .thinking => 1,
+        .tool_result => 3,
+        .assistant, .markdown => 5,
+        .welcome, .info, .@"error", .user, .tool_call => null,
+    };
+}
+
+fn drawCollapseIndicator(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    kind: ChatKind,
+    row: usize,
+    hidden_rows: usize,
+) !void {
+    if (row >= window.height) return;
+    const label = try actionLabel(allocator, keybindings, .toggle_expand_all, "Ctrl+R");
+    const text = try std.fmt.allocPrint(allocator, "… +{d} lines ({s} 展开)", .{ hidden_rows, label });
+    _ = window.printSegment(.{
+        .text = text,
+        .style = collapseIndicatorStyle(theme, kind),
+    }, .{
+        .wrap = .none,
+        .row_offset = @intCast(row),
+    });
+}
+
+fn collapseIndicatorStyle(
+    theme: ?*const resources_mod.Theme,
+    kind: ChatKind,
+) tui.vaxis.Cell.Style {
+    var style = switch (kind) {
+        .thinking => styleForToken(theme, .role_thinking),
+        .tool_result => styleForToken(theme, .role_tool_result),
+        .assistant, .markdown => styleForToken(theme, .markdown_text),
+        else => styleForToken(theme, .status),
+    };
+    style.dim = true;
+    if (kind == .assistant or kind == .markdown) {
+        style.italic = true;
+    }
+    return style;
 }
 
 fn drawThinkingChatItem(
@@ -1948,17 +2088,31 @@ fn chatToken(kind: ChatKind) resources_mod.ThemeToken {
     };
 }
 
-fn estimateChatRows(items: []const ChatItem, width: usize) usize {
+fn estimateChatRows(items: []const ChatItem, width: usize, all_expanded: bool) usize {
     var rows: usize = 1;
     for (items) |item| {
-        rows += switch (item.kind) {
-            .assistant => 1 + estimateWrappedRows(item.text, width) + 8,
-            .markdown => estimateWrappedRows(item.text, width) + 8,
-            .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item.text, width - 2)),
-            else => estimateWrappedRows(item.text, width),
-        };
+        rows += estimateChatItemRowsVisible(item, width, all_expanded);
     }
     return rows;
+}
+
+fn estimateChatItemRowsVisible(item: ChatItem, width: usize, all_expanded: bool) usize {
+    const full_rows = estimateChatItemRowsFull(item, width);
+    if (!all_expanded) {
+        if (previewThreshold(item.kind)) |threshold| {
+            if (full_rows > threshold) return threshold + 1;
+        }
+    }
+    return full_rows;
+}
+
+fn estimateChatItemRowsFull(item: ChatItem, width: usize) usize {
+    return switch (item.kind) {
+        .assistant => 1 + estimateWrappedRows(item.text, width) + 8,
+        .markdown => estimateWrappedRows(item.text, width) + 8,
+        .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item.text, width - 2)),
+        else => estimateWrappedRows(item.text, width),
+    };
 }
 
 fn blitScreenRows(
@@ -3006,11 +3160,24 @@ pub fn renderChatItemIntoAt(
     now_ms: i64,
     lines: *tui.LineList,
 ) !void {
+    try renderChatItemIntoWithOptions(allocator, width, null, theme, item, now_ms, true, lines);
+}
+
+fn renderChatItemIntoWithOptions(
+    allocator: std.mem.Allocator,
+    width: usize,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    now_ms: i64,
+    all_expanded: bool,
+    lines: *tui.LineList,
+) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch_allocator = arena.allocator();
 
-    const height_hint = @max(@as(usize, 1), estimateChatRows(&.{item}, width));
+    const height_hint = @max(@as(usize, 1), estimateChatRows(&.{item}, width, all_expanded));
     var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
         .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
         .cols = @intCast(@max(width, 1)),
@@ -3021,7 +3188,7 @@ pub fn renderChatItemIntoAt(
 
     const window = tui.draw.rootWindow(&screen);
     window.clear();
-    const rendered = try drawChatItem(window, scratch_allocator, theme, item, 0, now_ms);
+    const rendered = try drawChatItem(window, scratch_allocator, keybindings, theme, item, 0, now_ms, all_expanded);
     try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered, lines);
 }
 
@@ -3888,7 +4055,7 @@ test "drawChatViewport honors scroll offset and overlays overflow indicators" {
     const window = tui.draw.rootWindow(&screen);
     window.clear();
 
-    const metrics = try drawChatViewport(arena.allocator(), null, items[0..], window, 0, 12, 5, 0);
+    const metrics = try drawChatViewport(arena.allocator(), null, null, items[0..], window, 0, 12, 5, 0, true);
     try std.testing.expectEqual(@as(usize, 30), metrics.rendered_height);
     try std.testing.expectEqual(@as(usize, 12), metrics.visible_height);
 
@@ -4009,11 +4176,11 @@ test "thinking m1 spinner frame derives from injected render clock" {
         const window = tui.draw.rootWindow(&screen);
         window.clear();
         const now_ms = 1_000 + @as(i64, @intCast(index * tui.components.loader.DEFAULT_INTERVAL_MS));
-        _ = try drawChatItem(window, arena.allocator(), &theme, .{
+        _ = try drawChatItem(window, arena.allocator(), null, &theme, .{
             .kind = .thinking,
             .text = @constCast("abc"),
             .start_ms = 1_000,
-        }, 0, now_ms);
+        }, 0, now_ms, true);
 
         const glyph = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(frame, glyph.char.grapheme);
@@ -4056,12 +4223,12 @@ test "thinking m1 frozen frame ignores later render clock" {
 
     const early_window = tui.draw.rootWindow(&early_screen);
     early_window.clear();
-    _ = try drawChatItem(early_window, arena.allocator(), null, item, 0, 5_000);
+    _ = try drawChatItem(early_window, arena.allocator(), null, null, item, 0, 5_000, true);
     const early_glyph = early_screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
 
     const late_window = tui.draw.rootWindow(&late_screen);
     late_window.clear();
-    _ = try drawChatItem(late_window, arena.allocator(), null, item, 0, 15_000);
+    _ = try drawChatItem(late_window, arena.allocator(), null, null, item, 0, 15_000, true);
     const late_glyph = late_screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualStrings(tui.components.loader.DEFAULT_SPINNER_FRAMES[4], early_glyph.char.grapheme);
@@ -4083,11 +4250,11 @@ test "thinking m1 continuation rows are indented without repeating glyph" {
 
     const window = tui.draw.rootWindow(&screen);
     window.clear();
-    _ = try drawChatItem(window, arena.allocator(), null, .{
+    _ = try drawChatItem(window, arena.allocator(), null, null, .{
         .kind = .thinking,
         .text = @constCast("abcdef"),
         .start_ms = 0,
-    }, 0, 0);
+    }, 0, 0, true);
 
     const first_glyph = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(tui.components.loader.DEFAULT_SPINNER_FRAMES[0], first_glyph.char.grapheme);
@@ -4200,7 +4367,7 @@ test "roles m0 drawChatItem applies role styles to representative cells" {
 
     const window = tui.draw.rootWindow(&screen);
     window.clear();
-    _ = try drawChatItems(window, arena.allocator(), &theme, &items, 0);
+    _ = try drawChatItems(window, arena.allocator(), null, &theme, &items, 0, true);
 
     const user = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
     const assistant = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
@@ -4213,6 +4380,167 @@ test "roles m0 drawChatItem applies role styles to representative cells" {
     try std.testing.expectEqual(styleForToken(&theme, .role_thinking), thinking.style);
     try std.testing.expectEqual(styleForToken(&theme, .role_tool_call), tool_call.style);
     try std.testing.expectEqual(styleForToken(&theme, .role_tool_result), tool_result.style);
+}
+
+test "collapse m2 app state defaults and snapshots all_expanded" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try std.testing.expect(!state.all_expanded);
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(!snapshot.all_expanded);
+}
+
+test "collapse m2 preview thresholds match collapsible chat kinds" {
+    try std.testing.expectEqual(@as(?usize, 1), previewThreshold(.thinking));
+    try std.testing.expectEqual(@as(?usize, 3), previewThreshold(.tool_result));
+    try std.testing.expectEqual(@as(?usize, 5), previewThreshold(.assistant));
+    try std.testing.expectEqual(@as(?usize, 5), previewThreshold(.markdown));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.welcome));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.info));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.@"error"));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.user));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.tool_call));
+}
+
+test "collapse m2 indicator renders with hidden row count and distinct style" {
+    const allocator = std.testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+    var theme = try resources_mod.Theme.initDefault(allocator);
+    defer theme.deinit(allocator);
+
+    const text =
+        \\one
+        \\two
+        \\three
+        \\four
+        \\five
+        \\six
+        \\seven
+        \\eight
+        \\nine
+        \\ten
+    ;
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 4,
+        .cols = 80,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawChatItem(window, arena.allocator(), &keybindings, &theme, .{
+        .kind = .thinking,
+        .text = @constCast(text),
+        .frozen_frame_index = 0,
+    }, 0, 0, false);
+
+    try std.testing.expectEqual(@as(usize, 2), rendered);
+    const body = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
+    const indicator = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
+    const indicator_plus = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    const indicator_count = screen.readCell(3, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("…", indicator.char.grapheme);
+    try std.testing.expectEqualStrings("+", indicator_plus.char.grapheme);
+    try std.testing.expectEqualStrings("9", indicator_count.char.grapheme);
+    try std.testing.expect(!std.meta.eql(body.style, indicator.style));
+}
+
+test "collapse m2 items at or under threshold render without indicator" {
+    const allocator = std.testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 80,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawChatItem(window, arena.allocator(), &keybindings, null, .{
+        .kind = .tool_result,
+        .text = @constCast("Tool result bash: ok"),
+    }, 0, 0, false);
+
+    try std.testing.expectEqual(@as(usize, 1), rendered);
+    var lines = tui.LineList.empty;
+    defer tui.component.freeLines(allocator, &lines);
+    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, 80, rendered, &lines);
+    try std.testing.expect(!renderedLinesContain(lines.items, "展开"));
+}
+
+test "collapse m2 estimateChatRows uses collapsed or expanded heights" {
+    const text =
+        \\one
+        \\two
+        \\three
+        \\four
+        \\five
+        \\six
+        \\seven
+        \\eight
+        \\nine
+        \\ten
+    ;
+    const item = ChatItem{ .kind = .thinking, .text = @constCast(text), .frozen_frame_index = 0 };
+    try std.testing.expectEqual(@as(usize, 2), estimateChatItemRowsVisible(item, 80, false));
+    try std.testing.expectEqual(@as(usize, 10), estimateChatItemRowsVisible(item, 80, true));
+    try std.testing.expectEqual(@as(usize, 3), estimateChatRows(&.{item}, 80, false));
+    try std.testing.expectEqual(@as(usize, 11), estimateChatRows(&.{item}, 80, true));
+}
+
+test "collapse m2 toggle preserves tail and clamps non-tail offset" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    for (state.items.items) |item| allocator.free(item.text);
+    state.items.clearRetainingCapacity();
+
+    const text =
+        \\one
+        \\two
+        \\three
+        \\four
+        \\five
+        \\six
+        \\seven
+        \\eight
+        \\nine
+        \\ten
+    ;
+    try state.appendItemLocked(.thinking, text);
+    state.chat_visible_rows = 2;
+    state.chat_width = 80;
+
+    state.chat_scroll_offset = 0;
+    state.all_expanded = false;
+    state.toggleAllExpanded();
+    try std.testing.expect(state.all_expanded);
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    state.chat_scroll_offset = 20;
+    state.chat_scroll_max_offset = 30;
+    state.toggleAllExpanded();
+    try std.testing.expect(!state.all_expanded);
+    try std.testing.expectEqual(@as(usize, 1), state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 1), state.chat_scroll_max_offset);
 }
 
 test "renderChatItemInto renders markdown chat items without assistant prefix" {

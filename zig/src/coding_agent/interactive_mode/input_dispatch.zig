@@ -859,6 +859,7 @@ pub fn legacyParsedAppActionForKey(
             'p' => .open_models,
             'v' => .paste_image,
             'g' => .chat_scroll_to_tail,
+            'r' => .toggle_expand_all,
             else => null,
         },
         .escape => .exit,
@@ -914,6 +915,7 @@ pub fn handleAppAction(
         .queue_follow_up, .dequeue_messages => {},
         .paste_image => {},
         .chat_scroll_to_tail => app_state.chatScrollToTail(),
+        .toggle_expand_all => app_state.toggleAllExpanded(),
     }
 }
 
@@ -929,4 +931,5 @@ test "protocol events update kitty state through app context" {
 test "legacy app actions include clipboard image paste" {
     try std.testing.expectEqual(keybindings_mod.Action.paste_image, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
     try std.testing.expectEqual(keybindings_mod.Action.chat_scroll_to_tail, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
+    try std.testing.expectEqual(keybindings_mod.Action.toggle_expand_all, legacyAppActionForKey(.{ .ctrl = 'r' }).?);
 }
