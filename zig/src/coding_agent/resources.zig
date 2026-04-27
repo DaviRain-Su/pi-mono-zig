@@ -1351,6 +1351,9 @@ fn loadThemeFromFile(allocator: std.mem.Allocator, io: std.Io, resource: Resolve
                 if (object.get("bold")) |field| {
                     if (field == .bool) style.bold = field.bool;
                 }
+                if (object.get("dim")) |field| {
+                    if (field == .bool) style.dim = field.bool;
+                }
                 if (object.get("italic")) |field| {
                     if (field == .bool) style.italic = field.bool;
                 }
@@ -1563,6 +1566,12 @@ fn parseThemeToken(name: []const u8) ?ThemeToken {
     if (std.mem.eql(u8, name, "taskHeader")) return .task_header;
     if (std.mem.eql(u8, name, "taskHeaderAccent")) return .task_header_accent;
     if (std.mem.eql(u8, name, "taskHeaderSeparator")) return .task_header_separator;
+    if (std.mem.eql(u8, name, "role_user") or std.mem.eql(u8, name, "roleUser")) return .role_user;
+    if (std.mem.eql(u8, name, "role_assistant") or std.mem.eql(u8, name, "roleAssistant")) return .role_assistant;
+    if (std.mem.eql(u8, name, "role_thinking") or std.mem.eql(u8, name, "roleThinking")) return .role_thinking;
+    if (std.mem.eql(u8, name, "role_tool_call") or std.mem.eql(u8, name, "roleToolCall")) return .role_tool_call;
+    if (std.mem.eql(u8, name, "role_tool_result") or std.mem.eql(u8, name, "roleToolResult")) return .role_tool_result;
+    if (std.mem.eql(u8, name, "role_thinking_glyph") or std.mem.eql(u8, name, "roleThinkingGlyph")) return .role_thinking_glyph;
     if (std.mem.eql(u8, name, "terminalBadge")) return .terminal_badge;
     return null;
 }
@@ -1578,6 +1587,16 @@ fn parseThemeColor(name: []const u8) ?ThemeColor {
     if (std.mem.eql(u8, name, "border")) return .border;
     if (std.mem.eql(u8, name, "muted")) return .muted;
     return null;
+}
+
+test "roles m0 parseThemeToken accepts role token names" {
+    try std.testing.expectEqual(ThemeToken.role_user, parseThemeToken("role_user").?);
+    try std.testing.expectEqual(ThemeToken.role_assistant, parseThemeToken("role_assistant").?);
+    try std.testing.expectEqual(ThemeToken.role_thinking, parseThemeToken("role_thinking").?);
+    try std.testing.expectEqual(ThemeToken.role_tool_call, parseThemeToken("role_tool_call").?);
+    try std.testing.expectEqual(ThemeToken.role_tool_result, parseThemeToken("role_tool_result").?);
+    try std.testing.expectEqual(ThemeToken.role_thinking_glyph, parseThemeToken("role_thinking_glyph").?);
+    try std.testing.expectEqual(ThemeToken.role_tool_result, parseThemeToken("roleToolResult").?);
 }
 
 pub fn findThemeIndex(themes: []const Theme, name: ?[]const u8) ?usize {

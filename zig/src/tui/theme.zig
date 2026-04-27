@@ -49,6 +49,12 @@ pub const ThemeToken = enum(u8) {
     task_header,
     task_header_accent,
     task_header_separator,
+    role_user,
+    role_assistant,
+    role_thinking,
+    role_tool_call,
+    role_tool_result,
+    role_thinking_glyph,
     terminal_badge,
 };
 
@@ -56,6 +62,7 @@ pub const StyleSpec = struct {
     fg: ?[]u8 = null,
     bg: ?[]u8 = null,
     bold: bool = false,
+    dim: bool = false,
     italic: bool = false,
     underline: bool = false,
 
@@ -64,6 +71,7 @@ pub const StyleSpec = struct {
             .fg = if (self.fg) |value| try allocator.dupe(u8, value) else null,
             .bg = if (self.bg) |value| try allocator.dupe(u8, value) else null,
             .bold = self.bold,
+            .dim = self.dim,
             .italic = self.italic,
             .underline = self.underline,
         };
@@ -233,6 +241,12 @@ pub const Theme = struct {
         try self.setDerivedStyle(allocator, .task_header, .{ .fg = self.colors.get(.muted) });
         try self.setDerivedStyle(allocator, .task_header_accent, .{ .fg = self.colors.get(.primary), .bold = true });
         try self.setDerivedStyle(allocator, .task_header_separator, .{ .fg = self.colors.get(.border) });
+        try self.setDerivedStyle(allocator, .role_user, .{ .fg = self.colors.get(.secondary), .bold = true });
+        try self.setDerivedStyle(allocator, .role_assistant, .{ .fg = self.colors.get(.primary), .bold = true });
+        try self.setDerivedStyle(allocator, .role_thinking, .{ .fg = self.colors.get(.muted), .italic = true });
+        try self.setDerivedStyle(allocator, .role_tool_call, .{ .fg = self.colors.get(.secondary), .dim = true });
+        try self.setDerivedStyle(allocator, .role_tool_result, .{ .fg = self.colors.get(.warning), .dim = true });
+        try self.setDerivedStyle(allocator, .role_thinking_glyph, .{ .fg = self.colors.get(.muted), .italic = true });
         try self.setDerivedStyle(allocator, .terminal_badge, .{ .fg = self.colors.get(.muted) });
     }
 
@@ -255,6 +269,7 @@ const StyleTemplate = struct {
     bold: bool = false,
     italic: bool = false,
     underline: bool = false,
+    dim: bool = false,
 
     fn owned(self: StyleTemplate, allocator: std.mem.Allocator) !StyleSpec {
         return .{
@@ -263,6 +278,7 @@ const StyleTemplate = struct {
             .bold = self.bold,
             .italic = self.italic,
             .underline = self.underline,
+            .dim = self.dim,
         };
     }
 };
@@ -327,10 +343,25 @@ test "codex theme and new token fallbacks derive non-default styles" {
         .task_header,
         .task_header_accent,
         .task_header_separator,
+        .role_user,
+        .role_assistant,
+        .role_thinking,
+        .role_tool_call,
+        .role_tool_result,
+        .role_thinking_glyph,
         .terminal_badge,
     };
     for (fallback_tokens) |token| {
         const spec = dark.styles[@intFromEnum(token)];
-        try std.testing.expect(spec.fg != null or spec.bg != null or spec.bold or spec.italic or spec.underline);
+        try std.testing.expect(spec.fg != null or spec.bg != null or spec.bold or spec.dim or spec.italic or spec.underline);
     }
+
+    const thinking = dark.styles[@intFromEnum(ThemeToken.role_thinking)];
+    try std.testing.expect(thinking.italic);
+    try std.testing.expectEqualStrings(dark.colors.muted.?, thinking.fg.?);
+
+    const tool_result = dark.styles[@intFromEnum(ThemeToken.role_tool_result)];
+    try std.testing.expect(tool_result.dim);
+    try std.testing.expect(tool_result.fg != null);
+    try std.testing.expect(!std.mem.eql(u8, dark.colors.foreground.?, tool_result.fg.?));
 }
