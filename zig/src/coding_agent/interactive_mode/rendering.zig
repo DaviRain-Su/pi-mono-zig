@@ -823,6 +823,13 @@ pub const ScreenComponent = struct {
         };
     }
 
+    pub fn drawComponent(self: *const ScreenComponent) tui.DrawComponent {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
+        };
+    }
+
     pub fn renderIntoOpaque(
         ptr: *const anyopaque,
         allocator: std.mem.Allocator,
@@ -889,7 +896,135 @@ pub const ScreenComponent = struct {
         try tui.component.appendOwnedLine(lines, allocator, footer_line);
         try tui.component.appendOwnedLine(lines, allocator, hints_line);
     }
+
+    pub fn drawOpaque(
+        ptr: *const anyopaque,
+        window: tui.vaxis.Window,
+        ctx: tui.DrawContext,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        const self: *const ScreenComponent = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
+    }
+
+    pub fn draw(
+        self: *const ScreenComponent,
+        window: tui.vaxis.Window,
+        ctx: tui.DrawContext,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        self.editor.setTheme(self.theme);
+        window.clear();
+
+        var chat_lines = tui.LineList.empty;
+        var prompt_lines = tui.LineList.empty;
+        var queued_lines = tui.LineList.empty;
+        var autocomplete_lines = tui.LineList.empty;
+
+        var snapshot = try self.state.snapshotForRender(ctx.arena);
+
+        if (self.after_snapshot_hook) |hook| hook.run();
+
+        for (snapshot.items) |item| {
+            try renderChatItemInto(ctx.arena, @max(@as(usize, window.width), 1), self.theme, item, &chat_lines);
+        }
+
+        try renderPromptLines(
+            ctx.arena,
+            self.theme,
+            self.editor,
+            snapshot.pending_editor_images,
+            window.width,
+            &prompt_lines,
+        );
+        try renderQueuedMessageLines(ctx.arena, self.keybindings, self.theme, &snapshot, window.width, &queued_lines);
+        const footer_line = try formatFooterLine(ctx.arena, self.theme, &snapshot, window.width);
+        const hints_line = try formatHintsLine(ctx.arena, self.keybindings, self.theme, window.width);
+        try self.editor.renderAutocompleteInto(ctx.arena, window.width, &autocomplete_lines);
+
+        const reserved_lines: usize = prompt_lines.items.len + queued_lines.items.len + 2 + autocomplete_lines.items.len;
+        const window_height: usize = @max(@as(usize, window.height), 1);
+        const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
+        const chat_component = BorrowedLineListComponent{ .lines = chat_lines.items };
+        const chat_viewport = tui.Viewport{
+            .child = chat_component.component(),
+            .height = chat_capacity,
+            .anchor = .bottom,
+        };
+
+        var viewport_lines = tui.LineList.empty;
+        try chat_viewport.renderInto(ctx.arena, window.width, &viewport_lines);
+
+        var row: usize = 0;
+        try renderLineSlice(window, row, viewport_lines.items, ctx.arena);
+        row += viewport_lines.items.len;
+
+        try renderLineSlice(window, row, queued_lines.items, ctx.arena);
+        row += queued_lines.items.len;
+
+        const prompt_start_row = row;
+        try renderLineSlice(window, row, prompt_lines.items, ctx.arena);
+        row += prompt_lines.items.len;
+
+        const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), @as(usize, window.width));
+        const editor_image_rows = snapshot.pending_editor_images.len;
+        const editor_rows = if (prompt_lines.items.len > editor_image_rows)
+            prompt_lines.items.len - editor_image_rows
+        else
+            1;
+        const editor_window_width = @max(@as(usize, 1), if (window.width > prefix_width) window.width - @as(u16, @intCast(prefix_width)) else 1);
+        const editor_window = window.child(.{
+            .x_off = @intCast(prefix_width),
+            .y_off = @intCast(prompt_start_row),
+            .width = @intCast(editor_window_width),
+            .height = @intCast(@max(editor_rows, 1)),
+        });
+        _ = try self.editor.draw(editor_window, .{
+            .window = editor_window,
+            .arena = ctx.arena,
+            .theme = self.theme,
+        });
+
+        if (autocomplete_lines.items.len > 0) {
+            const autocomplete_window = window.child(.{
+                .x_off = @intCast(prefix_width),
+                .y_off = @intCast(row),
+                .width = @intCast(editor_window_width),
+                .height = @intCast(autocomplete_lines.items.len),
+            });
+            _ = try self.editor.drawAutocomplete(autocomplete_window, .{
+                .window = autocomplete_window,
+                .arena = ctx.arena,
+                .theme = self.theme,
+            });
+        }
+        row += autocomplete_lines.items.len;
+
+        try renderLineSlice(window, row, &.{footer_line}, ctx.arena);
+        row += 1;
+        try renderLineSlice(window, row, &.{hints_line}, ctx.arena);
+        row += 1;
+
+        return .{
+            .width = window.width,
+            .height = @intCast(@min(row, @as(usize, window.height))),
+        };
+    }
 };
+
+fn renderLineSlice(
+    window: tui.vaxis.Window,
+    start_row: usize,
+    lines: []const []u8,
+    allocator: std.mem.Allocator,
+) !void {
+    if (lines.len == 0 or start_row >= window.height) return;
+    const remaining = @as(usize, window.height) - start_row;
+    const visible = @min(lines.len, remaining);
+    const child = window.child(.{
+        .y_off = @intCast(start_row),
+        .height = @intCast(visible),
+    });
+    try tui.vaxis_adapter.renderLineListToWindow(child, lines[0..visible], allocator);
+}
 
 const RenderHook = struct {
     context: ?*anyopaque = null,
@@ -2242,6 +2377,40 @@ test "formatFooterLine shows provider auth status and sanitizes multiline status
 
     try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: OpenAI (env)") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "Status: missing key set OPENAI_API_KEY") != null);
+}
+
+test "screen draw stacks autocomplete below the prompt editor child window" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    try editor.setAutocompleteItems(&[_]tui.SelectItem{
+        .{ .value = "read", .label = "read" },
+        .{ .value = "reload", .label = "reload" },
+        .{ .value = "render", .label = "render" },
+    });
+
+    _ = try editor.handleKey(.{ .printable = tui.keys.PrintableKey.fromSlice("r") });
+    _ = try editor.handleKey(.{ .printable = tui.keys.PrintableKey.fromSlice("e") });
+
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+    };
+
+    var screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 20, 8);
+    defer screen.deinit(std.testing.allocator);
+
+    try tui.test_helpers.expectCell(&screen, 0, 2, "I", .{});
+
+    const prefix_width = tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX);
+    const selected = screen.readCell(@intCast(prefix_width + 2), 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("r", selected.char.grapheme);
+    try std.testing.expect(selected.style.reverse);
 }
 
 test "borrowed lines component draws stored cell rows without ansi strings" {
