@@ -70,6 +70,7 @@ pub const Renderer = struct {
     previous_lines: component_mod.LineList = .empty,
     previous_size: ?terminal_mod.Size = null,
     overlays: std.ArrayList(OverlayEntry) = .empty,
+    draw_overlays: std.ArrayList(DrawOverlayEntry) = .empty,
     next_overlay_id: usize = 1,
     synchronized_output_enabled: bool = true,
     last_render_stats: RenderStats = .{},
@@ -88,6 +89,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         component_mod.freeLines(self.allocator, &self.previous_lines);
         self.overlays.deinit(self.allocator);
+        self.draw_overlays.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -102,16 +104,36 @@ pub const Renderer = struct {
         return id;
     }
 
+    pub fn showDrawOverlay(self: *Renderer, component: draw_mod.Component, options: OverlayOptions) !usize {
+        const id = self.next_overlay_id;
+        self.next_overlay_id += 1;
+        try self.draw_overlays.append(self.allocator, .{
+            .id = id,
+            .component = component,
+            .options = options,
+        });
+        return id;
+    }
+
     pub fn removeOverlay(self: *Renderer, id: usize) bool {
         for (self.overlays.items, 0..) |entry, index| {
             if (entry.id != id) continue;
             _ = self.overlays.orderedRemove(index);
             return true;
         }
+        for (self.draw_overlays.items, 0..) |entry, index| {
+            if (entry.id != id) continue;
+            _ = self.draw_overlays.orderedRemove(index);
+            return true;
+        }
         return false;
     }
 
     pub fn dismissTopOverlay(self: *Renderer) bool {
+        if (self.draw_overlays.items.len > 0) {
+            _ = self.draw_overlays.pop();
+            return true;
+        }
         if (self.overlays.items.len == 0) return false;
         _ = self.overlays.pop();
         return true;
@@ -127,8 +149,18 @@ pub const Renderer = struct {
         return false;
     }
 
+    pub fn updateDrawOverlay(self: *Renderer, id: usize, component: draw_mod.Component, options: OverlayOptions) bool {
+        for (self.draw_overlays.items) |*entry| {
+            if (entry.id != id) continue;
+            entry.component = component;
+            entry.options = options;
+            return true;
+        }
+        return false;
+    }
+
     pub fn hasOverlays(self: *const Renderer) bool {
-        return self.overlays.items.len > 0;
+        return self.overlays.items.len > 0 or self.draw_overlays.items.len > 0;
     }
 
     pub fn render(self: *Renderer, root: component_mod.Component) !void {
@@ -171,7 +203,15 @@ pub const Renderer = struct {
                 self.previous_size = size;
             },
             draw_mod.Component => {
-                _ = try adapter.renderComponent(size, root, null);
+                const window = try adapter.beginFrame(size);
+                const frame_allocator = adapter.frameAllocator();
+                _ = try root.draw(window, .{
+                    .window = window,
+                    .arena = frame_allocator,
+                    .theme = null,
+                });
+                try self.compositeDrawOverlays(size, window, frame_allocator);
+                try adapter.finishFrame();
                 component_mod.freeLines(self.allocator, &self.previous_lines);
                 self.previous_lines = .empty;
                 self.last_render_stats = .{
@@ -303,11 +343,61 @@ pub const Renderer = struct {
             }
         }
     }
+
+    fn compositeDrawOverlays(
+        self: *Renderer,
+        size: terminal_mod.Size,
+        root_window: vaxis.Window,
+        frame_allocator: std.mem.Allocator,
+    ) !void {
+        if (self.draw_overlays.items.len == 0) return;
+
+        for (self.draw_overlays.items) |entry| {
+            const width = resolveOverlayWidth(entry.options, size.width);
+            const max_height = entry.options.max_height orelse size.height;
+            const measurement_height = @max(@as(usize, 1), @min(max_height, size.height));
+
+            var measure_screen = try vaxis.Screen.init(frame_allocator, .{
+                .rows = @intCast(measurement_height),
+                .cols = @intCast(@max(width, 1)),
+                .x_pixel = 0,
+                .y_pixel = 0,
+            });
+            defer measure_screen.deinit(frame_allocator);
+
+            const measure_window = draw_mod.rootWindow(&measure_screen);
+            measure_window.clear();
+            const measured_size = try entry.component.draw(measure_window, .{
+                .window = measure_window,
+                .arena = frame_allocator,
+                .theme = null,
+            });
+            const overlay_height = @min(@max(@as(usize, measured_size.height), 1), measurement_height);
+            const layout = resolveOverlayLayout(entry.options, width, overlay_height, size);
+            const overlay_window = root_window.child(.{
+                .x_off = @intCast(layout.col),
+                .y_off = @intCast(layout.row),
+                .width = @intCast(@min(width, size.width -| layout.col)),
+                .height = @intCast(@min(overlay_height, size.height -| layout.row)),
+            });
+            _ = try entry.component.draw(overlay_window, .{
+                .window = overlay_window,
+                .arena = frame_allocator,
+                .theme = null,
+            });
+        }
+    }
 };
 
 const OverlayEntry = struct {
     id: usize,
     component: component_mod.Component,
+    options: OverlayOptions,
+};
+
+const DrawOverlayEntry = struct {
+    id: usize,
+    component: draw_mod.Component,
     options: OverlayOptions,
 };
 
@@ -551,6 +641,31 @@ const TestDrawComponent = struct {
         return .{
             .width = 1,
             .height = 1,
+        };
+    }
+};
+
+const TestDrawOverlayComponent = struct {
+    const sentinel: u8 = 0;
+
+    pub fn component() draw_mod.Component {
+        return .{
+            .ptr = &sentinel,
+            .drawFn = draw,
+        };
+    }
+
+    fn draw(_: *const anyopaque, window: vaxis.Window, ctx: draw_mod.DrawContext) !draw_mod.Size {
+        _ = ctx;
+        window.writeCell(0, 0, .{
+            .char = .{
+                .grapheme = "M",
+                .width = 1,
+            },
+        });
+        return .{
+            .width = window.width,
+            .height = 2,
         };
     }
 };
@@ -831,4 +946,49 @@ test "renderer can render a draw component through the libvaxis adapter" {
     const drawn_cell = window.readCell(1, 1).?;
     try std.testing.expectEqualStrings("Z", drawn_cell.char.grapheme);
     try std.testing.expectEqual(@as(usize, 0), renderer.previous_lines.items.len);
+}
+
+test "renderer composes draw overlays through child windows with animated offsets" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 14, .height = 6 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    const overlay_id = try renderer.showDrawOverlay(TestDrawOverlayComponent.component(), .{
+        .width = 6,
+        .anchor = .center,
+        .animation = .{ .kind = .slide_from_top, .progress = 0.0 },
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var vx = try @import("vaxis").init(std.testing.io, allocator, &env_map, .{});
+    defer vx.deinit(allocator, &writer.writer);
+
+    var adapter = vaxis_adapter_mod.VaxisAdapter.init(allocator, &vx, &writer.writer);
+    defer adapter.deinit();
+
+    try renderer.renderToVaxis(TestDrawComponent.component(), &adapter);
+    var window = vx.window();
+    try std.testing.expectEqualStrings("M", window.readCell(4, 0).?.char.grapheme);
+
+    try std.testing.expect(renderer.updateDrawOverlay(overlay_id, TestDrawOverlayComponent.component(), .{
+        .width = 6,
+        .anchor = .center,
+        .animation = .{ .kind = .slide_from_top, .progress = 1.0 },
+    }));
+    try renderer.renderToVaxis(TestDrawComponent.component(), &adapter);
+    window = vx.window();
+    try std.testing.expectEqualStrings("M", window.readCell(4, 2).?.char.grapheme);
 }

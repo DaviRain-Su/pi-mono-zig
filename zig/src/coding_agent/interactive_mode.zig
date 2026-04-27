@@ -351,9 +351,9 @@ pub fn runInteractiveMode(
 
             const overlay_options = overlayPanelOptions(size, progress);
             if (overlay_handle_id) |existing_id| {
-                _ = renderer.updateOverlay(existing_id, overlay_panel.?.component(), overlay_options);
+                _ = renderer.updateDrawOverlay(existing_id, overlay_panel.?.drawComponent(), overlay_options);
             } else {
-                overlay_handle_id = try renderer.showOverlay(overlay_panel.?.component(), overlay_options);
+                overlay_handle_id = try renderer.showDrawOverlay(overlay_panel.?.drawComponent(), overlay_options);
             }
         } else {
             last_overlay_tag = null;
@@ -365,11 +365,7 @@ pub fn runInteractiveMode(
             }
         }
 
-        if (overlay == null) {
-            try renderer.renderToVaxis(screen.drawComponent(), &vaxis_adapter);
-        } else {
-            try renderer.renderToVaxis(screen.component(), &vaxis_adapter);
-        }
+        try renderer.renderToVaxis(screen.drawComponent(), &vaxis_adapter);
 
         if (should_exit and !prompt_worker_active) break;
 

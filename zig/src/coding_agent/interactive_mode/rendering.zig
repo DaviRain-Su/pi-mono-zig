@@ -914,62 +914,62 @@ pub const ScreenComponent = struct {
         self.editor.setTheme(self.theme);
         window.clear();
 
-        var chat_lines = tui.LineList.empty;
-        var prompt_lines = tui.LineList.empty;
-        var queued_lines = tui.LineList.empty;
-        var autocomplete_lines = tui.LineList.empty;
-
         var snapshot = try self.state.snapshotForRender(ctx.arena);
 
         if (self.after_snapshot_hook) |hook| hook.run();
 
-        for (snapshot.items) |item| {
-            try renderChatItemInto(ctx.arena, @max(@as(usize, window.width), 1), self.theme, item, &chat_lines);
-        }
-
-        try renderPromptLines(
+        const width = @max(@as(usize, window.width), 1);
+        const footer_text = try formatFooterText(ctx.arena, &snapshot, width);
+        const hints_text = try formatHintsText(ctx.arena, self.keybindings, width);
+        const prompt_height = try measurePromptHeight(
             ctx.arena,
             self.theme,
             self.editor,
             snapshot.pending_editor_images,
-            window.width,
-            &prompt_lines,
+            width,
         );
-        try renderQueuedMessageLines(ctx.arena, self.keybindings, self.theme, &snapshot, window.width, &queued_lines);
-        const footer_line = try formatFooterLine(ctx.arena, self.theme, &snapshot, window.width);
-        const hints_line = try formatHintsLine(ctx.arena, self.keybindings, self.theme, window.width);
-        try self.editor.renderAutocompleteInto(ctx.arena, window.width, &autocomplete_lines);
-
-        const reserved_lines: usize = prompt_lines.items.len + queued_lines.items.len + 2 + autocomplete_lines.items.len;
+        const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
+        const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
+        const reserved_lines: usize = prompt_height + queued_height + 2 + autocomplete_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
-        const chat_component = BorrowedLineListComponent{ .lines = chat_lines.items };
-        const chat_viewport = tui.Viewport{
-            .child = chat_component.component(),
-            .height = chat_capacity,
-            .anchor = .bottom,
-        };
-
-        var viewport_lines = tui.LineList.empty;
-        try chat_viewport.renderInto(ctx.arena, window.width, &viewport_lines);
 
         var row: usize = 0;
-        try renderLineSlice(window, row, viewport_lines.items, ctx.arena);
-        row += viewport_lines.items.len;
+        try drawChatViewport(ctx.arena, self.theme, snapshot.items, window, row, chat_capacity);
+        row += chat_capacity;
 
-        try renderLineSlice(window, row, queued_lines.items, ctx.arena);
-        row += queued_lines.items.len;
+        if (queued_height > 0 and row < window.height) {
+            const queued_window = window.child(.{
+                .y_off = @intCast(row),
+                .height = @intCast(@min(queued_height, @as(usize, window.height) - row)),
+            });
+            _ = try drawQueuedMessages(queued_window, .{
+                .window = queued_window,
+                .arena = ctx.arena,
+                .theme = self.theme,
+            }, self.keybindings, self.theme, &snapshot);
+        }
+        row += queued_height;
 
         const prompt_start_row = row;
-        try renderLineSlice(window, row, prompt_lines.items, ctx.arena);
-        row += prompt_lines.items.len;
+        if (row < window.height) {
+            const prompt_window = window.child(.{
+                .y_off = @intCast(row),
+                .height = @intCast(@min(prompt_height, @as(usize, window.height) - row)),
+            });
+            _ = try drawPromptLines(
+                prompt_window,
+                .{ .window = prompt_window, .arena = ctx.arena, .theme = self.theme },
+                self.theme,
+                self.editor,
+                snapshot.pending_editor_images,
+            );
+        }
+        row += prompt_height;
 
         const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), @as(usize, window.width));
         const editor_image_rows = snapshot.pending_editor_images.len;
-        const editor_rows = if (prompt_lines.items.len > editor_image_rows)
-            prompt_lines.items.len - editor_image_rows
-        else
-            1;
+        const editor_rows = if (prompt_height > editor_image_rows) prompt_height - editor_image_rows else 1;
         const editor_window_width = @max(@as(usize, 1), if (window.width > prefix_width) window.width - @as(u16, @intCast(prefix_width)) else 1);
         const editor_window = window.child(.{
             .x_off = @intCast(prefix_width),
@@ -983,12 +983,12 @@ pub const ScreenComponent = struct {
             .theme = self.theme,
         });
 
-        if (autocomplete_lines.items.len > 0) {
+        if (autocomplete_height > 0 and row < window.height) {
             const autocomplete_window = window.child(.{
                 .x_off = @intCast(prefix_width),
                 .y_off = @intCast(row),
                 .width = @intCast(editor_window_width),
-                .height = @intCast(autocomplete_lines.items.len),
+                .height = @intCast(@min(autocomplete_height, @as(usize, window.height) - row)),
             });
             _ = try self.editor.drawAutocomplete(autocomplete_window, .{
                 .window = autocomplete_window,
@@ -996,11 +996,15 @@ pub const ScreenComponent = struct {
                 .theme = self.theme,
             });
         }
-        row += autocomplete_lines.items.len;
+        row += autocomplete_height;
 
-        try renderLineSlice(window, row, &.{footer_line}, ctx.arena);
+        if (row < window.height) {
+            drawFittedLine(window, row, footer_text, styleForToken(self.theme, .footer));
+        }
         row += 1;
-        try renderLineSlice(window, row, &.{hints_line}, ctx.arena);
+        if (row < window.height) {
+            drawFittedLine(window, row, hints_text, styleForToken(self.theme, .status));
+        }
         row += 1;
 
         return .{
@@ -1010,20 +1014,377 @@ pub const ScreenComponent = struct {
     }
 };
 
-fn renderLineSlice(
+fn styleForToken(theme: ?*const resources_mod.Theme, token: resources_mod.ThemeToken) tui.vaxis.Cell.Style {
+    return if (theme) |active_theme| tui.styleFor(active_theme, token) else .{};
+}
+
+fn drawFittedLine(
+    window: tui.vaxis.Window,
+    row: usize,
+    text: []const u8,
+    style: tui.vaxis.Cell.Style,
+) void {
+    if (row >= window.height) return;
+    const line_window = window.child(.{
+        .y_off = @intCast(row),
+        .height = 1,
+    });
+    line_window.fill(.{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = style,
+    });
+    _ = line_window.printSegment(.{
+        .text = text,
+        .style = style,
+    }, .{ .wrap = .none });
+}
+
+fn drawWrappedText(
     window: tui.vaxis.Window,
     start_row: usize,
-    lines: []const []u8,
-    allocator: std.mem.Allocator,
-) !void {
-    if (lines.len == 0 or start_row >= window.height) return;
-    const remaining = @as(usize, window.height) - start_row;
-    const visible = @min(lines.len, remaining);
+    text: []const u8,
+    style: tui.vaxis.Cell.Style,
+) usize {
+    if (start_row >= window.height) return 0;
     const child = window.child(.{
         .y_off = @intCast(start_row),
-        .height = @intCast(visible),
+        .height = window.height - @as(u16, @intCast(start_row)),
     });
-    try tui.vaxis_adapter.renderLineListToWindow(child, lines[0..visible], allocator);
+    const result = child.printSegment(.{
+        .text = text,
+        .style = style,
+    }, .{ .wrap = .grapheme });
+    return renderedPrintHeight(result, text.len > 0, child.height);
+}
+
+fn renderedPrintHeight(result: tui.vaxis.Window.PrintResult, had_text: bool, max_height: u16) usize {
+    if (!had_text) return 0;
+    const height = @as(usize, result.row) + if (result.col > 0 or result.overflow) @as(usize, 1) else 0;
+    return @min(@max(height, 1), @as(usize, max_height));
+}
+
+fn estimateWrappedRows(text: []const u8, width: usize) usize {
+    const effective_width = @max(width, 1);
+    if (text.len == 0) return 1;
+    var rows: usize = 0;
+    var split = std.mem.splitScalar(u8, text, '\n');
+    while (split.next()) |line| {
+        const line_width = tui.ansi.visibleWidth(line);
+        rows += @max(@as(usize, 1), (line_width + effective_width - 1) / effective_width);
+    }
+    return rows;
+}
+
+fn measureEditorHeight(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    editor: *tui.Editor,
+    width: usize,
+) !usize {
+    const height_hint = @max(@as(usize, 1), estimateWrappedRows(editor.text(), width) + editor.padding_y * 2);
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const measure_window = tui.draw.rootWindow(&screen);
+    measure_window.clear();
+    const size = try editor.draw(measure_window, .{
+        .window = measure_window,
+        .arena = allocator,
+        .theme = theme,
+    });
+    return @max(@as(usize, size.height), 1);
+}
+
+fn measurePromptHeight(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    editor: *tui.Editor,
+    pending_images: []const ai.ImageContent,
+    width: usize,
+) !usize {
+    const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), width);
+    const editor_width = @max(@as(usize, 1), width -| prefix_width);
+    return try measureEditorHeight(allocator, theme, editor, editor_width) + pending_images.len;
+}
+
+fn drawPromptLines(
+    window: tui.vaxis.Window,
+    ctx: tui.DrawContext,
+    theme: ?*const resources_mod.Theme,
+    editor: *tui.Editor,
+    pending_images: []const ai.ImageContent,
+) !tui.DrawSize {
+    const prompt_style = styleForToken(theme, .prompt);
+    drawFittedLine(window, 0, INPUT_PROMPT_PREFIX, prompt_style);
+
+    const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), @as(usize, window.width));
+    const editor_width = @max(@as(usize, 1), @as(usize, window.width) -| prefix_width);
+    const editor_height = try measureEditorHeight(ctx.arena, theme, editor, editor_width);
+    if (prefix_width < window.width) {
+        const editor_window = window.child(.{
+            .x_off = @intCast(prefix_width),
+            .y_off = 0,
+            .width = @intCast(editor_width),
+            .height = @intCast(@min(editor_height, @as(usize, window.height))),
+        });
+        _ = try editor.draw(editor_window, .{
+            .window = editor_window,
+            .arena = ctx.arena,
+            .theme = theme,
+        });
+    }
+    const continuation_window = window.child(.{
+        .x_off = 0,
+        .y_off = @intCast(editor_height),
+        .height = @intCast(@min(pending_images.len, @as(usize, window.height) -| editor_height)),
+    });
+    const blank_prefix = try ctx.arena.alloc(u8, prefix_width);
+    @memset(blank_prefix, ' ');
+    for (pending_images, 0..) |image, index| {
+        if (index >= continuation_window.height) break;
+        const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
+        drawFittedLine(continuation_window, index, placeholder, prompt_style);
+    }
+    return .{
+        .width = window.width,
+        .height = @intCast(@min(editor_height + pending_images.len, @as(usize, window.height))),
+    };
+}
+
+fn measureAutocompleteHeight(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    editor: *tui.Editor,
+    width: usize,
+) !usize {
+    if (!editor.isShowingAutocomplete()) return 0;
+    const height_hint = @max(@as(usize, 1), editor.autocomplete_max_visible);
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = @intCast(height_hint),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const measure_window = tui.draw.rootWindow(&screen);
+    measure_window.clear();
+    const size = try editor.drawAutocomplete(measure_window, .{
+        .window = measure_window,
+        .arena = allocator,
+        .theme = theme,
+    });
+    return @as(usize, size.height);
+}
+
+fn measureQueuedMessagesHeight(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+) !usize {
+    if (snapshot.queued_steering.len == 0 and snapshot.queued_follow_up.len == 0) return 0;
+    const height_hint = @max(@as(usize, 4), queuedEstimateRows(snapshot, width));
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const measure_window = tui.draw.rootWindow(&screen);
+    measure_window.clear();
+    const size = try drawQueuedMessages(measure_window, .{
+        .window = measure_window,
+        .arena = allocator,
+        .theme = theme,
+    }, keybindings, theme, snapshot);
+    return @as(usize, size.height);
+}
+
+fn queuedEstimateRows(snapshot: *const RenderStateSnapshot, width: usize) usize {
+    var rows: usize = 2;
+    for (snapshot.queued_steering) |queued| rows += estimateWrappedRows(queued, width) + 1;
+    for (snapshot.queued_follow_up) |queued| rows += estimateWrappedRows(queued, width) + 1;
+    return rows;
+}
+
+fn drawQueuedMessages(
+    window: tui.vaxis.Window,
+    ctx: tui.DrawContext,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+) !tui.DrawSize {
+    if (snapshot.queued_steering.len == 0 and snapshot.queued_follow_up.len == 0) {
+        return .{ .width = window.width, .height = 0 };
+    }
+
+    const status_style = styleForToken(theme, .status);
+    var row: usize = 1;
+    for (snapshot.queued_steering) |queued| {
+        const line = try std.fmt.allocPrint(ctx.arena, "Steering: {s}", .{queued});
+        row += drawWrappedText(window, row, line, status_style);
+    }
+    for (snapshot.queued_follow_up) |queued| {
+        const line = try std.fmt.allocPrint(ctx.arena, "Follow-up: {s}", .{queued});
+        row += drawWrappedText(window, row, line, status_style);
+    }
+    const dequeue_label = try actionLabel(ctx.arena, keybindings, .dequeue_messages, "Alt+Up");
+    const hint = try std.fmt.allocPrint(ctx.arena, "↳ {s} to edit queued messages", .{dequeue_label});
+    row += drawWrappedText(window, row, hint, status_style);
+    return .{
+        .width = window.width,
+        .height = @intCast(@min(row, @as(usize, window.height))),
+    };
+}
+
+fn drawChatViewport(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    items: []const ChatItem,
+    window: tui.vaxis.Window,
+    start_row: usize,
+    height: usize,
+) !void {
+    if (start_row >= window.height or height == 0) return;
+
+    const visible_height = @min(height, @as(usize, window.height) - start_row);
+    const width = @max(@as(usize, window.width), 1);
+    const scratch_height = @max(visible_height, estimateChatRows(items, width));
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = @intCast(@min(scratch_height, @as(usize, std.math.maxInt(u16)))),
+        .cols = window.width,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const scratch_window = tui.draw.rootWindow(&screen);
+    scratch_window.clear();
+    const rendered = try drawChatItems(scratch_window, allocator, theme, items);
+    const rendered_height = @min(@as(usize, rendered.height), @as(usize, screen.height));
+    const src_start = rendered_height -| visible_height;
+    const dst = window.child(.{
+        .y_off = @intCast(start_row),
+        .height = @intCast(visible_height),
+    });
+    blitScreenRows(&screen, dst, src_start, visible_height);
+}
+
+fn drawChatItems(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    items: []const ChatItem,
+) !tui.DrawSize {
+    var row: usize = 0;
+    for (items) |item| {
+        if (row >= window.height) break;
+        row += try drawChatItem(window, allocator, theme, item, row);
+    }
+    return .{
+        .width = window.width,
+        .height = @intCast(@min(row, @as(usize, window.height))),
+    };
+}
+
+fn drawChatItem(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    start_row: usize,
+) !usize {
+    const remaining_height = @as(usize, window.height) -| start_row;
+    if (remaining_height == 0) return 0;
+    const child = window.child(.{
+        .y_off = @intCast(start_row),
+        .height = @intCast(remaining_height),
+    });
+    switch (item.kind) {
+        .assistant => {
+            var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, styleForToken(theme, .assistant));
+            if (std.mem.trim(u8, item.text, " \t\r\n").len == 0) return row;
+            const markdown_window = child.child(.{
+                .y_off = @intCast(row),
+                .height = child.height - @as(u16, @intCast(row)),
+            });
+            const markdown = tui.Markdown{ .text = item.text, .theme = theme };
+            const size = try markdown.draw(markdown_window, .{
+                .window = markdown_window,
+                .arena = allocator,
+                .theme = theme,
+            });
+            row += @as(usize, size.height);
+            return row;
+        },
+        .markdown => {
+            const markdown = tui.Markdown{ .text = item.text, .theme = theme };
+            const size = try markdown.draw(child, .{
+                .window = child,
+                .arena = allocator,
+                .theme = theme,
+            });
+            return @as(usize, size.height);
+        },
+        else => return drawWrappedText(child, 0, item.text, styleForToken(theme, chatToken(item.kind))),
+    }
+}
+
+fn chatToken(kind: ChatKind) resources_mod.ThemeToken {
+    return switch (kind) {
+        .welcome => .welcome,
+        .info => .status,
+        .@"error" => .@"error",
+        .markdown => .markdown_text,
+        .user => .user,
+        .assistant => .assistant,
+        .tool_call => .tool_call,
+        .tool_result => .tool_result,
+    };
+}
+
+fn estimateChatRows(items: []const ChatItem, width: usize) usize {
+    var rows: usize = 1;
+    for (items) |item| {
+        rows += switch (item.kind) {
+            .assistant => 1 + estimateWrappedRows(item.text, width) + 8,
+            .markdown => estimateWrappedRows(item.text, width) + 8,
+            else => estimateWrappedRows(item.text, width),
+        };
+    }
+    return rows;
+}
+
+fn blitScreenRows(
+    source: *tui.vaxis.Screen,
+    dest: tui.vaxis.Window,
+    source_start_row: usize,
+    height: usize,
+) void {
+    const rows = @min(height, @as(usize, dest.height));
+    const cols = @min(@as(usize, source.width), @as(usize, dest.width));
+    for (0..rows) |row| {
+        for (0..cols) |col| {
+            const cell = source.readCell(@intCast(col), @intCast(source_start_row + row)) orelse continue;
+            dest.writeCell(@intCast(col), @intCast(row), normalizeCellForBlit(cell));
+        }
+    }
+}
+
+fn normalizeCellForBlit(cell: tui.vaxis.Cell) tui.vaxis.Cell {
+    if (cell.char.grapheme.len != 0) return cell;
+    var normalized = cell;
+    normalized.char = .{ .grapheme = " ", .width = 1 };
+    return normalized;
 }
 
 const RenderHook = struct {
@@ -1112,6 +1473,13 @@ pub const OverlayPanelComponent = struct {
         return .{
             .ptr = self,
             .renderIntoFn = renderIntoOpaque,
+        };
+    }
+
+    pub fn drawComponent(self: *const OverlayPanelComponent) tui.DrawComponent {
+        return .{
+            .ptr = self,
+            .drawFn = drawOpaque,
         };
     }
 
@@ -1207,6 +1575,99 @@ pub const OverlayPanelComponent = struct {
         panel_box.theme = self.theme;
         try panel_box.addChild(allocator, content.component());
         try panel_box.renderInto(allocator, width, lines);
+    }
+
+    pub fn draw(
+        self: *const OverlayPanelComponent,
+        window: tui.vaxis.Window,
+        ctx: tui.DrawContext,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        window.clear();
+        const border_style = styleForToken(self.theme, .box_border);
+        const bordered = if (window.width >= 2 and window.height >= 2)
+            window.child(.{
+                .border = .{
+                    .where = .all,
+                    .style = border_style,
+                    .glyphs = .single_square,
+                },
+            })
+        else
+            window;
+        bordered.clear();
+
+        const content_window = bordered.child(.{
+            .x_off = @intCast(@min(@as(usize, 2), @as(usize, bordered.width))),
+            .y_off = @intCast(@min(@as(usize, 1), @as(usize, bordered.height))),
+            .width = @intCast(@max(@as(usize, 1), @as(usize, bordered.width) -| 4)),
+            .height = @intCast(@max(@as(usize, 1), @as(usize, bordered.height) -| 2)),
+        });
+
+        var row: usize = 0;
+        drawFittedLine(content_window, row, self.overlay.title(), styleForToken(self.theme, .overlay_title));
+        row += 2;
+        drawFittedLine(content_window, row, self.overlay.hint(), styleForToken(self.theme, .overlay_hint));
+        row += 2;
+
+        switch (self.overlay.*) {
+            .settings_editor => |*settings_editor| {
+                settings_editor.editor.setTheme(self.theme);
+                drawFittedLine(content_window, row, settings_editor.path, styleForToken(self.theme, .overlay_hint));
+                row += 2;
+                if (row < content_window.height) {
+                    const editor_window = content_window.child(.{
+                        .y_off = @intCast(row),
+                        .height = content_window.height - @as(u16, @intCast(row)),
+                    });
+                    const size = try settings_editor.editor.draw(editor_window, .{
+                        .window = editor_window,
+                        .arena = ctx.arena,
+                        .theme = self.theme,
+                    });
+                    row += @as(usize, size.height);
+                }
+            },
+            else => {
+                if (row < content_window.height) {
+                    const overlay_list = switch (self.overlay.*) {
+                        .info => |*info_overlay| &info_overlay.list,
+                        .session => |*session_overlay| &session_overlay.list,
+                        .model => |*model_overlay| &model_overlay.list,
+                        .tree => |*tree_overlay| &tree_overlay.list,
+                        .auth => |*auth_overlay| &auth_overlay.list,
+                        else => unreachable,
+                    };
+                    overlay_list.theme = self.theme;
+                    overlay_list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
+                    const list_window = content_window.child(.{
+                        .y_off = @intCast(row),
+                        .height = content_window.height - @as(u16, @intCast(row)),
+                    });
+                    const size = try overlay_list.draw(list_window, .{
+                        .window = list_window,
+                        .arena = ctx.arena,
+                        .theme = self.theme,
+                    });
+                    row += @as(usize, size.height);
+                }
+            },
+        }
+
+        const chrome_height: usize = if (window.width >= 2 and window.height >= 2) 2 else 0;
+        const total_height = @min(@as(usize, window.height), row + 2 + chrome_height);
+        return .{
+            .width = window.width,
+            .height = @intCast(@max(@as(usize, 1), total_height)),
+        };
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: tui.vaxis.Window,
+        ctx: tui.DrawContext,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        const self: *const OverlayPanelComponent = @ptrCast(@alignCast(ptr));
+        return self.draw(window, ctx);
     }
 };
 
@@ -1561,61 +2022,42 @@ pub fn renderPromptLines(
     width: usize,
     lines: *tui.LineList,
 ) !void {
-    const prefix_width = tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX);
-    const editor_width = @max(@as(usize, 1), if (width > prefix_width) width - prefix_width else 1);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch_allocator = arena.allocator();
 
-    var editor_lines = tui.LineList.empty;
-    defer freeLinesSafe(allocator, &editor_lines);
-    try editor.renderTextInto(allocator, editor_width, &editor_lines);
+    const height = try measurePromptHeight(scratch_allocator, theme, editor, pending_images, width);
+    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
+        .rows = @intCast(@max(height, 1)),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(scratch_allocator);
 
-    const continuation_prefix = try allocator.alloc(u8, prefix_width);
-    defer allocator.free(continuation_prefix);
-    @memset(continuation_prefix, ' ');
-
-    for (editor_lines.items, 0..) |editor_line, index| {
-        var builder = std.ArrayList(u8).empty;
-        errdefer builder.deinit(allocator);
-
-        if (index == 0 and theme != null) {
-            const themed_prefix = try applyThemeAlloc(allocator, theme, .prompt, INPUT_PROMPT_PREFIX);
-            defer allocator.free(themed_prefix);
-            try builder.appendSlice(allocator, themed_prefix);
-        } else {
-            try builder.appendSlice(allocator, if (index == 0) INPUT_PROMPT_PREFIX else continuation_prefix);
-        }
-        try builder.appendSlice(allocator, editor_line);
-
-        const fitted = try fitLine(allocator, builder.items, width);
-        defer allocator.free(fitted);
-        try tui.component.appendOwnedLine(lines, allocator, fitted);
-        builder.deinit(allocator);
-    }
-
-    for (pending_images, 0..) |image, index| {
-        const placeholder_text = try std.fmt.allocPrint(allocator, "[image {d}: {s}]", .{ index + 1, image.mime_type });
-        defer allocator.free(placeholder_text);
-
-        var builder = std.ArrayList(u8).empty;
-        errdefer builder.deinit(allocator);
-        try builder.appendSlice(allocator, continuation_prefix);
-        if (theme) |active_theme| {
-            const themed_placeholder = try active_theme.applyAlloc(allocator, .prompt, placeholder_text);
-            defer allocator.free(themed_placeholder);
-            try builder.appendSlice(allocator, themed_placeholder);
-        } else {
-            try builder.appendSlice(allocator, placeholder_text);
-        }
-
-        const fitted = try fitLine(allocator, builder.items, width);
-        defer allocator.free(fitted);
-        try tui.component.appendOwnedLine(lines, allocator, fitted);
-        builder.deinit(allocator);
-    }
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawPromptLines(window, .{
+        .window = window,
+        .arena = scratch_allocator,
+        .theme = theme,
+    }, theme, editor, pending_images);
+    try tui.vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, width, rendered.height, lines);
 }
 
 pub fn formatFooterLine(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+) ![]u8 {
+    const fitted = try formatFooterText(allocator, snapshot, width);
+    defer allocator.free(fitted);
+    return try applyThemeAlloc(allocator, theme, .footer, fitted);
+}
+
+pub fn formatFooterText(
+    allocator: std.mem.Allocator,
     snapshot: *const RenderStateSnapshot,
     width: usize,
 ) ![]u8 {
@@ -1714,8 +2156,7 @@ pub fn formatFooterLine(
     try appendFooterPart(allocator, &builder, &needs_separator, model_text);
 
     const fitted = try fitLine(allocator, builder.items, width);
-    defer allocator.free(fitted);
-    return try applyThemeAlloc(allocator, theme, .footer, fitted);
+    return fitted;
 }
 
 pub fn appendFooterPart(
@@ -1769,6 +2210,16 @@ pub fn formatHintsLine(
     theme: ?*const resources_mod.Theme,
     width: usize,
 ) ![]u8 {
+    const fitted = try formatHintsText(allocator, keybindings, width);
+    defer allocator.free(fitted);
+    return try applyThemeAlloc(allocator, theme, .status, fitted);
+}
+
+pub fn formatHintsText(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    width: usize,
+) ![]u8 {
     const open_sessions = try actionLabel(allocator, keybindings, .open_sessions, "Ctrl+S");
     defer allocator.free(open_sessions);
     const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
@@ -1793,8 +2244,7 @@ pub fn formatHintsLine(
     );
     defer allocator.free(line);
     const fitted = try fitLine(allocator, line, width);
-    defer allocator.free(fitted);
-    return try applyThemeAlloc(allocator, theme, .status, fitted);
+    return fitted;
 }
 
 pub fn actionLabel(
@@ -1833,15 +2283,23 @@ pub fn renderChatItemInto(
     item: ChatItem,
     lines: *tui.LineList,
 ) !void {
-    switch (item.kind) {
-        .assistant => try renderAssistantChatItemInto(allocator, width, theme, item.text, lines),
-        .markdown => try renderMarkdownChatItemInto(allocator, width, theme, item.text, lines),
-        else => {
-            const themed_item = try themeChatItem(allocator, theme, item);
-            defer allocator.free(themed_item);
-            try tui.ansi.wrapTextWithAnsi(allocator, themed_item, width, lines);
-        },
-    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch_allocator = arena.allocator();
+
+    const height_hint = @max(@as(usize, 1), estimateChatRows(&.{item}, width));
+    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
+        .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(scratch_allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawChatItem(window, scratch_allocator, theme, item, 0);
+    try tui.vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, width, rendered, lines);
 }
 
 pub fn renderAssistantChatItemInto(
@@ -1851,17 +2309,7 @@ pub fn renderAssistantChatItemInto(
     text: []const u8,
     lines: *tui.LineList,
 ) !void {
-    const prefix = try applyThemeAlloc(allocator, theme, .assistant, ASSISTANT_PREFIX);
-    defer allocator.free(prefix);
-    try tui.ansi.wrapTextWithAnsi(allocator, prefix, width, lines);
-
-    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
-
-    const markdown = tui.Markdown{
-        .text = text,
-        .theme = theme,
-    };
-    try markdown.renderInto(allocator, width, lines);
+    try renderChatItemInto(allocator, width, theme, .{ .kind = .assistant, .text = @constCast(text) }, lines);
 }
 
 pub fn renderMarkdownChatItemInto(
@@ -1871,11 +2319,7 @@ pub fn renderMarkdownChatItemInto(
     text: []const u8,
     lines: *tui.LineList,
 ) !void {
-    const markdown = tui.Markdown{
-        .text = text,
-        .theme = theme,
-    };
-    try markdown.renderInto(allocator, width, lines);
+    try renderChatItemInto(allocator, width, theme, .{ .kind = .markdown, .text = @constCast(text) }, lines);
 }
 
 pub fn applyThemeAlloc(
@@ -1946,35 +2390,29 @@ pub fn renderQueuedMessageLines(
     width: usize,
     lines: *tui.LineList,
 ) !void {
-    if (snapshot.queued_steering.len == 0 and snapshot.queued_follow_up.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch_allocator = arena.allocator();
 
-    const blank = try fitLine(allocator, "", width);
-    defer allocator.free(blank);
-    try tui.component.appendOwnedLine(lines, allocator, blank);
+    const height = try measureQueuedMessagesHeight(scratch_allocator, keybindings, theme, snapshot, width);
+    if (height == 0) return;
 
-    for (snapshot.queued_steering) |queued| {
-        const line = try std.fmt.allocPrint(allocator, "Steering: {s}", .{queued});
-        defer allocator.free(line);
-        const themed = try applyThemeAlloc(allocator, theme, .status, line);
-        defer allocator.free(themed);
-        try tui.ansi.wrapTextWithAnsi(allocator, themed, width, lines);
-    }
+    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
+        .rows = @intCast(height),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(scratch_allocator);
 
-    for (snapshot.queued_follow_up) |queued| {
-        const line = try std.fmt.allocPrint(allocator, "Follow-up: {s}", .{queued});
-        defer allocator.free(line);
-        const themed = try applyThemeAlloc(allocator, theme, .status, line);
-        defer allocator.free(themed);
-        try tui.ansi.wrapTextWithAnsi(allocator, themed, width, lines);
-    }
-
-    const dequeue_label = try actionLabel(allocator, keybindings, .dequeue_messages, "Alt+Up");
-    defer allocator.free(dequeue_label);
-    const hint = try std.fmt.allocPrint(allocator, "↳ {s} to edit queued messages", .{dequeue_label});
-    defer allocator.free(hint);
-    const themed_hint = try applyThemeAlloc(allocator, theme, .status, hint);
-    defer allocator.free(themed_hint);
-    try tui.ansi.wrapTextWithAnsi(allocator, themed_hint, width, lines);
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawQueuedMessages(window, .{
+        .window = window,
+        .arena = scratch_allocator,
+        .theme = theme,
+    }, keybindings, theme, snapshot);
+    try tui.vaxis_adapter.appendScreenRowsAsAnsiLines(allocator, &screen, width, rendered.height, lines);
 }
 
 fn cloneChatItems(allocator: std.mem.Allocator, items: []const ChatItem) ![]ChatItem {
