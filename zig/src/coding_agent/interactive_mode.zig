@@ -271,11 +271,16 @@ pub fn runInteractiveMode(
 
     var input_loop = try terminal.initInputLoop(allocator, io, env_map);
     defer input_loop.deinit();
+    input_loop.vaxis_state.queryTerminal(input_loop.loop.tty.writer(), .fromMilliseconds(250)) catch {};
 
     var renderer = tui.Renderer.init(allocator, &terminal);
     defer renderer.deinit();
     var vaxis_adapter = tui.VaxisAdapter.init(allocator, input_loop.vaxis_state, input_loop.loop.tty.writer());
     defer vaxis_adapter.deinit();
+    defer app_state.freeActiveTerminalImages(.{
+        .vx = input_loop.vaxis_state,
+        .tty = input_loop.loop.tty.writer(),
+    });
 
     var editor = tui.Editor.init(allocator);
     defer editor.deinit();
@@ -326,7 +331,14 @@ pub fn runInteractiveMode(
             if (should_exit) break;
         }
 
-        try app_state.pollClipboardPaste();
+        try app_state.pollClipboardPaste(.{
+            .vx = input_loop.vaxis_state,
+            .tty = input_loop.loop.tty.writer(),
+        });
+        app_state.flushRetiredTerminalImages(.{
+            .vx = input_loop.vaxis_state,
+            .tty = input_loop.loop.tty.writer(),
+        });
 
         const size = try terminal.refreshSize();
         screen.height = size.height;
@@ -3093,7 +3105,7 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
     var attempts: usize = 0;
     while (state.clipboardPasteInProgress() and attempts < 40) : (attempts += 1) {
         std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-        try state.pollClipboardPaste();
+        try state.pollClipboardPaste(null);
     }
 
     const completed_pending = try state.clonePendingEditorImages(allocator);

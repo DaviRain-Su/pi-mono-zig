@@ -37,6 +37,24 @@ pub const ChatItem = struct {
     text: []u8,
 };
 
+pub const PendingEditorImage = struct {
+    data: []const u8,
+    mime_type: []const u8,
+    kitty_image: ?tui.components.image.KittyImage = null,
+
+    fn content(self: PendingEditorImage) ai.ImageContent {
+        return .{
+            .data = self.data,
+            .mime_type = self.mime_type,
+        };
+    }
+};
+
+pub const TerminalImageContext = struct {
+    vx: *tui.vaxis.Vaxis,
+    tty: *std.Io.Writer,
+};
+
 pub const FooterUsageTotals = struct {
     input: u64 = 0,
     output: u64 = 0,
@@ -58,7 +76,7 @@ pub const RenderStateSnapshot = struct {
     context_percent: ?f64 = null,
     queued_steering: [][]u8 = &.{},
     queued_follow_up: [][]u8 = &.{},
-    pending_editor_images: []ai.ImageContent = &.{},
+    pending_editor_images: []PendingEditorImage = &.{},
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
         for (self.items) |item| allocator.free(item.text);
@@ -200,7 +218,8 @@ pub const AppState = struct {
     context_unknown: bool = false,
     queued_steering: std.ArrayList([]u8) = .empty,
     queued_follow_up: std.ArrayList([]u8) = .empty,
-    pending_editor_images: std.ArrayList(ai.ImageContent) = .empty,
+    pending_editor_images: std.ArrayList(PendingEditorImage) = .empty,
+    retired_kitty_images: std.ArrayList(u32) = .empty,
     active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
     tool_output_expanded: bool = false,
     clipboard_paste: ClipboardPasteTask,
@@ -225,6 +244,7 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         self.clearPendingEditorImagesLocked();
         self.pending_editor_images.deinit(self.allocator);
+        self.retired_kitty_images.deinit(self.allocator);
         self.clearActiveToolUpdatesLocked();
         self.active_tool_updates.deinit(self.allocator);
         self.clipboard_paste.deinit();
@@ -245,7 +265,10 @@ pub const AppState = struct {
     pub fn appendPendingEditorImage(self: *AppState, image: ai.ImageContent) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.pending_editor_images.append(self.allocator, image);
+        try self.pending_editor_images.append(self.allocator, .{
+            .data = image.data,
+            .mime_type = image.mime_type,
+        });
     }
 
     pub fn clearPendingEditorImages(self: *AppState) void {
@@ -262,7 +285,7 @@ pub const AppState = struct {
         try self.setStatus("pasting clipboard image...");
     }
 
-    pub fn pollClipboardPaste(self: *AppState) !void {
+    pub fn pollClipboardPaste(self: *AppState, terminal_image_context: ?TerminalImageContext) !void {
         const result = self.clipboard_paste.poll() orelse return;
 
         switch (result) {
@@ -271,10 +294,21 @@ pub const AppState = struct {
                     var owned = image;
                     clipboard_image.deinitImageContent(std.heap.page_allocator, &owned);
                 }
-                try self.appendPendingEditorImage(.{
+
+                var pending = PendingEditorImage{
                     .data = try self.allocator.dupe(u8, image.data),
                     .mime_type = try self.allocator.dupe(u8, image.mime_type),
-                });
+                    .kitty_image = try self.transmitKittyImage(image, terminal_image_context),
+                };
+                var appended = false;
+                errdefer if (!appended) self.deinitPendingEditorImage(&pending);
+
+                {
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+                    try self.pending_editor_images.append(self.allocator, pending);
+                    appended = true;
+                }
                 try self.setStatus("clipboard image pasted");
             },
             .empty => try self.setStatus("clipboard does not contain an image"),
@@ -311,6 +345,25 @@ pub const AppState = struct {
             initialized += 1;
         }
         return cloned;
+    }
+
+    pub fn flushRetiredTerminalImages(self: *AppState, terminal_image_context: TerminalImageContext) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.flushRetiredTerminalImagesLocked(terminal_image_context);
+    }
+
+    pub fn freeActiveTerminalImages(self: *AppState, terminal_image_context: TerminalImageContext) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.flushRetiredTerminalImagesLocked(terminal_image_context);
+        for (self.pending_editor_images.items) |*image| {
+            if (image.kitty_image) |kitty| {
+                terminal_image_context.vx.freeImage(terminal_image_context.tty, kitty.id);
+                image.kitty_image = null;
+            }
+        }
     }
 
     pub fn snapshotForRender(self: *const AppState, allocator: std.mem.Allocator) !RenderStateSnapshot {
@@ -746,11 +799,48 @@ pub const AppState = struct {
     }
 
     fn clearPendingEditorImagesLocked(self: *AppState) void {
-        for (self.pending_editor_images.items) |image| {
-            self.allocator.free(image.data);
-            self.allocator.free(image.mime_type);
+        for (self.pending_editor_images.items) |*image| {
+            self.retirePendingEditorImageLocked(image);
+            self.deinitPendingEditorImage(image);
         }
         self.pending_editor_images.clearRetainingCapacity();
+    }
+
+    fn deinitPendingEditorImage(self: *AppState, image: *PendingEditorImage) void {
+        self.allocator.free(image.data);
+        self.allocator.free(image.mime_type);
+        image.* = undefined;
+    }
+
+    fn retirePendingEditorImageLocked(self: *AppState, image: *PendingEditorImage) void {
+        if (image.kitty_image) |kitty| {
+            self.retired_kitty_images.append(self.allocator, kitty.id) catch {};
+            image.kitty_image = null;
+        }
+    }
+
+    fn flushRetiredTerminalImagesLocked(self: *AppState, terminal_image_context: TerminalImageContext) void {
+        for (self.retired_kitty_images.items) |id| {
+            terminal_image_context.vx.freeImage(terminal_image_context.tty, id);
+        }
+        self.retired_kitty_images.clearRetainingCapacity();
+    }
+
+    fn transmitKittyImage(
+        self: *AppState,
+        image: ai.ImageContent,
+        terminal_image_context: ?TerminalImageContext,
+    ) !?tui.components.image.KittyImage {
+        const context = terminal_image_context orelse return null;
+        if (!context.vx.caps.kitty_graphics) return null;
+
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(image.data) catch return null;
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(decoded);
+        std.base64.standard.Decoder.decode(decoded, image.data) catch return null;
+
+        const transmitted = context.vx.loadImage(self.allocator, context.tty, .{ .mem = decoded }) catch return null;
+        return tui.components.image.KittyImage.fromVaxisImage(transmitted);
     }
 
     fn clearActiveToolUpdatesLocked(self: *AppState) void {
@@ -968,9 +1058,9 @@ pub const ScreenComponent = struct {
         row += prompt_height;
 
         const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), @as(usize, window.width));
-        const editor_image_rows = snapshot.pending_editor_images.len;
-        const editor_rows = if (prompt_height > editor_image_rows) prompt_height - editor_image_rows else 1;
         const editor_window_width = @max(@as(usize, 1), if (window.width > prefix_width) window.width - @as(u16, @intCast(prefix_width)) else 1);
+        const editor_image_rows = pendingImagesRenderHeight(snapshot.pending_editor_images, editor_window_width);
+        const editor_rows = if (prompt_height > editor_image_rows) prompt_height - editor_image_rows else 1;
         const editor_window = window.child(.{
             .x_off = @intCast(prefix_width),
             .y_off = @intCast(prompt_start_row),
@@ -1104,12 +1194,12 @@ fn measurePromptHeight(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
-    pending_images: []const ai.ImageContent,
+    pending_images: []const PendingEditorImage,
     width: usize,
 ) !usize {
     const prefix_width = @min(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX), width);
     const editor_width = @max(@as(usize, 1), width -| prefix_width);
-    return try measureEditorHeight(allocator, theme, editor, editor_width) + pending_images.len;
+    return try measureEditorHeight(allocator, theme, editor, editor_width) + pendingImagesRenderHeight(pending_images, editor_width);
 }
 
 fn drawPromptLines(
@@ -1117,7 +1207,7 @@ fn drawPromptLines(
     ctx: tui.DrawContext,
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
-    pending_images: []const ai.ImageContent,
+    pending_images: []const PendingEditorImage,
 ) !tui.DrawSize {
     const prompt_style = styleForToken(theme, .prompt);
     drawFittedLine(window, 0, INPUT_PROMPT_PREFIX, prompt_style);
@@ -1138,22 +1228,58 @@ fn drawPromptLines(
             .theme = theme,
         });
     }
-    const continuation_window = window.child(.{
-        .x_off = 0,
-        .y_off = @intCast(editor_height),
-        .height = @intCast(@min(pending_images.len, @as(usize, window.height) -| editor_height)),
-    });
     const blank_prefix = try ctx.arena.alloc(u8, prefix_width);
     @memset(blank_prefix, ' ');
+    var image_row: usize = 0;
     for (pending_images, 0..) |image, index| {
-        if (index >= continuation_window.height) break;
-        const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
-        drawFittedLine(continuation_window, index, placeholder, prompt_style);
+        const row_count = pendingImageRenderHeight(image, editor_width);
+        if (editor_height + image_row >= window.height) break;
+
+        const continuation_window = window.child(.{
+            .x_off = 0,
+            .y_off = @intCast(editor_height + image_row),
+            .height = @intCast(@min(row_count, @as(usize, window.height) -| (editor_height + image_row))),
+        });
+
+        if (image.kitty_image) |kitty| {
+            const image_window = continuation_window.child(.{
+                .x_off = @intCast(prefix_width),
+                .width = @intCast(editor_width),
+                .height = @intCast(@min(row_count, @as(usize, continuation_window.height))),
+            });
+            const image_component = tui.Image{
+                .mime_type = image.mime_type,
+                .kitty_image = kitty,
+                .max_width_cells = editor_width,
+                .max_height_cells = row_count,
+            };
+            _ = try image_component.drawComponent().draw(image_window, .{
+                .window = image_window,
+                .arena = ctx.arena,
+                .theme = theme,
+            });
+        } else {
+            const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
+            drawFittedLine(continuation_window, 0, placeholder, prompt_style);
+        }
+
+        image_row += row_count;
     }
     return .{
         .width = window.width,
-        .height = @intCast(@min(editor_height + pending_images.len, @as(usize, window.height))),
+        .height = @intCast(@min(editor_height + image_row, @as(usize, window.height))),
     };
+}
+
+fn pendingImagesRenderHeight(images: []const PendingEditorImage, width: usize) usize {
+    var height: usize = 0;
+    for (images) |image| height += pendingImageRenderHeight(image, width);
+    return height;
+}
+
+fn pendingImageRenderHeight(image: PendingEditorImage, width: usize) usize {
+    _ = width;
+    return if (image.kitty_image != null) 4 else 1;
 }
 
 fn measureAutocompleteHeight(
@@ -2018,7 +2144,7 @@ pub fn renderPromptLines(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
-    pending_images: []const ai.ImageContent,
+    pending_images: []const PendingEditorImage,
     width: usize,
     lines: *tui.LineList,
 ) !void {
@@ -2496,10 +2622,10 @@ fn deinitOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
     if (items.len > 0) allocator.free(items);
 }
 
-fn cloneImageContentsForRender(allocator: std.mem.Allocator, images: []const ai.ImageContent) ![]ai.ImageContent {
+fn cloneImageContentsForRender(allocator: std.mem.Allocator, images: []const PendingEditorImage) ![]PendingEditorImage {
     if (images.len == 0) return &.{};
 
-    const cloned = try allocator.alloc(ai.ImageContent, images.len);
+    const cloned = try allocator.alloc(PendingEditorImage, images.len);
     var initialized: usize = 0;
     errdefer {
         for (cloned[0..initialized]) |image| {
@@ -2513,18 +2639,60 @@ fn cloneImageContentsForRender(allocator: std.mem.Allocator, images: []const ai.
         cloned[index] = .{
             .data = try allocator.dupe(u8, image.data),
             .mime_type = try allocator.dupe(u8, image.mime_type),
+            .kitty_image = image.kitty_image,
         };
         initialized += 1;
     }
     return cloned;
 }
 
-fn deinitImageContentsForRender(allocator: std.mem.Allocator, images: []const ai.ImageContent) void {
+fn deinitImageContentsForRender(allocator: std.mem.Allocator, images: []const PendingEditorImage) void {
     for (images) |image| {
         allocator.free(image.data);
         allocator.free(image.mime_type);
     }
     if (images.len > 0) allocator.free(images);
+}
+
+test "drawPromptLines places Kitty image cells for transmitted pending images" {
+    const allocator = std.testing.allocator;
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 8,
+        .cols = 40,
+        .x_pixel = 320,
+        .y_pixel = 128,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const pending = [_]PendingEditorImage{.{
+        .data = "AQID",
+        .mime_type = "image/png",
+        .kitty_image = .{
+            .id = 77,
+            .width_px = 64,
+            .height_px = 32,
+        },
+    }};
+
+    _ = try drawPromptLines(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    }, null, &editor, &pending);
+
+    const image_col: u16 = @intCast(tui.ansi.visibleWidth(INPUT_PROMPT_PREFIX));
+    const image_cell = screen.readCell(image_col, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(image_cell.image != null);
+    try std.testing.expectEqual(@as(u32, 77), image_cell.image.?.img_id);
 }
 
 pub const InteractiveModeTestBackend = struct {
