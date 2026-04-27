@@ -401,11 +401,12 @@ pub fn switchSession(
         overrideApiKeyForProvider(options, candidate.agent.getModel().provider),
         configuredApiKeyForProvider(runtime_config, candidate.agent.getModel().provider),
     ) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "error: {s}", .{
+        try presentProviderSelectionError(
+            allocator,
+            app_state,
             provider_config.resolveProviderErrorMessage(err, candidate.agent.getModel().provider),
-        });
-        defer allocator.free(message);
-        try app_state.setStatus(message);
+            "session switch failed",
+        );
         return;
     };
     errdefer candidate_provider.deinit(allocator);
@@ -420,7 +421,7 @@ pub fn switchSession(
     current_provider.* = candidate_provider;
     try session.agent.subscribe(subscriber);
 
-    try rebuildAppStateFromSession(allocator, session.io, app_state, session);
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session, current_provider);
 }
 
 pub fn switchModel(
@@ -442,11 +443,12 @@ pub fn switchModel(
         overrideApiKeyForProvider(options, provider_name),
         configuredApiKeyForProvider(runtime_config, provider_name),
     ) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "error: {s}", .{
+        try presentProviderSelectionError(
+            allocator,
+            app_state,
             provider_config.resolveProviderErrorMessage(err, provider_name),
-        });
-        defer allocator.free(message);
-        try app_state.setStatus(message);
+            "model switch failed",
+        );
         return;
     };
     errdefer next_provider.deinit(allocator);
@@ -455,8 +457,20 @@ pub fn switchModel(
     current_provider.* = next_provider;
     try session.setModel(next_provider.model);
     session.setApiKey(next_provider.api_key);
-    try updateAppFooterFromSession(allocator, session.io, app_state, session);
+    try updateAppFooterFromSession(allocator, session.io, app_state, session, current_provider);
     try app_state.setStatus("idle");
+}
+
+fn presentProviderSelectionError(
+    allocator: std.mem.Allocator,
+    app_state: *AppState,
+    detail: []const u8,
+    status: []const u8,
+) !void {
+    _ = status;
+    const owned = try allocator.dupe(u8, detail);
+    defer allocator.free(owned);
+    try app_state.appendError(owned);
 }
 
 pub fn handleModelSlashCommand(
@@ -471,11 +485,11 @@ pub fn handleModelSlashCommand(
     overlay: *?SelectorOverlay,
 ) !void {
     const search = argument orelse {
-        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
+        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
         return;
     };
 
-    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
+    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
     defer allocator.free(available);
 
     for (available) |entry| {
@@ -505,7 +519,7 @@ pub fn handleModelSlashCommand(
     const message = try std.fmt.allocPrint(allocator, "No exact model match for {s}; opening model selector", .{search});
     defer allocator.free(message);
     try app_state.appendInfo(message);
-    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), options.model_patterns, runtime_config);
+    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
 }
 
 pub fn handleScopedModelsSlashCommand(
@@ -518,12 +532,11 @@ pub fn handleScopedModelsSlashCommand(
     app_state: *AppState,
     overlay: *?SelectorOverlay,
 ) !void {
-    _ = current_provider;
-
     overlay.* = loadScopedModelOverlay(
         allocator,
         env_map,
         session.agent.getModel(),
+        current_provider,
         options.model_patterns,
         runtime_config,
     ) catch |err| switch (err) {
@@ -777,7 +790,7 @@ pub fn handleNameSlashCommand(
     };
 
     _ = try session.session_manager.appendSessionInfo(name);
-    try updateAppFooterFromSession(allocator, session.io, app_state, session);
+    try app_state.setFooter(session.agent.getModel().id, currentSessionLabel(session));
 
     const message = try std.fmt.allocPrint(allocator, "Session name set: {s}", .{currentSessionLabel(session)});
     defer allocator.free(message);
@@ -842,7 +855,7 @@ pub fn handleCompactSlashCommand(
         .{ result.tokens_before, result.first_kept_entry_id },
     );
     defer allocator.free(info);
-    try rebuildAppStateFromSession(allocator, session.io, app_state, session);
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session, null);
     try app_state.appendInfo(info);
 }
 
@@ -1965,7 +1978,7 @@ pub fn replaceCurrentSession(
     session.* = candidate.*;
     candidate.* = undefined;
     try session.agent.subscribe(subscriber);
-    try rebuildAppStateFromSession(allocator, session.io, app_state, session);
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session, null);
     try app_state.setStatus("idle");
 }
 
@@ -1975,7 +1988,7 @@ pub fn navigateTree(
     app_state: *AppState,
 ) !void {
     try session.navigateTo(entry_id);
-    try rebuildAppStateFromSession(session.allocator, session.io, app_state, session);
+    try rebuildAppStateFromSession(session.allocator, session.io, app_state, session, null);
     try app_state.setStatus("session tree updated");
 }
 
@@ -2014,4 +2027,52 @@ pub fn resolveSessionPath(
     }
 
     return error.FileNotFound;
+}
+
+test "switchModel shows provider-specific setup guidance when auth is missing" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var app_state = try AppState.init(allocator, std.testing.io);
+    defer app_state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+
+    try switchModel(
+        allocator,
+        &env_map,
+        &session,
+        &current_provider,
+        "openai",
+        "gpt-5.4",
+        options,
+        null,
+        &app_state,
+    );
+
+    app_state.mutex.lockUncancelable(app_state.io);
+    defer app_state.mutex.unlock(app_state.io);
+    try std.testing.expect(std.mem.indexOf(u8, app_state.status, "OPENAI_API_KEY") != null);
+    try std.testing.expect(app_state.items.items.len > 1);
+    const error_text = app_state.items.items[app_state.items.items.len - 1].text;
+    try std.testing.expect(std.mem.indexOf(u8, error_text, "OPENAI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, error_text, "/login openai") != null);
 }

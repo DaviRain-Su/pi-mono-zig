@@ -4,6 +4,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const tui = @import("tui");
 const keybindings_mod = @import("../keybindings.zig");
+const provider_config = @import("../provider_config.zig");
 const resources_mod = @import("../resources.zig");
 const session_mod = @import("../session.zig");
 const session_advanced = @import("../session_advanced.zig");
@@ -11,6 +12,7 @@ const common = @import("../tools/common.zig");
 const shared = @import("shared.zig");
 const formatting = @import("formatting.zig");
 const overlays = @import("overlays.zig");
+const clipboard_image = @import("clipboard_image.zig");
 const currentSessionLabel = shared.currentSessionLabel;
 const SelectorOverlay = overlays.SelectorOverlay;
 const ASSISTANT_PREFIX = formatting.ASSISTANT_PREFIX;
@@ -18,7 +20,6 @@ const ASSISTANT_THINKING_TEXT = "Thinking...";
 const formatPrefixedBlocks = formatting.formatPrefixedBlocks;
 const formatAssistantMessage = formatting.formatAssistantMessage;
 const formatToolCall = formatting.formatToolCall;
-const formatToolResult = formatting.formatToolResult;
 
 pub const ChatKind = enum {
     welcome,
@@ -44,10 +45,140 @@ pub const FooterUsageTotals = struct {
     cost: f64 = 0,
 };
 
+pub const RenderStateSnapshot = struct {
+    items: []ChatItem = &.{},
+    status: ?[]u8 = null,
+    provider_label: ?[]u8 = null,
+    provider_status: ?[]u8 = null,
+    model_label: ?[]u8 = null,
+    session_label: ?[]u8 = null,
+    git_branch: ?[]u8 = null,
+    usage_totals: FooterUsageTotals = .{},
+    context_window: u32 = 0,
+    context_percent: ?f64 = null,
+    queued_steering: [][]u8 = &.{},
+    queued_follow_up: [][]u8 = &.{},
+    pending_editor_images: []ai.ImageContent = &.{},
+
+    pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
+        for (self.items) |item| allocator.free(item.text);
+        if (self.items.len > 0) allocator.free(self.items);
+        if (self.status) |status| allocator.free(status);
+        if (self.provider_label) |provider_label| allocator.free(provider_label);
+        if (self.provider_status) |provider_status| allocator.free(provider_status);
+        if (self.model_label) |model_label| allocator.free(model_label);
+        if (self.session_label) |session_label| allocator.free(session_label);
+        if (self.git_branch) |git_branch| allocator.free(git_branch);
+        deinitOwnedStringList(allocator, self.queued_steering);
+        deinitOwnedStringList(allocator, self.queued_follow_up);
+        deinitImageContentsForRender(allocator, self.pending_editor_images);
+        self.* = undefined;
+    }
+};
+
 const ActiveToolUpdate = struct {
     tool_call_id: []u8,
     item_index: usize,
 };
+
+const CLIPBOARD_PASTE_PROGRESS_MIN_MS: i64 = 120;
+
+const ClipboardPasteResult = union(enum) {
+    none,
+    success: ai.ImageContent,
+    empty,
+    failure,
+};
+
+const ClipboardPasteTask = struct {
+    io: std.Io,
+    env_map: ?*const std.process.Environ.Map = null,
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    result_mutex: std.Io.Mutex = .init,
+    result: ClipboardPasteResult = .none,
+    started_at_ms: i64 = 0,
+
+    fn start(self: *ClipboardPasteTask, env_map: *const std.process.Environ.Map) !bool {
+        if (self.thread != null) return false;
+        self.env_map = env_map;
+        self.started_at_ms = nowMilliseconds();
+        self.running.store(true, .seq_cst);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return true;
+    }
+
+    fn poll(self: *ClipboardPasteTask) ?ClipboardPasteResult {
+        if (self.thread == null) return null;
+        if (self.running.load(.seq_cst)) return null;
+        if (nowMilliseconds() - self.started_at_ms < CLIPBOARD_PASTE_PROGRESS_MIN_MS) return null;
+
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+
+        self.result_mutex.lockUncancelable(self.io);
+        defer self.result_mutex.unlock(self.io);
+
+        const result = self.result;
+        self.result = .none;
+        return result;
+    }
+
+    fn isActive(self: *const ClipboardPasteTask) bool {
+        return self.thread != null;
+    }
+
+    fn deinit(self: *ClipboardPasteTask) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.running.store(false, .seq_cst);
+
+        self.result_mutex.lockUncancelable(self.io);
+        defer self.result_mutex.unlock(self.io);
+        freeClipboardPasteResult(&self.result);
+        self.result = .none;
+    }
+
+    fn run(self: *ClipboardPasteTask) void {
+        defer self.running.store(false, .seq_cst);
+
+        const allocator = std.heap.page_allocator;
+        const env_map = self.env_map orelse {
+            self.storeResult(.failure);
+            return;
+        };
+
+        var image = clipboard_image.readClipboardImage(allocator, self.io, env_map) catch {
+            self.storeResult(.failure);
+            return;
+        } orelse {
+            self.storeResult(.empty);
+            return;
+        };
+        defer image.deinit(allocator);
+
+        const encoded = clipboard_image.encodeImageContent(allocator, image) catch {
+            self.storeResult(.failure);
+            return;
+        };
+        self.storeResult(.{ .success = encoded });
+    }
+
+    fn storeResult(self: *ClipboardPasteTask, result: ClipboardPasteResult) void {
+        self.result_mutex.lockUncancelable(self.io);
+        defer self.result_mutex.unlock(self.io);
+        freeClipboardPasteResult(&self.result);
+        self.result = result;
+    }
+};
+
+fn freeClipboardPasteResult(result: *ClipboardPasteResult) void {
+    switch (result.*) {
+        .success => |*image| clipboard_image.deinitImageContent(std.heap.page_allocator, image),
+        else => {},
+    }
+    result.* = .none;
+}
 
 pub const AppState = struct {
     allocator: std.mem.Allocator,
@@ -57,6 +188,8 @@ pub const AppState = struct {
     visible_start_index: usize = 0,
     last_streaming_assistant_index: ?usize = null,
     status: []u8 = &.{},
+    provider_label: []u8 = &.{},
+    provider_status: []u8 = &.{},
     model_label: []u8 = &.{},
     session_label: []u8 = &.{},
     git_branch: []u8 = &.{},
@@ -69,14 +202,19 @@ pub const AppState = struct {
     queued_follow_up: std.ArrayList([]u8) = .empty,
     pending_editor_images: std.ArrayList(ai.ImageContent) = .empty,
     active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
+    tool_output_expanded: bool = false,
+    clipboard_paste: ClipboardPasteTask,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
             .allocator = allocator,
             .io = io,
+            .clipboard_paste = .{ .io = io },
         };
         errdefer state.deinit();
         state.status = try allocator.dupe(u8, "idle");
+        state.provider_label = try allocator.dupe(u8, "unknown");
+        state.provider_status = try allocator.dupe(u8, "needs auth");
         state.model_label = try allocator.dupe(u8, "unknown");
         state.session_label = try allocator.dupe(u8, "new");
         state.git_branch = try allocator.dupe(u8, "");
@@ -89,12 +227,15 @@ pub const AppState = struct {
         self.pending_editor_images.deinit(self.allocator);
         self.clearActiveToolUpdatesLocked();
         self.active_tool_updates.deinit(self.allocator);
+        self.clipboard_paste.deinit();
         self.clearQueuedMessagesLocked();
         self.queued_steering.deinit(self.allocator);
         self.queued_follow_up.deinit(self.allocator);
         for (self.items.items) |item| self.allocator.free(item.text);
         self.items.deinit(self.allocator);
         self.allocator.free(self.status);
+        self.allocator.free(self.provider_label);
+        self.allocator.free(self.provider_status);
         self.allocator.free(self.model_label);
         self.allocator.free(self.session_label);
         self.allocator.free(self.git_branch);
@@ -111,6 +252,39 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.clearPendingEditorImagesLocked();
+    }
+
+    pub fn startClipboardPaste(self: *AppState, env_map: *const std.process.Environ.Map) !void {
+        if (!(try self.clipboard_paste.start(env_map))) {
+            try self.setStatus("clipboard image paste already in progress");
+            return;
+        }
+        try self.setStatus("pasting clipboard image...");
+    }
+
+    pub fn pollClipboardPaste(self: *AppState) !void {
+        const result = self.clipboard_paste.poll() orelse return;
+
+        switch (result) {
+            .success => |image| {
+                defer {
+                    var owned = image;
+                    clipboard_image.deinitImageContent(std.heap.page_allocator, &owned);
+                }
+                try self.appendPendingEditorImage(.{
+                    .data = try self.allocator.dupe(u8, image.data),
+                    .mime_type = try self.allocator.dupe(u8, image.mime_type),
+                });
+                try self.setStatus("clipboard image pasted");
+            },
+            .empty => try self.setStatus("clipboard does not contain an image"),
+            .failure => try self.setStatus("clipboard image paste failed"),
+            .none => {},
+        }
+    }
+
+    pub fn clipboardPasteInProgress(self: *const AppState) bool {
+        return self.clipboard_paste.isActive();
     }
 
     pub fn clonePendingEditorImages(self: *AppState, allocator: std.mem.Allocator) ![]ai.ImageContent {
@@ -139,6 +313,32 @@ pub const AppState = struct {
         return cloned;
     }
 
+    pub fn snapshotForRender(self: *const AppState, allocator: std.mem.Allocator) !RenderStateSnapshot {
+        @constCast(&self.mutex).lockUncancelable(self.io);
+        defer @constCast(&self.mutex).unlock(self.io);
+
+        var snapshot = RenderStateSnapshot{
+            .usage_totals = self.usage_totals,
+            .context_window = self.context_window,
+            .context_percent = self.context_percent,
+        };
+        errdefer snapshot.deinit(allocator);
+
+        snapshot.status = try allocator.dupe(u8, self.status);
+        snapshot.provider_label = try allocator.dupe(u8, self.provider_label);
+        snapshot.provider_status = try allocator.dupe(u8, self.provider_status);
+        snapshot.model_label = try allocator.dupe(u8, self.model_label);
+        snapshot.session_label = try allocator.dupe(u8, self.session_label);
+        snapshot.git_branch = try allocator.dupe(u8, self.git_branch);
+
+        const start_index = @min(self.visible_start_index, self.items.items.len);
+        snapshot.items = try cloneChatItems(allocator, self.items.items[start_index..]);
+        snapshot.queued_steering = try cloneOwnedStringList(allocator, self.queued_steering.items);
+        snapshot.queued_follow_up = try cloneOwnedStringList(allocator, self.queued_follow_up.items);
+        snapshot.pending_editor_images = try cloneImageContentsForRender(allocator, self.pending_editor_images.items);
+        return snapshot;
+    }
+
     pub fn clearDisplay(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -163,6 +363,12 @@ pub const AppState = struct {
         self.clearQueuedMessagesLocked();
     }
 
+    pub fn setToolOutputExpanded(self: *AppState, expanded: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.tool_output_expanded = expanded;
+    }
+
     pub fn setFooter(self: *AppState, model_label: []const u8, session_label: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -175,9 +381,13 @@ pub const AppState = struct {
         model: ai.Model,
         session_label: []const u8,
         git_branch: ?[]const u8,
+        provider_label: []const u8,
+        provider_status: []const u8,
     ) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.replaceLabelLocked(&self.provider_label, provider_label);
+        try self.replaceLabelLocked(&self.provider_status, provider_status);
         try self.replaceLabelLocked(&self.model_label, model.id);
         try self.replaceLabelLocked(&self.session_label, session_label);
         try self.replaceLabelLocked(&self.git_branch, git_branch orelse "");
@@ -270,7 +480,14 @@ pub const AppState = struct {
                     }
                 },
                 .tool_result => |tool_result| {
-                    const rendered = try formatToolResult(self.allocator, tool_result.tool_name, tool_result.content, tool_result.is_error);
+                    const rendered = try formatting.formatToolResultWithExpansion(
+                        self.allocator,
+                        tool_result.tool_name,
+                        tool_result.content,
+                        tool_result.is_error,
+                        tool_result.details,
+                        self.tool_output_expanded,
+                    );
                     defer self.allocator.free(rendered);
                     try self.appendItemLocked(.tool_result, rendered);
                 },
@@ -389,7 +606,14 @@ pub const AppState = struct {
                 defer self.allocator.free(status_text);
                 if (event.tool_call_id) |tool_call_id| {
                     if (event.partial_result) |partial_result| {
-                        const rendered = try formatToolResult(self.allocator, tool_name, partial_result.content, false);
+                        const rendered = try formatting.formatToolResultWithExpansion(
+                            self.allocator,
+                            tool_name,
+                            partial_result.content,
+                            false,
+                            partial_result.details,
+                            self.tool_output_expanded,
+                        );
                         defer self.allocator.free(rendered);
                         if (self.activeToolUpdateIndexLocked(tool_call_id)) |index| {
                             try self.replaceItemTextLocked(index, rendered);
@@ -404,7 +628,14 @@ pub const AppState = struct {
             .tool_execution_end => {
                 const tool_name = event.tool_name orelse "tool";
                 const result = event.result orelse return;
-                const rendered = try formatToolResult(self.allocator, tool_name, result.content, event.is_error orelse false);
+                const rendered = try formatting.formatToolResultWithExpansion(
+                    self.allocator,
+                    tool_name,
+                    result.content,
+                    event.is_error orelse false,
+                    result.details,
+                    self.tool_output_expanded,
+                );
                 defer self.allocator.free(rendered);
                 if (event.tool_call_id) |tool_call_id| {
                     if (self.takeActiveToolUpdateIndexLocked(tool_call_id)) |index| {
@@ -583,6 +814,7 @@ pub const ScreenComponent = struct {
     overlay: ?*SelectorOverlay = null,
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
+    after_snapshot_hook: ?RenderHook = null,
 
     pub fn component(self: *const ScreenComponent) tui.Component {
         return .{
@@ -612,21 +844,22 @@ pub const ScreenComponent = struct {
         var chat_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &chat_lines);
 
-        self.state.mutex.lockUncancelable(self.state.io);
-        defer self.state.mutex.unlock(self.state.io);
+        var snapshot = try self.state.snapshotForRender(allocator);
+        defer snapshot.deinit(allocator);
 
-        const start_index = @min(self.state.visible_start_index, self.state.items.items.len);
-        for (self.state.items.items[start_index..]) |item| {
+        if (self.after_snapshot_hook) |hook| hook.run();
+
+        for (snapshot.items) |item| {
             try renderChatItemInto(allocator, @max(width, 1), self.theme, item, &chat_lines);
         }
 
         var prompt_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &prompt_lines);
-        try renderPromptLines(allocator, self.theme, self.editor, self.state.pending_editor_images.items, width, &prompt_lines);
+        try renderPromptLines(allocator, self.theme, self.editor, snapshot.pending_editor_images, width, &prompt_lines);
         var queued_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &queued_lines);
-        try renderQueuedMessageLines(allocator, self.keybindings, self.theme, self.state, width, &queued_lines);
-        const footer_line = try formatFooterLine(allocator, self.theme, self.state, width);
+        try renderQueuedMessageLines(allocator, self.keybindings, self.theme, &snapshot, width, &queued_lines);
+        const footer_line = try formatFooterLine(allocator, self.theme, &snapshot, width);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
         defer allocator.free(hints_line);
@@ -655,6 +888,15 @@ pub const ScreenComponent = struct {
         }
         try tui.component.appendOwnedLine(lines, allocator, footer_line);
         try tui.component.appendOwnedLine(lines, allocator, hints_line);
+    }
+};
+
+const RenderHook = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (?*anyopaque) void,
+
+    pub fn run(self: RenderHook) void {
+        self.callback(self.context);
     }
 };
 
@@ -989,10 +1231,20 @@ pub fn rebuildAppStateFromSession(
     io: std.Io,
     app_state: *AppState,
     session: *const session_mod.AgentSession,
+    current_provider: ?*const provider_config.ResolvedProviderConfig,
 ) !void {
     const git_branch = try resolveGitBranch(allocator, io, session.cwd);
     defer if (git_branch) |branch| allocator.free(branch);
     try app_state.rebuildFromSession(session, git_branch);
+    if (current_provider) |resolved_provider| {
+        try app_state.setFooterDetails(
+            session.agent.getModel(),
+            currentSessionLabel(session),
+            git_branch,
+            provider_config.providerDisplayName(resolved_provider.model.provider),
+            provider_config.providerAuthStatusLabel(resolved_provider.auth_status),
+        );
+    }
 }
 
 pub fn updateAppFooterFromSession(
@@ -1000,10 +1252,17 @@ pub fn updateAppFooterFromSession(
     io: std.Io,
     app_state: *AppState,
     session: *const session_mod.AgentSession,
+    current_provider: *const provider_config.ResolvedProviderConfig,
 ) !void {
     const git_branch = try resolveGitBranch(allocator, io, session.cwd);
     defer if (git_branch) |branch| allocator.free(branch);
-    try app_state.setFooterDetails(session.agent.getModel(), currentSessionLabel(session), git_branch);
+    try app_state.setFooterDetails(
+        session.agent.getModel(),
+        currentSessionLabel(session),
+        git_branch,
+        provider_config.providerDisplayName(current_provider.model.provider),
+        provider_config.providerAuthStatusLabel(current_provider.auth_status),
+    );
 }
 
 pub fn assistantContextTokens(usage: ai.Usage) ?u32 {
@@ -1179,59 +1438,92 @@ pub fn renderPromptLines(
 pub fn formatFooterLine(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
-    state: *const AppState,
+    snapshot: *const RenderStateSnapshot,
     width: usize,
 ) ![]u8 {
     var builder = std.ArrayList(u8).empty;
     defer builder.deinit(allocator);
 
     var needs_separator = false;
-    if (state.git_branch.len > 0) {
-        const branch_text = try std.fmt.allocPrint(allocator, "Branch: {s}", .{state.git_branch});
-        defer allocator.free(branch_text);
-        try appendFooterPart(allocator, &builder, &needs_separator, branch_text);
+    if (snapshot.git_branch) |git_branch| {
+        if (git_branch.len > 0) {
+            const branch_text = try std.fmt.allocPrint(allocator, "Branch: {s}", .{git_branch});
+            defer allocator.free(branch_text);
+            try appendFooterPart(allocator, &builder, &needs_separator, branch_text);
+        }
     }
-    const session_text = try std.fmt.allocPrint(allocator, "Session: {s}", .{state.session_label});
+    const compact_session_label = try truncateVisibleTextAlloc(allocator, snapshot.session_label.?, 16);
+    defer allocator.free(compact_session_label);
+    const session_text = try std.fmt.allocPrint(allocator, "Session: {s}", .{compact_session_label});
     defer allocator.free(session_text);
     try appendFooterPart(allocator, &builder, &needs_separator, session_text);
-    const status_text = try std.fmt.allocPrint(allocator, "Status: {s}", .{state.status});
+    const single_line_status = try sanitizeSingleLineStatusAlloc(allocator, snapshot.status.?);
+    defer allocator.free(single_line_status);
+    const status_text = try std.fmt.allocPrint(allocator, "Status: {s}", .{single_line_status});
     defer allocator.free(status_text);
     try appendFooterPart(allocator, &builder, &needs_separator, status_text);
+    if (snapshot.provider_label) |provider_label| {
+        if (provider_label.len > 0 and !std.mem.eql(u8, provider_label, "unknown")) {
+            const provider_text = try std.fmt.allocPrint(
+                allocator,
+                "Provider: {s} ({s})",
+                .{ provider_label, snapshot.provider_status.? },
+            );
+            defer allocator.free(provider_text);
+            try appendFooterPart(allocator, &builder, &needs_separator, provider_text);
+        }
+    }
 
-    const input_text = try formatCompactTokenCount(allocator, state.usage_totals.input);
-    defer allocator.free(input_text);
-    const output_text = try formatCompactTokenCount(allocator, state.usage_totals.output);
-    defer allocator.free(output_text);
-    const input_part = try std.fmt.allocPrint(allocator, "↑{s}", .{input_text});
-    defer allocator.free(input_part);
-    const output_part = try std.fmt.allocPrint(allocator, "↓{s}", .{output_text});
-    defer allocator.free(output_part);
-    try appendFooterPart(allocator, &builder, &needs_separator, input_part);
-    try appendFooterPart(allocator, &builder, &needs_separator, output_part);
+    if (snapshot.queued_steering.len > 0 or snapshot.queued_follow_up.len > 0) {
+        const queue_text = try formatQueueSummary(allocator, snapshot.queued_steering.len, snapshot.queued_follow_up.len);
+        defer allocator.free(queue_text);
+        try appendFooterPart(allocator, &builder, &needs_separator, queue_text);
+    }
 
-    if (state.usage_totals.cache_read > 0) {
-        const cache_read_text = try formatCompactTokenCount(allocator, state.usage_totals.cache_read);
+    if (snapshot.usage_totals.input > 0) {
+        const input_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.input);
+        defer allocator.free(input_text);
+        const input_part = try std.fmt.allocPrint(allocator, "↑{s}", .{input_text});
+        defer allocator.free(input_part);
+        try appendFooterPart(allocator, &builder, &needs_separator, input_part);
+    }
+    if (snapshot.usage_totals.output > 0) {
+        const output_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.output);
+        defer allocator.free(output_text);
+        const output_part = try std.fmt.allocPrint(allocator, "↓{s}", .{output_text});
+        defer allocator.free(output_part);
+        try appendFooterPart(allocator, &builder, &needs_separator, output_part);
+    }
+
+    if (snapshot.usage_totals.cache_read > 0) {
+        const cache_read_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.cache_read);
         defer allocator.free(cache_read_text);
         const cache_read_part = try std.fmt.allocPrint(allocator, "R{s}", .{cache_read_text});
         defer allocator.free(cache_read_part);
         try appendFooterPart(allocator, &builder, &needs_separator, cache_read_part);
     }
-    if (state.usage_totals.cache_write > 0) {
-        const cache_write_text = try formatCompactTokenCount(allocator, state.usage_totals.cache_write);
+    if (snapshot.usage_totals.cache_write > 0) {
+        const cache_write_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.cache_write);
         defer allocator.free(cache_write_text);
         const cache_write_part = try std.fmt.allocPrint(allocator, "W{s}", .{cache_write_text});
         defer allocator.free(cache_write_part);
         try appendFooterPart(allocator, &builder, &needs_separator, cache_write_part);
     }
-    if (state.usage_totals.cost > 0) {
-        const cost_text = try std.fmt.allocPrint(allocator, "${d:.3}", .{state.usage_totals.cost});
+    if (snapshot.usage_totals.cost > 0) {
+        const cost_text = try std.fmt.allocPrint(allocator, "${d:.3}", .{snapshot.usage_totals.cost});
         defer allocator.free(cost_text);
         try appendFooterPart(allocator, &builder, &needs_separator, cost_text);
     }
-    if (state.context_window > 0) {
-        const window_text = try formatCompactTokenCount(allocator, state.context_window);
+    const has_usage_totals = snapshot.usage_totals.input > 0 or
+        snapshot.usage_totals.output > 0 or
+        snapshot.usage_totals.cache_read > 0 or
+        snapshot.usage_totals.cache_write > 0 or
+        snapshot.usage_totals.cost > 0;
+    const show_context = snapshot.context_window > 0 and (has_usage_totals or snapshot.context_percent == null or snapshot.context_percent.? > 0.0);
+    if (show_context) {
+        const window_text = try formatCompactTokenCount(allocator, snapshot.context_window);
         defer allocator.free(window_text);
-        const context_text = if (state.context_percent) |percent|
+        const context_text = if (snapshot.context_percent) |percent|
             try std.fmt.allocPrint(allocator, "ctx {d:.1}%/{s}", .{ percent, window_text })
         else
             try std.fmt.allocPrint(allocator, "ctx ?/{s}", .{window_text});
@@ -1239,7 +1531,7 @@ pub fn formatFooterLine(
         try appendFooterPart(allocator, &builder, &needs_separator, context_text);
     }
 
-    const model_text = try std.fmt.allocPrint(allocator, "Model: {s}", .{state.model_label});
+    const model_text = try std.fmt.allocPrint(allocator, "Model: {s}", .{snapshot.model_label.?});
     defer allocator.free(model_text);
     try appendFooterPart(allocator, &builder, &needs_separator, model_text);
 
@@ -1257,6 +1549,20 @@ pub fn appendFooterPart(
     if (needs_separator.*) try builder.appendSlice(allocator, " • ");
     try builder.appendSlice(allocator, text);
     needs_separator.* = true;
+}
+
+fn formatQueueSummary(allocator: std.mem.Allocator, steering_count: usize, follow_up_count: usize) ![]u8 {
+    if (steering_count > 0 and follow_up_count > 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "Queue: {d} steering, {d} follow-up",
+            .{ steering_count, follow_up_count },
+        );
+    }
+    if (steering_count > 0) {
+        return std.fmt.allocPrint(allocator, "Queue: {d} steering", .{steering_count});
+    }
+    return std.fmt.allocPrint(allocator, "Queue: {d} follow-up", .{follow_up_count});
 }
 
 pub fn formatCompactTokenCount(allocator: std.mem.Allocator, count: u64) ![]u8 {
@@ -1458,17 +1764,17 @@ pub fn renderQueuedMessageLines(
     allocator: std.mem.Allocator,
     keybindings: ?*const keybindings_mod.Keybindings,
     theme: ?*const resources_mod.Theme,
-    state: *const AppState,
+    snapshot: *const RenderStateSnapshot,
     width: usize,
     lines: *tui.LineList,
 ) !void {
-    if (state.queued_steering.items.len == 0 and state.queued_follow_up.items.len == 0) return;
+    if (snapshot.queued_steering.len == 0 and snapshot.queued_follow_up.len == 0) return;
 
     const blank = try fitLine(allocator, "", width);
     defer allocator.free(blank);
     try tui.component.appendOwnedLine(lines, allocator, blank);
 
-    for (state.queued_steering.items) |queued| {
+    for (snapshot.queued_steering) |queued| {
         const line = try std.fmt.allocPrint(allocator, "Steering: {s}", .{queued});
         defer allocator.free(line);
         const themed = try applyThemeAlloc(allocator, theme, .status, line);
@@ -1476,7 +1782,7 @@ pub fn renderQueuedMessageLines(
         try tui.ansi.wrapTextWithAnsi(allocator, themed, width, lines);
     }
 
-    for (state.queued_follow_up.items) |queued| {
+    for (snapshot.queued_follow_up) |queued| {
         const line = try std.fmt.allocPrint(allocator, "Follow-up: {s}", .{queued});
         defer allocator.free(line);
         const themed = try applyThemeAlloc(allocator, theme, .status, line);
@@ -1491,6 +1797,118 @@ pub fn renderQueuedMessageLines(
     const themed_hint = try applyThemeAlloc(allocator, theme, .status, hint);
     defer allocator.free(themed_hint);
     try tui.ansi.wrapTextWithAnsi(allocator, themed_hint, width, lines);
+}
+
+fn cloneChatItems(allocator: std.mem.Allocator, items: []const ChatItem) ![]ChatItem {
+    if (items.len == 0) return &.{};
+
+    const cloned = try allocator.alloc(ChatItem, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |item| allocator.free(item.text);
+        allocator.free(cloned);
+    }
+
+    for (items, 0..) |item, index| {
+        cloned[index] = .{
+            .kind = item.kind,
+            .text = try allocator.dupe(u8, item.text),
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn sanitizeSingleLineStatusAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+
+    var previous_was_space = false;
+    for (text) |char| {
+        const is_whitespace = char == '\n' or char == '\r' or char == '\t';
+        if (is_whitespace) {
+            if (!previous_was_space) {
+                try builder.append(allocator, ' ');
+                previous_was_space = true;
+            }
+            continue;
+        }
+        try builder.append(allocator, char);
+        previous_was_space = char == ' ';
+    }
+
+    if (builder.items.len > 0 and builder.items[builder.items.len - 1] == ' ') {
+        _ = builder.pop();
+    }
+    return builder.toOwnedSlice(allocator);
+}
+
+fn truncateVisibleTextAlloc(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
+    if (max_width == 0) return allocator.dupe(u8, "");
+    if (tui.ansi.visibleWidth(text) <= max_width) return allocator.dupe(u8, text);
+
+    const limit = if (max_width > 1) max_width - 1 else 0;
+    const prefix = try tui.ansi.sliceVisibleAlloc(allocator, text, 0, limit);
+    defer allocator.free(prefix);
+
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+    try builder.appendSlice(allocator, prefix);
+    if (max_width > 0) try builder.append(allocator, '.');
+    return builder.toOwnedSlice(allocator);
+}
+
+fn cloneOwnedStringList(allocator: std.mem.Allocator, items: []const []u8) ![][]u8 {
+    if (items.len == 0) return &.{};
+
+    const cloned = try allocator.alloc([]u8, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |item| allocator.free(item);
+        allocator.free(cloned);
+    }
+
+    for (items, 0..) |item, index| {
+        cloned[index] = try allocator.dupe(u8, item);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn deinitOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
+    for (items) |item| allocator.free(item);
+    if (items.len > 0) allocator.free(items);
+}
+
+fn cloneImageContentsForRender(allocator: std.mem.Allocator, images: []const ai.ImageContent) ![]ai.ImageContent {
+    if (images.len == 0) return &.{};
+
+    const cloned = try allocator.alloc(ai.ImageContent, images.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        allocator.free(cloned);
+    }
+
+    for (images, 0..) |image, index| {
+        cloned[index] = .{
+            .data = try allocator.dupe(u8, image.data),
+            .mime_type = try allocator.dupe(u8, image.mime_type),
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn deinitImageContentsForRender(allocator: std.mem.Allocator, images: []const ai.ImageContent) void {
+    for (images) |image| {
+        allocator.free(image.data);
+        allocator.free(image.mime_type);
+    }
+    if (images.len > 0) allocator.free(images);
 }
 
 pub const InteractiveModeTestBackend = struct {
@@ -1659,4 +2077,126 @@ test "app state replaces streaming tool updates with the final tool result" {
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "line 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "Running...") == null);
     try std.testing.expectEqualStrings("thinking", state.status);
+}
+
+test "screen rendering releases app state lock before expensive rendering work" {
+    const allocator = std.heap.page_allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.setStatus("snapshot status");
+    try state.appendInfo("streaming output");
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("rendered prompt");
+
+    const HookContext = struct {
+        snapshot_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        release_render: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        setter_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn afterSnapshot(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.snapshot_ready.store(true, .seq_cst);
+            while (!self.release_render.load(.seq_cst)) {
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+
+    const RenderThreadContext = struct {
+        allocator: std.mem.Allocator,
+        screen: *const ScreenComponent,
+        lines: tui.LineList = tui.LineList.empty,
+        render_error: ?std.mem.Allocator.Error = null,
+
+        fn run(self: *@This()) void {
+            self.screen.renderInto(self.allocator, 120, &self.lines) catch |err| {
+                self.render_error = err;
+            };
+        }
+    };
+
+    const SetterThreadContext = struct {
+        state: *AppState,
+        finished: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            self.state.setStatus("updated while rendering") catch return;
+            self.finished.store(true, .seq_cst);
+        }
+    };
+
+    var hook_context = HookContext{};
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 10,
+        .after_snapshot_hook = .{
+            .context = &hook_context,
+            .callback = HookContext.afterSnapshot,
+        },
+    };
+
+    var render_context = RenderThreadContext{
+        .allocator = allocator,
+        .screen = &screen,
+    };
+    const render_thread = try std.Thread.spawn(.{}, RenderThreadContext.run, .{&render_context});
+
+    var snapshot_ready = false;
+    for (0..100) |_| {
+        if (hook_context.snapshot_ready.load(.seq_cst)) {
+            snapshot_ready = true;
+            break;
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(snapshot_ready);
+
+    var setter_context = SetterThreadContext{
+        .state = &state,
+        .finished = &hook_context.setter_finished,
+    };
+    const setter_thread = try std.Thread.spawn(.{}, SetterThreadContext.run, .{&setter_context});
+
+    var setter_finished_before_release = false;
+    for (0..100) |_| {
+        if (hook_context.setter_finished.load(.seq_cst)) {
+            setter_finished_before_release = true;
+            break;
+        }
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+
+    hook_context.release_render.store(true, .seq_cst);
+    render_thread.join();
+    setter_thread.join();
+
+    try std.testing.expect(setter_finished_before_release);
+    try std.testing.expectEqual(@as(?std.mem.Allocator.Error, null), render_context.render_error);
+    defer freeLinesSafe(allocator, &render_context.lines);
+    try std.testing.expect(renderedLinesContain(render_context.lines.items, "Status: snapshot status"));
+    try std.testing.expect(!renderedLinesContain(render_context.lines.items, "updated while rendering"));
+}
+
+test "formatFooterLine shows provider auth status and sanitizes multiline status text" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const model = ai.model_registry.find("openai", "gpt-5.4").?;
+    try state.setFooterDetails(model, "session.jsonl", "zig-implementation", "OpenAI", "env");
+    try state.setStatus("missing key\nset OPENAI_API_KEY");
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    const footer = try formatFooterLine(allocator, null, &snapshot, 240);
+    defer allocator.free(footer);
+
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Provider: OpenAI (env)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Status: missing key set OPENAI_API_KEY") != null);
 }
