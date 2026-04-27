@@ -16,6 +16,7 @@ const CliStdin = input_prep.CliStdin;
 const PreparedInitialInput = input_prep.PreparedInitialInput;
 const PreparedCliRuntime = runtime_prep.PreparedCliRuntime;
 const effectiveToolSelection = bootstrap.effectiveToolSelection;
+const offlineModeEnabled = bootstrap.offlineModeEnabled;
 const prepareCliRuntime = runtime_prep.prepareCliRuntime;
 const startupNetworkOperationsEnabled = bootstrap.startupNetworkOperationsEnabled;
 
@@ -81,8 +82,11 @@ fn runCliWithInput(
         return 0;
     }
 
+    var effective_env_map = try prepareEffectiveEnvMap(allocator, env_map, &options);
+    defer effective_env_map.deinit();
+
     if (options.@"export") |session_file| {
-        return output.runSessionExport(allocator, io, env_map, cwd_override, session_file, options.prompt, stdout, stderr) catch |err| {
+        return output.runSessionExport(allocator, io, &effective_env_map, cwd_override, session_file, options.prompt, stdout, stderr) catch |err| {
             try stderr.print("Error: {s}\n", .{output.exportErrorMessage(err)});
             return 1;
         };
@@ -102,9 +106,9 @@ fn runCliWithInput(
         return try output.printModelList(
             allocator,
             io,
-            env_map,
+            &effective_env_map,
             options.list_models_search,
-            startupNetworkOperationsEnabled(&options, env_map),
+            startupNetworkOperationsEnabled(&options, &effective_env_map),
             stdout,
         );
     }
@@ -137,14 +141,14 @@ fn runCliWithInput(
     };
     defer allocator.free(cwd);
 
-    var prepared = try runtime_prep.prepareCliRuntime(allocator, io, env_map, cwd, &options, selected_tools);
+    var prepared = try runtime_prep.prepareCliRuntime(allocator, io, &effective_env_map, cwd, &options, selected_tools);
     defer prepared.deinit(allocator);
     try output.writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
 
     var initial_input = input_prep.prepareInitialInput(
         allocator,
         io,
-        env_map,
+        &effective_env_map,
         cwd,
         options.file_args,
         prepared.expanded_prompt,
@@ -166,7 +170,7 @@ fn runCliWithInput(
 
     var provider_runtime = coding_agent.resolveProviderConfig(
         allocator,
-        env_map,
+        &effective_env_map,
         prepared.provider_name,
         prepared.model_name,
         options.api_key,
@@ -258,7 +262,7 @@ fn runCliWithInput(
     return try coding_agent.runInteractiveMode(
         allocator,
         io,
-        env_map,
+        &effective_env_map,
         .{
             .cwd = cwd,
             .system_prompt = prepared.system_prompt,
@@ -285,6 +289,22 @@ fn runCliWithInput(
         },
         stderr,
     );
+}
+
+fn prepareEffectiveEnvMap(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    options: *const cli.Args,
+) !std.process.Environ.Map {
+    var effective_env_map = try env_map.clone(allocator);
+    errdefer effective_env_map.deinit();
+
+    if (offlineModeEnabled(options, env_map)) {
+        try effective_env_map.put("PI_OFFLINE", "1");
+        try effective_env_map.put("PI_SKIP_VERSION_CHECK", "1");
+    }
+
+    return effective_env_map;
 }
 
 fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
@@ -443,6 +463,43 @@ test "startup network operations respect CLI offline flag and environment" {
 
     try env_map.put("PI_OFFLINE", "true");
     try std.testing.expect(!startupNetworkOperationsEnabled(&default_args, &env_map));
+}
+
+test "prepareEffectiveEnvMap sets offline environment overrides" {
+    const allocator = std.testing.allocator;
+
+    var base_env_map = std.process.Environ.Map.init(allocator);
+    defer base_env_map.deinit();
+    try base_env_map.put("HOME", "/tmp/home");
+
+    var offline_args = try cli.parseArgs(allocator, &.{"--offline"});
+    defer offline_args.deinit(allocator);
+
+    var effective_env_map = try prepareEffectiveEnvMap(allocator, &base_env_map, &offline_args);
+    defer effective_env_map.deinit();
+
+    try std.testing.expectEqualStrings("/tmp/home", effective_env_map.get("HOME").?);
+    try std.testing.expectEqualStrings("1", effective_env_map.get("PI_OFFLINE").?);
+    try std.testing.expectEqualStrings("1", effective_env_map.get("PI_SKIP_VERSION_CHECK").?);
+    try std.testing.expect(base_env_map.get("PI_OFFLINE") == null);
+    try std.testing.expect(base_env_map.get("PI_SKIP_VERSION_CHECK") == null);
+}
+
+test "prepareEffectiveEnvMap promotes PI_OFFLINE into PI_SKIP_VERSION_CHECK" {
+    const allocator = std.testing.allocator;
+
+    var base_env_map = std.process.Environ.Map.init(allocator);
+    defer base_env_map.deinit();
+    try base_env_map.put("PI_OFFLINE", "true");
+
+    var default_args = try cli.parseArgs(allocator, &.{});
+    defer default_args.deinit(allocator);
+
+    var effective_env_map = try prepareEffectiveEnvMap(allocator, &base_env_map, &default_args);
+    defer effective_env_map.deinit();
+
+    try std.testing.expectEqualStrings("1", effective_env_map.get("PI_OFFLINE").?);
+    try std.testing.expectEqualStrings("1", effective_env_map.get("PI_SKIP_VERSION_CHECK").?);
 }
 
 test "runCli lists models and applies optional search" {

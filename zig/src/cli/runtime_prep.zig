@@ -37,10 +37,13 @@ pub fn prepareCliRuntime(
     options: *const cli.Args,
     selected_tools: ?[]const []const u8,
 ) !PreparedCliRuntime {
-    const startup_network_enabled = bootstrap.startupNetworkOperationsEnabled(options, env_map);
-    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, io, env_map, cwd, .{
-        .discover_models = startup_network_enabled,
-    });
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(
+        allocator,
+        io,
+        env_map,
+        cwd,
+        runtimeConfigLoadOptions(options, env_map),
+    );
     errdefer runtime_config.deinit();
 
     var resource_bundle = try resources_mod.loadResourceBundle(allocator, io, .{
@@ -109,6 +112,15 @@ pub fn prepareCliRuntime(
         .provider_name = provider_name,
         .model_name = model_name,
         .thinking_level = thinking_level,
+    };
+}
+
+pub fn runtimeConfigLoadOptions(
+    options: *const cli.Args,
+    env_map: *const std.process.Environ.Map,
+) config_mod.RuntimeConfigLoadOptions {
+    return .{
+        .discover_models = bootstrap.startupNetworkOperationsEnabled(options, env_map),
     };
 }
 
@@ -188,4 +200,44 @@ fn mapThinkingLevel(level: cli.ThinkingLevel) agent.ThinkingLevel {
         .high => .high,
         .xhigh => .xhigh,
     };
+}
+
+test "runtimeConfigLoadOptions disables model discovery for offline CLI flag" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var args = try cli.parseArgs(allocator, &.{"--offline"});
+    defer args.deinit(allocator);
+
+    const options = runtimeConfigLoadOptions(&args, &env_map);
+    try std.testing.expect(!options.discover_models);
+}
+
+test "runtimeConfigLoadOptions disables model discovery for PI_OFFLINE" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_OFFLINE", "true");
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    const options = runtimeConfigLoadOptions(&args, &env_map);
+    try std.testing.expect(!options.discover_models);
+}
+
+test "runtimeConfigLoadOptions keeps model discovery enabled by default" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    const options = runtimeConfigLoadOptions(&args, &env_map);
+    try std.testing.expect(options.discover_models);
 }
