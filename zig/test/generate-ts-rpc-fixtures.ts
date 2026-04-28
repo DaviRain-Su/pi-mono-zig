@@ -57,6 +57,7 @@ type RuntimeScenario =
 	| "events-base-stream"
 	| "events-thinking-tool-usage"
 	| "events-session-extras"
+	| "prompt-concurrency-queue-order"
 	| "extension-ui";
 
 interface RuntimeCaptureOptions {
@@ -326,6 +327,15 @@ const responseScenarioInput = jsonl([
 	{ id: "resp_thrown", type: "bash", command: "throw" },
 ]) + "{not json\n" + serializeJsonLine({ id: "mystery", type: "mystery_command" });
 
+const promptConcurrencyScenarioInput = jsonl([
+	{ id: "pc_start", type: "prompt", message: "start slow" },
+	{ id: "pc_abort", type: "abort" },
+	{ id: "pc_steer", type: "steer", message: "steer while prompt running" },
+	{ id: "pc_follow", type: "follow_up", message: "follow while prompt running" },
+	{ id: "pc_prompt_steer", type: "prompt", message: "prompt as steer", streamingBehavior: "steer" },
+	{ id: "pc_prompt_follow", type: "prompt", message: "prompt as follow", streamingBehavior: "followUp" },
+] satisfies RpcCommand[]);
+
 const parseErrorCorpus = [
 	{ name: "empty", input: "" },
 	{ name: "whitespace", input: "   \t" },
@@ -538,6 +548,9 @@ class FixtureSession {
 	readonly autoCompactionEnabled = true;
 	readonly messages = [userMessage, assistantText, toolResult];
 	readonly pendingMessageCount = 2;
+	private listeners: Array<(event: AgentSessionEvent) => void> = [];
+	private steeringMessages: string[] = [];
+	private followUpMessages: string[] = [];
 
 	constructor(scenario: RuntimeScenario) {
 		this.scenario = scenario;
@@ -558,6 +571,7 @@ class FixtureSession {
 	}
 
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
+		this.listeners.push(listener);
 		if (this.scenario === "events-base-stream") {
 			emitBaseStreamScenario(listener);
 		} else if (this.scenario === "events-thinking-tool-usage") {
@@ -565,15 +579,47 @@ class FixtureSession {
 		} else if (this.scenario === "events-session-extras") {
 			emitSessionExtrasScenario(listener);
 		}
-		return () => {};
+		return () => {
+			this.listeners = this.listeners.filter((item) => item !== listener);
+		};
 	}
 
-	async prompt(_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }): Promise<void> {
+	private emitQueueUpdate(): void {
+		for (const listener of this.listeners) {
+			listener({ type: "queue_update", steering: [...this.steeringMessages], followUp: [...this.followUpMessages] });
+		}
+	}
+
+	async prompt(
+		message: string,
+		options?: { preflightResult?: (didSucceed: boolean) => void; streamingBehavior?: "steer" | "followUp" },
+	): Promise<void> {
+		if (this.scenario === "prompt-concurrency-queue-order" && options?.streamingBehavior === "steer") {
+			await this.steer(message);
+			options?.preflightResult?.(true);
+			return;
+		}
+		if (this.scenario === "prompt-concurrency-queue-order" && options?.streamingBehavior === "followUp") {
+			await this.followUp(message);
+			options?.preflightResult?.(true);
+			return;
+		}
 		options?.preflightResult?.(true);
+		if (this.scenario === "prompt-concurrency-queue-order") {
+			return new Promise<void>(() => {});
+		}
 	}
 
-	async steer(_message: string, _images?: unknown): Promise<void> {}
-	async followUp(_message: string, _images?: unknown): Promise<void> {}
+	async steer(message: string, _images?: unknown): Promise<void> {
+		this.steeringMessages.push(message);
+		this.emitQueueUpdate();
+	}
+
+	async followUp(message: string, _images?: unknown): Promise<void> {
+		this.followUpMessages.push(message);
+		this.emitQueueUpdate();
+	}
+
 	async abort(): Promise<void> {}
 	async setModel(_nextModel: Model<"anthropic-messages">): Promise<void> {}
 	cycleModel(): null {
@@ -737,6 +783,11 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			path: "events-session-extras.jsonl",
 			description: "runRpcMode stdout bytes for session-level queue, compaction, retry, and session info events emitted via AgentSession.subscribe.",
 			bytes: captureRuntimeStdout("events-session-extras"),
+		},
+		{
+			path: "prompt-concurrency-queue-order.jsonl",
+			description: "runRpcMode stdout bytes proving prompt stays fire-and-forget, abort can respond while a prompt promise is in flight, and steer/follow_up plus prompt.streamingBehavior emit queue_update before command responses.",
+			bytes: captureRuntimeStdout("prompt-concurrency-queue-order", { input: promptConcurrencyScenarioInput }),
 		},
 		{
 			path: "extension-ui.jsonl",

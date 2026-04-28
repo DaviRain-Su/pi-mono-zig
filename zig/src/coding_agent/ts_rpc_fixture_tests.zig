@@ -9,6 +9,7 @@ const fixture_files = [_][]const u8{
     "events-base-stream.jsonl",
     "events-thinking-tool-usage.jsonl",
     "events-session-extras.jsonl",
+    "prompt-concurrency-queue-order.jsonl",
     "extension-ui.jsonl",
 };
 
@@ -154,4 +155,23 @@ test "TS RPC event fixtures cover base stream thinking tools usage details and s
     try expectContains(tool, "\"stopReason\":\"toolUse\"");
     try expectContains(tool, "\"reason\":\"length\"");
     try expectContains(tool, "\"reason\":\"aborted\"");
+}
+
+test "TS RPC prompt concurrency fixture captures queue ordering and streamingBehavior" {
+    const bytes = try readFixture("prompt-concurrency-queue-order.jsonl");
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"pc_start\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n" ++
+            "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n" ++
+            "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[\"follow while prompt running\"]}\n" ++
+            "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\"]}\n" ++
+            "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\",\"prompt as follow\"]}\n" ++
+            "{\"id\":\"pc_prompt_steer\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n" ++
+            "{\"id\":\"pc_prompt_follow\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n" ++
+            "{\"id\":\"pc_abort\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n" ++
+            "{\"id\":\"pc_steer\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n" ++
+            "{\"id\":\"pc_follow\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n",
+        bytes,
+    );
 }

@@ -7,6 +7,90 @@ const session_mod = @import("session.zig");
 
 pub const RunTsRpcModeOptions = struct {};
 
+const PromptStreamingBehavior = enum {
+    steer,
+    follow_up,
+};
+
+const PromptTask = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: *TsRpcServer,
+    session: *session_mod.AgentSession,
+    id: ?[]u8,
+    message: []u8,
+    images: []ai.ImageContent,
+    response_sent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        server: *TsRpcServer,
+        session: *session_mod.AgentSession,
+        id: ?[]const u8,
+        message: []u8,
+        images: []ai.ImageContent,
+    ) !*PromptTask {
+        const task = try allocator.create(PromptTask);
+        errdefer allocator.destroy(task);
+        task.* = .{
+            .allocator = allocator,
+            .io = io,
+            .server = server,
+            .session = session,
+            .id = if (id) |id_string| try allocator.dupe(u8, id_string) else null,
+            .message = message,
+            .images = images,
+        };
+        return task;
+    }
+
+    fn spawn(self: *PromptTask) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *PromptTask) void {
+        defer self.done.store(true, .seq_cst);
+        self.session.promptWithAcceptedCallback(
+            .{ .text = self.message, .images = self.images },
+            .{ .context = self, .callback = writePromptAccepted },
+        ) catch |err| {
+            if (!self.response_sent.load(.seq_cst)) {
+                self.server.writeCommandError(self.id, "prompt", err) catch {};
+                self.response_sent.store(true, .seq_cst);
+            }
+        };
+    }
+
+    fn isDone(self: *const PromptTask) bool {
+        return self.done.load(.seq_cst);
+    }
+
+    fn waitForResponse(self: *const PromptTask) void {
+        while (!self.response_sent.load(.seq_cst)) {
+            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    fn joinAndDestroy(self: *PromptTask) void {
+        if (self.thread) |thread| {
+            thread.join();
+        }
+        if (self.id) |id_string| self.allocator.free(id_string);
+        self.allocator.free(self.message);
+        deinitImages(self.allocator, self.images);
+        self.allocator.destroy(self);
+    }
+
+    fn writePromptAccepted(context: ?*anyopaque) !void {
+        const self: *PromptTask = @ptrCast(@alignCast(context.?));
+        defer self.response_sent.store(true, .seq_cst);
+        try self.server.writeSuccessResponseNoData(self.id, "prompt");
+    }
+};
+
 pub const command_types = [_][]const u8{
     "prompt",
     "steer",
@@ -54,6 +138,7 @@ const TsRpcServer = struct {
     stderr_writer: *std.Io.Writer,
     output_mutex: std.Io.Mutex = .init,
     subscriber: ?agent.AgentSubscriber = null,
+    prompt_tasks: std.ArrayList(*PromptTask) = .empty,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -82,14 +167,27 @@ const TsRpcServer = struct {
     }
 
     fn finish(self: *TsRpcServer) !void {
+        for (self.prompt_tasks.items) |task| {
+            task.joinAndDestroy();
+        }
+        self.prompt_tasks.clearRetainingCapacity();
         if (self.session) |session| {
             if (self.subscriber) |subscriber| {
                 _ = session.agent.unsubscribe(subscriber);
                 self.subscriber = null;
             }
         }
+        self.prompt_tasks.deinit(self.allocator);
+        self.prompt_tasks = .empty;
         try self.stdout_writer.flush();
         try self.stderr_writer.flush();
+    }
+
+    fn hasInFlightPrompt(self: *const TsRpcServer) bool {
+        for (self.prompt_tasks.items) |task| {
+            if (!task.isDone()) return true;
+        }
+        return false;
     }
 
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
@@ -161,14 +259,62 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            defer deinitImages(self.allocator, images);
+            var images_owned = true;
+            defer if (images_owned) deinitImages(self.allocator, images);
+            const streaming_behavior = parsePromptStreamingBehavior(object) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
 
-            if (session.isStreaming()) {
-                try self.writeErrorResponse(id, command, "AgentAlreadyProcessing");
+            if (session.isStreaming() or self.hasInFlightPrompt()) {
+                const behavior = streaming_behavior orelse {
+                    try self.writeErrorResponse(
+                        id,
+                        command,
+                        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+                    );
+                    return;
+                };
+                switch (behavior) {
+                    .steer => session.steer(message, images) catch |err| {
+                        try self.writeCommandError(id, command, err);
+                        return;
+                    },
+                    .follow_up => session.followUp(message, images) catch |err| {
+                        try self.writeCommandError(id, command, err);
+                        return;
+                    },
+                }
+                try self.writeQueueUpdate();
+                try self.writeSuccessResponseNoData(id, command);
                 return;
             }
-            try self.writeSuccessResponseNoData(id, command);
-            session.prompt(.{ .text = message, .images = images }) catch {};
+
+            const message_copy = self.allocator.dupe(u8, message) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            var message_owned = true;
+            defer if (message_owned) self.allocator.free(message_copy);
+
+            const task = PromptTask.create(self.allocator, self.io, self, session, id, message_copy, images) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            images_owned = false;
+            message_owned = false;
+            self.prompt_tasks.append(self.allocator, task) catch |err| {
+                task.joinAndDestroy();
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            task.spawn() catch |err| {
+                _ = self.prompt_tasks.pop();
+                task.joinAndDestroy();
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            task.waitForResponse();
             return;
         }
 
@@ -186,8 +332,8 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            try self.writeSuccessResponseNoData(id, command);
             try self.writeQueueUpdate();
+            try self.writeSuccessResponseNoData(id, command);
             return;
         }
 
@@ -205,8 +351,8 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            try self.writeSuccessResponseNoData(id, command);
             try self.writeQueueUpdate();
+            try self.writeSuccessResponseNoData(id, command);
             return;
         }
 
@@ -749,6 +895,17 @@ fn requiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     };
 }
 
+fn parsePromptStreamingBehavior(object: std.json.ObjectMap) !?PromptStreamingBehavior {
+    const value = object.get("streamingBehavior") orelse return null;
+    const behavior = switch (value) {
+        .string => |string| string,
+        else => return error.InvalidFieldType,
+    };
+    if (std.mem.eql(u8, behavior, "steer")) return .steer;
+    if (std.mem.eql(u8, behavior, "followUp")) return .follow_up;
+    return error.InvalidFieldType;
+}
+
 fn parseImages(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]ai.ImageContent {
     const images_value = object.get("images") orelse return try allocator.alloc(ai.ImageContent, 0);
     const images_array = switch (images_value) {
@@ -1190,13 +1347,126 @@ test "TS RPC M2 steer follow_up and abort controls use TS responses and queue up
     );
 
     try std.testing.expectEqualStrings(
-        "{\"id\":\"s\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n" ++
-            "{\"type\":\"queue_update\",\"steering\":[\"steer now\"],\"followUp\":[]}\n" ++
-            "{\"id\":\"f\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n" ++
+        "{\"type\":\"queue_update\",\"steering\":[\"steer now\"],\"followUp\":[]}\n" ++
+            "{\"id\":\"s\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n" ++
             "{\"type\":\"queue_update\",\"steering\":[\"steer now\"],\"followUp\":[\"follow later\"]}\n" ++
+            "{\"id\":\"f\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n" ++
             "{\"id\":\"a\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n",
         stdout_capture.writer.buffered(),
     );
+}
+
+test "TS RPC M2 queue_update is emitted before response and prompt.streamingBehavior queues while streaming" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m2",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+    session.agent.is_streaming = true;
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{
+            "{\"id\":\"pc_steer\",\"type\":\"steer\",\"message\":\"steer while prompt running\"}",
+            "{\"id\":\"pc_follow\",\"type\":\"follow_up\",\"message\":\"follow while prompt running\"}",
+            "{\"id\":\"pc_prompt_steer\",\"type\":\"prompt\",\"message\":\"prompt as steer\",\"streamingBehavior\":\"steer\"}",
+            "{\"id\":\"pc_prompt_follow\",\"type\":\"prompt\",\"message\":\"prompt as follow\",\"streamingBehavior\":\"followUp\"}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    const expected =
+        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n" ++
+        "{\"id\":\"pc_steer\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n" ++
+        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[\"follow while prompt running\"]}\n" ++
+        "{\"id\":\"pc_follow\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n" ++
+        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\"]}\n" ++
+        "{\"id\":\"pc_prompt_steer\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n" ++
+        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\",\"prompt as follow\"]}\n" ++
+        "{\"id\":\"pc_prompt_follow\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n";
+
+    const fixture = try readFixture("prompt-concurrency-queue-order.jsonl");
+    defer allocator.free(fixture);
+    try expectContains(fixture, "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n");
+    try expectContains(fixture, "{\"id\":\"pc_steer\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n");
+    try expectContains(fixture, "{\"id\":\"pc_prompt_steer\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try std.testing.expectEqualStrings(expected, stdout_capture.writer.buffered());
+}
+
+test "TS RPC M2 prompt without streamingBehavior rejects while streaming" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m2",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+    session.agent.is_streaming = true;
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{"{\"id\":\"busy\",\"type\":\"prompt\",\"message\":\"second prompt\"}"},
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"busy\",\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.\"}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC M2 abort command is processed while prompt worker is in flight" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m2",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+    session.agent.stream_fn = blockingUntilAbortStream;
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+
+    try server.handleLine("{\"id\":\"p\",\"type\":\"prompt\",\"message\":\"slow prompt\"}");
+    try waitForSessionStreaming(&session);
+    try std.testing.expect(session.isStreaming());
+
+    try server.handleLine("{\"id\":\"a\",\"type\":\"abort\"}");
+    try expectContains(
+        stdout_capture.writer.buffered(),
+        "{\"id\":\"a\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n",
+    );
+
+    try server.finish();
+    try expectContains(
+        stdout_capture.writer.buffered(),
+        "{\"id\":\"p\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n",
+    );
+    try expectContains(stdout_capture.writer.buffered(), "\"stopReason\":\"aborted\"");
+    const abort_response_index = std.mem.indexOf(u8, stdout_capture.writer.buffered(), "{\"id\":\"a\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n").?;
+    const agent_end_index = std.mem.indexOf(u8, stdout_capture.writer.buffered(), "{\"type\":\"agent_end\"").?;
+    try std.testing.expect(abort_response_index < agent_end_index);
 }
 
 test "TS RPC M2 prompt response precedes base event stream" {
@@ -1320,4 +1590,46 @@ fn expectPromptLineTypeOrder(bytes: []const u8) !void {
     try std.testing.expectEqualStrings("turn_end", actual.items[index + 1]);
     try std.testing.expectEqualStrings("agent_end", actual.items[index + 2]);
     try std.testing.expectEqual(actual.items.len, index + 3);
+}
+
+fn waitForSessionStreaming(session: *const session_mod.AgentSession) !void {
+    var spins: usize = 0;
+    while (!session.isStreaming() and spins < 1000) : (spins += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(session.isStreaming());
+}
+
+fn blockingUntilAbortStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    context: ai.Context,
+    options: ?ai.types.SimpleStreamOptions,
+    stream_context: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    _ = context;
+    _ = stream_context;
+    const signal = if (options) |some| some.signal else null;
+    while (signal == null or !signal.?.load(.seq_cst)) {
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(std.heap.page_allocator, io);
+    const message = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .aborted,
+        .error_message = "Aborted by user",
+        .timestamp = 0,
+    };
+    stream.push(.{
+        .event_type = .done,
+        .message = message,
+    });
+    _ = allocator;
+    return stream;
 }

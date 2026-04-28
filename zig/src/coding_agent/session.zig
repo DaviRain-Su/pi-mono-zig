@@ -168,6 +168,15 @@ pub const AgentSession = struct {
         try self.runPostPromptMaintenance();
     }
 
+    pub fn promptWithAcceptedCallback(
+        self: *AgentSession,
+        input: anytype,
+        accepted_callback: ?agent.PromptAcceptedCallback,
+    ) !void {
+        try self.agent.promptWithAcceptedCallback(input, accepted_callback);
+        try self.runPostPromptMaintenance();
+    }
+
     pub fn steer(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
         var message = try queuedUserMessage(self.allocator, text, images);
         defer deinitQueuedUserMessage(self.allocator, &message);

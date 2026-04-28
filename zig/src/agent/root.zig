@@ -15,6 +15,7 @@ pub const AgentToolResult = types.AgentToolResult;
 pub const AgentEvent = types.AgentEvent;
 pub const AgentEventType = types.AgentEventType;
 pub const AgentSubscriber = types.AgentSubscriber;
+pub const PromptAcceptedCallback = types.PromptAcceptedCallback;
 pub const ThinkingLevel = types.ThinkingLevel;
 pub const ToolExecutionMode = types.ToolExecutionMode;
 pub const QueueMode = agent.QueueMode;
