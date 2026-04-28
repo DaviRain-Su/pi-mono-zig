@@ -60,7 +60,12 @@ type RuntimeScenario =
 	| "events-session-extras"
 	| "prompt-concurrency-queue-order"
 	| "bash-control"
-	| "extension-ui";
+	| "extension-ui"
+	| "m5-simple-prompt"
+	| "m5-thinking"
+	| "m5-tool"
+	| "m5-compaction"
+	| "m5-retry";
 
 interface RuntimeCaptureOptions {
 	input?: string;
@@ -362,6 +367,17 @@ const promptConcurrencyScenarioInput = jsonl([
 	{ id: "pc_prompt_follow", type: "prompt", message: "prompt as follow", streamingBehavior: "followUp" },
 ] satisfies RpcCommand[]);
 
+const m5SimplePromptInput = jsonl([{ id: "simple_prompt", type: "prompt", message: "hello" }] satisfies RpcCommand[]);
+const m5ThinkingInput = jsonl([{ id: "thinking_prompt", type: "prompt", message: "think" }] satisfies RpcCommand[]);
+const m5ToolInput = jsonl([{ id: "tool_prompt", type: "prompt", message: "run tool" }] satisfies RpcCommand[]);
+const m5CompactionInput = jsonl([
+	{ id: "compact", type: "compact", customInstructions: "short" },
+] satisfies RpcCommand[]);
+const m5RetryInput = jsonl([
+	{ id: "retry_on", type: "set_auto_retry", enabled: true },
+	{ id: "retry_prompt", type: "prompt", message: "retry" },
+] satisfies RpcCommand[]);
+
 const parseErrorCorpus = [
 	{ name: "empty", input: "" },
 	{ name: "whitespace", input: "   \t" },
@@ -528,6 +544,237 @@ function emitSessionExtrasScenario(emit: (event: AgentSessionEvent) => void): vo
 	emit({ type: "auto_retry_end", success: false, attempt: 3, finalError: "fixture retry exhausted" });
 }
 
+function m5Usage(input: number, output: number, cacheRead: number, cacheWrite: number, totalTokens: number): AssistantMessage["usage"] {
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function m5Assistant(
+	content: AssistantMessage["content"],
+	usageValue: AssistantMessage["usage"],
+	stopReason: AssistantMessage["stopReason"] = "stop",
+	errorMessage?: string,
+): AssistantMessage {
+	const message = {
+		role: "assistant",
+		content,
+		api: "faux",
+		provider: "faux",
+		model: "gpt-5.5",
+		usage: usageValue,
+		stopReason,
+		...(errorMessage === undefined ? {} : { errorMessage }),
+		timestamp: 0,
+	} satisfies AssistantMessage;
+	return message;
+}
+
+function m5User(content: string): AgentMessage {
+	return { role: "user", content, timestamp: 0 };
+}
+
+function emitM5TextTurn(
+	emit: (event: AgentSessionEvent) => void,
+	userContent: string,
+	text: string,
+	deltas: string[],
+	usageValue: AssistantMessage["usage"],
+	options: { stopReason?: AssistantMessage["stopReason"]; errorMessage?: string } = {},
+): AssistantMessage {
+	const user = m5User(userContent);
+	const emptyAssistant = m5Assistant([], usageValue, options.stopReason, options.errorMessage);
+	emit({ type: "agent_start" } satisfies AgentEvent);
+	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "message_start", message: user } satisfies AgentEvent);
+	emit({ type: "message_end", message: user } satisfies AgentEvent);
+	emit({ type: "message_start", message: emptyAssistant } satisfies AgentEvent);
+
+	const started = m5Assistant([{ type: "text", text: "" }], usageValue, options.stopReason, options.errorMessage);
+	emit({
+		type: "message_update",
+		message: started,
+		assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: started },
+	} satisfies AgentEvent);
+
+	let accumulated = "";
+	for (const delta of deltas) {
+		accumulated += delta;
+		const partial = m5Assistant([{ type: "text", text: accumulated }], usageValue, options.stopReason, options.errorMessage);
+		emit({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta, partial },
+		} satisfies AgentEvent);
+	}
+
+	const finalAssistant = m5Assistant([{ type: "text", text }], usageValue, options.stopReason, options.errorMessage);
+	emit({
+		type: "message_update",
+		message: finalAssistant,
+		assistantMessageEvent: { type: "text_end", contentIndex: 0, content: text, partial: finalAssistant },
+	} satisfies AgentEvent);
+	emit({ type: "message_end", message: finalAssistant } satisfies AgentEvent);
+	emit({ type: "turn_end", message: finalAssistant, toolResults: [] } satisfies AgentEvent);
+	emit({ type: "agent_end", messages: [user, finalAssistant] } satisfies AgentEvent);
+	return finalAssistant;
+}
+
+function emitM5SimplePrompt(emit: (event: AgentSessionEvent) => void): void {
+	emitM5TextTurn(emit, "hello", "faux response", ["faux respons", "e"], m5Usage(1247, 4, 0, 1247, 2498));
+}
+
+function emitM5Thinking(emit: (event: AgentSessionEvent) => void): void {
+	const user = m5User("think");
+	const usageValue = m5Usage(1247, 8, 0, 1247, 2502);
+	const emptyAssistant = m5Assistant([], usageValue);
+	emit({ type: "agent_start" } satisfies AgentEvent);
+	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "message_start", message: user } satisfies AgentEvent);
+	emit({ type: "message_end", message: user } satisfies AgentEvent);
+	emit({ type: "message_start", message: emptyAssistant } satisfies AgentEvent);
+	emit({
+		type: "message_update",
+		message: emptyAssistant,
+		assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: emptyAssistant },
+	} satisfies AgentEvent);
+	for (const delta of ["Need exact b", "ytes."]) {
+		emit({
+			type: "message_update",
+			message: emptyAssistant,
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta, partial: emptyAssistant },
+		} satisfies AgentEvent);
+	}
+	emit({
+		type: "message_update",
+		message: emptyAssistant,
+		assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "Need exact bytes.", partial: emptyAssistant },
+	} satisfies AgentEvent);
+	const textStarted = m5Assistant([{ type: "text", text: "" }], usageValue);
+	emit({
+		type: "message_update",
+		message: textStarted,
+		assistantMessageEvent: { type: "text_start", contentIndex: 1, partial: textStarted },
+	} satisfies AgentEvent);
+	const textDone = m5Assistant([{ type: "text", text: "final answer" }], usageValue);
+	emit({
+		type: "message_update",
+		message: textDone,
+		assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "final answer", partial: textDone },
+	} satisfies AgentEvent);
+	emit({
+		type: "message_update",
+		message: textDone,
+		assistantMessageEvent: { type: "text_end", contentIndex: 1, content: "final answer", partial: textDone },
+	} satisfies AgentEvent);
+	const finalAssistant = m5Assistant(
+		[
+			{ type: "thinking", thinking: "Need exact bytes." },
+			{ type: "text", text: "final answer" },
+		],
+		usageValue,
+	);
+	emit({ type: "message_end", message: finalAssistant } satisfies AgentEvent);
+	emit({ type: "turn_end", message: finalAssistant, toolResults: [] } satisfies AgentEvent);
+	emit({ type: "agent_end", messages: [user, finalAssistant] } satisfies AgentEvent);
+}
+
+function emitM5Tool(emit: (event: AgentSessionEvent) => void): void {
+	const user = m5User("run tool");
+	const firstUsage = m5Usage(1248, 9, 0, 1248, 2505);
+	const firstEmpty = m5Assistant([], firstUsage, "toolUse");
+	const toolCall = { type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "printf tool-ok" } } satisfies ToolCall;
+	emit({ type: "agent_start" } satisfies AgentEvent);
+	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "message_start", message: user } satisfies AgentEvent);
+	emit({ type: "message_end", message: user } satisfies AgentEvent);
+	emit({ type: "message_start", message: firstEmpty } satisfies AgentEvent);
+	emit({
+		type: "message_update",
+		message: firstEmpty,
+		assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: firstEmpty },
+	} satisfies AgentEvent);
+	for (const delta of ['{"command":"', 'printf tool-ok"}']) {
+		emit({
+			type: "message_update",
+			message: firstEmpty,
+			assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta, partial: firstEmpty },
+		} satisfies AgentEvent);
+	}
+	emit({
+		type: "message_update",
+		message: firstEmpty,
+		assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall, partial: firstEmpty },
+	} satisfies AgentEvent);
+	const toolAssistant = m5Assistant([toolCall], firstUsage, "toolUse");
+	emit({ type: "message_end", message: toolAssistant } satisfies AgentEvent);
+	emit({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash", args: { command: "printf tool-ok" } } satisfies AgentEvent);
+	const toolResultMessage = {
+		role: "toolResult",
+		toolCallId: "tool-1",
+		toolName: "bash",
+		content: [{ type: "text", text: "tool-ok" }],
+		details: { exit_code: 0, timed_out: false },
+		isError: false,
+		timestamp: 1766880000008,
+	} satisfies ToolResultMessage;
+	emit({
+		type: "tool_execution_end",
+		toolCallId: "tool-1",
+		toolName: "bash",
+		result: { content: [{ type: "text", text: "tool-ok" }], details: { exit_code: 0, timed_out: false } },
+		isError: false,
+	} satisfies AgentEvent);
+	emit({ type: "message_start", message: toolResultMessage } satisfies AgentEvent);
+	emit({ type: "message_end", message: toolResultMessage } satisfies AgentEvent);
+	emit({ type: "turn_end", message: toolAssistant, toolResults: [toolResultMessage] } satisfies AgentEvent);
+
+	const secondUsage = m5Usage(1110, 1, 156, 1110, 2377);
+	const secondEmpty = m5Assistant([], secondUsage);
+	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "message_start", message: secondEmpty } satisfies AgentEvent);
+	const textStarted = m5Assistant([{ type: "text", text: "" }], secondUsage);
+	emit({
+		type: "message_update",
+		message: textStarted,
+		assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: textStarted },
+	} satisfies AgentEvent);
+	const finalAssistant = m5Assistant([{ type: "text", text: "done" }], secondUsage);
+	emit({
+		type: "message_update",
+		message: finalAssistant,
+		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done", partial: finalAssistant },
+	} satisfies AgentEvent);
+	emit({
+		type: "message_update",
+		message: finalAssistant,
+		assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "done", partial: finalAssistant },
+	} satisfies AgentEvent);
+	emit({ type: "message_end", message: finalAssistant } satisfies AgentEvent);
+	emit({ type: "turn_end", message: finalAssistant, toolResults: [] } satisfies AgentEvent);
+	emit({ type: "agent_end", messages: [user, toolAssistant, toolResultMessage, finalAssistant] } satisfies AgentEvent);
+}
+
+function emitM5Retry(emit: (event: AgentSessionEvent) => void): void {
+	emitM5TextTurn(emit, "retry", "faux response", ["faux respons", "e"], m5Usage(1247, 4, 0, 1247, 2498), {
+		stopReason: "error",
+		errorMessage: "503 service unavailable",
+	});
+	emit({ type: "auto_retry_start", attempt: 1, maxAttempts: 2, delayMs: 1000, errorMessage: "503 service unavailable" });
+	const retryAssistant = m5Assistant([], m5Usage(0, 0, 0, 0, 0), "error", "No more faux responses queued");
+	emit({ type: "agent_start" } satisfies AgentEvent);
+	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "message_start", message: retryAssistant } satisfies AgentEvent);
+	emit({ type: "message_end", message: retryAssistant } satisfies AgentEvent);
+	emit({ type: "turn_end", message: retryAssistant, toolResults: [] } satisfies AgentEvent);
+	emit({ type: "agent_end", messages: [retryAssistant] } satisfies AgentEvent);
+}
+
 interface FixtureUiContext {
 	select(title: string, options: string[], opts?: { timeout?: number }): Promise<string | undefined>;
 	confirm(title: string, message: string, opts?: { timeout?: number }): Promise<boolean>;
@@ -614,10 +861,14 @@ class FixtureSession {
 		};
 	}
 
-	private emitQueueUpdate(): void {
+	private emit(event: AgentSessionEvent): void {
 		for (const listener of this.listeners) {
-			listener({ type: "queue_update", steering: [...this.steeringMessages], followUp: [...this.followUpMessages] });
+			listener(event);
 		}
+	}
+
+	private emitQueueUpdate(): void {
+		this.emit({ type: "queue_update", steering: [...this.steeringMessages], followUp: [...this.followUpMessages] });
 	}
 
 	async prompt(
@@ -634,9 +885,23 @@ class FixtureSession {
 			options?.preflightResult?.(true);
 			return;
 		}
+		if (this.scenario === "m5-retry") {
+			await Promise.resolve();
+		}
 		options?.preflightResult?.(true);
 		if (this.scenario === "prompt-concurrency-queue-order") {
 			return new Promise<void>(() => {});
+		}
+		if (this.scenario === "m5-simple-prompt") {
+			emitM5SimplePrompt((event) => this.emit(event));
+		} else if (this.scenario === "m5-thinking") {
+			emitM5Thinking((event) => this.emit(event));
+		} else if (this.scenario === "m5-tool") {
+			emitM5Tool((event) => this.emit(event));
+		} else if (this.scenario === "m5-retry") {
+			emitM5Retry((event) => this.emit(event));
+		} else {
+			void message;
 		}
 	}
 
@@ -662,6 +927,11 @@ class FixtureSession {
 	setSteeringMode(_mode: "all" | "one-at-a-time"): void {}
 	setFollowUpMode(_mode: "all" | "one-at-a-time"): void {}
 	async compact(_customInstructions?: string): Promise<object> {
+		if (this.scenario === "m5-compaction") {
+			this.emit({ type: "compaction_start", reason: "manual" });
+			this.emit({ type: "compaction_end", reason: "manual", aborted: true, willRetry: false });
+			throw new Error("NothingToCompact");
+		}
 		return {
 			summary: "Compacted fixture history.",
 			firstKeptEntryId: "entry_fixture_2",
@@ -860,46 +1130,56 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			description: "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
 			bytes: captureRuntimeStdout("extension-ui") + extensionUiResponseInputBytes,
 		},
-		checkedInM5ParityFixture(
-			"m5-simple-prompt.input.jsonl",
-			"Scripted JSONL stdin for the M5 simple prompt and streaming text production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-simple-prompt.jsonl",
-			"Expected stdout bytes for the M5 simple prompt and streaming text production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-thinking.input.jsonl",
-			"Scripted JSONL stdin for the M5 thinking-delta production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-thinking.jsonl",
-			"Expected stdout bytes for the M5 thinking-delta production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-tool.input.jsonl",
-			"Scripted JSONL stdin for the M5 tool call/result production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-tool.jsonl",
-			"Expected stdout bytes for the M5 tool call/result production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-compaction.input.jsonl",
-			"Scripted JSONL stdin for the M5 compaction production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-compaction.jsonl",
-			"Expected stdout bytes for the M5 compaction production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-retry.input.jsonl",
-			"Scripted JSONL stdin for the M5 retry production parity scenario.",
-		),
-		checkedInM5ParityFixture(
-			"m5-retry.jsonl",
-			"Expected stdout bytes for the M5 retry production parity scenario.",
-		),
+		{
+			path: "m5-simple-prompt.input.jsonl",
+			description: "Scripted JSONL stdin for the M5 simple prompt and streaming text production parity scenario.",
+			bytes: m5SimplePromptInput,
+		},
+		{
+			path: "m5-simple-prompt.jsonl",
+			description: "live runRpcMode stdout bytes for the M5 simple prompt and streaming text production parity scenario.",
+			bytes: captureRuntimeStdout("m5-simple-prompt", { input: m5SimplePromptInput }),
+		},
+		{
+			path: "m5-thinking.input.jsonl",
+			description: "Scripted JSONL stdin for the M5 thinking-delta production parity scenario.",
+			bytes: m5ThinkingInput,
+		},
+		{
+			path: "m5-thinking.jsonl",
+			description: "live runRpcMode stdout bytes for the M5 thinking-delta production parity scenario.",
+			bytes: captureRuntimeStdout("m5-thinking", { input: m5ThinkingInput }),
+		},
+		{
+			path: "m5-tool.input.jsonl",
+			description: "Scripted JSONL stdin for the M5 tool call/result production parity scenario.",
+			bytes: m5ToolInput,
+		},
+		{
+			path: "m5-tool.jsonl",
+			description: "live runRpcMode stdout bytes for the M5 tool call/result production parity scenario.",
+			bytes: captureRuntimeStdout("m5-tool", { input: m5ToolInput }),
+		},
+		{
+			path: "m5-compaction.input.jsonl",
+			description: "Scripted JSONL stdin for the M5 compaction production parity scenario.",
+			bytes: m5CompactionInput,
+		},
+		{
+			path: "m5-compaction.jsonl",
+			description: "live runRpcMode stdout bytes for the M5 compaction production parity scenario.",
+			bytes: captureRuntimeStdout("m5-compaction", { input: m5CompactionInput }),
+		},
+		{
+			path: "m5-retry.input.jsonl",
+			description: "Scripted JSONL stdin for the M5 retry production parity scenario.",
+			bytes: m5RetryInput,
+		},
+		{
+			path: "m5-retry.jsonl",
+			description: "live runRpcMode stdout bytes for the M5 retry production parity scenario.",
+			bytes: captureRuntimeStdout("m5-retry", { input: m5RetryInput }),
+		},
 	];
 
 	const manifest = {
@@ -936,14 +1216,6 @@ function checkFile(path: string, expected: string): boolean {
 		return false;
 	}
 	return true;
-}
-
-function checkedInM5ParityFixture(path: string, description: string): FixtureFile {
-	return {
-		path,
-		description,
-		bytes: readFileSync(join(fixtureDir, path), "utf8"),
-	};
 }
 
 const scenario = runtimeChildArg?.slice("--runtime-child=".length) as RuntimeScenario | undefined;
