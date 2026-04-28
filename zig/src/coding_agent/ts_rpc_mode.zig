@@ -3,6 +3,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const json_event_wire = @import("json_event_wire.zig");
 const common = @import("tools/common.zig");
+const truncate = @import("tools/truncate.zig");
 const session_mod = @import("session.zig");
 const session_advanced = @import("session_advanced.zig");
 const session_manager_mod = @import("session_manager.zig");
@@ -31,6 +32,7 @@ const DeferredResponsePriority = enum(u8) {
 };
 
 const DEFERRED_RESPONSE_FLUSH_INTERVAL_MS = 50;
+const DIRECT_BASH_MAX_BUFFER_BYTES = truncate.DEFAULT_MAX_BYTES * 2;
 
 const DeferredResponse = struct {
     id: ?[]u8,
@@ -50,9 +52,11 @@ const BashRunResult = struct {
     exit_code: ?u8,
     cancelled: bool,
     truncated: bool = false,
+    full_output_path: ?[]u8 = null,
 
     fn deinit(self: *BashRunResult, allocator: std.mem.Allocator) void {
         allocator.free(self.output);
+        if (self.full_output_path) |path| allocator.free(path);
         self.* = undefined;
     }
 };
@@ -2089,14 +2093,203 @@ const BashOutputReaderState = struct {
     allocator: std.mem.Allocator,
     file: std.Io.File,
     io: std.Io,
-    output: std.ArrayList(u8) = .empty,
+    chunks: std.ArrayList([]u8) = .empty,
+    output_bytes: usize = 0,
+    total_raw_bytes: usize = 0,
+    temp_file: ?DirectBashTempFile = null,
     err: ?anyerror = null,
 
     fn deinit(self: *BashOutputReaderState) void {
-        self.output.deinit(self.allocator);
+        for (self.chunks.items) |chunk| self.allocator.free(chunk);
+        self.chunks.deinit(self.allocator);
+        if (self.temp_file) |*temp_file| temp_file.deinit(self.allocator, self.io);
         self.file.close(self.io);
     }
+
+    fn appendRaw(self: *BashOutputReaderState, bytes: []const u8) !void {
+        self.total_raw_bytes += bytes.len;
+        const sanitized = try sanitizeDirectBashOutput(self.allocator, bytes);
+        errdefer self.allocator.free(sanitized);
+
+        if (self.total_raw_bytes > truncate.DEFAULT_MAX_BYTES and self.temp_file == null) {
+            try self.ensureTempFile();
+        }
+        if (self.temp_file) |*temp_file| {
+            try temp_file.file.?.writeStreamingAll(self.io, sanitized);
+        }
+
+        if (sanitized.len == 0) {
+            self.allocator.free(sanitized);
+            return;
+        }
+        try self.chunks.append(self.allocator, sanitized);
+        self.output_bytes += sanitized.len;
+
+        while (self.output_bytes > DIRECT_BASH_MAX_BUFFER_BYTES and self.chunks.items.len > 1) {
+            const removed = self.chunks.orderedRemove(0);
+            self.output_bytes -= removed.len;
+            self.allocator.free(removed);
+        }
+    }
+
+    fn ensureTempFile(self: *BashOutputReaderState) !void {
+        var temp_file = try DirectBashTempFile.create(self.allocator, self.io);
+        errdefer temp_file.deinit(self.allocator, self.io);
+        for (self.chunks.items) |chunk| {
+            try temp_file.file.?.writeStreamingAll(self.io, chunk);
+        }
+        self.temp_file = temp_file;
+    }
+
+    fn finish(self: *BashOutputReaderState, result_allocator: std.mem.Allocator) !DirectBashBufferedOutput {
+        const rolling_output = try std.mem.join(result_allocator, "", self.chunks.items);
+        errdefer result_allocator.free(rolling_output);
+        if (self.temp_file) |*temp_file| {
+            temp_file.file.?.close(self.io);
+            temp_file.file = null;
+            return .{
+                .output = rolling_output,
+                .full_output_path = temp_file.releasePath(),
+            };
+        }
+        return .{
+            .output = rolling_output,
+            .full_output_path = null,
+        };
+    }
 };
+
+const DirectBashBufferedOutput = struct {
+    output: []u8,
+    full_output_path: ?[]u8 = null,
+
+    fn deinit(self: *DirectBashBufferedOutput, allocator: std.mem.Allocator) void {
+        allocator.free(self.output);
+        if (self.full_output_path) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+const DirectBashTempFile = struct {
+    file: ?std.Io.File,
+    path: ?[]u8,
+
+    fn create(allocator: std.mem.Allocator, io: std.Io) !DirectBashTempFile {
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            var random_bytes: [16]u8 = undefined;
+            io.random(&random_bytes);
+            const encoded = std.fmt.bytesToHex(random_bytes, .lower);
+            const path = try std.fmt.allocPrint(allocator, "/tmp/pi-bash-{s}.log", .{encoded[0..]});
+            errdefer allocator.free(path);
+
+            var file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    allocator.free(path);
+                    continue;
+                },
+                else => return err,
+            };
+            errdefer file.close(io);
+
+            return .{
+                .file = file,
+                .path = path,
+            };
+        }
+
+        return error.TemporaryFilePathCollision;
+    }
+
+    fn releasePath(self: *DirectBashTempFile) []u8 {
+        const path = self.path.?;
+        self.path = null;
+        return path;
+    }
+
+    fn deinit(self: *DirectBashTempFile, allocator: std.mem.Allocator, io: std.Io) void {
+        if (self.file) |file| file.close(io);
+        if (self.path) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+fn sanitizeDirectBashOutput(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (bytes[index] == 0x1b) {
+            index = skipAnsiEscape(bytes, index);
+            continue;
+        }
+
+        const start = index;
+        const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch {
+            try appendUtf8Codepoint(allocator, &out, 0xfffd);
+            index += 1;
+            continue;
+        };
+        if (start + sequence_len > bytes.len) {
+            try appendUtf8Codepoint(allocator, &out, 0xfffd);
+            index += 1;
+            continue;
+        }
+
+        const slice = bytes[start .. start + sequence_len];
+        const codepoint = std.unicode.utf8Decode(slice) catch {
+            try appendUtf8Codepoint(allocator, &out, 0xfffd);
+            index += 1;
+            continue;
+        };
+        index += sequence_len;
+
+        if (codepoint == '\t' or codepoint == '\n') {
+            try out.appendSlice(allocator, slice);
+        } else if (codepoint == '\r') {
+            continue;
+        } else if (codepoint <= 0x1f) {
+            continue;
+        } else if (codepoint >= 0xfff9 and codepoint <= 0xfffb) {
+            continue;
+        } else {
+            try out.appendSlice(allocator, slice);
+        }
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn skipAnsiEscape(bytes: []const u8, start: usize) usize {
+    if (start + 1 >= bytes.len) return start + 1;
+
+    const introducer = bytes[start + 1];
+    if (introducer == '[') {
+        var index = start + 2;
+        while (index < bytes.len) : (index += 1) {
+            if (bytes[index] >= 0x40 and bytes[index] <= 0x7e) return index + 1;
+        }
+        return bytes.len;
+    }
+
+    if (introducer == ']') {
+        var index = start + 2;
+        while (index < bytes.len) : (index += 1) {
+            if (bytes[index] == 0x07) return index + 1;
+            if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '\\') return index + 2;
+        }
+        return bytes.len;
+    }
+
+    return start + 2;
+}
+
+fn appendUtf8Codepoint(allocator: std.mem.Allocator, out: *std.ArrayList(u8), codepoint: u21) !void {
+    var buffer: [4]u8 = undefined;
+    const len = try std.unicode.utf8Encode(codepoint, &buffer);
+    try out.appendSlice(allocator, buffer[0..len]);
+}
 
 fn waitDirectBashChild(state: *BashWaitState) void {
     state.term = state.child.wait(state.io) catch |err| {
@@ -2115,7 +2308,7 @@ fn readDirectBashOutput(state: *BashOutputReaderState) void {
             return;
         };
         if (bytes_read == 0) return;
-        state.output.appendSlice(state.allocator, buffer[0..bytes_read]) catch |err| {
+        state.appendRaw(buffer[0..bytes_read]) catch |err| {
             state.err = err;
             return;
         };
@@ -2210,11 +2403,42 @@ fn runDirectBash(
     if (reader_state.err) |err| return err;
     if (wait_state.err) |err| return err;
 
+    var buffered_output = try reader_state.finish(allocator);
+    defer buffered_output.deinit(allocator);
+    var truncation_result = try truncate.truncateTail(allocator, buffered_output.output, .{});
+    defer truncation_result.deinit(allocator);
+
+    var full_output_path = buffered_output.full_output_path;
+    buffered_output.full_output_path = null;
+    errdefer if (full_output_path) |path| allocator.free(path);
+
+    if (truncation_result.truncated and full_output_path == null) {
+        full_output_path = try captureDirectBashOutputInTempFile(allocator, io, buffered_output.output);
+    }
+
     return .{
-        .output = try reader_state.output.toOwnedSlice(allocator),
+        .output = if (truncation_result.truncated)
+            try allocator.dupe(u8, truncation_result.content)
+        else
+            try allocator.dupe(u8, buffered_output.output),
         .exit_code = if (cancelled) null else exitCodeFromTerm(wait_state.term.?),
         .cancelled = cancelled,
+        .truncated = truncation_result.truncated,
+        .full_output_path = full_output_path,
     };
+}
+
+fn captureDirectBashOutputInTempFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+) ![]u8 {
+    var temp_file = try DirectBashTempFile.create(allocator, io);
+    errdefer temp_file.deinit(allocator, io);
+    try temp_file.file.?.writeStreamingAll(io, output);
+    temp_file.file.?.close(io);
+    temp_file.file = null;
+    return temp_file.releasePath();
 }
 
 fn buildBashResultJson(allocator: std.mem.Allocator, result: BashRunResult) ![]u8 {
@@ -2229,6 +2453,10 @@ fn buildBashResultJson(allocator: std.mem.Allocator, result: BashRunResult) ![]u
     try out.writer.writeAll(if (result.cancelled) "true" else "false");
     try out.writer.writeAll(",\"truncated\":");
     try out.writer.writeAll(if (result.truncated) "true" else "false");
+    if (result.full_output_path) |path| {
+        try out.writer.writeAll(",\"fullOutputPath\":");
+        try writeJsonString(allocator, &out.writer, path);
+    }
     try out.writer.writeAll("}");
     return try allocator.dupe(u8, out.written());
 }
@@ -2967,6 +3195,75 @@ test "TS RPC direct bash failure is a successful BashResult response with exitCo
     );
 }
 
+test "TS RPC direct bash sanitizes control and ANSI output before serializing BashResult" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{"{\"id\":\"bash_sanitize\",\"type\":\"bash\",\"command\":\"printf 'a\\\\033[31mred\\\\033[0m\\\\001b\\\\r\\\\nc'\"}"},
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"bash_sanitize\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"aredb\\nc\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC direct bash truncates large output and retains full output path" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{"{\"id\":\"bash_big\",\"type\":\"bash\",\"command\":\"printf BEGIN; yes A | head -c 120000; printf END\"}"},
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdout_capture.writer.buffered(), .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.object;
+    const output = data.get("output").?.string;
+    const full_output_path = data.get("fullOutputPath").?.string;
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, full_output_path) catch {};
+
+    try std.testing.expect(data.get("truncated").?.bool);
+    try std.testing.expect(output.len <= truncate.DEFAULT_MAX_BYTES);
+    try expectContains(output, "END");
+    try std.testing.expect(std.mem.indexOf(u8, output, "BEGIN") == null);
+    try std.testing.expect(std.mem.startsWith(u8, full_output_path, "/tmp/pi-bash-"));
+
+    const full_output = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, full_output_path, allocator, .limited(256 * 1024));
+    defer allocator.free(full_output);
+    try expectContains(full_output, "BEGIN");
+    try expectContains(full_output, "END");
+}
+
 test "TS RPC abort_bash interrupts active direct bash and cleans tracked task" {
     const allocator = std.testing.allocator;
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3017,6 +3314,7 @@ test "TS RPC command loop remains live while direct bash is active" {
 
     try server.handleLine("{\"id\":\"live_bash\",\"type\":\"bash\",\"command\":\"printf 'live\\n'; sleep 5; printf done\"}");
     try waitForActiveBashStarted(&server);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
     try server.handleLine("{\"id\":\"live_commands\",\"type\":\"get_commands\"}");
     try waitForOutputContains(
         &server,
