@@ -53,7 +53,10 @@ test "TS RPC fixture files are checked in and valid JSONL" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, manifest, .{});
     defer parsed.deinit();
     try expectContains(manifest, "packages/coding-agent/src/modes/rpc/jsonl.ts:10-58");
-    try expectContains(manifest, "packages/coding-agent/src/modes/rpc/rpc-mode.ts:650-704");
+    try expectContains(manifest, "packages/coding-agent/src/modes/rpc/rpc-mode.ts:369-704");
+    try expectContains(manifest, "captureMethod");
+    try expectContains(manifest, "runRpcMode");
+    try expectContains(manifest, "AgentSession.subscribe");
 }
 
 test "TS RPC response fixtures preserve parse and unknown-command quirks" {
@@ -75,12 +78,14 @@ test "TS RPC framing fixture captures LF CRLF final-line and Unicode separator b
     const bytes = try readFixture("jsonl-framing.jsonl");
     defer std.testing.allocator.free(bytes);
 
-    try expectContains(bytes, "serialize-unicode-separators");
-    try expectContains(bytes, "a\xe2\x80\xa8b\xe2\x80\xa9c");
-    try expectContains(bytes, "\"case\":\"lf-input\"");
-    try expectContains(bytes, "\"case\":\"crlf-input\"");
-    try expectContains(bytes, "\"case\":\"final-unterminated-input\"");
-    try expectContains(bytes, "\"case\":\"parse-error-output\"");
+    try expectContains(bytes, "fixture\xe2\x80\xa8session\xe2\x80\xa9name");
+    try expectContains(bytes, "\"case\":\"lf-input-reader\"");
+    try expectContains(bytes, "\"case\":\"crlf-input-reader\"");
+    try expectContains(bytes, "\"case\":\"final-unterminated-input-reader\"");
+    try expectContains(bytes, "\"id\":\"framing_lf_a\"");
+    try expectContains(bytes, "\"id\":\"framing_crlf_a\"");
+    try expectContains(bytes, "\"id\":\"framing_final\"");
+    try expectContains(bytes, "\"command\":\"parse\"");
 }
 
 test "TS RPC event fixtures cover base stream thinking tools usage details and stop reasons" {
