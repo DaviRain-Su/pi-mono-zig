@@ -64,6 +64,60 @@ const BashRunResult = struct {
     }
 };
 
+const ExtensionUIDialogMethod = enum {
+    select,
+    confirm,
+    input,
+    editor,
+};
+
+const ExtensionUIResolution = union(enum) {
+    none,
+    value: []u8,
+    confirmed: bool,
+
+    fn clone(allocator: std.mem.Allocator, resolution: ExtensionUIResolution) !ExtensionUIResolution {
+        return switch (resolution) {
+            .none => .none,
+            .confirmed => |confirmed| .{ .confirmed = confirmed },
+            .value => |value| .{ .value = try allocator.dupe(u8, value) },
+        };
+    }
+
+    fn deinit(self: *ExtensionUIResolution, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .value => |value| allocator.free(value),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const PendingExtensionUIRequest = struct {
+    method: ExtensionUIDialogMethod,
+    timeout_ms: ?u64 = null,
+    elapsed_ms: u64 = 0,
+
+    fn defaultResolution(self: PendingExtensionUIRequest) ExtensionUIResolution {
+        return switch (self.method) {
+            .confirm => .{ .confirmed = false },
+            .select, .input, .editor => .none,
+        };
+    }
+};
+
+const ResolvedExtensionUIRequest = struct {
+    id: []u8,
+    method: ExtensionUIDialogMethod,
+    resolution: ExtensionUIResolution,
+
+    fn deinit(self: *ResolvedExtensionUIRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        self.resolution.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const BashTask = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -428,6 +482,8 @@ const TsRpcServer = struct {
     deferred_flush_thread: ?std.Thread = null,
     next_deferred_response_sequence: usize = 0,
     next_bash_response_sequence: usize = 0,
+    pending_extension_requests: std.StringHashMap(PendingExtensionUIRequest),
+    completed_extension_requests: std.ArrayList(ResolvedExtensionUIRequest) = .empty,
     suppress_events: bool = false,
     finished: bool = false,
 
@@ -444,6 +500,7 @@ const TsRpcServer = struct {
             .session = session,
             .stdout_writer = stdout_writer,
             .stderr_writer = stderr_writer,
+            .pending_extension_requests = std.StringHashMap(PendingExtensionUIRequest).init(allocator),
         };
     }
 
@@ -478,6 +535,7 @@ const TsRpcServer = struct {
         self.deferred_responses = .empty;
         self.bash_tasks.deinit(self.allocator);
         self.bash_tasks = .empty;
+        self.deinitExtensionUIState();
         try self.stdout_writer.flush();
         try self.stderr_writer.flush();
     }
@@ -613,6 +671,107 @@ const TsRpcServer = struct {
         }
     }
 
+    fn deinitExtensionUIState(self: *TsRpcServer) void {
+        var pending_iterator = self.pending_extension_requests.iterator();
+        while (pending_iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.pending_extension_requests.deinit();
+
+        for (self.completed_extension_requests.items) |*resolved| {
+            resolved.deinit(self.allocator);
+        }
+        self.completed_extension_requests.deinit(self.allocator);
+        self.completed_extension_requests = .empty;
+    }
+
+    fn registerPendingExtensionUIRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        method: ExtensionUIDialogMethod,
+        timeout_ms: ?u64,
+    ) !void {
+        if (self.pending_extension_requests.fetchRemove(id)) |removed| {
+            self.allocator.free(removed.key);
+        }
+        try self.pending_extension_requests.put(
+            try self.allocator.dupe(u8, id),
+            .{
+                .method = method,
+                .timeout_ms = timeout_ms,
+            },
+        );
+    }
+
+    fn resolvePendingExtensionUIRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        resolution: ExtensionUIResolution,
+    ) !bool {
+        if (self.pending_extension_requests.fetchRemove(id)) |removed| {
+            defer self.allocator.free(removed.key);
+            try self.completed_extension_requests.append(self.allocator, .{
+                .id = try self.allocator.dupe(u8, id),
+                .method = removed.value.method,
+                .resolution = try ExtensionUIResolution.clone(self.allocator, resolution),
+            });
+            return true;
+        }
+        return false;
+    }
+
+    fn cancelPendingExtensionUIRequest(self: *TsRpcServer, id: []const u8) !bool {
+        if (self.pending_extension_requests.get(id)) |pending| {
+            const default_resolution = pending.defaultResolution();
+            return try self.resolvePendingExtensionUIRequest(id, default_resolution);
+        }
+        return false;
+    }
+
+    fn advanceExtensionUITime(self: *TsRpcServer, elapsed_ms: u64) !void {
+        var timed_out_ids = std.ArrayList([]u8).empty;
+        defer {
+            for (timed_out_ids.items) |id| self.allocator.free(id);
+            timed_out_ids.deinit(self.allocator);
+        }
+
+        var iterator = self.pending_extension_requests.iterator();
+        while (iterator.next()) |entry| {
+            const timeout_ms = entry.value_ptr.timeout_ms orelse continue;
+            entry.value_ptr.elapsed_ms += elapsed_ms;
+            if (entry.value_ptr.elapsed_ms >= timeout_ms) {
+                try timed_out_ids.append(self.allocator, try self.allocator.dupe(u8, entry.key_ptr.*));
+            }
+        }
+
+        for (timed_out_ids.items) |id| {
+            _ = try self.cancelPendingExtensionUIRequest(id);
+        }
+    }
+
+    fn handleExtensionUIResponse(self: *TsRpcServer, object: std.json.ObjectMap) !void {
+        const id = requiredString(object, "id") catch return;
+
+        if (object.get("cancelled")) |cancelled_value| {
+            if (cancelled_value == .bool and cancelled_value.bool) {
+                _ = try self.resolvePendingExtensionUIRequest(id, .none);
+                return;
+            }
+        }
+        if (object.get("value")) |value| {
+            if (value == .string) {
+                _ = try self.resolvePendingExtensionUIRequest(id, .{ .value = @constCast(value.string) });
+                return;
+            }
+        }
+        if (object.get("confirmed")) |confirmed| {
+            if (confirmed == .bool) {
+                _ = try self.resolvePendingExtensionUIRequest(id, .{ .confirmed = confirmed.bool });
+                return;
+            }
+        }
+    }
+
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
         const ts_line = stripTrailingCarriageReturn(line);
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, ts_line, .{}) catch {
@@ -626,6 +785,7 @@ const TsRpcServer = struct {
         if (parsed.value == .object) {
             if (parsed.value.object.get("type")) |type_value| {
                 if (type_value == .string and std.mem.eql(u8, type_value.string, "extension_ui_response")) {
+                    try self.handleExtensionUIResponse(parsed.value.object);
                     return;
                 }
             }
@@ -1191,6 +1351,187 @@ const TsRpcServer = struct {
         }
         try self.stdout_writer.writeAll(",\"success\":false,\"error\":");
         try writeJsonString(self.allocator, self.stdout_writer, message);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUISelectRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        title: []const u8,
+        options: []const []const u8,
+        timeout_ms: ?u64,
+    ) !void {
+        try self.registerPendingExtensionUIRequest(id, .select, timeout_ms);
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"select\",\"title\":");
+        try writeJsonString(self.allocator, self.stdout_writer, title);
+        try self.stdout_writer.writeAll(",\"options\":[");
+        for (options, 0..) |option, index| {
+            if (index > 0) try self.stdout_writer.writeAll(",");
+            try writeJsonString(self.allocator, self.stdout_writer, option);
+        }
+        try self.stdout_writer.writeAll("]");
+        if (timeout_ms) |timeout| try self.stdout_writer.print(",\"timeout\":{d}", .{timeout});
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUIConfirmRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        title: []const u8,
+        message: []const u8,
+        timeout_ms: ?u64,
+    ) !void {
+        try self.registerPendingExtensionUIRequest(id, .confirm, timeout_ms);
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"confirm\",\"title\":");
+        try writeJsonString(self.allocator, self.stdout_writer, title);
+        try self.stdout_writer.writeAll(",\"message\":");
+        try writeJsonString(self.allocator, self.stdout_writer, message);
+        if (timeout_ms) |timeout| try self.stdout_writer.print(",\"timeout\":{d}", .{timeout});
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUIInputRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        title: []const u8,
+        placeholder: ?[]const u8,
+        timeout_ms: ?u64,
+    ) !void {
+        try self.registerPendingExtensionUIRequest(id, .input, timeout_ms);
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"input\",\"title\":");
+        try writeJsonString(self.allocator, self.stdout_writer, title);
+        if (placeholder) |text| {
+            try self.stdout_writer.writeAll(",\"placeholder\":");
+            try writeJsonString(self.allocator, self.stdout_writer, text);
+        }
+        if (timeout_ms) |timeout| try self.stdout_writer.print(",\"timeout\":{d}", .{timeout});
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUIEditorRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        title: []const u8,
+        prefill: ?[]const u8,
+    ) !void {
+        try self.registerPendingExtensionUIRequest(id, .editor, null);
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"editor\",\"title\":");
+        try writeJsonString(self.allocator, self.stdout_writer, title);
+        if (prefill) |text| {
+            try self.stdout_writer.writeAll(",\"prefill\":");
+            try writeJsonString(self.allocator, self.stdout_writer, text);
+        }
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUINotifyRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        message: []const u8,
+        notify_type: ?[]const u8,
+    ) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"notify\",\"message\":");
+        try writeJsonString(self.allocator, self.stdout_writer, message);
+        if (notify_type) |kind| {
+            try self.stdout_writer.writeAll(",\"notifyType\":");
+            try writeJsonString(self.allocator, self.stdout_writer, kind);
+        }
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUISetStatusRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        status_key: []const u8,
+        status_text: ?[]const u8,
+    ) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"setStatus\",\"statusKey\":");
+        try writeJsonString(self.allocator, self.stdout_writer, status_key);
+        if (status_text) |text| {
+            try self.stdout_writer.writeAll(",\"statusText\":");
+            try writeJsonString(self.allocator, self.stdout_writer, text);
+        }
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUISetWidgetRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        widget_key: []const u8,
+        widget_lines: ?[]const []const u8,
+        widget_placement: ?[]const u8,
+    ) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"setWidget\",\"widgetKey\":");
+        try writeJsonString(self.allocator, self.stdout_writer, widget_key);
+        if (widget_lines) |lines| {
+            try self.stdout_writer.writeAll(",\"widgetLines\":[");
+            for (lines, 0..) |line, index| {
+                if (index > 0) try self.stdout_writer.writeAll(",");
+                try writeJsonString(self.allocator, self.stdout_writer, line);
+            }
+            try self.stdout_writer.writeAll("]");
+        }
+        if (widget_placement) |placement| {
+            try self.stdout_writer.writeAll(",\"widgetPlacement\":");
+            try writeJsonString(self.allocator, self.stdout_writer, placement);
+        }
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUISetTitleRequest(self: *TsRpcServer, id: []const u8, title: []const u8) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"setTitle\",\"title\":");
+        try writeJsonString(self.allocator, self.stdout_writer, title);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeExtensionUISetEditorTextRequest(self: *TsRpcServer, id: []const u8, text: []const u8) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+        try writeJsonString(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll(",\"method\":\"set_editor_text\",\"text\":");
+        try writeJsonString(self.allocator, self.stdout_writer, text);
         try self.stdout_writer.writeAll("}\n");
         try self.stdout_writer.flush();
     }
@@ -4250,6 +4591,36 @@ test "TS RPC dispatcher skeleton covers every TypeScript RpcCommand type" {
     }
 }
 
+test "TS RPC extension UI request writer matches TypeScript fixture bytes" {
+    const allocator = std.testing.allocator;
+    const fixture = try readFixture("extension-ui.jsonl");
+    defer allocator.free(fixture);
+    const response_start = std.mem.indexOf(u8, fixture, "{\"type\":\"extension_ui_response\"").?;
+    const expected_requests = fixture[0..response_start];
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    const select_options = [_][]const u8{ "option-a", "option-b" };
+    const widget_lines = [_][]const u8{ "line one", "line two" };
+
+    try server.writeExtensionUISelectRequest("ui_select", "Choose fixture", &select_options, 1000);
+    try server.writeExtensionUIConfirmRequest("ui_confirm", "Confirm fixture", "Proceed?", 1000);
+    try server.writeExtensionUIInputRequest("ui_input", "Fixture input", "value", 1000);
+    try server.writeExtensionUINotifyRequest("ui_notify", "Fixture notice", "info");
+    try server.writeExtensionUISetStatusRequest("ui_status", "fixture", "ready");
+    try server.writeExtensionUISetWidgetRequest("ui_widget", "fixture", &widget_lines, "aboveEditor");
+    try server.writeExtensionUISetTitleRequest("ui_title", "Fixture Title");
+    try server.writeExtensionUISetEditorTextRequest("ui_editor_text", "fixture editor text");
+    try server.writeExtensionUIEditorRequest("ui_editor", "Edit fixture", "prefill");
+    try server.finish();
+
+    try std.testing.expectEqualStrings(expected_requests, stdout_capture.writer.buffered());
+}
+
 test "TS RPC extension UI responses are consumed without output" {
     const allocator = std.testing.allocator;
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
@@ -4270,6 +4641,75 @@ test "TS RPC extension UI responses are consumed without output" {
         &stderr_capture.writer,
     );
     try std.testing.expectEqual(@as(usize, 0), stdout_capture.writer.buffered().len);
+}
+
+test "TS RPC extension UI responses resolve pending requests like TypeScript" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    try server.registerPendingExtensionUIRequest("ui_select", .select, 1000);
+    try server.registerPendingExtensionUIRequest("ui_confirm", .confirm, 1000);
+    try server.registerPendingExtensionUIRequest("ui_input", .input, 1000);
+    try server.registerPendingExtensionUIRequest("ui_editor", .editor, null);
+
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"value\":\"option-a\"}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"value\":\"edited text\"}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"missing\",\"value\":\"ignored\"}");
+    defer server.finish() catch {};
+
+    try std.testing.expectEqual(@as(usize, 0), stdout_capture.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), server.pending_extension_requests.count());
+    try std.testing.expectEqual(@as(usize, 4), server.completed_extension_requests.items.len);
+    try std.testing.expectEqualStrings("ui_select", server.completed_extension_requests.items[0].id);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.select, server.completed_extension_requests.items[0].method);
+    try std.testing.expectEqualStrings("option-a", server.completed_extension_requests.items[0].resolution.value);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.confirm, server.completed_extension_requests.items[1].method);
+    try std.testing.expect(server.completed_extension_requests.items[1].resolution.confirmed);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.input, server.completed_extension_requests.items[2].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[2].resolution);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.editor, server.completed_extension_requests.items[3].method);
+    try std.testing.expectEqualStrings("edited text", server.completed_extension_requests.items[3].resolution.value);
+}
+
+test "TS RPC extension UI timeout and cancel resolve deterministic defaults" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    try server.registerPendingExtensionUIRequest("ui_select", .select, 1000);
+    try server.registerPendingExtensionUIRequest("ui_confirm", .confirm, null);
+    try server.registerPendingExtensionUIRequest("ui_input", .input, 50);
+    defer server.finish() catch {};
+
+    try server.advanceExtensionUITime(49);
+    try std.testing.expectEqual(@as(usize, 0), server.completed_extension_requests.items.len);
+    try std.testing.expectEqual(@as(u32, 3), server.pending_extension_requests.count());
+
+    try server.advanceExtensionUITime(1);
+    try std.testing.expectEqual(@as(usize, 1), server.completed_extension_requests.items.len);
+    try std.testing.expectEqualStrings("ui_input", server.completed_extension_requests.items[0].id);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.input, server.completed_extension_requests.items[0].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[0].resolution);
+
+    try std.testing.expect(try server.cancelPendingExtensionUIRequest("ui_confirm"));
+    try std.testing.expectEqual(@as(usize, 2), server.completed_extension_requests.items.len);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.confirm, server.completed_extension_requests.items[1].method);
+    try std.testing.expect(!server.completed_extension_requests.items[1].resolution.confirmed);
+
+    try server.advanceExtensionUITime(950);
+    try std.testing.expectEqual(@as(usize, 3), server.completed_extension_requests.items.len);
+    try std.testing.expectEqualStrings("ui_select", server.completed_extension_requests.items[2].id);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[2].resolution);
+    try std.testing.expect(!try server.cancelPendingExtensionUIRequest("ui_select"));
 }
 
 fn expectPromptLineTypeOrder(bytes: []const u8) !void {
