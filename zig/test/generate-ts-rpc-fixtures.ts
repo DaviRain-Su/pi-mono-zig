@@ -1,38 +1,65 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, AssistantMessageEvent, Model, ToolCall, ToolResultMessage } from "@mariozechner/pi-ai";
+import type { AssistantMessage, Model, ToolCall, ToolResultMessage } from "@mariozechner/pi-ai";
 import type { AgentSessionEvent } from "../../packages/coding-agent/src/core/agent-session.js";
+import type { AgentSessionRuntime } from "../../packages/coding-agent/src/core/agent-session-runtime.js";
+import { runRpcMode } from "../../packages/coding-agent/src/modes/rpc/rpc-mode.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../../packages/coding-agent/src/modes/rpc/jsonl.js";
 import type {
 	RpcCommand,
-	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
-	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
 } from "../../packages/coding-agent/src/modes/rpc/rpc-types.js";
 
-const scriptDir = dirname(fileURLToPath(import.meta.url));
+const scriptPath = fileURLToPath(import.meta.url);
+const scriptDir = dirname(scriptPath);
+const repoRoot = join(scriptDir, "..", "..");
 const fixtureDir = join(scriptDir, "golden", "ts-rpc");
 const checkMode = process.argv.includes("--check");
+const runtimeChildArg = process.argv.find((arg) => arg.startsWith("--runtime-child="));
 
 const sourceCitations = [
 	"packages/coding-agent/src/modes/rpc/jsonl.ts:10-58",
-	"packages/coding-agent/src/modes/rpc/rpc-mode.ts:57-70",
-	"packages/coding-agent/src/modes/rpc/rpc-mode.ts:650-704",
+	"packages/coding-agent/src/modes/rpc/rpc-mode.ts:53-70",
+	"packages/coding-agent/src/modes/rpc/rpc-mode.ts:313-365",
+	"packages/coding-agent/src/modes/rpc/rpc-mode.ts:369-704",
 	"packages/coding-agent/src/modes/rpc/rpc-mode.ts:706-737",
 	"packages/coding-agent/src/modes/rpc/rpc-types.ts:19-264",
 	"packages/agent/src/types.ts:350-365",
 	"packages/ai/src/types.ts:207-276",
 ];
 
+const captureMethod = {
+	responses: "spawn runRpcMode with a deterministic faux AgentSessionRuntime and capture child stdout bytes",
+	framing: "feed LF, CRLF, invalid, and final unterminated stdin into runRpcMode and capture child stdout bytes",
+	events: "emit deterministic faux AgentSession events through session.subscribe inside runRpcMode and capture child stdout bytes",
+	extensionUi: "invoke the runRpcMode ExtensionUIContext from bindExtensions with deterministic crypto.randomUUID preload",
+};
+
 interface FixtureFile {
 	path: string;
 	description: string;
 	bytes: string;
+}
+
+type RuntimeScenario =
+	| "responses-basic"
+	| "framing-lf"
+	| "framing-crlf"
+	| "framing-final"
+	| "framing-parse"
+	| "events-base-stream"
+	| "events-thinking-tool-usage"
+	| "events-session-extras"
+	| "extension-ui";
+
+interface RuntimeCaptureOptions {
+	input?: string;
 }
 
 function jsonl(records: readonly unknown[]): string {
@@ -52,32 +79,46 @@ async function collectJsonlReaderLines(chunks: readonly (string | Buffer)[]): Pr
 	return lines;
 }
 
-function success<T extends RpcCommand["type"]>(
-	id: string | undefined,
-	command: T,
-	data?: object | null,
-): RpcResponse {
-	if (data === undefined) {
-		return { id, type: "response", command, success: true } as RpcResponse;
+function deterministicCryptoPreload(): string {
+	const ids = [
+		"ui_select",
+		"ui_confirm",
+		"ui_input",
+		"ui_notify",
+		"ui_status",
+		"ui_widget",
+		"ui_title",
+		"ui_editor_text",
+		"ui_editor",
+		"ui_extra_1",
+		"ui_extra_2",
+	];
+	const source = `import { createRequire } from "node:module";\nconst require = createRequire(process.cwd() + "/package.json");\nconst crypto = require("node:crypto");\nconst ids = ${JSON.stringify(ids)};\ncrypto.randomUUID = () => ids.shift() ?? "ui_extra";\n`;
+	return `data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+function captureRuntimeStdout(scenario: RuntimeScenario, options: RuntimeCaptureOptions = {}): string {
+	const result = spawnSync(
+		process.execPath,
+		["--import", deterministicCryptoPreload(), "--import", "tsx", scriptPath, `--runtime-child=${scenario}`],
+		{
+			cwd: repoRoot,
+			input: options.input ?? "",
+			encoding: "utf8",
+			env: { ...process.env, PI_TS_RPC_FIXTURE_CHILD: "1" },
+			maxBuffer: 1024 * 1024 * 10,
+		},
+	);
+
+	if (result.error) {
+		throw result.error;
 	}
-	return { id, type: "response", command, success: true, data } as RpcResponse;
-}
-
-function error(id: string | undefined, command: string, message: string): RpcResponse {
-	return { id, type: "response", command, success: false, error: message };
-}
-
-function parseErrorResponse(line: string): RpcResponse {
-	try {
-		JSON.parse(line);
-		throw new Error("Expected fixture parse input to fail");
-	} catch (parseError: unknown) {
-		return error(
-			undefined,
-			"parse",
-			`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+	if (result.status !== 0) {
+		throw new Error(
+			`Runtime fixture capture failed for ${scenario} with exit ${result.status}\nSTDERR:\n${result.stderr}\nSTDOUT:\n${result.stdout}`,
 		);
 	}
+	return result.stdout;
 }
 
 const usage = {
@@ -212,6 +253,11 @@ const sessionState = {
 	pendingMessageCount: 2,
 } satisfies RpcSessionState;
 
+const framingSessionState = {
+	...sessionState,
+	sessionName: "fixture\u2028session\u2029name",
+} satisfies RpcSessionState;
+
 const slashCommand = {
 	name: "fixture",
 	description: "Run the deterministic fixture command",
@@ -262,96 +308,72 @@ const extensionUiResponses = [
 	{ type: "extension_ui_response", id: "ui_input", cancelled: true },
 ] satisfies RpcExtensionUIResponse[];
 
-const responses = [
-	success("resp_prompt", "prompt"),
-	success(undefined, "steer"),
-	success("resp_state", "get_state", sessionState),
-	success(undefined, "cycle_model", null),
-	success("resp_models", "get_available_models", { models: [model] }),
-	success("resp_compact", "compact", {
-		summary: "Compacted fixture history.",
-		firstKeptEntryId: "entry_fixture_2",
-		tokensBefore: 1234,
-		details: { strategy: "faux" },
-	}),
-	success("resp_bash", "bash", {
-		output: "fixture\n",
-		exitCode: 0,
-		cancelled: false,
-		truncated: true,
-		fullOutputPath: "/tmp/pi-ts-rpc/full-output.txt",
-	}),
-	success("resp_stats", "get_session_stats", {
-		sessionFile: "/tmp/pi-ts-rpc/session.jsonl",
-		sessionId: "sess_fixture_1",
-		userMessages: 1,
-		assistantMessages: 1,
-		toolCalls: 1,
-		toolResults: 1,
-		totalMessages: 3,
-		tokens: { input: 11, output: 22, cacheRead: 3, cacheWrite: 4, total: 40 },
-		cost: 0.0066,
-		contextUsage: { used: 40, available: 200000, percentage: 0.02 },
-	}),
-	success("resp_export", "export_html", { path: "/tmp/pi-ts-rpc/export.html" }),
-	success("resp_fork", "fork", { text: "selected fixture text", cancelled: false }),
-	success("resp_messages", "get_messages", { messages: [userMessage, assistantText, toolResult] }),
-	success("resp_commands", "get_commands", { commands: [slashCommand] }),
-	error("resp_set_model_error", "set_model", "Model not found: anthropic/missing-model"),
-	error("resp_thrown", "bash", "Command fixture failure"),
-	parseErrorResponse("{not json"),
-	error(undefined, "mystery_command", "Unknown command: mystery_command"),
-] satisfies RpcResponse[];
+const responseScenarioInput = jsonl([
+	{ id: "resp_prompt", type: "prompt", message: "accepted prompt" },
+	{ type: "steer", message: "steer fixture" },
+	{ id: "resp_state", type: "get_state" },
+	{ type: "cycle_model" },
+	{ id: "resp_models", type: "get_available_models" },
+	{ id: "resp_compact", type: "compact", customInstructions: "preserve fixture notes" },
+	{ id: "resp_bash", type: "bash", command: "printf fixture" },
+	{ id: "resp_stats", type: "get_session_stats" },
+	{ id: "resp_export", type: "export_html", outputPath: "/tmp/pi-ts-rpc/export.html" },
+	{ id: "resp_fork", type: "fork", entryId: "entry_fixture_1" },
+	{ id: "resp_messages", type: "get_messages" },
+	{ id: "resp_commands", type: "get_commands" },
+	{ id: "resp_set_model_error", type: "set_model", provider: "anthropic", modelId: "missing-model" },
+	{ id: "resp_thrown", type: "bash", command: "throw" },
+]) + "{not json\n" + serializeJsonLine({ id: "mystery", type: "mystery_command" });
 
-const baseEvents = [
-	{ type: "agent_start" },
-	{ type: "turn_start" },
-	{ type: "message_start", message: userMessage },
-	{ type: "message_end", message: userMessage },
-	{ type: "message_start", message: assistantEmpty },
-	{
+function emitBaseStreamScenario(emit: (event: AgentSessionEvent) => void): void {
+	emit({ type: "agent_start" } satisfies AgentEvent);
+	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "message_start", message: userMessage } satisfies AgentEvent);
+	emit({ type: "message_end", message: userMessage } satisfies AgentEvent);
+	emit({ type: "message_start", message: assistantEmpty } satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantEmpty,
 		assistantMessageEvent: { type: "start", partial: assistantEmpty },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantText,
 		assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: assistantEmpty },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantText,
 		assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Fixtures", partial: assistantText },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantText,
 		assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Fixtures captured.", partial: assistantText },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantText,
 		assistantMessageEvent: { type: "done", reason: "stop", message: assistantText },
-	},
-	{ type: "message_end", message: assistantText },
-	{ type: "turn_end", message: assistantText, toolResults: [] },
-	{ type: "agent_end", messages: [userMessage, assistantText] },
-] satisfies AgentEvent[];
+	} satisfies AgentEvent);
+	emit({ type: "message_end", message: assistantText } satisfies AgentEvent);
+	emit({ type: "turn_end", message: assistantText, toolResults: [] } satisfies AgentEvent);
+	emit({ type: "agent_end", messages: [userMessage, assistantText] } satisfies AgentEvent);
+}
 
-const thinkingAndToolEvents = [
-	{ type: "message_start", message: userMessageWithImage },
-	{
+function emitThinkingToolUsageScenario(emit: (event: AgentSessionEvent) => void): void {
+	emit({ type: "message_start", message: userMessageWithImage } satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantThinking,
 		assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: assistantEmpty },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantThinking,
 		assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Need exact", partial: assistantThinking },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantThinking,
 		assistantMessageEvent: {
@@ -360,13 +382,13 @@ const thinkingAndToolEvents = [
 			content: "Need exact field order.",
 			partial: assistantThinking,
 		},
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantToolUse,
 		assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, partial: assistantThinking },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantToolUse,
 		assistantMessageEvent: {
@@ -375,51 +397,51 @@ const thinkingAndToolEvents = [
 			delta: "{\"path\":\"zig/test/golden/ts-rpc\"}",
 			partial: assistantToolUse,
 		},
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantToolUse,
 		assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall, partial: assistantToolUse },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantToolUse,
 		assistantMessageEvent: { type: "done", reason: "toolUse", message: assistantToolUse },
-	},
-	{ type: "tool_execution_start", toolCallId: "toolu_fixture_1", toolName: "fixture_tool", args: toolCall.arguments },
-	{
+	} satisfies AgentEvent);
+	emit({ type: "tool_execution_start", toolCallId: "toolu_fixture_1", toolName: "fixture_tool", args: toolCall.arguments } satisfies AgentEvent);
+	emit({
 		type: "tool_execution_update",
 		toolCallId: "toolu_fixture_1",
 		toolName: "fixture_tool",
 		args: toolCall.arguments,
 		partialResult: partialToolResult,
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "tool_execution_end",
 		toolCallId: "toolu_fixture_1",
 		toolName: "fixture_tool",
 		result: toolResult,
 		isError: false,
-	},
-	{ type: "message_end", message: toolResult },
-	{ type: "turn_end", message: assistantToolUse, toolResults: [toolResult] },
-	{
+	} satisfies AgentEvent);
+	emit({ type: "message_end", message: toolResult } satisfies AgentEvent);
+	emit({ type: "turn_end", message: assistantToolUse, toolResults: [toolResult] } satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantLength,
 		assistantMessageEvent: { type: "done", reason: "length", message: assistantLength },
-	},
-	{
+	} satisfies AgentEvent);
+	emit({
 		type: "message_update",
 		message: assistantAborted,
 		assistantMessageEvent: { type: "error", reason: "aborted", error: assistantAborted },
-	},
-] satisfies AgentEvent[];
+	} satisfies AgentEvent);
+}
 
-const sessionEvents = [
-	{ type: "queue_update", steering: ["steer one"], followUp: ["follow one", "follow two"] },
-	{ type: "compaction_start", reason: "manual" },
-	{ type: "session_info_changed", name: "fixture session" },
-	{
+function emitSessionExtrasScenario(emit: (event: AgentSessionEvent) => void): void {
+	emit({ type: "queue_update", steering: ["steer one"], followUp: ["follow one", "follow two"] });
+	emit({ type: "compaction_start", reason: "manual" });
+	emit({ type: "session_info_changed", name: "fixture session" });
+	emit({
 		type: "compaction_end",
 		reason: "manual",
 		result: {
@@ -430,42 +452,215 @@ const sessionEvents = [
 		},
 		aborted: false,
 		willRetry: false,
-	},
-	{ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 250, errorMessage: "transient fixture error" },
-	{ type: "auto_retry_end", success: false, attempt: 3, finalError: "fixture retry exhausted" },
-] satisfies AgentSessionEvent[];
+	});
+	emit({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 250, errorMessage: "transient fixture error" });
+	emit({ type: "auto_retry_end", success: false, attempt: 3, finalError: "fixture retry exhausted" });
+}
 
-const extensionUiRequests = [
-	{ type: "extension_ui_request", id: "ui_select", method: "select", title: "Choose fixture", options: ["option-a", "option-b"], timeout: 1000 },
-	{ type: "extension_ui_request", id: "ui_confirm", method: "confirm", title: "Confirm fixture", message: "Proceed?", timeout: 1000 },
-	{ type: "extension_ui_request", id: "ui_input", method: "input", title: "Fixture input", placeholder: "value", timeout: 1000 },
-	{ type: "extension_ui_request", id: "ui_editor", method: "editor", title: "Edit fixture", prefill: "prefill" },
-	{ type: "extension_ui_request", id: "ui_notify", method: "notify", message: "Fixture notice", notifyType: "info" },
-	{ type: "extension_ui_request", id: "ui_status", method: "setStatus", statusKey: "fixture", statusText: "ready" },
-	{
-		type: "extension_ui_request",
-		id: "ui_widget",
-		method: "setWidget",
-		widgetKey: "fixture",
-		widgetLines: ["line one", "line two"],
-		widgetPlacement: "aboveEditor",
-	},
-	{ type: "extension_ui_request", id: "ui_title", method: "setTitle", title: "Fixture Title" },
-	{ type: "extension_ui_request", id: "ui_editor_text", method: "set_editor_text", text: "fixture editor text" },
-] satisfies RpcExtensionUIRequest[];
+interface FixtureUiContext {
+	select(title: string, options: string[], opts?: { timeout?: number }): Promise<string | undefined>;
+	confirm(title: string, message: string, opts?: { timeout?: number }): Promise<boolean>;
+	input(title: string, placeholder?: string, opts?: { timeout?: number }): Promise<string | undefined>;
+	editor(title: string, prefill?: string): Promise<string | undefined>;
+	notify(message: string, type?: "info" | "warning" | "error"): void;
+	setStatus(key: string, text: string | undefined): void;
+	setWidget(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+	setTitle(title: string): void;
+	setEditorText(text: string): void;
+}
+
+interface BindExtensionsOptions {
+	uiContext: FixtureUiContext;
+}
+
+class FixtureSession {
+	readonly scenario: RuntimeScenario;
+	readonly agent = { waitForIdle: async () => {} };
+	readonly sessionManager = { getLeafId: () => "entry_fixture_1" };
+	readonly modelRegistry = {
+		getAvailable: async () => [model],
+	};
+	readonly extensionRunner = {
+		getRegisteredCommands: () => [
+			{
+				invocationName: slashCommand.name,
+				description: slashCommand.description,
+				sourceInfo: slashCommand.sourceInfo,
+			},
+		],
+	};
+	readonly promptTemplates: RpcSlashCommand[] = [];
+	readonly resourceLoader = { getSkills: () => ({ skills: [] }) };
+	readonly model = model;
+	readonly thinkingLevel = "high";
+	readonly isStreaming = false;
+	readonly isCompacting = false;
+	readonly steeringMode = "one-at-a-time";
+	readonly followUpMode = "all";
+	readonly sessionFile = "/tmp/pi-ts-rpc/session.jsonl";
+	readonly sessionId = "sess_fixture_1";
+	readonly sessionName: string;
+	readonly autoCompactionEnabled = true;
+	readonly messages = [userMessage, assistantText, toolResult];
+	readonly pendingMessageCount = 2;
+
+	constructor(scenario: RuntimeScenario) {
+		this.scenario = scenario;
+		this.sessionName = scenario.startsWith("framing") ? framingSessionState.sessionName : sessionState.sessionName;
+	}
+
+	async bindExtensions(options: BindExtensionsOptions): Promise<void> {
+		if (this.scenario !== "extension-ui") return;
+		void options.uiContext.select("Choose fixture", ["option-a", "option-b"], { timeout: 1000 });
+		void options.uiContext.confirm("Confirm fixture", "Proceed?", { timeout: 1000 });
+		void options.uiContext.input("Fixture input", "value", { timeout: 1000 });
+		options.uiContext.notify("Fixture notice", "info");
+		options.uiContext.setStatus("fixture", "ready");
+		options.uiContext.setWidget("fixture", ["line one", "line two"], { placement: "aboveEditor" });
+		options.uiContext.setTitle("Fixture Title");
+		options.uiContext.setEditorText("fixture editor text");
+		void options.uiContext.editor("Edit fixture", "prefill");
+	}
+
+	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
+		if (this.scenario === "events-base-stream") {
+			emitBaseStreamScenario(listener);
+		} else if (this.scenario === "events-thinking-tool-usage") {
+			emitThinkingToolUsageScenario(listener);
+		} else if (this.scenario === "events-session-extras") {
+			emitSessionExtrasScenario(listener);
+		}
+		return () => {};
+	}
+
+	async prompt(_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }): Promise<void> {
+		options?.preflightResult?.(true);
+	}
+
+	async steer(_message: string, _images?: unknown): Promise<void> {}
+	async followUp(_message: string, _images?: unknown): Promise<void> {}
+	async abort(): Promise<void> {}
+	async setModel(_nextModel: Model<"anthropic-messages">): Promise<void> {}
+	cycleModel(): null {
+		return null;
+	}
+	setThinkingLevel(_level: string): void {}
+	cycleThinkingLevel(): null {
+		return null;
+	}
+	setSteeringMode(_mode: "all" | "one-at-a-time"): void {}
+	setFollowUpMode(_mode: "all" | "one-at-a-time"): void {}
+	async compact(_customInstructions?: string): Promise<object> {
+		return {
+			summary: "Compacted fixture history.",
+			firstKeptEntryId: "entry_fixture_2",
+			tokensBefore: 1234,
+			details: { strategy: "faux" },
+		};
+	}
+	setAutoCompactionEnabled(_enabled: boolean): void {}
+	setAutoRetryEnabled(_enabled: boolean): void {}
+	abortRetry(): void {}
+	async executeBash(command: string): Promise<object> {
+		if (command === "throw") {
+			throw new Error("Command fixture failure");
+		}
+		return {
+			output: "fixture\n",
+			exitCode: 0,
+			cancelled: false,
+			truncated: true,
+			fullOutputPath: "/tmp/pi-ts-rpc/full-output.txt",
+		};
+	}
+	abortBash(): void {}
+	getSessionStats(): object {
+		return {
+			sessionFile: "/tmp/pi-ts-rpc/session.jsonl",
+			sessionId: "sess_fixture_1",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 1,
+			toolResults: 1,
+			totalMessages: 3,
+			tokens: { input: 11, output: 22, cacheRead: 3, cacheWrite: 4, total: 40 },
+			cost: 0.0066,
+			contextUsage: { used: 40, available: 200000, percentage: 0.02 },
+		};
+	}
+	async exportToHtml(_outputPath?: string): Promise<string> {
+		return "/tmp/pi-ts-rpc/export.html";
+	}
+	getUserMessagesForForking(): Array<{ entryId: string; text: string }> {
+		return [{ entryId: "entry_fixture_1", text: "Plan with deterministic fixtures" }];
+	}
+	getLastAssistantText(): string {
+		return "Fixtures captured.";
+	}
+	setSessionName(_name: string): void {}
+}
+
+class FixtureRuntimeHost {
+	session: FixtureSession;
+	private readonly scenario: RuntimeScenario;
+
+	constructor(scenario: RuntimeScenario) {
+		this.scenario = scenario;
+		this.session = new FixtureSession(scenario);
+	}
+
+	setRebindSession(_rebind: () => Promise<void>): void {}
+
+	async newSession(_options?: object): Promise<{ cancelled: boolean }> {
+		this.session = new FixtureSession(this.scenario);
+		return { cancelled: false };
+	}
+
+	async switchSession(_sessionPath: string): Promise<{ cancelled: boolean }> {
+		this.session = new FixtureSession(this.scenario);
+		return { cancelled: false };
+	}
+
+	async fork(_entryId: string, _options?: object): Promise<{ selectedText: string; cancelled: boolean }> {
+		return { selectedText: "selected fixture text", cancelled: false };
+	}
+
+	async dispose(): Promise<void> {
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+async function runRuntimeChild(scenario: RuntimeScenario): Promise<never> {
+	const runtimeHost = new FixtureRuntimeHost(scenario) as unknown as AgentSessionRuntime;
+	return runRpcMode(runtimeHost);
+}
 
 async function buildFixtures(): Promise<FixtureFile[]> {
 	const lfLines = await collectJsonlReaderLines([Buffer.from('{"case":"lf-a"}\n{"case":"lf-b"}\n')]);
 	const crlfLines = await collectJsonlReaderLines([Buffer.from('{"case":"crlf-a"}\r\n{"case":"crlf-b"}\r\n')]);
 	const finalLine = await collectJsonlReaderLines([Buffer.from('{"case":"final-no-lf"}')]);
-	const framingRecords = [
-		{ case: "serialize-unicode-separators", bytes: serializeJsonLine({ text: "a\u2028b\u2029c" }) },
-		...lfLines.map((line, index) => ({ case: "lf-input", index, line })),
-		...crlfLines.map((line, index) => ({ case: "crlf-input", index, line })),
-		...finalLine.map((line, index) => ({ case: "final-unterminated-input", index, line })),
-		{ case: "parse-error-output", response: parseErrorResponse("") },
-	];
+	const framingReaderObservations = jsonl([
+		...lfLines.map((line, index) => ({ case: "lf-input-reader", index, line })),
+		...crlfLines.map((line, index) => ({ case: "crlf-input-reader", index, line })),
+		...finalLine.map((line, index) => ({ case: "final-unterminated-input-reader", index, line })),
+	]);
+	const runtimeFramingBytes = [
+		captureRuntimeStdout("framing-lf", {
+			input: jsonl([
+				{ id: "framing_lf_a", type: "get_state" },
+				{ id: "framing_lf_b", type: "get_state" },
+			]),
+		}),
+		captureRuntimeStdout("framing-crlf", {
+			input: '{"id":"framing_crlf_a","type":"get_state"}\r\n{"id":"framing_crlf_b","type":"get_state"}\r\n',
+		}),
+		captureRuntimeStdout("framing-final", {
+			input: '{"id":"framing_final","type":"get_state"}',
+		}),
+		captureRuntimeStdout("framing-parse", { input: "{bad\n" }),
+	].join("");
 
+	const extensionUiResponseInputBytes = jsonl(extensionUiResponses);
 	const files: FixtureFile[] = [
 		{
 			path: "commands-input.jsonl",
@@ -474,39 +669,40 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 		},
 		{
 			path: "jsonl-framing.jsonl",
-			description: "Strict JSONL serialization plus LF, CRLF, and final unterminated input reader observations.",
-			bytes: jsonl(framingRecords),
+			description: "Strict JSONL reader observations plus runRpcMode stdout bytes for LF, CRLF, parse-error, and final unterminated input.",
+			bytes: framingReaderObservations + runtimeFramingBytes,
 		},
 		{
 			path: "responses-basic.jsonl",
-			description: "Success, success-with-data, null data, command errors, parse error, and unknown-command quirk responses.",
-			bytes: jsonl(responses),
+			description: "runRpcMode stdout bytes for success, success-with-data, null data, command errors, parse error, and unknown-command quirk responses.",
+			bytes: captureRuntimeStdout("responses-basic", { input: responseScenarioInput }),
 		},
 		{
 			path: "events-base-stream.jsonl",
-			description: "Base deterministic faux prompt event stream envelopes.",
-			bytes: jsonl(baseEvents),
+			description: "runRpcMode stdout bytes for base deterministic faux prompt event stream envelopes emitted via AgentSession.subscribe.",
+			bytes: captureRuntimeStdout("events-base-stream"),
 		},
 		{
 			path: "events-thinking-tool-usage.jsonl",
-			description: "Thinking, tool call, tool execution, usage, details, and stop reason event shapes.",
-			bytes: jsonl(thinkingAndToolEvents),
+			description: "runRpcMode stdout bytes for thinking, tool call, tool execution, usage, details, and stop reason event shapes emitted via AgentSession.subscribe.",
+			bytes: captureRuntimeStdout("events-thinking-tool-usage"),
 		},
 		{
 			path: "events-session-extras.jsonl",
-			description: "Session-level queue, compaction, retry, and session info events forwarded by TS RPC mode.",
-			bytes: jsonl(sessionEvents),
+			description: "runRpcMode stdout bytes for session-level queue, compaction, retry, and session info events emitted via AgentSession.subscribe.",
+			bytes: captureRuntimeStdout("events-session-extras"),
 		},
 		{
 			path: "extension-ui.jsonl",
-			description: "Extension UI request methods and response commands with deterministic request ids.",
-			bytes: jsonl([...extensionUiRequests, ...extensionUiResponses]),
+			description: "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
+			bytes: captureRuntimeStdout("extension-ui") + extensionUiResponseInputBytes,
 		},
 	];
 
 	const manifest = {
 		generatedBy: "zig/test/generate-ts-rpc-fixtures.ts",
 		compatibilityTarget: "packages/coding-agent TypeScript RPC mode",
+		captureMethod,
 		sourceCitations,
 		files: files.map(({ path, description, bytes }) => ({
 			path,
@@ -518,7 +714,7 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 
 	files.push({
 		path: "manifest.json",
-		description: "Fixture inventory and TS source citations.",
+		description: "Fixture inventory, runtime capture method, and TS source citations.",
 		bytes: `${JSON.stringify(manifest, null, "\t")}\n`,
 	});
 
@@ -539,30 +735,36 @@ function checkFile(path: string, expected: string): boolean {
 	return true;
 }
 
-const files = await buildFixtures();
+const scenario = runtimeChildArg?.slice("--runtime-child=".length) as RuntimeScenario | undefined;
 
-if (checkMode) {
-	const expectedPaths = new Set(files.map((file) => file.path));
-	let ok = true;
-	if (existsSync(fixtureDir)) {
-		for (const existing of readdirSync(fixtureDir)) {
-			if (!expectedPaths.has(existing)) {
-				console.error(`Unexpected fixture: ${relative(process.cwd(), join(fixtureDir, existing))}`);
-				ok = false;
+if (scenario) {
+	await runRuntimeChild(scenario);
+} else {
+	const files = await buildFixtures();
+
+	if (checkMode) {
+		const expectedPaths = new Set(files.map((file) => file.path));
+		let ok = true;
+		if (existsSync(fixtureDir)) {
+			for (const existing of readdirSync(fixtureDir)) {
+				if (!expectedPaths.has(existing)) {
+					console.error(`Unexpected fixture: ${relative(process.cwd(), join(fixtureDir, existing))}`);
+					ok = false;
+				}
 			}
 		}
+		for (const file of files) {
+			ok = checkFile(file.path, file.bytes) && ok;
+		}
+		if (!ok) {
+			process.exit(1);
+		}
+		console.log(`TS RPC fixtures are up to date in ${relative(process.cwd(), fixtureDir)}`);
+	} else {
+		mkdirSync(fixtureDir, { recursive: true });
+		for (const file of files) {
+			writeFileSync(join(fixtureDir, file.path), file.bytes);
+		}
+		console.log(`Wrote ${files.length} TS RPC fixture files to ${relative(process.cwd(), fixtureDir)}`);
 	}
-	for (const file of files) {
-		ok = checkFile(file.path, file.bytes) && ok;
-	}
-	if (!ok) {
-		process.exit(1);
-	}
-	console.log(`TS RPC fixtures are up to date in ${relative(process.cwd(), fixtureDir)}`);
-} else {
-	mkdirSync(fixtureDir, { recursive: true });
-	for (const file of files) {
-		writeFileSync(join(fixtureDir, file.path), file.bytes);
-	}
-	console.log(`Wrote ${files.length} TS RPC fixture files to ${relative(process.cwd(), fixtureDir)}`);
 }
