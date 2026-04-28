@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("tools/common.zig");
 
 pub const HOST_MARKER_ENV = "PI_M6_EXTENSION_HOST_MARKER";
 
@@ -260,6 +261,14 @@ pub const ProtocolState = struct {
         return self.pending_request_ids.count();
     }
 
+    pub fn resolvePendingRequest(self: *ProtocolState, id: []const u8) bool {
+        if (self.pending_request_ids.fetchRemove(id)) |removed| {
+            self.allocator.free(removed.key);
+            return true;
+        }
+        return false;
+    }
+
     fn addDiagnostic(self: *ProtocolState, category: DiagnosticCategory, severity: DiagnosticSeverity, message: []const u8) !void {
         try self.diagnostics.append(self.allocator, .{
             .category = category,
@@ -419,6 +428,30 @@ pub const HostProcess = struct {
         return self.state.shutdown_complete_seen;
     }
 
+    pub fn takeUiRequests(self: *HostProcess, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const requests = try allocator.alloc(ExtensionUiRequest, self.state.ui_requests.items.len);
+        errdefer allocator.free(requests);
+        for (self.state.ui_requests.items, 0..) |request, index| {
+            requests[index] = try ExtensionUiRequest.clone(allocator, request);
+        }
+        for (self.state.ui_requests.items) |*request| request.deinit(self.allocator);
+        self.state.ui_requests.clearRetainingCapacity();
+        return requests;
+    }
+
+    pub fn sendExtensionUiResponse(self: *HostProcess, id: []const u8, payload_json: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.state.resolvePendingRequest(id)) return;
+        const file = self.stdin_file orelse return;
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try writeExtensionUiResponseFrame(self.allocator, &out.writer, id, payload_json);
+        try file.writeStreamingAll(self.io, out.written());
+    }
+
     fn sendInitialize(self: *HostProcess, initialize: InitializeFrame) !void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
@@ -522,7 +555,7 @@ fn parseObjectMessage(allocator: std.mem.Allocator, object: std.json.ObjectMap) 
     if (std.mem.eql(u8, type_name, "extension_ui_request")) {
         const id = optionalString(object, "id") orelse return error.UnsupportedHostMessageType;
         const method = optionalString(object, "method") orelse return error.UnsupportedHostMessageType;
-        const payload_json = try allocator.dupe(u8, "{}");
+        const payload_json = try extensionUiPayloadJson(allocator, object);
         errdefer allocator.free(payload_json);
         return .{ .extension_ui_request = .{
             .id = try allocator.dupe(u8, id),
@@ -532,6 +565,36 @@ fn parseObjectMessage(allocator: std.mem.Allocator, object: std.json.ObjectMap) 
         } };
     }
     return error.UnsupportedHostMessageType;
+}
+
+fn extensionUiPayloadJson(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]u8 {
+    if (object.get("payload")) |payload| {
+        if (payload == .object) {
+            return try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        }
+    }
+
+    var payload = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const payload_value = std.json.Value{ .object = payload };
+        common.deinitJsonValue(allocator, payload_value);
+    }
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "type") or
+            std.mem.eql(u8, entry.key_ptr.*, "id") or
+            std.mem.eql(u8, entry.key_ptr.*, "method") or
+            std.mem.eql(u8, entry.key_ptr.*, "responseRequired"))
+        {
+            continue;
+        }
+        try payload.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try common.cloneJsonValue(allocator, entry.value_ptr.*));
+    }
+    const payload_value = std.json.Value{ .object = payload };
+    defer {
+        common.deinitJsonValue(allocator, payload_value);
+    }
+    return try std.json.Stringify.valueAlloc(allocator, payload_value, .{});
 }
 
 fn parseDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, default_severity: DiagnosticSeverity) !Diagnostic {
