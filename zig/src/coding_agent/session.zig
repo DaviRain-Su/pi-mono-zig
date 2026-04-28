@@ -92,6 +92,17 @@ pub const AgentSession = struct {
         retry: RetrySettings = .{},
     };
 
+    pub const ManagedOptions = struct {
+        cwd: []const u8,
+        system_prompt: []const u8 = "",
+        model: ?ai.Model = null,
+        api_key: ?[]const u8 = null,
+        thinking_level: agent.ThinkingLevel = .off,
+        tools: []const agent.AgentTool = &.{},
+        compaction: CompactionSettings = .{},
+        retry: RetrySettings = .{},
+    };
+
     pub fn create(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -142,6 +153,29 @@ pub const AgentSession = struct {
             allocator,
             io,
             effective_cwd,
+            options.system_prompt,
+            options.model,
+            options.api_key,
+            options.thinking_level,
+            options.tools,
+            options.compaction,
+            options.retry,
+            manager,
+        );
+    }
+
+    /// Takes ownership of `manager`. Caller must destroy the manager pointer if
+    /// this function returns an error.
+    pub fn createWithManager(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        manager: *session_manager.SessionManager,
+        options: ManagedOptions,
+    ) !AgentSession {
+        return initWithManager(
+            allocator,
+            io,
+            options.cwd,
             options.system_prompt,
             options.model,
             options.api_key,
