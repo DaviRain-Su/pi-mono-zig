@@ -6,6 +6,11 @@ pub const AgentToolCall = ai.ToolCall;
 pub const ToolResultMessage = ai.types.ToolResultMessage;
 
 pub fn nowMilliseconds() i64 {
+    if (std.c.getenv("PI_FIXED_NOW_MS")) |value| {
+        if (std.fmt.parseInt(i64, std.mem.span(value), 10)) |fixed_now_ms| {
+            return fixed_now_ms;
+        } else |_| {}
+    }
     var now: std.c.timeval = undefined;
     _ = std.c.gettimeofday(&now, null);
     return @as(i64, @intCast(now.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(now.usec)), std.time.us_per_ms);

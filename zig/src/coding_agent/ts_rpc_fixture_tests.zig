@@ -14,6 +14,16 @@ const fixture_files = [_][]const u8{
     "prompt-concurrency-queue-order.jsonl",
     "bash-control.jsonl",
     "extension-ui.jsonl",
+    "m5-simple-prompt.input.jsonl",
+    "m5-simple-prompt.jsonl",
+    "m5-thinking.input.jsonl",
+    "m5-thinking.jsonl",
+    "m5-tool.input.jsonl",
+    "m5-tool.jsonl",
+    "m5-compaction.input.jsonl",
+    "m5-compaction.jsonl",
+    "m5-retry.input.jsonl",
+    "m5-retry.jsonl",
 };
 
 fn readFixture(comptime name: []const u8) ![]u8 {
@@ -234,6 +244,39 @@ test "TS RPC prompt concurrency fixture captures queue ordering and streamingBeh
             "{\"id\":\"pc_follow\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n",
         bytes,
     );
+}
+
+test "TS RPC M5 production parity fixtures cover every required scenario" {
+    const simple = try readFixture("m5-simple-prompt.jsonl");
+    defer std.testing.allocator.free(simple);
+    try expectContains(simple, "{\"id\":\"simple_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectContains(simple, "\"type\":\"text_delta\"");
+    try expectContains(simple, "\"type\":\"agent_end\"");
+
+    const thinking = try readFixture("m5-thinking.jsonl");
+    defer std.testing.allocator.free(thinking);
+    try expectContains(thinking, "\"type\":\"thinking_start\"");
+    try expectContains(thinking, "\"type\":\"thinking_delta\"");
+    try expectContains(thinking, "\"type\":\"thinking_end\"");
+
+    const tool = try readFixture("m5-tool.jsonl");
+    defer std.testing.allocator.free(tool);
+    try expectContains(tool, "\"type\":\"toolcall_start\"");
+    try expectContains(tool, "\"type\":\"toolcall_delta\"");
+    try expectContains(tool, "\"type\":\"toolcall_end\"");
+    try expectContains(tool, "\"type\":\"tool_execution_start\"");
+    try expectContains(tool, "\"type\":\"tool_execution_end\"");
+    try expectContains(tool, "\"timestamp\":1766880000008");
+
+    const compaction = try readFixture("m5-compaction.jsonl");
+    defer std.testing.allocator.free(compaction);
+    try expectContains(compaction, "{\"type\":\"compaction_start\",\"reason\":\"manual\"}\n");
+    try expectContains(compaction, "\"command\":\"compact\"");
+
+    const retry = try readFixture("m5-retry.jsonl");
+    defer std.testing.allocator.free(retry);
+    try expectContains(retry, "\"command\":\"set_auto_retry\"");
+    try expectContains(retry, "\"type\":\"auto_retry_start\"");
 }
 
 test "TS RPC production and test code do not contain fixture bypass symbols" {
