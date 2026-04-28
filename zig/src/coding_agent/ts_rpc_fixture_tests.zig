@@ -78,6 +78,26 @@ test "TS RPC response fixtures preserve parse and unknown-command quirks" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"id\":\"mystery") == null);
 }
 
+test "TS RPC M3 fixtures cover remaining control response and event shapes" {
+    const responses = try readFixture("responses-basic.jsonl");
+    defer std.testing.allocator.free(responses);
+    try expectContains(responses, "\"command\":\"cycle_model\",\"success\":true,\"data\":null");
+    try expectContains(responses, "\"command\":\"get_available_models\",\"success\":true,\"data\":{\"models\":[");
+    try expectContains(responses, "\"command\":\"compact\",\"success\":true,\"data\":{\"summary\":");
+    try expectContains(responses, "\"command\":\"bash\",\"success\":true,\"data\":{\"output\":");
+    try expectContains(responses, "\"command\":\"export_html\",\"success\":true,\"data\":{\"path\":");
+    try expectContains(responses, "\"command\":\"set_model\",\"success\":false,\"error\":\"Model not found:");
+    try expectContains(responses, "\"command\":\"fork\",\"success\":true,\"data\":{\"text\":");
+
+    const events = try readFixture("events-session-extras.jsonl");
+    defer std.testing.allocator.free(events);
+    try expectContains(events, "{\"type\":\"compaction_start\",\"reason\":\"manual\"}");
+    try expectContains(events, "\"type\":\"compaction_end\",\"reason\":\"manual\",\"result\":");
+    try expectContains(events, "{\"type\":\"session_info_changed\",\"name\":");
+    try expectContains(events, "{\"type\":\"auto_retry_start\",\"attempt\":");
+    try expectContains(events, "{\"type\":\"auto_retry_end\",\"success\":");
+}
+
 test "TS RPC parse-error fixtures cover multiple TypeScript JSON.parse messages" {
     const bytes = try readFixture("parse-errors.jsonl");
     defer std.testing.allocator.free(bytes);
