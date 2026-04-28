@@ -32,9 +32,15 @@
 		},
 		{
 			"path": "parse-errors.jsonl",
-			"description": "Node JSON.parse-derived runRpcMode stdout bytes for whitespace, unterminated, invalid-token, trailing-comma object, and malformed array inputs.",
-			"byteLength": 684,
-			"lineCount": 5
+			"description": "Node JSON.parse-derived runRpcMode stdout bytes for the malformed JSONL corpus.",
+			"byteLength": 2582,
+			"lineCount": 18
+		},
+		{
+			"path": "parse-error-corpus.jsonl",
+			"description": "Malformed JSONL corpus inputs and their exact Node JSON.parse-derived runRpcMode output bytes.",
+			"byteLength": 3978,
+			"lineCount": 18
 		},
 		{
 			"path": "responses-basic.jsonl",

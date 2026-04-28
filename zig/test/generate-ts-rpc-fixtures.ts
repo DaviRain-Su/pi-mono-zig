@@ -53,6 +53,7 @@ type RuntimeScenario =
 	| "framing-crlf"
 	| "framing-final"
 	| "framing-parse"
+	| "parse-error-corpus"
 	| "events-base-stream"
 	| "events-thinking-tool-usage"
 	| "events-session-extras"
@@ -324,6 +325,40 @@ const responseScenarioInput = jsonl([
 	{ id: "resp_set_model_error", type: "set_model", provider: "anthropic", modelId: "missing-model" },
 	{ id: "resp_thrown", type: "bash", command: "throw" },
 ]) + "{not json\n" + serializeJsonLine({ id: "mystery", type: "mystery_command" });
+
+const parseErrorCorpus = [
+	{ name: "empty", input: "" },
+	{ name: "whitespace", input: "   \t" },
+	{ name: "unterminated-object-open", input: "{" },
+	{ name: "unterminated-object-value", input: '{"type":' },
+	{ name: "unterminated-array-open", input: "[" },
+	{ name: "unterminated-array-comma", input: "[1," },
+	{ name: "unterminated-string", input: '"unterminated' },
+	{ name: "invalid-literal", input: "not-json" },
+	{ name: "invalid-literal-short", input: "tru" },
+	{ name: "trailing-comma-object", input: '{"type":"get_state",}' },
+	{ name: "trailing-comma-array", input: "[1,]" },
+	{ name: "extra-tokens-after-primitive", input: "1 2" },
+	{ name: "extra-tokens-after-object", input: "{} {}" },
+	{ name: "extra-tokens-after-array", input: "[] []" },
+	{ name: "missing-colon", input: '{"a" 1}' },
+	{ name: "bad-property-name", input: "{foo:1}" },
+	{ name: "invalid-value-token", input: '{"a":#}' },
+	{ name: "malformed-unicode-escape", input: '"\\u12G4"' },
+] as const;
+
+function buildParseErrorCorpusFixtures(): { outputs: string; corpus: string } {
+	const inputBytes = parseErrorCorpus.map((entry) => `${entry.input}\n`).join("");
+	const outputs = captureRuntimeStdout("parse-error-corpus", { input: inputBytes });
+	const outputLines = outputs.split("\n").filter((line) => line.length > 0);
+	if (outputLines.length !== parseErrorCorpus.length) {
+		throw new Error(`Expected ${parseErrorCorpus.length} parse-error outputs, got ${outputLines.length}`);
+	}
+	return {
+		outputs,
+		corpus: jsonl(parseErrorCorpus.map((entry, index) => ({ ...entry, output: `${outputLines[index]}\n` }))),
+	};
+}
 
 function emitBaseStreamScenario(emit: (event: AgentSessionEvent) => void): void {
 	emit({ type: "agent_start" } satisfies AgentEvent);
@@ -636,6 +671,7 @@ async function runRuntimeChild(scenario: RuntimeScenario): Promise<never> {
 }
 
 async function buildFixtures(): Promise<FixtureFile[]> {
+	const parseErrorFixtures = buildParseErrorCorpusFixtures();
 	const lfLines = await collectJsonlReaderLines([Buffer.from('{"case":"lf-a"}\n{"case":"lf-b"}\n')]);
 	const crlfLines = await collectJsonlReaderLines([Buffer.from('{"case":"crlf-a"}\r\n{"case":"crlf-b"}\r\n')]);
 	const finalLine = await collectJsonlReaderLines([Buffer.from('{"case":"final-no-lf"}')]);
@@ -671,6 +707,16 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			path: "jsonl-framing.jsonl",
 			description: "Strict JSONL reader observations plus runRpcMode stdout bytes for LF, CRLF, parse-error, and final unterminated input.",
 			bytes: framingReaderObservations + runtimeFramingBytes,
+		},
+		{
+			path: "parse-errors.jsonl",
+			description: "Node JSON.parse-derived runRpcMode stdout bytes for the malformed JSONL corpus.",
+			bytes: parseErrorFixtures.outputs,
+		},
+		{
+			path: "parse-error-corpus.jsonl",
+			description: "Malformed JSONL corpus inputs and their exact Node JSON.parse-derived runRpcMode output bytes.",
+			bytes: parseErrorFixtures.corpus,
 		},
 		{
 			path: "responses-basic.jsonl",
