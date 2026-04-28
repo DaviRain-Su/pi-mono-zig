@@ -1,0 +1,7 @@
+{"case":"serialize-unicode-separators","bytes":"{\"text\":\"a b c\"}\n"}
+{"case":"lf-input","index":0,"line":"{\"case\":\"lf-a\"}"}
+{"case":"lf-input","index":1,"line":"{\"case\":\"lf-b\"}"}
+{"case":"crlf-input","index":0,"line":"{\"case\":\"crlf-a\"}"}
+{"case":"crlf-input","index":1,"line":"{\"case\":\"crlf-b\"}"}
+{"case":"final-unterminated-input","index":0,"line":"{\"case\":\"final-no-lf\"}"}
+{"case":"parse-error-output","response":{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}}

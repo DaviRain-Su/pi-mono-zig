@@ -1,0 +1,6 @@
+{"type":"queue_update","steering":["steer one"],"followUp":["follow one","follow two"]}
+{"type":"compaction_start","reason":"manual"}
+{"type":"session_info_changed","name":"fixture session"}
+{"type":"compaction_end","reason":"manual","result":{"summary":"Compacted fixture history.","firstKeptEntryId":"entry_fixture_2","tokensBefore":1234,"details":{"strategy":"faux"}},"aborted":false,"willRetry":false}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":250,"errorMessage":"transient fixture error"}
+{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"fixture retry exhausted"}
