@@ -146,6 +146,11 @@ pub const PendingMessagesFn = *const fn (
     context: ?*anyopaque,
 ) anyerror![]AgentMessage;
 
+pub const PromptAcceptedCallback = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (context: ?*anyopaque) anyerror!void,
+};
+
 pub const AgentLoopConfig = struct {
     model: ai.Model,
     api_key: ?[]const u8 = null,

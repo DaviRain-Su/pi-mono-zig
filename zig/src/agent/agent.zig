@@ -443,21 +443,29 @@ pub const Agent = struct {
     }
 
     pub fn prompt(self: *Agent, input: anytype) !void {
+        return self.promptWithAcceptedCallback(input, null);
+    }
+
+    pub fn promptWithAcceptedCallback(
+        self: *Agent,
+        input: anytype,
+        accepted_callback: ?types.PromptAcceptedCallback,
+    ) !void {
         const Input = @TypeOf(input);
         if (comptime isStringLike(Input)) {
-            return self.promptTextWithImages(input, &.{});
+            return self.promptTextWithImages(input, &.{}, accepted_callback);
         }
 
         if (Input == types.AgentMessage) {
-            return self.promptSingleMessage(input);
+            return self.promptSingleMessage(input, accepted_callback);
         }
 
         if (comptime isAgentMessageSlice(Input)) {
-            return self.runPromptMessages(input);
+            return self.runPromptMessages(input, accepted_callback);
         }
 
         if (comptime isTextWithImagesPrompt(Input)) {
-            return self.promptTextWithImages(input.text, input.images);
+            return self.promptTextWithImages(input.text, input.images, accepted_callback);
         }
 
         @compileError("Agent.prompt supports string input, AgentMessage, []const AgentMessage, or a struct with .text and .images fields.");
@@ -465,25 +473,34 @@ pub const Agent = struct {
 
     pub fn continueRun(self: *Agent) !void {
         const prompts = [_]types.AgentMessage{};
-        try self.runPromptMessages(prompts[0..]);
+        try self.runPromptMessages(prompts[0..], null);
     }
 
-    fn promptSingleMessage(self: *Agent, message: types.AgentMessage) !void {
+    fn promptSingleMessage(
+        self: *Agent,
+        message: types.AgentMessage,
+        accepted_callback: ?types.PromptAcceptedCallback,
+    ) !void {
         const prompts = [_]types.AgentMessage{message};
-        try self.runPromptMessages(prompts[0..]);
+        try self.runPromptMessages(prompts[0..], accepted_callback);
     }
 
     fn promptTextWithImages(
         self: *Agent,
         text: []const u8,
         images: []const ai.ImageContent,
+        accepted_callback: ?types.PromptAcceptedCallback,
     ) !void {
         const prompt_message = try userMessageWithImages(std.heap.page_allocator, text, images, 0);
         const prompts = [_]types.AgentMessage{prompt_message};
-        try self.runPromptMessages(prompts[0..]);
+        try self.runPromptMessages(prompts[0..], accepted_callback);
     }
 
-    fn runPromptMessages(self: *Agent, prompts: []const types.AgentMessage) !void {
+    fn runPromptMessages(
+        self: *Agent,
+        prompts: []const types.AgentMessage,
+        accepted_callback: ?types.PromptAcceptedCallback,
+    ) !void {
         if (self.is_streaming) return error.AgentAlreadyProcessing;
         const context = self.createContextSnapshot();
         const config = self.createLoopConfig();
@@ -496,6 +513,10 @@ pub const Agent = struct {
         self.active_abort_signal = &abort_signal;
         self.run_state_mutex.unlock(self.io);
         defer self.finishRun();
+
+        if (accepted_callback) |callback| {
+            try callback.callback(callback.context);
+        }
 
         const added_messages = try agent_loop.runAgentLoop(
             arena.allocator(),
