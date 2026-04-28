@@ -385,6 +385,7 @@ pi list
 pi update                               # update pi and packages (skips pinned packages)
 pi update --extensions                  # update packages only
 pi update --self                        # update pi only
+pi update --self --force                # reinstall pi even if current
 pi update npm:@foo/pi-tools             # update one package
 pi config                               # enable/disable extensions, skills, prompts, themes
 ```
@@ -483,6 +484,7 @@ pi uninstall <source> [-l]   # Alias for remove
 pi update [source|self|pi]   # Update pi and packages (skips pinned packages)
 pi update --extensions       # Update packages only
 pi update --self             # Update pi only
+pi update --self --force     # Reinstall pi even if current
 pi update --extension <src>  # Update one package
 pi list                      # List installed packages
 pi config                    # Enable/disable package resources
