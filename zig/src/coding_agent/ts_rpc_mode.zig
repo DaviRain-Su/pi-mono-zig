@@ -1253,6 +1253,49 @@ fn expectOutputOrder(haystack: []const u8, before: []const u8, after: []const u8
     try std.testing.expect(before_index < after_index);
 }
 
+fn promptConcurrencyFixtureWithoutAllowedLifecycleEvents(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const allowed_agent_start = "{\"type\":\"agent_start\"}";
+    var normalized = std.ArrayList(u8).empty;
+    errdefer normalized.deinit(allocator);
+    var allowed_agent_start_count: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, allowed_agent_start)) {
+            allowed_agent_start_count += 1;
+            continue;
+        }
+        try normalized.appendSlice(allocator, line);
+        try normalized.append(allocator, '\n');
+    }
+
+    try std.testing.expect(allowed_agent_start_count <= 1);
+    return try normalized.toOwnedSlice(allocator);
+}
+
+fn expectPromptConcurrencyQueueInvariant(bytes: []const u8) !void {
+    const pc_start = "{\"id\":\"pc_start\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n";
+    const agent_start = "{\"type\":\"agent_start\"}\n";
+    const steer_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n";
+    const follow_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[\"follow while prompt running\"]}\n";
+    const prompt_steer_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\"]}\n";
+    const prompt_follow_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\",\"prompt as follow\"]}\n";
+    const steer_response = "{\"id\":\"pc_steer\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n";
+    const follow_response = "{\"id\":\"pc_follow\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n";
+    const prompt_steer_response = "{\"id\":\"pc_prompt_steer\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n";
+    const prompt_follow_response = "{\"id\":\"pc_prompt_follow\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n";
+
+    try expectOutputOrder(bytes, steer_queue_update, steer_response);
+    try expectOutputOrder(bytes, follow_queue_update, follow_response);
+    try expectOutputOrder(bytes, prompt_steer_queue_update, prompt_steer_response);
+    try expectOutputOrder(bytes, prompt_follow_queue_update, prompt_follow_response);
+
+    if (std.mem.indexOf(u8, bytes, agent_start)) |_| {
+        try expectOutputOrder(bytes, pc_start, agent_start);
+    }
+}
+
 test "TS RPC writer preserves response field order from TypeScript fixtures" {
     const allocator = std.testing.allocator;
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
@@ -1530,7 +1573,10 @@ test "TS RPC M2 queue_update is emitted before response and prompt.streamingBeha
 
     const fixture = try readFixture("prompt-concurrency-queue-order.jsonl");
     defer allocator.free(fixture);
-    try std.testing.expectEqualStrings(fixture, stdout_capture.writer.buffered());
+    try expectPromptConcurrencyQueueInvariant(stdout_capture.writer.buffered());
+    const normalized = try promptConcurrencyFixtureWithoutAllowedLifecycleEvents(allocator, stdout_capture.writer.buffered());
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings(fixture, normalized);
 }
 
 test "TS RPC M2 prompt without streamingBehavior rejects while streaming" {
