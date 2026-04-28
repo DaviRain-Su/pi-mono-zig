@@ -18,6 +18,8 @@ const DeferredResponsePriority = enum(u8) {
     queue_control = 2,
 };
 
+const DEFERRED_RESPONSE_FLUSH_INTERVAL_MS = 50;
+
 const DeferredResponse = struct {
     id: ?[]u8,
     command: []u8,
@@ -165,8 +167,12 @@ const TsRpcServer = struct {
     subscriber: ?agent.AgentSubscriber = null,
     prompt_tasks: std.ArrayList(*PromptTask) = .empty,
     deferred_responses: std.ArrayList(DeferredResponse) = .empty,
+    deferred_responses_mutex: std.Io.Mutex = .init,
+    deferred_flush_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    deferred_flush_thread: ?std.Thread = null,
     next_deferred_response_sequence: usize = 0,
     suppress_events: bool = false,
+    finished: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -192,9 +198,18 @@ const TsRpcServer = struct {
             };
             try session.agent.subscribe(self.subscriber.?);
         }
+        self.deferred_flush_stop.store(false, .seq_cst);
+        self.deferred_flush_thread = try std.Thread.spawn(.{}, deferredFlushMain, .{self});
     }
 
     fn finish(self: *TsRpcServer) !void {
+        if (self.finished) return;
+        self.finished = true;
+        self.deferred_flush_stop.store(true, .seq_cst);
+        if (self.deferred_flush_thread) |thread| {
+            thread.join();
+            self.deferred_flush_thread = null;
+        }
         try self.flushDeferredResponses();
         for (self.prompt_tasks.items) |task| {
             task.joinAndDestroy();
@@ -397,10 +412,10 @@ const TsRpcServer = struct {
 
         if (std.mem.eql(u8, command, "abort")) {
             const defer_response = session.isStreaming() or self.hasInFlightPrompt();
-            session.agent.abort();
             if (defer_response) {
                 try self.enqueueDeferredSuccess(id, command, .abort);
             } else {
+                session.agent.abort();
                 try self.writeSuccessResponseNoData(id, command);
             }
             return;
@@ -595,6 +610,9 @@ const TsRpcServer = struct {
         command: []const u8,
         priority: DeferredResponsePriority,
     ) !void {
+        self.deferred_responses_mutex.lockUncancelable(self.io);
+        defer self.deferred_responses_mutex.unlock(self.io);
+
         try self.deferred_responses.append(self.allocator, .{
             .id = if (id) |id_string| try self.allocator.dupe(u8, id_string) else null,
             .command = try self.allocator.dupe(u8, command),
@@ -605,15 +623,33 @@ const TsRpcServer = struct {
     }
 
     fn flushDeferredResponses(self: *TsRpcServer) !void {
+        self.deferred_responses_mutex.lockUncancelable(self.io);
+        defer self.deferred_responses_mutex.unlock(self.io);
+
         if (self.deferred_responses.items.len == 0) return;
+        var should_abort_after_flush = false;
         std.mem.sort(DeferredResponse, self.deferred_responses.items, {}, lessThanDeferredResponse);
         for (self.deferred_responses.items) |*response| {
             try self.writeSuccessResponseNoData(response.id, response.command);
+            if (std.mem.eql(u8, response.command, "abort")) {
+                should_abort_after_flush = true;
+            }
             response.deinit(self.allocator);
         }
         self.deferred_responses.clearRetainingCapacity();
+        if (should_abort_after_flush) {
+            if (self.session) |session| session.agent.abort();
+        }
     }
 };
+
+fn deferredFlushMain(server: *TsRpcServer) void {
+    while (!server.deferred_flush_stop.load(.seq_cst)) {
+        std.Io.sleep(server.io, .fromMilliseconds(DEFERRED_RESPONSE_FLUSH_INTERVAL_MS), .awake) catch {};
+        if (server.deferred_flush_stop.load(.seq_cst)) break;
+        server.flushDeferredResponses() catch {};
+    }
+}
 
 fn lessThanDeferredResponse(_: void, lhs: DeferredResponse, rhs: DeferredResponse) bool {
     if (@intFromEnum(lhs.priority) != @intFromEnum(rhs.priority)) {
@@ -1552,6 +1588,44 @@ test "TS RPC M2 abort command is processed while prompt worker is in flight" {
     try std.testing.expect(abort_response_index < agent_end_index);
 }
 
+test "TS RPC live client receives queued control responses before EOF" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m2",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+    session.agent.stream_fn = blockingUntilAbortStream;
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+
+    try server.handleLine("{\"id\":\"p\",\"type\":\"prompt\",\"message\":\"slow prompt\"}");
+    try waitForSessionStreaming(&session);
+    try std.testing.expect(session.isStreaming());
+
+    try server.handleLine("{\"id\":\"s\",\"type\":\"steer\",\"message\":\"steer while live\"}");
+    try server.handleLine("{\"id\":\"f\",\"type\":\"follow_up\",\"message\":\"follow while live\"}");
+    try server.handleLine("{\"id\":\"ps\",\"type\":\"prompt\",\"message\":\"prompt steer while live\",\"streamingBehavior\":\"steer\"}");
+    try server.handleLine("{\"id\":\"pf\",\"type\":\"prompt\",\"message\":\"prompt follow while live\",\"streamingBehavior\":\"followUp\"}");
+
+    try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"ps\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"pf\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"s\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n");
+    try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"f\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n");
+    try std.testing.expect(session.isStreaming());
+
+    try server.handleLine("{\"id\":\"a\",\"type\":\"abort\"}");
+    try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"a\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n");
+
+    try server.finish();
+}
+
 test "TS RPC M2 prompt response precedes base event stream" {
     const allocator = std.testing.allocator;
     const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
@@ -1681,6 +1755,24 @@ fn waitForSessionStreaming(session: *const session_mod.AgentSession) !void {
         std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(session.isStreaming());
+}
+
+fn waitForServerOutputContains(
+    server: *TsRpcServer,
+    writer: *std.Io.Writer,
+    needle: []const u8,
+) !void {
+    var spins: usize = 0;
+    while (spins < 1000) : (spins += 1) {
+        server.output_mutex.lockUncancelable(std.testing.io);
+        const found = std.mem.indexOf(u8, writer.buffered(), needle) != null;
+        server.output_mutex.unlock(std.testing.io);
+        if (found) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    server.output_mutex.lockUncancelable(std.testing.io);
+    defer server.output_mutex.unlock(std.testing.io);
+    try expectContains(writer.buffered(), needle);
 }
 
 fn blockingUntilAbortStream(
