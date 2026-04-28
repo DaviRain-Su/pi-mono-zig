@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 BASE_ARGS = [
@@ -69,11 +70,25 @@ SCENARIOS = [
 	),
 ]
 
+def emit_ts_fixture(name):
+	proc = subprocess.run(
+		["npx", "tsx", "test/generate-ts-rpc-fixtures.ts", f"--emit-fixture={name}"],
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		text=True,
+		check=False,
+	)
+	if proc.returncode != 0:
+		print(proc.stderr, file=sys.stderr)
+		print(f"TypeScript RPC fixture emission failed for {name}", file=sys.stderr)
+		sys.exit(proc.returncode)
+	return proc.stdout
+
 for name, env_extra, settle_seconds, label in SCENARIOS:
 	input_path = Path(f"test/golden/ts-rpc/{name}.input.jsonl")
-	expected_path = Path(f"test/golden/ts-rpc/{name}.jsonl")
 	actual_path = Path(f"/tmp/pi-ts-rpc-{name}-actual.jsonl")
 	input_bytes = input_path.read_text()
+	ts_stdout = emit_ts_fixture(f"{name}.jsonl")
 	env = os.environ.copy()
 	env.update(env_extra)
 	proc = subprocess.Popen(
@@ -96,19 +111,33 @@ for name, env_extra, settle_seconds, label in SCENARIOS:
 		print(stderr, file=sys.stderr)
 		print(f"{name} Zig ts-rpc exited {status}", file=sys.stderr)
 		sys.exit(status)
-	expected = expected_path.read_text()
-	if stdout != expected:
+	if stdout != ts_stdout:
 		actual_path.write_text(stdout)
-		print(f"{name} ({label}) stdout differs; actual written to {actual_path}", file=sys.stderr)
-		subprocess.run(["diff", "-u", str(expected_path), str(actual_path)], check=False)
+		with tempfile.NamedTemporaryFile("w", delete=False, prefix=f"pi-ts-rpc-{name}-ts-", suffix=".jsonl") as ts_file:
+			ts_file.write(ts_stdout)
+			ts_path = ts_file.name
+		print(f"{name} ({label}) stdout differs from live TypeScript RPC output; actual written to {actual_path}", file=sys.stderr)
+		subprocess.run(["diff", "-u", ts_path, str(actual_path)], check=False)
 		sys.exit(1)
-	print(f"  {label} exact byte diff passed")
+	print(f"  {label} live TS-vs-Zig exact byte diff passed")
 
 extension_response_input = (
 	'{"type":"extension_ui_response","id":"ui_select","value":"option-a"}\n'
 	'{"type":"extension_ui_response","id":"ui_confirm","confirmed":true}\n'
 	'{"type":"extension_ui_response","id":"ui_input","cancelled":true}\n'
 )
+ts_extension_response = subprocess.run(
+	["npx", "tsx", "test/generate-ts-rpc-fixtures.ts", "--runtime-child=responses-basic"],
+	input=extension_response_input,
+	text=True,
+	stdout=subprocess.PIPE,
+	stderr=subprocess.PIPE,
+	check=False,
+)
+if ts_extension_response.returncode != 0:
+	print(ts_extension_response.stderr, file=sys.stderr)
+	print(f"extension_ui_response TypeScript RPC exited {ts_extension_response.returncode}", file=sys.stderr)
+	sys.exit(ts_extension_response.returncode)
 proc = subprocess.run(
 	BASE_ARGS,
 	input=extension_response_input,
@@ -121,12 +150,20 @@ if proc.returncode != 0:
 	print(proc.stderr, file=sys.stderr)
 	print(f"extension_ui_response Zig ts-rpc exited {proc.returncode}", file=sys.stderr)
 	sys.exit(proc.returncode)
-if proc.stdout != "":
+if proc.stdout != ts_extension_response.stdout:
 	Path("/tmp/pi-ts-rpc-extension-ui-response-actual.jsonl").write_text(proc.stdout)
-	print("extension_ui_response should be consumed without stdout", file=sys.stderr)
+	Path("/tmp/pi-ts-rpc-extension-ui-response-ts.jsonl").write_text(ts_extension_response.stdout)
+	print("extension_ui_response Zig stdout differs from live TypeScript RPC stdout", file=sys.stderr)
+	subprocess.run(
+		["diff", "-u", "/tmp/pi-ts-rpc-extension-ui-response-ts.jsonl", "/tmp/pi-ts-rpc-extension-ui-response-actual.jsonl"],
+		check=False,
+	)
 	sys.exit(1)
-print("  extension UI response consumption exact byte diff passed")
+print("  extension UI response consumption live TS-vs-Zig exact byte diff passed")
 PY
+
+echo "TS-RPC parity: extension UI request writer exact byte coverage"
+zig build test-coding-agent -- --test-filter "TS RPC extension UI request writer matches TypeScript fixture bytes"
 
 echo "TS-RPC parity: direct bash exact byte diff"
 python3 <<'PY'
@@ -198,12 +235,23 @@ if status != 0:
 	print(f"Zig ts-rpc bash-control exited {status}", file=sys.stderr)
 	sys.exit(status)
 
-expected = Path("test/golden/ts-rpc/bash-control.jsonl").read_text()
-if stdout != expected:
+ts_expected = subprocess.run(
+	["npx", "tsx", "test/generate-ts-rpc-fixtures.ts", "--emit-fixture=bash-control.jsonl"],
+	stdout=subprocess.PIPE,
+	stderr=subprocess.PIPE,
+	text=True,
+	check=False,
+)
+if ts_expected.returncode != 0:
+	print(ts_expected.stderr, file=sys.stderr)
+	print(f"TypeScript RPC bash-control emission exited {ts_expected.returncode}", file=sys.stderr)
+	sys.exit(ts_expected.returncode)
+if stdout != ts_expected.stdout:
 	Path("/tmp/pi-ts-rpc-bash-control-actual.jsonl").write_text(stdout)
-	print("bash-control stdout differs from TypeScript fixture; actual written to /tmp/pi-ts-rpc-bash-control-actual.jsonl", file=sys.stderr)
+	Path("/tmp/pi-ts-rpc-bash-control-ts.jsonl").write_text(ts_expected.stdout)
+	print("bash-control stdout differs from live TypeScript RPC output; actual written to /tmp/pi-ts-rpc-bash-control-actual.jsonl", file=sys.stderr)
 	subprocess.run(
-		["diff", "-u", "test/golden/ts-rpc/bash-control.jsonl", "/tmp/pi-ts-rpc-bash-control-actual.jsonl"],
+		["diff", "-u", "/tmp/pi-ts-rpc-bash-control-ts.jsonl", "/tmp/pi-ts-rpc-bash-control-actual.jsonl"],
 		check=False,
 	)
 	sys.exit(1)
@@ -217,13 +265,13 @@ done
 
 cat <<'REPORT'
 TS-RPC parity scenarios passed:
-- simple prompt: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- streaming text: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- thinking deltas: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- tool call/result: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- direct bash: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- compaction: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- retry: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- queue steer/follow-up: current TS prompt-concurrency fixture and Zig --mode ts-rpc stdout diff passed; 20 stress iterations passed.
-- extension UI request/response: extension-ui fixture checked against current TS; Zig --mode ts-rpc consumes extension_ui_response without stdout, and request bytes are covered by Zig extension UI exact-byte tests.
+- simple prompt: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- streaming text: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- thinking deltas: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- tool call/result: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- direct bash: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- compaction: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- retry: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
+- queue steer/follow-up: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed; 20 stress iterations passed.
+- extension UI request/response: live TypeScript RPC response-consumption stdout and Zig --mode ts-rpc stdout diff passed; request bytes are generated by current TypeScript RPC and checked by Zig extension UI exact-byte tests.
 REPORT
