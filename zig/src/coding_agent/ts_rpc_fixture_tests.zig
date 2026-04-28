@@ -3,6 +3,7 @@ const std = @import("std");
 const fixture_files = [_][]const u8{
     "commands-input.jsonl",
     "jsonl-framing.jsonl",
+    "parse-errors.jsonl",
     "responses-basic.jsonl",
     "events-base-stream.jsonl",
     "events-thinking-tool-usage.jsonl",
@@ -72,6 +73,28 @@ test "TS RPC response fixtures preserve parse and unknown-command quirks" {
         "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
     );
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"id\":\"mystery") == null);
+}
+
+test "TS RPC parse-error fixtures cover multiple TypeScript JSON.parse messages" {
+    const bytes = try readFixture("parse-errors.jsonl");
+    defer std.testing.allocator.free(bytes);
+
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Unexpected end of JSON input\"}\n",
+    );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Unexpected token 'o', \\\"not-json\\\" is not valid JSON\"}\n",
+    );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Expected double-quoted property name in JSON at position 20 (line 1 column 21)\"}\n",
+    );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Unexpected token ']', \\\"[1,]\\\" is not valid JSON\"}\n",
+    );
 }
 
 test "TS RPC framing fixture captures LF CRLF final-line and Unicode separator behavior" {

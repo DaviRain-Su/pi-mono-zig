@@ -1,0 +1,5 @@
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected token 'o', \"not-json\" is not valid JSON"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Expected double-quoted property name in JSON at position 20 (line 1 column 21)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected token ']', \"[1,]\" is not valid JSON"}

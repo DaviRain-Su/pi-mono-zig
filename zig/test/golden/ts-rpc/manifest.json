@@ -31,6 +31,12 @@
 			"lineCount": 11
 		},
 		{
+			"path": "parse-errors.jsonl",
+			"description": "Node JSON.parse-derived runRpcMode stdout bytes for whitespace, unterminated, invalid-token, trailing-comma object, and malformed array inputs.",
+			"byteLength": 684,
+			"lineCount": 5
+		},
+		{
 			"path": "responses-basic.jsonl",
 			"description": "runRpcMode stdout bytes for success, success-with-data, null data, command errors, parse error, and unknown-command quirk responses.",
 			"byteLength": 4166,
