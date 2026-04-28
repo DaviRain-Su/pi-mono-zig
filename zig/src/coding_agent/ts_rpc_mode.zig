@@ -462,7 +462,7 @@ const TsRpcServer = struct {
             task.joinAndDestroy();
         }
         self.prompt_tasks.clearRetainingCapacity();
-        self.cancelAndJoinBashTask();
+        self.joinBashTask();
         self.detachFromCurrentSession();
         self.prompt_tasks.deinit(self.allocator);
         self.prompt_tasks = .empty;
@@ -561,6 +561,14 @@ const TsRpcServer = struct {
         const task = self.bash_task;
         self.bash_task = null;
         if (task) |some| some.abort();
+        self.bash_task_mutex.unlock(self.io);
+        if (task) |some| some.joinAndDestroy();
+    }
+
+    fn joinBashTask(self: *TsRpcServer) void {
+        self.bash_task_mutex.lockUncancelable(self.io);
+        const task = self.bash_task;
+        self.bash_task = null;
         self.bash_task_mutex.unlock(self.io);
         if (task) |some| some.joinAndDestroy();
     }
@@ -2487,6 +2495,7 @@ fn runTsRpcModeScript(
         try server.handleLine(line);
     }
 
+    try waitForNoActiveBashTask(&server, 30_000);
     try server.finish();
 }
 
@@ -2566,6 +2575,15 @@ fn waitForOutputContains(
         std.Io.sleep(server.io, .fromMilliseconds(5), .awake) catch {};
     }
     try expectContains(writer.buffered(), needle);
+}
+
+fn waitForNoActiveBashTask(server: *TsRpcServer, timeout_ms: u64) !void {
+    var elapsed: u64 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 5) {
+        if (!server.hasActiveBashTask()) return;
+        std.Io.sleep(server.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(!server.hasActiveBashTask());
 }
 
 fn waitForSessionRetrying(session: *const session_mod.AgentSession, timeout_ms: u64) !void {
@@ -3295,6 +3313,33 @@ test "TS RPC direct bash success matches exact BashResult fixture bytes" {
         "{\"id\":\"bash_ok\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"ok\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n",
         stdout_capture.writer.buffered(),
     );
+}
+
+test "TS RPC finish waits for active direct bash result before cleanup" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"bash_finish\",\"type\":\"bash\",\"command\":\"printf before; sleep 0.05; printf after\"}");
+    try server.finish();
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"bash_finish\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"beforeafter\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n",
+        stdout_capture.writer.buffered(),
+    );
+    try std.testing.expect(!server.hasActiveBashTask());
 }
 
 test "TS RPC direct bash failure is a successful BashResult response with exitCode" {
