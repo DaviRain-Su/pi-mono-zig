@@ -9,6 +9,7 @@ const fixture_files = [_][]const u8{
     "events-base-stream.jsonl",
     "events-thinking-tool-usage.jsonl",
     "events-session-extras.jsonl",
+    "prompt-concurrency-queue-order.input.jsonl",
     "prompt-concurrency-queue-order.jsonl",
     "extension-ui.jsonl",
 };

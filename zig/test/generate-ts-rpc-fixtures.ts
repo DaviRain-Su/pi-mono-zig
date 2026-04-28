@@ -785,6 +785,11 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			bytes: captureRuntimeStdout("events-session-extras"),
 		},
 		{
+			path: "prompt-concurrency-queue-order.input.jsonl",
+			description: "Scripted JSONL stdin for the prompt concurrency and queue-order scenario used by TS-vs-Zig exact-byte fixture diff checks.",
+			bytes: promptConcurrencyScenarioInput,
+		},
+		{
 			path: "prompt-concurrency-queue-order.jsonl",
 			description: "runRpcMode stdout bytes proving prompt stays fire-and-forget, abort can respond while a prompt promise is in flight, and steer/follow_up plus prompt.streamingBehavior emit queue_update before command responses.",
 			bytes: captureRuntimeStdout("prompt-concurrency-queue-order", { input: promptConcurrencyScenarioInput }),

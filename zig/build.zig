@@ -80,6 +80,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(external_tool_check_step);
 
+    const ts_rpc_prompt_concurrency_fixture_diff = b.addSystemCommand(&.{"bash"});
+    ts_rpc_prompt_concurrency_fixture_diff.addFileArg(b.path("test/ts-rpc-prompt-concurrency-fixture-diff.sh"));
+    ts_rpc_prompt_concurrency_fixture_diff.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&ts_rpc_prompt_concurrency_fixture_diff.step);
+
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
     });
