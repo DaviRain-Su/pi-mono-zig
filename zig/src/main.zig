@@ -120,12 +120,12 @@ fn runCliWithInput(
         return 1;
     }
 
-    if (options.mode == .rpc and options.prompt != null) {
+    if ((options.mode == .rpc or options.mode == .ts_rpc) and options.prompt != null) {
         try stderr.writeAll("Error: Prompt arguments are not supported in RPC mode\n");
         return 1;
     }
 
-    if (options.mode == .rpc and options.file_args != null) {
+    if ((options.mode == .rpc or options.mode == .ts_rpc) and options.file_args != null) {
         try stderr.writeAll("Error: @file arguments are not supported in RPC mode\n");
         return 1;
     }
@@ -220,6 +220,17 @@ fn runCliWithInput(
 
         if (app_mode == .rpc) {
             return try coding_agent.runRpcMode(
+                allocator,
+                io,
+                &session,
+                .{},
+                stdout,
+                stderr,
+            );
+        }
+
+        if (app_mode == .ts_rpc) {
+            return try coding_agent.runTsRpcMode(
                 allocator,
                 io,
                 &session,
@@ -415,7 +426,7 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc|ts-rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-builtin-tools, -nbt") != null);

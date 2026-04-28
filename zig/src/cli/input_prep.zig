@@ -36,7 +36,7 @@ pub fn stdinIsTty(io: std.Io) bool {
 }
 
 pub fn detectCliStdin(allocator: std.mem.Allocator, io: std.Io, mode: cli.Mode) !CliStdin {
-    if (mode == .rpc or stdinIsTty(io)) return .{};
+    if (mode == .rpc or mode == .ts_rpc or stdinIsTty(io)) return .{};
 
     const content = try readPipedStdin(allocator, io);
     return .{

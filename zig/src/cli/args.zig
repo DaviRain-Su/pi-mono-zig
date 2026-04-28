@@ -4,6 +4,7 @@ pub const Mode = enum {
     text,
     json,
     rpc,
+    ts_rpc,
 };
 
 pub const ThinkingLevel = enum {
@@ -286,7 +287,7 @@ pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --models <patterns>            Comma-separated model patterns for model selection
         \\  --list-models [search]         List available models and exit
         \\  --print, -p                    Non-interactive mode
-        \\  --mode <text|json|rpc>         Output mode (default: text)
+        \\  --mode <text|json|rpc|ts-rpc>  Output mode (default: text)
         \\  --tools <names>                Comma-separated tool allowlist
         \\  --no-tools                     Disable built-in tools by default
         \\  --no-builtin-tools, -nbt       Disable built-in tools by default but keep custom tools enabled
@@ -323,6 +324,7 @@ fn parseMode(value: []const u8) ?Mode {
     if (std.mem.eql(u8, value, "text")) return .text;
     if (std.mem.eql(u8, value, "json")) return .json;
     if (std.mem.eql(u8, value, "rpc")) return .rpc;
+    if (std.mem.eql(u8, value, "ts-rpc")) return .ts_rpc;
     return null;
 }
 
@@ -453,6 +455,14 @@ test "parse args supports expected CLI flags" {
     try std.testing.expectEqualStrings("ls", args.tools.?[2]);
 }
 
+test "parse args accepts TS RPC mode" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{ "--mode", "ts-rpc" });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(Mode.ts_rpc, args.mode);
+}
+
 test "parse args supports help and version" {
     const allocator = std.testing.allocator;
 
@@ -567,7 +577,7 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc|ts-rpc>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-builtin-tools, -nbt") != null);
