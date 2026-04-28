@@ -4,6 +4,7 @@ const agent = @import("agent");
 const json_event_wire = @import("json_event_wire.zig");
 const common = @import("tools/common.zig");
 const session_mod = @import("session.zig");
+const session_advanced = @import("session_advanced.zig");
 
 pub const RunTsRpcModeOptions = struct {};
 
@@ -428,6 +429,219 @@ const TsRpcServer = struct {
             return;
         }
 
+        if (std.mem.eql(u8, command, "set_model")) {
+            const provider = requiredString(object, "provider") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const model_id = requiredString(object, "modelId") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const model = ai.model_registry.getDefault().find(provider, model_id) orelse {
+                const message = try std.fmt.allocPrint(self.allocator, "Model not found: {s}/{s}", .{ provider, model_id });
+                defer self.allocator.free(message);
+                try self.writeErrorResponse(id, command, message);
+                return;
+            };
+            session.setModel(model) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const data = try self.buildModelJson(model);
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "cycle_model")) {
+            try self.writeSuccessResponseRawData(id, command, "null");
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "get_available_models")) {
+            const data = try self.buildAvailableModelsJson();
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "set_thinking_level")) {
+            const level = parseThinkingLevel(object, "level") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            session.setThinkingLevel(level) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "cycle_thinking_level")) {
+            if (!session.agent.getModel().reasoning) {
+                try self.writeSuccessResponseRawData(id, command, "null");
+                return;
+            }
+            const next_level = nextThinkingLevel(session.agent.getThinkingLevel());
+            session.setThinkingLevel(next_level) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{thinkingLevelName(next_level)});
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "set_steering_mode")) {
+            session.agent.steering_queue.mode = parseQueueMode(object, "mode") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "set_follow_up_mode")) {
+            session.agent.follow_up_queue.mode = parseQueueMode(object, "mode") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "compact")) {
+            const custom_instructions = optionalString(object, "customInstructions") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeCompactionStartEvent("manual");
+            const result = session.compact(custom_instructions) catch |err| {
+                try self.writeCompactionEndEvent("manual", null, true, false);
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const data = try self.buildCompactionResultJson(result);
+            defer self.allocator.free(data);
+            try self.writeCompactionEndEvent("manual", data, false, false);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "set_auto_compaction")) {
+            session.compaction_settings.enabled = parseRequiredBool(object, "enabled") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "set_auto_retry")) {
+            session.retry_settings.enabled = parseRequiredBool(object, "enabled") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "abort_retry")) {
+            session.retry_attempt = 0;
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "bash")) {
+            const bash_command = requiredString(object, "command") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const data = self.buildBashResultJson(session, bash_command) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "abort_bash")) {
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "get_session_stats")) {
+            const data = try self.buildSessionStatsJson(session);
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "export_html")) {
+            const output_path = optionalString(object, "outputPath") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const path = session_advanced.exportToHtml(self.allocator, self.io, session, output_path) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            defer self.allocator.free(path);
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer out.deinit();
+            try out.writer.writeAll("{\"path\":");
+            try writeJsonString(self.allocator, &out.writer, path);
+            try out.writer.writeAll("}");
+            try self.writeSuccessResponseRawData(id, command, out.written());
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "get_fork_messages")) {
+            const data = try self.buildForkMessagesJson(session);
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "get_last_assistant_text")) {
+            const text = try lastAssistantTextAlloc(self.allocator, session);
+            defer if (text) |value| self.allocator.free(value);
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer out.deinit();
+            try out.writer.writeAll("{\"text\":");
+            if (text) |value| {
+                try writeJsonString(self.allocator, &out.writer, value);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll("}");
+            try self.writeSuccessResponseRawData(id, command, out.written());
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "set_session_name")) {
+            const raw_name = requiredString(object, "name") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const name = std.mem.trim(u8, raw_name, &std.ascii.whitespace);
+            if (name.len == 0) {
+                try self.writeErrorResponse(id, command, "Session name cannot be empty");
+                return;
+            }
+            _ = session.session_manager.appendSessionInfo(name) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            try self.writeSessionInfoChangedEvent(name);
+            try self.writeSuccessResponseNoData(id, command);
+            return;
+        }
+
         if (std.mem.eql(u8, command, "get_messages")) {
             const data = try self.buildMessagesJson(session.agent.getMessages());
             defer self.allocator.free(data);
@@ -602,6 +816,179 @@ const TsRpcServer = struct {
         } };
         defer common.deinitJsonValue(self.allocator, value);
         return try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+    }
+
+    fn buildModelJson(self: *TsRpcServer, model: ai.Model) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try writeModelJson(self.allocator, &out.writer, model);
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn buildAvailableModelsJson(self: *TsRpcServer) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const registry = ai.model_registry.getDefault();
+        try out.writer.writeAll("{\"models\":[");
+        for (registry.models.items, 0..) |entry, index| {
+            if (index > 0) try out.writer.writeAll(",");
+            try writeModelJson(self.allocator, &out.writer, entry.model);
+        }
+        try out.writer.writeAll("]}");
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn buildCompactionResultJson(self: *TsRpcServer, result: session_mod.CompactionResult) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"summary\":");
+        try writeJsonString(self.allocator, &out.writer, result.summary);
+        try out.writer.writeAll(",\"firstKeptEntryId\":");
+        try writeJsonString(self.allocator, &out.writer, result.first_kept_entry_id);
+        try out.writer.print(",\"tokensBefore\":{d}", .{result.tokens_before});
+        try out.writer.writeAll("}");
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn buildSessionStatsJson(self: *TsRpcServer, session: *const session_mod.AgentSession) ![]u8 {
+        const stats = session_advanced.getSessionStats(session);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{");
+        if (stats.session_file) |session_file| {
+            try writer.writeAll("\"sessionFile\":");
+            try writeJsonString(self.allocator, writer, session_file);
+            try writer.writeAll(",");
+        }
+        try writer.writeAll("\"sessionId\":");
+        try writeJsonString(self.allocator, writer, stats.session_id);
+        try writer.print(
+            ",\"userMessages\":{d},\"assistantMessages\":{d},\"toolCalls\":{d},\"toolResults\":{d},\"totalMessages\":{d}",
+            .{ stats.user_messages, stats.assistant_messages, stats.tool_calls, stats.tool_results, stats.total_messages },
+        );
+        try writer.print(
+            ",\"tokens\":{{\"input\":{d},\"output\":{d},\"cacheRead\":{d},\"cacheWrite\":{d},\"total\":{d}}}",
+            .{ stats.tokens.input, stats.tokens.output, stats.tokens.cache_read, stats.tokens.cache_write, stats.tokens.total },
+        );
+        try writer.writeAll(",\"cost\":");
+        try writeJsonNumber(self.allocator, writer, stats.cost);
+        if (stats.context_usage) |context_usage| {
+            try writer.writeAll(",\"contextUsage\":{\"used\":");
+            if (context_usage.tokens) |tokens| {
+                try writer.print("{d}", .{tokens});
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.print(",\"available\":{d},\"percentage\":", .{context_usage.context_window});
+            if (context_usage.percent) |percent| {
+                try writeJsonNumber(self.allocator, writer, percent);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("}");
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn buildBashResultJson(self: *TsRpcServer, session: *const session_mod.AgentSession, command: []const u8) ![]u8 {
+        const argv = [_][]const u8{ "/bin/sh", "-c", command };
+        const run_result = try std.process.run(self.allocator, self.io, .{
+            .argv = argv[0..],
+            .cwd = .{ .path = session.cwd },
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+        });
+        defer self.allocator.free(run_result.stdout);
+        defer self.allocator.free(run_result.stderr);
+
+        const output = try std.mem.concat(self.allocator, u8, &[_][]const u8{ run_result.stdout, run_result.stderr });
+        defer self.allocator.free(output);
+        const exit_code = exitCodeFromTerm(run_result.term);
+
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"output\":");
+        try writeJsonString(self.allocator, &out.writer, output);
+        try out.writer.writeAll(",\"exitCode\":");
+        if (exit_code) |code| {
+            try out.writer.print("{d}", .{code});
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"cancelled\":false,\"truncated\":false}");
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn buildForkMessagesJson(self: *TsRpcServer, session: *const session_mod.AgentSession) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"messages\":[");
+        var first = true;
+        for (session.session_manager.getEntries()) |entry| {
+            switch (entry) {
+                .message => |message_entry| switch (message_entry.message) {
+                    .user => |user| {
+                        const text = try textBlocksConcat(self.allocator, user.content);
+                        defer self.allocator.free(text);
+                        if (text.len == 0) continue;
+                        if (!first) try out.writer.writeAll(",");
+                        first = false;
+                        try out.writer.writeAll("{\"entryId\":");
+                        try writeJsonString(self.allocator, &out.writer, message_entry.id);
+                        try out.writer.writeAll(",\"text\":");
+                        try writeJsonString(self.allocator, &out.writer, text);
+                        try out.writer.writeAll("}");
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        try out.writer.writeAll("]}");
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn writeCompactionStartEvent(self: *TsRpcServer, reason: []const u8) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"compaction_start\",\"reason\":");
+        try writeJsonString(self.allocator, self.stdout_writer, reason);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeCompactionEndEvent(
+        self: *TsRpcServer,
+        reason: []const u8,
+        result_json: ?[]const u8,
+        aborted: bool,
+        will_retry: bool,
+    ) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"compaction_end\",\"reason\":");
+        try writeJsonString(self.allocator, self.stdout_writer, reason);
+        if (result_json) |result| {
+            try self.stdout_writer.writeAll(",\"result\":");
+            try self.stdout_writer.writeAll(result);
+        }
+        try self.stdout_writer.writeAll(",\"aborted\":");
+        try self.stdout_writer.writeAll(if (aborted) "true" else "false");
+        try self.stdout_writer.writeAll(",\"willRetry\":");
+        try self.stdout_writer.writeAll(if (will_retry) "true" else "false");
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeSessionInfoChangedEvent(self: *TsRpcServer, name: []const u8) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+        try self.stdout_writer.writeAll("{\"type\":\"session_info_changed\",\"name\":");
+        try writeJsonString(self.allocator, self.stdout_writer, name);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
     }
 
     fn enqueueDeferredSuccess(
@@ -1013,6 +1400,51 @@ fn requiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     };
 }
 
+fn optionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |string| string,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn parseRequiredBool(object: std.json.ObjectMap, key: []const u8) !bool {
+    const value = object.get(key) orelse return error.MissingRequiredField;
+    return switch (value) {
+        .bool => |boolean| boolean,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn parseThinkingLevel(object: std.json.ObjectMap, key: []const u8) !agent.ThinkingLevel {
+    const value = try requiredString(object, key);
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return error.InvalidFieldType;
+}
+
+fn nextThinkingLevel(level: agent.ThinkingLevel) agent.ThinkingLevel {
+    return switch (level) {
+        .off => .minimal,
+        .minimal => .low,
+        .low => .medium,
+        .medium => .high,
+        .high => .xhigh,
+        .xhigh => .off,
+    };
+}
+
+fn parseQueueMode(object: std.json.ObjectMap, key: []const u8) !agent.QueueMode {
+    const value = try requiredString(object, key);
+    if (std.mem.eql(u8, value, "all")) return .all;
+    if (std.mem.eql(u8, value, "one-at-a-time")) return .one_at_a_time;
+    return error.InvalidFieldType;
+}
+
 fn parsePromptStreamingBehavior(object: std.json.ObjectMap) !?PromptStreamingBehavior {
     const value = object.get("streamingBehavior") orelse return null;
     const behavior = switch (value) {
@@ -1171,6 +1603,49 @@ fn firstTextBlock(blocks: []const ai.ContentBlock) []const u8 {
         }
     }
     return "";
+}
+
+fn textBlocksConcat(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| try out.appendSlice(allocator, text.text),
+            else => {},
+        }
+    }
+    const text = std.mem.trim(u8, out.items, &std.ascii.whitespace);
+    const owned = try allocator.dupe(u8, text);
+    out.deinit(allocator);
+    return owned;
+}
+
+fn lastAssistantTextAlloc(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) !?[]u8 {
+    const messages = session.agent.getMessages();
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        switch (messages[index]) {
+            .assistant => |assistant_message| {
+                if (assistant_message.stop_reason == .aborted and assistant_message.content.len == 0) continue;
+                const text = try textBlocksConcat(allocator, assistant_message.content);
+                if (text.len == 0) {
+                    allocator.free(text);
+                    return null;
+                }
+                return text;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => null,
+    };
 }
 
 fn runTsRpcModeScript(
@@ -1545,6 +2020,134 @@ test "TS RPC M2 steer follow_up and abort controls use TS responses and queue up
             "{\"id\":\"a\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n",
         stdout_capture.writer.buffered(),
     );
+}
+
+test "TS RPC M3 model thinking and queue controls use TS response bytes" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m3",
+        .system_prompt = "system",
+        .model = ai.model_registry.getDefault().find("faux", "faux-1").?,
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{
+            "{\"id\":\"model\",\"type\":\"set_model\",\"provider\":\"anthropic\",\"modelId\":\"claude-sonnet-4-5\"}",
+            "{\"id\":\"missing\",\"type\":\"set_model\",\"provider\":\"anthropic\",\"modelId\":\"missing-model\"}",
+            "{\"id\":\"cycle_model\",\"type\":\"cycle_model\"}",
+            "{\"id\":\"think\",\"type\":\"set_thinking_level\",\"level\":\"high\"}",
+            "{\"id\":\"cycle_think\",\"type\":\"cycle_thinking_level\"}",
+            "{\"id\":\"steer_mode\",\"type\":\"set_steering_mode\",\"mode\":\"all\"}",
+            "{\"id\":\"follow_mode\",\"type\":\"set_follow_up_mode\",\"mode\":\"one-at-a-time\"}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try expectContains(
+        stdout_capture.writer.buffered(),
+        "{\"id\":\"model\",\"type\":\"response\",\"command\":\"set_model\",\"success\":true,\"data\":{\"id\":\"claude-sonnet-4-5\",\"name\":\"Claude Sonnet 4.5\",\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"baseUrl\":\"https://api.anthropic.com/v1\",\"reasoning\":true,\"input\":[\"text\",\"image\"],\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0},\"contextWindow\":1000000,\"maxTokens\":64000}}\n",
+    );
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"missing\",\"type\":\"response\",\"command\":\"set_model\",\"success\":false,\"error\":\"Model not found: anthropic/missing-model\"}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"cycle_model\",\"type\":\"response\",\"command\":\"cycle_model\",\"success\":true,\"data\":null}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"think\",\"type\":\"response\",\"command\":\"set_thinking_level\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"cycle_think\",\"type\":\"response\",\"command\":\"cycle_thinking_level\",\"success\":true,\"data\":{\"level\":\"xhigh\"}}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"steer_mode\",\"type\":\"response\",\"command\":\"set_steering_mode\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"follow_mode\",\"type\":\"response\",\"command\":\"set_follow_up_mode\",\"success\":true}\n");
+    try std.testing.expectEqual(agent.QueueMode.all, session.agent.steering_queue.mode);
+    try std.testing.expectEqual(agent.QueueMode.one_at_a_time, session.agent.follow_up_queue.mode);
+}
+
+test "TS RPC M3 session bash retry compaction controls use TS-compatible response bytes" {
+    const allocator = std.testing.allocator;
+    const model = ai.Model{
+        .id = "fixture-model",
+        .name = "Fixture Model",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "https://example.invalid",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1000,
+        .max_tokens = 100,
+    };
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+        .model = model,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = "forkable prompt" } };
+    const assistant_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_content[0] = .{ .text = .{ .text = " assistant answer " } };
+    try session.agent.setMessages(&[_]agent.AgentMessage{
+        .{ .user = .{ .content = user_content, .timestamp = 11 } },
+        .{ .assistant = .{
+            .content = assistant_content,
+            .api = "faux",
+            .provider = "faux",
+            .model = "fixture-model",
+            .usage = .{ .input = 2, .output = 3, .cache_read = 4, .cache_write = 5, .total_tokens = 14, .cost = .{ .total = 0.012 } },
+            .stop_reason = .stop,
+            .timestamp = 12,
+        } },
+    });
+    const fork_entry_id = try session.session_manager.appendMessage(.{ .user = .{ .content = user_content, .timestamp = 11 } });
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{
+            "{\"id\":\"auto_compact\",\"type\":\"set_auto_compaction\",\"enabled\":true}",
+            "{\"id\":\"auto_retry\",\"type\":\"set_auto_retry\",\"enabled\":true}",
+            "{\"id\":\"abort_retry\",\"type\":\"abort_retry\"}",
+            "{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf rpc-bash\"}",
+            "{\"id\":\"abort_bash\",\"type\":\"abort_bash\"}",
+            "{\"id\":\"name\",\"type\":\"set_session_name\",\"name\":\"  rpc session  \"}",
+            "{\"id\":\"last\",\"type\":\"get_last_assistant_text\"}",
+            "{\"id\":\"fork_messages\",\"type\":\"get_fork_messages\"}",
+            "{\"id\":\"stats\",\"type\":\"get_session_stats\"}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    const expected_fork = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"fork_messages\",\"type\":\"response\",\"command\":\"get_fork_messages\",\"success\":true,\"data\":{{\"messages\":[{{\"entryId\":\"{s}\",\"text\":\"forkable prompt\"}}]}}}}\n",
+        .{fork_entry_id},
+    );
+    defer allocator.free(expected_fork);
+
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"auto_compact\",\"type\":\"response\",\"command\":\"set_auto_compaction\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"auto_retry\",\"type\":\"response\",\"command\":\"set_auto_retry\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"abort_retry\",\"type\":\"response\",\"command\":\"abort_retry\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"bash\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"rpc-bash\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"abort_bash\",\"type\":\"response\",\"command\":\"abort_bash\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"type\":\"session_info_changed\",\"name\":\"rpc session\"}\n{\"id\":\"name\",\"type\":\"response\",\"command\":\"set_session_name\",\"success\":true}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"last\",\"type\":\"response\",\"command\":\"get_last_assistant_text\",\"success\":true,\"data\":{\"text\":\"assistant answer\"}}\n");
+    try expectContains(stdout_capture.writer.buffered(), expected_fork);
+    try expectContains(stdout_capture.writer.buffered(), "\"command\":\"get_session_stats\",\"success\":true,\"data\":{\"sessionId\":");
+    try expectContains(stdout_capture.writer.buffered(), "\"tokens\":{\"input\":2,\"output\":3,\"cacheRead\":4,\"cacheWrite\":5,\"total\":14}");
 }
 
 test "TS RPC M2 queue_update is emitted before response and prompt.streamingBehavior queues while streaming" {
