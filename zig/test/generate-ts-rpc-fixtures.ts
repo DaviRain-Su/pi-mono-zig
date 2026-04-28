@@ -40,6 +40,8 @@ const captureMethod = {
 	framing: "feed LF, CRLF, invalid, and final unterminated stdin into runRpcMode and capture child stdout bytes",
 	events: "emit deterministic faux AgentSession events through session.subscribe inside runRpcMode and capture child stdout bytes",
 	extensionUi: "invoke the runRpcMode ExtensionUIContext from bindExtensions with deterministic crypto.randomUUID preload",
+	m6ExtensionHost:
+		"invoke the same M6 fixture interaction through runRpcMode ExtensionUIContext while scripted extension_ui_response stdin resolves dialog promises",
 };
 
 interface FixtureFile {
@@ -61,6 +63,7 @@ type RuntimeScenario =
 	| "prompt-concurrency-queue-order"
 	| "bash-control"
 	| "extension-ui"
+	| "m6-extension-host"
 	| "m5-simple-prompt"
 	| "m5-thinking"
 	| "m5-tool"
@@ -99,6 +102,7 @@ function deterministicCryptoPreload(): string {
 		"ui_title",
 		"ui_editor_text",
 		"ui_editor",
+		"ui_m6_complete",
 		"ui_extra_1",
 		"ui_extra_2",
 	];
@@ -317,6 +321,13 @@ const extensionUiResponses = [
 	{ type: "extension_ui_response", id: "ui_input", cancelled: true },
 	{ type: "extension_ui_response", id: "ui_confirm_cancelled", cancelled: true },
 ] satisfies RpcExtensionUIResponse[];
+
+const m6ExtensionHostInput = jsonl([
+	{ type: "extension_ui_response", id: "ui_confirm", confirmed: true },
+	{ type: "extension_ui_response", id: "ui_select", value: "option-b" },
+	{ type: "extension_ui_response", id: "ui_input", cancelled: true },
+	{ type: "extension_ui_response", id: "ui_editor", value: "edited text" },
+] satisfies RpcExtensionUIResponse[]);
 
 const responseScenarioInput = jsonl([
 	{ id: "resp_prompt", type: "prompt", message: "accepted prompt" },
@@ -835,6 +846,24 @@ class FixtureSession {
 	}
 
 	async bindExtensions(options: BindExtensionsOptions): Promise<void> {
+		if (this.scenario === "m6-extension-host") {
+			const selected = options.uiContext.select("Choose fixture", ["option-a", "option-b"], { timeout: 1000 });
+			const confirmed = options.uiContext.confirm("Confirm fixture", "Proceed?", { timeout: 1000 });
+			const input = options.uiContext.input("Fixture input", "value", { timeout: 1000 });
+			options.uiContext.notify("Fixture notice", "info");
+			options.uiContext.setStatus("fixture", "ready");
+			options.uiContext.setWidget("fixture", ["line one", "line two"], { placement: "aboveEditor" });
+			options.uiContext.setTitle("Fixture Title");
+			options.uiContext.setEditorText("fixture editor text");
+			const edited = options.uiContext.editor("Edit fixture", "prefill");
+			void Promise.all([selected, confirmed, input, edited]).then(([selectedValue, confirmedValue, inputValue, editedValue]) => {
+				options.uiContext.setStatus(
+					"fixture",
+					`complete:${selectedValue ?? "cancelled"}:${confirmedValue}:${inputValue ?? "cancelled"}:${editedValue ?? "cancelled"}`,
+				);
+			});
+			return;
+		}
 		if (this.scenario !== "extension-ui") return;
 		void options.uiContext.select("Choose fixture", ["option-a", "option-b"], { timeout: 1000 });
 		void options.uiContext.confirm("Confirm fixture", "Proceed?", { timeout: 1000 });
@@ -1129,6 +1158,18 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			path: "extension-ui.jsonl",
 			description: "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
 			bytes: captureRuntimeStdout("extension-ui") + extensionUiResponseInputBytes,
+		},
+		{
+			path: "m6-extension-host.input.jsonl",
+			description:
+				"Scripted out-of-order extension_ui_response stdin for the M6 extension host fixture covering confirmed, value, cancelled, and editor value variants.",
+			bytes: m6ExtensionHostInput,
+		},
+		{
+			path: "m6-extension-host.jsonl",
+			description:
+				"live runRpcMode stdout bytes for the M6 fixture extension/host UI request matrix, including fire-and-forget methods and post-response completion status.",
+			bytes: captureRuntimeStdout("m6-extension-host", { input: m6ExtensionHostInput }),
 		},
 		{
 			path: "m5-simple-prompt.input.jsonl",

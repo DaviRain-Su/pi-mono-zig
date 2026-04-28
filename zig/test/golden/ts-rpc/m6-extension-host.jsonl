@@ -1,0 +1,10 @@
+{"type":"extension_ui_request","id":"ui_select","method":"select","title":"Choose fixture","options":["option-a","option-b"],"timeout":1000}
+{"type":"extension_ui_request","id":"ui_confirm","method":"confirm","title":"Confirm fixture","message":"Proceed?","timeout":1000}
+{"type":"extension_ui_request","id":"ui_input","method":"input","title":"Fixture input","placeholder":"value","timeout":1000}
+{"type":"extension_ui_request","id":"ui_notify","method":"notify","message":"Fixture notice","notifyType":"info"}
+{"type":"extension_ui_request","id":"ui_status","method":"setStatus","statusKey":"fixture","statusText":"ready"}
+{"type":"extension_ui_request","id":"ui_widget","method":"setWidget","widgetKey":"fixture","widgetLines":["line one","line two"],"widgetPlacement":"aboveEditor"}
+{"type":"extension_ui_request","id":"ui_title","method":"setTitle","title":"Fixture Title"}
+{"type":"extension_ui_request","id":"ui_editor_text","method":"set_editor_text","text":"fixture editor text"}
+{"type":"extension_ui_request","id":"ui_editor","method":"editor","title":"Edit fixture","prefill":"prefill"}
+{"type":"extension_ui_request","id":"ui_m6_complete","method":"setStatus","statusKey":"fixture","statusText":"complete:option-b:true:cancelled:edited text"}

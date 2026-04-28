@@ -14,6 +14,8 @@ const fixture_files = [_][]const u8{
     "prompt-concurrency-queue-order.jsonl",
     "bash-control.jsonl",
     "extension-ui.jsonl",
+    "m6-extension-host.input.jsonl",
+    "m6-extension-host.jsonl",
     "m5-simple-prompt.input.jsonl",
     "m5-simple-prompt.jsonl",
     "m5-thinking.input.jsonl",
@@ -145,6 +147,34 @@ test "TS RPC M4 extension UI fixtures cover request and response variants" {
     try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}\n");
     try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}\n");
     try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm_cancelled\",\"cancelled\":true}\n");
+}
+
+test "TS RPC M6 extension host fixtures cover configured response matrix" {
+    const input = try readFixture("m6-extension-host.input.jsonl");
+    defer std.testing.allocator.free(input);
+    const bytes = try readFixture("m6-extension-host.jsonl");
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}\n" ++
+            "{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"value\":\"option-b\"}\n" ++
+            "{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}\n" ++
+            "{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"value\":\"edited text\"}\n",
+        input,
+    );
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_select\",\"method\":\"select\",\"title\":\"Choose fixture\",\"options\":[\"option-a\",\"option-b\"],\"timeout\":1000}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_confirm\",\"method\":\"confirm\",\"title\":\"Confirm fixture\",\"message\":\"Proceed?\",\"timeout\":1000}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_input\",\"method\":\"input\",\"title\":\"Fixture input\",\"placeholder\":\"value\",\"timeout\":1000}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_notify\",\"method\":\"notify\",\"message\":\"Fixture notice\",\"notifyType\":\"info\"}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_status\",\"method\":\"setStatus\",\"statusKey\":\"fixture\",\"statusText\":\"ready\"}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_widget\",\"method\":\"setWidget\",\"widgetKey\":\"fixture\",\"widgetLines\":[\"line one\",\"line two\"],\"widgetPlacement\":\"aboveEditor\"}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_title\",\"method\":\"setTitle\",\"title\":\"Fixture Title\"}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_editor_text\",\"method\":\"set_editor_text\",\"text\":\"fixture editor text\"}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_editor\",\"method\":\"editor\",\"title\":\"Edit fixture\",\"prefill\":\"prefill\"}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_request\",\"id\":\"ui_m6_complete\",\"method\":\"setStatus\",\"statusKey\":\"fixture\",\"statusText\":\"complete:option-b:true:cancelled:edited text\"}\n");
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/Users/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"pid\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "runtime") == null);
 }
 
 test "TS RPC parse-error fixtures cover multiple TypeScript JSON.parse messages" {
