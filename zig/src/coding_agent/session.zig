@@ -15,6 +15,25 @@ pub const RetrySettings = struct {
     base_delay_ms: u64 = 1000,
 };
 
+pub const RetryLifecycleEvent = union(enum) {
+    start: struct {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: []const u8,
+    },
+    end: struct {
+        success: bool,
+        attempt: u32,
+        final_error: ?[]const u8 = null,
+    },
+};
+
+pub const RetryLifecycleCallback = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (context: ?*anyopaque, event: RetryLifecycleEvent) anyerror!void,
+};
+
 pub const CompactionResult = struct {
     summary: []const u8,
     first_kept_entry_id: []const u8,
@@ -65,6 +84,9 @@ pub const AgentSession = struct {
     compaction_settings: CompactionSettings,
     retry_settings: RetrySettings,
     retry_attempt: u32,
+    retry_lifecycle_callback: ?RetryLifecycleCallback,
+    retry_abort_requested: std.atomic.Value(bool),
+    retry_delay_active: std.atomic.Value(bool),
     overflow_recovery_attempted: bool,
     compaction_active: std.atomic.Value(bool),
 
@@ -254,6 +276,22 @@ pub const AgentSession = struct {
         return try self.runCompaction(custom_instructions);
     }
 
+    pub fn setRetryLifecycleCallback(self: *AgentSession, callback: RetryLifecycleCallback) void {
+        self.retry_lifecycle_callback = callback;
+    }
+
+    pub fn clearRetryLifecycleCallback(self: *AgentSession) void {
+        self.retry_lifecycle_callback = null;
+    }
+
+    pub fn abortRetry(self: *AgentSession) void {
+        self.retry_abort_requested.store(true, .seq_cst);
+    }
+
+    pub fn isRetrying(self: *const AgentSession) bool {
+        return self.retry_delay_active.load(.seq_cst);
+    }
+
     pub fn navigateTo(self: *AgentSession, entry_id: ?[]const u8) !void {
         if (entry_id) |id| {
             try self.session_manager.branch(id);
@@ -286,6 +324,12 @@ pub const AgentSession = struct {
             };
 
             if (last_assistant.stop_reason != .error_reason) {
+                if (self.retry_attempt > 0) {
+                    try self.emitRetryLifecycleEvent(.{ .end = .{
+                        .success = true,
+                        .attempt = self.retry_attempt,
+                    } });
+                }
                 self.retry_attempt = 0;
                 self.overflow_recovery_attempted = false;
             }
@@ -332,14 +376,59 @@ pub const AgentSession = struct {
 
         self.retry_attempt += 1;
         if (self.retry_attempt > self.retry_settings.max_retries) {
+            try self.emitRetryLifecycleEvent(.{ .end = .{
+                .success = false,
+                .attempt = self.retry_attempt - 1,
+                .final_error = last_assistant.error_message,
+            } });
             self.retry_attempt = 0;
             return false;
         }
 
+        const error_message = last_assistant.error_message orelse "Unknown error";
+        const delay_ms = exponentialBackoffMs(self.retry_settings.base_delay_ms, self.retry_attempt);
+        try self.emitRetryLifecycleEvent(.{ .start = .{
+            .attempt = self.retry_attempt,
+            .max_attempts = self.retry_settings.max_retries,
+            .delay_ms = delay_ms,
+            .error_message = error_message,
+        } });
+
         _ = removeLastAssistantError(self);
-        try sleepMilliseconds(self.io, exponentialBackoffMs(self.retry_settings.base_delay_ms, self.retry_attempt));
+        const slept = try self.sleepRetryDelay(delay_ms);
+        if (!slept) {
+            const cancelled_attempt = self.retry_attempt;
+            self.retry_attempt = 0;
+            try self.emitRetryLifecycleEvent(.{ .end = .{
+                .success = false,
+                .attempt = cancelled_attempt,
+                .final_error = "Retry cancelled",
+            } });
+            return false;
+        }
         try self.agent.continueRun();
         return true;
+    }
+
+    fn emitRetryLifecycleEvent(self: *AgentSession, event: RetryLifecycleEvent) !void {
+        if (self.retry_lifecycle_callback) |callback| {
+            try callback.callback(callback.context, event);
+        }
+    }
+
+    fn sleepRetryDelay(self: *AgentSession, delay_ms: u64) !bool {
+        self.retry_abort_requested.store(false, .seq_cst);
+        self.retry_delay_active.store(true, .seq_cst);
+        defer self.retry_delay_active.store(false, .seq_cst);
+
+        var remaining = delay_ms;
+        while (remaining > 0) {
+            if (self.retry_abort_requested.load(.seq_cst)) return false;
+            const step = @min(remaining, @as(u64, 10));
+            try sleepMilliseconds(self.io, step);
+            remaining -= step;
+        }
+        return !self.retry_abort_requested.load(.seq_cst);
     }
 
     fn runCompaction(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
@@ -428,6 +517,9 @@ pub const AgentSession = struct {
             .compaction_settings = compaction_settings,
             .retry_settings = retry_settings,
             .retry_attempt = 0,
+            .retry_lifecycle_callback = null,
+            .retry_abort_requested = std.atomic.Value(bool).init(false),
+            .retry_delay_active = std.atomic.Value(bool).init(false),
             .overflow_recovery_attempted = false,
             .compaction_active = std.atomic.Value(bool).init(false),
         };
