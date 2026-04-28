@@ -703,7 +703,7 @@ fn toolResultMessagesToJsonValue(allocator: std.mem.Allocator, tool_results: []c
     return .{ .array = array };
 }
 
-fn messageToJsonValue(allocator: std.mem.Allocator, message: agent.AgentMessage) !std.json.Value {
+pub fn messageToJsonValue(allocator: std.mem.Allocator, message: agent.AgentMessage) !std.json.Value {
     return switch (message) {
         .user => |user| try userMessageToJsonValue(allocator, user),
         .assistant => |assistant| try assistantMessageToJsonValue(allocator, assistant),
