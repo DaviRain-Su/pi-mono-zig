@@ -1,0 +1,6 @@
+{"id":"pc_start","type":"prompt","message":"start slow"}
+{"id":"pc_abort","type":"abort"}
+{"id":"pc_steer","type":"steer","message":"steer while prompt running"}
+{"id":"pc_follow","type":"follow_up","message":"follow while prompt running"}
+{"id":"pc_prompt_steer","type":"prompt","message":"prompt as steer","streamingBehavior":"steer"}
+{"id":"pc_prompt_follow","type":"prompt","message":"prompt as follow","streamingBehavior":"followUp"}

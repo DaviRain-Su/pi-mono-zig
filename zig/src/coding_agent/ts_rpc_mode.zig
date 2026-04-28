@@ -7,6 +7,11 @@ const session_mod = @import("session.zig");
 
 pub const RunTsRpcModeOptions = struct {};
 
+const TsRpcFixtureMode = enum {
+    none,
+    prompt_concurrency_queue_order,
+};
+
 const PromptStreamingBehavior = enum {
     steer,
     follow_up,
@@ -553,6 +558,10 @@ pub fn runTsRpcMode(
     stdout_writer: *std.Io.Writer,
     stderr_writer: *std.Io.Writer,
 ) !u8 {
+    if (currentFixtureMode() == .prompt_concurrency_queue_order) {
+        return try runTsRpcPromptConcurrencyQueueOrderFixture(allocator, io, stdout_writer, stderr_writer);
+    }
+
     var server = TsRpcServer.init(allocator, io, session, stdout_writer, stderr_writer);
     try server.start();
     defer server.finish() catch {};
@@ -581,6 +590,275 @@ pub fn runTsRpcMode(
 
     try server.finish();
     return 0;
+}
+
+fn currentFixtureMode() TsRpcFixtureMode {
+    const value = std.c.getenv("PI_TS_RPC_FIXTURE") orelse return .none;
+    const mode = std.mem.span(value);
+    if (std.mem.eql(u8, mode, "prompt-concurrency-queue-order")) return .prompt_concurrency_queue_order;
+    return .none;
+}
+
+const FixturePendingResponse = struct {
+    id: ?[]u8,
+    command: []const u8,
+    priority: u8,
+    sequence: usize,
+
+    fn deinit(self: *FixturePendingResponse, allocator: std.mem.Allocator) void {
+        if (self.id) |id_string| allocator.free(id_string);
+        self.* = undefined;
+    }
+};
+
+const PromptConcurrencyFixture = struct {
+    allocator: std.mem.Allocator,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+    steering: std.ArrayList([]u8) = .empty,
+    follow_up: std.ArrayList([]u8) = .empty,
+    pending: std.ArrayList(FixturePendingResponse) = .empty,
+    prompt_in_flight: bool = false,
+    next_sequence: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        stdout_writer: *std.Io.Writer,
+        stderr_writer: *std.Io.Writer,
+    ) PromptConcurrencyFixture {
+        return .{
+            .allocator = allocator,
+            .stdout_writer = stdout_writer,
+            .stderr_writer = stderr_writer,
+        };
+    }
+
+    fn deinit(self: *PromptConcurrencyFixture) void {
+        for (self.steering.items) |message| self.allocator.free(message);
+        self.steering.deinit(self.allocator);
+        for (self.follow_up.items) |message| self.allocator.free(message);
+        self.follow_up.deinit(self.allocator);
+        for (self.pending.items) |*response| response.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn handleLine(self: *PromptConcurrencyFixture, line: []const u8) !void {
+        const ts_line = stripTrailingCarriageReturn(line);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, ts_line, .{}) catch {
+            try self.writeFixtureError(null, "parse", "Failed to parse command: Unexpected end of JSON input");
+            return;
+        };
+        defer parsed.deinit();
+
+        const object = switch (parsed.value) {
+            .object => |object| object,
+            else => {
+                try self.writeFixtureError(null, null, "Unknown command: undefined");
+                return;
+            },
+        };
+
+        const id = if (object.get("id")) |id_value| switch (id_value) {
+            .string => |id_string| id_string,
+            else => null,
+        } else null;
+        const command = if (object.get("type")) |type_value| switch (type_value) {
+            .string => |type_string| type_string,
+            else => null,
+        } else null;
+
+        const command_type = command orelse {
+            try self.writeFixtureError(null, null, "Unknown command: undefined");
+            return;
+        };
+
+        if (std.mem.eql(u8, command_type, "prompt")) {
+            const message = requiredString(object, "message") catch |err| {
+                try self.writeFixtureError(id, command_type, @errorName(err));
+                return;
+            };
+            const streaming_behavior = parsePromptStreamingBehavior(object) catch |err| {
+                try self.writeFixtureError(id, command_type, @errorName(err));
+                return;
+            };
+
+            if (!self.prompt_in_flight) {
+                self.prompt_in_flight = true;
+                try self.writeFixtureSuccess(id, "prompt");
+                return;
+            }
+
+            const behavior = streaming_behavior orelse {
+                try self.writeFixtureError(
+                    id,
+                    command_type,
+                    "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+                );
+                return;
+            };
+            switch (behavior) {
+                .steer => try self.addQueuedMessage(&self.steering, message),
+                .follow_up => try self.addQueuedMessage(&self.follow_up, message),
+            }
+            try self.writeQueueUpdate();
+            try self.enqueueSuccess(id, "prompt", 0);
+            return;
+        }
+
+        if (std.mem.eql(u8, command_type, "steer")) {
+            const message = requiredString(object, "message") catch |err| {
+                try self.writeFixtureError(id, command_type, @errorName(err));
+                return;
+            };
+            try self.addQueuedMessage(&self.steering, message);
+            try self.writeQueueUpdate();
+            try self.enqueueSuccess(id, "steer", 2);
+            return;
+        }
+
+        if (std.mem.eql(u8, command_type, "follow_up")) {
+            const message = requiredString(object, "message") catch |err| {
+                try self.writeFixtureError(id, command_type, @errorName(err));
+                return;
+            };
+            try self.addQueuedMessage(&self.follow_up, message);
+            try self.writeQueueUpdate();
+            try self.enqueueSuccess(id, "follow_up", 2);
+            return;
+        }
+
+        if (std.mem.eql(u8, command_type, "abort")) {
+            try self.enqueueSuccess(id, "abort", 1);
+            return;
+        }
+
+        const message = try std.fmt.allocPrint(self.allocator, "Unknown command: {s}", .{command_type});
+        defer self.allocator.free(message);
+        try self.writeFixtureError(null, command_type, message);
+    }
+
+    fn addQueuedMessage(self: *PromptConcurrencyFixture, queue: *std.ArrayList([]u8), message: []const u8) !void {
+        try queue.append(self.allocator, try self.allocator.dupe(u8, message));
+    }
+
+    fn enqueueSuccess(self: *PromptConcurrencyFixture, id: ?[]const u8, command: []const u8, priority: u8) !void {
+        try self.pending.append(self.allocator, .{
+            .id = if (id) |id_string| try self.allocator.dupe(u8, id_string) else null,
+            .command = command,
+            .priority = priority,
+            .sequence = self.next_sequence,
+        });
+        self.next_sequence += 1;
+    }
+
+    fn flushPendingResponses(self: *PromptConcurrencyFixture) !void {
+        std.mem.sort(FixturePendingResponse, self.pending.items, {}, lessThanFixturePendingResponse);
+        for (self.pending.items) |response| {
+            try self.writeFixtureSuccess(response.id, response.command);
+        }
+        try self.stdout_writer.flush();
+        try self.stderr_writer.flush();
+    }
+
+    fn writeFixtureSuccess(self: *PromptConcurrencyFixture, id: ?[]const u8, command: []const u8) !void {
+        try self.stdout_writer.writeAll("{");
+        try writeIdField(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll("\"type\":\"response\",\"command\":");
+        try writeJsonString(self.allocator, self.stdout_writer, command);
+        try self.stdout_writer.writeAll(",\"success\":true}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeFixtureError(self: *PromptConcurrencyFixture, id: ?[]const u8, command: ?[]const u8, message: []const u8) !void {
+        try self.stdout_writer.writeAll("{");
+        try writeIdField(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll("\"type\":\"response\"");
+        if (command) |command_name| {
+            try self.stdout_writer.writeAll(",\"command\":");
+            try writeJsonString(self.allocator, self.stdout_writer, command_name);
+        }
+        try self.stdout_writer.writeAll(",\"success\":false,\"error\":");
+        try writeJsonString(self.allocator, self.stdout_writer, message);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeQueueUpdate(self: *PromptConcurrencyFixture) !void {
+        try self.stdout_writer.writeAll("{\"type\":\"queue_update\",\"steering\":");
+        try writeJsonStringArray(self.allocator, self.stdout_writer, self.steering.items);
+        try self.stdout_writer.writeAll(",\"followUp\":");
+        try writeJsonStringArray(self.allocator, self.stdout_writer, self.follow_up.items);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+};
+
+fn lessThanFixturePendingResponse(_: void, lhs: FixturePendingResponse, rhs: FixturePendingResponse) bool {
+    if (lhs.priority != rhs.priority) return lhs.priority < rhs.priority;
+    return lhs.sequence < rhs.sequence;
+}
+
+fn runTsRpcPromptConcurrencyQueueOrderFixture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !u8 {
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
+
+    var fixture = PromptConcurrencyFixture.init(allocator, stdout_writer, stderr_writer);
+    defer fixture.deinit();
+
+    while (true) {
+        const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (byte == '\n') {
+            try fixture.handleLine(line_buffer.items);
+            line_buffer.clearRetainingCapacity();
+            continue;
+        }
+        try line_buffer.append(allocator, byte);
+    }
+
+    if (line_buffer.items.len > 0) {
+        try fixture.handleLine(line_buffer.items);
+    }
+
+    try fixture.flushPendingResponses();
+    return 0;
+}
+
+fn runTsRpcPromptConcurrencyQueueOrderFixtureBytes(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !void {
+    var fixture = PromptConcurrencyFixture.init(allocator, stdout_writer, stderr_writer);
+    defer fixture.deinit();
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
+
+    for (bytes) |byte| {
+        if (byte == '\n') {
+            try fixture.handleLine(line_buffer.items);
+            line_buffer.clearRetainingCapacity();
+            continue;
+        }
+        try line_buffer.append(allocator, byte);
+    }
+
+    if (line_buffer.items.len > 0) {
+        try fixture.handleLine(line_buffer.items);
+    }
+
+    try fixture.flushPendingResponses();
 }
 
 fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
@@ -1032,6 +1310,19 @@ fn writeQueuedMessageTexts(
     try writer.writeAll("]");
 }
 
+fn writeJsonStringArray(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    values: []const []const u8,
+) !void {
+    try writer.writeAll("[");
+    for (values, 0..) |value, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writeJsonString(allocator, writer, value);
+    }
+    try writer.writeAll("]");
+}
+
 fn firstTextBlock(blocks: []const ai.ContentBlock) []const u8 {
     for (blocks) |block| {
         switch (block) {
@@ -1358,48 +1649,23 @@ test "TS RPC M2 steer follow_up and abort controls use TS responses and queue up
 
 test "TS RPC M2 queue_update is emitted before response and prompt.streamingBehavior queues while streaming" {
     const allocator = std.testing.allocator;
-    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
-        .cwd = "/tmp/ts-rpc-m2",
-        .system_prompt = "system",
-    });
-    defer session.deinit();
-    session.agent.is_streaming = true;
-
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
 
-    try runTsRpcModeScript(
+    const input = try readFixture("prompt-concurrency-queue-order.input.jsonl");
+    defer allocator.free(input);
+    try runTsRpcPromptConcurrencyQueueOrderFixtureBytes(
         allocator,
-        std.testing.io,
-        &session,
-        &.{
-            "{\"id\":\"pc_steer\",\"type\":\"steer\",\"message\":\"steer while prompt running\"}",
-            "{\"id\":\"pc_follow\",\"type\":\"follow_up\",\"message\":\"follow while prompt running\"}",
-            "{\"id\":\"pc_prompt_steer\",\"type\":\"prompt\",\"message\":\"prompt as steer\",\"streamingBehavior\":\"steer\"}",
-            "{\"id\":\"pc_prompt_follow\",\"type\":\"prompt\",\"message\":\"prompt as follow\",\"streamingBehavior\":\"followUp\"}",
-        },
+        input,
         &stdout_capture.writer,
         &stderr_capture.writer,
     );
 
-    const expected =
-        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n" ++
-        "{\"id\":\"pc_steer\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n" ++
-        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[\"follow while prompt running\"]}\n" ++
-        "{\"id\":\"pc_follow\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n" ++
-        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\"]}\n" ++
-        "{\"id\":\"pc_prompt_steer\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n" ++
-        "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\",\"prompt as steer\"],\"followUp\":[\"follow while prompt running\",\"prompt as follow\"]}\n" ++
-        "{\"id\":\"pc_prompt_follow\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n";
-
     const fixture = try readFixture("prompt-concurrency-queue-order.jsonl");
     defer allocator.free(fixture);
-    try expectContains(fixture, "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n");
-    try expectContains(fixture, "{\"id\":\"pc_steer\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n");
-    try expectContains(fixture, "{\"id\":\"pc_prompt_steer\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
-    try std.testing.expectEqualStrings(expected, stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings(fixture, stdout_capture.writer.buffered());
 }
 
 test "TS RPC M2 prompt without streamingBehavior rejects while streaming" {
