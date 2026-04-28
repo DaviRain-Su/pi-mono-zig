@@ -11,6 +11,7 @@ const fixture_files = [_][]const u8{
     "events-session-extras.jsonl",
     "prompt-concurrency-queue-order.input.jsonl",
     "prompt-concurrency-queue-order.jsonl",
+    "bash-control.jsonl",
     "extension-ui.jsonl",
 };
 
@@ -93,6 +94,13 @@ test "TS RPC M3 fixtures cover remaining control response and event shapes" {
     try expectContains(responses, "\"command\":\"clone\",\"success\":true,\"data\":{\"cancelled\":false}");
     try expectContains(responses, "\"command\":\"get_fork_messages\",\"success\":true,\"data\":{\"messages\":[");
     try expectContains(responses, "\"command\":\"set_session_name\",\"success\":true}");
+
+    const bash = try readFixture("bash-control.jsonl");
+    defer std.testing.allocator.free(bash);
+    try expectContains(bash, "{\"id\":\"bash_ok\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"ok\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n");
+    try expectContains(bash, "{\"id\":\"bash_fail\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"fail\",\"exitCode\":7,\"cancelled\":false,\"truncated\":false}}\n");
+    try expectContains(bash, "{\"id\":\"bash_abort\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"start\\n\",\"cancelled\":true,\"truncated\":false}}\n");
+    try expectContains(bash, "{\"id\":\"live_commands\",\"type\":\"response\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[]}}\n");
 
     const events = try readFixture("events-session-extras.jsonl");
     defer std.testing.allocator.free(events);

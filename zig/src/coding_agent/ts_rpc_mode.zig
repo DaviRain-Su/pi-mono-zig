@@ -45,6 +45,107 @@ const DeferredResponse = struct {
     }
 };
 
+const BashRunResult = struct {
+    output: []u8,
+    exit_code: ?u8,
+    cancelled: bool,
+    truncated: bool = false,
+
+    fn deinit(self: *BashRunResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.output);
+        self.* = undefined;
+    }
+};
+
+const BashTask = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: *TsRpcServer,
+    cwd: []u8,
+    id: ?[]u8,
+    command: []u8,
+    abort_signal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        server: *TsRpcServer,
+        cwd: []const u8,
+        id: ?[]const u8,
+        command: []const u8,
+    ) !*BashTask {
+        const task = try allocator.create(BashTask);
+        errdefer allocator.destroy(task);
+        const cwd_copy = try allocator.dupe(u8, cwd);
+        errdefer allocator.free(cwd_copy);
+        const id_copy = if (id) |id_string| try allocator.dupe(u8, id_string) else null;
+        errdefer if (id_copy) |id_string| allocator.free(id_string);
+        const command_copy = try allocator.dupe(u8, command);
+        errdefer allocator.free(command_copy);
+        task.* = .{
+            .allocator = allocator,
+            .io = io,
+            .server = server,
+            .cwd = cwd_copy,
+            .id = id_copy,
+            .command = command_copy,
+        };
+        return task;
+    }
+
+    fn spawn(self: *BashTask) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *BashTask) void {
+        defer self.done.store(true, .seq_cst);
+        var result = runDirectBash(
+            self.allocator,
+            self.io,
+            self.cwd,
+            self.command,
+            &self.abort_signal,
+            &self.started,
+        ) catch |err| {
+            self.server.writeCommandError(self.id, "bash", err) catch {};
+            return;
+        };
+        defer result.deinit(self.allocator);
+
+        const data = buildBashResultJson(self.allocator, result) catch |err| {
+            self.server.writeCommandError(self.id, "bash", err) catch {};
+            return;
+        };
+        defer self.allocator.free(data);
+        self.server.writeSuccessResponseRawData(self.id, "bash", data) catch {};
+    }
+
+    fn isDone(self: *const BashTask) bool {
+        return self.done.load(.seq_cst);
+    }
+
+    fn isStarted(self: *const BashTask) bool {
+        return self.started.load(.seq_cst);
+    }
+
+    fn abort(self: *BashTask) void {
+        self.abort_signal.store(true, .seq_cst);
+    }
+
+    fn joinAndDestroy(self: *BashTask) void {
+        if (self.thread) |thread| {
+            thread.join();
+        }
+        self.allocator.free(self.cwd);
+        if (self.id) |id_string| self.allocator.free(id_string);
+        self.allocator.free(self.command);
+        self.allocator.destroy(self);
+    }
+};
+
 const PromptTask = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -253,6 +354,7 @@ const TsRpcSessionHost = struct {
         errdefer replacement.deinit();
 
         self.server.cancelAndJoinPromptTasks();
+        self.server.cancelAndJoinBashTask();
         self.server.detachFromCurrentSession();
         old.deinit();
         old.* = replacement;
@@ -308,6 +410,8 @@ const TsRpcServer = struct {
     output_mutex: std.Io.Mutex = .init,
     subscriber: ?agent.AgentSubscriber = null,
     prompt_tasks: std.ArrayList(*PromptTask) = .empty,
+    bash_task: ?*BashTask = null,
+    bash_task_mutex: std.Io.Mutex = .init,
     deferred_responses: std.ArrayList(DeferredResponse) = .empty,
     deferred_responses_mutex: std.Io.Mutex = .init,
     deferred_flush_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -351,6 +455,7 @@ const TsRpcServer = struct {
             task.joinAndDestroy();
         }
         self.prompt_tasks.clearRetainingCapacity();
+        self.cancelAndJoinBashTask();
         self.detachFromCurrentSession();
         self.prompt_tasks.deinit(self.allocator);
         self.prompt_tasks = .empty;
@@ -400,6 +505,50 @@ const TsRpcServer = struct {
             if (!task.isDone()) return true;
         }
         return false;
+    }
+
+    fn takeCompletedBashTask(self: *TsRpcServer) ?*BashTask {
+        self.bash_task_mutex.lockUncancelable(self.io);
+        defer self.bash_task_mutex.unlock(self.io);
+        const task = self.bash_task orelse return null;
+        if (!task.isDone()) return null;
+        self.bash_task = null;
+        return task;
+    }
+
+    fn reapCompletedBashTask(self: *TsRpcServer) void {
+        if (self.takeCompletedBashTask()) |task| {
+            task.joinAndDestroy();
+        }
+    }
+
+    fn hasActiveBashTask(self: *TsRpcServer) bool {
+        self.reapCompletedBashTask();
+        self.bash_task_mutex.lockUncancelable(self.io);
+        defer self.bash_task_mutex.unlock(self.io);
+        return self.bash_task != null;
+    }
+
+    fn activeBashTaskStarted(self: *TsRpcServer) bool {
+        self.bash_task_mutex.lockUncancelable(self.io);
+        defer self.bash_task_mutex.unlock(self.io);
+        const task = self.bash_task orelse return false;
+        return task.isStarted();
+    }
+
+    fn abortActiveBashTask(self: *TsRpcServer) void {
+        self.bash_task_mutex.lockUncancelable(self.io);
+        defer self.bash_task_mutex.unlock(self.io);
+        if (self.bash_task) |task| task.abort();
+    }
+
+    fn cancelAndJoinBashTask(self: *TsRpcServer) void {
+        self.bash_task_mutex.lockUncancelable(self.io);
+        const task = self.bash_task;
+        self.bash_task = null;
+        if (task) |some| some.abort();
+        self.bash_task_mutex.unlock(self.io);
+        if (task) |some| some.joinAndDestroy();
     }
 
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
@@ -457,6 +606,7 @@ const TsRpcServer = struct {
         command: []const u8,
         object: std.json.ObjectMap,
     ) !void {
+        self.reapCompletedBashTask();
         const session = self.session orelse {
             try self.writeNotImplemented(id, command);
             return;
@@ -740,17 +890,39 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            const data = self.buildBashResultJson(session, bash_command) catch |err| {
+            if (self.hasActiveBashTask()) {
+                try self.writeErrorResponse(id, command, "Bash command is already running");
+                return;
+            }
+            const task = BashTask.create(self.allocator, self.io, self, session.cwd, id, bash_command) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
+            self.bash_task_mutex.lockUncancelable(self.io);
+            if (self.bash_task != null) {
+                self.bash_task_mutex.unlock(self.io);
+                task.joinAndDestroy();
+                try self.writeErrorResponse(id, command, "Bash command is already running");
+                return;
+            }
+            self.bash_task = task;
+            self.bash_task_mutex.unlock(self.io);
+            task.spawn() catch |err| {
+                self.bash_task_mutex.lockUncancelable(self.io);
+                if (self.bash_task == task) self.bash_task = null;
+                self.bash_task_mutex.unlock(self.io);
+                task.joinAndDestroy();
+                try self.writeCommandError(id, command, err);
+                return;
+            };
             return;
         }
 
         if (std.mem.eql(u8, command, "abort_bash")) {
-            try self.writeSuccessResponseNoData(id, command);
+            self.output_mutex.lockUncancelable(self.io);
+            defer self.output_mutex.unlock(self.io);
+            self.abortActiveBashTask();
+            try self.writeSuccessResponseNoDataLocked(id, command);
             return;
         }
 
@@ -911,7 +1083,10 @@ const TsRpcServer = struct {
     fn writeSuccessResponseNoData(self: *TsRpcServer, id: ?[]const u8, command: []const u8) !void {
         self.output_mutex.lockUncancelable(self.io);
         defer self.output_mutex.unlock(self.io);
+        try self.writeSuccessResponseNoDataLocked(id, command);
+    }
 
+    fn writeSuccessResponseNoDataLocked(self: *TsRpcServer, id: ?[]const u8, command: []const u8) !void {
         try self.stdout_writer.writeAll("{");
         try writeIdField(self.allocator, self.stdout_writer, id);
         try self.stdout_writer.writeAll("\"type\":\"response\",\"command\":");
@@ -1147,35 +1322,6 @@ const TsRpcServer = struct {
             try writer.writeAll("}");
         }
         try writer.writeAll("}");
-        return try self.allocator.dupe(u8, out.written());
-    }
-
-    fn buildBashResultJson(self: *TsRpcServer, session: *const session_mod.AgentSession, command: []const u8) ![]u8 {
-        const argv = [_][]const u8{ "/bin/sh", "-c", command };
-        const run_result = try std.process.run(self.allocator, self.io, .{
-            .argv = argv[0..],
-            .cwd = .{ .path = session.cwd },
-            .stdout_limit = .limited(1024 * 1024),
-            .stderr_limit = .limited(1024 * 1024),
-        });
-        defer self.allocator.free(run_result.stdout);
-        defer self.allocator.free(run_result.stderr);
-
-        const output = try std.mem.concat(self.allocator, u8, &[_][]const u8{ run_result.stdout, run_result.stderr });
-        defer self.allocator.free(output);
-        const exit_code = exitCodeFromTerm(run_result.term);
-
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        try out.writer.writeAll("{\"output\":");
-        try writeJsonString(self.allocator, &out.writer, output);
-        try out.writer.writeAll(",\"exitCode\":");
-        if (exit_code) |code| {
-            try out.writer.print("{d}", .{code});
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"cancelled\":false,\"truncated\":false}");
         return try self.allocator.dupe(u8, out.written());
     }
 
@@ -1931,6 +2077,162 @@ fn exitCodeFromTerm(term: std.process.Child.Term) ?u8 {
     };
 }
 
+const BashWaitState = struct {
+    child: *std.process.Child,
+    io: std.Io,
+    term: ?std.process.Child.Term = null,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+const BashOutputReaderState = struct {
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    io: std.Io,
+    output: std.ArrayList(u8) = .empty,
+    err: ?anyerror = null,
+
+    fn deinit(self: *BashOutputReaderState) void {
+        self.output.deinit(self.allocator);
+        self.file.close(self.io);
+    }
+};
+
+fn waitDirectBashChild(state: *BashWaitState) void {
+    state.term = state.child.wait(state.io) catch |err| {
+        state.err = err;
+        state.done.store(true, .seq_cst);
+        return;
+    };
+    state.done.store(true, .seq_cst);
+}
+
+fn readDirectBashOutput(state: *BashOutputReaderState) void {
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const bytes_read = std.posix.read(state.file.handle, &buffer) catch |err| {
+            state.err = err;
+            return;
+        };
+        if (bytes_read == 0) return;
+        state.output.appendSlice(state.allocator, buffer[0..bytes_read]) catch |err| {
+            state.err = err;
+            return;
+        };
+    }
+}
+
+fn killDirectBashProcessGroup(pid: std.posix.pid_t) void {
+    std.posix.kill(-pid, .TERM) catch {};
+    std.posix.kill(-pid, .KILL) catch {};
+}
+
+fn runDirectBash(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    command: []const u8,
+    abort_signal: *const std.atomic.Value(bool),
+    started: *std.atomic.Value(bool),
+) !BashRunResult {
+    var cwd_dir = std.Io.Dir.openDirAbsolute(io, cwd, .{}) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Working directory does not exist: {s} ({s})", .{ cwd, @errorName(err) });
+        defer allocator.free(message);
+        return .{
+            .output = try allocator.dupe(u8, message),
+            .exit_code = null,
+            .cancelled = abort_signal.load(.seq_cst),
+        };
+    };
+    defer cwd_dir.close(io);
+
+    const wrapped_command = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{command});
+    defer allocator.free(wrapped_command);
+    const argv = [_][]const u8{ "/bin/sh", "-c", wrapped_command };
+    var child = try std.process.spawn(io, .{
+        .argv = argv[0..],
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    defer {
+        if (child.id != null) child.kill(io);
+    }
+    const pid = child.id.?;
+    started.store(true, .seq_cst);
+
+    const stdout_file = child.stdout.?;
+    child.stdout = null;
+
+    var wait_state = BashWaitState{
+        .child = &child,
+        .io = io,
+    };
+    const wait_thread = try std.Thread.spawn(.{}, waitDirectBashChild, .{&wait_state});
+
+    var reader_state = BashOutputReaderState{
+        .allocator = allocator,
+        .file = stdout_file,
+        .io = io,
+    };
+    const reader_thread = std.Thread.spawn(.{}, readDirectBashOutput, .{&reader_state}) catch |err| {
+        killDirectBashProcessGroup(pid);
+        wait_thread.join();
+        reader_state.deinit();
+        return err;
+    };
+
+    var threads_joined = false;
+    defer {
+        if (!threads_joined) {
+            wait_thread.join();
+            reader_thread.join();
+        }
+        reader_state.deinit();
+    }
+
+    var cancelled = false;
+    while (!wait_state.done.load(.seq_cst)) {
+        if (abort_signal.load(.seq_cst)) {
+            cancelled = true;
+            killDirectBashProcessGroup(pid);
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+
+    wait_thread.join();
+    reader_thread.join();
+    threads_joined = true;
+
+    if (reader_state.err) |err| return err;
+    if (wait_state.err) |err| return err;
+
+    return .{
+        .output = try reader_state.output.toOwnedSlice(allocator),
+        .exit_code = if (cancelled) null else exitCodeFromTerm(wait_state.term.?),
+        .cancelled = cancelled,
+    };
+}
+
+fn buildBashResultJson(allocator: std.mem.Allocator, result: BashRunResult) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"output\":");
+    try writeJsonString(allocator, &out.writer, result.output);
+    if (result.exit_code) |code| {
+        try out.writer.print(",\"exitCode\":{d}", .{code});
+    }
+    try out.writer.writeAll(",\"cancelled\":");
+    try out.writer.writeAll(if (result.cancelled) "true" else "false");
+    try out.writer.writeAll(",\"truncated\":");
+    try out.writer.writeAll(if (result.truncated) "true" else "false");
+    try out.writer.writeAll("}");
+    return try allocator.dupe(u8, out.written());
+}
+
 fn runTsRpcModeScript(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2421,8 +2723,8 @@ test "TS RPC M3 session bash retry compaction controls use TS-compatible respons
             "{\"id\":\"auto_compact\",\"type\":\"set_auto_compaction\",\"enabled\":true}",
             "{\"id\":\"auto_retry\",\"type\":\"set_auto_retry\",\"enabled\":true}",
             "{\"id\":\"abort_retry\",\"type\":\"abort_retry\"}",
-            "{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf rpc-bash\"}",
             "{\"id\":\"abort_bash\",\"type\":\"abort_bash\"}",
+            "{\"id\":\"bash\",\"type\":\"bash\",\"command\":\"printf rpc-bash\"}",
             "{\"id\":\"name\",\"type\":\"set_session_name\",\"name\":\"  rpc session  \"}",
             "{\"id\":\"last\",\"type\":\"get_last_assistant_text\"}",
             "{\"id\":\"fork_messages\",\"type\":\"get_fork_messages\"}",
@@ -2607,6 +2909,130 @@ test "TS RPC set_auto_retry false disables retry lifecycle" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"type\":\"auto_retry_end\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "unexpected retry") == null);
     try std.testing.expectEqual(@as(u32, 0), session.retry_attempt);
+}
+
+test "TS RPC direct bash success matches exact BashResult fixture bytes" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{"{\"id\":\"bash_ok\",\"type\":\"bash\",\"command\":\"printf ok\"}"},
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"bash_ok\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"ok\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC direct bash failure is a successful BashResult response with exitCode" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{"{\"id\":\"bash_fail\",\"type\":\"bash\",\"command\":\"printf fail; exit 7\"}"},
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"bash_fail\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"fail\",\"exitCode\":7,\"cancelled\":false,\"truncated\":false}}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC abort_bash interrupts active direct bash and cleans tracked task" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"bash_abort\",\"type\":\"bash\",\"command\":\"printf 'start\\n'; sleep 5; printf end\"}");
+    try waitForActiveBashStarted(&server);
+    std.Io.sleep(std.testing.io, .fromMilliseconds(50), .awake) catch {};
+    try server.handleLine("{\"id\":\"abort\",\"type\":\"abort_bash\"}");
+    try server.finish();
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"abort\",\"type\":\"response\",\"command\":\"abort_bash\",\"success\":true}\n" ++
+            "{\"id\":\"bash_abort\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"start\\n\",\"cancelled\":true,\"truncated\":false}}\n",
+        stdout_capture.writer.buffered(),
+    );
+    try std.testing.expect(!server.hasActiveBashTask());
+}
+
+test "TS RPC command loop remains live while direct bash is active" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"live_bash\",\"type\":\"bash\",\"command\":\"printf 'live\\n'; sleep 5; printf done\"}");
+    try waitForActiveBashStarted(&server);
+    try server.handleLine("{\"id\":\"live_commands\",\"type\":\"get_commands\"}");
+    try waitForOutputContains(
+        &server,
+        &stdout_capture.writer,
+        "{\"id\":\"live_commands\",\"type\":\"response\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[]}}\n",
+        500,
+    );
+    try server.handleLine("{\"id\":\"live_abort\",\"type\":\"abort_bash\"}");
+    try server.finish();
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"live_commands\",\"type\":\"response\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[]}}\n" ++
+            "{\"id\":\"live_abort\",\"type\":\"response\",\"command\":\"abort_bash\",\"success\":true}\n" ++
+            "{\"id\":\"live_bash\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"live\\n\",\"cancelled\":true,\"truncated\":false}}\n",
+        stdout_capture.writer.buffered(),
+    );
 }
 
 test "TS RPC M3 session host rebinds new switch fork clone and state" {
@@ -3025,6 +3451,14 @@ fn waitForSessionStreaming(session: *const session_mod.AgentSession) !void {
         std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
     }
     try std.testing.expect(session.isStreaming());
+}
+
+fn waitForActiveBashStarted(server: *TsRpcServer) !void {
+    var spins: usize = 0;
+    while (!server.activeBashTaskStarted() and spins < 1000) : (spins += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(server.activeBashTaskStarted());
 }
 
 fn waitForServerOutputContains(
