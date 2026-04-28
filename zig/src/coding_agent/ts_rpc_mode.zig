@@ -2111,6 +2111,7 @@ const BashOutputReaderState = struct {
     allocator: std.mem.Allocator,
     file: std.Io.File,
     io: std.Io,
+    sanitizer: DirectBashUtf8Sanitizer = .{},
     chunks: std.ArrayList([]u8) = .empty,
     output_bytes: usize = 0,
     total_raw_bytes: usize = 0,
@@ -2126,7 +2127,11 @@ const BashOutputReaderState = struct {
 
     fn appendRaw(self: *BashOutputReaderState, bytes: []const u8) !void {
         self.total_raw_bytes += bytes.len;
-        const sanitized = try sanitizeDirectBashOutput(self.allocator, bytes);
+        const sanitized = try self.sanitizer.sanitizeChunk(self.allocator, bytes);
+        try self.appendSanitized(sanitized);
+    }
+
+    fn appendSanitized(self: *BashOutputReaderState, sanitized: []u8) !void {
         errdefer self.allocator.free(sanitized);
 
         if (self.total_raw_bytes > truncate.DEFAULT_MAX_BYTES and self.temp_file == null) {
@@ -2160,6 +2165,9 @@ const BashOutputReaderState = struct {
     }
 
     fn finish(self: *BashOutputReaderState, result_allocator: std.mem.Allocator) !DirectBashBufferedOutput {
+        const flushed = try self.sanitizer.flush(self.allocator);
+        try self.appendSanitized(flushed);
+
         const rolling_output = try std.mem.join(result_allocator, "", self.chunks.items);
         errdefer result_allocator.free(rolling_output);
         if (self.temp_file) |*temp_file| {
@@ -2232,51 +2240,139 @@ const DirectBashTempFile = struct {
     }
 };
 
-fn sanitizeDirectBashOutput(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+const DirectBashUtf8Sanitizer = struct {
+    pending_utf8: [4]u8 = undefined,
+    pending_utf8_len: u8 = 0,
 
-    var index: usize = 0;
-    while (index < bytes.len) {
-        if (bytes[index] == 0x1b) {
-            index = skipAnsiEscape(bytes, index);
-            continue;
+    fn sanitizeChunk(self: *DirectBashUtf8Sanitizer, allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        var index: usize = 0;
+        try self.drainPending(allocator, &out, bytes, &index);
+
+        while (index < bytes.len) {
+            if (bytes[index] == 0x1b) {
+                index = skipAnsiEscape(bytes, index);
+                continue;
+            }
+
+            const start = index;
+            const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch {
+                try appendUtf8Codepoint(allocator, &out, 0xfffd);
+                index += 1;
+                continue;
+            };
+            if (start + sequence_len > bytes.len) {
+                var continuation_index = start + 1;
+                while (continuation_index < bytes.len) : (continuation_index += 1) {
+                    if (!isUtf8Continuation(bytes[continuation_index])) {
+                        try appendUtf8Codepoint(allocator, &out, 0xfffd);
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    const remaining = bytes[start..];
+                    @memcpy(self.pending_utf8[0..remaining.len], remaining);
+                    self.pending_utf8_len = @intCast(remaining.len);
+                    index = bytes.len;
+                }
+                continue;
+            }
+
+            const slice = bytes[start .. start + sequence_len];
+            const codepoint = std.unicode.utf8Decode(slice) catch {
+                try appendUtf8Codepoint(allocator, &out, 0xfffd);
+                index += 1;
+                continue;
+            };
+            index += sequence_len;
+
+            try appendSanitizedCodepoint(allocator, &out, slice, codepoint);
         }
 
-        const start = index;
-        const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch {
-            try appendUtf8Codepoint(allocator, &out, 0xfffd);
-            index += 1;
-            continue;
-        };
-        if (start + sequence_len > bytes.len) {
-            try appendUtf8Codepoint(allocator, &out, 0xfffd);
-            index += 1;
-            continue;
-        }
-
-        const slice = bytes[start .. start + sequence_len];
-        const codepoint = std.unicode.utf8Decode(slice) catch {
-            try appendUtf8Codepoint(allocator, &out, 0xfffd);
-            index += 1;
-            continue;
-        };
-        index += sequence_len;
-
-        if (codepoint == '\t' or codepoint == '\n') {
-            try out.appendSlice(allocator, slice);
-        } else if (codepoint == '\r') {
-            continue;
-        } else if (codepoint <= 0x1f) {
-            continue;
-        } else if (codepoint >= 0xfff9 and codepoint <= 0xfffb) {
-            continue;
-        } else {
-            try out.appendSlice(allocator, slice);
-        }
+        return try out.toOwnedSlice(allocator);
     }
 
-    return try out.toOwnedSlice(allocator);
+    fn drainPending(
+        self: *DirectBashUtf8Sanitizer,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        bytes: []const u8,
+        index: *usize,
+    ) !void {
+        if (self.pending_utf8_len == 0) return;
+
+        const sequence_len = std.unicode.utf8ByteSequenceLength(self.pending_utf8[0]) catch {
+            try appendUtf8Codepoint(allocator, out, 0xfffd);
+            self.pending_utf8_len = 0;
+            return;
+        };
+
+        while (self.pending_utf8_len < sequence_len) {
+            if (index.* >= bytes.len) return;
+            const byte = bytes[index.*];
+            if (!isUtf8Continuation(byte)) {
+                try appendUtf8Codepoint(allocator, out, 0xfffd);
+                self.pending_utf8_len = 0;
+                return;
+            }
+            self.pending_utf8[self.pending_utf8_len] = byte;
+            self.pending_utf8_len += 1;
+            index.* += 1;
+        }
+
+        const slice = self.pending_utf8[0..sequence_len];
+        const codepoint = std.unicode.utf8Decode(slice) catch {
+            try appendUtf8Codepoint(allocator, out, 0xfffd);
+            self.pending_utf8_len = 0;
+            return;
+        };
+        try appendSanitizedCodepoint(allocator, out, slice, codepoint);
+        self.pending_utf8_len = 0;
+    }
+
+    fn flush(self: *DirectBashUtf8Sanitizer, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        if (self.pending_utf8_len != 0) {
+            try appendUtf8Codepoint(allocator, &out, 0xfffd);
+            self.pending_utf8_len = 0;
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+};
+
+fn sanitizeDirectBashOutput(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var sanitizer: DirectBashUtf8Sanitizer = .{};
+    const chunk = try sanitizer.sanitizeChunk(allocator, bytes);
+    defer allocator.free(chunk);
+    const flushed = try sanitizer.flush(allocator);
+    defer allocator.free(flushed);
+    return try std.mem.concat(allocator, u8, &.{ chunk, flushed });
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xc0) == 0x80;
+}
+
+fn appendSanitizedCodepoint(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    slice: []const u8,
+    codepoint: u21,
+) !void {
+    if (codepoint == '\t' or codepoint == '\n') {
+        try out.appendSlice(allocator, slice);
+    } else if (codepoint == '\r') {
+        return;
+    } else if (codepoint <= 0x1f) {
+        return;
+    } else if (codepoint >= 0xfff9 and codepoint <= 0xfffb) {
+        return;
+    } else {
+        try out.appendSlice(allocator, slice);
+    }
 }
 
 fn skipAnsiEscape(bytes: []const u8, start: usize) usize {
@@ -3396,6 +3492,63 @@ test "TS RPC direct bash sanitizes control and ANSI output before serializing Ba
         "{\"id\":\"bash_sanitize\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"aredb\\nc\",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n",
         stdout_capture.writer.buffered(),
     );
+}
+
+test "TS RPC direct bash preserves multibyte UTF-8 split across read boundary" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var command: std.Io.Writer.Allocating = .init(allocator);
+    defer command.deinit();
+    try command.writer.writeAll("printf '");
+    for (0..4095) |_| try command.writer.writeByte('A');
+    try command.writer.writeAll("💡END'");
+
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    try line.writer.writeAll("{\"id\":\"bash_utf8_split\",\"type\":\"bash\",\"command\":");
+    try writeJsonString(allocator, &line.writer, command.written());
+    try line.writer.writeAll("}");
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{line.written()},
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    var expected_output: std.Io.Writer.Allocating = .init(allocator);
+    defer expected_output.deinit();
+    for (0..4095) |_| try expected_output.writer.writeByte('A');
+    try expected_output.writer.writeAll("💡END");
+
+    var expected: std.Io.Writer.Allocating = .init(allocator);
+    defer expected.deinit();
+    try expected.writer.writeAll("{\"id\":\"bash_utf8_split\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":");
+    try writeJsonString(allocator, &expected.writer, expected_output.written());
+    try expected.writer.writeAll(",\"exitCode\":0,\"cancelled\":false,\"truncated\":false}}\n");
+
+    try std.testing.expectEqualStrings(expected.written(), stdout_capture.writer.buffered());
+    try expectContains(stdout_capture.writer.buffered(), "💡END");
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "�") == null);
+}
+
+test "TS RPC direct bash UTF-8 sanitizer flushes incomplete sequence at end of stream" {
+    const allocator = std.testing.allocator;
+    const sanitized = try sanitizeDirectBashOutput(allocator, &.{ 0xf0, 0x9f });
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("�", sanitized);
 }
 
 test "TS RPC direct bash truncates large output and retains full output path" {
