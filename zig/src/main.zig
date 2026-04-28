@@ -8,6 +8,7 @@ const runtime_prep = @import("cli/runtime_prep.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 const json_event_wire = @import("coding_agent/json_event_wire.zig");
+const extension_host_mod = @import("coding_agent/extension_host.zig");
 
 const VERSION = "0.1.0";
 
@@ -230,12 +231,15 @@ fn runCliWithInput(
         }
 
         if (app_mode == .ts_rpc) {
+            var extension_host_options = try tsRpcExtensionHostOptions(allocator, &effective_env_map, cwd);
+            defer extension_host_options.deinit(allocator);
             return try coding_agent.runTsRpcMode(
                 allocator,
                 io,
                 &session,
                 .{
                     .extension_ui_parity_scenario = isEnabledEnv(&effective_env_map, "PI_TS_RPC_EXTENSION_UI_PARITY_SCENARIO"),
+                    .extension_host = extension_host_options.options,
                 },
                 stdout,
                 stderr,
@@ -309,6 +313,46 @@ fn runCliWithInput(
 
 fn isEnabledEnv(env_map: *const std.process.Environ.Map, key: []const u8) bool {
     const value = env_map.get(key) orelse return false;
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes");
+}
+
+const OwnedTsRpcExtensionHostOptions = struct {
+    options: ?coding_agent.ts_rpc_mode.ExtensionHostOptions = null,
+    argv: ?[][]const u8 = null,
+
+    fn deinit(self: *OwnedTsRpcExtensionHostOptions, allocator: std.mem.Allocator) void {
+        if (self.argv) |argv| allocator.free(argv);
+        self.* = undefined;
+    }
+};
+
+fn tsRpcExtensionHostOptions(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+) !OwnedTsRpcExtensionHostOptions {
+    const entry = env_map.get("PI_M6_EXTENSION_HOST_ENTRY") orelse return .{};
+    if (env_map.get("PI_M6_EXTENSION_HOST_DISABLED")) |value| {
+        if (isEnabledValue(value)) return .{};
+    }
+    const runtime = env_map.get("PI_M6_EXTENSION_HOST_RUNTIME") orelse "bun";
+    const fixture = env_map.get("PI_M6_EXTENSION_HOST_FIXTURE") orelse "m6-fixture";
+    const marker = env_map.get(extension_host_mod.HOST_MARKER_ENV) orelse "pi-m6-extension-host";
+    var argv = try allocator.alloc([]const u8, 2);
+    argv[0] = runtime;
+    argv[1] = entry;
+    return .{
+        .argv = argv,
+        .options = .{
+            .argv = argv,
+            .cwd = cwd,
+            .marker = marker,
+            .fixture = fixture,
+        },
+    };
+}
+
+fn isEnabledValue(value: []const u8) bool {
     return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes");
 }
 

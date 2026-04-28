@@ -7,9 +7,20 @@ const truncate = @import("tools/truncate.zig");
 const session_mod = @import("session.zig");
 const session_advanced = @import("session_advanced.zig");
 const session_manager_mod = @import("session_manager.zig");
+const extension_host_mod = @import("extension_host.zig");
 
 pub const RunTsRpcModeOptions = struct {
     extension_ui_parity_scenario: bool = false,
+    extension_host: ?ExtensionHostOptions = null,
+};
+
+pub const ExtensionHostOptions = struct {
+    argv: []const []const u8,
+    cwd: ?[]const u8 = null,
+    marker: []const u8,
+    fixture: []const u8,
+    ready_timeout_ms: u64 = 1000,
+    shutdown_timeout_ms: u64 = 1000,
 };
 
 const PromptStreamingBehavior = enum {
@@ -486,6 +497,7 @@ const TsRpcServer = struct {
     next_bash_response_sequence: usize = 0,
     pending_extension_requests: std.StringHashMap(PendingExtensionUIRequest),
     completed_extension_requests: std.ArrayList(ResolvedExtensionUIRequest) = .empty,
+    extension_host: ?*extension_host_mod.HostProcess = null,
     suppress_events: bool = false,
     finished: bool = false,
 
@@ -510,6 +522,24 @@ const TsRpcServer = struct {
         try self.attachToCurrentSession();
         self.deferred_flush_stop.store(false, .seq_cst);
         self.deferred_flush_thread = try std.Thread.spawn(.{}, deferredFlushMain, .{self});
+    }
+
+    fn startExtensionHost(self: *TsRpcServer, options: ExtensionHostOptions) !void {
+        if (self.extension_host != null) return error.ExtensionHostAlreadyStarted;
+        const host = try extension_host_mod.HostProcess.start(self.allocator, self.io, .{
+            .argv = options.argv,
+            .cwd = options.cwd,
+            .initialize = .{
+                .marker = options.marker,
+                .cwd = options.cwd orelse "",
+                .fixture = options.fixture,
+            },
+            .shutdown_timeout_ms = options.shutdown_timeout_ms,
+        });
+        errdefer host.deinit();
+        try host.waitForReady(options.ready_timeout_ms);
+        self.extension_host = host;
+        try self.drainExtensionHostUiRequests(50);
     }
 
     fn finish(self: *TsRpcServer) !void {
@@ -537,6 +567,10 @@ const TsRpcServer = struct {
         self.deferred_responses = .empty;
         self.bash_tasks.deinit(self.allocator);
         self.bash_tasks = .empty;
+        if (self.extension_host) |host| {
+            host.deinit();
+            self.extension_host = null;
+        }
         self.deinitExtensionUIState();
         try self.stdout_writer.flush();
         try self.stderr_writer.flush();
@@ -725,9 +759,31 @@ const TsRpcServer = struct {
     fn cancelPendingExtensionUIRequest(self: *TsRpcServer, id: []const u8) !bool {
         if (self.pending_extension_requests.get(id)) |pending| {
             const default_resolution = pending.defaultResolution();
-            return try self.resolvePendingExtensionUIRequest(id, default_resolution);
+            const did_resolve = try self.resolvePendingExtensionUIRequest(id, default_resolution);
+            if (did_resolve) try self.forwardExtensionUIResolutionToHost(id, default_resolution);
+            return did_resolve;
         }
         return false;
+    }
+
+    fn forwardExtensionUIResolutionToHost(self: *TsRpcServer, id: []const u8, resolution: ExtensionUIResolution) !void {
+        const host = self.extension_host orelse return;
+        var payload: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload.deinit();
+        switch (resolution) {
+            .none => try payload.writer.writeAll("{\"cancelled\":true}"),
+            .value => |value| {
+                try payload.writer.writeAll("{\"value\":");
+                try writeJsonString(self.allocator, &payload.writer, value);
+                try payload.writer.writeAll("}");
+            },
+            .confirmed => |confirmed| {
+                try payload.writer.writeAll("{\"confirmed\":");
+                try payload.writer.writeAll(if (confirmed) "true" else "false");
+                try payload.writer.writeAll("}");
+            },
+        }
+        try host.sendExtensionUiResponse(id, payload.written());
     }
 
     fn advanceExtensionUITime(self: *TsRpcServer, elapsed_ms: u64) !void {
@@ -762,13 +818,19 @@ const TsRpcServer = struct {
         }
         if (object.get("value")) |value| {
             if (value == .string) {
-                _ = try self.resolvePendingExtensionUIRequest(id, .{ .value = @constCast(value.string) });
+                const resolution = ExtensionUIResolution{ .value = @constCast(value.string) };
+                if (try self.resolvePendingExtensionUIRequest(id, resolution)) {
+                    try self.forwardExtensionUIResolutionToHost(id, resolution);
+                }
                 return;
             }
         }
         if (object.get("confirmed")) |confirmed| {
             if (confirmed == .bool) {
-                _ = try self.resolvePendingExtensionUIRequest(id, .{ .confirmed = confirmed.bool });
+                const resolution = ExtensionUIResolution{ .confirmed = confirmed.bool };
+                if (try self.resolvePendingExtensionUIRequest(id, resolution)) {
+                    try self.forwardExtensionUIResolutionToHost(id, resolution);
+                }
                 return;
             }
         }
@@ -1553,6 +1615,90 @@ const TsRpcServer = struct {
         try self.writeExtensionUIEditorRequest("ui_editor", "Edit fixture", "prefill");
     }
 
+    fn drainExtensionHostUiRequests(self: *TsRpcServer, idle_ms: u64) !void {
+        const host = self.extension_host orelse return;
+        var idle_elapsed: u64 = 0;
+        while (idle_elapsed <= idle_ms) {
+            const requests = try host.takeUiRequests(self.allocator);
+            defer self.allocator.free(requests);
+            if (requests.len == 0) {
+                std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+                idle_elapsed += 10;
+                continue;
+            }
+            idle_elapsed = 0;
+            for (requests) |*request| {
+                defer request.deinit(self.allocator);
+                try self.writeExtensionUIRequestFromHost(request.*);
+            }
+        }
+    }
+
+    fn writeExtensionUIRequestFromHost(self: *TsRpcServer, request: extension_host_mod.ExtensionUiRequest) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, request.payload_json, .{}) catch return;
+        defer parsed.deinit();
+        const payload = switch (parsed.value) {
+            .object => |object| object,
+            else => return,
+        };
+
+        if (std.mem.eql(u8, request.method, "select")) {
+            const title = requiredString(payload, "title") catch return;
+            const options = try requiredStringArray(self.allocator, payload, "options");
+            defer self.allocator.free(options);
+            try self.writeExtensionUISelectRequest(request.id, title, options, optionalU64(payload, "timeout"));
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "confirm")) {
+            const title = requiredString(payload, "title") catch return;
+            const message = requiredString(payload, "message") catch return;
+            try self.writeExtensionUIConfirmRequest(request.id, title, message, optionalU64(payload, "timeout"));
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "input")) {
+            const title = requiredString(payload, "title") catch return;
+            const placeholder = optionalString(payload, "placeholder") catch return;
+            try self.writeExtensionUIInputRequest(request.id, title, placeholder, optionalU64(payload, "timeout"));
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "editor")) {
+            const title = requiredString(payload, "title") catch return;
+            const prefill = optionalString(payload, "prefill") catch return;
+            try self.writeExtensionUIEditorRequest(request.id, title, prefill);
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "notify")) {
+            const message = requiredString(payload, "message") catch return;
+            const notify_type = optionalString(payload, "notifyType") catch return;
+            try self.writeExtensionUINotifyRequest(request.id, message, notify_type);
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "setStatus")) {
+            const status_key = requiredString(payload, "statusKey") catch return;
+            const status_text = optionalString(payload, "statusText") catch return;
+            try self.writeExtensionUISetStatusRequest(request.id, status_key, status_text);
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "setWidget")) {
+            const widget_key = requiredString(payload, "widgetKey") catch return;
+            const widget_lines = try optionalStringArray(self.allocator, payload, "widgetLines");
+            defer if (widget_lines) |lines| self.allocator.free(lines);
+            const widget_placement = optionalString(payload, "widgetPlacement") catch return;
+            try self.writeExtensionUISetWidgetRequest(request.id, widget_key, widget_lines, widget_placement);
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "setTitle")) {
+            const title = requiredString(payload, "title") catch return;
+            try self.writeExtensionUISetTitleRequest(request.id, title);
+            return;
+        }
+        if (std.mem.eql(u8, request.method, "set_editor_text")) {
+            const text = requiredString(payload, "text") catch return;
+            try self.writeExtensionUISetEditorTextRequest(request.id, text);
+            return;
+        }
+    }
+
     fn writeEvent(self: *TsRpcServer, event: agent.AgentEvent) !void {
         if (self.suppress_events) return;
         const value = try json_event_wire.agentEventToJsonValue(self.allocator, event);
@@ -1915,6 +2061,9 @@ pub fn runTsRpcMode(
     var server = TsRpcServer.init(allocator, io, session, stdout_writer, stderr_writer);
     try server.start();
     defer server.finish() catch {};
+    if (options.extension_host) |host_options| {
+        try server.startExtensionHost(host_options);
+    }
     if (options.extension_ui_parity_scenario) {
         try server.emitExtensionUIParityScenario();
     }
@@ -1932,6 +2081,7 @@ pub fn runTsRpcMode(
         if (byte == '\n') {
             try server.handleLine(line_buffer.items);
             line_buffer.clearRetainingCapacity();
+            try server.drainExtensionHostUiRequests(50);
             continue;
         }
         try line_buffer.append(allocator, byte);
@@ -1939,6 +2089,7 @@ pub fn runTsRpcMode(
 
     if (line_buffer.items.len > 0) {
         try server.handleLine(line_buffer.items);
+        try server.drainExtensionHostUiRequests(50);
     }
 
     if (server.hasInFlightPrompt()) {
@@ -2292,6 +2443,36 @@ fn optionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
     return switch (value) {
         .string => |string| string,
         else => error.InvalidFieldType,
+    };
+}
+
+fn requiredStringArray(allocator: std.mem.Allocator, object: std.json.ObjectMap, key: []const u8) ![]const []const u8 {
+    const value = object.get(key) orelse return error.MissingRequiredField;
+    const array = switch (value) {
+        .array => |items| items,
+        else => return error.InvalidFieldType,
+    };
+    var result = try allocator.alloc([]const u8, array.items.len);
+    errdefer allocator.free(result);
+    for (array.items, 0..) |item, index| {
+        result[index] = switch (item) {
+            .string => |string| string,
+            else => return error.InvalidFieldType,
+        };
+    }
+    return result;
+}
+
+fn optionalStringArray(allocator: std.mem.Allocator, object: std.json.ObjectMap, key: []const u8) !?[]const []const u8 {
+    if (object.get(key) == null) return null;
+    return try requiredStringArray(allocator, object, key);
+}
+
+fn optionalU64(object: std.json.ObjectMap, key: []const u8) ?u64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else null,
+        else => null,
     };
 }
 
@@ -4753,6 +4934,118 @@ test "TS RPC extension UI timeout and cancel resolve deterministic defaults" {
     try std.testing.expectEqualStrings("ui_select", server.completed_extension_requests.items[2].id);
     try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[2].resolution);
     try std.testing.expect(!try server.cancelPendingExtensionUIRequest("ui_select"));
+}
+
+test "M6 extension UI bridge serializes host requests and forwards responses exactly once" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-m6-extension-ui-bridge-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_select\",\"method\":\"select\",\"responseRequired\":true,\"payload\":{{\"title\":\"Choose fixture\",\"options\":[\"option-a\",\"option-b\"],\"timeout\":1000}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_confirm\",\"method\":\"confirm\",\"responseRequired\":true,\"payload\":{{\"title\":\"Confirm fixture\",\"message\":\"Proceed?\",\"timeout\":1000}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_input\",\"method\":\"input\",\"responseRequired\":true,\"payload\":{{\"title\":\"Fixture input\",\"placeholder\":\"value\",\"timeout\":1000}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_notify\",\"method\":\"notify\",\"payload\":{{\"message\":\"Fixture notice\",\"notifyType\":\"info\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_status\",\"method\":\"setStatus\",\"payload\":{{\"statusKey\":\"fixture\",\"statusText\":\"ready\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_widget\",\"method\":\"setWidget\",\"payload\":{{\"widgetKey\":\"fixture\",\"widgetLines\":[\"line one\",\"line two\"],\"widgetPlacement\":\"aboveEditor\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_title\",\"method\":\"setTitle\",\"payload\":{{\"title\":\"Fixture Title\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_editor_text\",\"method\":\"set_editor_text\",\"payload\":{{\"text\":\"fixture editor text\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_editor\",\"method\":\"editor\",\"responseRequired\":true,\"payload\":{{\"title\":\"Edit fixture\",\"prefill\":\"prefill\"}}}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m6-extension-ui-bridge" };
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-m6-extension-ui-bridge",
+        .fixture = "ui-bridge",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+    try server.drainExtensionHostUiRequests(100);
+
+    const expected =
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_select\",\"method\":\"select\",\"title\":\"Choose fixture\",\"options\":[\"option-a\",\"option-b\"],\"timeout\":1000}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_confirm\",\"method\":\"confirm\",\"title\":\"Confirm fixture\",\"message\":\"Proceed?\",\"timeout\":1000}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_input\",\"method\":\"input\",\"title\":\"Fixture input\",\"placeholder\":\"value\",\"timeout\":1000}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_notify\",\"method\":\"notify\",\"message\":\"Fixture notice\",\"notifyType\":\"info\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_status\",\"method\":\"setStatus\",\"statusKey\":\"fixture\",\"statusText\":\"ready\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_widget\",\"method\":\"setWidget\",\"widgetKey\":\"fixture\",\"widgetLines\":[\"line one\",\"line two\"],\"widgetPlacement\":\"aboveEditor\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_title\",\"method\":\"setTitle\",\"title\":\"Fixture Title\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_editor_text\",\"method\":\"set_editor_text\",\"text\":\"fixture editor text\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_editor\",\"method\":\"editor\",\"title\":\"Edit fixture\",\"prefill\":\"prefill\"}\n";
+    try std.testing.expectEqualStrings(expected, stdout_capture.writer.buffered());
+
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"value\":\"option-a\"}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":false}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"value\":\"edited text\"}");
+    try std.testing.expectEqual(@as(usize, 4), server.completed_extension_requests.items.len);
+    try std.testing.expectEqualStrings("ui_confirm", server.completed_extension_requests.items[0].id);
+    try std.testing.expectEqualStrings("ui_select", server.completed_extension_requests.items[1].id);
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"payload\":{\"confirmed\":true}}\n");
+    try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"payload\":{\"value\":\"option-a\"}}\n");
+    try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"payload\":{\"cancelled\":true}}\n");
+    try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"payload\":{\"value\":\"edited text\"}}\n");
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"payload\":{\"confirmed\":false}}\n") == null);
+}
+
+test "M6 extension UI bridge forwards timeout defaults to host" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-m6-extension-ui-timeout-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_confirm\",\"method\":\"confirm\",\"responseRequired\":true,\"payload\":{{\"title\":\"Confirm fixture\",\"message\":\"Proceed?\",\"timeout\":10}}}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m6-extension-ui-timeout" };
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-m6-extension-ui-timeout",
+        .fixture = "ui-timeout",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+    try server.drainExtensionHostUiRequests(100);
+    try expectContains(stdout_capture.writer.buffered(), "{\"type\":\"extension_ui_request\",\"id\":\"ui_confirm\",\"method\":\"confirm\",\"title\":\"Confirm fixture\",\"message\":\"Proceed?\",\"timeout\":10}\n");
+    try server.advanceExtensionUITime(10);
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"payload\":{\"confirmed\":false}}\n");
 }
 
 fn expectPromptLineTypeOrder(bytes: []const u8) !void {
