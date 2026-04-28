@@ -4,6 +4,7 @@ const fixture_files = [_][]const u8{
     "commands-input.jsonl",
     "jsonl-framing.jsonl",
     "parse-errors.jsonl",
+    "parse-error-corpus.jsonl",
     "responses-basic.jsonl",
     "events-base-stream.jsonl",
     "events-thinking-tool-usage.jsonl",
@@ -78,6 +79,8 @@ test "TS RPC response fixtures preserve parse and unknown-command quirks" {
 test "TS RPC parse-error fixtures cover multiple TypeScript JSON.parse messages" {
     const bytes = try readFixture("parse-errors.jsonl");
     defer std.testing.allocator.free(bytes);
+    const corpus = try readFixture("parse-error-corpus.jsonl");
+    defer std.testing.allocator.free(corpus);
 
     try expectContains(
         bytes,
@@ -95,6 +98,21 @@ test "TS RPC parse-error fixtures cover multiple TypeScript JSON.parse messages"
         bytes,
         "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Unexpected token ']', \\\"[1,]\\\" is not valid JSON\"}\n",
     );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)\"}\n",
+    );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Expected ':' after property name in JSON at position 5 (line 1 column 6)\"}\n",
+    );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Unexpected token '#', \\\"{\\\"a\\\":#}\\\" is not valid JSON\"}\n",
+    );
+    try expectContains(corpus, "\"name\":\"extra-tokens-after-primitive\",\"input\":\"1 2\"");
+    try expectContains(corpus, "\"name\":\"missing-colon\",\"input\":\"{\\\"a\\\" 1}\"");
+    try expectContains(corpus, "\"name\":\"invalid-value-token\",\"input\":\"{\\\"a\\\":#}\"");
 }
 
 test "TS RPC framing fixture captures LF CRLF final-line and Unicode separator behavior" {

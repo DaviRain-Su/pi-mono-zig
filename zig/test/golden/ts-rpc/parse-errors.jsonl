@@ -1,5 +1,18 @@
 {"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
 {"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unterminated string in JSON at position 13 (line 1 column 14)"}
 {"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected token 'o', \"not-json\" is not valid JSON"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected end of JSON input"}
 {"type":"response","command":"parse","success":false,"error":"Failed to parse command: Expected double-quoted property name in JSON at position 20 (line 1 column 21)"}
 {"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected token ']', \"[1,]\" is not valid JSON"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected non-whitespace character after JSON at position 3 (line 1 column 4)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected non-whitespace character after JSON at position 3 (line 1 column 4)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Expected ':' after property name in JSON at position 5 (line 1 column 6)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Unexpected token '#', \"{\"a\":#}\" is not valid JSON"}
+{"type":"response","command":"parse","success":false,"error":"Failed to parse command: Bad Unicode escape in JSON at position 5 (line 1 column 6)"}
