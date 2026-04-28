@@ -127,6 +127,7 @@ test "TS RPC M4 extension UI fixtures cover request and response variants" {
     try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"value\":\"option-a\"}\n");
     try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}\n");
     try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}\n");
+    try expectContains(bytes, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm_cancelled\",\"cancelled\":true}\n");
 }
 
 test "TS RPC parse-error fixtures cover multiple TypeScript JSON.parse messages" {

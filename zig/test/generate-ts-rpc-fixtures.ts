@@ -309,6 +309,7 @@ const extensionUiResponses = [
 	{ type: "extension_ui_response", id: "ui_select", value: "option-a" },
 	{ type: "extension_ui_response", id: "ui_confirm", confirmed: true },
 	{ type: "extension_ui_response", id: "ui_input", cancelled: true },
+	{ type: "extension_ui_response", id: "ui_confirm_cancelled", cancelled: true },
 ] satisfies RpcExtensionUIResponse[];
 
 const responseScenarioInput = jsonl([

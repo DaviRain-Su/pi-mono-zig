@@ -21,8 +21,8 @@
 		{
 			"path": "commands-input.jsonl",
 			"description": "All current TS RPC command input shapes plus extension_ui_response variants.",
-			"byteLength": 1989,
-			"lineCount": 32
+			"byteLength": 2067,
+			"lineCount": 33
 		},
 		{
 			"path": "bash-control.jsonl",
@@ -87,8 +87,8 @@
 		{
 			"path": "extension-ui.jsonl",
 			"description": "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
-			"byteLength": 1302,
-			"lineCount": 12
+			"byteLength": 1380,
+			"lineCount": 13
 		}
 	]
 }

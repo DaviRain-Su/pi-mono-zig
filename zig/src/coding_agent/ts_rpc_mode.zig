@@ -754,7 +754,7 @@ const TsRpcServer = struct {
 
         if (object.get("cancelled")) |cancelled_value| {
             if (cancelled_value == .bool and cancelled_value.bool) {
-                _ = try self.resolvePendingExtensionUIRequest(id, .none);
+                _ = try self.cancelPendingExtensionUIRequest(id);
                 return;
             }
         }
@@ -4675,6 +4675,45 @@ test "TS RPC extension UI responses resolve pending requests like TypeScript" {
     try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[2].resolution);
     try std.testing.expectEqual(ExtensionUIDialogMethod.editor, server.completed_extension_requests.items[3].method);
     try std.testing.expectEqualStrings("edited text", server.completed_extension_requests.items[3].resolution.value);
+}
+
+test "TS RPC cancelled extension UI responses use pending method defaults" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    try server.registerPendingExtensionUIRequest("ui_select_cancelled", .select, 1000);
+    try server.registerPendingExtensionUIRequest("ui_confirm_cancelled", .confirm, 1000);
+    try server.registerPendingExtensionUIRequest("ui_input_cancelled", .input, 1000);
+    try server.registerPendingExtensionUIRequest("ui_editor_cancelled", .editor, null);
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_select_cancelled\",\"cancelled\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm_cancelled\",\"cancelled\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_input_cancelled\",\"cancelled\":true}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_editor_cancelled\",\"cancelled\":true}");
+
+    try std.testing.expectEqual(@as(usize, 0), stdout_capture.writer.buffered().len);
+    try std.testing.expectEqual(@as(u32, 0), server.pending_extension_requests.count());
+    try std.testing.expectEqual(@as(usize, 4), server.completed_extension_requests.items.len);
+
+    try std.testing.expectEqual(ExtensionUIDialogMethod.select, server.completed_extension_requests.items[0].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[0].resolution);
+
+    try std.testing.expectEqual(ExtensionUIDialogMethod.confirm, server.completed_extension_requests.items[1].method);
+    switch (server.completed_extension_requests.items[1].resolution) {
+        .confirmed => |confirmed| try std.testing.expect(!confirmed),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(ExtensionUIDialogMethod.input, server.completed_extension_requests.items[2].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[2].resolution);
+
+    try std.testing.expectEqual(ExtensionUIDialogMethod.editor, server.completed_extension_requests.items[3].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[3].resolution);
 }
 
 test "TS RPC extension UI timeout and cancel resolve deterministic defaults" {
