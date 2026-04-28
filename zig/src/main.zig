@@ -234,7 +234,9 @@ fn runCliWithInput(
                 allocator,
                 io,
                 &session,
-                .{},
+                .{
+                    .extension_ui_parity_scenario = isEnabledEnv(&effective_env_map, "PI_TS_RPC_EXTENSION_UI_PARITY_SCENARIO"),
+                },
                 stdout,
                 stderr,
             );
@@ -303,6 +305,11 @@ fn runCliWithInput(
         },
         stderr,
     );
+}
+
+fn isEnabledEnv(env_map: *const std.process.Environ.Map, key: []const u8) bool {
+    const value = env_map.get(key) orelse return false;
+    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes");
 }
 
 fn prepareEffectiveEnvMap(
