@@ -25,6 +25,12 @@
 			"lineCount": 32
 		},
 		{
+			"path": "bash-control.jsonl",
+			"description": "runRpcMode stdout bytes for direct bash success, failure, abort, and live command interleaving result shapes.",
+			"byteLength": 797,
+			"lineCount": 7
+		},
+		{
 			"path": "jsonl-framing.jsonl",
 			"description": "Strict JSONL reader observations plus runRpcMode stdout bytes for LF, CRLF, parse-error, and final unterminated input.",
 			"byteLength": 4145,
@@ -45,8 +51,8 @@
 		{
 			"path": "responses-basic.jsonl",
 			"description": "runRpcMode stdout bytes for success, success-with-data, null data, command errors, parse error, and unknown-command quirk responses.",
-			"byteLength": 4233,
-			"lineCount": 17
+			"byteLength": 4835,
+			"lineCount": 22
 		},
 		{
 			"path": "events-base-stream.jsonl",

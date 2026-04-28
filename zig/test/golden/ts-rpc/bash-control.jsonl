@@ -1,7 +1,7 @@
-{"id":"bash_ok","type":"response","command":"bash","success":true,"data":{"output":"ok","exitCode":0,"cancelled":false,"truncated":false}}
-{"id":"bash_fail","type":"response","command":"bash","success":true,"data":{"output":"fail","exitCode":7,"cancelled":false,"truncated":false}}
 {"id":"abort","type":"response","command":"abort_bash","success":true}
-{"id":"bash_abort","type":"response","command":"bash","success":true,"data":{"output":"start\n","cancelled":true,"truncated":false}}
 {"id":"live_commands","type":"response","command":"get_commands","success":true,"data":{"commands":[]}}
 {"id":"live_abort","type":"response","command":"abort_bash","success":true}
+{"id":"bash_ok","type":"response","command":"bash","success":true,"data":{"output":"ok","exitCode":0,"cancelled":false,"truncated":false}}
+{"id":"bash_fail","type":"response","command":"bash","success":true,"data":{"output":"fail","exitCode":7,"cancelled":false,"truncated":false}}
+{"id":"bash_abort","type":"response","command":"bash","success":true,"data":{"output":"start\n","cancelled":true,"truncated":false}}
 {"id":"live_bash","type":"response","command":"bash","success":true,"data":{"output":"live\n","cancelled":true,"truncated":false}}

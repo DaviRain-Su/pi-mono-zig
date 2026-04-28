@@ -58,6 +58,7 @@ type RuntimeScenario =
 	| "events-thinking-tool-usage"
 	| "events-session-extras"
 	| "prompt-concurrency-queue-order"
+	| "bash-control"
 	| "extension-ui";
 
 interface RuntimeCaptureOptions {
@@ -321,11 +322,26 @@ const responseScenarioInput = jsonl([
 	{ id: "resp_stats", type: "get_session_stats" },
 	{ id: "resp_export", type: "export_html", outputPath: "/tmp/pi-ts-rpc/export.html" },
 	{ id: "resp_fork", type: "fork", entryId: "entry_fixture_1" },
+	{ id: "resp_new_session", type: "new_session" },
+	{ id: "resp_switch_session", type: "switch_session", sessionPath: "/tmp/pi-ts-rpc/session.jsonl" },
+	{ id: "resp_clone", type: "clone" },
+	{ id: "resp_fork_messages", type: "get_fork_messages" },
+	{ id: "resp_set_session_name", type: "set_session_name", name: "fixture session" },
 	{ id: "resp_messages", type: "get_messages" },
 	{ id: "resp_commands", type: "get_commands" },
 	{ id: "resp_set_model_error", type: "set_model", provider: "anthropic", modelId: "missing-model" },
 	{ id: "resp_thrown", type: "bash", command: "throw" },
 ]) + "{not json\n" + serializeJsonLine({ id: "mystery", type: "mystery_command" });
+
+const bashControlScenarioInput = jsonl([
+	{ id: "bash_ok", type: "bash", command: "fixture-ok" },
+	{ id: "bash_fail", type: "bash", command: "fixture-fail" },
+	{ id: "bash_abort", type: "bash", command: "fixture-abort" },
+	{ id: "abort", type: "abort_bash" },
+	{ id: "live_bash", type: "bash", command: "fixture-live" },
+	{ id: "live_commands", type: "get_commands" },
+	{ id: "live_abort", type: "abort_bash" },
+] satisfies RpcCommand[]);
 
 const promptConcurrencyScenarioInput = jsonl([
 	{ id: "pc_start", type: "prompt", message: "start slow" },
@@ -526,13 +542,16 @@ class FixtureSession {
 		getAvailable: async () => [model],
 	};
 	readonly extensionRunner = {
-		getRegisteredCommands: () => [
-			{
-				invocationName: slashCommand.name,
-				description: slashCommand.description,
-				sourceInfo: slashCommand.sourceInfo,
-			},
-		],
+		getRegisteredCommands: () =>
+			this.scenario === "bash-control"
+				? []
+				: [
+						{
+							invocationName: slashCommand.name,
+							description: slashCommand.description,
+							sourceInfo: slashCommand.sourceInfo,
+						},
+					],
 	};
 	readonly promptTemplates: RpcSlashCommand[] = [];
 	readonly resourceLoader = { getSkills: () => ({ skills: [] }) };
@@ -551,6 +570,7 @@ class FixtureSession {
 	private listeners: Array<(event: AgentSessionEvent) => void> = [];
 	private steeringMessages: string[] = [];
 	private followUpMessages: string[] = [];
+	private pendingBashResolvers: Array<() => void> = [];
 
 	constructor(scenario: RuntimeScenario) {
 		this.scenario = scenario;
@@ -646,6 +666,24 @@ class FixtureSession {
 		if (command === "throw") {
 			throw new Error("Command fixture failure");
 		}
+		if (this.scenario === "bash-control") {
+			if (command === "fixture-ok") {
+				return { output: "ok", exitCode: 0, cancelled: false, truncated: false };
+			}
+			if (command === "fixture-fail") {
+				return { output: "fail", exitCode: 7, cancelled: false, truncated: false };
+			}
+			if (command === "fixture-abort") {
+				return new Promise((resolve) => {
+					this.pendingBashResolvers.push(() => resolve({ output: "start\n", cancelled: true, truncated: false }));
+				});
+			}
+			if (command === "fixture-live") {
+				return new Promise((resolve) => {
+					this.pendingBashResolvers.push(() => resolve({ output: "live\n", cancelled: true, truncated: false }));
+				});
+			}
+		}
 		return {
 			output: "fixture\n",
 			exitCode: 0,
@@ -654,7 +692,10 @@ class FixtureSession {
 			fullOutputPath: "/tmp/pi-ts-rpc/full-output.txt",
 		};
 	}
-	abortBash(): void {}
+	abortBash(): void {
+		const resolve = this.pendingBashResolvers.shift();
+		resolve?.();
+	}
 	getSessionStats(): object {
 		return {
 			sessionFile: "/tmp/pi-ts-rpc/session.jsonl",
@@ -748,6 +789,11 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			path: "commands-input.jsonl",
 			description: "All current TS RPC command input shapes plus extension_ui_response variants.",
 			bytes: jsonl([...commands, ...extensionUiResponses]),
+		},
+		{
+			path: "bash-control.jsonl",
+			description: "runRpcMode stdout bytes for direct bash success, failure, abort, and live command interleaving result shapes.",
+			bytes: captureRuntimeStdout("bash-control", { input: bashControlScenarioInput }),
 		},
 		{
 			path: "jsonl-framing.jsonl",
