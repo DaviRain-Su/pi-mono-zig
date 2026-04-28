@@ -29,6 +29,7 @@ const DeferredResponsePriority = enum(u8) {
     queued_prompt = 0,
     abort = 1,
     queue_control = 2,
+    bash_completion = 3,
 };
 
 const DEFERRED_RESPONSE_FLUSH_INTERVAL_MS = 50;
@@ -37,12 +38,14 @@ const DIRECT_BASH_MAX_BUFFER_BYTES = truncate.DEFAULT_MAX_BYTES * 2;
 const DeferredResponse = struct {
     id: ?[]u8,
     command: []u8,
+    data_json: ?[]u8 = null,
     priority: DeferredResponsePriority,
     sequence: usize,
 
     fn deinit(self: *DeferredResponse, allocator: std.mem.Allocator) void {
         if (self.id) |id_string| allocator.free(id_string);
         allocator.free(self.command);
+        if (self.data_json) |data| allocator.free(data);
         self.* = undefined;
     }
 };
@@ -68,6 +71,7 @@ const BashTask = struct {
     cwd: []u8,
     id: ?[]u8,
     command: []u8,
+    response_sequence: usize,
     abort_signal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -80,6 +84,7 @@ const BashTask = struct {
         cwd: []const u8,
         id: ?[]const u8,
         command: []const u8,
+        response_sequence: usize,
     ) !*BashTask {
         const task = try allocator.create(BashTask);
         errdefer allocator.destroy(task);
@@ -96,6 +101,7 @@ const BashTask = struct {
             .cwd = cwd_copy,
             .id = id_copy,
             .command = command_copy,
+            .response_sequence = response_sequence,
         };
         return task;
     }
@@ -124,7 +130,7 @@ const BashTask = struct {
             return;
         };
         defer self.allocator.free(data);
-        self.server.writeSuccessResponseRawData(self.id, "bash", data) catch {};
+        self.server.enqueueDeferredRawData(self.id, "bash", data, .bash_completion, self.response_sequence) catch {};
     }
 
     fn isDone(self: *const BashTask) bool {
@@ -358,7 +364,7 @@ const TsRpcSessionHost = struct {
         errdefer replacement.deinit();
 
         self.server.cancelAndJoinPromptTasks();
-        self.server.cancelAndJoinBashTask();
+        self.server.cancelAndJoinBashTasks();
         self.server.detachFromCurrentSession();
         old.deinit();
         old.* = replacement;
@@ -414,13 +420,14 @@ const TsRpcServer = struct {
     output_mutex: std.Io.Mutex = .init,
     subscriber: ?agent.AgentSubscriber = null,
     prompt_tasks: std.ArrayList(*PromptTask) = .empty,
-    bash_task: ?*BashTask = null,
+    bash_tasks: std.ArrayList(*BashTask) = .empty,
     bash_task_mutex: std.Io.Mutex = .init,
     deferred_responses: std.ArrayList(DeferredResponse) = .empty,
     deferred_responses_mutex: std.Io.Mutex = .init,
     deferred_flush_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     deferred_flush_thread: ?std.Thread = null,
     next_deferred_response_sequence: usize = 0,
+    next_bash_response_sequence: usize = 0,
     suppress_events: bool = false,
     finished: bool = false,
 
@@ -462,12 +469,15 @@ const TsRpcServer = struct {
             task.joinAndDestroy();
         }
         self.prompt_tasks.clearRetainingCapacity();
-        self.joinBashTask();
+        self.joinBashTasks();
+        try self.flushDeferredResponses();
         self.detachFromCurrentSession();
         self.prompt_tasks.deinit(self.allocator);
         self.prompt_tasks = .empty;
         self.deferred_responses.deinit(self.allocator);
         self.deferred_responses = .empty;
+        self.bash_tasks.deinit(self.allocator);
+        self.bash_tasks = .empty;
         try self.stdout_writer.flush();
         try self.stderr_writer.flush();
     }
@@ -524,53 +534,75 @@ const TsRpcServer = struct {
     fn takeCompletedBashTask(self: *TsRpcServer) ?*BashTask {
         self.bash_task_mutex.lockUncancelable(self.io);
         defer self.bash_task_mutex.unlock(self.io);
-        const task = self.bash_task orelse return null;
-        if (!task.isDone()) return null;
-        self.bash_task = null;
-        return task;
+        for (self.bash_tasks.items, 0..) |task, index| {
+            if (task.isDone()) return self.bash_tasks.orderedRemove(index);
+        }
+        return null;
     }
 
-    fn reapCompletedBashTask(self: *TsRpcServer) void {
-        if (self.takeCompletedBashTask()) |task| {
+    fn reapCompletedBashTasks(self: *TsRpcServer) void {
+        while (self.takeCompletedBashTask()) |task| {
             task.joinAndDestroy();
         }
     }
 
     fn hasActiveBashTask(self: *TsRpcServer) bool {
-        self.reapCompletedBashTask();
+        self.reapCompletedBashTasks();
         self.bash_task_mutex.lockUncancelable(self.io);
         defer self.bash_task_mutex.unlock(self.io);
-        return self.bash_task != null;
+        return self.bash_tasks.items.len != 0;
     }
 
     fn activeBashTaskStarted(self: *TsRpcServer) bool {
         self.bash_task_mutex.lockUncancelable(self.io);
         defer self.bash_task_mutex.unlock(self.io);
-        const task = self.bash_task orelse return false;
-        return task.isStarted();
+        for (self.bash_tasks.items) |task| {
+            if (task.isStarted()) return true;
+        }
+        return false;
+    }
+
+    fn hasUnfinishedBashTask(self: *TsRpcServer) bool {
+        self.bash_task_mutex.lockUncancelable(self.io);
+        defer self.bash_task_mutex.unlock(self.io);
+        for (self.bash_tasks.items) |task| {
+            if (!task.isDone()) return true;
+        }
+        return false;
     }
 
     fn abortActiveBashTask(self: *TsRpcServer) void {
+        self.reapCompletedBashTasks();
         self.bash_task_mutex.lockUncancelable(self.io);
         defer self.bash_task_mutex.unlock(self.io);
-        if (self.bash_task) |task| task.abort();
+        var index = self.bash_tasks.items.len;
+        while (index > 0) {
+            index -= 1;
+            const task = self.bash_tasks.items[index];
+            if (!task.isDone()) {
+                task.abort();
+                return;
+            }
+        }
     }
 
-    fn cancelAndJoinBashTask(self: *TsRpcServer) void {
+    fn cancelAndJoinBashTasks(self: *TsRpcServer) void {
         self.bash_task_mutex.lockUncancelable(self.io);
-        const task = self.bash_task;
-        self.bash_task = null;
-        if (task) |some| some.abort();
+        while (self.bash_tasks.items.len > 0) {
+            const task = self.bash_tasks.orderedRemove(0);
+            task.abort();
+            task.joinAndDestroy();
+        }
         self.bash_task_mutex.unlock(self.io);
-        if (task) |some| some.joinAndDestroy();
     }
 
-    fn joinBashTask(self: *TsRpcServer) void {
+    fn joinBashTasks(self: *TsRpcServer) void {
         self.bash_task_mutex.lockUncancelable(self.io);
-        const task = self.bash_task;
-        self.bash_task = null;
+        while (self.bash_tasks.items.len > 0) {
+            const task = self.bash_tasks.orderedRemove(0);
+            task.joinAndDestroy();
+        }
         self.bash_task_mutex.unlock(self.io);
-        if (task) |some| some.joinAndDestroy();
     }
 
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
@@ -628,7 +660,7 @@ const TsRpcServer = struct {
         command: []const u8,
         object: std.json.ObjectMap,
     ) !void {
-        self.reapCompletedBashTask();
+        self.reapCompletedBashTasks();
         const session = self.session orelse {
             try self.writeNotImplemented(id, command);
             return;
@@ -912,26 +944,28 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            if (self.hasActiveBashTask()) {
-                try self.writeErrorResponse(id, command, "Bash command is already running");
-                return;
-            }
-            const task = BashTask.create(self.allocator, self.io, self, session.cwd, id, bash_command) catch |err| {
+            const response_sequence = self.next_bash_response_sequence;
+            self.next_bash_response_sequence += 1;
+            const task = BashTask.create(self.allocator, self.io, self, session.cwd, id, bash_command, response_sequence) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
             self.bash_task_mutex.lockUncancelable(self.io);
-            if (self.bash_task != null) {
+            self.bash_tasks.append(self.allocator, task) catch |err| {
                 self.bash_task_mutex.unlock(self.io);
                 task.joinAndDestroy();
-                try self.writeErrorResponse(id, command, "Bash command is already running");
+                try self.writeCommandError(id, command, err);
                 return;
-            }
-            self.bash_task = task;
+            };
             self.bash_task_mutex.unlock(self.io);
             task.spawn() catch |err| {
                 self.bash_task_mutex.lockUncancelable(self.io);
-                if (self.bash_task == task) self.bash_task = null;
+                for (self.bash_tasks.items, 0..) |candidate, index| {
+                    if (candidate == task) {
+                        _ = self.bash_tasks.orderedRemove(index);
+                        break;
+                    }
+                }
                 self.bash_task_mutex.unlock(self.io);
                 task.joinAndDestroy();
                 try self.writeCommandError(id, command, err);
@@ -1435,6 +1469,26 @@ const TsRpcServer = struct {
         self.next_deferred_response_sequence += 1;
     }
 
+    fn enqueueDeferredRawData(
+        self: *TsRpcServer,
+        id: ?[]const u8,
+        command: []const u8,
+        data_json: []const u8,
+        priority: DeferredResponsePriority,
+        sequence: usize,
+    ) !void {
+        self.deferred_responses_mutex.lockUncancelable(self.io);
+        defer self.deferred_responses_mutex.unlock(self.io);
+
+        try self.deferred_responses.append(self.allocator, .{
+            .id = if (id) |id_string| try self.allocator.dupe(u8, id_string) else null,
+            .command = try self.allocator.dupe(u8, command),
+            .data_json = try self.allocator.dupe(u8, data_json),
+            .priority = priority,
+            .sequence = sequence,
+        });
+    }
+
     fn flushDeferredResponses(self: *TsRpcServer) !void {
         self.deferred_responses_mutex.lockUncancelable(self.io);
         defer self.deferred_responses_mutex.unlock(self.io);
@@ -1442,14 +1496,27 @@ const TsRpcServer = struct {
         if (self.deferred_responses.items.len == 0) return;
         var should_abort_after_flush = false;
         std.mem.sort(DeferredResponse, self.deferred_responses.items, {}, lessThanDeferredResponse);
-        for (self.deferred_responses.items) |*response| {
-            try self.writeSuccessResponseNoData(response.id, response.command);
+        const hold_bash_completions = self.hasUnfinishedBashTask();
+        var keep_count: usize = 0;
+        for (self.deferred_responses.items, 0..) |*response, index| {
+            if (response.priority == .bash_completion and hold_bash_completions) {
+                if (keep_count != index) {
+                    self.deferred_responses.items[keep_count] = response.*;
+                }
+                keep_count += 1;
+                continue;
+            }
+            if (response.data_json) |data_json| {
+                try self.writeSuccessResponseRawData(response.id, response.command, data_json);
+            } else {
+                try self.writeSuccessResponseNoData(response.id, response.command);
+            }
             if (std.mem.eql(u8, response.command, "abort")) {
                 should_abort_after_flush = true;
             }
             response.deinit(self.allocator);
         }
-        self.deferred_responses.clearRetainingCapacity();
+        self.deferred_responses.shrinkRetainingCapacity(keep_count);
         if (should_abort_after_flush) {
             self.abortActivePromptWork();
         }
@@ -2673,6 +2740,18 @@ fn waitForOutputContains(
     try expectContains(writer.buffered(), needle);
 }
 
+fn waitForAbsoluteFile(path: []const u8, timeout_ms: u64) !void {
+    var elapsed: u64 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 5) {
+        if (std.Io.Dir.openFileAbsolute(std.testing.io, path, .{})) |file| {
+            file.close(std.testing.io);
+            return;
+        } else |_| {}
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    _ = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+}
+
 fn waitForNoActiveBashTask(server: *TsRpcServer, timeout_ms: u64) !void {
     var elapsed: u64 = 0;
     while (elapsed <= timeout_ms) : (elapsed += 5) {
@@ -3659,6 +3738,66 @@ test "TS RPC command loop remains live while direct bash is active" {
             "{\"id\":\"live_bash\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"live\\n\",\"cancelled\":true,\"truncated\":false}}\n",
         stdout_capture.writer.buffered(),
     );
+}
+
+test "TS RPC production bash-control script matches generated TypeScript fixture bytes" {
+    const allocator = std.testing.allocator;
+    const start_marker = try allocator.dupe(u8, "/tmp/pi-ts-rpc-bash-control-start");
+    defer allocator.free(start_marker);
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, start_marker) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, start_marker) catch {};
+    const live_marker = try allocator.dupe(u8, "/tmp/pi-ts-rpc-bash-control-live");
+    defer allocator.free(live_marker);
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, live_marker) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, live_marker) catch {};
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var bash_abort_command = std.Io.Writer.Allocating.init(allocator);
+    defer bash_abort_command.deinit();
+    try bash_abort_command.writer.print("printf 'start\\n'; touch {s}; sleep 5; printf end", .{start_marker});
+    var bash_abort_line = std.Io.Writer.Allocating.init(allocator);
+    defer bash_abort_line.deinit();
+    try bash_abort_line.writer.writeAll("{\"id\":\"bash_abort\",\"type\":\"bash\",\"command\":");
+    try writeJsonString(allocator, &bash_abort_line.writer, bash_abort_command.written());
+    try bash_abort_line.writer.writeAll("}");
+
+    var live_command = std.Io.Writer.Allocating.init(allocator);
+    defer live_command.deinit();
+    try live_command.writer.print("printf 'live\\n'; touch {s}; sleep 5; printf done", .{live_marker});
+    var live_line = std.Io.Writer.Allocating.init(allocator);
+    defer live_line.deinit();
+    try live_line.writer.writeAll("{\"id\":\"live_bash\",\"type\":\"bash\",\"command\":");
+    try writeJsonString(allocator, &live_line.writer, live_command.written());
+    try live_line.writer.writeAll("}");
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"bash_ok\",\"type\":\"bash\",\"command\":\"printf ok\"}");
+    try server.handleLine("{\"id\":\"bash_fail\",\"type\":\"bash\",\"command\":\"printf fail; exit 7\"}");
+    try server.handleLine(bash_abort_line.written());
+    try waitForAbsoluteFile(start_marker, 500);
+    try server.handleLine("{\"id\":\"abort\",\"type\":\"abort_bash\"}");
+    try server.handleLine(live_line.written());
+    try waitForAbsoluteFile(live_marker, 500);
+    try server.handleLine("{\"id\":\"live_commands\",\"type\":\"get_commands\"}");
+    try server.handleLine("{\"id\":\"live_abort\",\"type\":\"abort_bash\"}");
+    try server.finish();
+
+    const expected = try readFixture("bash-control.jsonl");
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, stdout_capture.writer.buffered());
 }
 
 test "TS RPC M3 session host rebinds new switch fork clone and state" {
