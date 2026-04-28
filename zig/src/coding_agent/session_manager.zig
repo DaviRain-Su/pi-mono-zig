@@ -777,12 +777,7 @@ pub const SessionManager = struct {
             try manager.appendLoadedEntry(try cloneEntry(self.allocator, entry.*));
         }
 
-        for (self.entries.items) |entry| {
-            if (entry != .label) continue;
-            const label = entry.label;
-            if (!branchContainsEntry(path, label.target_id)) continue;
-            try manager.appendLoadedEntry(try cloneEntry(self.allocator, entry));
-        }
+        try appendBranchedLabelEntries(self, &manager, path);
 
         try manager.persistToDisk();
         return manager;
@@ -1589,6 +1584,77 @@ fn branchContainsEntry(branch: []const *const SessionEntry, id: []const u8) bool
         if (std.mem.eql(u8, entry.id(), id)) return true;
     }
     return false;
+}
+
+fn orderedLabelTargetIndex(targets: []const []const u8, target_id: []const u8) ?usize {
+    for (targets, 0..) |candidate, index| {
+        if (std.mem.eql(u8, candidate, target_id)) return index;
+    }
+    return null;
+}
+
+fn appendBranchedLabelEntries(
+    source: *const SessionManager,
+    manager: *SessionManager,
+    branch_path: []const *const SessionEntry,
+) !void {
+    var ordered_targets = std.ArrayList([]const u8).empty;
+    defer ordered_targets.deinit(source.allocator);
+
+    for (source.entries.items) |entry| {
+        if (entry != .label) continue;
+        const label_entry = entry.label;
+        if (!branchContainsEntry(branch_path, label_entry.target_id)) continue;
+
+        if (label_entry.label == null) {
+            if (orderedLabelTargetIndex(ordered_targets.items, label_entry.target_id)) |index| {
+                _ = ordered_targets.orderedRemove(index);
+            }
+            continue;
+        }
+
+        if (orderedLabelTargetIndex(ordered_targets.items, label_entry.target_id) == null) {
+            try ordered_targets.append(source.allocator, label_entry.target_id);
+        }
+    }
+
+    for (ordered_targets.items) |target_id| {
+        const resolved_label = source.labels_by_id.get(target_id) orelse continue;
+        const label_timestamp = source.label_timestamps_by_id.get(target_id) orelse continue;
+
+        var id: ?[]u8 = try generateUniqueId(manager.allocator, &manager.by_id);
+        errdefer if (id) |value| manager.allocator.free(value);
+
+        var parent_id: ?[]u8 = if (manager.leaf_id) |leaf_id| try manager.allocator.dupe(u8, leaf_id) else null;
+        errdefer if (parent_id) |value| manager.allocator.free(value);
+
+        var timestamp: ?[]u8 = try manager.allocator.dupe(u8, label_timestamp);
+        errdefer if (timestamp) |value| manager.allocator.free(value);
+
+        var owned_target_id: ?[]u8 = try manager.allocator.dupe(u8, target_id);
+        errdefer if (owned_target_id) |value| manager.allocator.free(value);
+
+        var owned_label: ?[]u8 = try manager.allocator.dupe(u8, resolved_label);
+        errdefer if (owned_label) |value| manager.allocator.free(value);
+
+        var entry = SessionEntry{ .label = .{
+            .id = id.?,
+            .parent_id = parent_id,
+            .timestamp = timestamp.?,
+            .target_id = owned_target_id.?,
+            .label = owned_label,
+        } };
+        id = null;
+        parent_id = null;
+        timestamp = null;
+        owned_target_id = null;
+        owned_label = null;
+
+        var committed = false;
+        errdefer if (!committed) deinitEntry(manager.allocator, &entry);
+        try manager.appendLoadedEntry(entry);
+        committed = true;
+    }
 }
 
 fn cloneParentId(allocator: std.mem.Allocator, parent_id: ?[]const u8) !?[]const u8 {
@@ -2993,6 +3059,79 @@ test "session manager persists session names and labels" {
 
     try std.testing.expectEqualStrings("Night Shift", reopened.getSessionName().?);
     try std.testing.expectEqualStrings("bookmark", reopened.getLabel(user_id).?);
+}
+
+test "session manager createBranchedSession recreates label parent chain from branch tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project", session_dir);
+    defer manager.deinit();
+
+    var first = try userTextMessage(std.testing.allocator, "first", 1);
+    defer deinitMessage(std.testing.allocator, &first);
+    const first_id = try manager.appendMessage(first);
+
+    var second = try assistantTextMessage(std.testing.allocator, "second", model, 2);
+    defer deinitMessage(std.testing.allocator, &second);
+    const second_id = try manager.appendMessage(second);
+
+    var third = try userTextMessage(std.testing.allocator, "third", 3);
+    defer deinitMessage(std.testing.allocator, &third);
+    _ = try manager.appendMessage(third);
+
+    const obsolete_first_label_id = try manager.appendLabelChange(first_id, "first draft");
+    const second_label_id = try manager.appendLabelChange(second_id, "second label");
+    const final_first_label_id = try manager.appendLabelChange(first_id, "first final");
+
+    var branched = try manager.createBranchedSession(second_id);
+    defer branched.deinit();
+
+    const entries = branched.getEntries();
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expect(entries[0] == .message);
+    try std.testing.expect(entries[1] == .message);
+    try std.testing.expect(entries[2] == .label);
+    try std.testing.expect(entries[3] == .label);
+    try std.testing.expectEqualStrings(first_id, entries[0].message.id);
+    try std.testing.expectEqualStrings(second_id, entries[1].message.id);
+
+    try std.testing.expect(entries[2].label.parent_id != null);
+    try std.testing.expectEqualStrings(second_id, entries[2].label.parent_id.?);
+    try std.testing.expectEqualStrings(first_id, entries[2].label.target_id);
+    try std.testing.expectEqualStrings("first final", entries[2].label.label.?);
+    try std.testing.expect(!std.mem.eql(u8, obsolete_first_label_id, entries[2].label.id));
+    try std.testing.expect(!std.mem.eql(u8, final_first_label_id, entries[2].label.id));
+
+    try std.testing.expect(entries[3].label.parent_id != null);
+    try std.testing.expectEqualStrings(entries[2].label.id, entries[3].label.parent_id.?);
+    try std.testing.expectEqualStrings(second_id, entries[3].label.target_id);
+    try std.testing.expectEqualStrings("second label", entries[3].label.label.?);
+    try std.testing.expect(!std.mem.eql(u8, second_label_id, entries[3].label.id));
+
+    try std.testing.expectEqualStrings("first final", branched.getLabel(first_id).?);
+    try std.testing.expectEqualStrings("second label", branched.getLabel(second_id).?);
 }
 
 test "session manager persists branch summaries and custom entry types" {
