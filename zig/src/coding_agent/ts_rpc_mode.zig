@@ -588,21 +588,29 @@ const TsRpcServer = struct {
 
     fn cancelAndJoinBashTasks(self: *TsRpcServer) void {
         self.bash_task_mutex.lockUncancelable(self.io);
-        while (self.bash_tasks.items.len > 0) {
-            const task = self.bash_tasks.orderedRemove(0);
+        var tasks = self.bash_tasks;
+        self.bash_tasks = .empty;
+        for (tasks.items) |task| {
             task.abort();
-            task.joinAndDestroy();
         }
         self.bash_task_mutex.unlock(self.io);
+        defer tasks.deinit(self.allocator);
+
+        for (tasks.items) |task| {
+            task.joinAndDestroy();
+        }
     }
 
     fn joinBashTasks(self: *TsRpcServer) void {
         self.bash_task_mutex.lockUncancelable(self.io);
-        while (self.bash_tasks.items.len > 0) {
-            const task = self.bash_tasks.orderedRemove(0);
+        var tasks = self.bash_tasks;
+        self.bash_tasks = .empty;
+        self.bash_task_mutex.unlock(self.io);
+        defer tasks.deinit(self.allocator);
+
+        for (tasks.items) |task| {
             task.joinAndDestroy();
         }
-        self.bash_task_mutex.unlock(self.io);
     }
 
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
@@ -3738,6 +3746,81 @@ test "TS RPC command loop remains live while direct bash is active" {
             "{\"id\":\"live_bash\",\"type\":\"response\",\"command\":\"bash\",\"success\":true,\"data\":{\"output\":\"live\\n\",\"cancelled\":true,\"truncated\":false}}\n",
         stdout_capture.writer.buffered(),
     );
+}
+
+test "TS RPC bash cleanup releases task mutex before joining blocked completion" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    server.deferred_responses_mutex.lockUncancelable(std.testing.io);
+    var deferred_responses_locked = true;
+    defer if (deferred_responses_locked) server.deferred_responses_mutex.unlock(std.testing.io);
+
+    try server.handleLine("{\"id\":\"cleanup_bash\",\"type\":\"bash\",\"command\":\"printf cleanup\"}");
+    try waitForActiveBashStarted(&server);
+
+    server.bash_task_mutex.lockUncancelable(std.testing.io);
+    const task = server.bash_tasks.items[0];
+    server.bash_task_mutex.unlock(std.testing.io);
+
+    const CancelContext = struct {
+        server: *TsRpcServer,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(context: *@This()) void {
+            context.server.cancelAndJoinBashTasks();
+            context.done.store(true, .seq_cst);
+        }
+    };
+    var cancel_context = CancelContext{ .server = &server };
+    const cancel_thread = try std.Thread.spawn(.{}, CancelContext.run, .{&cancel_context});
+
+    var abort_spins: usize = 0;
+    while (!task.abort_signal.load(.seq_cst) and abort_spins < 1000) : (abort_spins += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    const cleanup_reached_join = task.abort_signal.load(.seq_cst);
+
+    const ProbeContext = struct {
+        server: *TsRpcServer,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(context: *@This()) void {
+            _ = context.server.hasUnfinishedBashTask();
+            context.done.store(true, .seq_cst);
+        }
+    };
+    var probe_context = ProbeContext{ .server = &server };
+    const probe_thread = try std.Thread.spawn(.{}, ProbeContext.run, .{&probe_context});
+
+    var probe_spins: usize = 0;
+    while (!probe_context.done.load(.seq_cst) and probe_spins < 100) : (probe_spins += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    const probe_completed_before_join_unblocked = probe_context.done.load(.seq_cst);
+
+    server.deferred_responses_mutex.unlock(std.testing.io);
+    deferred_responses_locked = false;
+    cancel_thread.join();
+    probe_thread.join();
+
+    try std.testing.expect(cleanup_reached_join);
+    try std.testing.expect(probe_completed_before_join_unblocked);
+    try std.testing.expect(cancel_context.done.load(.seq_cst));
+    try std.testing.expect(!server.hasActiveBashTask());
 }
 
 test "TS RPC production bash-control script matches generated TypeScript fixture bytes" {
