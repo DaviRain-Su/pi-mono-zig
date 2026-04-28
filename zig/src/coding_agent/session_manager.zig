@@ -321,6 +321,19 @@ pub const SessionManager = struct {
         return manager;
     }
 
+    pub fn createWithParent(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        session_dir: []const u8,
+        parent_session: ?[]const u8,
+    ) !SessionManager {
+        var manager = try initEmpty(allocator, io, cwd, session_dir, true, parent_session);
+        errdefer manager.deinit();
+        try manager.persistToDisk();
+        return manager;
+    }
+
     pub fn inMemory(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -738,6 +751,41 @@ pub const SessionManager = struct {
 
     pub fn resetLeaf(self: *SessionManager) void {
         self.leaf_id = null;
+    }
+
+    /// Create a new session manager containing only the path from root to
+    /// `leaf_id`. The returned manager owns cloned entries and has a fresh
+    /// session id. For persisted managers, it writes a new session file in the
+    /// same session directory with the current file recorded as parent.
+    pub fn createBranchedSession(self: *const SessionManager, leaf_id: []const u8) !SessionManager {
+        const path = try self.getBranch(self.allocator, leaf_id);
+        defer self.allocator.free(path);
+        if (path.len == 0) return error.EntryNotFound;
+
+        var manager = try initEmpty(
+            self.allocator,
+            self.io,
+            self.header.cwd,
+            self.session_dir,
+            self.persist,
+            if (self.persist) self.session_file else null,
+        );
+        errdefer manager.deinit();
+
+        for (path) |entry| {
+            if (entry.* == .label) continue;
+            try manager.appendLoadedEntry(try cloneEntry(self.allocator, entry.*));
+        }
+
+        for (self.entries.items) |entry| {
+            if (entry != .label) continue;
+            const label = entry.label;
+            if (!branchContainsEntry(path, label.target_id)) continue;
+            try manager.appendLoadedEntry(try cloneEntry(self.allocator, entry));
+        }
+
+        try manager.persistToDisk();
+        return manager;
     }
 
     pub fn buildSessionContext(self: *const SessionManager, allocator: std.mem.Allocator) !SessionContext {
@@ -1534,6 +1582,87 @@ fn deinitEntry(allocator: std.mem.Allocator, entry: *SessionEntry) void {
             if (session_info_entry.name) |name| allocator.free(name);
         },
     }
+}
+
+fn branchContainsEntry(branch: []const *const SessionEntry, id: []const u8) bool {
+    for (branch) |entry| {
+        if (std.mem.eql(u8, entry.id(), id)) return true;
+    }
+    return false;
+}
+
+fn cloneParentId(allocator: std.mem.Allocator, parent_id: ?[]const u8) !?[]const u8 {
+    return if (parent_id) |value| try allocator.dupe(u8, value) else null;
+}
+
+fn cloneEntry(allocator: std.mem.Allocator, entry: SessionEntry) !SessionEntry {
+    return switch (entry) {
+        .message => |message_entry| .{ .message = .{
+            .id = try allocator.dupe(u8, message_entry.id),
+            .parent_id = try cloneParentId(allocator, message_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, message_entry.timestamp),
+            .message = try cloneMessage(allocator, message_entry.message),
+        } },
+        .thinking_level_change => |thinking_entry| .{ .thinking_level_change = .{
+            .id = try allocator.dupe(u8, thinking_entry.id),
+            .parent_id = try cloneParentId(allocator, thinking_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, thinking_entry.timestamp),
+            .thinking_level = thinking_entry.thinking_level,
+        } },
+        .model_change => |model_entry| .{ .model_change = .{
+            .id = try allocator.dupe(u8, model_entry.id),
+            .parent_id = try cloneParentId(allocator, model_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, model_entry.timestamp),
+            .provider = try allocator.dupe(u8, model_entry.provider),
+            .model_id = try allocator.dupe(u8, model_entry.model_id),
+        } },
+        .compaction => |compaction_entry| .{ .compaction = .{
+            .id = try allocator.dupe(u8, compaction_entry.id),
+            .parent_id = try cloneParentId(allocator, compaction_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, compaction_entry.timestamp),
+            .first_kept_entry_id = try allocator.dupe(u8, compaction_entry.first_kept_entry_id),
+            .tokens_before = compaction_entry.tokens_before,
+            .message = try cloneMessage(allocator, compaction_entry.message),
+        } },
+        .branch_summary => |branch_summary_entry| .{ .branch_summary = .{
+            .id = try allocator.dupe(u8, branch_summary_entry.id),
+            .parent_id = try cloneParentId(allocator, branch_summary_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, branch_summary_entry.timestamp),
+            .from_id = try allocator.dupe(u8, branch_summary_entry.from_id),
+            .summary = try allocator.dupe(u8, branch_summary_entry.summary),
+            .details = if (branch_summary_entry.details) |details| try common.cloneJsonValue(allocator, details) else null,
+            .from_hook = branch_summary_entry.from_hook,
+        } },
+        .custom => |custom_entry| .{ .custom = .{
+            .id = try allocator.dupe(u8, custom_entry.id),
+            .parent_id = try cloneParentId(allocator, custom_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, custom_entry.timestamp),
+            .custom_type = try allocator.dupe(u8, custom_entry.custom_type),
+            .data = if (custom_entry.data) |data| try common.cloneJsonValue(allocator, data) else null,
+        } },
+        .custom_message => |custom_message_entry| .{ .custom_message = .{
+            .id = try allocator.dupe(u8, custom_message_entry.id),
+            .parent_id = try cloneParentId(allocator, custom_message_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, custom_message_entry.timestamp),
+            .custom_type = try allocator.dupe(u8, custom_message_entry.custom_type),
+            .content = try cloneCustomMessageContent(allocator, custom_message_entry.content),
+            .details = if (custom_message_entry.details) |details| try common.cloneJsonValue(allocator, details) else null,
+            .display = custom_message_entry.display,
+        } },
+        .label => |label_entry| .{ .label = .{
+            .id = try allocator.dupe(u8, label_entry.id),
+            .parent_id = try cloneParentId(allocator, label_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, label_entry.timestamp),
+            .target_id = try allocator.dupe(u8, label_entry.target_id),
+            .label = if (label_entry.label) |label| try allocator.dupe(u8, label) else null,
+        } },
+        .session_info => |session_info_entry| .{ .session_info = .{
+            .id = try allocator.dupe(u8, session_info_entry.id),
+            .parent_id = try cloneParentId(allocator, session_info_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, session_info_entry.timestamp),
+            .name = if (session_info_entry.name) |name| try allocator.dupe(u8, name) else null,
+        } },
+    };
 }
 
 pub fn cloneMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !agent.AgentMessage {

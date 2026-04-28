@@ -88,6 +88,11 @@ test "TS RPC M3 fixtures cover remaining control response and event shapes" {
     try expectContains(responses, "\"command\":\"export_html\",\"success\":true,\"data\":{\"path\":");
     try expectContains(responses, "\"command\":\"set_model\",\"success\":false,\"error\":\"Model not found:");
     try expectContains(responses, "\"command\":\"fork\",\"success\":true,\"data\":{\"text\":");
+    try expectContains(responses, "\"command\":\"new_session\",\"success\":true,\"data\":{\"cancelled\":false}");
+    try expectContains(responses, "\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}");
+    try expectContains(responses, "\"command\":\"clone\",\"success\":true,\"data\":{\"cancelled\":false}");
+    try expectContains(responses, "\"command\":\"get_fork_messages\",\"success\":true,\"data\":{\"messages\":[");
+    try expectContains(responses, "\"command\":\"set_session_name\",\"success\":true}");
 
     const events = try readFixture("events-session-extras.jsonl");
     defer std.testing.allocator.free(events);

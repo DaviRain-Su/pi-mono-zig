@@ -15,3 +15,8 @@
 {"id":"resp_set_model_error","type":"response","command":"set_model","success":false,"error":"Model not found: anthropic/missing-model"}
 {"id":"resp_thrown","type":"response","command":"bash","success":false,"error":"Command fixture failure"}
 {"id":"resp_fork","type":"response","command":"fork","success":true,"data":{"text":"selected fixture text","cancelled":false}}
+{"id":"resp_new_session","type":"response","command":"new_session","success":true,"data":{"cancelled":false}}
+{"id":"resp_switch_session","type":"response","command":"switch_session","success":true,"data":{"cancelled":false}}
+{"id":"resp_clone","type":"response","command":"clone","success":true,"data":{"cancelled":false}}
+{"id":"resp_fork_messages","type":"response","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"entry_fixture_user","text":"forkable fixture prompt"}]}}
+{"id":"resp_set_session_name","type":"response","command":"set_session_name","success":true}

@@ -5,12 +5,23 @@ const json_event_wire = @import("json_event_wire.zig");
 const common = @import("tools/common.zig");
 const session_mod = @import("session.zig");
 const session_advanced = @import("session_advanced.zig");
+const session_manager_mod = @import("session_manager.zig");
 
 pub const RunTsRpcModeOptions = struct {};
 
 const PromptStreamingBehavior = enum {
     steer,
     follow_up,
+};
+
+const SessionReplacementResult = struct {
+    cancelled: bool = false,
+    selected_text: ?[]u8 = null,
+
+    fn deinit(self: *SessionReplacementResult, allocator: std.mem.Allocator) void {
+        if (self.selected_text) |text| allocator.free(text);
+        self.* = undefined;
+    }
 };
 
 const DeferredResponsePriority = enum(u8) {
@@ -119,6 +130,136 @@ const PromptTask = struct {
     }
 };
 
+const TsRpcSessionHost = struct {
+    server: *TsRpcServer,
+
+    fn init(server: *TsRpcServer) TsRpcSessionHost {
+        return .{ .server = server };
+    }
+
+    fn current(self: *TsRpcSessionHost) *session_mod.AgentSession {
+        return self.server.session.?;
+    }
+
+    fn newSession(self: *TsRpcSessionHost, parent_session: ?[]const u8) !SessionReplacementResult {
+        const old = self.current();
+        var manager = try self.server.allocator.create(session_manager_mod.SessionManager);
+        errdefer self.server.allocator.destroy(manager);
+        manager.* = if (old.session_manager.isPersisted())
+            try session_manager_mod.SessionManager.createWithParent(
+                self.server.allocator,
+                self.server.io,
+                old.cwd,
+                old.session_manager.getSessionDir(),
+                parent_session,
+            )
+        else
+            try session_manager_mod.SessionManager.inMemory(self.server.allocator, self.server.io, old.cwd);
+        errdefer manager.deinit();
+
+        try self.replaceWithManager(manager, old.cwd);
+        return .{ .cancelled = false };
+    }
+
+    fn switchSession(self: *TsRpcSessionHost, session_path: []const u8) !SessionReplacementResult {
+        const old = self.current();
+        var manager = try self.server.allocator.create(session_manager_mod.SessionManager);
+        errdefer self.server.allocator.destroy(manager);
+        manager.* = try session_manager_mod.SessionManager.open(
+            self.server.allocator,
+            self.server.io,
+            session_path,
+            null,
+        );
+        errdefer manager.deinit();
+
+        try self.replaceWithManager(manager, manager.getCwd());
+        _ = old;
+        return .{ .cancelled = false };
+    }
+
+    fn fork(self: *TsRpcSessionHost, entry_id: []const u8, position: enum { before, at }) !SessionReplacementResult {
+        const old = self.current();
+        const selected_entry = old.session_manager.getEntry(entry_id) orelse return error.InvalidEntryIdForForking;
+        const target_leaf_id: ?[]const u8 = switch (position) {
+            .at => selected_entry.id(),
+            .before => blk: {
+                if (selected_entry.* != .message) return error.InvalidEntryIdForForking;
+                if (selected_entry.message.message != .user) return error.InvalidEntryIdForForking;
+                break :blk selected_entry.message.parent_id;
+            },
+        };
+        const selected_text = if (position == .before)
+            try textBlocksConcat(self.server.allocator, selected_entry.message.message.user.content)
+        else
+            null;
+        errdefer if (selected_text) |text| self.server.allocator.free(text);
+
+        var manager = try self.server.allocator.create(session_manager_mod.SessionManager);
+        errdefer self.server.allocator.destroy(manager);
+        manager.* = if (target_leaf_id) |leaf_id|
+            try old.session_manager.createBranchedSession(leaf_id)
+        else if (old.session_manager.isPersisted())
+            try session_manager_mod.SessionManager.createWithParent(
+                self.server.allocator,
+                self.server.io,
+                old.cwd,
+                old.session_manager.getSessionDir(),
+                old.session_manager.getSessionFile(),
+            )
+        else
+            try session_manager_mod.SessionManager.inMemory(self.server.allocator, self.server.io, old.cwd);
+        errdefer manager.deinit();
+
+        try self.replaceWithManager(manager, manager.getCwd());
+        return .{ .cancelled = false, .selected_text = selected_text };
+    }
+
+    fn clone(self: *TsRpcSessionHost) !SessionReplacementResult {
+        const leaf_id = self.current().session_manager.getLeafId() orelse return error.CannotCloneSessionNoCurrentEntrySelected;
+        return try self.fork(leaf_id, .at);
+    }
+
+    fn replaceWithManager(
+        self: *TsRpcSessionHost,
+        manager: *session_manager_mod.SessionManager,
+        cwd: []const u8,
+    ) !void {
+        const old = self.current();
+        const old_model = old.agent.getModel();
+        const replacement_model = ai.model_registry.getDefault().find(old_model.provider, old_model.id) orelse old_model;
+        const options = session_mod.AgentSession.ManagedOptions{
+            .cwd = cwd,
+            .system_prompt = old.system_prompt,
+            .model = replacement_model,
+            .api_key = old.agent.getApiKey(),
+            .thinking_level = old.agent.getThinkingLevel(),
+            .tools = old.agent.getTools(),
+            .compaction = old.compaction_settings,
+            .retry = old.retry_settings,
+        };
+        var replacement = session_mod.AgentSession.createWithManager(
+            self.server.allocator,
+            self.server.io,
+            manager,
+            options,
+        ) catch |err| {
+            manager.deinit();
+            self.server.allocator.destroy(manager);
+            return err;
+        };
+        replacement.agent.steering_queue.mode = old.agent.steering_queue.mode;
+        replacement.agent.follow_up_queue.mode = old.agent.follow_up_queue.mode;
+        errdefer replacement.deinit();
+
+        self.server.cancelAndJoinPromptTasks();
+        self.server.detachFromCurrentSession();
+        old.deinit();
+        old.* = replacement;
+        try self.server.attachToCurrentSession();
+    }
+};
+
 pub const command_types = [_][]const u8{
     "prompt",
     "steer",
@@ -192,13 +333,7 @@ const TsRpcServer = struct {
     }
 
     fn start(self: *TsRpcServer) !void {
-        if (self.session) |session| {
-            self.subscriber = .{
-                .context = self,
-                .callback = handleTsRpcAgentEvent,
-            };
-            try session.agent.subscribe(self.subscriber.?);
-        }
+        try self.attachToCurrentSession();
         self.deferred_flush_stop.store(false, .seq_cst);
         self.deferred_flush_thread = try std.Thread.spawn(.{}, deferredFlushMain, .{self});
     }
@@ -216,18 +351,43 @@ const TsRpcServer = struct {
             task.joinAndDestroy();
         }
         self.prompt_tasks.clearRetainingCapacity();
-        if (self.session) |session| {
-            if (self.subscriber) |subscriber| {
-                _ = session.agent.unsubscribe(subscriber);
-                self.subscriber = null;
-            }
-        }
+        self.detachFromCurrentSession();
         self.prompt_tasks.deinit(self.allocator);
         self.prompt_tasks = .empty;
         self.deferred_responses.deinit(self.allocator);
         self.deferred_responses = .empty;
         try self.stdout_writer.flush();
         try self.stderr_writer.flush();
+    }
+
+    fn attachToCurrentSession(self: *TsRpcServer) !void {
+        if (self.subscriber != null) return;
+        if (self.session) |session| {
+            self.subscriber = .{
+                .context = self,
+                .callback = handleTsRpcAgentEvent,
+            };
+            try session.agent.subscribe(self.subscriber.?);
+        }
+    }
+
+    fn detachFromCurrentSession(self: *TsRpcServer) void {
+        if (self.session) |session| {
+            if (self.subscriber) |subscriber| {
+                _ = session.agent.unsubscribe(subscriber);
+                self.subscriber = null;
+            }
+        }
+    }
+
+    fn cancelAndJoinPromptTasks(self: *TsRpcServer) void {
+        if (self.hasInFlightPrompt()) {
+            if (self.session) |session| session.agent.abort();
+        }
+        for (self.prompt_tasks.items) |task| {
+            task.joinAndDestroy();
+        }
+        self.prompt_tasks.clearRetainingCapacity();
     }
 
     fn hasInFlightPrompt(self: *const TsRpcServer) bool {
@@ -422,6 +582,21 @@ const TsRpcServer = struct {
             return;
         }
 
+        if (std.mem.eql(u8, command, "new_session")) {
+            const parent_session = optionalString(object, "parentSession") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            var host = TsRpcSessionHost.init(self);
+            const result = host.newSession(parent_session) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            _ = result;
+            try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
+            return;
+        }
+
         if (std.mem.eql(u8, command, "get_state")) {
             const data = try self.buildStateJson(session);
             defer self.allocator.free(data);
@@ -597,6 +772,52 @@ const TsRpcServer = struct {
             try writeJsonString(self.allocator, &out.writer, path);
             try out.writer.writeAll("}");
             try self.writeSuccessResponseRawData(id, command, out.written());
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "switch_session")) {
+            const session_path = requiredString(object, "sessionPath") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            var host = TsRpcSessionHost.init(self);
+            var result = host.switchSession(session_path) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            defer result.deinit(self.allocator);
+            try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "fork")) {
+            const entry_id = requiredString(object, "entryId") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            var host = TsRpcSessionHost.init(self);
+            var result = host.fork(entry_id, .before) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            defer result.deinit(self.allocator);
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer out.deinit();
+            try out.writer.writeAll("{\"text\":");
+            try writeJsonString(self.allocator, &out.writer, result.selected_text orelse "");
+            try out.writer.writeAll(",\"cancelled\":false}");
+            try self.writeSuccessResponseRawData(id, command, out.written());
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "clone")) {
+            var host = TsRpcSessionHost.init(self);
+            var result = host.clone() catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            defer result.deinit(self.allocator);
+            try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
             return;
         }
 
@@ -1728,6 +1949,17 @@ fn expectOutputOrder(haystack: []const u8, before: []const u8, after: []const u8
     try std.testing.expect(before_index < after_index);
 }
 
+fn expectNewOutput(
+    writer: *std.Io.Writer,
+    cursor: *usize,
+    expected: []const u8,
+) !void {
+    const bytes = writer.buffered();
+    try std.testing.expect(bytes.len >= cursor.*);
+    try std.testing.expectEqualStrings(expected, bytes[cursor.*..]);
+    cursor.* = bytes.len;
+}
+
 fn promptConcurrencyFixtureWithoutAllowedLifecycleEvents(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const allowed_agent_start = "{\"type\":\"agent_start\"}";
     var normalized = std.ArrayList(u8).empty;
@@ -2069,17 +2301,7 @@ test "TS RPC M3 model thinking and queue controls use TS response bytes" {
 
 test "TS RPC M3 session bash retry compaction controls use TS-compatible response bytes" {
     const allocator = std.testing.allocator;
-    const model = ai.Model{
-        .id = "fixture-model",
-        .name = "Fixture Model",
-        .api = "faux",
-        .provider = "faux",
-        .base_url = "https://example.invalid",
-        .reasoning = true,
-        .input_types = &[_][]const u8{"text"},
-        .context_window = 1000,
-        .max_tokens = 100,
-    };
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp",
         .system_prompt = "system",
@@ -2148,6 +2370,142 @@ test "TS RPC M3 session bash retry compaction controls use TS-compatible respons
     try expectContains(stdout_capture.writer.buffered(), expected_fork);
     try expectContains(stdout_capture.writer.buffered(), "\"command\":\"get_session_stats\",\"success\":true,\"data\":{\"sessionId\":");
     try expectContains(stdout_capture.writer.buffered(), "\"tokens\":{\"input\":2,\"output\":3,\"cacheRead\":4,\"cacheWrite\":5,\"total\":14}");
+}
+
+test "TS RPC M3 session host rebinds new switch fork clone and state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "ts-rpc-session-host",
+    });
+    defer allocator.free(relative_dir);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(cwd);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, relative_dir });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-host",
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const first_user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    first_user_content[0] = .{ .text = .{ .text = "root prompt" } };
+    const assistant_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_content[0] = .{ .text = .{ .text = "root answer" } };
+    const second_user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    second_user_content[0] = .{ .text = .{ .text = "fork selected prompt" } };
+
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = first_user_content, .timestamp = 11 } });
+    _ = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_content,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 12,
+    } });
+    const fork_entry_id = try session.session_manager.appendMessage(.{ .user = .{ .content = second_user_content, .timestamp = 13 } });
+    const fork_entry_id_owned = try allocator.dupe(u8, fork_entry_id);
+    defer allocator.free(fork_entry_id_owned);
+    try session.navigateTo(fork_entry_id);
+    const original_session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(original_session_file);
+    const original_session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(original_session_id);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    try server.handleLine("{\"id\":\"new\",\"type\":\"new_session\",\"parentSession\":\"parent.jsonl\"}");
+    try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"new\",\"type\":\"response\",\"command\":\"new_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n");
+    try std.testing.expect(!std.mem.eql(u8, original_session_id, session.session_manager.getSessionId()));
+
+    try server.handleLine("{\"id\":\"new_state\",\"type\":\"get_state\"}");
+    const new_state = try server.buildStateJson(&session);
+    defer allocator.free(new_state);
+    const expected_new_state = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"new_state\",\"type\":\"response\",\"command\":\"get_state\",\"success\":true,\"data\":{s}}}\n",
+        .{new_state},
+    );
+    defer allocator.free(expected_new_state);
+    try expectNewOutput(&stdout_capture.writer, &cursor, expected_new_state);
+    try std.testing.expectEqual(@as(usize, 0), session.agent.getMessages().len);
+
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"switch\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{original_session_file},
+    );
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"switch\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n");
+    try std.testing.expectEqualStrings(original_session_id, session.session_manager.getSessionId());
+    try std.testing.expectEqual(@as(usize, 3), session.agent.getMessages().len);
+
+    try server.handleLine("{\"id\":\"fork_messages\",\"type\":\"get_fork_messages\"}");
+    const fork_messages = try server.buildForkMessagesJson(&session);
+    defer allocator.free(fork_messages);
+    const expected_fork_messages = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"fork_messages\",\"type\":\"response\",\"command\":\"get_fork_messages\",\"success\":true,\"data\":{s}}}\n",
+        .{fork_messages},
+    );
+    defer allocator.free(expected_fork_messages);
+    try expectNewOutput(&stdout_capture.writer, &cursor, expected_fork_messages);
+
+    const fork_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"fork\",\"type\":\"fork\",\"entryId\":\"{s}\"}}",
+        .{fork_entry_id_owned},
+    );
+    defer allocator.free(fork_command);
+    try server.handleLine(fork_command);
+    try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"fork\",\"type\":\"response\",\"command\":\"fork\",\"success\":true,\"data\":{\"text\":\"fork selected prompt\",\"cancelled\":false}}\n");
+    try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
+
+    try server.handleLine("{\"id\":\"clone\",\"type\":\"clone\"}");
+    try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"clone\",\"type\":\"response\",\"command\":\"clone\",\"success\":true,\"data\":{\"cancelled\":false}}\n");
+    try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
+
+    try server.handleLine("{\"id\":\"name\",\"type\":\"set_session_name\",\"name\":\"  rebound name  \"}");
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"type\":\"session_info_changed\",\"name\":\"rebound name\"}\n{\"id\":\"name\",\"type\":\"response\",\"command\":\"set_session_name\",\"success\":true}\n",
+    );
+
+    try server.handleLine("{\"id\":\"clone_state\",\"type\":\"get_state\"}");
+    const clone_state = try server.buildStateJson(&session);
+    defer allocator.free(clone_state);
+    const expected_clone_state = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"clone_state\",\"type\":\"response\",\"command\":\"get_state\",\"success\":true,\"data\":{s}}}\n",
+        .{clone_state},
+    );
+    defer allocator.free(expected_clone_state);
+    try expectNewOutput(&stdout_capture.writer, &cursor, expected_clone_state);
+    try expectContains(clone_state, "\"sessionName\":\"rebound name\"");
 }
 
 test "TS RPC M2 queue_update is emitted before response and prompt.streamingBehavior queues while streaming" {
