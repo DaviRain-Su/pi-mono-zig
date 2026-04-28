@@ -492,15 +492,22 @@ fn buildOwnedFauxMessages(
     allocator: std.mem.Allocator,
     env_map: *const std.process.Environ.Map,
 ) (ResolveProviderError || std.mem.Allocator.Error)![]OwnedFauxMessage {
+    const thinking = env_map.get("PI_FAUX_THINKING");
     if (env_map.get("PI_FAUX_TOOL_NAME")) |tool_name| {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, env_map.get("PI_FAUX_TOOL_ARGS_JSON") orelse "{}", .{}) catch
             return error.InvalidFauxToolArguments;
         defer parsed.deinit();
 
-        const first_blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+        const first_block_count: usize = if (thinking != null) 2 else 1;
+        const first_blocks = try allocator.alloc(faux.FauxContentBlock, first_block_count);
+        var first_index: usize = 0;
+        if (thinking) |thinking_text| {
+            first_blocks[first_index] = faux.fauxThinking(thinking_text);
+            first_index += 1;
+        }
         const tool_args = try common.cloneJsonValue(allocator, parsed.value);
         defer common.deinitJsonValue(allocator, tool_args);
-        first_blocks[0] = faux.fauxToolCall(allocator, tool_name, tool_args, .{}) catch |err| switch (err) {
+        first_blocks[first_index] = faux.fauxToolCall(allocator, tool_name, tool_args, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidFauxToolArguments,
         };
@@ -514,8 +521,14 @@ fn buildOwnedFauxMessages(
         return messages;
     }
 
-    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
-    blocks[0] = faux.fauxText(env_map.get("PI_FAUX_RESPONSE") orelse "faux response");
+    const block_count: usize = if (thinking != null) 2 else 1;
+    const blocks = try allocator.alloc(faux.FauxContentBlock, block_count);
+    var index: usize = 0;
+    if (thinking) |thinking_text| {
+        blocks[index] = faux.fauxThinking(thinking_text);
+        index += 1;
+    }
+    blocks[index] = faux.fauxText(env_map.get("PI_FAUX_RESPONSE") orelse "faux response");
 
     const messages = try allocator.alloc(OwnedFauxMessage, 1);
     messages[0] = .{ .blocks = blocks };

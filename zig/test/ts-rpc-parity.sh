@@ -9,6 +9,125 @@ npx tsx test/generate-ts-rpc-fixtures.ts --check
 echo "TS-RPC parity: prompt-concurrency queue-order exact byte diff"
 bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
 
+echo "TS-RPC parity: live production scenario exact byte diffs"
+python3 <<'PY'
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE_ARGS = [
+	"./zig-out/bin/pi",
+	"--mode",
+	"ts-rpc",
+	"--provider",
+	"faux",
+	"--no-session",
+	"--no-extensions",
+	"--no-context-files",
+	"--no-prompt-templates",
+	"--system-prompt",
+	"sys",
+]
+
+SCENARIOS = [
+	(
+		"m5-simple-prompt",
+		{"PI_FAUX_RESPONSE": "faux response"},
+		1.0,
+		"simple prompt + streaming text",
+	),
+	(
+		"m5-thinking",
+		{"PI_FAUX_THINKING": "Need exact bytes.", "PI_FAUX_RESPONSE": "final answer"},
+		1.0,
+		"thinking deltas",
+	),
+	(
+		"m5-tool",
+		{
+			"PI_FAUX_TOOL_NAME": "bash",
+			"PI_FAUX_TOOL_ARGS_JSON": '{"command":"printf tool-ok"}',
+			"PI_FAUX_TOOL_FINAL_RESPONSE": "done",
+			"PI_FIXED_NOW_MS": "1766880000008",
+		},
+		2.0,
+		"tool call/result",
+	),
+	(
+		"m5-compaction",
+		{"PI_FAUX_RESPONSE": "compact summary"},
+		1.0,
+		"compaction",
+	),
+	(
+		"m5-retry",
+		{"PI_FAUX_STOP_REASON": "error", "PI_FAUX_ERROR_MESSAGE": "503 service unavailable"},
+		3.0,
+		"retry",
+	),
+]
+
+for name, env_extra, settle_seconds, label in SCENARIOS:
+	input_path = Path(f"test/golden/ts-rpc/{name}.input.jsonl")
+	expected_path = Path(f"test/golden/ts-rpc/{name}.jsonl")
+	actual_path = Path(f"/tmp/pi-ts-rpc-{name}-actual.jsonl")
+	input_bytes = input_path.read_text()
+	env = os.environ.copy()
+	env.update(env_extra)
+	proc = subprocess.Popen(
+		BASE_ARGS,
+		stdin=subprocess.PIPE,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		text=True,
+		env=env,
+	)
+	assert proc.stdin is not None
+	proc.stdin.write(input_bytes)
+	proc.stdin.flush()
+	time.sleep(settle_seconds)
+	proc.stdin.close()
+	stdout = proc.stdout.read() if proc.stdout is not None else ""
+	stderr = proc.stderr.read() if proc.stderr is not None else ""
+	status = proc.wait(timeout=10)
+	if status != 0:
+		print(stderr, file=sys.stderr)
+		print(f"{name} Zig ts-rpc exited {status}", file=sys.stderr)
+		sys.exit(status)
+	expected = expected_path.read_text()
+	if stdout != expected:
+		actual_path.write_text(stdout)
+		print(f"{name} ({label}) stdout differs; actual written to {actual_path}", file=sys.stderr)
+		subprocess.run(["diff", "-u", str(expected_path), str(actual_path)], check=False)
+		sys.exit(1)
+	print(f"  {label} exact byte diff passed")
+
+extension_response_input = (
+	'{"type":"extension_ui_response","id":"ui_select","value":"option-a"}\n'
+	'{"type":"extension_ui_response","id":"ui_confirm","confirmed":true}\n'
+	'{"type":"extension_ui_response","id":"ui_input","cancelled":true}\n'
+)
+proc = subprocess.run(
+	BASE_ARGS,
+	input=extension_response_input,
+	text=True,
+	stdout=subprocess.PIPE,
+	stderr=subprocess.PIPE,
+	check=False,
+)
+if proc.returncode != 0:
+	print(proc.stderr, file=sys.stderr)
+	print(f"extension_ui_response Zig ts-rpc exited {proc.returncode}", file=sys.stderr)
+	sys.exit(proc.returncode)
+if proc.stdout != "":
+	Path("/tmp/pi-ts-rpc-extension-ui-response-actual.jsonl").write_text(proc.stdout)
+	print("extension_ui_response should be consumed without stdout", file=sys.stderr)
+	sys.exit(1)
+print("  extension UI response consumption exact byte diff passed")
+PY
+
 echo "TS-RPC parity: direct bash exact byte diff"
 python3 <<'PY'
 import subprocess
@@ -98,13 +217,13 @@ done
 
 cat <<'REPORT'
 TS-RPC parity scenarios passed:
-- simple prompt: responses-basic fixture checked against current TS; Zig prompt lifecycle exact-byte tests run under test-coding-agent.
-- streaming text: events-base-stream fixture checked against current TS; Zig prompt response/event ordering exact-byte tests run under test-coding-agent.
-- thinking deltas: events-thinking-tool-usage fixture checked against current TS and Zig event writer tests.
-- tool call/result: events-thinking-tool-usage fixture checked against current TS and Zig event writer tests.
+- simple prompt: current TS fixture and Zig --mode ts-rpc stdout diff passed.
+- streaming text: current TS fixture and Zig --mode ts-rpc stdout diff passed.
+- thinking deltas: current TS fixture and Zig --mode ts-rpc stdout diff passed.
+- tool call/result: current TS fixture and Zig --mode ts-rpc stdout diff passed.
 - direct bash: current TS fixture and Zig --mode ts-rpc stdout diff passed.
-- compaction: responses-basic/events-session-extras fixtures checked against current TS and Zig compaction control tests.
-- retry: events-session-extras fixture checked against current TS and Zig retry lifecycle tests.
+- compaction: current TS fixture and Zig --mode ts-rpc stdout diff passed.
+- retry: current TS fixture and Zig --mode ts-rpc stdout diff passed.
 - queue steer/follow-up: current TS prompt-concurrency fixture and Zig --mode ts-rpc stdout diff passed; 20 stress iterations passed.
-- extension UI request/response: extension-ui fixture checked against current TS and Zig extension UI request/response tests.
+- extension UI request/response: extension-ui fixture checked against current TS; Zig --mode ts-rpc consumes extension_ui_response without stdout, and request bytes are covered by Zig extension UI exact-byte tests.
 REPORT

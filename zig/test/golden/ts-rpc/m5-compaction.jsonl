@@ -1,0 +1,3 @@
+{"type":"compaction_start","reason":"manual"}
+{"type":"compaction_end","reason":"manual","aborted":true,"willRetry":false}
+{"id":"compact","type":"response","command":"compact","success":false,"error":"NothingToCompact"}

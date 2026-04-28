@@ -1,0 +1,2 @@
+{"id":"retry_on","type":"set_auto_retry","enabled":true}
+{"id":"retry_prompt","type":"prompt","message":"retry"}

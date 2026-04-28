@@ -860,6 +860,46 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			description: "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
 			bytes: captureRuntimeStdout("extension-ui") + extensionUiResponseInputBytes,
 		},
+		checkedInM5ParityFixture(
+			"m5-simple-prompt.input.jsonl",
+			"Scripted JSONL stdin for the M5 simple prompt and streaming text production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-simple-prompt.jsonl",
+			"Expected stdout bytes for the M5 simple prompt and streaming text production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-thinking.input.jsonl",
+			"Scripted JSONL stdin for the M5 thinking-delta production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-thinking.jsonl",
+			"Expected stdout bytes for the M5 thinking-delta production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-tool.input.jsonl",
+			"Scripted JSONL stdin for the M5 tool call/result production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-tool.jsonl",
+			"Expected stdout bytes for the M5 tool call/result production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-compaction.input.jsonl",
+			"Scripted JSONL stdin for the M5 compaction production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-compaction.jsonl",
+			"Expected stdout bytes for the M5 compaction production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-retry.input.jsonl",
+			"Scripted JSONL stdin for the M5 retry production parity scenario.",
+		),
+		checkedInM5ParityFixture(
+			"m5-retry.jsonl",
+			"Expected stdout bytes for the M5 retry production parity scenario.",
+		),
 	];
 
 	const manifest = {
@@ -896,6 +936,14 @@ function checkFile(path: string, expected: string): boolean {
 		return false;
 	}
 	return true;
+}
+
+function checkedInM5ParityFixture(path: string, description: string): FixtureFile {
+	return {
+		path,
+		description,
+		bytes: readFileSync(join(fixtureDir, path), "utf8"),
+	};
 }
 
 const scenario = runtimeChildArg?.slice("--runtime-child=".length) as RuntimeScenario | undefined;

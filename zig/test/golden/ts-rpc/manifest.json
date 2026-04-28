@@ -95,6 +95,66 @@
 			"description": "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
 			"byteLength": 1380,
 			"lineCount": 13
+		},
+		{
+			"path": "m5-simple-prompt.input.jsonl",
+			"description": "Scripted JSONL stdin for the M5 simple prompt and streaming text production parity scenario.",
+			"byteLength": 57,
+			"lineCount": 1
+		},
+		{
+			"path": "m5-simple-prompt.jsonl",
+			"description": "Expected stdout bytes for the M5 simple prompt and streaming text production parity scenario.",
+			"byteLength": 4618,
+			"lineCount": 13
+		},
+		{
+			"path": "m5-thinking.input.jsonl",
+			"description": "Scripted JSONL stdin for the M5 thinking-delta production parity scenario.",
+			"byteLength": 59,
+			"lineCount": 1
+		},
+		{
+			"path": "m5-thinking.jsonl",
+			"description": "Expected stdout bytes for the M5 thinking-delta production parity scenario.",
+			"byteLength": 6715,
+			"lineCount": 16
+		},
+		{
+			"path": "m5-tool.input.jsonl",
+			"description": "Scripted JSONL stdin for the M5 tool call/result production parity scenario.",
+			"byteLength": 58,
+			"lineCount": 1
+		},
+		{
+			"path": "m5-tool.jsonl",
+			"description": "Expected stdout bytes for the M5 tool call/result production parity scenario.",
+			"byteLength": 9254,
+			"lineCount": 24
+		},
+		{
+			"path": "m5-compaction.input.jsonl",
+			"description": "Scripted JSONL stdin for the M5 compaction production parity scenario.",
+			"byteLength": 63,
+			"lineCount": 1
+		},
+		{
+			"path": "m5-compaction.jsonl",
+			"description": "Expected stdout bytes for the M5 compaction production parity scenario.",
+			"byteLength": 221,
+			"lineCount": 3
+		},
+		{
+			"path": "m5-retry.input.jsonl",
+			"description": "Scripted JSONL stdin for the M5 retry production parity scenario.",
+			"byteLength": 113,
+			"lineCount": 2
+		},
+		{
+			"path": "m5-retry.jsonl",
+			"description": "Expected stdout bytes for the M5 retry production parity scenario.",
+			"byteLength": 6745,
+			"lineCount": 21
 		}
 	]
 }
