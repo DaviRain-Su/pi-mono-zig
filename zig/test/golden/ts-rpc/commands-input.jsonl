@@ -1,0 +1,32 @@
+{"id":"cmd_prompt","type":"prompt","message":"hello","images":[{"type":"image","data":"aW1n","mimeType":"image/png"}]}
+{"id":"cmd_steer","type":"steer","message":"steer now"}
+{"id":"cmd_follow","type":"follow_up","message":"follow later"}
+{"id":"cmd_abort","type":"abort"}
+{"id":"cmd_new","type":"new_session","parentSession":"/tmp/parent.jsonl"}
+{"id":"cmd_state","type":"get_state"}
+{"id":"cmd_set_model","type":"set_model","provider":"anthropic","modelId":"claude-sonnet-4-5"}
+{"id":"cmd_cycle_model","type":"cycle_model"}
+{"id":"cmd_models","type":"get_available_models"}
+{"id":"cmd_thinking","type":"set_thinking_level","level":"high"}
+{"id":"cmd_cycle_thinking","type":"cycle_thinking_level"}
+{"id":"cmd_steering_mode","type":"set_steering_mode","mode":"one-at-a-time"}
+{"id":"cmd_follow_mode","type":"set_follow_up_mode","mode":"all"}
+{"id":"cmd_compact","type":"compact","customInstructions":"preserve fixture notes"}
+{"id":"cmd_auto_compact","type":"set_auto_compaction","enabled":true}
+{"id":"cmd_auto_retry","type":"set_auto_retry","enabled":false}
+{"id":"cmd_abort_retry","type":"abort_retry"}
+{"id":"cmd_bash","type":"bash","command":"printf fixture"}
+{"id":"cmd_abort_bash","type":"abort_bash"}
+{"id":"cmd_stats","type":"get_session_stats"}
+{"id":"cmd_export","type":"export_html","outputPath":"/tmp/pi-ts-rpc/export.html"}
+{"id":"cmd_switch","type":"switch_session","sessionPath":"/tmp/pi-ts-rpc/other.jsonl"}
+{"id":"cmd_fork","type":"fork","entryId":"entry_fixture_1"}
+{"id":"cmd_clone","type":"clone"}
+{"id":"cmd_fork_messages","type":"get_fork_messages"}
+{"id":"cmd_last_text","type":"get_last_assistant_text"}
+{"id":"cmd_name","type":"set_session_name","name":"fixture session"}
+{"id":"cmd_messages","type":"get_messages"}
+{"id":"cmd_commands","type":"get_commands"}
+{"type":"extension_ui_response","id":"ui_select","value":"option-a"}
+{"type":"extension_ui_response","id":"ui_confirm","confirmed":true}
+{"type":"extension_ui_response","id":"ui_input","cancelled":true}

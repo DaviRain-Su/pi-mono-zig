@@ -50,6 +50,7 @@ test {
     _ = @import("system_prompt.zig");
     _ = @import("print_mode.zig");
     _ = @import("rpc_mode.zig");
+    _ = @import("ts_rpc_fixture_tests.zig");
     _ = @import("provider_config.zig");
     _ = @import("interactive_mode.zig");
     _ = @import("migrations.zig");

@@ -1,0 +1,111 @@
+const std = @import("std");
+
+const fixture_files = [_][]const u8{
+    "commands-input.jsonl",
+    "jsonl-framing.jsonl",
+    "responses-basic.jsonl",
+    "events-base-stream.jsonl",
+    "events-thinking-tool-usage.jsonl",
+    "events-session-extras.jsonl",
+    "extension-ui.jsonl",
+};
+
+fn readFixture(comptime name: []const u8) ![]u8 {
+    return std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "test/golden/ts-rpc/" ++ name,
+        std.testing.allocator,
+        .unlimited,
+    );
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+fn expectValidJsonl(comptime name: []const u8) !void {
+    const bytes = try readFixture(name);
+    defer std.testing.allocator.free(bytes);
+
+    try std.testing.expect(bytes.len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\r\n") == null);
+
+    var line_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        line_count += 1;
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        parsed.deinit();
+    }
+    try std.testing.expect(line_count > 0);
+}
+
+test "TS RPC fixture files are checked in and valid JSONL" {
+    inline for (fixture_files) |file| {
+        try expectValidJsonl(file);
+    }
+
+    const manifest = try readFixture("manifest.json");
+    defer std.testing.allocator.free(manifest);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, manifest, .{});
+    defer parsed.deinit();
+    try expectContains(manifest, "packages/coding-agent/src/modes/rpc/jsonl.ts:10-58");
+    try expectContains(manifest, "packages/coding-agent/src/modes/rpc/rpc-mode.ts:650-704");
+}
+
+test "TS RPC response fixtures preserve parse and unknown-command quirks" {
+    const bytes = try readFixture("responses-basic.jsonl");
+    defer std.testing.allocator.free(bytes);
+
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command:",
+    );
+    try expectContains(
+        bytes,
+        "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"id\":\"mystery") == null);
+}
+
+test "TS RPC framing fixture captures LF CRLF final-line and Unicode separator behavior" {
+    const bytes = try readFixture("jsonl-framing.jsonl");
+    defer std.testing.allocator.free(bytes);
+
+    try expectContains(bytes, "serialize-unicode-separators");
+    try expectContains(bytes, "a\xe2\x80\xa8b\xe2\x80\xa9c");
+    try expectContains(bytes, "\"case\":\"lf-input\"");
+    try expectContains(bytes, "\"case\":\"crlf-input\"");
+    try expectContains(bytes, "\"case\":\"final-unterminated-input\"");
+    try expectContains(bytes, "\"case\":\"parse-error-output\"");
+}
+
+test "TS RPC event fixtures cover base stream thinking tools usage details and stop reasons" {
+    const base = try readFixture("events-base-stream.jsonl");
+    defer std.testing.allocator.free(base);
+    try expectContains(base, "\"type\":\"agent_start\"");
+    try expectContains(base, "\"type\":\"turn_start\"");
+    try expectContains(base, "\"type\":\"message_start\"");
+    try expectContains(base, "\"type\":\"message_update\"");
+    try expectContains(base, "\"type\":\"message_end\"");
+    try expectContains(base, "\"type\":\"turn_end\"");
+    try expectContains(base, "\"type\":\"agent_end\"");
+
+    const tool = try readFixture("events-thinking-tool-usage.jsonl");
+    defer std.testing.allocator.free(tool);
+    try expectContains(tool, "\"type\":\"thinking_delta\"");
+    try expectContains(tool, "\"type\":\"toolcall_start\"");
+    try expectContains(tool, "\"type\":\"toolcall_delta\"");
+    try expectContains(tool, "\"type\":\"toolcall_end\"");
+    try expectContains(tool, "\"type\":\"tool_execution_start\"");
+    try expectContains(tool, "\"type\":\"tool_execution_update\"");
+    try expectContains(tool, "\"type\":\"tool_execution_end\"");
+    try expectContains(tool, "\"details\":");
+    try expectContains(tool, "\"usage\":");
+    try expectContains(tool, "\"stopReason\":\"toolUse\"");
+    try expectContains(tool, "\"reason\":\"length\"");
+    try expectContains(tool, "\"reason\":\"aborted\"");
+}

@@ -1,0 +1,57 @@
+{
+	"generatedBy": "zig/test/generate-ts-rpc-fixtures.ts",
+	"compatibilityTarget": "packages/coding-agent TypeScript RPC mode",
+	"sourceCitations": [
+		"packages/coding-agent/src/modes/rpc/jsonl.ts:10-58",
+		"packages/coding-agent/src/modes/rpc/rpc-mode.ts:57-70",
+		"packages/coding-agent/src/modes/rpc/rpc-mode.ts:650-704",
+		"packages/coding-agent/src/modes/rpc/rpc-mode.ts:706-737",
+		"packages/coding-agent/src/modes/rpc/rpc-types.ts:19-264",
+		"packages/agent/src/types.ts:350-365",
+		"packages/ai/src/types.ts:207-276"
+	],
+	"files": [
+		{
+			"path": "commands-input.jsonl",
+			"description": "All current TS RPC command input shapes plus extension_ui_response variants.",
+			"byteLength": 1989,
+			"lineCount": 32
+		},
+		{
+			"path": "jsonl-framing.jsonl",
+			"description": "Strict JSONL serialization plus LF, CRLF, and final unterminated input reader observations.",
+			"byteLength": 562,
+			"lineCount": 7
+		},
+		{
+			"path": "responses-basic.jsonl",
+			"description": "Success, success-with-data, null data, command errors, parse error, and unknown-command quirk responses.",
+			"byteLength": 4166,
+			"lineCount": 16
+		},
+		{
+			"path": "events-base-stream.jsonl",
+			"description": "Base deterministic faux prompt event stream envelopes.",
+			"byteLength": 6613,
+			"lineCount": 13
+		},
+		{
+			"path": "events-thinking-tool-usage.jsonl",
+			"description": "Thinking, tool call, tool execution, usage, details, and stop reason event shapes.",
+			"byteLength": 13012,
+			"lineCount": 15
+		},
+		{
+			"path": "events-session-extras.jsonl",
+			"description": "Session-level queue, compaction, retry, and session info events forwarded by TS RPC mode.",
+			"byteLength": 610,
+			"lineCount": 6
+		},
+		{
+			"path": "extension-ui.jsonl",
+			"description": "Extension UI request methods and response commands with deterministic request ids.",
+			"byteLength": 1302,
+			"lineCount": 12
+		}
+	]
+}
