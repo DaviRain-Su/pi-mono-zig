@@ -6,6 +6,7 @@ pub const session = @import("session.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const print_mode = @import("print_mode.zig");
 pub const rpc_mode = @import("rpc_mode.zig");
+pub const ts_rpc_mode = @import("ts_rpc_mode.zig");
 pub const provider_config = @import("provider_config.zig");
 pub const interactive_mode = @import("interactive_mode.zig");
 
@@ -36,6 +37,8 @@ pub const RunPrintModeOptions = print_mode.RunPrintModeOptions;
 pub const runPrintMode = print_mode.runPrintMode;
 pub const RunRpcModeOptions = rpc_mode.RunRpcModeOptions;
 pub const runRpcMode = rpc_mode.runRpcMode;
+pub const RunTsRpcModeOptions = ts_rpc_mode.RunTsRpcModeOptions;
+pub const runTsRpcMode = ts_rpc_mode.runTsRpcMode;
 pub const ResolvedProviderConfig = provider_config.ResolvedProviderConfig;
 pub const ResolveProviderError = provider_config.ResolveProviderError;
 pub const resolveProviderConfig = provider_config.resolveProviderConfig;
@@ -50,6 +53,7 @@ test {
     _ = @import("system_prompt.zig");
     _ = @import("print_mode.zig");
     _ = @import("rpc_mode.zig");
+    _ = @import("ts_rpc_mode.zig");
     _ = @import("ts_rpc_fixture_tests.zig");
     _ = @import("provider_config.zig");
     _ = @import("interactive_mode.zig");

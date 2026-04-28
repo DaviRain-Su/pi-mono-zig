@@ -6,6 +6,7 @@ pub const AppMode = enum {
     print,
     json,
     rpc,
+    ts_rpc,
 };
 
 pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) cli.ParseArgsError!cli.Args {
@@ -15,7 +16,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) cli.Par
 pub fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
     return switch (err) {
         error.MissingOptionValue => "Missing value for option",
-        error.InvalidMode => "Invalid mode. Expected one of: text, json, rpc",
+        error.InvalidMode => "Invalid mode. Expected one of: text, json, rpc, ts-rpc",
         error.InvalidThinkingLevel => "Invalid thinking level. Expected one of: off, minimal, low, medium, high, xhigh",
         error.UnknownOption => "Unknown option",
         error.OutOfMemory => "Out of memory while parsing CLI arguments",
@@ -25,6 +26,7 @@ pub fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
 pub fn resolveAppMode(mode: cli.Mode, print_requested: bool, stdin_is_tty: bool) AppMode {
     return switch (mode) {
         .rpc => .rpc,
+        .ts_rpc => .ts_rpc,
         .json => .json,
         .text => if (print_requested or !stdin_is_tty) .print else .interactive,
     };

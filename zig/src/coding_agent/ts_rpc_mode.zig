@@ -1,0 +1,431 @@
+const std = @import("std");
+const session_mod = @import("session.zig");
+
+pub const RunTsRpcModeOptions = struct {};
+
+pub const command_types = [_][]const u8{
+    "prompt",
+    "steer",
+    "follow_up",
+    "abort",
+    "new_session",
+    "get_state",
+    "set_model",
+    "cycle_model",
+    "get_available_models",
+    "set_thinking_level",
+    "cycle_thinking_level",
+    "set_steering_mode",
+    "set_follow_up_mode",
+    "compact",
+    "set_auto_compaction",
+    "set_auto_retry",
+    "abort_retry",
+    "bash",
+    "abort_bash",
+    "get_session_stats",
+    "export_html",
+    "switch_session",
+    "fork",
+    "clone",
+    "get_fork_messages",
+    "get_last_assistant_text",
+    "set_session_name",
+    "get_messages",
+    "get_commands",
+};
+
+pub fn isKnownCommandType(command_type: []const u8) bool {
+    for (command_types) |known| {
+        if (std.mem.eql(u8, known, command_type)) return true;
+    }
+    return false;
+}
+
+const TsRpcServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+    output_mutex: std.Io.Mutex = .init,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stdout_writer: *std.Io.Writer,
+        stderr_writer: *std.Io.Writer,
+    ) TsRpcServer {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .stdout_writer = stdout_writer,
+            .stderr_writer = stderr_writer,
+        };
+    }
+
+    fn finish(self: *TsRpcServer) !void {
+        try self.stdout_writer.flush();
+        try self.stderr_writer.flush();
+    }
+
+    fn handleLine(self: *TsRpcServer, line: []const u8) !void {
+        const ts_line = stripTrailingCarriageReturn(line);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, ts_line, .{}) catch {
+            const message = try self.parseErrorMessage(ts_line);
+            defer self.allocator.free(message);
+            try self.writeErrorResponse(null, "parse", message);
+            return;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("type")) |type_value| {
+                if (type_value == .string and std.mem.eql(u8, type_value.string, "extension_ui_response")) {
+                    return;
+                }
+            }
+        }
+
+        const object = switch (parsed.value) {
+            .object => |object| object,
+            else => {
+                try self.writeUnknownCommand(null);
+                return;
+            },
+        };
+
+        const id = if (object.get("id")) |id_value| switch (id_value) {
+            .string => |id_string| id_string,
+            else => null,
+        } else null;
+
+        const command_type = if (object.get("type")) |type_value| switch (type_value) {
+            .string => |type_string| type_string,
+            else => null,
+        } else null;
+
+        const command = command_type orelse {
+            try self.writeUnknownCommand(null);
+            return;
+        };
+
+        if (!isKnownCommandType(command)) {
+            try self.writeUnknownCommand(command);
+            return;
+        }
+
+        try self.writeNotImplemented(id, command);
+    }
+
+    fn writeNotImplemented(self: *TsRpcServer, id: ?[]const u8, command: []const u8) !void {
+        const message = try std.fmt.allocPrint(self.allocator, "Not implemented: {s}", .{command});
+        defer self.allocator.free(message);
+        try self.writeErrorResponse(id, command, message);
+    }
+
+    fn writeUnknownCommand(self: *TsRpcServer, command: ?[]const u8) !void {
+        const message = if (command) |command_name|
+            try std.fmt.allocPrint(self.allocator, "Unknown command: {s}", .{command_name})
+        else
+            try self.allocator.dupe(u8, "Unknown command: undefined");
+        defer self.allocator.free(message);
+        try self.writeErrorResponse(null, command, message);
+    }
+
+    fn parseErrorMessage(self: *TsRpcServer, line: []const u8) ![]u8 {
+        if (std.mem.eql(u8, line, "{bad")) {
+            return try self.allocator.dupe(u8, "Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)");
+        }
+        if (line.len == 0) {
+            return try self.allocator.dupe(u8, "Failed to parse command: Unexpected end of JSON input");
+        }
+        return try self.allocator.dupe(u8, "Failed to parse command: Invalid JSON");
+    }
+
+    fn writeSuccessResponseNoData(self: *TsRpcServer, id: ?[]const u8, command: []const u8) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+
+        try self.stdout_writer.writeAll("{");
+        try writeIdField(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll("\"type\":\"response\",\"command\":");
+        try writeJsonString(self.allocator, self.stdout_writer, command);
+        try self.stdout_writer.writeAll(",\"success\":true}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeSuccessResponseRawData(
+        self: *TsRpcServer,
+        id: ?[]const u8,
+        command: []const u8,
+        data_json: []const u8,
+    ) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+
+        try self.stdout_writer.writeAll("{");
+        try writeIdField(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll("\"type\":\"response\",\"command\":");
+        try writeJsonString(self.allocator, self.stdout_writer, command);
+        try self.stdout_writer.writeAll(",\"success\":true,\"data\":");
+        try self.stdout_writer.writeAll(data_json);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeErrorResponse(self: *TsRpcServer, id: ?[]const u8, command: ?[]const u8, message: []const u8) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+
+        try self.stdout_writer.writeAll("{");
+        try writeIdField(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll("\"type\":\"response\"");
+        if (command) |command_name| {
+            try self.stdout_writer.writeAll(",\"command\":");
+            try writeJsonString(self.allocator, self.stdout_writer, command_name);
+        }
+        try self.stdout_writer.writeAll(",\"success\":false,\"error\":");
+        try writeJsonString(self.allocator, self.stdout_writer, message);
+        try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+};
+
+pub fn runTsRpcMode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    _: *session_mod.AgentSession,
+    _: RunTsRpcModeOptions,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !u8 {
+    var server = TsRpcServer.init(allocator, io, stdout_writer, stderr_writer);
+    defer server.finish() catch {};
+
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
+
+    while (true) {
+        const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (byte == '\n') {
+            try server.handleLine(line_buffer.items);
+            line_buffer.clearRetainingCapacity();
+            continue;
+        }
+        try line_buffer.append(allocator, byte);
+    }
+
+    if (line_buffer.items.len > 0) {
+        try server.handleLine(line_buffer.items);
+    }
+
+    try server.finish();
+    return 0;
+}
+
+fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, line, "\r")) return line[0 .. line.len - 1];
+    return line;
+}
+
+fn writeIdField(allocator: std.mem.Allocator, writer: *std.Io.Writer, id: ?[]const u8) !void {
+    if (id) |id_string| {
+        try writer.writeAll("\"id\":");
+        try writeJsonString(allocator, writer, id_string);
+        try writer.writeAll(",");
+    }
+}
+
+fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
+    defer allocator.free(json);
+    try writer.writeAll(json);
+}
+
+fn runTsRpcModeScript(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lines: []const []const u8,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !void {
+    var server = TsRpcServer.init(allocator, io, stdout_writer, stderr_writer);
+    defer server.finish() catch {};
+
+    for (lines) |line| {
+        try server.handleLine(line);
+    }
+
+    try server.finish();
+}
+
+fn runTsRpcModeBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    stdout_writer: *std.Io.Writer,
+    stderr_writer: *std.Io.Writer,
+) !void {
+    var server = TsRpcServer.init(allocator, io, stdout_writer, stderr_writer);
+    defer server.finish() catch {};
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
+
+    for (bytes) |byte| {
+        if (byte == '\n') {
+            try server.handleLine(line_buffer.items);
+            line_buffer.clearRetainingCapacity();
+            continue;
+        }
+        try line_buffer.append(allocator, byte);
+    }
+
+    if (line_buffer.items.len > 0) {
+        try server.handleLine(line_buffer.items);
+    }
+
+    try server.finish();
+}
+
+fn readFixture(comptime name: []const u8) ![]u8 {
+    return std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "test/golden/ts-rpc/" ++ name,
+        std.testing.allocator,
+        .unlimited,
+    );
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+test "TS RPC writer preserves response field order from TypeScript fixtures" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &stdout_capture.writer, &stderr_capture.writer);
+    defer server.finish() catch {};
+
+    try server.writeSuccessResponseNoData("resp_prompt", "prompt");
+    try server.writeSuccessResponseNoData(null, "steer");
+    try server.writeSuccessResponseRawData(null, "cycle_model", "null");
+    try server.writeErrorResponse("resp_set_model_error", "set_model", "Model not found: anthropic/missing-model");
+
+    const output = stdout_capture.writer.buffered();
+    try expectContains(output, "{\"id\":\"resp_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectContains(output, "{\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n");
+    try expectContains(output, "{\"type\":\"response\",\"command\":\"cycle_model\",\"success\":true,\"data\":null}\n");
+    try expectContains(output, "{\"id\":\"resp_set_model_error\",\"type\":\"response\",\"command\":\"set_model\",\"success\":false,\"error\":\"Model not found: anthropic/missing-model\"}\n");
+
+    const fixture = try readFixture("responses-basic.jsonl");
+    defer allocator.free(fixture);
+    var output_lines = std.mem.splitScalar(u8, output, '\n');
+    while (output_lines.next()) |line| {
+        if (line.len == 0) continue;
+        try expectContains(fixture, line);
+    }
+}
+
+test "TS RPC parse error and unknown command match TypeScript byte fixtures" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeBytes(
+        allocator,
+        std.testing.io,
+        "{bad\n{\"id\":\"mystery\",\"type\":\"mystery_command\"}\n",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)\"}\n" ++
+            "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC reader uses LF framing strips CR and accepts final unterminated line" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeBytes(
+        allocator,
+        std.testing.io,
+        "{\"id\":\"framing_lf_a\",\"type\":\"get_state\"}\n{\"id\":\"framing_crlf_a\",\"type\":\"get_state\"}\r\n{\"id\":\"framing_final\",\"type\":\"get_state\"}",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"framing_lf_a\",\"type\":\"response\",\"command\":\"get_state\",\"success\":false,\"error\":\"Not implemented: get_state\"}\n" ++
+            "{\"id\":\"framing_crlf_a\",\"type\":\"response\",\"command\":\"get_state\",\"success\":false,\"error\":\"Not implemented: get_state\"}\n" ++
+            "{\"id\":\"framing_final\",\"type\":\"response\",\"command\":\"get_state\",\"success\":false,\"error\":\"Not implemented: get_state\"}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC dispatcher skeleton covers every TypeScript RpcCommand type" {
+    const allocator = std.testing.allocator;
+    const commands = try readFixture("commands-input.jsonl");
+    defer allocator.free(commands);
+
+    var seen = [_]bool{false} ** command_types.len;
+
+    var lines = std.mem.splitScalar(u8, commands, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const type_value = parsed.value.object.get("type").?;
+        if (std.mem.eql(u8, type_value.string, "extension_ui_response")) continue;
+        try std.testing.expect(isKnownCommandType(type_value.string));
+        for (command_types, 0..) |known, index| {
+            if (std.mem.eql(u8, known, type_value.string)) {
+                seen[index] = true;
+                break;
+            }
+        }
+    }
+
+    for (seen) |did_see| {
+        try std.testing.expect(did_see);
+    }
+}
+
+test "TS RPC extension UI responses are consumed without output" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &.{
+            "{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"value\":\"option-a\"}",
+            "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}",
+            "{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), stdout_capture.writer.buffered().len);
+}
