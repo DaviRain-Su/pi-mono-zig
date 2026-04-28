@@ -107,7 +107,7 @@ function captureRuntimeStdout(scenario: RuntimeScenario, options: RuntimeCapture
 			cwd: repoRoot,
 			input: options.input ?? "",
 			encoding: "utf8",
-			env: { ...process.env, PI_TS_RPC_FIXTURE_CHILD: "1" },
+			env: process.env,
 			maxBuffer: 1024 * 1024 * 10,
 		},
 	);
