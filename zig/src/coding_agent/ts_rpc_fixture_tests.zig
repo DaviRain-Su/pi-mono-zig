@@ -176,3 +176,25 @@ test "TS RPC prompt concurrency fixture captures queue ordering and streamingBeh
         bytes,
     );
 }
+
+test "TS RPC production and test code do not contain fixture bypass symbols" {
+    const allocator = std.testing.allocator;
+    const forbidden = [_][]const u8{
+        "PI_TS_RPC_" ++ "FIXTURE",
+        "runTsRpcPromptConcurrencyQueueOrder" ++ "Fixture",
+    };
+    const checked_files = [_][]const u8{
+        "src/coding_agent/ts_rpc_mode.zig",
+        "src/coding_agent/ts_rpc_fixture_tests.zig",
+        "test/generate-ts-rpc-fixtures.ts",
+        "test/ts-rpc-prompt-concurrency-fixture-diff.sh",
+    };
+
+    inline for (checked_files) |path| {
+        const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .unlimited);
+        defer allocator.free(bytes);
+        inline for (forbidden) |needle| {
+            try std.testing.expect(std.mem.indexOf(u8, bytes, needle) == null);
+        }
+    }
+}
