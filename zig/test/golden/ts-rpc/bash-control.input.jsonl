@@ -1,0 +1,7 @@
+{"id":"bash_ok","type":"bash","command":"printf ok"}
+{"id":"bash_fail","type":"bash","command":"printf fail; exit 7"}
+{"id":"bash_abort","type":"bash","command":"printf 'start\\n'; touch /tmp/pi-ts-rpc-bash-control-start; sleep 5; printf end"}
+{"id":"abort","type":"abort_bash"}
+{"id":"live_bash","type":"bash","command":"printf 'live\\n'; touch /tmp/pi-ts-rpc-bash-control-live; sleep 5; printf done"}
+{"id":"live_commands","type":"get_commands"}
+{"id":"live_abort","type":"abort_bash"}

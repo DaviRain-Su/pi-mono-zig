@@ -291,7 +291,7 @@ const PromptTask = struct {
         // events can dominate the output stream. Yield briefly after the
         // acceptance response so rapid controls can be handled in dispatcher
         // order instead of racing the prompt worker.
-        std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+        std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch {};
     }
 };
 
@@ -3007,6 +3007,7 @@ fn runTsRpcModeScript(
         try server.handleLine(line);
     }
 
+    try waitForNoInFlightPrompt(&server, 30_000);
     try waitForNoActiveBashTask(&server, 30_000);
     try server.finish();
 }
@@ -3110,6 +3111,15 @@ fn waitForNoActiveBashTask(server: *TsRpcServer, timeout_ms: u64) !void {
     try std.testing.expect(!server.hasActiveBashTask());
 }
 
+fn waitForNoInFlightPrompt(server: *const TsRpcServer, timeout_ms: u64) !void {
+    var elapsed: u64 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 5) {
+        if (!server.hasInFlightPrompt()) return;
+        std.Io.sleep(server.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(!server.hasInFlightPrompt());
+}
+
 fn waitForSessionRetrying(session: *const session_mod.AgentSession, timeout_ms: u64) !void {
     var elapsed: u64 = 0;
     while (elapsed <= timeout_ms) : (elapsed += 5) {
@@ -3130,29 +3140,7 @@ fn expectNewOutput(
     cursor.* = bytes.len;
 }
 
-fn promptConcurrencyFixtureWithoutAllowedLifecycleEvents(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const allowed_agent_start = "{\"type\":\"agent_start\"}";
-    var normalized = std.ArrayList(u8).empty;
-    errdefer normalized.deinit(allocator);
-    var allowed_agent_start_count: usize = 0;
-
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (std.mem.eql(u8, line, allowed_agent_start)) {
-            allowed_agent_start_count += 1;
-            continue;
-        }
-        try normalized.appendSlice(allocator, line);
-        try normalized.append(allocator, '\n');
-    }
-
-    try std.testing.expect(allowed_agent_start_count <= 1);
-    return try normalized.toOwnedSlice(allocator);
-}
-
 fn expectPromptConcurrencyQueueInvariant(bytes: []const u8) !void {
-    const pc_start = "{\"id\":\"pc_start\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n";
     const agent_start = "{\"type\":\"agent_start\"}\n";
     const steer_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[]}\n";
     const follow_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while prompt running\"],\"followUp\":[\"follow while prompt running\"]}\n";
@@ -3167,10 +3155,7 @@ fn expectPromptConcurrencyQueueInvariant(bytes: []const u8) !void {
     try expectOutputOrder(bytes, follow_queue_update, follow_response);
     try expectOutputOrder(bytes, prompt_steer_queue_update, prompt_steer_response);
     try expectOutputOrder(bytes, prompt_follow_queue_update, prompt_follow_response);
-
-    if (std.mem.indexOf(u8, bytes, agent_start)) |_| {
-        try expectOutputOrder(bytes, pc_start, agent_start);
-    }
+    try std.testing.expect(std.mem.indexOf(u8, bytes, agent_start) == null);
 }
 
 test "TS RPC writer preserves response field order from TypeScript fixtures" {
@@ -4398,9 +4383,8 @@ test "TS RPC M2 queue_update is emitted before response and prompt.streamingBeha
     const fixture = try readFixture("prompt-concurrency-queue-order.jsonl");
     defer allocator.free(fixture);
     try expectPromptConcurrencyQueueInvariant(stdout_capture.writer.buffered());
-    const normalized = try promptConcurrencyFixtureWithoutAllowedLifecycleEvents(allocator, stdout_capture.writer.buffered());
-    defer allocator.free(normalized);
-    try std.testing.expectEqualStrings(fixture, normalized);
+    try std.testing.expect(std.mem.indexOf(u8, fixture, "{\"type\":\"agent_start\"}\n") == null);
+    try std.testing.expectEqualStrings(fixture, stdout_capture.writer.buffered());
 }
 
 test "TS RPC M2 prompt without streamingBehavior rejects while streaming" {
