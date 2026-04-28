@@ -258,7 +258,7 @@ const TsRpcSessionHost = struct {
             try session_manager_mod.SessionManager.inMemory(self.server.allocator, self.server.io, old.cwd);
         errdefer manager.deinit();
 
-        try self.replaceWithManager(manager, old.cwd);
+        try self.replaceWithManager(manager, manager.getCwd());
         return .{ .cancelled = false };
     }
 
@@ -3121,6 +3121,17 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
         .{original_session_file},
     );
     defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"switch\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n");
+    try std.testing.expectEqualStrings(original_session_id, session.session_manager.getSessionId());
+    try std.testing.expectEqual(@as(usize, 3), session.agent.getMessages().len);
+
+    try server.handleLine("{\"id\":\"new_after_rebind\",\"type\":\"new_session\",\"parentSession\":\"parent-after-rebind.jsonl\"}");
+    try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"new_after_rebind\",\"type\":\"response\",\"command\":\"new_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n");
+    try std.testing.expectEqualStrings(session.session_manager.getCwd(), session.cwd);
+    try std.testing.expectEqual(session.session_manager.getCwd().ptr, session.cwd.ptr);
+    try std.testing.expectEqual(@as(usize, 0), session.agent.getMessages().len);
+
     try server.handleLine(switch_command);
     try expectNewOutput(&stdout_capture.writer, &cursor, "{\"id\":\"switch\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n");
     try std.testing.expectEqualStrings(original_session_id, session.session_manager.getSessionId());
