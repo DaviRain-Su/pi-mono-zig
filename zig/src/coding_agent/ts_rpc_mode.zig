@@ -368,11 +368,16 @@ const TsRpcServer = struct {
                 .callback = handleTsRpcAgentEvent,
             };
             try session.agent.subscribe(self.subscriber.?);
+            session.setRetryLifecycleCallback(.{
+                .context = self,
+                .callback = handleTsRpcRetryLifecycleEvent,
+            });
         }
     }
 
     fn detachFromCurrentSession(self: *TsRpcServer) void {
         if (self.session) |session| {
+            session.clearRetryLifecycleCallback();
             if (self.subscriber) |subscriber| {
                 _ = session.agent.unsubscribe(subscriber);
                 self.subscriber = null;
@@ -725,7 +730,7 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "abort_retry")) {
-            session.retry_attempt = 0;
+            session.abortRetry();
             try self.writeSuccessResponseNoData(id, command);
             return;
         }
@@ -984,6 +989,38 @@ const TsRpcServer = struct {
         try self.stdout_writer.writeAll(",\"followUp\":");
         try writeQueuedMessageTexts(self.allocator, self.stdout_writer, follow_up);
         try self.stdout_writer.writeAll("}\n");
+        try self.stdout_writer.flush();
+    }
+
+    fn writeRetryLifecycleEvent(self: *TsRpcServer, event: session_mod.RetryLifecycleEvent) !void {
+        if (self.suppress_events) return;
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+
+        switch (event) {
+            .start => |start_event| {
+                try self.stdout_writer.writeAll("{\"type\":\"auto_retry_start\",\"attempt\":");
+                try self.stdout_writer.print("{d}", .{start_event.attempt});
+                try self.stdout_writer.writeAll(",\"maxAttempts\":");
+                try self.stdout_writer.print("{d}", .{start_event.max_attempts});
+                try self.stdout_writer.writeAll(",\"delayMs\":");
+                try self.stdout_writer.print("{d}", .{start_event.delay_ms});
+                try self.stdout_writer.writeAll(",\"errorMessage\":");
+                try writeJsonString(self.allocator, self.stdout_writer, start_event.error_message);
+                try self.stdout_writer.writeAll("}\n");
+            },
+            .end => |end| {
+                try self.stdout_writer.writeAll("{\"type\":\"auto_retry_end\",\"success\":");
+                try self.stdout_writer.writeAll(if (end.success) "true" else "false");
+                try self.stdout_writer.writeAll(",\"attempt\":");
+                try self.stdout_writer.print("{d}", .{end.attempt});
+                if (end.final_error) |final_error| {
+                    try self.stdout_writer.writeAll(",\"finalError\":");
+                    try writeJsonString(self.allocator, self.stdout_writer, final_error);
+                }
+                try self.stdout_writer.writeAll("}\n");
+            },
+        }
         try self.stdout_writer.flush();
     }
 
@@ -1611,6 +1648,31 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
 fn handleTsRpcAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
     const server: *TsRpcServer = @ptrCast(@alignCast(context.?));
     try server.writeEvent(event);
+    if (event.event_type == .message_end) {
+        if (event.message) |message| {
+            switch (message) {
+                .assistant => |assistant| {
+                    if (assistant.stop_reason != .error_reason) {
+                        if (server.session) |session| {
+                            if (session.retry_attempt > 0) {
+                                try server.writeRetryLifecycleEvent(.{ .end = .{
+                                    .success = true,
+                                    .attempt = session.retry_attempt,
+                                } });
+                                session.retry_attempt = 0;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+fn handleTsRpcRetryLifecycleEvent(context: ?*anyopaque, event: session_mod.RetryLifecycleEvent) !void {
+    const server: *TsRpcServer = @ptrCast(@alignCast(context.?));
+    try server.writeRetryLifecycleEvent(event);
 }
 
 fn requiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
@@ -1947,6 +2009,23 @@ fn expectOutputOrder(haystack: []const u8, before: []const u8, after: []const u8
         unreachable;
     };
     try std.testing.expect(before_index < after_index);
+}
+
+fn waitForOutputContains(
+    server: *TsRpcServer,
+    writer: *std.Io.Writer,
+    needle: []const u8,
+    timeout_ms: u64,
+) !void {
+    var elapsed: u64 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 5) {
+        server.output_mutex.lockUncancelable(server.io);
+        const found = std.mem.indexOf(u8, writer.buffered(), needle) != null;
+        server.output_mutex.unlock(server.io);
+        if (found) return;
+        std.Io.sleep(server.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try expectContains(writer.buffered(), needle);
 }
 
 fn expectNewOutput(
@@ -2370,6 +2449,164 @@ test "TS RPC M3 session bash retry compaction controls use TS-compatible respons
     try expectContains(stdout_capture.writer.buffered(), expected_fork);
     try expectContains(stdout_capture.writer.buffered(), "\"command\":\"get_session_stats\",\"success\":true,\"data\":{\"sessionId\":");
     try expectContains(stdout_capture.writer.buffered(), "\"tokens\":{\"input\":2,\"output\":3,\"cacheRead\":4,\"cacheWrite\":5,\"total\":14}");
+}
+
+test "TS RPC retry lifecycle emits start then success end in TS-compatible order" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{ai.providers.faux.fauxText("retry ok")}, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-retry",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = false,
+            .max_retries = 2,
+            .base_delay_ms = 1,
+        },
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{
+            "{\"id\":\"retry_on\",\"type\":\"set_auto_retry\",\"enabled\":true}",
+            "{\"id\":\"retry_prompt\",\"type\":\"prompt\",\"message\":\"please retry\"}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    const output = stdout_capture.writer.buffered();
+    const start_event = "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":2,\"delayMs\":1,\"errorMessage\":\"503 service unavailable\"}\n";
+    const end_event = "{\"type\":\"auto_retry_end\",\"success\":true,\"attempt\":1}\n";
+    try expectContains(output, "{\"id\":\"retry_on\",\"type\":\"response\",\"command\":\"set_auto_retry\",\"success\":true}\n");
+    try expectContains(output, "{\"id\":\"retry_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectContains(output, start_event);
+    try expectContains(output, end_event);
+    try expectOutputOrder(output, "{\"id\":\"retry_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n", start_event);
+    try expectOutputOrder(output, start_event, end_event);
+    try expectOutputOrder(
+        output,
+        end_event,
+        "{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"retry ok\"}]",
+    );
+}
+
+test "TS RPC abort_retry cancels active retry delay and emits failure end" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{ai.providers.faux.fauxText("should not run")}, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-retry-abort",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = true,
+            .max_retries = 2,
+            .base_delay_ms = 250,
+        },
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"abort_prompt\",\"type\":\"prompt\",\"message\":\"please retry then abort\"}");
+    const start_event = "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":2,\"delayMs\":250,\"errorMessage\":\"503 service unavailable\"}\n";
+    try waitForOutputContains(&server, &stdout_capture.writer, start_event, 500);
+    try server.handleLine("{\"id\":\"abort_retry\",\"type\":\"abort_retry\"}");
+    try server.finish();
+
+    const output = stdout_capture.writer.buffered();
+    const abort_response = "{\"id\":\"abort_retry\",\"type\":\"response\",\"command\":\"abort_retry\",\"success\":true}\n";
+    const end_event = "{\"type\":\"auto_retry_end\",\"success\":false,\"attempt\":1,\"finalError\":\"Retry cancelled\"}\n";
+    try expectContains(output, "{\"id\":\"abort_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectContains(output, start_event);
+    try expectContains(output, abort_response);
+    try expectContains(output, end_event);
+    try expectOutputOrder(output, start_event, abort_response);
+    try expectOutputOrder(output, abort_response, end_event);
+    try std.testing.expect(std.mem.indexOf(u8, output, "should not run") == null);
+}
+
+test "TS RPC set_auto_retry false disables retry lifecycle" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{ai.providers.faux.fauxText("unexpected retry")}, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-retry-disabled",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = true,
+            .max_retries = 2,
+            .base_delay_ms = 1,
+        },
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeScript(
+        allocator,
+        std.testing.io,
+        &session,
+        &.{
+            "{\"id\":\"retry_off\",\"type\":\"set_auto_retry\",\"enabled\":false}",
+            "{\"id\":\"disabled_prompt\",\"type\":\"prompt\",\"message\":\"do not retry\"}",
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    const output = stdout_capture.writer.buffered();
+    try expectContains(output, "{\"id\":\"retry_off\",\"type\":\"response\",\"command\":\"set_auto_retry\",\"success\":true}\n");
+    try expectContains(output, "{\"id\":\"disabled_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"type\":\"auto_retry_start\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"type\":\"auto_retry_end\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "unexpected retry") == null);
+    try std.testing.expectEqual(@as(u32, 0), session.retry_attempt);
 }
 
 test "TS RPC M3 session host rebinds new switch fork clone and state" {
