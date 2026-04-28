@@ -25,6 +25,12 @@
 			"lineCount": 33
 		},
 		{
+			"path": "bash-control.input.jsonl",
+			"description": "Scripted JSONL stdin for direct bash success, failure, abort, and live command interleaving TS-vs-Zig parity checks.",
+			"byteLength": 488,
+			"lineCount": 7
+		},
+		{
 			"path": "bash-control.jsonl",
 			"description": "runRpcMode stdout bytes for direct bash success, failure, abort, and live command interleaving result shapes.",
 			"byteLength": 797,

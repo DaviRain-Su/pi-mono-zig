@@ -22,6 +22,7 @@ const repoRoot = join(scriptDir, "..", "..");
 const fixtureDir = join(scriptDir, "golden", "ts-rpc");
 const checkMode = process.argv.includes("--check");
 const runtimeChildArg = process.argv.find((arg) => arg.startsWith("--runtime-child="));
+const emitFixtureArg = process.argv.find((arg) => arg.startsWith("--emit-fixture="));
 
 const sourceCitations = [
 	"packages/coding-agent/src/modes/rpc/jsonl.ts:10-58",
@@ -335,11 +336,19 @@ const responseScenarioInput = jsonl([
 ]) + "{not json\n" + serializeJsonLine({ id: "mystery", type: "mystery_command" });
 
 const bashControlScenarioInput = jsonl([
-	{ id: "bash_ok", type: "bash", command: "fixture-ok" },
-	{ id: "bash_fail", type: "bash", command: "fixture-fail" },
-	{ id: "bash_abort", type: "bash", command: "fixture-abort" },
+	{ id: "bash_ok", type: "bash", command: "printf ok" },
+	{ id: "bash_fail", type: "bash", command: "printf fail; exit 7" },
+	{
+		id: "bash_abort",
+		type: "bash",
+		command: "printf 'start\\n'; touch /tmp/pi-ts-rpc-bash-control-start; sleep 5; printf end",
+	},
 	{ id: "abort", type: "abort_bash" },
-	{ id: "live_bash", type: "bash", command: "fixture-live" },
+	{
+		id: "live_bash",
+		type: "bash",
+		command: "printf 'live\\n'; touch /tmp/pi-ts-rpc-bash-control-live; sleep 5; printf done",
+	},
 	{ id: "live_commands", type: "get_commands" },
 	{ id: "live_abort", type: "abort_bash" },
 ] satisfies RpcCommand[]);
@@ -668,18 +677,18 @@ class FixtureSession {
 			throw new Error("Command fixture failure");
 		}
 		if (this.scenario === "bash-control") {
-			if (command === "fixture-ok") {
+			if (command === "printf ok") {
 				return { output: "ok", exitCode: 0, cancelled: false, truncated: false };
 			}
-			if (command === "fixture-fail") {
+			if (command === "printf fail; exit 7") {
 				return { output: "fail", exitCode: 7, cancelled: false, truncated: false };
 			}
-			if (command === "fixture-abort") {
+			if (command === "printf 'start\\n'; touch /tmp/pi-ts-rpc-bash-control-start; sleep 5; printf end") {
 				return new Promise((resolve) => {
 					this.pendingBashResolvers.push(() => resolve({ output: "start\n", cancelled: true, truncated: false }));
 				});
 			}
-			if (command === "fixture-live") {
+			if (command === "printf 'live\\n'; touch /tmp/pi-ts-rpc-bash-control-live; sleep 5; printf done") {
 				return new Promise((resolve) => {
 					this.pendingBashResolvers.push(() => resolve({ output: "live\n", cancelled: true, truncated: false }));
 				});
@@ -792,6 +801,11 @@ async function buildFixtures(): Promise<FixtureFile[]> {
 			bytes: jsonl([...commands, ...extensionUiResponses]),
 		},
 		{
+			path: "bash-control.input.jsonl",
+			description: "Scripted JSONL stdin for direct bash success, failure, abort, and live command interleaving TS-vs-Zig parity checks.",
+			bytes: bashControlScenarioInput,
+		},
+		{
 			path: "bash-control.jsonl",
 			description: "runRpcMode stdout bytes for direct bash success, failure, abort, and live command interleaving result shapes.",
 			bytes: captureRuntimeStdout("bash-control", { input: bashControlScenarioInput }),
@@ -890,6 +904,16 @@ if (scenario) {
 	await runRuntimeChild(scenario);
 } else {
 	const files = await buildFixtures();
+	if (emitFixtureArg) {
+		const requestedPath = emitFixtureArg.slice("--emit-fixture=".length);
+		const file = files.find((candidate) => candidate.path === requestedPath);
+		if (!file) {
+			console.error(`Unknown fixture: ${requestedPath}`);
+			process.exit(1);
+		}
+		process.stdout.write(file.bytes);
+		process.exit(0);
+	}
 
 	if (checkMode) {
 		const expectedPaths = new Set(files.map((file) => file.path));

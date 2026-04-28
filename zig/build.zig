@@ -80,10 +80,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(external_tool_check_step);
 
-    const ts_rpc_prompt_concurrency_fixture_diff = b.addSystemCommand(&.{"bash"});
-    ts_rpc_prompt_concurrency_fixture_diff.addFileArg(b.path("test/ts-rpc-prompt-concurrency-fixture-diff.sh"));
-    ts_rpc_prompt_concurrency_fixture_diff.step.dependOn(b.getInstallStep());
-    test_step.dependOn(&ts_rpc_prompt_concurrency_fixture_diff.step);
+    const ts_rpc_parity = b.addSystemCommand(&.{"bash"});
+    ts_rpc_parity.addFileArg(b.path("test/ts-rpc-parity.sh"));
+    ts_rpc_parity.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&ts_rpc_parity.step);
+
+    const ts_rpc_parity_step = b.step("test-ts-rpc-parity", "Run TS-vs-Zig ts-rpc exact-byte parity harness");
+    ts_rpc_parity_step.dependOn(external_tool_check_step);
+    ts_rpc_parity_step.dependOn(&ts_rpc_parity.step);
 
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
