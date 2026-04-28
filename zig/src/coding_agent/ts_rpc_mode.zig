@@ -1241,6 +1241,18 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
 
+fn expectOutputOrder(haystack: []const u8, before: []const u8, after: []const u8) !void {
+    const before_index = std.mem.indexOf(u8, haystack, before) orelse {
+        try expectContains(haystack, before);
+        unreachable;
+    };
+    const after_index = std.mem.indexOf(u8, haystack, after) orelse {
+        try expectContains(haystack, after);
+        unreachable;
+    };
+    try std.testing.expect(before_index < after_index);
+}
+
 test "TS RPC writer preserves response field order from TypeScript fixtures" {
     const allocator = std.testing.allocator;
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
@@ -1588,7 +1600,7 @@ test "TS RPC M2 abort command is processed while prompt worker is in flight" {
     try std.testing.expect(abort_response_index < agent_end_index);
 }
 
-test "TS RPC live client receives queued control responses before EOF" {
+test "TS RPC live client receives queue_update events and queued control responses before EOF" {
     const allocator = std.testing.allocator;
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp/ts-rpc-m2",
@@ -1614,11 +1626,25 @@ test "TS RPC live client receives queued control responses before EOF" {
     try server.handleLine("{\"id\":\"ps\",\"type\":\"prompt\",\"message\":\"prompt steer while live\",\"streamingBehavior\":\"steer\"}");
     try server.handleLine("{\"id\":\"pf\",\"type\":\"prompt\",\"message\":\"prompt follow while live\",\"streamingBehavior\":\"followUp\"}");
 
+    const steer_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while live\"],\"followUp\":[]}\n";
+    const follow_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while live\"],\"followUp\":[\"follow while live\"]}\n";
+    const prompt_steer_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while live\",\"prompt steer while live\"],\"followUp\":[\"follow while live\"]}\n";
+    const prompt_follow_queue_update = "{\"type\":\"queue_update\",\"steering\":[\"steer while live\",\"prompt steer while live\"],\"followUp\":[\"follow while live\",\"prompt follow while live\"]}\n";
+
+    try waitForServerOutputContains(&server, &stdout_capture.writer, steer_queue_update);
+    try waitForServerOutputContains(&server, &stdout_capture.writer, follow_queue_update);
+    try waitForServerOutputContains(&server, &stdout_capture.writer, prompt_steer_queue_update);
+    try waitForServerOutputContains(&server, &stdout_capture.writer, prompt_follow_queue_update);
     try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"ps\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
     try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"pf\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
     try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"s\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n");
     try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"f\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n");
     try std.testing.expect(session.isStreaming());
+
+    try expectOutputOrder(stdout_capture.writer.buffered(), steer_queue_update, "{\"id\":\"s\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n");
+    try expectOutputOrder(stdout_capture.writer.buffered(), follow_queue_update, "{\"id\":\"f\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n");
+    try expectOutputOrder(stdout_capture.writer.buffered(), prompt_steer_queue_update, "{\"id\":\"ps\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectOutputOrder(stdout_capture.writer.buffered(), prompt_follow_queue_update, "{\"id\":\"pf\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
 
     try server.handleLine("{\"id\":\"a\",\"type\":\"abort\"}");
     try waitForServerOutputContains(&server, &stdout_capture.writer, "{\"id\":\"a\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n");
