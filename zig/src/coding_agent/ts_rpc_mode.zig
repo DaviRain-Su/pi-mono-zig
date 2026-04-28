@@ -455,6 +455,9 @@ const TsRpcServer = struct {
             self.deferred_flush_thread = null;
         }
         try self.flushDeferredResponses();
+        if (self.hasInFlightPrompt()) {
+            self.abortActivePromptWork();
+        }
         for (self.prompt_tasks.items) |task| {
             task.joinAndDestroy();
         }
@@ -496,7 +499,7 @@ const TsRpcServer = struct {
 
     fn cancelAndJoinPromptTasks(self: *TsRpcServer) void {
         if (self.hasInFlightPrompt()) {
-            if (self.session) |session| session.agent.abort();
+            self.abortActivePromptWork();
         }
         for (self.prompt_tasks.items) |task| {
             task.joinAndDestroy();
@@ -509,6 +512,13 @@ const TsRpcServer = struct {
             if (!task.isDone()) return true;
         }
         return false;
+    }
+
+    fn abortActivePromptWork(self: *TsRpcServer) void {
+        if (self.session) |session| {
+            session.abortRetry();
+            session.agent.abort();
+        }
     }
 
     fn takeCompletedBashTask(self: *TsRpcServer) ?*BashTask {
@@ -735,7 +745,7 @@ const TsRpcServer = struct {
             if (defer_response) {
                 try self.enqueueDeferredSuccess(id, command, .abort);
             } else {
-                session.agent.abort();
+                self.abortActivePromptWork();
                 try self.writeSuccessResponseNoData(id, command);
             }
             return;
@@ -1433,7 +1443,7 @@ const TsRpcServer = struct {
         }
         self.deferred_responses.clearRetainingCapacity();
         if (should_abort_after_flush) {
-            if (self.session) |session| session.agent.abort();
+            self.abortActivePromptWork();
         }
     }
 };
@@ -1489,7 +1499,7 @@ pub fn runTsRpcMode(
 
     if (server.hasInFlightPrompt()) {
         server.suppress_events = true;
-        session.agent.abort();
+        server.abortActivePromptWork();
     }
     try server.flushDeferredResponses();
     try server.finish();
@@ -2509,7 +2519,7 @@ fn runTsRpcModeBytes(
 
     if (server.hasInFlightPrompt()) {
         server.suppress_events = true;
-        if (session) |some_session| some_session.agent.abort();
+        server.abortActivePromptWork();
     }
     try server.flushDeferredResponses();
     try server.finish();
@@ -2556,6 +2566,15 @@ fn waitForOutputContains(
         std.Io.sleep(server.io, .fromMilliseconds(5), .awake) catch {};
     }
     try expectContains(writer.buffered(), needle);
+}
+
+fn waitForSessionRetrying(session: *const session_mod.AgentSession, timeout_ms: u64) !void {
+    var elapsed: u64 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 5) {
+        if (session.isRetrying()) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(session.isRetrying());
 }
 
 fn expectNewOutput(
@@ -3087,6 +3106,117 @@ test "TS RPC abort_retry cancels active retry delay and emits failure end" {
     try expectOutputOrder(output, start_event, abort_response);
     try expectOutputOrder(output, abort_response, end_event);
     try std.testing.expect(std.mem.indexOf(u8, output, "should not run") == null);
+}
+
+test "TS RPC new_session aborts active retry delay before rebind" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{ai.providers.faux.fauxText("should not run after rebind")}, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-retry-rebind",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = true,
+            .max_retries = 2,
+            .base_delay_ms = 1000,
+        },
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"rebind_prompt\",\"type\":\"prompt\",\"message\":\"please retry then rebind\"}");
+    const start_event = "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":2,\"delayMs\":1000,\"errorMessage\":\"503 service unavailable\"}\n";
+    try waitForOutputContains(&server, &stdout_capture.writer, start_event, 500);
+    try waitForSessionRetrying(&session, 500);
+
+    const start_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    try server.handleLine("{\"id\":\"new_during_retry\",\"type\":\"new_session\"}");
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start_ns, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms < 500);
+
+    const output = stdout_capture.writer.buffered();
+    const end_event = "{\"type\":\"auto_retry_end\",\"success\":false,\"attempt\":1,\"finalError\":\"Retry cancelled\"}\n";
+    const rebind_response = "{\"id\":\"new_during_retry\",\"type\":\"response\",\"command\":\"new_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n";
+    try expectContains(output, "{\"id\":\"rebind_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectContains(output, start_event);
+    try expectContains(output, end_event);
+    try expectContains(output, rebind_response);
+    try expectOutputOrder(output, start_event, end_event);
+    try expectOutputOrder(output, end_event, rebind_response);
+    try std.testing.expect(std.mem.indexOf(u8, output, "should not run after rebind") == null);
+}
+
+test "TS RPC EOF shutdown aborts active retry delay promptly" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "503 service unavailable" }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{ai.providers.faux.fauxText("should not run after shutdown")}, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-retry-shutdown",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .retry = .{
+            .enabled = true,
+            .max_retries = 2,
+            .base_delay_ms = 1000,
+        },
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    try server.handleLine("{\"id\":\"shutdown_prompt\",\"type\":\"prompt\",\"message\":\"please retry then shutdown\"}");
+    try waitForOutputContains(
+        &server,
+        &stdout_capture.writer,
+        "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":2,\"delayMs\":1000,\"errorMessage\":\"503 service unavailable\"}\n",
+        500,
+    );
+    try waitForSessionRetrying(&session, 500);
+
+    const start_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    server.suppress_events = true;
+    server.abortActivePromptWork();
+    try server.flushDeferredResponses();
+    try server.finish();
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start_ns, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms < 500);
+
+    const output = stdout_capture.writer.buffered();
+    try expectContains(output, "{\"id\":\"shutdown_prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n");
+    try expectContains(output, "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":2,\"delayMs\":1000,\"errorMessage\":\"503 service unavailable\"}\n");
+    try std.testing.expect(std.mem.indexOf(u8, output, "should not run after shutdown") == null);
 }
 
 test "TS RPC set_auto_retry false disables retry lifecycle" {
