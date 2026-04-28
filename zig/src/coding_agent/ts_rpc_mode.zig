@@ -133,13 +133,9 @@ const TsRpcServer = struct {
     }
 
     fn parseErrorMessage(self: *TsRpcServer, line: []const u8) ![]u8 {
-        if (std.mem.eql(u8, line, "{bad")) {
-            return try self.allocator.dupe(u8, "Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)");
-        }
-        if (line.len == 0) {
-            return try self.allocator.dupe(u8, "Failed to parse command: Unexpected end of JSON input");
-        }
-        return try self.allocator.dupe(u8, "Failed to parse command: Invalid JSON");
+        const detail = try jsonParseErrorDetail(self.allocator, line);
+        defer self.allocator.free(detail);
+        return try std.fmt.allocPrint(self.allocator, "Failed to parse command: {s}", .{detail});
     }
 
     fn writeSuccessResponseNoData(self: *TsRpcServer, id: ?[]const u8, command: []const u8) !void {
@@ -231,6 +227,170 @@ pub fn runTsRpcMode(
 fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
     if (std.mem.endsWith(u8, line, "\r")) return line[0 .. line.len - 1];
     return line;
+}
+
+fn jsonParseErrorDetail(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    const first_index = firstNonJsonWhitespaceIndex(line) orelse
+        return try allocator.dupe(u8, "Unexpected end of JSON input");
+    const trimmed = line[first_index..];
+
+    if (hasUnterminatedString(line)) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "Unterminated string in JSON at position {d} (line 1 column {d})",
+            .{ line.len, line.len + 1 },
+        );
+    }
+
+    switch (trimmed[0]) {
+        '{' => return try objectParseErrorDetail(allocator, line, first_index),
+        '[' => return try arrayParseErrorDetail(allocator, line, first_index),
+        't' => return try literalParseErrorDetail(allocator, line, first_index, "true"),
+        'f' => return try literalParseErrorDetail(allocator, line, first_index, "false"),
+        'n' => return try literalParseErrorDetail(allocator, line, first_index, "null"),
+        else => return try unexpectedTokenDetail(allocator, line, first_index),
+    }
+}
+
+fn objectParseErrorDetail(allocator: std.mem.Allocator, line: []const u8, object_start: usize) ![]u8 {
+    const after_open = firstNonJsonWhitespaceIndexFrom(line, object_start + 1) orelse object_start + 1;
+    if (after_open >= line.len or line[after_open] == '}') {
+        return try expectedPropertyNameOrCloseDetail(allocator, after_open);
+    }
+    if (line[after_open] != '"') {
+        return try expectedPropertyNameOrCloseDetail(allocator, after_open);
+    }
+
+    if (lastNonJsonWhitespaceIndex(line)) |last_index| {
+        if (line[last_index] == '}') {
+            const before_close = previousNonJsonWhitespaceIndex(line, last_index);
+            if (before_close != null and line[before_close.?] == ',') {
+                return try std.fmt.allocPrint(
+                    allocator,
+                    "Expected double-quoted property name in JSON at position {d} (line 1 column {d})",
+                    .{ last_index, last_index + 1 },
+                );
+            }
+        }
+        if (line[last_index] == ':' or line[last_index] == ',') {
+            return try allocator.dupe(u8, "Unexpected end of JSON input");
+        }
+    }
+
+    return try allocator.dupe(u8, "Unexpected end of JSON input");
+}
+
+fn arrayParseErrorDetail(allocator: std.mem.Allocator, line: []const u8, array_start: usize) ![]u8 {
+    _ = array_start;
+    if (lastNonJsonWhitespaceIndex(line)) |last_index| {
+        if (line[last_index] == ']') {
+            const before_close = previousNonJsonWhitespaceIndex(line, last_index);
+            if (before_close != null and line[before_close.?] == ',') {
+                return try unexpectedTokenDetail(allocator, line, last_index);
+            }
+        }
+        if (line[last_index] == '[' or line[last_index] == ',') {
+            return try allocator.dupe(u8, "Unexpected end of JSON input");
+        }
+    }
+
+    return try allocator.dupe(u8, "Unexpected end of JSON input");
+}
+
+fn literalParseErrorDetail(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    start_index: usize,
+    literal: []const u8,
+) ![]u8 {
+    var offset: usize = 0;
+    while (offset < literal.len and start_index + offset < line.len and line[start_index + offset] == literal[offset]) {
+        offset += 1;
+    }
+
+    if (offset == literal.len) {
+        const after_literal = firstNonJsonWhitespaceIndexFrom(line, start_index + literal.len);
+        if (after_literal) |token_index| return try unexpectedTokenDetail(allocator, line, token_index);
+        return try allocator.dupe(u8, "Unexpected end of JSON input");
+    }
+
+    if (start_index + offset >= line.len) {
+        return try allocator.dupe(u8, "Unexpected end of JSON input");
+    }
+    return try unexpectedTokenDetail(allocator, line, start_index + offset);
+}
+
+fn unexpectedTokenDetail(allocator: std.mem.Allocator, line: []const u8, token_index: usize) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "Unexpected token '{c}', \"{s}\" is not valid JSON",
+        .{ line[token_index], line },
+    );
+}
+
+fn expectedPropertyNameOrCloseDetail(allocator: std.mem.Allocator, index: usize) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "Expected property name or '}}' in JSON at position {d} (line 1 column {d})",
+        .{ index, index + 1 },
+    );
+}
+
+fn hasUnterminatedString(line: []const u8) bool {
+    var in_string = false;
+    var escaped = false;
+    for (line) |byte| {
+        if (!in_string) {
+            if (byte == '"') in_string = true;
+            continue;
+        }
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') {
+            in_string = false;
+        }
+    }
+    return in_string;
+}
+
+fn firstNonJsonWhitespaceIndex(line: []const u8) ?usize {
+    return firstNonJsonWhitespaceIndexFrom(line, 0);
+}
+
+fn firstNonJsonWhitespaceIndexFrom(line: []const u8, start: usize) ?usize {
+    var index = start;
+    while (index < line.len) : (index += 1) {
+        if (!isJsonWhitespace(line[index])) return index;
+    }
+    return null;
+}
+
+fn lastNonJsonWhitespaceIndex(line: []const u8) ?usize {
+    var index = line.len;
+    while (index > 0) {
+        index -= 1;
+        if (!isJsonWhitespace(line[index])) return index;
+    }
+    return null;
+}
+
+fn previousNonJsonWhitespaceIndex(line: []const u8, before: usize) ?usize {
+    var index = before;
+    while (index > 0) {
+        index -= 1;
+        if (!isJsonWhitespace(line[index])) return index;
+    }
+    return null;
+}
+
+fn isJsonWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
 
 fn writeIdField(allocator: std.mem.Allocator, writer: *std.Io.Writer, id: ?[]const u8) !void {
@@ -353,6 +513,47 @@ test "TS RPC parse error and unknown command match TypeScript byte fixtures" {
     try std.testing.expectEqualStrings(
         "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)\"}\n" ++
             "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
+        stdout_capture.writer.buffered(),
+    );
+}
+
+test "TS RPC malformed JSON parse errors match TypeScript bytes beyond bad fixture" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeBytes(
+        allocator,
+        std.testing.io,
+        "   \n{\"type\":\nnot-json\n{\"type\":\"get_state\",}\n[1,]\n",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    const fixture = try readFixture("parse-errors.jsonl");
+    defer allocator.free(fixture);
+    try std.testing.expectEqualStrings(fixture, stdout_capture.writer.buffered());
+}
+
+test "TS RPC array input where command object is expected matches TypeScript unknown-command bytes" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    try runTsRpcModeBytes(
+        allocator,
+        std.testing.io,
+        "[]\n",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"response\",\"success\":false,\"error\":\"Unknown command: undefined\"}\n",
         stdout_capture.writer.buffered(),
     );
 }
