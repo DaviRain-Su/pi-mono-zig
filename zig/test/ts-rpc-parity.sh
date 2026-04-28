@@ -12,11 +12,14 @@ bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
 echo "TS-RPC parity: live production scenario exact byte diffs"
 python3 <<'PY'
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 BASE_ARGS = [
 	"./zig-out/bin/pi",
@@ -160,6 +163,127 @@ if proc.stdout != ts_extension_response.stdout:
 	)
 	sys.exit(1)
 print("  extension UI response consumption live TS-vs-Zig exact byte diff passed")
+
+def deterministic_crypto_import():
+	source = (
+		'import { createRequire } from "node:module";\n'
+		'const require = createRequire(process.cwd() + "/package.json");\n'
+		'const crypto = require("node:crypto");\n'
+		'const ids = ["ui_select","ui_confirm","ui_input","ui_notify","ui_status","ui_widget","ui_title","ui_editor_text","ui_editor","ui_extra_1","ui_extra_2"];\n'
+		'crypto.randomUUID = () => ids.shift() ?? "ui_extra";\n'
+	)
+	return f"data:text/javascript,{quote(source)}"
+
+def run_live_extension_ui(args, env, label):
+	responses = {
+		"ui_select": '{"type":"extension_ui_response","id":"ui_select","value":"option-a"}\n',
+		"ui_confirm": '{"type":"extension_ui_response","id":"ui_confirm","confirmed":true}\n',
+		"ui_input": '{"type":"extension_ui_response","id":"ui_input","cancelled":true}\n',
+		"ui_editor": '{"type":"extension_ui_response","id":"ui_editor","value":"edited text"}\n',
+	}
+	proc = subprocess.Popen(
+		args,
+		stdin=subprocess.PIPE,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		text=True,
+		env=env,
+	)
+	assert proc.stdin is not None
+	assert proc.stdout is not None
+	assert proc.stderr is not None
+	lines = queue.Queue()
+
+	def read_stdout():
+		for line in proc.stdout:
+			lines.put(line)
+
+	reader = threading.Thread(target=read_stdout, daemon=True)
+	reader.start()
+	stdout_lines = []
+	sent = set()
+	deadline = time.monotonic() + 10
+	expected_request_lines = 9
+	while len(stdout_lines) < expected_request_lines:
+		remaining = deadline - time.monotonic()
+		if remaining <= 0:
+			proc.kill()
+			print(f"{label} timed out waiting for extension_ui_request output", file=sys.stderr)
+			sys.exit(1)
+		try:
+			line = lines.get(timeout=remaining)
+		except queue.Empty:
+			proc.kill()
+			print(f"{label} timed out waiting for extension_ui_request output", file=sys.stderr)
+			sys.exit(1)
+		stdout_lines.append(line)
+		for request_id, response in responses.items():
+			if request_id not in sent and f'"id":"{request_id}"' in line:
+				proc.stdin.write(response)
+				proc.stdin.flush()
+				sent.add(request_id)
+
+	missing = sorted(set(responses) - sent)
+	if missing:
+		proc.kill()
+		print(f"{label} did not emit dialog request ids: {', '.join(missing)}", file=sys.stderr)
+		sys.exit(1)
+	proc.stdin.close()
+	stderr = proc.stderr.read()
+	status = proc.wait(timeout=10)
+	reader.join(timeout=1)
+	while True:
+		try:
+			stdout_lines.append(lines.get_nowait())
+		except queue.Empty:
+			break
+	if status != 0:
+		print(stderr, file=sys.stderr)
+		print(f"{label} exited {status}", file=sys.stderr)
+		sys.exit(status)
+	return "".join(stdout_lines)
+
+ts_extension_ui_stdout = run_live_extension_ui(
+	[
+		"node",
+		"--import",
+		deterministic_crypto_import(),
+		"--import",
+		"tsx",
+		"test/generate-ts-rpc-fixtures.ts",
+		"--runtime-child=extension-ui",
+	],
+	os.environ.copy(),
+	"extension UI TypeScript RPC",
+)
+zig_extension_ui_env = os.environ.copy()
+zig_extension_ui_env["PI_TS_RPC_EXTENSION_UI_PARITY_SCENARIO"] = "1"
+zig_extension_ui_stdout = run_live_extension_ui(
+	[
+		"./zig-out/bin/pi",
+		"--mode",
+		"ts-rpc",
+		"--provider",
+		"faux",
+		"--no-session",
+		"--no-context-files",
+		"--no-prompt-templates",
+		"--system-prompt",
+		"sys",
+	],
+	zig_extension_ui_env,
+	"extension UI Zig ts-rpc",
+)
+if zig_extension_ui_stdout != ts_extension_ui_stdout:
+	Path("/tmp/pi-ts-rpc-extension-ui-live-actual.jsonl").write_text(zig_extension_ui_stdout)
+	Path("/tmp/pi-ts-rpc-extension-ui-live-ts.jsonl").write_text(ts_extension_ui_stdout)
+	print("extension UI live request/response Zig stdout differs from live TypeScript RPC stdout", file=sys.stderr)
+	subprocess.run(
+		["diff", "-u", "/tmp/pi-ts-rpc-extension-ui-live-ts.jsonl", "/tmp/pi-ts-rpc-extension-ui-live-actual.jsonl"],
+		check=False,
+	)
+	sys.exit(1)
+print("  extension UI live request emission + response consumption TS-vs-Zig exact byte diff passed")
 PY
 
 echo "TS-RPC parity: extension UI request writer exact byte coverage"
@@ -273,5 +397,5 @@ TS-RPC parity scenarios passed:
 - compaction: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
 - retry: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
 - queue steer/follow-up: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed; 20 stress iterations passed.
-- extension UI request/response: live TypeScript RPC response-consumption stdout and Zig --mode ts-rpc stdout diff passed; request bytes are generated by current TypeScript RPC and checked by Zig extension UI exact-byte tests.
+- extension UI request/response: live TypeScript RPC runtime and Zig --mode ts-rpc emitted extension_ui_request bytes, consumed matching extension_ui_response inputs while running, and exact-byte stdout diff passed.
 REPORT

@@ -8,7 +8,9 @@ const session_mod = @import("session.zig");
 const session_advanced = @import("session_advanced.zig");
 const session_manager_mod = @import("session_manager.zig");
 
-pub const RunTsRpcModeOptions = struct {};
+pub const RunTsRpcModeOptions = struct {
+    extension_ui_parity_scenario: bool = false,
+};
 
 const PromptStreamingBehavior = enum {
     steer,
@@ -1536,6 +1538,21 @@ const TsRpcServer = struct {
         try self.stdout_writer.flush();
     }
 
+    fn emitExtensionUIParityScenario(self: *TsRpcServer) !void {
+        const select_options = [_][]const u8{ "option-a", "option-b" };
+        const widget_lines = [_][]const u8{ "line one", "line two" };
+
+        try self.writeExtensionUISelectRequest("ui_select", "Choose fixture", &select_options, 1000);
+        try self.writeExtensionUIConfirmRequest("ui_confirm", "Confirm fixture", "Proceed?", 1000);
+        try self.writeExtensionUIInputRequest("ui_input", "Fixture input", "value", 1000);
+        try self.writeExtensionUINotifyRequest("ui_notify", "Fixture notice", "info");
+        try self.writeExtensionUISetStatusRequest("ui_status", "fixture", "ready");
+        try self.writeExtensionUISetWidgetRequest("ui_widget", "fixture", &widget_lines, "aboveEditor");
+        try self.writeExtensionUISetTitleRequest("ui_title", "Fixture Title");
+        try self.writeExtensionUISetEditorTextRequest("ui_editor_text", "fixture editor text");
+        try self.writeExtensionUIEditorRequest("ui_editor", "Edit fixture", "prefill");
+    }
+
     fn writeEvent(self: *TsRpcServer, event: agent.AgentEvent) !void {
         if (self.suppress_events) return;
         const value = try json_event_wire.agentEventToJsonValue(self.allocator, event);
@@ -1891,13 +1908,16 @@ pub fn runTsRpcMode(
     allocator: std.mem.Allocator,
     io: std.Io,
     session: *session_mod.AgentSession,
-    _: RunTsRpcModeOptions,
+    options: RunTsRpcModeOptions,
     stdout_writer: *std.Io.Writer,
     stderr_writer: *std.Io.Writer,
 ) !u8 {
     var server = TsRpcServer.init(allocator, io, session, stdout_writer, stderr_writer);
     try server.start();
     defer server.finish() catch {};
+    if (options.extension_ui_parity_scenario) {
+        try server.emitExtensionUIParityScenario();
+    }
 
     var stdin_buffer: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
