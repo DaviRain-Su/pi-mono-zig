@@ -1,0 +1,4 @@
+{"type":"extension_ui_response","id":"ui_confirm","confirmed":true}
+{"type":"extension_ui_response","id":"ui_select","value":"option-b"}
+{"type":"extension_ui_response","id":"ui_input","cancelled":true}
+{"type":"extension_ui_response","id":"ui_editor","value":"edited text"}

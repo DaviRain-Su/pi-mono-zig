@@ -5,7 +5,8 @@
 		"responses": "spawn runRpcMode with a deterministic faux AgentSessionRuntime and capture child stdout bytes",
 		"framing": "feed LF, CRLF, invalid, and final unterminated stdin into runRpcMode and capture child stdout bytes",
 		"events": "emit deterministic faux AgentSession events through session.subscribe inside runRpcMode and capture child stdout bytes",
-		"extensionUi": "invoke the runRpcMode ExtensionUIContext from bindExtensions with deterministic crypto.randomUUID preload"
+		"extensionUi": "invoke the runRpcMode ExtensionUIContext from bindExtensions with deterministic crypto.randomUUID preload",
+		"m6ExtensionHost": "invoke the same M6 fixture interaction through runRpcMode ExtensionUIContext while scripted extension_ui_response stdin resolves dialog promises"
 	},
 	"sourceCitations": [
 		"packages/coding-agent/src/modes/rpc/jsonl.ts:10-58",
@@ -95,6 +96,18 @@
 			"description": "runRpcMode stdout bytes for ExtensionUIContext request methods plus extension_ui_response command input shapes.",
 			"byteLength": 1380,
 			"lineCount": 13
+		},
+		{
+			"path": "m6-extension-host.input.jsonl",
+			"description": "Scripted out-of-order extension_ui_response stdin for the M6 extension host fixture covering confirmed, value, cancelled, and editor value variants.",
+			"byteLength": 275,
+			"lineCount": 4
+		},
+		{
+			"path": "m6-extension-host.jsonl",
+			"description": "live runRpcMode stdout bytes for the M6 fixture extension/host UI request matrix, including fire-and-forget methods and post-response completion status.",
+			"byteLength": 1256,
+			"lineCount": 10
 		},
 		{
 			"path": "m5-simple-prompt.input.jsonl",

@@ -169,7 +169,7 @@ def deterministic_crypto_import():
 		'import { createRequire } from "node:module";\n'
 		'const require = createRequire(process.cwd() + "/package.json");\n'
 		'const crypto = require("node:crypto");\n'
-		'const ids = ["ui_select","ui_confirm","ui_input","ui_notify","ui_status","ui_widget","ui_title","ui_editor_text","ui_editor","ui_extra_1","ui_extra_2"];\n'
+		'const ids = ["ui_select","ui_confirm","ui_input","ui_notify","ui_status","ui_widget","ui_title","ui_editor_text","ui_editor","ui_m6_complete","ui_extra_1","ui_extra_2"];\n'
 		'crypto.randomUUID = () => ids.shift() ?? "ui_extra";\n'
 	)
 	return f"data:text/javascript,{quote(source)}"
@@ -284,6 +284,205 @@ if zig_extension_ui_stdout != ts_extension_ui_stdout:
 	)
 	sys.exit(1)
 print("  extension UI live request emission + response consumption TS-vs-Zig exact byte diff passed")
+
+def host_process_count(marker):
+	proc = subprocess.run(["ps", "axo", "command"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+	if proc.returncode != 0:
+		print(proc.stderr, file=sys.stderr)
+		print("failed to inspect process table for M6 host marker", file=sys.stderr)
+		sys.exit(proc.returncode)
+	return sum(1 for line in proc.stdout.splitlines() if marker in line)
+
+def read_jsonl(path):
+	return [line for line in Path(path).read_text().splitlines() if line.strip()]
+
+def assert_m6_capture(path, marker):
+	records = []
+	for line in read_jsonl(path):
+		try:
+			records.append(__import__("json").loads(line))
+		except Exception as exc:
+			print(f"M6 host capture contains invalid JSONL: {exc}", file=sys.stderr)
+			sys.exit(1)
+	initializes = [record for record in records if record.get("event") == "initialize"]
+	ready = [record for record in records if record.get("event") == "ready"]
+	completions = [record for record in records if record.get("event") == "completion"]
+	if len(initializes) != 1 or initializes[0].get("marker") != marker or initializes[0].get("fixture") != "m6-extension-host":
+		print(f"M6 host capture initialize evidence invalid: {initializes}", file=sys.stderr)
+		sys.exit(1)
+	if len(ready) != 1:
+		print(f"M6 host capture ready evidence invalid: {ready}", file=sys.stderr)
+		sys.exit(1)
+	if len(completions) != 1:
+		print(f"M6 host capture completion evidence invalid: {completions}", file=sys.stderr)
+		sys.exit(1)
+	response_ids = [record.get("id") for record in records if record.get("event") == "response"]
+	if response_ids != ["ui_confirm", "ui_select", "ui_input", "ui_editor"]:
+		print(f"M6 host capture response order invalid: {response_ids}", file=sys.stderr)
+		sys.exit(1)
+
+def run_m6_configured(label, marker, expected_stdout, response_input):
+	if host_process_count(marker) != 0:
+		print(f"{label} found pre-existing M6 host marker process: {marker}", file=sys.stderr)
+		sys.exit(1)
+	capture_path = Path(tempfile.gettempdir()) / f"{marker}-capture.jsonl"
+	try:
+		capture_path.unlink()
+	except FileNotFoundError:
+		pass
+	env = os.environ.copy()
+	env.update(
+		{
+			"PI_M6_EXTENSION_HOST_ENTRY": "test/m6-extension-host-fixture.mjs",
+			"PI_M6_EXTENSION_HOST_RUNTIME": "bun",
+			"PI_M6_EXTENSION_HOST_FIXTURE": "m6-extension-host",
+			"PI_M6_EXTENSION_HOST_MARKER": marker,
+			"PI_M6_EXTENSION_HOST_CAPTURE": str(capture_path),
+		}
+	)
+	proc = subprocess.Popen(
+		BASE_ARGS,
+		stdin=subprocess.PIPE,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		text=True,
+		env=env,
+	)
+	assert proc.stdin is not None
+	assert proc.stdout is not None
+	assert proc.stderr is not None
+	initial_lines = []
+	for _ in range(9):
+		line = proc.stdout.readline()
+		if not line:
+			stderr = proc.stderr.read()
+			proc.kill()
+			print(stderr, file=sys.stderr)
+			print(f"{label} ended before initial M6 request matrix", file=sys.stderr)
+			sys.exit(1)
+		initial_lines.append(line)
+	active_count = host_process_count(marker)
+	if active_count != 1:
+		proc.kill()
+		print(f"{label} expected one active M6 host marker process, found {active_count}", file=sys.stderr)
+		sys.exit(1)
+	for line in response_input.splitlines(keepends=True):
+		proc.stdin.write(line)
+		proc.stdin.flush()
+	completion_line = proc.stdout.readline()
+	if not completion_line:
+		stderr = proc.stderr.read()
+		proc.kill()
+		print(stderr, file=sys.stderr)
+		print(f"{label} ended before M6 completion request", file=sys.stderr)
+		sys.exit(1)
+	proc.stdin.close()
+	remaining_stdout = proc.stdout.read()
+	stderr = proc.stderr.read()
+	status = proc.wait(timeout=10)
+	stdout = "".join(initial_lines) + completion_line + remaining_stdout
+	if status != 0:
+		print(stderr, file=sys.stderr)
+		print(f"{label} Zig ts-rpc exited {status}", file=sys.stderr)
+		sys.exit(status)
+	if stdout != expected_stdout:
+		actual_path = Path(tempfile.gettempdir()) / f"{marker}-actual.jsonl"
+		expected_path = Path(tempfile.gettempdir()) / f"{marker}-ts.jsonl"
+		actual_path.write_text(stdout)
+		expected_path.write_text(expected_stdout)
+		print(f"{label} public stdout differs from live TypeScript RPC output; actual written to {actual_path}", file=sys.stderr)
+		subprocess.run(["diff", "-u", str(expected_path), str(actual_path)], check=False)
+		sys.exit(1)
+	if not capture_path.exists():
+		print(f"{label} did not write M6 side-channel host capture", file=sys.stderr)
+		sys.exit(1)
+	assert_m6_capture(capture_path, marker)
+	if host_process_count(marker) != 0:
+		print(f"{label} left an M6 host marker process running: {marker}", file=sys.stderr)
+		sys.exit(1)
+	return stdout
+
+def run_m6_without_host(label, env_extra, response_input, marker):
+	capture_path = Path(tempfile.gettempdir()) / f"{marker}-capture.jsonl"
+	try:
+		capture_path.unlink()
+	except FileNotFoundError:
+		pass
+	env = os.environ.copy()
+	env.update(env_extra)
+	env["PI_M6_EXTENSION_HOST_CAPTURE"] = str(capture_path)
+	proc = subprocess.run(
+		BASE_ARGS,
+		input=response_input,
+		text=True,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		env=env,
+		check=False,
+	)
+	if proc.returncode != 0:
+		print(proc.stderr, file=sys.stderr)
+		print(f"{label} Zig ts-rpc exited {proc.returncode}", file=sys.stderr)
+		sys.exit(proc.returncode)
+	if proc.stdout != "":
+		print(f"{label} unexpectedly emitted public stdout: {proc.stdout}", file=sys.stderr)
+		sys.exit(1)
+	if capture_path.exists():
+		print(f"{label} unexpectedly wrote M6 side-channel host capture", file=sys.stderr)
+		sys.exit(1)
+	if host_process_count(marker) != 0:
+		print(f"{label} left an M6 host marker process running: {marker}", file=sys.stderr)
+		sys.exit(1)
+
+m6_ts_stdout = emit_ts_fixture("m6-extension-host.jsonl")
+m6_response_input = emit_ts_fixture("m6-extension-host.input.jsonl")
+run_m6_configured("M6 configured extension host", "pi-m6-extension-host-configured", m6_ts_stdout, m6_response_input)
+run_m6_without_host(
+	"M6 unconfigured extension host",
+	{},
+	m6_response_input,
+	"pi-m6-extension-host-unconfigured",
+)
+run_m6_without_host(
+	"M6 disabled extension host",
+	{
+		"PI_M6_EXTENSION_HOST_ENTRY": "test/m6-extension-host-fixture.mjs",
+		"PI_M6_EXTENSION_HOST_RUNTIME": "bun",
+		"PI_M6_EXTENSION_HOST_FIXTURE": "m6-extension-host",
+		"PI_M6_EXTENSION_HOST_MARKER": "pi-m6-extension-host-disabled",
+		"PI_M6_EXTENSION_HOST_DISABLED": "1",
+	},
+	m6_response_input,
+	"pi-m6-extension-host-disabled",
+)
+first_mode_switch = run_m6_configured(
+	"M6 mode-switch configured first run",
+	"pi-m6-extension-host-mode-switch-a",
+	m6_ts_stdout,
+	m6_response_input,
+)
+run_m6_without_host(
+	"M6 mode-switch disabled middle run",
+	{
+		"PI_M6_EXTENSION_HOST_ENTRY": "test/m6-extension-host-fixture.mjs",
+		"PI_M6_EXTENSION_HOST_RUNTIME": "bun",
+		"PI_M6_EXTENSION_HOST_FIXTURE": "m6-extension-host",
+		"PI_M6_EXTENSION_HOST_MARKER": "pi-m6-extension-host-mode-switch-disabled",
+		"PI_M6_EXTENSION_HOST_DISABLED": "1",
+	},
+	m6_response_input,
+	"pi-m6-extension-host-mode-switch-disabled",
+)
+second_mode_switch = run_m6_configured(
+	"M6 mode-switch configured second run",
+	"pi-m6-extension-host-mode-switch-b",
+	m6_ts_stdout,
+	m6_response_input,
+)
+if first_mode_switch != second_mode_switch:
+	print("M6 configured mode-switch runs produced different public stdout", file=sys.stderr)
+	sys.exit(1)
+print("  M6 extension host configured, disabled/unconfigured, multi-request, and mode-switch parity passed")
 PY
 
 echo "TS-RPC parity: extension UI request writer exact byte coverage"
@@ -398,4 +597,5 @@ TS-RPC parity scenarios passed:
 - retry: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed.
 - queue steer/follow-up: live TypeScript RPC runtime stdout and Zig --mode ts-rpc stdout diff passed; 20 stress iterations passed.
 - extension UI request/response: live TypeScript RPC runtime and Zig --mode ts-rpc emitted extension_ui_request bytes, consumed matching extension_ui_response inputs while running, and exact-byte stdout diff passed.
+- M6 extension host fixture: live TypeScript RPC runtime stdout and Zig configured host stdout diff passed; side-channel host capture verified init/ready/responses/completion separately from public stdout; disabled/unconfigured and repeated mode-switch runs emitted no stale host output.
 REPORT

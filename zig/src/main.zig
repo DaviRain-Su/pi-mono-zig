@@ -338,9 +338,10 @@ fn tsRpcExtensionHostOptions(
     const runtime = env_map.get("PI_M6_EXTENSION_HOST_RUNTIME") orelse "bun";
     const fixture = env_map.get("PI_M6_EXTENSION_HOST_FIXTURE") orelse "m6-fixture";
     const marker = env_map.get(extension_host_mod.HOST_MARKER_ENV) orelse "pi-m6-extension-host";
-    var argv = try allocator.alloc([]const u8, 2);
+    var argv = try allocator.alloc([]const u8, 3);
     argv[0] = runtime;
     argv[1] = entry;
+    argv[2] = marker;
     return .{
         .argv = argv,
         .options = .{
