@@ -128,7 +128,10 @@ pub fn buildRequestPayload(
 }
 
 const CurrentBlock = union(enum) {
-    text: std.ArrayList(u8),
+    text: struct {
+        text: std.ArrayList(u8),
+        signature: ?[]const u8,
+    },
     thinking: struct {
         text: std.ArrayList(u8),
         signature: ?[]const u8,
@@ -229,7 +232,7 @@ fn parseSseStreamLines(
                                         current_block = if (is_thinking)
                                             .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
                                         else
-                                            .{ .text = std.ArrayList(u8).empty };
+                                            .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
                                         stream_ptr.push(.{
                                             .event_type = if (is_thinking) .thinking_start else .text_start,
                                             .content_index = @intCast(content_blocks.items.len),
@@ -238,7 +241,15 @@ fn parseSseStreamLines(
 
                                     if (current_block) |*block| {
                                         switch (block.*) {
-                                            .text => |*text| try text.appendSlice(allocator, text_value.string),
+                                            .text => |*text| {
+                                                try text.text.appendSlice(allocator, text_value.string);
+                                                if (part.object.get("thoughtSignature")) |signature_value| {
+                                                    if (signature_value == .string and signature_value.string.len > 0) {
+                                                        if (text.signature) |existing| allocator.free(existing);
+                                                        text.signature = try allocator.dupe(u8, signature_value.string);
+                                                    }
+                                                }
+                                            },
                                             .thinking => |*thinking| {
                                                 try thinking.text.appendSlice(allocator, text_value.string);
                                                 if (part.object.get("thoughtSignature")) |signature_value| {
@@ -391,8 +402,12 @@ fn finishCurrentBlock(
     if (current_block.*) |*block| {
         switch (block.*) {
             .text => |text| {
-                const owned = try allocator.dupe(u8, text.items);
-                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+                const owned = try allocator.dupe(u8, text.text.items);
+                const signature = if (text.signature) |value| try allocator.dupe(u8, value) else null;
+                try content_blocks.append(allocator, .{ .text = .{
+                    .text = owned,
+                    .text_signature = signature,
+                } });
                 stream_ptr.push(.{
                     .event_type = .text_end,
                     .content_index = @intCast(content_blocks.items.len - 1),
@@ -421,7 +436,10 @@ fn finishCurrentBlock(
 
 fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
     switch (block.*) {
-        .text => |*text| text.deinit(allocator),
+        .text => |*text| {
+            text.text.deinit(allocator);
+            if (text.signature) |signature| allocator.free(signature);
+        },
         .thinking => |*thinking| {
             thinking.text.deinit(allocator);
             if (thinking.signature) |signature| allocator.free(signature);
@@ -552,7 +570,7 @@ fn buildAssistantMessageValue(
         switch (block) {
             .text => |text| {
                 if (std.mem.trim(u8, text.text, " \t\r\n").len == 0) continue;
-                try parts.append(try buildTextPartValue(allocator, text.text));
+                try parts.append(try buildTextPartWithSignatureValue(allocator, text.text, text.text_signature));
             },
             .thinking => |thinking| {
                 if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
@@ -588,6 +606,9 @@ fn buildAssistantMessageValue(
                 try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                if (tool_call.thought_signature) |signature| {
+                    try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                }
                 try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
                 try parts.append(.{ .object = part });
             }
@@ -677,8 +698,17 @@ fn buildPartsArray(
 }
 
 fn buildTextPartValue(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
+    return buildTextPartWithSignatureValue(allocator, text, null);
+}
+
+fn buildTextPartWithSignatureValue(allocator: std.mem.Allocator, text: []const u8, signature: ?[]const u8) !std.json.Value {
     var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+    if (signature) |thought_signature| {
+        if (thought_signature.len > 0) {
+            try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, thought_signature) });
+        }
+    }
     return .{ .object = part };
 }
 
@@ -964,6 +994,112 @@ test "buildRequestPayload includes contents, tools, generation config, and think
     try std.testing.expectEqual(@as(usize, 1), payload_tools.array.items.len);
 }
 
+fn optionalString(value: ?std.json.Value) ?[]const u8 {
+    if (value) |json_value| {
+        if (json_value == .string) return json_value.string;
+    }
+    return null;
+}
+
+fn expectScenarioString(scenario: []const u8, expected: []const u8, actual: ?[]const u8) !void {
+    if (actual) |actual_value| {
+        if (std.mem.eql(u8, expected, actual_value)) return;
+        std.debug.print("{s}: expected {s}, actual {s}\n", .{ scenario, expected, actual_value });
+        return error.MessageSignatureFixtureMismatch;
+    }
+    std.debug.print("{s}: expected {s}, actual <null>\n", .{ scenario, expected });
+    return error.MessageSignatureFixtureMismatch;
+}
+
+test "VAL-MSG-004 VAL-MSG-011 Google same-model request signature parity fixtures" {
+    const allocator = std.testing.allocator;
+
+    var tool_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try tool_args.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
+    const tool_args_value = std.json.Value{ .object = tool_args };
+    defer freeJsonValue(allocator, tool_args_value);
+
+    const inline_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "signed text", .text_signature = "ts-text-sig" } },
+        .{ .tool_call = .{
+            .id = "inline-tool-1",
+            .name = "get_weather",
+            .arguments = tool_args_value,
+            .thought_signature = "ts-tool-sig",
+        } },
+    };
+    const legacy_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "legacy mirror" } },
+    };
+    const legacy_tool_calls = [_]types.ToolCall{.{
+        .id = "legacy-tool-1",
+        .name = "get_weather",
+        .arguments = tool_args_value,
+        .thought_signature = "ts-legacy-tool-sig",
+    }};
+
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .assistant = .{
+                .content = &inline_content,
+                .api = "google-generative-ai",
+                .provider = "google",
+                .model = "gemini-2.5-pro",
+                .usage = types.Usage.init(),
+                .stop_reason = .tool_use,
+                .timestamp = 2,
+            } },
+            .{ .assistant = .{
+                .content = &legacy_content,
+                .tool_calls = &legacy_tool_calls,
+                .api = "google-generative-ai",
+                .provider = "google",
+                .model = "gemini-2.5-pro",
+                .usage = types.Usage.init(),
+                .stop_reason = .tool_use,
+                .timestamp = 3,
+            } },
+        },
+    };
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    const contents = payload.object.get("contents").?.array;
+    const inline_parts = contents.items[0].object.get("parts").?.array;
+    const legacy_parts = contents.items[1].object.get("parts").?.array;
+
+    try expectScenarioString(
+        "VAL-MSG-004/google-inline-text-signature",
+        "ts-text-sig",
+        optionalString(inline_parts.items[0].object.get("thoughtSignature")),
+    );
+    try expectScenarioString(
+        "VAL-MSG-004/google-inline-tool-signature",
+        "ts-tool-sig",
+        optionalString(inline_parts.items[1].object.get("thoughtSignature")),
+    );
+    try std.testing.expect(inline_parts.items[1].object.get("functionCall").?.object.get("thoughtSignature") == null);
+    try expectScenarioString(
+        "VAL-MSG-011/google-legacy-tool-signature-mirror",
+        "ts-legacy-tool-sig",
+        optionalString(legacy_parts.items[1].object.get("thoughtSignature")),
+    );
+    try std.testing.expect(legacy_parts.items[1].object.get("functionCall").?.object.get("thoughtSignature") == null);
+}
+
 test "buildRequestPayload converts assistant tool calls and tool results" {
     const allocator = std.testing.allocator;
 
@@ -1084,6 +1220,7 @@ test "parse stream emits text events" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("text-sig", done.message.?.content[0].text.text_signature.?);
     try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 5), done.message.?.usage.output);
 }
