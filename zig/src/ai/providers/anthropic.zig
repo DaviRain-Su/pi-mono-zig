@@ -352,6 +352,57 @@ fn buildToolChoiceValue(
     return .{ .object = object };
 }
 
+test "VAL-MSG-010 Anthropic skips failed assistants" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+    const first_user = [_]types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    const failed_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "partial" } },
+        .{ .tool_call = .{ .id = "failed-tool", .name = "lookup", .arguments = .null } },
+    };
+    const final_user = [_]types.ContentBlock{.{ .text = .{ .text = "continue" } }};
+
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{
+        .{ .user = .{ .content = &first_user, .timestamp = 1 } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "anthropic-messages",
+            .provider = "anthropic",
+            .model = "claude-3-7-sonnet-latest",
+            .usage = types.Usage.init(),
+            .stop_reason = .error_reason,
+            .error_message = "failed",
+            .timestamp = 2,
+        } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "anthropic-messages",
+            .provider = "anthropic",
+            .model = "claude-3-7-sonnet-latest",
+            .usage = types.Usage.init(),
+            .stop_reason = .aborted,
+            .error_message = "aborted",
+            .timestamp = 3,
+        } },
+        .{ .user = .{ .content = &final_user, .timestamp = 4 } },
+    } }, null);
+    defer freeJsonValue(allocator, payload);
+
+    const messages = payload.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("user", messages.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages.items[1].object.get("role").?.string);
+}
+
 test "buildRequestPayload includes system tools and cache control without default thinking" {
     const allocator = std.testing.allocator;
 
@@ -1804,7 +1855,11 @@ fn buildMessagesValue(
     while (index < messages.len) : (index += 1) {
         switch (messages[index]) {
             .user => |user| try array.append(try buildUserMessageValue(allocator, user)),
-            .assistant => |assistant| try array.append(try buildAssistantMessageValue(allocator, assistant, is_oauth)),
+            .assistant => |assistant| {
+                if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                    try array.append(try buildAssistantMessageValue(allocator, assistant, is_oauth));
+                }
+            },
             .tool_result => {
                 const grouped = try buildToolResultUserMessageValue(allocator, messages[index..], cache_control);
                 try array.append(grouped.value);

@@ -460,8 +460,10 @@ fn buildContentsValue(
         switch (messages[index]) {
             .user => |user| try contents.append(try buildUserMessageValue(allocator, model, user)),
             .assistant => |assistant| {
-                if (try buildAssistantMessageValue(allocator, assistant)) |assistant_value| {
-                    try contents.append(assistant_value);
+                if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                    if (try buildAssistantMessageValue(allocator, assistant)) |assistant_value| {
+                        try contents.append(assistant_value);
+                    }
                 }
             },
             .tool_result => {
@@ -909,6 +911,58 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
         },
         else => {},
     }
+}
+
+test "VAL-MSG-010 Google skips failed assistants" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+    const first_user = [_]types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    const failed_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "partial", .text_signature = "failed-text-sig" } },
+        .{ .tool_call = .{ .id = "failed-tool", .name = "lookup", .arguments = .null, .thought_signature = "failed-tool-sig" } },
+    };
+    const final_user = [_]types.ContentBlock{.{ .text = .{ .text = "continue" } }};
+
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{
+        .{ .user = .{ .content = &first_user, .timestamp = 1 } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "google-generative-ai",
+            .provider = "google",
+            .model = "gemini-2.5-pro",
+            .usage = types.Usage.init(),
+            .stop_reason = .error_reason,
+            .error_message = "failed",
+            .timestamp = 2,
+        } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "google-generative-ai",
+            .provider = "google",
+            .model = "gemini-2.5-pro",
+            .usage = types.Usage.init(),
+            .stop_reason = .aborted,
+            .error_message = "aborted",
+            .timestamp = 3,
+        } },
+        .{ .user = .{ .content = &final_user, .timestamp = 4 } },
+    } }, null);
+    defer freeJsonValue(allocator, payload);
+
+    const contents = payload.object.get("contents").?.array;
+    try std.testing.expectEqual(@as(usize, 2), contents.items.len);
+    try std.testing.expectEqualStrings("user", contents.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", contents.items[1].object.get("role").?.string);
 }
 
 test "buildRequestPayload includes contents, tools, generation config, and thinking config" {
