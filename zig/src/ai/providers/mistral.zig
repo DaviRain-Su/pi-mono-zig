@@ -551,8 +551,10 @@ fn buildMessagesValue(
         switch (message) {
             .user => |user| try messages.append(try buildUserMessageValue(allocator, model, user)),
             .assistant => |assistant| {
-                if (try buildAssistantMessageValue(allocator, assistant, normalizer)) |assistant_value| {
-                    try messages.append(assistant_value);
+                if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                    if (try buildAssistantMessageValue(allocator, assistant, normalizer)) |assistant_value| {
+                        try messages.append(assistant_value);
+                    }
                 }
             },
             .tool_result => |tool_result| try messages.append(try buildToolResultMessageValue(allocator, model, tool_result, normalizer)),
@@ -1179,6 +1181,83 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
         },
         else => {},
     }
+}
+
+test "VAL-MSG-010 Mistral skips failed assistants" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "mistral-medium-latest",
+        .name = "Mistral Medium",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+    const first_user = [_]types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    const valid_assistant_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "I can call a valid tool" } },
+        .{ .tool_call = .{ .id = "valid-tool", .name = "lookup", .arguments = .null } },
+    };
+    const failed_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "partial content must not replay" } },
+        .{ .tool_call = .{ .id = "failed-tool", .name = "lookup", .arguments = .null } },
+    };
+    const tool_result_content = [_]types.ContentBlock{.{ .text = .{ .text = "valid result" } }};
+    const final_user = [_]types.ContentBlock{.{ .text = .{ .text = "continue" } }};
+
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{
+        .{ .user = .{ .content = &first_user, .timestamp = 1 } },
+        .{ .assistant = .{
+            .content = &valid_assistant_content,
+            .api = "mistral-conversations",
+            .provider = "mistral",
+            .model = "mistral-medium-latest",
+            .usage = types.Usage.init(),
+            .stop_reason = .tool_use,
+            .timestamp = 2,
+        } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "mistral-conversations",
+            .provider = "mistral",
+            .model = "mistral-medium-latest",
+            .usage = types.Usage.init(),
+            .stop_reason = .error_reason,
+            .error_message = "failed",
+            .timestamp = 3,
+        } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "mistral-conversations",
+            .provider = "mistral",
+            .model = "mistral-medium-latest",
+            .usage = types.Usage.init(),
+            .stop_reason = .aborted,
+            .error_message = "aborted",
+            .timestamp = 4,
+        } },
+        .{ .tool_result = .{
+            .tool_call_id = "valid-tool",
+            .tool_name = "lookup",
+            .content = &tool_result_content,
+            .timestamp = 5,
+        } },
+        .{ .user = .{ .content = &final_user, .timestamp = 6 } },
+    } }, null);
+    defer freeJsonValue(allocator, payload);
+
+    const messages = payload.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqualStrings("user", messages.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("assistant", messages.items[1].object.get("role").?.string);
+    try std.testing.expectEqualStrings("tool", messages.items[2].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages.items[3].object.get("role").?.string);
+
+    const assistant_tool_call = messages.items[1].object.get("tool_calls").?.array.items[0].object;
+    const normalized_id = assistant_tool_call.get("id").?.string;
+    try std.testing.expectEqualStrings(normalized_id, messages.items[2].object.get("tool_call_id").?.string);
 }
 
 test "buildRequestPayload includes tools and normalized tool ids" {
