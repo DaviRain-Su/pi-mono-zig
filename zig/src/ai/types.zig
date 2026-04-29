@@ -379,6 +379,10 @@ pub const StreamOptions = struct {
     google_tool_choice: ?[]const u8 = null,
     /// Google provider thinking configuration.
     google_thinking: ?GoogleThinkingOptions = null,
+    /// OpenAI Chat Completions tool_choice override.
+    openai_tool_choice: ?std.json.Value = null,
+    /// OpenAI Chat Completions reasoning effort level.
+    openai_reasoning_effort: ?[]const u8 = null,
     /// Anthropic provider extended thinking enabled/disabled override.
     anthropic_thinking_enabled: ?bool = null,
     /// Anthropic provider token budget for non-adaptive thinking models.
@@ -418,6 +422,8 @@ pub const SimpleStreamOptions = struct {
     thinking_budgets: ?ThinkingBudgets = null,
     google_tool_choice: ?[]const u8 = null,
     google_thinking: ?GoogleThinkingOptions = null,
+    openai_tool_choice: ?std.json.Value = null,
+    openai_reasoning_effort: ?[]const u8 = null,
     mistral_prompt_mode: ?[]const u8 = null,
     mistral_reasoning_effort: ?[]const u8 = null,
 
@@ -440,6 +446,8 @@ pub const SimpleStreamOptions = struct {
             .signal = self.signal,
             .google_tool_choice = self.google_tool_choice,
             .google_thinking = self.google_thinking,
+            .openai_tool_choice = self.openai_tool_choice,
+            .openai_reasoning_effort = self.openai_reasoning_effort,
             .anthropic_thinking_enabled = null,
             .anthropic_thinking_budget_tokens = null,
             .anthropic_thinking_display = null,

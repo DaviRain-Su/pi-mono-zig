@@ -20,7 +20,7 @@ pub const OpenAIProvider = struct {
         errdefer event_stream_instance.deinit();
 
         // Build request payload
-        const payload = try buildRequestPayload(allocator, model, context, options);
+        const payload = try buildFinalRequestPayload(allocator, model, context, options);
         defer freeJsonValue(allocator, payload);
 
         // Serialize payload to JSON
@@ -810,6 +810,31 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
+pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    freeJsonValue(allocator, value);
+}
+
+pub fn buildFinalRequestPayload(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !std.json.Value {
+    var payload = try buildRequestPayload(allocator, model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+
+    if (options) |opts| {
+        if (opts.on_payload) |on_payload| {
+            if (try on_payload(allocator, payload, model)) |replacement| {
+                freeJsonValue(allocator, payload);
+                payload = replacement;
+            }
+        }
+    }
+
+    return payload;
+}
+
 /// Build the request payload for OpenAI chat completions API
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
@@ -817,6 +842,7 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
+    const compat = getCompat(model);
     const transformed_messages = try transform_messages.transformMessages(
         allocator,
         context.messages,
@@ -829,7 +855,7 @@ pub fn buildRequestPayload(
     errdefer messages.deinit();
 
     // Determine if we should use developer role for reasoning models
-    const use_developer_role = model.reasoning and !isNonStandardProvider(model);
+    const use_developer_role = model.reasoning and compat.supports_developer_role;
 
     // Add system prompt if present
     if (context.system_prompt) |system| {
@@ -849,7 +875,7 @@ pub fn buildRequestPayload(
                 try messages.append(try buildAssistantMessage(allocator, model, assistant_msg));
             },
             .tool_result => |tool_result| {
-                try messages.append(try buildToolResultMessage(allocator, model, tool_result));
+                try appendToolResultMessages(allocator, &messages, model, tool_result);
             },
         }
     }
@@ -861,18 +887,42 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "messages"), std.json.Value{ .array = messages });
     try payload.put(allocator, try allocator.dupe(u8, "stream"), std.json.Value{ .bool = true });
 
-    // Add stream_options.include_usage
-    var stream_options = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer stream_options.deinit(allocator);
-    try stream_options.put(allocator, try allocator.dupe(u8, "include_usage"), std.json.Value{ .bool = true });
-    try payload.put(allocator, try allocator.dupe(u8, "stream_options"), std.json.Value{ .object = stream_options });
+    if (compat.supports_usage_in_streaming) {
+        var stream_options = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        errdefer stream_options.deinit(allocator);
+        try stream_options.put(allocator, try allocator.dupe(u8, "include_usage"), std.json.Value{ .bool = true });
+        try payload.put(allocator, try allocator.dupe(u8, "stream_options"), std.json.Value{ .object = stream_options });
+    }
+
+    if (compat.supports_store) {
+        try payload.put(allocator, try allocator.dupe(u8, "store"), std.json.Value{ .bool = false });
+    }
 
     if (options) |opts| {
+        if (opts.session_id) |session_id| {
+            if ((std.mem.indexOf(u8, model.base_url, "api.openai.com") != null and opts.cache_retention != .none) or
+                (opts.cache_retention == .long and compat.supports_long_cache_retention))
+            {
+                try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), std.json.Value{ .string = try allocator.dupe(u8, session_id) });
+            }
+        }
+        if (opts.cache_retention == .long and compat.supports_long_cache_retention) {
+            try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), std.json.Value{ .string = try allocator.dupe(u8, "24h") });
+        }
         if (opts.temperature) |temp| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), std.json.Value{ .float = temp });
         }
         if (opts.max_tokens) |max| {
-            try payload.put(allocator, try allocator.dupe(u8, "max_tokens"), std.json.Value{ .integer = @intCast(max) });
+            const field = if (std.mem.eql(u8, compat.max_tokens_field, "max_tokens")) "max_tokens" else "max_completion_tokens";
+            try payload.put(allocator, try allocator.dupe(u8, field), std.json.Value{ .integer = @intCast(max) });
+        }
+        if (opts.openai_tool_choice) |tool_choice| {
+            try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try cloneJsonValue(allocator, tool_choice));
+        }
+        if (opts.openai_reasoning_effort) |effort| {
+            if (model.reasoning and compat.supports_reasoning_effort and std.mem.eql(u8, compat.thinking_format, "openai")) {
+                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), std.json.Value{ .string = try allocator.dupe(u8, effort) });
+            }
         }
     }
 
@@ -892,14 +942,46 @@ pub fn buildRequestPayload(
 }
 
 const OpenAICompat = struct {
+    supports_store: bool = true,
+    supports_developer_role: bool = true,
+    supports_reasoning_effort: bool = true,
+    supports_usage_in_streaming: bool = true,
+    max_tokens_field: []const u8 = "max_completion_tokens",
     requires_thinking_as_text: bool = false,
     requires_reasoning_content_on_assistant_messages: bool = false,
+    requires_tool_result_name: bool = false,
+    thinking_format: []const u8 = "openai",
+    send_session_affinity_headers: bool = false,
+    supports_long_cache_retention: bool = true,
 };
 
 fn getCompat(model: types.Model) OpenAICompat {
+    const is_non_standard = isNonStandardProvider(model);
+    const is_chutes = std.mem.indexOf(u8, model.base_url, "chutes.ai") != null;
+    const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null;
+    const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
+    const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
+    const detected_thinking_format = if (is_deepseek)
+        "deepseek"
+    else if (is_zai)
+        "zai"
+    else if (std.mem.eql(u8, model.provider, "openrouter") or std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null)
+        "openrouter"
+    else
+        "openai";
+
     return .{
+        .supports_store = compatBoolField(model.compat, "supportsStore") orelse !is_non_standard,
+        .supports_developer_role = compatBoolField(model.compat, "supportsDeveloperRole") orelse !is_non_standard,
+        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai),
+        .supports_usage_in_streaming = compatBoolField(model.compat, "supportsUsageInStreaming") orelse true,
+        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes) "max_tokens" else "max_completion_tokens",
         .requires_thinking_as_text = compatBoolField(model.compat, "requiresThinkingAsText") orelse false,
         .requires_reasoning_content_on_assistant_messages = compatBoolField(model.compat, "requiresReasoningContentOnAssistantMessages") orelse false,
+        .requires_tool_result_name = compatBoolField(model.compat, "requiresToolResultName") orelse false,
+        .thinking_format = compatStringField(model.compat, "thinkingFormat") orelse detected_thinking_format,
+        .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse false,
+        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse true,
     };
 }
 
@@ -909,6 +991,14 @@ fn compatBoolField(compat: ?std.json.Value, key: []const u8) ?bool {
     const field = value.object.get(key) orelse return null;
     if (field != .bool) return null;
     return field.bool;
+}
+
+fn compatStringField(compat: ?std.json.Value, key: []const u8) ?[]const u8 {
+    const value = compat orelse return null;
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    if (field != .string) return null;
+    return field.string;
 }
 
 fn isNonStandardProvider(model: types.Model) bool {
@@ -943,6 +1033,7 @@ fn buildRequestHeaders(
 ) !std.StringHashMap([]const u8) {
     var headers = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitOwnedHeaders(allocator, &headers);
+    const compat = getCompat(model);
 
     try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
     try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
@@ -956,6 +1047,12 @@ fn buildRequestHeaders(
 
     try mergeHeaders(allocator, &headers, model.headers);
     if (options) |stream_options| {
+        if (stream_options.cache_retention != .none and stream_options.session_id != null and compat.send_session_affinity_headers) {
+            const session_id = stream_options.session_id.?;
+            try putOwnedHeader(allocator, &headers, "session_id", session_id);
+            try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
+            try putOwnedHeader(allocator, &headers, "x-session-affinity", session_id);
+        }
         try mergeHeaders(allocator, &headers, stream_options.headers);
     }
 
@@ -968,11 +1065,29 @@ fn putOwnedHeader(
     name: []const u8,
     value: []const u8,
 ) !void {
-    if (headers.fetchRemove(name)) |removed| {
-        allocator.free(removed.key);
-        allocator.free(removed.value);
-    }
+    try removeHeaderCaseInsensitive(allocator, headers, name);
     try headers.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
+}
+
+fn removeHeaderCaseInsensitive(
+    allocator: std.mem.Allocator,
+    headers: *std.StringHashMap([]const u8),
+    name: []const u8,
+) !void {
+    var key_to_remove: ?[]const u8 = null;
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
+            key_to_remove = entry.key_ptr.*;
+            break;
+        }
+    }
+    if (key_to_remove) |key| {
+        if (headers.fetchRemove(key)) |removed| {
+            allocator.free(removed.key);
+            allocator.free(removed.value);
+        }
+    }
 }
 
 fn mergeHeaders(
@@ -995,6 +1110,106 @@ fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap(
         allocator.free(entry.value_ptr.*);
     }
     headers.deinit();
+}
+
+pub fn buildRequestSnapshotValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !std.json.Value {
+    var payload = try buildFinalRequestPayload(allocator, model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+
+    var headers = try buildRequestHeaders(allocator, model, options);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    var snapshot = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer snapshot.deinit(allocator);
+
+    const request_path = try buildRequestPath(allocator, model.base_url);
+    defer allocator.free(request_path);
+    const request_url = try buildSemanticRequestUrl(allocator, model.base_url, request_path);
+    defer allocator.free(request_url);
+
+    try snapshot.put(allocator, try allocator.dupe(u8, "baseUrl"), std.json.Value{ .string = try allocator.dupe(u8, model.base_url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "headers"), .{ .object = try normalizeSemanticHeaders(allocator, headers) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "jsonPayload"), payload);
+    payload = .null;
+    try snapshot.put(allocator, try allocator.dupe(u8, "method"), std.json.Value{ .string = try allocator.dupe(u8, "POST") });
+    try snapshot.put(allocator, try allocator.dupe(u8, "path"), std.json.Value{ .string = try allocator.dupe(u8, request_path) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, request_url) });
+
+    return .{ .object = snapshot };
+}
+
+fn buildRequestPath(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    const scheme = std.mem.indexOf(u8, base_url, "://") orelse return try allocator.dupe(u8, "/chat/completions");
+    const after_origin = base_url[scheme + 3 ..];
+    const slash_index = std.mem.indexOfScalar(u8, after_origin, '/') orelse return try allocator.dupe(u8, "/chat/completions");
+    const base_path_raw = after_origin[slash_index..];
+    const base_path = trimRightScalar(base_path_raw, '/');
+    if (base_path.len == 0) return try allocator.dupe(u8, "/chat/completions");
+    return try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_path});
+}
+
+fn buildSemanticRequestUrl(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) ![]const u8 {
+    const scheme = std.mem.indexOf(u8, base_url, "://") orelse return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path });
+    const after_scheme_index = scheme + 3;
+    const after_origin = base_url[after_scheme_index..];
+    const slash_index = std.mem.indexOfScalar(u8, after_origin, '/') orelse return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path });
+    const origin = base_url[0 .. after_scheme_index + slash_index];
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, path });
+}
+
+fn normalizeSemanticHeaders(
+    allocator: std.mem.Allocator,
+    headers: std.StringHashMap([]const u8),
+) !std.json.ObjectMap {
+    var semantic = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer semantic.deinit(allocator);
+
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        const lower = try asciiLowerAlloc(allocator, entry.key_ptr.*);
+        defer allocator.free(lower);
+        const include = std.mem.eql(u8, lower, "authorization") or
+            std.mem.eql(u8, lower, "content-type") or
+            std.mem.eql(u8, lower, "session_id") or
+            std.mem.eql(u8, lower, "x-client-request-id") or
+            std.mem.eql(u8, lower, "x-session-affinity") or
+            std.mem.startsWith(u8, lower, "x-fixture-");
+        if (!include) continue;
+
+        const value = if (std.mem.eql(u8, lower, "authorization"))
+            if (entry.value_ptr.*.len > 0) "<redacted-present>" else "<redacted-empty>"
+        else
+            entry.value_ptr.*;
+
+        const next_value = std.json.Value{ .string = try allocator.dupe(u8, value) };
+        if (semantic.getPtr(lower)) |existing| {
+            freeJsonValue(allocator, existing.*);
+            existing.* = next_value;
+        } else {
+            try semantic.put(allocator, try allocator.dupe(u8, lower), next_value);
+        }
+    }
+
+    return semantic;
+}
+
+fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const output = try allocator.alloc(u8, input.len);
+    for (input, 0..) |byte, index| {
+        output[index] = std.ascii.toLower(byte);
+    }
+    return output;
+}
+
+fn trimRightScalar(value: []const u8, scalar: u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == scalar) : (end -= 1) {}
+    return value[0..end];
 }
 
 fn normalizeToolCallId(
@@ -1125,6 +1340,13 @@ fn buildUserMessage(allocator: std.mem.Allocator, model: types.Model, user_msg: 
 
 fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assistant_msg: types.AssistantMessage) !std.json.Value {
     const compat = getCompat(model);
+    const tool_calls_source = if (types.hasInlineToolCalls(assistant_msg))
+        try types.collectAssistantToolCalls(allocator, assistant_msg)
+    else
+        null;
+    defer if (tool_calls_source) |calls| allocator.free(calls);
+    const assistant_tool_calls = tool_calls_source orelse assistant_msg.tool_calls;
+    const has_tool_calls = if (assistant_tool_calls) |calls| calls.len > 0 else false;
 
     var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer obj.deinit(allocator);
@@ -1181,7 +1403,11 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
 
     const content = if (text_parts.items.len > 0) try sanitizeSurrogates(allocator, text_parts.items) else try allocator.dupe(u8, "");
     defer allocator.free(content);
-    try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+    if (content.len == 0 and has_tool_calls) {
+        try obj.put(allocator, try allocator.dupe(u8, "content"), .null);
+    } else {
+        try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+    }
 
     if (!compat.requires_thinking_as_text and thinking_parts.items.len > 0 and reasoning_field_name != null) {
         const sanitized_reasoning = try sanitizeSurrogates(allocator, thinking_parts.items);
@@ -1196,13 +1422,7 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
     }
 
     // Add tool_calls if present
-    const tool_calls_source = if (types.hasInlineToolCalls(assistant_msg))
-        try types.collectAssistantToolCalls(allocator, assistant_msg)
-    else
-        null;
-    defer if (tool_calls_source) |calls| allocator.free(calls);
-
-    if (tool_calls_source orelse assistant_msg.tool_calls) |tool_calls| {
+    if (assistant_tool_calls) |tool_calls| {
         var tc_array = std.json.Array.init(allocator);
         errdefer tc_array.deinit();
         for (tool_calls) |tc| {
@@ -1228,11 +1448,23 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
     return std.json.Value{ .object = obj };
 }
 
+fn appendToolResultMessages(
+    allocator: std.mem.Allocator,
+    messages: *std.json.Array,
+    model: types.Model,
+    tool_result: types.ToolResultMessage,
+) !void {
+    try messages.append(try buildToolResultMessage(allocator, model, tool_result));
+    if (try buildToolResultImageUserMessage(allocator, model, tool_result)) |image_message| {
+        try messages.append(image_message);
+    }
+}
+
 fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool_result: types.ToolResultMessage) !std.json.Value {
+    const compat = getCompat(model);
     var text_parts = std.ArrayList(u8).empty;
     defer text_parts.deinit(allocator);
 
-    var has_images = false;
     for (tool_result.content) |block| {
         switch (block) {
             .text => |text| {
@@ -1241,17 +1473,13 @@ fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool
                 }
                 try text_parts.appendSlice(allocator, text.text);
             },
-            .image => {
-                has_images = true;
-            },
+            .image => {},
             .thinking, .tool_call => continue,
         }
     }
 
     const content = if (text_parts.items.len > 0)
         try sanitizeSurrogates(allocator, text_parts.items)
-    else if (has_images)
-        try allocator.dupe(u8, "(see attached image)")
     else
         try allocator.dupe(u8, "");
     defer allocator.free(content);
@@ -1263,11 +1491,18 @@ fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool
     try obj.put(allocator, try allocator.dupe(u8, "tool_call_id"), std.json.Value{ .string = try allocator.dupe(u8, tool_result.tool_call_id) });
 
     // Add name if required by provider
-    if (tool_result.tool_name.len > 0) {
+    if (compat.requires_tool_result_name and tool_result.tool_name.len > 0) {
         try obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tool_result.tool_name) });
     }
 
-    // If there are images and model supports them, add as separate user message
+    return std.json.Value{ .object = obj };
+}
+
+fn buildToolResultImageUserMessage(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    tool_result: types.ToolResultMessage,
+) !?std.json.Value {
     var model_supports_images = false;
     for (model.input_types) |input_type| {
         if (std.mem.eql(u8, input_type, "image")) {
@@ -1275,14 +1510,47 @@ fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool
             break;
         }
     }
+    if (!model_supports_images) return null;
 
-    if (has_images and model_supports_images) {
-        // This is a simplified approach - in full implementation we'd need to
-        // return multiple messages. For now, just include the text content.
-        // Images from tool results would be added in a subsequent user message.
+    var has_images = false;
+    for (tool_result.content) |block| {
+        if (block == .image) {
+            has_images = true;
+            break;
+        }
+    }
+    if (!has_images) return null;
+
+    var content_parts = std.json.Array.init(allocator);
+    errdefer content_parts.deinit();
+
+    var text_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer text_part.deinit(allocator);
+    try text_part.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "text") });
+    try text_part.put(allocator, try allocator.dupe(u8, "text"), std.json.Value{ .string = try allocator.dupe(u8, "Attached image(s) from tool result:") });
+    try content_parts.append(.{ .object = text_part });
+
+    for (tool_result.content) |block| {
+        if (block != .image) continue;
+        var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        errdefer part.deinit(allocator);
+        try part.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "image_url") });
+
+        const url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ block.image.mime_type, block.image.data });
+        defer allocator.free(url);
+
+        var image_url = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        errdefer image_url.deinit(allocator);
+        try image_url.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, url) });
+        try part.put(allocator, try allocator.dupe(u8, "image_url"), .{ .object = image_url });
+        try content_parts.append(.{ .object = part });
     }
 
-    return std.json.Value{ .object = obj };
+    var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, try allocator.dupe(u8, "role"), std.json.Value{ .string = try allocator.dupe(u8, "user") });
+    try obj.put(allocator, try allocator.dupe(u8, "content"), .{ .array = content_parts });
+    return .{ .object = obj };
 }
 
 fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Value {
