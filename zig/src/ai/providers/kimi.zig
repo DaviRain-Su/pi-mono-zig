@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 
 pub const KimiProvider = struct {
@@ -70,17 +71,9 @@ pub const KimiProvider = struct {
         defer streaming.deinit();
 
         if (streaming.status != 200) {
-            stream_instance.end(.{
-                .role = "assistant",
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = try std.fmt.allocPrint(allocator, "HTTP {d}", .{streaming.status}),
-                .timestamp = 0,
-            });
+            const response_body = try streaming.readAll(allocator);
+            defer allocator.free(response_body);
+            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, streaming.status, response_body);
             return stream_instance;
         }
 
@@ -1172,4 +1165,60 @@ test "sanitizeSurrogates matches openai surrogate filtering" {
     defer allocator.free(openai_sanitized);
     try std.testing.expectEqualStrings("AB", sanitized);
     try std.testing.expectEqualStrings(openai_sanitized, sanitized);
+}
+
+test "stream HTTP status error is terminal sanitized event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "{\"error\":{\"message\":\"kimi denied\",\"authorization\":\"Bearer sk-kimi-secret\",\"request_id\":\"req_kimi_random_123456\"},\"trace\":\"/Users/alice/pi/kimi.zig\"}");
+    try body.appendNTimes(allocator, 'x', 900);
+
+    var server = try provider_error.TestStatusServer.init(io, 503, "Service Unavailable", "", body.items);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try KimiProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 503: "));
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "kimi denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "[truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-kimi-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_kimi_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("kimi-completions", result.api);
 }

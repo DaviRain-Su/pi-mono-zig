@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
@@ -132,8 +133,8 @@ pub const OpenAICodexResponsesProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAll(allocator);
             defer allocator.free(response_body);
-            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response_body });
-            return emitErrorMessage(allocator, &stream_instance, model, error_message);
+            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
+            return stream_instance;
         }
 
         try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
@@ -1461,6 +1462,69 @@ test "resolveCodexUrl appends codex responses path" {
     defer allocator.free(url);
 
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", url);
+}
+
+test "stream HTTP status error is terminal sanitized event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "{\"error\":{\"message\":\"codex denied\",\"authorization\":\"Bearer sk-codex-secret\",\"request_id\":\"req_codex_random_123456\"},\"trace\":\"/Users/alice/pi/openai_codex_responses.zig\"}");
+    try body.appendNTimes(allocator, 'x', 900);
+
+    var server = try provider_error.TestStatusServer.init(io, 429, "Too Many Requests", "", body.items);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const payload_json = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc_test\"}}";
+    var encoded_payload: [std.base64.url_safe_no_pad.Encoder.calcSize(payload_json.len)]u8 = undefined;
+    const payload_segment = std.base64.url_safe_no_pad.Encoder.encode(&encoded_payload, payload_json);
+    const api_key = try std.fmt.allocPrint(allocator, "aaa.{s}.sig", .{payload_segment});
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, context, .{ .api_key = api_key });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 429: "));
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "codex denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "[truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-codex-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_codex_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("openai-codex-responses", result.api);
 }
 
 test "buildRequestPayload includes empty instructions when no system prompt is provided" {
