@@ -800,7 +800,7 @@ pub fn parseSseLine(line: []const u8) ?[]const u8 {
 
 pub fn parseChunk(allocator: std.mem.Allocator, data: []const u8) !?std.json.Parsed(std.json.Value) {
     if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) return null;
-    return try json_parse.parseStreamingJson(allocator, data);
+    return try std.json.parseFromSlice(std.json.Value, allocator, data, .{ .allocate = .alloc_always });
 }
 
 fn parseChunkUsage(value: std.json.Value) types.Usage {
@@ -1121,6 +1121,11 @@ test "parseSseStream emits kimi thinking and text events" {
     try std.testing.expectEqual(types.StopReason.stop, event8.message.?.stop_reason);
 }
 
+test "parseChunk rejects malformed provider control envelopes without JSON repair" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.SyntaxError, parseChunk(allocator, "{\"id\":\"chunk\" trailing"));
+}
+
 test "parseSseStream emits kimi tool call events across fragmented deltas" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1285,7 +1290,6 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
         .max_tokens = 4096,
     };
 }
-
 
 test "parseSseStreamLines preserves partial Kimi text before malformed terminal error" {
     const allocator = std.heap.page_allocator;

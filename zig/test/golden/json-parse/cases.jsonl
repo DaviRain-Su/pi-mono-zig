@@ -1,0 +1,21 @@
+{"name":"empty absent input","input":null,"category":"empty","expected":"{}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"empty string input","input":"","category":"empty","expected":"{}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"empty whitespace input","input":" \t\r\n ","category":"empty","expected":"{}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"complete object preserves semantics","input":"{\"foo\":123,\"bar\":\"baz\",\"nested\":{\"ok\":true},\"arr\":[1,\"two\",null]}","category":"complete","expected":"{\"foo\":123,\"bar\":\"baz\",\"nested\":{\"ok\":true},\"arr\":[1,\"two\",null]}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"complete array preserves semantics","input":"[1,2,{\"x\":true}]","category":"complete","expected":"[1,2,{\"x\":true}]","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"primitive number follows baseline","input":"123","category":"primitive","expected":"123","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"primitive string follows baseline","input":"\"hello\"","category":"primitive","expected":"\"hello\"","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"primitive boolean follows baseline","input":"true","category":"primitive","expected":"true","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"partial object drops incomplete trailing key","input":"{\"foo\":123,\"bar","category":"partial-object","expected":"{\"foo\":123}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"partial object keeps partial string value","input":"{\"foo\":\"hel","category":"partial-object","expected":"{\"foo\":\"hel\"}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"partial array drops dangling separator","input":"[1,2,","category":"partial-array","expected":"[1,2]","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"partial array drops incomplete object value","input":"[{\"a\":1},{\"b\":","category":"partial-array","expected":"[{\"a\":1},{}]","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"nested partial object array","input":"{\"a\":{\"b\":[1,2,","category":"nested-partial","expected":"{\"a\":{\"b\":[1,2]}}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"nested partial object in array","input":"{\"items\":[{\"id\":1},{\"id\":2,\"name\":\"tw","category":"nested-partial","expected":"{\"items\":[{\"id\":1},{\"id\":2,\"name\":\"tw\"}]}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"invalid escape repaired","input":"{\"path\":\"A\\H\"}","category":"invalid-escape","expected":"{\"path\":\"A\\\\H\"}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"incomplete unicode escape repaired","input":"{\"text\":\"\\u12\"}","category":"invalid-escape","expected":"{}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"dangling backslash repaired","input":"{\"path\":\"C:\\","category":"invalid-escape","expected":"{\"path\":\"C:\"}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"raw control character escaped","input":"{\"text\":\"a\tb\"}","category":"raw-control","expected":"{\"text\":\"a\\tb\"}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"trailing garbage uses stable prefix","input":"{\"a\":1} trailing","category":"non-recoverable","expected":"{\"a\":1}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"non json prose falls back","input":"not json","category":"non-recoverable","expected":"{}","source":"packages/ai/src/utils/json-parse.ts"}
+{"name":"corrupt object falls back","input":"{bad","category":"non-recoverable","expected":"{}","source":"packages/ai/src/utils/json-parse.ts"}

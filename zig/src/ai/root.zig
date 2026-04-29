@@ -69,6 +69,7 @@ test {
     _ = @import("providers/register_builtins.zig");
     _ = @import("model_registry.zig");
     _ = @import("model_discovery.zig");
+    _ = @import("json_parse.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
     _ = @import("shared/provider_error.zig");
