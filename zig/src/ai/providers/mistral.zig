@@ -297,23 +297,30 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (try streaming.readLine()) |line| {
+    while (true) {
+        const maybe_line = streaming.readLine() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_slots, &tool_calls, &active_tool_calls, model, err);
+                return;
+            },
+        };
+        const line = maybe_line orelse break;
         if (isAbortRequested(options)) {
-            output.stop_reason = .aborted;
-            output.error_message = "Request was aborted";
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = output.error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_slots, &tool_calls, &active_tool_calls, model, error.RequestAborted);
             return;
         }
 
         const data = parseSseLine(std.mem.trim(u8, line, " \t\r")) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
-        var parsed = try json_parse.parseStreamingJson(allocator, data);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_slots, &tool_calls, &active_tool_calls, model, err);
+                return;
+            },
+        };
         defer parsed.deinit();
         const value = parsed.value;
         if (value != .object) continue;
@@ -469,6 +476,62 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn finalizeOutputFromPartials(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_slots: *std.ArrayList(?types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_tool_calls: *std.ArrayList(StreamingToolCall),
+    model: types.Model,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    try finishCurrentBlock(allocator, current_block, content_slots, stream_ptr);
+
+    for (active_tool_calls.items) |*tool_call| {
+        const arguments = try parseStreamingJsonToValue(allocator, tool_call.partial_args.items);
+        const final_tool_call = types.ToolCall{
+            .id = try allocator.dupe(u8, tool_call.id.items),
+            .name = try allocator.dupe(u8, std.mem.trim(u8, tool_call.name.items, " ")),
+            .arguments = arguments,
+        };
+        try ensureContentSlotCapacity(allocator, content_slots, tool_call.event_index);
+        content_slots.items[tool_call.event_index] = null;
+        try tool_calls.append(allocator, final_tool_call);
+        stream_ptr.push(.{
+            .event_type = .toolcall_end,
+            .content_index = @intCast(tool_call.event_index),
+            .tool_call = final_tool_call,
+        });
+    }
+    active_tool_calls.clearRetainingCapacity();
+
+    calculateCost(model, &output.usage);
+    if (output.content.len == 0 and content_slots.items.len > 0) {
+        output.content = try materializeContent(allocator, content_slots.items);
+    }
+    if (output.tool_calls == null and tool_calls.items.len > 0) {
+        output.tool_calls = try cloneToolCallsSlice(allocator, tool_calls.items);
+    }
+}
+
+fn emitRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_slots: *std.ArrayList(?types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_tool_calls: *std.ArrayList(StreamingToolCall),
+    model: types.Model,
+    err: anyerror,
+) !void {
+    try finalizeOutputFromPartials(allocator, output, current_block, content_slots, tool_calls, active_tool_calls, model, stream_ptr);
+    output.stop_reason = provider_error.runtimeStopReason(err);
+    output.error_message = provider_error.runtimeErrorMessage(err);
+    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
 }
 
 fn buildMessagesValue(
@@ -1395,4 +1458,53 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("mistral-conversations", result.api);
+}
+
+fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {
+    return .{
+        .id = "runtime-test-model",
+        .name = "Runtime Test Model",
+        .api = api,
+        .provider = provider,
+        .base_url = "https://example.test",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
+
+
+test "parseSseStreamLines preserves partial Mistral text before malformed terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"mistral-runtime\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n" ++
+            "data: {not-json}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("mistral-conversations", "mistral"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("mistral-runtime", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }

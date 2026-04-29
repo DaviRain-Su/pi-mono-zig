@@ -444,16 +444,17 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (try streaming.readLine()) |line| {
+    while (true) {
+        const maybe_line = streaming.readLine() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                return;
+            },
+        };
+        const line = maybe_line orelse break;
         if (isAbortRequested(options)) {
-            output.stop_reason = .aborted;
-            output.error_message = "Request was aborted";
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = output.error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, error.RequestAborted);
             return;
         }
 
@@ -462,7 +463,13 @@ fn parseSseStreamLines(
         const data = parseSseLine(trimmed) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
-        var parsed = try json_parse.parseStreamingJson(allocator, data);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                return;
+            },
+        };
         defer parsed.deinit();
         const value = parsed.value;
         if (value != .object) continue;
@@ -619,6 +626,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "response.failed")) {
             const error_message = try extractFailureMessage(allocator, value.object.get("response"));
+            try finalizeOutputFromPartials(allocator, &output, &current_block, &content_blocks, &tool_calls, stream_ptr);
             output.stop_reason = .error_reason;
             output.error_message = error_message;
             stream_ptr.push(.{
@@ -632,6 +640,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "error")) {
             const error_message = try extractTopLevelErrorMessage(allocator, value);
+            try finalizeOutputFromPartials(allocator, &output, &current_block, &content_blocks, &tool_calls, stream_ptr);
             output.stop_reason = .error_reason;
             output.error_message = error_message;
             stream_ptr.push(.{
@@ -661,6 +670,38 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn finalizeOutputFromPartials(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    try finalizeCurrentBlock(allocator, null, current_block, content_blocks, tool_calls, stream_ptr);
+    if (output.content.len == 0 and content_blocks.items.len > 0) {
+        output.content = try content_blocks.toOwnedSlice(allocator);
+    }
+    if (output.tool_calls == null and tool_calls.items.len > 0) {
+        output.tool_calls = try tool_calls.toOwnedSlice(allocator);
+    }
+}
+
+fn emitRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    err: anyerror,
+) !void {
+    try finalizeOutputFromPartials(allocator, output, current_block, content_blocks, tool_calls, stream_ptr);
+    output.stop_reason = provider_error.runtimeStopReason(err);
+    output.error_message = provider_error.runtimeErrorMessage(err);
+    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
 }
 
 fn handleOutputItemAdded(

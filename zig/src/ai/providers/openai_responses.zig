@@ -480,6 +480,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "response.failed")) {
             const error_message = try extractFailureMessage(allocator, value.object.get("response"));
+            try finalizeOutputFromPartials(allocator, &output, &current_block, &content_blocks, &tool_calls, stream_ptr);
             output.stop_reason = .error_reason;
             output.error_message = error_message;
             stream_ptr.push(.{
@@ -493,6 +494,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "error")) {
             const error_message = try extractTopLevelErrorMessage(allocator, value);
+            try finalizeOutputFromPartials(allocator, &output, &current_block, &content_blocks, &tool_calls, stream_ptr);
             output.stop_reason = .error_reason;
             output.error_message = error_message;
             stream_ptr.push(.{
@@ -1962,4 +1964,101 @@ test "buildRequestHeaders omits session_id when compat disables it" {
     try std.testing.expectEqualStrings("Bearer test-key", headers.get("Authorization").?);
     try std.testing.expectEqualStrings("sess-1", headers.get("x-client-request-id").?);
     try std.testing.expect(headers.get("session_id") == null);
+}
+
+
+test "parseSseStreamLines finalizes partial text before response.failed terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n" ++
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"error\":{\"message\":\"provider failed\"}}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("unknown: provider failed", terminal.error_message.?);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("resp_failed", terminal.message.?.response_id.?);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseSseStreamLines finalizes partial text before top-level error terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_top_error\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n" ++
+            "data: {\"type\":\"error\",\"message\":\"top-level failed\"}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("top-level failed", terminal.error_message.?);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("resp_top_error", terminal.message.?.response_id.?);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }

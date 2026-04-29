@@ -447,16 +447,17 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (try streaming.readLine()) |line| {
+    while (true) {
+        const maybe_line = streaming.readLine() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                return;
+            },
+        };
+        const line = maybe_line orelse break;
         if (isAbortRequested(options)) {
-            output.stop_reason = .aborted;
-            output.error_message = "Request was aborted";
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = output.error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, error.RequestAborted);
             return;
         }
 
@@ -466,7 +467,13 @@ fn parseSseStreamLines(
         const data = parseSseLine(trimmed) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
-        var parsed = (try parseChunk(allocator, data)) orelse continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                return;
+            },
+        };
         defer parsed.deinit();
 
         if (parsed.value != .object) continue;
@@ -620,6 +627,44 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn finalizeOutputFromPartials(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
+    if (output.content.len == 0 and content_blocks.items.len > 0) {
+        const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
+        for (content_blocks.items, 0..) |block, index| blocks[index] = block;
+        output.content = blocks;
+        content_blocks.clearRetainingCapacity();
+    }
+    if (output.tool_calls == null and tool_calls.items.len > 0) {
+        const output_tool_calls = try allocator.alloc(types.ToolCall, tool_calls.items.len);
+        for (tool_calls.items, 0..) |tool_call, index| output_tool_calls[index] = tool_call;
+        output.tool_calls = output_tool_calls;
+        tool_calls.clearRetainingCapacity();
+    }
+}
+
+fn emitRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    err: anyerror,
+) !void {
+    try finalizeOutputFromPartials(allocator, output, current_block, content_blocks, tool_calls, stream_ptr);
+    output.stop_reason = provider_error.runtimeStopReason(err);
+    output.error_message = provider_error.runtimeErrorMessage(err);
+    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
 }
 
 fn appendTextDelta(
@@ -1221,4 +1266,53 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("kimi-completions", result.api);
+}
+
+fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {
+    return .{
+        .id = "runtime-test-model",
+        .name = "Runtime Test Model",
+        .api = api,
+        .provider = provider,
+        .base_url = "https://example.test",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
+
+
+test "parseSseStreamLines preserves partial Kimi text before malformed terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"kimi-runtime\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n" ++
+            "data: {not-json}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("kimi-k2", "moonshot"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("kimi-runtime", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }
