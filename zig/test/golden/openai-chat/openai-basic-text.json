@@ -1,0 +1,83 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json",
+        "x-fixture-model-header": "model-default"
+      },
+      "jsonPayload": {
+        "max_completion_tokens": 64,
+        "messages": [
+          {
+            "content": "You are the deterministic OpenAI Chat fixture assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Return a concise fixture response.",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-fixture",
+        "prompt_cache_key": "fixture-session-basic",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "temperature": 0
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "url": "https://api.openai.com/v1/chat/completions"
+    }
+  },
+  "id": "openai-basic-text",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic OpenAI Chat fixture assistant."
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "x-fixture-model-header": "model-default"
+      },
+      "id": "gpt-4.1-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 4.1 Fixture",
+      "provider": "openai",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "short",
+      "maxTokens": 64,
+      "sessionId": "fixture-session-basic",
+      "temperature": 0
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "OpenAI baseline text request captures semantic payload and auth presence"
+}
