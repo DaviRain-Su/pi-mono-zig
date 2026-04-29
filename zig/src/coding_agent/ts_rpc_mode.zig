@@ -46,6 +46,7 @@ const DeferredResponsePriority = enum(u8) {
 };
 
 const DEFERRED_RESPONSE_FLUSH_INTERVAL_MS = 50;
+const EXTENSION_HOST_EVENT_LOOP_TICK_MS = 10;
 const DIRECT_BASH_MAX_BUFFER_BYTES = truncate.DEFAULT_MAX_BYTES * 2;
 
 const DeferredResponse = struct {
@@ -1615,23 +1616,47 @@ const TsRpcServer = struct {
         try self.writeExtensionUIEditorRequest("ui_editor", "Edit fixture", "prefill");
     }
 
-    fn drainExtensionHostUiRequests(self: *TsRpcServer, idle_ms: u64) !void {
-        const host = self.extension_host orelse return;
-        var idle_elapsed: u64 = 0;
-        while (idle_elapsed <= idle_ms) {
+    fn drainAvailableExtensionHostUiRequests(self: *TsRpcServer) !usize {
+        const host = self.extension_host orelse return 0;
+        var drained_count: usize = 0;
+        while (true) {
             const requests = try host.takeUiRequests(self.allocator);
-            defer self.allocator.free(requests);
-            if (requests.len == 0) {
-                std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
-                idle_elapsed += 10;
-                continue;
-            }
-            idle_elapsed = 0;
-            for (requests) |*request| {
-                defer request.deinit(self.allocator);
-                try self.writeExtensionUIRequestFromHost(request.*);
+            {
+                defer {
+                    for (requests) |*request| request.deinit(self.allocator);
+                    self.allocator.free(requests);
+                }
+                if (requests.len == 0) return drained_count;
+                drained_count += requests.len;
+                for (requests) |*request| {
+                    try self.writeExtensionUIRequestFromHost(request.*);
+                }
             }
         }
+    }
+
+    fn drainExtensionHostUiRequests(self: *TsRpcServer, idle_ms: u64) !void {
+        if (self.extension_host == null) return;
+        var idle_elapsed: u64 = 0;
+        while (true) {
+            const drained_count = try self.drainAvailableExtensionHostUiRequests();
+            if (drained_count != 0) {
+                idle_elapsed = 0;
+                continue;
+            }
+            if (idle_elapsed >= idle_ms) return;
+            const remaining = idle_ms - idle_elapsed;
+            const sleep_ms: i64 = @intCast(if (remaining < EXTENSION_HOST_EVENT_LOOP_TICK_MS) remaining else EXTENSION_HOST_EVENT_LOOP_TICK_MS);
+            if (sleep_ms == 0) return;
+            std.Io.sleep(self.io, .fromMilliseconds(sleep_ms), .awake) catch {};
+            idle_elapsed += @intCast(sleep_ms);
+        }
+    }
+
+    fn serviceExtensionHostIdleTick(self: *TsRpcServer, elapsed_ms: u64) !void {
+        _ = try self.drainAvailableExtensionHostUiRequests();
+        if (elapsed_ms != 0) try self.advanceExtensionUITime(elapsed_ms);
+        _ = try self.drainAvailableExtensionHostUiRequests();
     }
 
     fn writeExtensionUIRequestFromHost(self: *TsRpcServer, request: extension_host_mod.ExtensionUiRequest) !void {
@@ -2073,7 +2098,16 @@ pub fn runTsRpcMode(
     var line_buffer = std.ArrayList(u8).empty;
     defer line_buffer.deinit(allocator);
 
+    const service_extension_host = options.extension_host != null;
     while (true) {
+        if (service_extension_host) {
+            try server.serviceExtensionHostIdleTick(0);
+            if (stdin_reader.interface.bufferedLen() == 0 and !try pollTsRpcStdin(EXTENSION_HOST_EVENT_LOOP_TICK_MS)) {
+                try server.serviceExtensionHostIdleTick(EXTENSION_HOST_EVENT_LOOP_TICK_MS);
+                continue;
+            }
+        }
+
         const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
@@ -2081,7 +2115,11 @@ pub fn runTsRpcMode(
         if (byte == '\n') {
             try server.handleLine(line_buffer.items);
             line_buffer.clearRetainingCapacity();
-            try server.drainExtensionHostUiRequests(50);
+            if (service_extension_host) {
+                try server.serviceExtensionHostIdleTick(0);
+            } else {
+                try server.drainExtensionHostUiRequests(50);
+            }
             continue;
         }
         try line_buffer.append(allocator, byte);
@@ -2089,7 +2127,11 @@ pub fn runTsRpcMode(
 
     if (line_buffer.items.len > 0) {
         try server.handleLine(line_buffer.items);
-        try server.drainExtensionHostUiRequests(50);
+        if (service_extension_host) {
+            try server.serviceExtensionHostIdleTick(0);
+        } else {
+            try server.drainExtensionHostUiRequests(50);
+        }
     }
 
     if (server.hasInFlightPrompt()) {
@@ -2099,6 +2141,17 @@ pub fn runTsRpcMode(
     try server.flushDeferredResponses();
     try server.finish();
     return 0;
+}
+
+fn pollTsRpcStdin(timeout_ms: i32) !bool {
+    var fds = [_]std.posix.pollfd{
+        .{
+            .fd = 0,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+    };
+    return (try std.posix.poll(fds[0..], timeout_ms)) > 0;
 }
 
 fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
@@ -5046,6 +5099,60 @@ test "M6 extension UI bridge forwards timeout defaults to host" {
     const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
     defer allocator.free(capture);
     try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"payload\":{\"confirmed\":false}}\n");
+}
+
+test "M6 extension UI bridge drains delayed host requests without stdin activity" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-m6-extension-ui-idle-pump-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "sleep 0.2; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"ui_idle_confirm\",\"method\":\"confirm\",\"responseRequired\":true,\"payload\":{{\"title\":\"Idle confirm\",\"message\":\"Proceed while idle?\",\"timeout\":20}}}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m6-extension-ui-idle-pump" };
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-m6-extension-ui-idle-pump",
+        .fixture = "ui-idle-pump",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+    try std.testing.expectEqual(@as(usize, 0), stdout_capture.writer.buffered().len);
+
+    const request_line = "{\"type\":\"extension_ui_request\",\"id\":\"ui_idle_confirm\",\"method\":\"confirm\",\"title\":\"Idle confirm\",\"message\":\"Proceed while idle?\",\"timeout\":20}\n";
+    var elapsed: u64 = 0;
+    while (std.mem.indexOf(u8, stdout_capture.writer.buffered(), request_line) == null and elapsed < 1000) : (elapsed += EXTENSION_HOST_EVENT_LOOP_TICK_MS) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(EXTENSION_HOST_EVENT_LOOP_TICK_MS), .awake) catch {};
+        try server.serviceExtensionHostIdleTick(EXTENSION_HOST_EVENT_LOOP_TICK_MS);
+    }
+    try expectContains(stdout_capture.writer.buffered(), request_line);
+
+    var timeout_elapsed: u64 = 0;
+    while (server.pending_extension_requests.count() != 0 and timeout_elapsed < 1000) : (timeout_elapsed += EXTENSION_HOST_EVENT_LOOP_TICK_MS) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(EXTENSION_HOST_EVENT_LOOP_TICK_MS), .awake) catch {};
+        try server.serviceExtensionHostIdleTick(EXTENSION_HOST_EVENT_LOOP_TICK_MS);
+    }
+    try std.testing.expectEqual(@as(u32, 0), server.pending_extension_requests.count());
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_idle_confirm\",\"payload\":{\"confirmed\":false}}\n");
 }
 
 fn expectPromptLineTypeOrder(bytes: []const u8) !void {
