@@ -1,11 +1,12 @@
 const std = @import("std");
 
 pub const JSON_REPAIR_MAX_INPUT_BYTES: usize = 64 * 1024;
-pub const JSON_REPAIR_MAX_NESTING_DEPTH: usize = 64;
 pub const JSON_REPAIR_MAX_WORK_UNITS: usize = 512 * 1024;
+pub const JSON_REPAIR_MAX_NESTING_DEPTH: usize = 64;
 
 const parse_options: std.json.ParseOptions = .{ .allocate = .alloc_always };
 const PartialParseError = error{ OutOfMemory, LimitExceeded };
+const JSON_REPAIR_VALUE_WORK_UNITS: usize = 32;
 
 /// Parse a JSON string, handling incomplete/partial JSON gracefully.
 /// Returns a parsed JSON value (caller must call `.deinit()` on the result).
@@ -20,6 +21,10 @@ pub fn parseStreamingJson(allocator: std.mem.Allocator, input: ?[]const u8) !std
 
     const trimmed = std.mem.trim(u8, input.?, " \t\r\n");
     if (trimmed.len == 0) {
+        return parseEmptyObject(allocator);
+    }
+
+    if (try exceedsStreamingJsonLimits(allocator, trimmed)) {
         return parseEmptyObject(allocator);
     }
 
@@ -59,6 +64,25 @@ fn parsePartialCandidate(allocator: std.mem.Allocator, input: []const u8) !?std.
     } else |_| {
         return null;
     }
+}
+
+fn exceedsStreamingJsonLimits(allocator: std.mem.Allocator, input: []const u8) !bool {
+    var parser = PartialParser{
+        .allocator = allocator,
+        .input = input,
+    };
+    var parsed_prefix = std.ArrayList(u8).empty;
+    defer parsed_prefix.deinit(allocator);
+
+    _ = parser.parseValue(&parsed_prefix) catch |err| switch (err) {
+        error.LimitExceeded => return true,
+        else => |other| return other,
+    };
+    parser.skipWhitespace() catch |err| switch (err) {
+        error.LimitExceeded => return true,
+        else => |other| return other,
+    };
+    return false;
 }
 
 fn repairJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -175,7 +199,11 @@ const PartialParser = struct {
     }
 
     fn bumpWork(self: *PartialParser) PartialParseError!void {
-        self.work_units += 1;
+        try self.bumpWorkCost(1);
+    }
+
+    fn bumpWorkCost(self: *PartialParser, units: usize) PartialParseError!void {
+        self.work_units = std.math.add(usize, self.work_units, units) catch return error.LimitExceeded;
         if (self.work_units > JSON_REPAIR_MAX_WORK_UNITS) return error.LimitExceeded;
     }
 
@@ -191,6 +219,7 @@ const PartialParser = struct {
     }
 
     fn parseValue(self: *PartialParser, out: *std.ArrayList(u8)) PartialParseError!bool {
+        try self.bumpWorkCost(JSON_REPAIR_VALUE_WORK_UNITS);
         try self.skipWhitespace();
         if (self.index >= self.input.len) return false;
 
@@ -488,13 +517,60 @@ test "parseStreamingJson enforces deterministic nesting depth limit" {
     try assertParsedJsonEquals(allocator, input.items, "{}");
 }
 
+test "parseStreamingJson enforces nesting depth limit for complete valid input" {
+    const allocator = std.testing.allocator;
+    var input = std.ArrayList(u8).empty;
+    defer input.deinit(allocator);
+
+    try input.appendNTimes(allocator, '[', JSON_REPAIR_MAX_NESTING_DEPTH + 1);
+    try input.append(allocator, '0');
+    try input.appendNTimes(allocator, ']', JSON_REPAIR_MAX_NESTING_DEPTH + 1);
+
+    try std.testing.expect(input.items.len <= JSON_REPAIR_MAX_INPUT_BYTES);
+    try assertParsedJsonEquals(allocator, input.items, "{}");
+}
+
+test "parseStreamingJson preserves complete valid input within nesting depth limit" {
+    const allocator = std.testing.allocator;
+    var input = std.ArrayList(u8).empty;
+    defer input.deinit(allocator);
+
+    try input.appendNTimes(allocator, '[', JSON_REPAIR_MAX_NESTING_DEPTH);
+    try input.append(allocator, '0');
+    try input.appendNTimes(allocator, ']', JSON_REPAIR_MAX_NESTING_DEPTH);
+
+    try assertParsedJsonEquals(allocator, input.items, input.items);
+}
+
 test "parseStreamingJson enforces deterministic work limit" {
     const allocator = std.testing.allocator;
     var input = std.ArrayList(u8).empty;
     defer input.deinit(allocator);
 
     try input.append(allocator, '[');
-    try input.appendNTimes(allocator, ' ', JSON_REPAIR_MAX_WORK_UNITS + 1);
+    const item_count = (JSON_REPAIR_MAX_WORK_UNITS / JSON_REPAIR_VALUE_WORK_UNITS) + 1;
+    for (0..item_count) |index| {
+        if (index > 0) try input.append(allocator, ',');
+        try input.append(allocator, '0');
+    }
 
+    try std.testing.expect(input.items.len <= JSON_REPAIR_MAX_INPUT_BYTES);
+    try assertParsedJsonEquals(allocator, input.items, "{}");
+}
+
+test "parseStreamingJson enforces work limit for complete valid input" {
+    const allocator = std.testing.allocator;
+    var input = std.ArrayList(u8).empty;
+    defer input.deinit(allocator);
+
+    try input.append(allocator, '[');
+    const item_count = (JSON_REPAIR_MAX_WORK_UNITS / JSON_REPAIR_VALUE_WORK_UNITS) + 1;
+    for (0..item_count) |index| {
+        if (index > 0) try input.append(allocator, ',');
+        try input.append(allocator, '0');
+    }
+    try input.append(allocator, ']');
+
+    try std.testing.expect(input.items.len <= JSON_REPAIR_MAX_INPUT_BYTES);
     try assertParsedJsonEquals(allocator, input.items, "{}");
 }
