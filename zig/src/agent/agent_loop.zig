@@ -152,7 +152,22 @@ const PartialAssistantAccumulator = struct {
                 text.clearRetainingCapacity();
                 if (event.content) |content| try text.appendSlice(self.allocator, content);
             },
-            .thinking_start, .thinking_delta, .thinking_end => {},
+            .thinking_start => {
+                const index = try self.indexFor(event);
+                const thinking = try self.ensureThinking(index);
+                thinking.clearRetainingCapacity();
+            },
+            .thinking_delta => {
+                const index = try self.indexFor(event);
+                const thinking = try self.ensureThinking(index);
+                if (event.delta) |delta| try thinking.appendSlice(self.allocator, delta);
+            },
+            .thinking_end => {
+                const index = try self.indexFor(event);
+                const thinking = try self.ensureThinking(index);
+                thinking.clearRetainingCapacity();
+                if (event.content) |content| try thinking.appendSlice(self.allocator, content);
+            },
             .toolcall_start => {
                 const index = try self.indexFor(event);
                 _ = try self.ensureToolCall(index);
@@ -208,12 +223,19 @@ fn buildPartialToolCallBlock(
     }
 
     const parsed = ai.json_parse.parseStreamingJson(allocator, tool_call.arguments.items) catch null;
-    const arguments: std.json.Value = if (parsed) |value| value.value else .null;
+    const arguments: std.json.Value = if (parsed) |value| switch (value.value) {
+        .object => value.value,
+        else => try emptyJsonObject(allocator),
+    } else try emptyJsonObject(allocator);
     return .{ .tool_call = .{
         .id = "",
         .name = "",
         .arguments = arguments,
     } };
+}
+
+fn emptyJsonObject(allocator: std.mem.Allocator) !std.json.Value {
+    return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
 }
 
 const UpdateEmitterContext = struct {
@@ -1684,9 +1706,10 @@ fn crossPartialUpdateStreamForAgentLoopTest(
         try result_allocator.dupe(u8, "query"),
         .{ .string = try result_allocator.dupe(u8, "partial") },
     );
-    const content = try result_allocator.alloc(ai.ContentBlock, 2);
-    content[0] = .{ .text = .{ .text = try result_allocator.dupe(u8, "prior text") } };
-    content[1] = .{ .tool_call = .{
+    const content = try result_allocator.alloc(ai.ContentBlock, 3);
+    content[0] = .{ .thinking = .{ .thinking = try result_allocator.dupe(u8, "plan first") } };
+    content[1] = .{ .text = .{ .text = try result_allocator.dupe(u8, "prior text") } };
+    content[2] = .{ .tool_call = .{
         .id = try result_allocator.dupe(u8, "call_1"),
         .name = try result_allocator.dupe(u8, "lookup"),
         .arguments = .{ .object = content_args_object },
@@ -1712,18 +1735,24 @@ fn crossPartialUpdateStreamForAgentLoopTest(
 
     var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
     stream.push(.{ .event_type = .start, .message = template });
-    stream.push(.{ .event_type = .text_start, .content_index = 0 });
-    stream.push(.{ .event_type = .text_delta, .content_index = 0, .delta = "prior " });
-    stream.push(.{ .event_type = .text_delta, .content_index = 0, .delta = "text" });
-    stream.push(.{ .event_type = .text_end, .content_index = 0, .content = "prior text" });
-    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
-    stream.push(.{ .event_type = .toolcall_delta, .content_index = 1, .delta = "{\"query\":\"par" });
-    stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = tool_call });
+    stream.push(.{ .event_type = .thinking_start, .content_index = 0 });
+    stream.push(.{ .event_type = .thinking_delta, .content_index = 0, .delta = "plan " });
+    stream.push(.{ .event_type = .thinking_delta, .content_index = 0, .delta = "first" });
+    stream.push(.{ .event_type = .thinking_end, .content_index = 0, .content = "plan first" });
+    stream.push(.{ .event_type = .text_start, .content_index = 1 });
+    stream.push(.{ .event_type = .text_delta, .content_index = 1, .delta = "prior " });
+    stream.push(.{ .event_type = .text_delta, .content_index = 1, .delta = "text" });
+    stream.push(.{ .event_type = .text_end, .content_index = 1, .content = "prior text" });
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 2 });
+    stream.push(.{ .event_type = .toolcall_delta, .content_index = 2, .delta = "{\"query\":\"par" });
+    stream.push(.{ .event_type = .toolcall_end, .content_index = 2, .tool_call = tool_call });
     stream.push(.{ .event_type = .done, .message = final_message });
     return stream;
 }
 
 const PartialUpdateCrossCapture = struct {
+    saw_thinking_delta: bool = false,
+    saw_thinking_end: bool = false,
     saw_text_delta: bool = false,
     saw_toolcall_delta: bool = false,
     saw_toolcall_end: bool = false,
@@ -1740,32 +1769,131 @@ fn capturePartialUpdateCrossEvent(context: ?*anyopaque, event: types.AgentEvent)
     };
 
     switch (assistant_event.event_type) {
+        .thinking_delta => {
+            if (!std.mem.eql(u8, assistant_event.delta orelse "", "first")) return;
+            capture.saw_thinking_delta = true;
+            try std.testing.expectEqual(@as(?u32, 0), assistant_event.content_index);
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            try std.testing.expect(assistant.content[0] == .thinking);
+            try std.testing.expectEqualStrings("plan first", assistant.content[0].thinking.thinking);
+        },
+        .thinking_end => {
+            capture.saw_thinking_end = true;
+            try std.testing.expectEqual(@as(?u32, 0), assistant_event.content_index);
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            try std.testing.expect(assistant.content[0] == .thinking);
+            try std.testing.expectEqualStrings("plan first", assistant.content[0].thinking.thinking);
+        },
         .text_delta => {
             if (!std.mem.eql(u8, assistant_event.delta orelse "", "text")) return;
             capture.saw_text_delta = true;
-            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
-            try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
+            try std.testing.expectEqual(@as(?u32, 1), assistant_event.content_index);
+            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+            try std.testing.expectEqualStrings("plan first", assistant.content[0].thinking.thinking);
+            try std.testing.expectEqualStrings("prior text", assistant.content[1].text.text);
         },
         .toolcall_delta => {
             capture.saw_toolcall_delta = true;
-            try std.testing.expectEqual(@as(?u32, 1), assistant_event.content_index);
-            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
-            try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
-            try std.testing.expect(assistant.content[1] == .tool_call);
-            const arguments = assistant.content[1].tool_call.arguments;
+            try std.testing.expectEqual(@as(?u32, 2), assistant_event.content_index);
+            try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+            try std.testing.expectEqualStrings("plan first", assistant.content[0].thinking.thinking);
+            try std.testing.expectEqualStrings("prior text", assistant.content[1].text.text);
+            try std.testing.expect(assistant.content[2] == .tool_call);
+            const arguments = assistant.content[2].tool_call.arguments;
             try std.testing.expect(arguments == .object);
             try std.testing.expectEqualStrings("par", arguments.object.get("query").?.string);
         },
         .toolcall_end => {
             capture.saw_toolcall_end = true;
-            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
-            try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
-            try std.testing.expectEqualStrings("call_1", assistant.content[1].tool_call.id);
-            try std.testing.expectEqualStrings("lookup", assistant.content[1].tool_call.name);
-            try std.testing.expectEqualStrings("partial", assistant.content[1].tool_call.arguments.object.get("query").?.string);
+            try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+            try std.testing.expectEqualStrings("plan first", assistant.content[0].thinking.thinking);
+            try std.testing.expectEqualStrings("prior text", assistant.content[1].text.text);
+            try std.testing.expectEqualStrings("call_1", assistant.content[2].tool_call.id);
+            try std.testing.expectEqualStrings("lookup", assistant.content[2].tool_call.name);
+            try std.testing.expectEqualStrings("partial", assistant.content[2].tool_call.arguments.object.get("query").?.string);
         },
         else => {},
     }
+}
+
+fn malformedPartialToolCallStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const result_allocator = std.heap.page_allocator;
+    const final_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
+    const tool_call = ai.ToolCall{
+        .id = try result_allocator.dupe(u8, "call_bad_args"),
+        .name = try result_allocator.dupe(u8, "lookup"),
+        .arguments = .{ .object = final_args_object },
+    };
+    const content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
+    const content = try result_allocator.alloc(ai.ContentBlock, 2);
+    content[0] = .{ .text = .{ .text = try result_allocator.dupe(u8, "before tool") } };
+    content[1] = .{ .tool_call = .{
+        .id = try result_allocator.dupe(u8, "call_bad_args"),
+        .name = try result_allocator.dupe(u8, "lookup"),
+        .arguments = .{ .object = content_args_object },
+    } };
+    const final_message = ai.AssistantMessage{
+        .content = content,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+    };
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    stream.push(.{ .event_type = .start, .message = template });
+    stream.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream.push(.{ .event_type = .text_delta, .content_index = 0, .delta = "before tool" });
+    stream.push(.{ .event_type = .text_end, .content_index = 0, .content = "before tool" });
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
+    stream.push(.{ .event_type = .toolcall_delta, .content_index = 1, .delta = "not-json" });
+    stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = tool_call });
+    stream.push(.{ .event_type = .done, .message = final_message });
+    return stream;
+}
+
+const MalformedPartialArgsCapture = struct {
+    saw_malformed_toolcall_delta: bool = false,
+};
+
+fn captureMalformedPartialArgsEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *MalformedPartialArgsCapture = @ptrCast(@alignCast(context.?));
+    if (event.event_type != .message_update) return;
+    const assistant_event = event.assistant_message_event orelse return;
+    if (assistant_event.event_type != .toolcall_delta) return;
+
+    const message = event.message orelse return error.MissingPartialMessage;
+    const assistant = switch (message) {
+        .assistant => |assistant_message| assistant_message,
+        else => return error.UnexpectedMessageRole,
+    };
+
+    capture.saw_malformed_toolcall_delta = true;
+    try std.testing.expectEqual(@as(?u32, 1), assistant_event.content_index);
+    try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+    try std.testing.expectEqualStrings("before tool", assistant.content[0].text.text);
+    try std.testing.expect(assistant.content[1] == .tool_call);
+    const arguments = assistant.content[1].tool_call.arguments;
+    try std.testing.expect(arguments == .object);
+    try std.testing.expectEqual(@as(usize, 0), arguments.object.count());
 }
 
 const CountedToolFixture = struct {
@@ -2384,12 +2512,52 @@ test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content 
         crossPartialUpdateStreamForAgentLoopTest,
     );
 
+    try std.testing.expect(capture.saw_thinking_delta);
+    try std.testing.expect(capture.saw_thinking_end);
     try std.testing.expect(capture.saw_text_delta);
     try std.testing.expect(capture.saw_toolcall_delta);
     try std.testing.expect(capture.saw_toolcall_end);
+    try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+    try std.testing.expectEqualStrings("plan first", assistant.content[0].thinking.thinking);
+    try std.testing.expectEqualStrings("prior text", assistant.content[1].text.text);
+    try std.testing.expectEqualStrings("partial", assistant.content[2].tool_call.arguments.object.get("query").?.string);
+}
+
+test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty object" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:malformed-partial-args",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var capture = MalformedPartialArgsCapture{};
+    const assistant = try streamAssistantResponse(
+        std.testing.allocator,
+        std.Io.failing,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = passthroughConvertToLlmForTest,
+        },
+        &capture,
+        captureMalformedPartialArgsEvent,
+        null,
+        malformedPartialToolCallStreamForAgentLoopTest,
+    );
+
+    try std.testing.expect(capture.saw_malformed_toolcall_delta);
     try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
-    try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
-    try std.testing.expectEqualStrings("partial", assistant.content[1].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expectEqualStrings("call_bad_args", assistant.content[1].tool_call.id);
+    try std.testing.expectEqual(@as(usize, 0), assistant.content[1].tool_call.arguments.object.count());
 }
 
 test "VAL-CROSS-002 terminal error with partial tool call suppresses tool execution" {
