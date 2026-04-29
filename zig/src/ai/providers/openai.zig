@@ -155,14 +155,46 @@ fn parseSseStreamLines(
         }
     }
 
-    while (try streaming.readLine()) |line| {
+    while (true) {
+        const maybe_line = streaming.readLine() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(
+                    allocator,
+                    stream_ptr,
+                    &output,
+                    &current_block,
+                    &content_blocks,
+                    &tool_calls,
+                    &tool_calls_transferred,
+                    err,
+                );
+                return;
+            },
+        };
+        const line = maybe_line orelse break;
         const data = parseSseLine(line) orelse continue;
 
         if (std.mem.eql(u8, data, "[DONE]")) {
             break;
         }
 
-        const chunk = try parseChunk(allocator, data);
+        const chunk = parseChunk(allocator, data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(
+                    allocator,
+                    stream_ptr,
+                    &output,
+                    &current_block,
+                    &content_blocks,
+                    &tool_calls,
+                    &tool_calls_transferred,
+                    err,
+                );
+                return;
+            },
+        };
         defer if (chunk) |*c| c.deinit();
 
         if (chunk == null) continue;
@@ -386,6 +418,55 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn finalizeOutputFromPartials(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    tool_calls_transferred: *bool,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    try finishCurrentBlock(current_block, content_blocks, tool_calls, stream_ptr, allocator);
+
+    if (content_blocks.items.len > 0 and output.content.len == 0) {
+        const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
+        for (content_blocks.items, 0..) |block, i| {
+            blocks[i] = block;
+        }
+        output.content = blocks;
+    }
+
+    if (tool_calls.items.len > 0 and output.tool_calls == null) {
+        output.tool_calls = try tool_calls.toOwnedSlice(allocator);
+        tool_calls_transferred.* = true;
+    }
+}
+
+fn emitRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    tool_calls_transferred: *bool,
+    err: anyerror,
+) !void {
+    try finalizeOutputFromPartials(
+        allocator,
+        output,
+        current_block,
+        content_blocks,
+        tool_calls,
+        tool_calls_transferred,
+        stream_ptr,
+    );
+    output.stop_reason = provider_error.runtimeStopReason(err);
+    output.error_message = provider_error.runtimeErrorMessage(err);
+    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
 }
 
 fn finishCurrentBlock(
@@ -1141,7 +1222,7 @@ pub fn parseChunk(allocator: std.mem.Allocator, data: []const u8) !?std.json.Par
     if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) {
         return null;
     }
-    return try json_parse.parseStreamingJson(allocator, data);
+    return try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
 }
 
 test "buildRequestPayload basic" {
@@ -1654,6 +1735,246 @@ test "stream emits single terminal sanitized error for HTTP status" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(event.message.?.stop_reason, result.stop_reason);
     try std.testing.expectEqual(event.message.?.usage.total_tokens, result.usage.total_tokens);
+}
+
+const RuntimeFailureServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    first_chunk: []const u8,
+    second_chunk: []const u8,
+    delay_ms: u64,
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, first_chunk: []const u8, second_chunk: []const u8, delay_ms: u64) !RuntimeFailureServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .first_chunk = first_chunk,
+            .second_chunk = second_chunk,
+            .delay_ms = delay_ms,
+        };
+    }
+
+    fn start(self: *RuntimeFailureServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *RuntimeFailureServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn url(self: *const RuntimeFailureServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn run(self: *RuntimeFailureServer) void {
+        const stream = self.server.accept(self.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => std.debug.panic("runtime failure server accept failed: {}", .{err}),
+        };
+        defer stream.close(self.io);
+
+        readRequestHead(stream) catch |err| std.debug.panic("runtime failure server read failed: {}", .{err});
+        writeResponse(self, stream) catch {};
+    }
+
+    fn readRequestHead(stream: std.Io.net.Stream) !void {
+        var read_buffer: [1024]u8 = undefined;
+        var reader = stream.reader(std.testing.io, &read_buffer);
+        var tail = [_]u8{ 0, 0, 0, 0 };
+        var count: usize = 0;
+
+        while (true) {
+            const byte = try reader.interface.takeByte();
+            tail[count % tail.len] = byte;
+            count += 1;
+
+            if (count >= 4) {
+                const start_index = count % tail.len;
+                const ordered = [_]u8{
+                    tail[start_index],
+                    tail[(start_index + 1) % tail.len],
+                    tail[(start_index + 2) % tail.len],
+                    tail[(start_index + 3) % tail.len],
+                };
+                if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
+            }
+        }
+    }
+
+    fn writeResponse(self: *RuntimeFailureServer, stream: std.Io.net.Stream) !void {
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        const total_len = self.first_chunk.len + self.second_chunk.len;
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{total_len},
+        );
+        try writer.interface.flush();
+        try writer.interface.writeAll(self.first_chunk);
+        try writer.interface.flush();
+        if (self.delay_ms > 0) {
+            std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.delay_ms)), .awake) catch {};
+        }
+        try writer.interface.writeAll(self.second_chunk);
+        try writer.interface.flush();
+    }
+};
+
+fn runtimeFailureTestModel(base_url: []const u8) types.Model {
+    return .{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+}
+
+fn runtimeFailureContext() types.Context {
+    return .{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+}
+
+test "parseSseStreamLines preserves partial text before malformed event JSON terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n" ++
+            "data: {not-json}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimeFailureTestModel("https://api.openai.com/v1"));
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings(terminal.error_message.?, terminal.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+}
+
+test "stream preserves partial text before timeout terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var server = try RuntimeFailureServer.init(
+        io,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
+        "data: [DONE]\n",
+        500,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try OpenAIProvider.stream(allocator, io, runtimeFailureTestModel(url), runtimeFailureContext(), .{
+        .api_key = "test-key",
+        .timeout_ms = 100,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream.next().?.event_type);
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Timeout", terminal.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream preserves partial text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var server = try RuntimeFailureServer.init(
+        io,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
+        "data: [DONE]\n",
+        500,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try std.Thread.spawn(.{}, struct {
+        fn run(signal: *std.atomic.Value(bool), test_io: std.Io) void {
+            std.Io.sleep(test_io, .fromMilliseconds(50), .awake) catch {};
+            signal.store(true, .seq_cst);
+        }
+    }.run, .{ &abort_signal, io });
+    defer abort_thread.join();
+
+    var stream = try OpenAIProvider.stream(allocator, io, runtimeFailureTestModel(url), runtimeFailureContext(), .{
+        .api_key = "test-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream.next().?.event_type);
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "parseSseStream with tool calls" {

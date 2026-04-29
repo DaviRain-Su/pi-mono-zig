@@ -294,6 +294,44 @@ fn failingContractStream(
     return StreamContractFixtureError.CallbackFailed;
 }
 
+fn partialRuntimeFailureStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    _: types.Context,
+    _: ?types.StreamOptions,
+) !event_stream.AssistantMessageEventStream {
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "partial" } }},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "ProviderParseFailure",
+        .timestamp = 0,
+    };
+    stream_instance.push(.{ .event_type = .start });
+    stream_instance.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream_instance.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "partial",
+    });
+    stream_instance.push(.{
+        .event_type = .text_end,
+        .content_index = 0,
+        .content = "partial",
+    });
+    stream_instance.push(.{
+        .event_type = .error_event,
+        .error_message = message.error_message,
+        .message = message,
+    });
+    return stream_instance;
+}
+
 fn recordingStreamSimple(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -970,6 +1008,57 @@ test "complete and streamSimple preserve provider failure stream semantics" {
     try std.testing.expectEqualStrings("recording-model", result.model);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("CallbackFailed", result.error_message.?);
+}
+
+test "complete and streamSimple preserve partial runtime provider failure stream semantics" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "recording:test:runtime-partial-failure",
+        .stream = partialRuntimeFailureStream,
+        .stream_simple = partialRuntimeFailureStream,
+    });
+
+    const model = streamContractTestModel("recording:test:runtime-partial-failure", "recording", "recording-model");
+    var simple_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .api_key = "fixture-key" },
+    );
+    defer simple_stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, simple_stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, simple_stream.next().?.event_type);
+    const delta = simple_stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, simple_stream.next().?.event_type);
+    const terminal = simple_stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("ProviderParseFailure", terminal.error_message.?);
+    try std.testing.expect(simple_stream.next() == null);
+
+    const simple_result = simple_stream.result().?;
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, simple_result.error_message.?);
+    try std.testing.expectEqualStrings("partial", simple_result.content[0].text.text);
+
+    const result = try complete(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+
+    try std.testing.expectEqualStrings("recording:test:runtime-partial-failure", result.api);
+    try std.testing.expectEqualStrings("recording", result.provider);
+    try std.testing.expectEqualStrings("recording-model", result.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("ProviderParseFailure", result.error_message.?);
+    try std.testing.expectEqualStrings("partial", result.content[0].text.text);
 }
 
 test "pre-start abort takes precedence over provider lookup and setup failures" {

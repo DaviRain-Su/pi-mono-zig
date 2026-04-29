@@ -42,6 +42,32 @@ pub fn pushHttpStatusError(
     stream_ptr.end(message);
 }
 
+pub fn runtimeStopReason(err: anyerror) types.StopReason {
+    return switch (err) {
+        error.RequestAborted => .aborted,
+        else => .error_reason,
+    };
+}
+
+pub fn runtimeErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.RequestAborted => "Request was aborted",
+        else => @errorName(err),
+    };
+}
+
+pub fn pushTerminalRuntimeError(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    message: types.AssistantMessage,
+) void {
+    stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = message.error_message,
+        .message = message,
+    });
+    stream_ptr.end(message);
+}
+
 pub fn sanitizeProviderErrorDetail(
     allocator: std.mem.Allocator,
     body: []const u8,
