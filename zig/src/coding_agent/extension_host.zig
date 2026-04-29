@@ -363,12 +363,19 @@ pub const HostProcess = struct {
     }
 
     pub fn shutdown(self: *HostProcess) !void {
+        var shutdown_write_err: ?anyerror = null;
         if (!self.shutdown_requested.swap(true, .seq_cst)) {
             if (self.stdin_file) |file| {
                 var shutdown_line: std.Io.Writer.Allocating = .init(self.allocator);
                 defer shutdown_line.deinit();
-                try writeShutdownFrame(&shutdown_line.writer);
-                try file.writeStreamingAll(self.io, shutdown_line.written());
+                writeShutdownFrame(&shutdown_line.writer) catch |err| {
+                    shutdown_write_err = err;
+                };
+                if (shutdown_write_err == null) {
+                    file.writeStreamingAll(self.io, shutdown_line.written()) catch |err| {
+                        shutdown_write_err = err;
+                    };
+                }
                 file.close(self.io);
                 self.stdin_file = null;
             }
@@ -395,6 +402,10 @@ pub const HostProcess = struct {
             file.close(self.io);
             self.stdout_file = null;
         }
+        self.mutex.lockUncancelable(self.io);
+        self.state.clearPendingRequests();
+        self.mutex.unlock(self.io);
+        if (shutdown_write_err) |err| return err;
     }
 
     pub fn waitForReady(self: *HostProcess, timeout_ms: u64) !void {
@@ -815,4 +826,40 @@ test "M6 host lifecycle kills and reaps unresponsive shutdown" {
     try host.shutdown();
     try std.testing.expect(host.wait_done.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 1), host.start_count);
+}
+
+test "M6 host lifecycle cleans up after shutdown write failure" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; exec 0<&-; printf '{\"type\":\"ready\"}\\n'; printf '{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true}\\n'; while true; do sleep 1; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m6-host-marker-shutdown-write-failure" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-m6-host-marker-shutdown-write-failure",
+            .cwd = "/tmp",
+            .fixture = "shutdown-write-failure",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var elapsed: u64 = 0;
+    while (host.pendingCount() == 0 and elapsed <= 500) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), host.pendingCount());
+    var saw_write_error = false;
+    host.shutdown() catch |err| {
+        try std.testing.expectEqual(error.BrokenPipe, err);
+        saw_write_error = true;
+    };
+    try std.testing.expect(saw_write_error);
+    try std.testing.expect(host.wait_done.load(.seq_cst));
+    try std.testing.expect(host.wait_thread == null);
+    try std.testing.expect(host.reader_thread == null);
+    try std.testing.expect(host.stdin_file == null);
+    try std.testing.expect(host.stdout_file == null);
+    try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
 }
