@@ -1097,9 +1097,10 @@ test "agent session navigation switches visible branch transcript" {
     };
 
     const manager = try std.testing.allocator.create(session_manager.SessionManager);
-    errdefer std.testing.allocator.destroy(manager);
+    var manager_transferred = false;
+    errdefer if (!manager_transferred) std.testing.allocator.destroy(manager);
     manager.* = try session_manager.SessionManager.inMemory(std.testing.allocator, std.testing.io, "/tmp/project");
-    errdefer manager.deinit();
+    errdefer if (!manager_transferred) manager.deinit();
 
     var first = try makeUserMessage("root", 1);
     defer session_manager.deinitMessage(std.testing.allocator, &first);
@@ -1128,6 +1129,7 @@ test "agent session navigation switches visible branch transcript" {
         .{},
         manager,
     );
+    manager_transferred = true;
     defer session.deinit();
 
     try session.navigateTo(main_id);
@@ -1137,6 +1139,69 @@ test "agent session navigation switches visible branch transcript" {
     try session.navigateTo(branch_id);
     try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
     try std.testing.expectEqualStrings("branch", session.agent.getMessages()[1].assistant.content[0].text.text);
+}
+
+test "VAL-CROSS-006 session reload keeps errored partial assistant inert" {
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    const manager = try std.testing.allocator.create(session_manager.SessionManager);
+    var manager_transferred = false;
+    errdefer if (!manager_transferred) std.testing.allocator.destroy(manager);
+    manager.* = try session_manager.SessionManager.inMemory(std.testing.allocator, std.testing.io, "/tmp/project");
+    errdefer if (!manager_transferred) manager.deinit();
+
+    var prompt = try makeUserMessage("root", 1);
+    defer session_manager.deinitMessage(std.testing.allocator, &prompt);
+    _ = try manager.appendMessage(prompt);
+
+    var errored = try makeErroredPartialAssistantMessage(model, 2);
+    defer session_manager.deinitMessage(std.testing.allocator, &errored);
+    _ = try manager.appendMessage(errored);
+
+    var session = try AgentSession.initWithManager(
+        std.testing.allocator,
+        std.testing.io,
+        "/tmp/project",
+        "system prompt",
+        model,
+        null,
+        .off,
+        &.{},
+        .{},
+        .{},
+        manager,
+    );
+    manager_transferred = true;
+    defer session.deinit();
+
+    try session.reloadFromSession();
+    try session.reloadFromSession();
+
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("root", messages[0].user.content[0].text.text);
+    const entries = session.session_manager.getEntries();
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expect(entries[1] == .message);
+    const assistant = entries[1].message.message.assistant;
+    try std.testing.expectEqual(ai.StopReason.error_reason, assistant.stop_reason);
+    try std.testing.expect(!ai.types.shouldReplayAssistantInProviderContext(assistant));
+    try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+    try std.testing.expectEqualStrings("partial text", assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("private thought", assistant.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("partial-call", assistant.content[2].tool_call.id);
+    try std.testing.expectEqualStrings("lookup", assistant.content[2].tool_call.name);
+    try std.testing.expectEqualStrings("partial", assistant.content[2].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(assistant.tool_calls == null);
 }
 
 test "manual compaction replaces older history with a summary message" {
@@ -1369,6 +1434,40 @@ fn makeAssistantMessage(text: []const u8, model: ai.Model, timestamp: i64) !agen
         .model = try std.testing.allocator.dupe(u8, model.id),
         .usage = ai.Usage.init(),
         .stop_reason = .stop,
+        .timestamp = timestamp,
+    } };
+}
+
+fn makeErroredPartialAssistantMessage(model: ai.Model, timestamp: i64) !agent.AgentMessage {
+    var args_object = try std.json.ObjectMap.init(std.testing.allocator, &.{}, &.{});
+    try args_object.put(
+        std.testing.allocator,
+        try std.testing.allocator.dupe(u8, "query"),
+        .{ .string = try std.testing.allocator.dupe(u8, "partial") },
+    );
+    const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 3);
+    blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "partial text") } };
+    blocks[1] = .{ .thinking = .{
+        .thinking = try std.testing.allocator.dupe(u8, "private thought"),
+        .thinking_signature = try std.testing.allocator.dupe(u8, "think-sig"),
+    } };
+    blocks[2] = .{ .tool_call = .{
+        .id = try std.testing.allocator.dupe(u8, "partial-call"),
+        .name = try std.testing.allocator.dupe(u8, "lookup"),
+        .arguments = .{ .object = args_object },
+        .thought_signature = try std.testing.allocator.dupe(u8, "tool-sig"),
+    } };
+    return .{ .assistant = .{
+        .role = try std.testing.allocator.dupe(u8, "assistant"),
+        .content = blocks,
+        .tool_calls = null,
+        .api = try std.testing.allocator.dupe(u8, model.api),
+        .provider = try std.testing.allocator.dupe(u8, model.provider),
+        .model = try std.testing.allocator.dupe(u8, model.id),
+        .response_id = try std.testing.allocator.dupe(u8, "resp-partial-error"),
+        .usage = ai.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = try std.testing.allocator.dupe(u8, "provider failed after partials"),
         .timestamp = timestamp,
     } };
 }

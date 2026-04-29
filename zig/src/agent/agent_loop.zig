@@ -26,6 +26,196 @@ const ExecutedToolCallOutcome = struct {
     is_error: bool,
 };
 
+const PartialToolCallBlock = struct {
+    arguments: std.ArrayList(u8) = .empty,
+    final_tool_call: ?ai.ToolCall = null,
+
+    fn deinit(self: *PartialToolCallBlock, allocator: std.mem.Allocator) void {
+        self.arguments.deinit(allocator);
+        if (self.final_tool_call) |tool_call| deinitToolCall(allocator, tool_call);
+        self.* = undefined;
+    }
+
+    fn appendDelta(self: *PartialToolCallBlock, allocator: std.mem.Allocator, delta: []const u8) !void {
+        try self.arguments.appendSlice(allocator, delta);
+    }
+
+    fn setFinal(self: *PartialToolCallBlock, allocator: std.mem.Allocator, tool_call: ai.ToolCall) !void {
+        if (self.final_tool_call) |existing| deinitToolCall(allocator, existing);
+        self.final_tool_call = try cloneToolCall(allocator, tool_call);
+    }
+};
+
+const PartialContentBlock = union(enum) {
+    text: std.ArrayList(u8),
+    thinking: std.ArrayList(u8),
+    tool_call: PartialToolCallBlock,
+
+    fn deinit(self: *PartialContentBlock, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |*text| text.deinit(allocator),
+            .thinking => |*thinking| thinking.deinit(allocator),
+            .tool_call => |*tool_call| tool_call.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+const PartialAssistantAccumulator = struct {
+    allocator: std.mem.Allocator,
+    blocks: std.ArrayList(PartialContentBlock) = .empty,
+    index_map: std.ArrayList(?usize) = .empty,
+
+    fn init(allocator: std.mem.Allocator) PartialAssistantAccumulator {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *PartialAssistantAccumulator) void {
+        for (self.blocks.items) |*block| block.deinit(self.allocator);
+        self.blocks.deinit(self.allocator);
+        self.index_map.deinit(self.allocator);
+    }
+
+    fn indexFor(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !usize {
+        if (event.content_index) |content_index| {
+            const requested: usize = @intCast(content_index);
+            if (requested < self.index_map.items.len) {
+                if (self.index_map.items[requested]) |mapped| return mapped;
+            }
+            while (self.index_map.items.len <= requested) {
+                try self.index_map.append(self.allocator, null);
+            }
+            const mapped = self.blocks.items.len;
+            self.index_map.items[requested] = mapped;
+            return mapped;
+        }
+        return if (self.blocks.items.len == 0) 0 else self.blocks.items.len - 1;
+    }
+
+    fn ensureIndex(self: *PartialAssistantAccumulator, index: usize) !void {
+        while (self.blocks.items.len <= index) {
+            try self.blocks.append(self.allocator, .{ .text = .empty });
+        }
+    }
+
+    fn ensureText(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
+        try self.ensureIndex(index);
+        switch (self.blocks.items[index]) {
+            .text => |*text| return text,
+            else => {
+                self.blocks.items[index].deinit(self.allocator);
+                self.blocks.items[index] = .{ .text = .empty };
+                return &self.blocks.items[index].text;
+            },
+        }
+    }
+
+    fn ensureThinking(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
+        try self.ensureIndex(index);
+        switch (self.blocks.items[index]) {
+            .thinking => |*thinking| return thinking,
+            else => {
+                self.blocks.items[index].deinit(self.allocator);
+                self.blocks.items[index] = .{ .thinking = .empty };
+                return &self.blocks.items[index].thinking;
+            },
+        }
+    }
+
+    fn ensureToolCall(self: *PartialAssistantAccumulator, index: usize) !*PartialToolCallBlock {
+        try self.ensureIndex(index);
+        switch (self.blocks.items[index]) {
+            .tool_call => |*tool_call| return tool_call,
+            else => {
+                self.blocks.items[index].deinit(self.allocator);
+                self.blocks.items[index] = .{ .tool_call = .{} };
+                return &self.blocks.items[index].tool_call;
+            },
+        }
+    }
+
+    fn applyEvent(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !void {
+        switch (event.event_type) {
+            .text_start => {
+                const index = try self.indexFor(event);
+                const text = try self.ensureText(index);
+                text.clearRetainingCapacity();
+            },
+            .text_delta => {
+                const index = try self.indexFor(event);
+                const text = try self.ensureText(index);
+                if (event.delta) |delta| try text.appendSlice(self.allocator, delta);
+            },
+            .text_end => {
+                const index = try self.indexFor(event);
+                const text = try self.ensureText(index);
+                text.clearRetainingCapacity();
+                if (event.content) |content| try text.appendSlice(self.allocator, content);
+            },
+            .thinking_start, .thinking_delta, .thinking_end => {},
+            .toolcall_start => {
+                const index = try self.indexFor(event);
+                _ = try self.ensureToolCall(index);
+            },
+            .toolcall_delta => {
+                const index = try self.indexFor(event);
+                const tool_call = try self.ensureToolCall(index);
+                if (event.delta) |delta| try tool_call.appendDelta(self.allocator, delta);
+            },
+            .toolcall_end => {
+                const index = try self.indexFor(event);
+                const tool_call = try self.ensureToolCall(index);
+                if (event.tool_call) |final_tool_call| try tool_call.setFinal(self.allocator, final_tool_call);
+            },
+            else => {},
+        }
+    }
+
+    fn buildMessage(
+        self: *PartialAssistantAccumulator,
+        allocator: std.mem.Allocator,
+        template: ai.AssistantMessage,
+    ) !ai.AssistantMessage {
+        if (self.blocks.items.len == 1 and self.blocks.items[0] == .tool_call) {
+            var partial = template;
+            partial.content = &[_]ai.ContentBlock{};
+            partial.tool_calls = null;
+            return partial;
+        }
+
+        var content = try allocator.alloc(ai.ContentBlock, self.blocks.items.len);
+        for (self.blocks.items, 0..) |*block, index| {
+            content[index] = switch (block.*) {
+                .text => |text| .{ .text = .{ .text = text.items } },
+                .thinking => |thinking| .{ .thinking = .{ .thinking = thinking.items } },
+                .tool_call => |tool_call| try buildPartialToolCallBlock(allocator, tool_call),
+            };
+        }
+
+        var partial = template;
+        partial.content = content;
+        partial.tool_calls = null;
+        return partial;
+    }
+};
+
+fn buildPartialToolCallBlock(
+    allocator: std.mem.Allocator,
+    tool_call: PartialToolCallBlock,
+) !ai.ContentBlock {
+    if (tool_call.final_tool_call) |final_tool_call| {
+        return .{ .tool_call = final_tool_call };
+    }
+
+    const parsed = ai.json_parse.parseStreamingJson(allocator, tool_call.arguments.items) catch null;
+    const arguments: std.json.Value = if (parsed) |value| value.value else .null;
+    return .{ .tool_call = .{
+        .id = "",
+        .name = "",
+        .arguments = arguments,
+    } };
+}
+
 const UpdateEmitterContext = struct {
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
@@ -334,10 +524,8 @@ fn streamAssistantResponse(
     defer stream.deinit();
 
     var partial_template: ?ai.AssistantMessage = null;
-    var partial_text = std.ArrayList(u8).empty;
-    defer partial_text.deinit(allocator);
-    var partial_content: [1]ai.ContentBlock = undefined;
-    var has_text_block = false;
+    var partial_accumulator = PartialAssistantAccumulator.init(allocator);
+    defer partial_accumulator.deinit();
     var saw_message_start = false;
 
     while (stream.next()) |event| {
@@ -355,52 +543,40 @@ fn streamAssistantResponse(
             },
             .text_start => {
                 if (partial_template) |template| {
-                    try partial_text.resize(allocator, 0);
-                    partial_content[0] = .{ .text = .{ .text = "" } };
-                    has_text_block = true;
+                    try partial_accumulator.applyEvent(event);
                     try emitPartialMessageUpdate(
+                        allocator,
                         emit_context,
                         emit,
                         template,
                         event,
-                        &partial_content,
-                        has_text_block,
+                        &partial_accumulator,
                     );
                 }
             },
             .text_delta => {
                 if (partial_template) |template| {
-                    if (!has_text_block) {
-                        partial_content[0] = .{ .text = .{ .text = "" } };
-                        has_text_block = true;
-                    }
-                    if (event.delta) |delta| {
-                        try partial_text.appendSlice(allocator, delta);
-                    }
-                    partial_content[0] = .{ .text = .{ .text = partial_text.items } };
+                    try partial_accumulator.applyEvent(event);
                     try emitPartialMessageUpdate(
+                        allocator,
                         emit_context,
                         emit,
                         template,
                         event,
-                        &partial_content,
-                        has_text_block,
+                        &partial_accumulator,
                     );
                 }
             },
             .text_end => {
                 if (partial_template) |template| {
-                    if (!has_text_block) {
-                        has_text_block = true;
-                    }
-                    partial_content[0] = .{ .text = .{ .text = event.content orelse partial_text.items } };
+                    try partial_accumulator.applyEvent(event);
                     try emitPartialMessageUpdate(
+                        allocator,
                         emit_context,
                         emit,
                         template,
                         event,
-                        &partial_content,
-                        has_text_block,
+                        &partial_accumulator,
                     );
                 }
             },
@@ -420,11 +596,15 @@ fn streamAssistantResponse(
                     .stop_reason = .stop,
                     .timestamp = types.nowMilliseconds(),
                 };
-                try emit(emit_context, .{
-                    .event_type = .message_update,
-                    .message = .{ .assistant = template },
-                    .assistant_message_event = event,
-                });
+                try partial_accumulator.applyEvent(event);
+                try emitPartialMessageUpdate(
+                    allocator,
+                    emit_context,
+                    emit,
+                    template,
+                    event,
+                    &partial_accumulator,
+                );
             },
             .done, .error_event => {
                 const final_message = event.message orelse stream.result() orelse return AgentLoopError.MissingAssistantResult;
@@ -984,18 +1164,17 @@ fn emitToolCallOutcome(
 }
 
 fn emitPartialMessageUpdate(
+    allocator: std.mem.Allocator,
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
     template: ai.AssistantMessage,
     assistant_message_event: ai.AssistantMessageEvent,
-    partial_content: *[1]ai.ContentBlock,
-    has_text_block: bool,
+    partial_accumulator: *PartialAssistantAccumulator,
 ) !void {
-    var partial_message = template;
-    partial_message.content = if (has_text_block)
-        partial_content[0..1]
-    else
-        &[_]ai.ContentBlock{};
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
     try emit(emit_context, .{
         .event_type = .message_update,
         .message = .{ .assistant = partial_message },
@@ -1477,6 +1656,116 @@ fn toolCallStreamForAgentLoopTest(
     stream.push(.{ .event_type = .toolcall_end, .content_index = 0, .tool_call = tool_calls[0] });
     stream.push(.{ .event_type = .done, .message = final_message });
     return stream;
+}
+
+fn crossPartialUpdateStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const result_allocator = std.heap.page_allocator;
+    var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
+    try args_object.put(
+        result_allocator,
+        try result_allocator.dupe(u8, "query"),
+        .{ .string = try result_allocator.dupe(u8, "partial") },
+    );
+    const tool_call = ai.ToolCall{
+        .id = try result_allocator.dupe(u8, "call_1"),
+        .name = try result_allocator.dupe(u8, "lookup"),
+        .arguments = .{ .object = args_object },
+    };
+    var content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
+    try content_args_object.put(
+        result_allocator,
+        try result_allocator.dupe(u8, "query"),
+        .{ .string = try result_allocator.dupe(u8, "partial") },
+    );
+    const content = try result_allocator.alloc(ai.ContentBlock, 2);
+    content[0] = .{ .text = .{ .text = try result_allocator.dupe(u8, "prior text") } };
+    content[1] = .{ .tool_call = .{
+        .id = try result_allocator.dupe(u8, "call_1"),
+        .name = try result_allocator.dupe(u8, "lookup"),
+        .arguments = .{ .object = content_args_object },
+    } };
+    const final_message = ai.AssistantMessage{
+        .content = content,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+    };
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    stream.push(.{ .event_type = .start, .message = template });
+    stream.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream.push(.{ .event_type = .text_delta, .content_index = 0, .delta = "prior " });
+    stream.push(.{ .event_type = .text_delta, .content_index = 0, .delta = "text" });
+    stream.push(.{ .event_type = .text_end, .content_index = 0, .content = "prior text" });
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
+    stream.push(.{ .event_type = .toolcall_delta, .content_index = 1, .delta = "{\"query\":\"par" });
+    stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = tool_call });
+    stream.push(.{ .event_type = .done, .message = final_message });
+    return stream;
+}
+
+const PartialUpdateCrossCapture = struct {
+    saw_text_delta: bool = false,
+    saw_toolcall_delta: bool = false,
+    saw_toolcall_end: bool = false,
+};
+
+fn capturePartialUpdateCrossEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *PartialUpdateCrossCapture = @ptrCast(@alignCast(context.?));
+    if (event.event_type != .message_update) return;
+    const assistant_event = event.assistant_message_event orelse return;
+    const message = event.message orelse return error.MissingPartialMessage;
+    const assistant = switch (message) {
+        .assistant => |assistant_message| assistant_message,
+        else => return error.UnexpectedMessageRole,
+    };
+
+    switch (assistant_event.event_type) {
+        .text_delta => {
+            if (!std.mem.eql(u8, assistant_event.delta orelse "", "text")) return;
+            capture.saw_text_delta = true;
+            try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+            try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
+        },
+        .toolcall_delta => {
+            capture.saw_toolcall_delta = true;
+            try std.testing.expectEqual(@as(?u32, 1), assistant_event.content_index);
+            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+            try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
+            try std.testing.expect(assistant.content[1] == .tool_call);
+            const arguments = assistant.content[1].tool_call.arguments;
+            try std.testing.expect(arguments == .object);
+            try std.testing.expectEqualStrings("par", arguments.object.get("query").?.string);
+        },
+        .toolcall_end => {
+            capture.saw_toolcall_end = true;
+            try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+            try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
+            try std.testing.expectEqualStrings("call_1", assistant.content[1].tool_call.id);
+            try std.testing.expectEqualStrings("lookup", assistant.content[1].tool_call.name);
+            try std.testing.expectEqualStrings("partial", assistant.content[1].tool_call.arguments.object.get("query").?.string);
+        },
+        else => {},
+    }
 }
 
 const CountedToolFixture = struct {
@@ -2062,6 +2351,248 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
         }
     }
     try std.testing.expectEqual(expected.len, next_expected);
+}
+
+test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content while tool JSON repairs" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:cross-partials",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var capture = PartialUpdateCrossCapture{};
+    const assistant = try streamAssistantResponse(
+        std.testing.allocator,
+        std.Io.failing,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = passthroughConvertToLlmForTest,
+        },
+        &capture,
+        capturePartialUpdateCrossEvent,
+        null,
+        crossPartialUpdateStreamForAgentLoopTest,
+    );
+
+    try std.testing.expect(capture.saw_text_delta);
+    try std.testing.expect(capture.saw_toolcall_delta);
+    try std.testing.expect(capture.saw_toolcall_end);
+    try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
+    try std.testing.expectEqualStrings("prior text", assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("partial", assistant.content[1].tool_call.arguments.object.get("query").?.string);
+}
+
+test "VAL-CROSS-002 terminal error with partial tool call suppresses tool execution" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = try jsonStringObject(arena.allocator(), "value", "should-not-run");
+    const blocks = try arena.allocator().alloc(faux.FauxContentBlock, 2);
+    blocks[0] = faux.fauxText("partial before error");
+    blocks[1] = try faux.fauxToolCall(arena.allocator(), "echo", args, .{ .id = "tool-error-1" });
+    const response = faux.fauxAssistantMessage(blocks, .{
+        .stop_reason = .error_reason,
+        .error_message = "provider failed after tool call",
+        .response_id = "resp_error_partial",
+    });
+    try registration.setResponses(&[_]faux.FauxResponseStep{.{ .message = response }});
+
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
+    };
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(ai.StopReason.error_reason, result[1].assistant.stop_reason);
+    try std.testing.expectEqualStrings("resp_error_partial", result[1].assistant.response_id.?);
+    try std.testing.expectEqualStrings("partial before error", result[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("tool-error-1", result[1].assistant.content[1].tool_call.id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
+
+    for (capture.events.items) |event| {
+        try std.testing.expect(event.event_type != .tool_execution_start);
+        try std.testing.expect(event.event_type != .tool_execution_end);
+    }
+}
+
+test "VAL-CROSS-002 terminal abort with partial tool call suppresses tool execution" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = try jsonStringObject(arena.allocator(), "value", "should-not-run");
+    const blocks = try arena.allocator().alloc(faux.FauxContentBlock, 2);
+    blocks[0] = faux.fauxText("partial before abort");
+    blocks[1] = try faux.fauxToolCall(arena.allocator(), "echo", args, .{ .id = "tool-abort-1" });
+    const response = faux.fauxAssistantMessage(blocks, .{
+        .stop_reason = .aborted,
+        .error_message = "Request was aborted",
+        .response_id = "resp_abort_partial",
+    });
+    try registration.setResponses(&[_]faux.FauxResponseStep{.{ .message = response }});
+
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
+    };
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(ai.StopReason.aborted, result[1].assistant.stop_reason);
+    try std.testing.expectEqualStrings("resp_abort_partial", result[1].assistant.response_id.?);
+    try std.testing.expectEqualStrings("partial before abort", result[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("tool-abort-1", result[1].assistant.content[1].tool_call.id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
+}
+
+test "VAL-CROSS-003 interleaved repaired and fallback tool calls execute exactly once" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first_parsed = try ai.json_parse.parseStreamingJson(arena.allocator(), "{\"value\":\"first");
+    const fallback_args = try std.json.ObjectMap.init(arena.allocator(), &.{}, &.{});
+    const blocks = try arena.allocator().alloc(faux.FauxContentBlock, 2);
+    blocks[0] = try faux.fauxToolCall(arena.allocator(), "echo", first_parsed.value, .{ .id = "tool-repaired" });
+    blocks[1] = try faux.fauxToolCall(arena.allocator(), "optional", .{ .object = fallback_args }, .{ .id = "tool-fallback" });
+    const first_response = faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use });
+    const done_blocks = [_]faux.FauxContentBlock{faux.fauxText("done")};
+    const second_response = faux.fauxAssistantMessage(done_blocks[0..], .{});
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = first_response },
+        .{ .message = second_response },
+    });
+
+    const echo_fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(echo_fixture);
+    echo_fixture.* = .{};
+    const optional_fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(optional_fixture);
+    optional_fixture.* = .{};
+
+    const tools = [_]types.AgentTool{
+        .{
+            .name = "echo",
+            .description = "Echo input",
+            .label = "Echo",
+            .parameters = .null,
+            .execute_context = echo_fixture,
+            .execute = countedEchoToolExecute,
+        },
+        .{
+            .name = "optional",
+            .description = "Accept fallback args",
+            .label = "Optional",
+            .parameters = .null,
+            .execute_context = optional_fixture,
+            .execute = countedEchoToolExecute,
+        },
+    };
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = tools[0..],
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .tool_execution = .sequential,
+        },
+        null,
+        ignoreEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), result.len);
+    try std.testing.expectEqualStrings("tool-repaired", result[2].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("tool-fallback", result[3].tool_result.tool_call_id);
+    try std.testing.expectEqual(@as(usize, 1), echo_fixture.execute_count);
+    try std.testing.expectEqual(@as(usize, 1), optional_fixture.execute_count);
 }
 
 test "runAgentLoop executes multiple tool calls in parallel and emits tool results in source order" {
