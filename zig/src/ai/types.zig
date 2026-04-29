@@ -130,6 +130,7 @@ pub const Usage = struct {
 
 pub const TextContent = struct {
     text: []const u8,
+    text_signature: ?[]const u8 = null,
 };
 
 pub const ImageContent = struct {
@@ -139,21 +140,35 @@ pub const ImageContent = struct {
 
 pub const ThinkingContent = struct {
     thinking: []const u8,
+    thinking_signature: ?[]const u8 = null,
+    /// Legacy field name kept for stored-session/provider compatibility during
+    /// the ordered assistant content migration. Prefer `thinking_signature` for
+    /// new code.
     signature: ?[]const u8 = null,
     redacted: bool = false,
-};
-
-pub const ContentBlock = union(enum) {
-    text: TextContent,
-    image: ImageContent,
-    thinking: ThinkingContent,
 };
 
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments: std.json.Value,
+    thought_signature: ?[]const u8 = null,
 };
+
+pub const ContentBlock = union(enum) {
+    text: TextContent,
+    image: ImageContent,
+    thinking: ThinkingContent,
+    tool_call: ToolCall,
+};
+
+pub fn textSignature(text: TextContent) ?[]const u8 {
+    return text.text_signature;
+}
+
+pub fn thinkingSignature(thinking: ThinkingContent) ?[]const u8 {
+    return thinking.thinking_signature orelse thinking.signature;
+}
 
 pub const UserMessage = struct {
     role: []const u8 = "user",
@@ -179,6 +194,44 @@ pub const AssistantMessage = struct {
     error_message: ?[]const u8 = null,
     timestamp: i64,
 };
+
+pub fn countInlineToolCalls(assistant: AssistantMessage) usize {
+    var count: usize = 0;
+    for (assistant.content) |block| {
+        if (block == .tool_call) count += 1;
+    }
+    return count;
+}
+
+pub fn hasInlineToolCalls(assistant: AssistantMessage) bool {
+    return countInlineToolCalls(assistant) > 0;
+}
+
+/// Collects executable tool calls with inline ordered content as source of
+/// truth. The returned slice is an owned array of borrowed ToolCall values; free
+/// only the slice, not the tool-call fields.
+pub fn collectAssistantToolCalls(
+    allocator: std.mem.Allocator,
+    assistant: AssistantMessage,
+) ![]const ToolCall {
+    const inline_count = countInlineToolCalls(assistant);
+    if (inline_count > 0) {
+        var calls = try allocator.alloc(ToolCall, inline_count);
+        var index: usize = 0;
+        for (assistant.content) |block| {
+            if (block == .tool_call) {
+                calls[index] = block.tool_call;
+                index += 1;
+            }
+        }
+        return calls;
+    }
+
+    const legacy = assistant.tool_calls orelse return try allocator.alloc(ToolCall, 0);
+    const calls = try allocator.alloc(ToolCall, legacy.len);
+    @memcpy(calls, legacy);
+    return calls;
+}
 
 pub const ToolResultMessage = struct {
     role: []const u8 = "toolResult",

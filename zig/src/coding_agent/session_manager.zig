@@ -1331,6 +1331,7 @@ fn appendContentBlocksSearchText(
         switch (block) {
             .text => |text| try appendSearchText(out, allocator, text.text),
             .thinking => |thinking| try appendSearchText(out, allocator, thinking.thinking),
+            .tool_call => |tool_call| try appendSearchText(out, allocator, tool_call.name),
             .image => {},
         }
     }
@@ -1968,8 +1969,10 @@ fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBl
                     },
                     .thinking => |thinking| {
                         allocator.free(thinking.thinking);
+                        if (thinking.thinking_signature) |signature| allocator.free(signature);
                         if (thinking.signature) |signature| allocator.free(signature);
                     },
+                    .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
                 }
             }
             allocator.free(cloned);
@@ -1982,16 +1985,21 @@ fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBl
 
 fn cloneContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
     return switch (block) {
-        .text => |text| ai.ContentBlock{ .text = .{ .text = try allocator.dupe(u8, text.text) } },
+        .text => |text| ai.ContentBlock{ .text = .{
+            .text = try allocator.dupe(u8, text.text),
+            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
         .image => |image| ai.ContentBlock{ .image = .{
             .data = try allocator.dupe(u8, image.data),
             .mime_type = try allocator.dupe(u8, image.mime_type),
         } },
         .thinking => |thinking| ai.ContentBlock{ .thinking = .{
             .thinking = try allocator.dupe(u8, thinking.thinking),
-            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .thinking_signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
+            .signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
             .redacted = thinking.redacted,
         } },
+        .tool_call => |tool_call| ai.ContentBlock{ .tool_call = try cloneToolCall(allocator, tool_call) },
     };
 }
 
@@ -2004,6 +2012,7 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
             .id = try allocator.dupe(u8, tool_call.id),
             .name = try allocator.dupe(u8, tool_call.name),
             .arguments = try common.cloneJsonValue(allocator, tool_call.arguments),
+            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         };
     }
 
@@ -2012,11 +2021,25 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
 
 fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) void {
     for (tool_calls) |tool_call| {
-        allocator.free(tool_call.id);
-        allocator.free(tool_call.name);
-        common.deinitJsonValue(allocator, tool_call.arguments);
+        deinitToolCall(allocator, tool_call);
     }
     allocator.free(tool_calls);
+}
+
+fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
+    return .{
+        .id = try allocator.dupe(u8, tool_call.id),
+        .name = try allocator.dupe(u8, tool_call.name),
+        .arguments = try common.cloneJsonValue(allocator, tool_call.arguments),
+        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+    };
+}
+
+fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
+    common.deinitJsonValue(allocator, tool_call.arguments);
 }
 
 fn buildSessionFilePath(
@@ -2231,6 +2254,9 @@ fn contentBlocksToJsonValue(
             .text => |text| {
                 try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
                 try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text.text) });
+                if (text.text_signature) |signature| {
+                    try object.put(allocator, try allocator.dupe(u8, "textSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                }
             },
             .image => |image| {
                 try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "image") });
@@ -2240,29 +2266,51 @@ fn contentBlocksToJsonValue(
             .thinking => |thinking| {
                 try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "thinking") });
                 try object.put(allocator, try allocator.dupe(u8, "thinking"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
-                if (thinking.signature) |signature| {
-                    try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, signature) });
+                if (ai.thinkingSignature(thinking)) |signature| {
+                    try object.put(allocator, try allocator.dupe(u8, "thinkingSignature"), .{ .string = try allocator.dupe(u8, signature) });
                 }
                 if (thinking.redacted) {
                     try object.put(allocator, try allocator.dupe(u8, "redacted"), .{ .bool = true });
                 }
             },
+            .tool_call => |tool_call| {
+                common.deinitJsonValue(allocator, .{ .object = object });
+                try array.append(try toolCallToJsonValue(allocator, tool_call));
+                continue;
+            },
         }
         try array.append(.{ .object = object });
     }
 
-    if (tool_calls) |calls| {
-        for (calls) |tool_call| {
-            var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "toolCall") });
-            try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
-            try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-            try object.put(allocator, try allocator.dupe(u8, "arguments"), try common.cloneJsonValue(allocator, tool_call.arguments));
-            try array.append(.{ .object = object });
+    const inline_has_tool_calls = blk: {
+        for (content) |block| {
+            if (block == .tool_call) break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (!inline_has_tool_calls) {
+        if (tool_calls) |calls| {
+            for (calls) |tool_call| {
+                try array.append(try toolCallToJsonValue(allocator, tool_call));
+            }
         }
     }
 
     return .{ .array = array };
+}
+
+fn toolCallToJsonValue(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = object });
+    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "toolCall") });
+    try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
+    try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
+    try object.put(allocator, try allocator.dupe(u8, "arguments"), try common.cloneJsonValue(allocator, tool_call.arguments));
+    if (tool_call.thought_signature) |signature| {
+        try object.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
+    }
+    return .{ .object = object };
 }
 
 fn customMessageContentToJsonValue(
@@ -2625,11 +2673,14 @@ fn parseAssistantContentValue(
         const item_type = try getRequiredString(object, "type");
 
         if (std.mem.eql(u8, item_type, "toolCall")) {
-            try tool_calls.append(allocator, .{
+            const tool_call = ai.ToolCall{
                 .id = try allocator.dupe(u8, try getRequiredString(object, "id")),
                 .name = try allocator.dupe(u8, try getRequiredString(object, "name")),
                 .arguments = try common.cloneJsonValue(allocator, object.get("arguments") orelse .null),
-            });
+                .thought_signature = if (getOptionalString(object, "thoughtSignature")) |signature| try allocator.dupe(u8, signature) else null,
+            };
+            try content.append(allocator, .{ .tool_call = try cloneToolCall(allocator, tool_call) });
+            try tool_calls.append(allocator, tool_call);
             continue;
         }
 
@@ -2658,7 +2709,10 @@ fn parseContentBlockObject(allocator: std.mem.Allocator, object: std.json.Object
     const item_type = try getRequiredString(object, "type");
 
     if (std.mem.eql(u8, item_type, "text")) {
-        return .{ .text = .{ .text = try allocator.dupe(u8, try getRequiredString(object, "text")) } };
+        return .{ .text = .{
+            .text = try allocator.dupe(u8, try getRequiredString(object, "text")),
+            .text_signature = if (getOptionalString(object, "textSignature")) |signature| try allocator.dupe(u8, signature) else null,
+        } };
     }
 
     if (std.mem.eql(u8, item_type, "image")) {
@@ -2671,7 +2725,8 @@ fn parseContentBlockObject(allocator: std.mem.Allocator, object: std.json.Object
     if (std.mem.eql(u8, item_type, "thinking")) {
         return .{ .thinking = .{
             .thinking = try allocator.dupe(u8, try getRequiredString(object, "thinking")),
-            .signature = if (getOptionalString(object, "signature")) |signature| try allocator.dupe(u8, signature) else null,
+            .thinking_signature = if (getOptionalString(object, "thinkingSignature") orelse getOptionalString(object, "signature")) |signature| try allocator.dupe(u8, signature) else null,
+            .signature = if (getOptionalString(object, "thinkingSignature") orelse getOptionalString(object, "signature")) |signature| try allocator.dupe(u8, signature) else null,
             .redacted = getOptionalBool(object, "redacted") orelse false,
         } };
     }

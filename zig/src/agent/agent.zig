@@ -711,31 +711,41 @@ fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBl
 
 fn cloneContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
     return switch (block) {
-        .text => |text| ai.ContentBlock{ .text = .{ .text = try allocator.dupe(u8, text.text) } },
+        .text => |text| ai.ContentBlock{ .text = .{
+            .text = try allocator.dupe(u8, text.text),
+            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
         .image => |image| ai.ContentBlock{ .image = .{
             .data = try allocator.dupe(u8, image.data),
             .mime_type = try allocator.dupe(u8, image.mime_type),
         } },
         .thinking => |thinking| ai.ContentBlock{ .thinking = .{
             .thinking = try allocator.dupe(u8, thinking.thinking),
-            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .thinking_signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
+            .signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
             .redacted = thinking.redacted,
         } },
+        .tool_call => |tool_call| ai.ContentBlock{ .tool_call = try cloneToolCall(allocator, tool_call) },
     };
 }
 
 fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
     for (blocks) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .image => |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
             },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
             },
+            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
         }
     }
     allocator.free(blocks);
@@ -750,6 +760,7 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
             .id = try allocator.dupe(u8, tool_call.id),
             .name = try allocator.dupe(u8, tool_call.name),
             .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         };
     }
 
@@ -758,11 +769,25 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
 
 fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) void {
     for (tool_calls) |tool_call| {
-        allocator.free(tool_call.id);
-        allocator.free(tool_call.name);
-        deinitJsonValue(allocator, tool_call.arguments);
+        deinitToolCall(allocator, tool_call);
     }
     allocator.free(tool_calls);
+}
+
+fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
+    return .{
+        .id = try allocator.dupe(u8, tool_call.id),
+        .name = try allocator.dupe(u8, tool_call.name),
+        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+    };
+}
+
+fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
+    deinitJsonValue(allocator, tool_call.arguments);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {

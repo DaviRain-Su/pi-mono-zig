@@ -14,14 +14,24 @@ pub fn makeTextContent(allocator: std.mem.Allocator, text: []const u8) ![]const 
 pub fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
     for (blocks) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .image => |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
             },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
+            },
+            .tool_call => |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                if (tool_call.thought_signature) |signature| allocator.free(signature);
+                deinitJsonValue(allocator, tool_call.arguments);
             },
         }
     }

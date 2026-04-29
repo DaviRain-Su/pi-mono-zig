@@ -586,7 +586,7 @@ fn buildUserMessageValue(
                     inserted_image_placeholder = true;
                 }
             },
-            .thinking => {},
+            .thinking, .tool_call => {},
         }
     }
 
@@ -615,6 +615,7 @@ fn buildAssistantMessageValue(
                 try content.append(try buildThinkingChunkValue(allocator, thinking.thinking));
             },
             .image => {},
+            .tool_call => {},
         }
     }
 
@@ -628,7 +629,12 @@ fn buildAssistantMessageValue(
         content.deinit();
     }
 
-    if (assistant.tool_calls) |tool_calls| {
+    const tool_calls_source = if (types.hasInlineToolCalls(assistant)) blk: {
+        break :blk try types.collectAssistantToolCalls(allocator, assistant);
+    } else null;
+    defer if (tool_calls_source) |calls| allocator.free(calls);
+
+    if (tool_calls_source orelse assistant.tool_calls) |tool_calls| {
         if (tool_calls.len > 0) {
             var tool_calls_array = std.json.Array.init(allocator);
             errdefer tool_calls_array.deinit();
@@ -781,6 +787,7 @@ fn buildToolResultText(
                 try text.appendSlice(allocator, thinking.thinking);
                 has_text = true;
             },
+            .tool_call => {},
         }
     }
 
@@ -1010,15 +1017,25 @@ fn materializeContent(
 
 fn cloneContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) !types.ContentBlock {
     return switch (block) {
-        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text) } },
+        .text => |text| .{ .text = .{
+            .text = try allocator.dupe(u8, text.text),
+            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
         .image => |image| .{ .image = .{
             .data = try allocator.dupe(u8, image.data),
             .mime_type = try allocator.dupe(u8, image.mime_type),
         } },
         .thinking => |thinking| .{ .thinking = .{
             .thinking = try allocator.dupe(u8, thinking.thinking),
-            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .thinking_signature = if (types.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
+            .signature = if (types.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
             .redacted = thinking.redacted,
+        } },
+        .tool_call => |tool_call| .{ .tool_call = .{
+            .id = try allocator.dupe(u8, tool_call.id),
+            .name = try allocator.dupe(u8, tool_call.name),
+            .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         } },
     };
 }
@@ -1030,6 +1047,7 @@ fn cloneToolCallsSlice(allocator: std.mem.Allocator, tool_calls: []const types.T
             .id = try allocator.dupe(u8, tool_call.id),
             .name = try allocator.dupe(u8, tool_call.name),
             .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         };
     }
     return owned;

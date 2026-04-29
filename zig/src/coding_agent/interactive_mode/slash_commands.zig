@@ -1697,7 +1697,7 @@ pub fn assistantBlocksToTextAlloc(allocator: std.mem.Allocator, blocks: []const 
                 try writer.writer.writeAll(thinking.thinking);
                 wrote_any = true;
             },
-            .image => {},
+            .image, .tool_call => {},
         }
     }
 
@@ -1739,7 +1739,9 @@ pub fn messageToShareMarkdown(allocator: std.mem.Allocator, message: agent.Agent
         .assistant => |assistant_message| blk: {
             const text = try blocksToShareText(allocator, assistant_message.content);
             if (text.len > 0) break :blk text;
-            if (assistant_message.tool_calls) |calls| {
+            const calls = try ai.collectAssistantToolCalls(allocator, assistant_message);
+            defer allocator.free(calls);
+            if (calls.len > 0) {
                 var writer: std.Io.Writer.Allocating = .init(allocator);
                 defer writer.deinit();
                 for (calls, 0..) |tool_call, index| {
@@ -1785,6 +1787,13 @@ pub fn blocksToShareText(allocator: std.mem.Allocator, blocks: []const ai.Conten
             .image => |image| {
                 if (wrote_any) try writer.writer.writeAll("\n");
                 try writer.writer.print("![image](data:{s};base64,{s})", .{ image.mime_type, image.data });
+                wrote_any = true;
+            },
+            .tool_call => |tool_call| {
+                if (wrote_any) try writer.writer.writeAll("\n");
+                const args = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{ .whitespace = .indent_2 });
+                defer allocator.free(args);
+                try writer.writer.print("- `{s}` `{s}`\n```json\n{s}\n```", .{ tool_call.name, tool_call.id, args });
                 wrote_any = true;
             },
         }

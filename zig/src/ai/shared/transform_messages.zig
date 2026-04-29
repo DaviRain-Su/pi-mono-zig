@@ -123,7 +123,7 @@ fn cloneAssistantMessage(
         std.mem.eql(u8, assistant.model, model.id);
 
     return .{
-        .content = try cloneAssistantContent(allocator, assistant.content, is_same_model),
+        .content = try cloneAssistantContent(allocator, assistant.content, assistant, model, is_same_model, normalize_tool_call_id, normalized_tool_call_ids),
         .tool_calls = try cloneToolCalls(allocator, assistant, model, is_same_model, normalize_tool_call_id, normalized_tool_call_ids),
         .api = try allocator.dupe(u8, assistant.api),
         .provider = try allocator.dupe(u8, assistant.provider),
@@ -144,6 +144,29 @@ fn cloneToolCalls(
     normalize_tool_call_id: ?NormalizeToolCallIdFn,
     normalized_tool_call_ids: *std.StringHashMap([]const u8),
 ) !?[]types.ToolCall {
+    if (types.hasInlineToolCalls(assistant)) {
+        var tool_calls = std.ArrayList(types.ToolCall).empty;
+        errdefer {
+            for (tool_calls.items) |tool_call| freeToolCall(allocator, tool_call);
+            tool_calls.deinit(allocator);
+        }
+
+        for (assistant.content) |block| {
+            if (block != .tool_call) continue;
+            try tool_calls.append(allocator, try cloneToolCallWithTransform(
+                allocator,
+                block.tool_call,
+                assistant,
+                model,
+                is_same_model,
+                normalize_tool_call_id,
+                normalized_tool_call_ids,
+            ));
+        }
+
+        return try tool_calls.toOwnedSlice(allocator);
+    }
+
     const source_tool_calls = assistant.tool_calls orelse return null;
     var tool_calls = std.ArrayList(types.ToolCall).empty;
     errdefer {
@@ -152,30 +175,54 @@ fn cloneToolCalls(
     }
 
     for (source_tool_calls) |tool_call| {
-        var id: []const u8 = try allocator.dupe(u8, tool_call.id);
-        errdefer allocator.free(id);
-
-        if (!is_same_model) {
-            if (normalize_tool_call_id) |normalizer| {
-                const normalized_id = try normalizer(allocator, tool_call.id, model, assistant);
-                if (!std.mem.eql(u8, normalized_id, tool_call.id)) {
-                    allocator.free(id);
-                    id = normalized_id;
-                    try normalized_tool_call_ids.put(try allocator.dupe(u8, tool_call.id), try allocator.dupe(u8, normalized_id));
-                } else {
-                    allocator.free(normalized_id);
-                }
-            }
-        }
-
-        try tool_calls.append(allocator, .{
-            .id = id,
-            .name = try allocator.dupe(u8, tool_call.name),
-            .arguments = try cloneJsonValue(allocator, tool_call.arguments),
-        });
+        try tool_calls.append(allocator, try cloneToolCallWithTransform(
+            allocator,
+            tool_call,
+            assistant,
+            model,
+            is_same_model,
+            normalize_tool_call_id,
+            normalized_tool_call_ids,
+        ));
     }
 
     return try tool_calls.toOwnedSlice(allocator);
+}
+
+fn cloneToolCallWithTransform(
+    allocator: std.mem.Allocator,
+    tool_call: types.ToolCall,
+    assistant: types.AssistantMessage,
+    model: types.Model,
+    is_same_model: bool,
+    normalize_tool_call_id: ?NormalizeToolCallIdFn,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
+) !types.ToolCall {
+    var id: []const u8 = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(id);
+
+    if (!is_same_model) {
+        if (normalized_tool_call_ids.get(tool_call.id)) |existing_id| {
+            allocator.free(id);
+            id = try allocator.dupe(u8, existing_id);
+        } else if (normalize_tool_call_id) |normalizer| {
+            const normalized_id = try normalizer(allocator, tool_call.id, model, assistant);
+            if (!std.mem.eql(u8, normalized_id, tool_call.id)) {
+                allocator.free(id);
+                id = normalized_id;
+                try normalized_tool_call_ids.put(try allocator.dupe(u8, tool_call.id), try allocator.dupe(u8, normalized_id));
+            } else {
+                allocator.free(normalized_id);
+            }
+        }
+    }
+
+    return .{
+        .id = id,
+        .name = try allocator.dupe(u8, tool_call.name),
+        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .thought_signature = if (is_same_model) if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null else null,
+    };
 }
 
 fn cloneUserLikeContent(
@@ -202,15 +249,24 @@ fn cloneUserLikeContent(
                 previous_was_placeholder = true;
             },
             .text => |text| {
-                try blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, text.text) } });
+                try blocks.append(allocator, .{ .text = .{
+                    .text = try allocator.dupe(u8, text.text),
+                    .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+                } });
                 previous_was_placeholder = std.mem.eql(u8, text.text, placeholder);
             },
             .thinking => |thinking| {
+                const signature = types.thinkingSignature(thinking);
                 try blocks.append(allocator, .{ .thinking = .{
                     .thinking = try allocator.dupe(u8, thinking.thinking),
-                    .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+                    .thinking_signature = if (signature) |value| try allocator.dupe(u8, value) else null,
+                    .signature = if (signature) |value| try allocator.dupe(u8, value) else null,
                     .redacted = thinking.redacted,
                 } });
+                previous_was_placeholder = false;
+            },
+            .tool_call => |tool_call| {
+                try blocks.append(allocator, .{ .tool_call = try cloneToolCall(allocator, tool_call) });
                 previous_was_placeholder = false;
             },
         }
@@ -222,7 +278,11 @@ fn cloneUserLikeContent(
 fn cloneAssistantContent(
     allocator: std.mem.Allocator,
     content: []const types.ContentBlock,
+    assistant: types.AssistantMessage,
+    model: types.Model,
     is_same_model: bool,
+    normalize_tool_call_id: ?NormalizeToolCallIdFn,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
 ) ![]types.ContentBlock {
     var blocks = std.ArrayList(types.ContentBlock).empty;
     errdefer {
@@ -234,6 +294,7 @@ fn cloneAssistantContent(
         switch (block) {
             .thinking => |thinking| {
                 if (thinking.redacted and !is_same_model) continue;
+                const signature = types.thinkingSignature(thinking);
                 if (!is_same_model) {
                     const trimmed = std.mem.trim(u8, thinking.thinking, " \t\r\n");
                     if (trimmed.len == 0) continue;
@@ -241,15 +302,33 @@ fn cloneAssistantContent(
                     continue;
                 }
 
-                if (thinking.signature != null or std.mem.trim(u8, thinking.thinking, " \t\r\n").len > 0) {
+                if (signature != null or std.mem.trim(u8, thinking.thinking, " \t\r\n").len > 0) {
                     try blocks.append(allocator, .{ .thinking = .{
                         .thinking = try allocator.dupe(u8, thinking.thinking),
-                        .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+                        .thinking_signature = if (signature) |value| try allocator.dupe(u8, value) else null,
+                        .signature = if (signature) |value| try allocator.dupe(u8, value) else null,
                         .redacted = thinking.redacted,
                     } });
                 }
             },
-            else => try blocks.append(allocator, try cloneContentBlock(allocator, block)),
+            .text => |text| {
+                try blocks.append(allocator, .{ .text = .{
+                    .text = try allocator.dupe(u8, text.text),
+                    .text_signature = if (is_same_model) if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null else null,
+                } });
+            },
+            .tool_call => |tool_call| {
+                try blocks.append(allocator, .{ .tool_call = try cloneToolCallWithTransform(
+                    allocator,
+                    tool_call,
+                    assistant,
+                    model,
+                    is_same_model,
+                    normalize_tool_call_id,
+                    normalized_tool_call_ids,
+                ) });
+            },
+            .image => try blocks.append(allocator, try cloneContentBlock(allocator, block)),
         }
     }
 
@@ -269,16 +348,33 @@ fn cloneContentBlocks(allocator: std.mem.Allocator, content: []const types.Conte
 
 fn cloneContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) !types.ContentBlock {
     return switch (block) {
-        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text) } },
+        .text => |text| .{ .text = .{
+            .text = try allocator.dupe(u8, text.text),
+            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
         .image => |image| .{ .image = .{
             .data = try allocator.dupe(u8, image.data),
             .mime_type = try allocator.dupe(u8, image.mime_type),
         } },
-        .thinking => |thinking| .{ .thinking = .{
+        .thinking => |thinking| blk: {
+            const signature = types.thinkingSignature(thinking);
+            break :blk .{ .thinking = .{
             .thinking = try allocator.dupe(u8, thinking.thinking),
-            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .thinking_signature = if (signature) |value| try allocator.dupe(u8, value) else null,
+            .signature = if (signature) |value| try allocator.dupe(u8, value) else null,
             .redacted = thinking.redacted,
-        } },
+        } };
+        },
+        .tool_call => |tool_call| .{ .tool_call = try cloneToolCall(allocator, tool_call) },
+    };
+}
+
+fn cloneToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) !types.ToolCall {
+    return .{
+        .id = try allocator.dupe(u8, tool_call.id),
+        .name = try allocator.dupe(u8, tool_call.name),
+        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
     };
 }
 
@@ -399,21 +495,27 @@ fn freeContentBlocks(allocator: std.mem.Allocator, blocks: []const types.Content
 
 fn freeContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) void {
     switch (block) {
-        .text => |text| allocator.free(text.text),
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |signature| allocator.free(signature);
+        },
         .image => |image| {
             allocator.free(image.data);
             allocator.free(image.mime_type);
         },
         .thinking => |thinking| {
             allocator.free(thinking.thinking);
+            if (thinking.thinking_signature) |signature| allocator.free(signature);
             if (thinking.signature) |signature| allocator.free(signature);
         },
+        .tool_call => |tool_call| freeToolCall(allocator, tool_call),
     }
 }
 
 fn freeToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
     freeJsonValue(allocator, tool_call.arguments);
 }
 
@@ -596,4 +698,138 @@ test "transformMessages inserts synthetic tool results for orphaned calls and dr
     try std.testing.expect(transformed[1].tool_result.is_error);
     try std.testing.expectEqualStrings(SYNTHETIC_TOOL_RESULT_TEXT, transformed[1].tool_result.content[0].text.text);
     try std.testing.expect(transformed[2] == .user);
+}
+
+test "transformMessages preserves ordered inline content and signatures for same model" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5",
+        .name = "GPT-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iterator = arguments.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = arguments;
+        owned.deinit(allocator);
+    }
+    try arguments.put(allocator, try allocator.dupe(u8, "city"), .{ .string = "Berlin" });
+
+    const content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "visible", .text_signature = "text-sig" } },
+        .{ .thinking = .{ .thinking = "", .thinking_signature = "thinking-sig" } },
+        .{ .tool_call = .{
+            .id = "call_1",
+            .name = "weather",
+            .arguments = .{ .object = arguments },
+            .thought_signature = "thought-sig",
+        } },
+        .{ .text = .{ .text = "after" } },
+    };
+
+    const assistant = types.AssistantMessage{
+        .content = &content,
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 10,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{.{ .assistant = assistant }}, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 2), transformed.len);
+    try std.testing.expectEqual(@as(usize, 4), transformed[0].assistant.content.len);
+    try std.testing.expectEqualStrings("text-sig", transformed[0].assistant.content[0].text.text_signature.?);
+    try std.testing.expectEqualStrings("thinking-sig", types.thinkingSignature(transformed[0].assistant.content[1].thinking).?);
+    try std.testing.expectEqualStrings("call_1", transformed[0].assistant.content[2].tool_call.id);
+    try std.testing.expectEqualStrings("thought-sig", transformed[0].assistant.content[2].tool_call.thought_signature.?);
+    try std.testing.expectEqual(@as(usize, 1), transformed[0].assistant.tool_calls.?.len);
+    try std.testing.expectEqualStrings("call_1", transformed[0].assistant.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("call_1", transformed[1].tool_result.tool_call_id);
+    try std.testing.expect(transformed[1].tool_result.is_error);
+}
+
+test "transformMessages strips cross model signatures and normalizes inline tool calls/results" {
+    const allocator = std.testing.allocator;
+    const target_model = types.Model{
+        .id = "claude-sonnet",
+        .name = "Claude Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iterator = arguments.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = arguments;
+        owned.deinit(allocator);
+    }
+    try arguments.put(allocator, try allocator.dupe(u8, "query"), .{ .string = "pi" });
+
+    const content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "signed", .text_signature = "text-sig" } },
+        .{ .thinking = .{ .thinking = "convert to text", .thinking_signature = "thinking-sig" } },
+        .{ .thinking = .{ .thinking = "", .thinking_signature = "empty-signed" } },
+        .{ .thinking = .{ .thinking = "redacted", .thinking_signature = "redacted-sig", .redacted = true } },
+        .{ .tool_call = .{
+            .id = "tool-call-1",
+            .name = "lookup",
+            .arguments = .{ .object = arguments },
+            .thought_signature = "thought-sig",
+        } },
+    };
+
+    const assistant = types.AssistantMessage{
+        .content = &content,
+        .tool_calls = &[_]types.ToolCall{.{
+            .id = "stale-legacy",
+            .name = "stale",
+            .arguments = .null,
+            .thought_signature = "stale-sig",
+        }},
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 11,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .assistant = assistant },
+        .{ .tool_result = .{
+            .tool_call_id = "tool-call-1",
+            .tool_name = "lookup",
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "ok" } }},
+            .timestamp = 12,
+        } },
+    }, target_model, normalizeToolCallIdForTest);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 2), transformed.len);
+    try std.testing.expectEqual(@as(usize, 3), transformed[0].assistant.content.len);
+    try std.testing.expectEqualStrings("signed", transformed[0].assistant.content[0].text.text);
+    try std.testing.expect(transformed[0].assistant.content[0].text.text_signature == null);
+    try std.testing.expectEqualStrings("convert to text", transformed[0].assistant.content[1].text.text);
+    try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[0].assistant.content[2].tool_call.id);
+    try std.testing.expect(transformed[0].assistant.content[2].tool_call.thought_signature == null);
+    try std.testing.expectEqual(@as(usize, 1), transformed[0].assistant.tool_calls.?.len);
+    try std.testing.expectEqualStrings("lookup", transformed[0].assistant.tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[0].assistant.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[1].tool_result.tool_call_id);
 }

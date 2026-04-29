@@ -988,7 +988,7 @@ fn buildUserMessage(allocator: std.mem.Allocator, model: types.Model, user_msg: 
                     try part.put(allocator, try allocator.dupe(u8, "image_url"), std.json.Value{ .object = image_url });
                     try content_parts.append(std.json.Value{ .object = part });
                 },
-                .thinking => continue, // User messages shouldn't have thinking blocks
+                .thinking, .tool_call => continue, // User messages shouldn't have thinking/tool-call blocks
             }
         }
 
@@ -1018,7 +1018,7 @@ fn buildUserMessage(allocator: std.mem.Allocator, model: types.Model, user_msg: 
                         try text_parts.appendSlice(allocator, "(image omitted: model does not support images)");
                     }
                 },
-                .thinking => continue,
+                .thinking, .tool_call => continue,
             }
         }
 
@@ -1050,18 +1050,19 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
                 try text_parts.appendSlice(allocator, text.text);
             },
             .thinking => |thinking| {
+                const signature = types.thinkingSignature(thinking);
                 const trimmed = std.mem.trim(u8, thinking.thinking, " \t\r\n");
-                if (trimmed.len == 0 and thinking.signature == null) continue;
+                if (trimmed.len == 0 and signature == null) continue;
                 if (compat.requires_thinking_as_text) {
                     if (trimmed.len == 0) continue;
                     if (thinking_parts.items.len > 0) {
                         try thinking_parts.appendSlice(allocator, "\n\n");
                     }
                     try thinking_parts.appendSlice(allocator, thinking.thinking);
-                } else if (thinking.signature) |signature| {
+                } else if (signature) |value| {
                     if (trimmed.len > 0) {
-                        if (reasoning_field_name == null) reasoning_field_name = signature;
-                        if (reasoning_field_name != null and std.mem.eql(u8, reasoning_field_name.?, signature)) {
+                        if (reasoning_field_name == null) reasoning_field_name = value;
+                        if (reasoning_field_name != null and std.mem.eql(u8, reasoning_field_name.?, value)) {
                             if (thinking_parts.items.len > 0) {
                                 try thinking_parts.appendSlice(allocator, "\n");
                             }
@@ -1070,7 +1071,7 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
                     }
                 }
             },
-            .image => continue,
+            .image, .tool_call => continue,
         }
     }
 
@@ -1100,7 +1101,13 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
     }
 
     // Add tool_calls if present
-    if (assistant_msg.tool_calls) |tool_calls| {
+    const tool_calls_source = if (types.hasInlineToolCalls(assistant_msg))
+        try types.collectAssistantToolCalls(allocator, assistant_msg)
+    else
+        null;
+    defer if (tool_calls_source) |calls| allocator.free(calls);
+
+    if (tool_calls_source orelse assistant_msg.tool_calls) |tool_calls| {
         var tc_array = std.json.Array.init(allocator);
         errdefer tc_array.deinit();
         for (tool_calls) |tc| {
@@ -1142,7 +1149,7 @@ fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool
             .image => {
                 has_images = true;
             },
-            .thinking => continue,
+            .thinking, .tool_call => continue,
         }
     }
 
