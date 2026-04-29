@@ -3,6 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+for name in "${!PI_M6_EXTENSION_HOST_@}"; do
+	unset "$name"
+done
+
 echo "TS-RPC parity: checking TypeScript fixtures are current and read-only"
 npx tsx test/generate-ts-rpc-fixtures.ts --check
 
@@ -73,12 +77,25 @@ SCENARIOS = [
 	),
 ]
 
+M6_HOST_ENV_PREFIX = "PI_M6_EXTENSION_HOST_"
+
+def clean_child_env(env_extra=None):
+	env = {
+		key: value
+		for key, value in os.environ.items()
+		if not key.startswith(M6_HOST_ENV_PREFIX)
+	}
+	if env_extra:
+		env.update(env_extra)
+	return env
+
 def emit_ts_fixture(name):
 	proc = subprocess.run(
 		["npx", "tsx", "test/generate-ts-rpc-fixtures.ts", f"--emit-fixture={name}"],
 		stdout=subprocess.PIPE,
 		stderr=subprocess.PIPE,
 		text=True,
+		env=clean_child_env(),
 		check=False,
 	)
 	if proc.returncode != 0:
@@ -92,8 +109,7 @@ for name, env_extra, settle_seconds, label in SCENARIOS:
 	actual_path = Path(f"/tmp/pi-ts-rpc-{name}-actual.jsonl")
 	input_bytes = input_path.read_text()
 	ts_stdout = emit_ts_fixture(f"{name}.jsonl")
-	env = os.environ.copy()
-	env.update(env_extra)
+	env = clean_child_env(env_extra)
 	proc = subprocess.Popen(
 		BASE_ARGS,
 		stdin=subprocess.PIPE,
@@ -136,6 +152,7 @@ ts_extension_response = subprocess.run(
 	stdout=subprocess.PIPE,
 	stderr=subprocess.PIPE,
 	check=False,
+	env=clean_child_env(),
 )
 if ts_extension_response.returncode != 0:
 	print(ts_extension_response.stderr, file=sys.stderr)
@@ -148,6 +165,7 @@ proc = subprocess.run(
 	stdout=subprocess.PIPE,
 	stderr=subprocess.PIPE,
 	check=False,
+	env=clean_child_env(),
 )
 if proc.returncode != 0:
 	print(proc.stderr, file=sys.stderr)
@@ -253,11 +271,10 @@ ts_extension_ui_stdout = run_live_extension_ui(
 		"test/generate-ts-rpc-fixtures.ts",
 		"--runtime-child=extension-ui",
 	],
-	os.environ.copy(),
+	clean_child_env(),
 	"extension UI TypeScript RPC",
 )
-zig_extension_ui_env = os.environ.copy()
-zig_extension_ui_env["PI_TS_RPC_EXTENSION_UI_PARITY_SCENARIO"] = "1"
+zig_extension_ui_env = clean_child_env({"PI_TS_RPC_EXTENSION_UI_PARITY_SCENARIO": "1"})
 zig_extension_ui_stdout = run_live_extension_ui(
 	[
 		"./zig-out/bin/pi",
@@ -316,9 +333,29 @@ def assert_m6_capture(path, marker):
 	if len(completions) != 1:
 		print(f"M6 host capture completion evidence invalid: {completions}", file=sys.stderr)
 		sys.exit(1)
-	response_ids = [record.get("id") for record in records if record.get("event") == "response"]
-	if response_ids != ["ui_confirm", "ui_select", "ui_input", "ui_editor"]:
-		print(f"M6 host capture response order invalid: {response_ids}", file=sys.stderr)
+	response_records = [
+		{"event": record.get("event"), "id": record.get("id"), "payload": record.get("payload")}
+		for record in records
+		if record.get("event") == "response"
+	]
+	expected_responses = [
+		{"event": "response", "id": "ui_confirm", "payload": {"confirmed": True}},
+		{"event": "response", "id": "ui_select", "payload": {"value": "option-b"}},
+		{"event": "response", "id": "ui_input", "payload": {"cancelled": True}},
+		{"event": "response", "id": "ui_editor", "payload": {"value": "edited text"}},
+	]
+	if response_records != expected_responses:
+		print(f"M6 host capture response payload evidence invalid: {response_records}", file=sys.stderr)
+		sys.exit(1)
+	completion_result = completions[0].get("result")
+	expected_completion_result = {
+		"select": "option-b",
+		"confirmed": True,
+		"input": "cancelled",
+		"editor": "edited text",
+	}
+	if completion_result != expected_completion_result:
+		print(f"M6 host capture completion result invalid: {completion_result}", file=sys.stderr)
 		sys.exit(1)
 
 def run_m6_configured(label, marker, expected_stdout, response_input):
@@ -330,16 +367,13 @@ def run_m6_configured(label, marker, expected_stdout, response_input):
 		capture_path.unlink()
 	except FileNotFoundError:
 		pass
-	env = os.environ.copy()
-	env.update(
-		{
-			"PI_M6_EXTENSION_HOST_ENTRY": "test/m6-extension-host-fixture.mjs",
-			"PI_M6_EXTENSION_HOST_RUNTIME": "bun",
-			"PI_M6_EXTENSION_HOST_FIXTURE": "m6-extension-host",
-			"PI_M6_EXTENSION_HOST_MARKER": marker,
-			"PI_M6_EXTENSION_HOST_CAPTURE": str(capture_path),
-		}
-	)
+	env = clean_child_env({
+		"PI_M6_EXTENSION_HOST_ENTRY": "test/m6-extension-host-fixture.mjs",
+		"PI_M6_EXTENSION_HOST_RUNTIME": "bun",
+		"PI_M6_EXTENSION_HOST_FIXTURE": "m6-extension-host",
+		"PI_M6_EXTENSION_HOST_MARKER": marker,
+		"PI_M6_EXTENSION_HOST_CAPTURE": str(capture_path),
+	})
 	proc = subprocess.Popen(
 		BASE_ARGS,
 		stdin=subprocess.PIPE,
@@ -408,9 +442,7 @@ def run_m6_without_host(label, env_extra, response_input, marker):
 		capture_path.unlink()
 	except FileNotFoundError:
 		pass
-	env = os.environ.copy()
-	env.update(env_extra)
-	env["PI_M6_EXTENSION_HOST_CAPTURE"] = str(capture_path)
+	env = clean_child_env({**env_extra, "PI_M6_EXTENSION_HOST_CAPTURE": str(capture_path)})
 	proc = subprocess.run(
 		BASE_ARGS,
 		input=response_input,
@@ -490,10 +522,23 @@ zig build test-coding-agent -- --test-filter "TS RPC extension UI request writer
 
 echo "TS-RPC parity: direct bash exact byte diff"
 python3 <<'PY'
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+M6_HOST_ENV_PREFIX = "PI_M6_EXTENSION_HOST_"
+
+def clean_child_env(env_extra=None):
+	env = {
+		key: value
+		for key, value in os.environ.items()
+		if not key.startswith(M6_HOST_ENV_PREFIX)
+	}
+	if env_extra:
+		env.update(env_extra)
+	return env
 
 start_marker = Path("/tmp/pi-ts-rpc-bash-control-start")
 live_marker = Path("/tmp/pi-ts-rpc-bash-control-live")
@@ -518,6 +563,7 @@ proc = subprocess.Popen(
 	stdout=subprocess.PIPE,
 	stderr=subprocess.PIPE,
 	text=True,
+	env=clean_child_env(),
 )
 assert proc.stdin is not None
 for line in input_lines[:3]:
@@ -564,6 +610,7 @@ ts_expected = subprocess.run(
 	stderr=subprocess.PIPE,
 	text=True,
 	check=False,
+	env=clean_child_env(),
 )
 if ts_expected.returncode != 0:
 	print(ts_expected.stderr, file=sys.stderr)
