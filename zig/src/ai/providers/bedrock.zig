@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const provider_error = @import("../shared/provider_error.zig");
 
 const SERVICE_NAME = "bedrock";
 const SHA256_HEX_LEN = std.crypto.hash.sha2.Sha256.digest_length * 2;
@@ -144,24 +145,9 @@ pub const BedrockProvider = struct {
         }
 
         if (response.status != 200) {
-            const detail = extractErrorMessage(response.body);
-            const error_message = try std.fmt.allocPrint(allocator, "Bedrock API error ({d}): {s}", .{ response.status, detail });
-            const message = types.AssistantMessage{
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = error_message,
-                .timestamp = 0,
-            };
-            stream_instance.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = message,
-            });
-            stream_instance.end(message);
+            const response_body = try response.readAll(allocator);
+            defer allocator.free(response_body);
+            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
         }
 
@@ -1348,10 +1334,6 @@ fn authErrorMessage(err: anyerror) []const u8 {
         error.MissingAwsSecretAccessKey => "Bedrock requires AWS_SECRET_ACCESS_KEY.",
         else => "Bedrock authentication failed.",
     };
-}
-
-fn extractErrorMessage(body: []const u8) []const u8 {
-    return if (body.len == 0) "Bedrock request failed" else body;
 }
 
 fn trimTrailingSlash(value: []const u8) []const u8 {

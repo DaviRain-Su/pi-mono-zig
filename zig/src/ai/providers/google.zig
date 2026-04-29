@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const provider_error = @import("../shared/provider_error.zig");
 
 pub const GoogleProvider = struct {
     pub const api = "google-generative-ai";
@@ -74,23 +75,9 @@ pub const GoogleProvider = struct {
         }
 
         if (response.status != 200) {
-            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response.body });
-            const message = types.AssistantMessage{
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = error_message,
-                .timestamp = 0,
-            };
-            stream_instance.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = message,
-            });
-            stream_instance.end(message);
+            const response_body = try response.readAll(allocator);
+            defer allocator.free(response_body);
+            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
         }
 
@@ -1083,4 +1070,54 @@ test "parse stream emits thinking and tool call events" {
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
     try std.testing.expectEqual(@as(u32, 18), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.output);
+}
+
+test "stream HTTP status error is terminal sanitized event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body = "{\"error\":{\"message\":\"permission denied\",\"x-goog-api-key\":\"AIza-google-secret\",\"request_id\":\"req_google_random_123456\"},\"trace\":\"/Users/alice/pi/google.zig\"}";
+    var server = try provider_error.TestStatusServer.init(io, 403, "Forbidden", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try GoogleProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 403: "));
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "permission denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "AIza-google-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_google_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("google-generative-ai", result.api);
 }

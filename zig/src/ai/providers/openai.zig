@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const provider_error = @import("../shared/provider_error.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 
 pub const OpenAIProvider = struct {
@@ -51,17 +52,9 @@ pub const OpenAIProvider = struct {
         defer streaming.deinit();
 
         if (streaming.status != 200) {
-            event_stream_instance.end(.{
-                .role = "assistant",
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = try std.fmt.allocPrint(allocator, "HTTP {d}", .{streaming.status}),
-                .timestamp = 0,
-            });
+            const response_body = try streaming.readAll(allocator);
+            defer allocator.free(response_body);
+            try provider_error.pushHttpStatusError(allocator, &event_stream_instance, model, streaming.status, response_body);
             return event_stream_instance;
         }
 
@@ -1595,6 +1588,72 @@ test "stream respects pre-aborted signal" {
             .signal = &aborted,
         }),
     );
+}
+
+test "stream emits single terminal sanitized error for HTTP status" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "{\"error\":\"quota exceeded\",\"Authorization\":\"Bearer sk-live-secret\",\"request_id\":\"req_random_123456789\",\"trace\":\"/Users/alice/pi/trace.zig:1\"}");
+    try body.appendNTimes(allocator, 'x', 900);
+
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        429,
+        "Too Many Requests",
+        "x-request-id: req_header_secret\r\n",
+        body.items,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream_instance = try OpenAIProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream_instance.deinit();
+
+    const event = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 429: "));
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "quota exceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "[truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-live-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("openai-completions", event.message.?.api);
+    try std.testing.expectEqualStrings("openai", event.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-4", event.message.?.model);
+    try std.testing.expect(stream_instance.next() == null);
+
+    const result = stream_instance.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(event.message.?.stop_reason, result.stop_reason);
+    try std.testing.expectEqual(event.message.?.usage.total_tokens, result.usage.total_tokens);
 }
 
 test "parseSseStream with tool calls" {
