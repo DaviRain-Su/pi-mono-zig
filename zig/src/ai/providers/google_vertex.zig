@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const event_stream = @import("../event_stream.zig");
+const provider_error = @import("../shared/provider_error.zig");
 const asn1 = std.crypto.codecs.asn1;
 
 const DEFAULT_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
@@ -169,24 +170,9 @@ pub const GoogleVertexProvider = struct {
         }
 
         if (response.status != 200) {
-            const detail = extractErrorMessage(response.body);
-            const error_message = try std.fmt.allocPrint(allocator, "Vertex AI API error ({d}): {s}", .{ response.status, detail });
-            const message = types.AssistantMessage{
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = error_message,
-                .timestamp = 0,
-            };
-            stream_instance.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = message,
-            });
-            stream_instance.end(message);
+            const response_body = try response.readAll(allocator);
+            defer allocator.free(response_body);
+            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
         }
 
@@ -1755,4 +1741,62 @@ test "parse stream emits Vertex thinking, tool, and text events" {
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
     try std.testing.expectEqualStrings("resp-vertex", done.message.?.response_id.?);
+}
+
+test "stream HTTP status error is terminal sanitized event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "{\"error\":{\"message\":\"vertex denied\",\"x-goog-api-key\":\"AIza-vertex-secret\",\"request_id\":\"req_vertex_random_123456\"},\"trace\":\"/Users/alice/pi/google_vertex.zig\"}");
+    try body.appendNTimes(allocator, 'x', 900);
+
+    var server = try provider_error.TestStatusServer.init(io, 403, "Forbidden", "", body.items);
+    defer server.deinit();
+    try server.start();
+
+    const server_url = try server.url(allocator);
+    defer allocator.free(server_url);
+    const base_url = try std.fmt.allocPrint(allocator, "{s}/v1/projects/test-project/locations/us-central1/publishers/google", .{server_url});
+    defer allocator.free(base_url);
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Vertex Gemini 2.5 Pro",
+        .api = "google-vertex",
+        .provider = "google-vertex",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try GoogleVertexProvider.stream(allocator, io, model, context, .{ .api_key = "vertex-api-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 403: "));
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "vertex denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "[truncated]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "AIza-vertex-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_vertex_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("google-vertex", result.api);
 }
