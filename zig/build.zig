@@ -89,6 +89,27 @@ pub fn build(b: *std.Build) void {
     ts_rpc_parity_step.dependOn(external_tool_check_step);
     ts_rpc_parity_step.dependOn(&ts_rpc_parity.step);
 
+    const openai_chat_parity_exe_mod = b.createModule(.{
+        .root_source_file = b.path("test/openai_chat_parity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    openai_chat_parity_exe_mod.addImport("ai", ai_mod);
+    const openai_chat_parity_exe = b.addExecutable(.{
+        .name = "openai-chat-parity",
+        .root_module = openai_chat_parity_exe_mod,
+    });
+    const run_openai_chat_parity = b.addRunArtifact(openai_chat_parity_exe);
+    const run_openai_chat_parity_step = b.step("run-openai-chat-parity", "Run Zig OpenAI Chat fixture parity comparator");
+    run_openai_chat_parity_step.dependOn(external_tool_check_step);
+    run_openai_chat_parity_step.dependOn(&run_openai_chat_parity.step);
+
+    const openai_chat_parity = b.addSystemCommand(&.{"bash"});
+    openai_chat_parity.addFileArg(b.path("test/openai-chat-parity.sh"));
+    openai_chat_parity.step.dependOn(external_tool_check_step);
+    const openai_chat_parity_step = b.step("test-openai-chat-parity", "Run OpenAI Chat TypeScript-vs-Zig semantic request parity harness");
+    openai_chat_parity_step.dependOn(&openai_chat_parity.step);
+
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
     });
