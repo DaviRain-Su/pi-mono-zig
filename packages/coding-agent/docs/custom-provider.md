@@ -41,6 +41,7 @@ export default function (pi: ExtensionAPI) {
 
   // Register new provider with models
   pi.registerProvider("my-provider", {
+    name: "My Provider",
     baseUrl: "https://api.example.com",
     apiKey: "MY_API_KEY",
     api: "openai-completions",
@@ -544,6 +545,9 @@ Run tests with your provider/model pairs to verify compatibility.
 
 ```typescript
 interface ProviderConfig {
+  /** Display name for the provider in UI such as /login. */
+  name?: string;
+
   /** API endpoint URL. Required when defining models. */
   baseUrl?: string;
 
