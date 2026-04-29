@@ -255,8 +255,10 @@ fn buildMessagesValue(allocator: std.mem.Allocator, messages: []const types.Mess
         switch (messages[index]) {
             .user => |user| try array.append(try buildUserMessageValue(allocator, user)),
             .assistant => |assistant| {
-                if (try buildAssistantMessageValue(allocator, assistant)) |message_value| {
-                    try array.append(message_value);
+                if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                    if (try buildAssistantMessageValue(allocator, assistant)) |message_value| {
+                        try array.append(message_value);
+                    }
                 }
             },
             .tool_result => {
@@ -1525,6 +1527,57 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
         },
         else => {},
     }
+}
+
+test "VAL-MSG-010 Bedrock skips failed assistants" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Bedrock",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+    const first_user = [_]types.ContentBlock{.{ .text = .{ .text = "hello" } }};
+    const failed_content = [_]types.ContentBlock{
+        .{ .thinking = .{ .thinking = "partial thinking", .thinking_signature = "sig" } },
+        .{ .tool_call = .{ .id = "failed-tool", .name = "lookup", .arguments = .null } },
+    };
+    const final_user = [_]types.ContentBlock{.{ .text = .{ .text = "continue" } }};
+
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{
+        .{ .user = .{ .content = &first_user, .timestamp = 1 } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "bedrock-converse-stream",
+            .provider = "amazon-bedrock",
+            .model = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            .usage = types.Usage.init(),
+            .stop_reason = .error_reason,
+            .error_message = "failed",
+            .timestamp = 2,
+        } },
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "bedrock-converse-stream",
+            .provider = "amazon-bedrock",
+            .model = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            .usage = types.Usage.init(),
+            .stop_reason = .aborted,
+            .error_message = "aborted",
+            .timestamp = 3,
+        } },
+        .{ .user = .{ .content = &final_user, .timestamp = 4 } },
+    } }, null);
+    defer freeJsonValue(allocator, payload);
+
+    const messages = payload.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("user", messages.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages.items[1].object.get("role").?.string);
 }
 
 test "buildRequestPayload includes bedrock system messages inference config and tools" {

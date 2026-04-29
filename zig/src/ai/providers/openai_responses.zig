@@ -742,6 +742,7 @@ fn findContinuationAnchor(context: types.Context, model: types.Model) ?Continuat
         const message = context.messages[index];
         switch (message) {
             .assistant => |assistant| {
+                if (!types.shouldReplayAssistantInProviderContext(assistant)) continue;
                 if (assistant.response_id == null) continue;
                 if (!std.mem.eql(u8, assistant.provider, model.provider)) continue;
                 if (!std.mem.eql(u8, assistant.api, model.api)) continue;
@@ -762,7 +763,7 @@ fn findContinuationAnchor(context: types.Context, model: types.Model) ?Continuat
 fn continuationMessagesAreCompatible(messages: []const types.Message) bool {
     if (messages.len == 0) return false;
     for (messages) |message| {
-        if (message == .assistant) return false;
+        if (message == .assistant and types.shouldReplayAssistantInProviderContext(message.assistant)) return false;
     }
     return true;
 }
@@ -787,7 +788,11 @@ fn appendInputItemsForMessage(
 ) !void {
     switch (message) {
         .user => |user| try input.append(try buildUserInputItem(allocator, model, user)),
-        .assistant => |assistant| try appendAssistantInputItems(allocator, input, assistant, message_index),
+        .assistant => |assistant| {
+            if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                try appendAssistantInputItems(allocator, input, assistant, message_index);
+            }
+        },
         .tool_result => |tool_result| try input.append(try buildToolResultInputItem(allocator, model, tool_result)),
     }
 }
@@ -1626,6 +1631,77 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("openai-responses", result.api);
+}
+
+test "VAL-MSG-010 OpenAI Responses skips failed assistants and anchors on valid responses" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const ok_content = [_]types.ContentBlock{.{ .text = .{ .text = "First answer" } }};
+    const failed_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "partial signed output", .text_signature = "failed-text-sig" } },
+        .{ .tool_call = .{ .id = "failed-call", .name = "lookup", .arguments = .null, .thought_signature = "failed-tool-sig" } },
+    };
+    const user_after_anchor = [_]types.ContentBlock{.{ .text = .{ .text = "After anchor" } }};
+    const final_user = [_]types.ContentBlock{.{ .text = .{ .text = "Continue" } }};
+    const context = types.Context{
+        .system_prompt = "System prompt should be omitted when previous_response_id is used.",
+        .messages = &[_]types.Message{
+            .{ .assistant = .{
+                .content = &ok_content,
+                .api = "openai-responses",
+                .provider = "openai",
+                .model = "gpt-5-mini",
+                .response_id = "resp_ok",
+                .usage = types.Usage.init(),
+                .stop_reason = .stop,
+                .timestamp = 1,
+            } },
+            .{ .user = .{ .content = &user_after_anchor, .timestamp = 2 } },
+            .{ .assistant = .{
+                .content = &failed_content,
+                .api = "openai-responses",
+                .provider = "openai",
+                .model = "gpt-5-mini",
+                .response_id = "resp_failed",
+                .usage = types.Usage.init(),
+                .stop_reason = .error_reason,
+                .error_message = "provider failed",
+                .timestamp = 3,
+            } },
+            .{ .assistant = .{
+                .content = &failed_content,
+                .api = "openai-responses",
+                .provider = "openai",
+                .model = "gpt-5-mini",
+                .response_id = "resp_aborted",
+                .usage = types.Usage.init(),
+                .stop_reason = .aborted,
+                .error_message = "aborted",
+                .timestamp = 4,
+            } },
+            .{ .user = .{ .content = &final_user, .timestamp = 5 } },
+        },
+    };
+
+    const payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expectEqualStrings("resp_ok", payload.object.get("previous_response_id").?.string);
+    const input = payload.object.get("input").?.array;
+    try std.testing.expectEqual(@as(usize, 2), input.items.len);
+    try std.testing.expectEqualStrings("user", input.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", input.items[1].object.get("role").?.string);
 }
 
 test "buildRequestPayload uses previous_response_id for continuation" {

@@ -940,7 +940,7 @@ fn buildCompactionSummary(
                 wrote_line = true;
             },
             .assistant => |assistant_message| {
-                if (assistant_message.stop_reason == .error_reason) continue;
+                if (assistant_message.stop_reason == .error_reason or assistant_message.stop_reason == .aborted) continue;
                 const text = summarizeAssistant(assistant_message);
                 if (text.len == 0) continue;
                 try writer.writer.print("\n- assistant: {s}", .{text});

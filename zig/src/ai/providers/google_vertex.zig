@@ -1065,8 +1065,10 @@ fn buildContentsValue(
         switch (messages[index]) {
             .user => |user| try contents.append(try buildUserMessageValue(allocator, model, user)),
             .assistant => |assistant| {
-                if (try buildAssistantMessageValue(allocator, assistant)) |assistant_value| {
-                    try contents.append(assistant_value);
+                if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                    if (try buildAssistantMessageValue(allocator, assistant)) |assistant_value| {
+                        try contents.append(assistant_value);
+                    }
                 }
             },
             .tool_result => {

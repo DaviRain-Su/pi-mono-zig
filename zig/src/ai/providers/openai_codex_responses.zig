@@ -267,7 +267,11 @@ fn appendInputItemsForMessage(
 ) !void {
     switch (message) {
         .user => |user| try input.append(try buildUserInputItem(allocator, model, user)),
-        .assistant => |assistant| try appendAssistantInputItems(allocator, input, assistant, message_index),
+        .assistant => |assistant| {
+            if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                try appendAssistantInputItems(allocator, input, assistant, message_index);
+            }
+        },
         .tool_result => |tool_result| try input.append(try buildToolResultInputItem(allocator, model, tool_result)),
     }
 }
@@ -1291,6 +1295,44 @@ fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.Assist
 fn freeEventOwned(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
     if (event.delta) |delta| allocator.free(delta);
     if (event.tool_call) |tool_call| freeToolCallOwned(allocator, tool_call);
+}
+
+test "VAL-MSG-010 Codex Responses skips failed assistants" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex/responses",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const failed_content = [_]types.ContentBlock{
+        .{ .text = .{ .text = "partial" } },
+        .{ .tool_call = .{ .id = "failed-call", .name = "lookup", .arguments = .null } },
+    };
+    const user_content = [_]types.ContentBlock{.{ .text = .{ .text = "continue" } }};
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{
+        .{ .assistant = .{
+            .content = &failed_content,
+            .api = "openai-codex-responses",
+            .provider = "openai-codex",
+            .model = "gpt-5.1-codex",
+            .usage = types.Usage.init(),
+            .stop_reason = .error_reason,
+            .error_message = "failed",
+            .timestamp = 1,
+        } },
+        .{ .user = .{ .content = &user_content, .timestamp = 2 } },
+    } }, null);
+    defer freeJsonValue(allocator, payload);
+
+    const input = payload.object.get("input").?.array;
+    try std.testing.expectEqual(@as(usize, 1), input.items.len);
+    try std.testing.expectEqualStrings("user", input.items[0].object.get("role").?.string);
 }
 
 test "buildRequestPayload uses Codex-specific request shape" {

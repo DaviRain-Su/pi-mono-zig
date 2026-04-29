@@ -207,6 +207,10 @@ pub fn hasInlineToolCalls(assistant: AssistantMessage) bool {
     return countInlineToolCalls(assistant) > 0;
 }
 
+pub fn shouldReplayAssistantInProviderContext(assistant: AssistantMessage) bool {
+    return assistant.stop_reason != .error_reason and assistant.stop_reason != .aborted;
+}
+
 /// Collects executable tool calls with inline ordered content as source of
 /// truth. The returned slice is an owned array of borrowed ToolCall values; free
 /// only the slice, not the tool-call fields.
