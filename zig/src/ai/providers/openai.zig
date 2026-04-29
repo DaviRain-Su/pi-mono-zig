@@ -89,6 +89,14 @@ const CurrentBlock = union(enum) {
     },
 };
 
+const ActiveToolCallBlock = struct {
+    event_index: usize,
+    stream_index: ?usize,
+    id: std.ArrayList(u8),
+    name: std.ArrayList(u8),
+    partial_args: std.ArrayList(u8),
+};
+
 fn deinitCurrentBlock(block: *CurrentBlock, allocator: std.mem.Allocator) void {
     switch (block.*) {
         .text => |*t| t.deinit(allocator),
@@ -102,6 +110,12 @@ fn deinitCurrentBlock(block: *CurrentBlock, allocator: std.mem.Allocator) void {
             tc.partial_args.deinit(allocator);
         },
     }
+}
+
+fn deinitActiveToolCallBlock(allocator: std.mem.Allocator, block: *ActiveToolCallBlock) void {
+    block.id.deinit(allocator);
+    block.name.deinit(allocator);
+    block.partial_args.deinit(allocator);
 }
 
 /// Free allocated fields within an AssistantMessageEvent.
@@ -139,6 +153,14 @@ fn parseSseStreamLines(
     var current_block: ?CurrentBlock = null;
     defer if (current_block) |*b| deinitCurrentBlock(b, allocator);
 
+    var active_tool_calls = std.ArrayList(ActiveToolCallBlock).empty;
+    defer {
+        for (active_tool_calls.items) |*tool_call| {
+            deinitActiveToolCallBlock(allocator, tool_call);
+        }
+        active_tool_calls.deinit(allocator);
+    }
+
     var content_blocks = std.ArrayList(types.ContentBlock).empty;
     defer content_blocks.deinit(allocator);
 
@@ -164,6 +186,7 @@ fn parseSseStreamLines(
                     stream_ptr,
                     &output,
                     &current_block,
+                    &active_tool_calls,
                     &content_blocks,
                     &tool_calls,
                     &tool_calls_transferred,
@@ -187,6 +210,7 @@ fn parseSseStreamLines(
                     stream_ptr,
                     &output,
                     &current_block,
+                    &active_tool_calls,
                     &content_blocks,
                     &tool_calls,
                     &tool_calls_transferred,
@@ -248,6 +272,7 @@ fn parseSseStreamLines(
         if (delta.object.get("content")) |content| {
             if (content == .string and content.string.len > 0) {
                 if (current_block == null or current_block.? != .text) {
+                    try finishActiveToolCalls(allocator, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
                     try finishCurrentBlock(&current_block, &content_blocks, &tool_calls, stream_ptr, allocator);
                     current_block = CurrentBlock{ .text = std.ArrayList(u8).empty };
                     stream_ptr.push(.{
@@ -284,6 +309,7 @@ fn parseSseStreamLines(
 
         if (found_reasoning) |reasoning_text| {
             if (current_block == null or current_block.? != .thinking) {
+                try finishActiveToolCalls(allocator, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
                 try finishCurrentBlock(&current_block, &content_blocks, &tool_calls, stream_ptr, allocator);
                 current_block = CurrentBlock{
                     .thinking = .{
@@ -339,57 +365,35 @@ fn parseSseStreamLines(
                         break :blk null;
                     } else null;
 
-                    // Check if we need to start a new tool call
-                    const need_new_block = blk: {
-                        if (current_block == null) break :blk true;
-                        if (current_block.? != .tool_call) break :blk true;
-                        if (tc_id) |id| {
-                            const current_id = std.mem.trim(u8, current_block.?.tool_call.id.items, " ");
-                            if (current_id.len > 0 and !std.mem.eql(u8, current_id, id)) break :blk true;
-                        }
-                        break :blk false;
-                    };
-
-                    if (need_new_block) {
-                        try finishCurrentBlock(&current_block, &content_blocks, &tool_calls, stream_ptr, allocator);
-                        current_block = CurrentBlock{
-                            .tool_call = .{
-                                .id = std.ArrayList(u8).empty,
-                                .name = std.ArrayList(u8).empty,
-                                .partial_args = std.ArrayList(u8).empty,
-                            },
-                        };
-                        stream_ptr.push(.{
-                            .event_type = .toolcall_start,
-                            .content_index = @intCast(content_blocks.items.len),
-                        });
+                    try finishCurrentBlock(&current_block, &content_blocks, &tool_calls, stream_ptr, allocator);
+                    const stream_index = extractToolCallIndex(tool_call_item);
+                    const active_tool_call = try ensureActiveToolCall(
+                        allocator,
+                        &active_tool_calls,
+                        stream_ptr,
+                        content_blocks.items.len,
+                        stream_index,
+                        tc_id,
+                    );
+                    if (tc_id) |id| {
+                        active_tool_call.id.clearRetainingCapacity();
+                        try active_tool_call.id.appendSlice(allocator, id);
                     }
-
-                    if (current_block) |*block| {
-                        if (block.* == .tool_call) {
-                            if (tc_id) |id| {
-                                block.tool_call.id.clearRetainingCapacity();
-                                try block.tool_call.id.appendSlice(allocator, id);
-                            }
-                            if (tc_name) |name| {
-                                block.tool_call.name.clearRetainingCapacity();
-                                try block.tool_call.name.appendSlice(allocator, name);
-                            }
-                            var delta_str: ?[]const u8 = null;
-                            if (tc_args) |args| {
-                                try block.tool_call.partial_args.appendSlice(allocator, args);
-                                if (args.len > 0) {
-                                    delta_str = try allocator.dupe(u8, args);
-                                }
-                            }
-                            stream_ptr.push(.{
-                                .event_type = .toolcall_delta,
-                                .content_index = @intCast(content_blocks.items.len),
-                                .delta = delta_str,
-                                .owns_delta = delta_str != null,
-                            });
-                        }
+                    if (tc_name) |name| {
+                        active_tool_call.name.clearRetainingCapacity();
+                        try active_tool_call.name.appendSlice(allocator, name);
                     }
+                    const delta_str = if (tc_args) |args| blk: {
+                        try active_tool_call.partial_args.appendSlice(allocator, args);
+                        break :blk try allocator.dupe(u8, args);
+                    } else null;
+
+                    stream_ptr.push(.{
+                        .event_type = .toolcall_delta,
+                        .content_index = @intCast(active_tool_call.event_index),
+                        .delta = delta_str,
+                        .owns_delta = delta_str != null,
+                    });
                 }
             }
         }
@@ -397,6 +401,7 @@ fn parseSseStreamLines(
 
     // Finish any remaining block
     try finishCurrentBlock(&current_block, &content_blocks, &tool_calls, stream_ptr, allocator);
+    try finishActiveToolCalls(allocator, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
 
     // Build output content from content_blocks
     if (content_blocks.items.len > 0) {
@@ -424,12 +429,14 @@ fn finalizeOutputFromPartials(
     allocator: std.mem.Allocator,
     output: *types.AssistantMessage,
     current_block: *?CurrentBlock,
+    active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     tool_calls_transferred: *bool,
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     try finishCurrentBlock(current_block, content_blocks, tool_calls, stream_ptr, allocator);
+    try finishActiveToolCalls(allocator, active_tool_calls, content_blocks, tool_calls, stream_ptr);
 
     if (content_blocks.items.len > 0 and output.content.len == 0) {
         const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
@@ -450,6 +457,7 @@ fn emitRuntimeFailure(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     output: *types.AssistantMessage,
     current_block: *?CurrentBlock,
+    active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     tool_calls_transferred: *bool,
@@ -459,6 +467,7 @@ fn emitRuntimeFailure(
         allocator,
         output,
         current_block,
+        active_tool_calls,
         content_blocks,
         tool_calls,
         tool_calls_transferred,
@@ -467,6 +476,90 @@ fn emitRuntimeFailure(
     output.stop_reason = provider_error.runtimeStopReason(err);
     output.error_message = provider_error.runtimeErrorMessage(err);
     provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+}
+
+fn extractToolCallIndex(tool_call_value: std.json.Value) ?usize {
+    if (tool_call_value != .object) return null;
+    const index_value = tool_call_value.object.get("index") orelse return null;
+    if (index_value != .integer or index_value.integer < 0) return null;
+    return @intCast(index_value.integer);
+}
+
+fn ensureActiveToolCall(
+    allocator: std.mem.Allocator,
+    active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    completed_count: usize,
+    stream_index: ?usize,
+    id: ?[]const u8,
+) !*ActiveToolCallBlock {
+    if (stream_index) |index| {
+        for (active_tool_calls.items) |*tool_call| {
+            if (tool_call.stream_index != null and tool_call.stream_index.? == index) return tool_call;
+        }
+    }
+
+    if (id) |tool_call_id| {
+        if (tool_call_id.len > 0) {
+            for (active_tool_calls.items) |*tool_call| {
+                if (std.mem.eql(u8, tool_call.id.items, tool_call_id)) return tool_call;
+            }
+        }
+    }
+
+    if (stream_index == null and id == null and active_tool_calls.items.len == 1) {
+        return &active_tool_calls.items[0];
+    }
+
+    const event_index = completed_count + active_tool_calls.items.len;
+    try active_tool_calls.append(allocator, .{
+        .event_index = event_index,
+        .stream_index = stream_index,
+        .id = std.ArrayList(u8).empty,
+        .name = std.ArrayList(u8).empty,
+        .partial_args = std.ArrayList(u8).empty,
+    });
+    stream_ptr.push(.{
+        .event_type = .toolcall_start,
+        .content_index = @intCast(event_index),
+    });
+    return &active_tool_calls.items[active_tool_calls.items.len - 1];
+}
+
+fn finishActiveToolCalls(
+    allocator: std.mem.Allocator,
+    active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    for (active_tool_calls.items) |*tool_call| {
+        const id = try allocator.dupe(u8, std.mem.trim(u8, tool_call.id.items, " "));
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, std.mem.trim(u8, tool_call.name.items, " "));
+        errdefer allocator.free(name);
+        const args_str = std.mem.trim(u8, tool_call.partial_args.items, " ");
+        const args = try parseStreamingJsonToValue(allocator, args_str);
+        errdefer freeJsonValue(allocator, args);
+        const final_tool_call = types.ToolCall{
+            .id = id,
+            .name = name,
+            .arguments = args,
+        };
+        try tool_calls.append(allocator, final_tool_call);
+        try content_blocks.append(allocator, types.ContentBlock{ .tool_call = .{
+            .id = try allocator.dupe(u8, final_tool_call.id),
+            .name = try allocator.dupe(u8, final_tool_call.name),
+            .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+        } });
+        stream_ptr.push(.{
+            .event_type = .toolcall_end,
+            .content_index = @intCast(tool_call.event_index),
+            .tool_call = final_tool_call,
+        });
+        deinitActiveToolCallBlock(allocator, tool_call);
+    }
+    active_tool_calls.clearRetainingCapacity();
 }
 
 fn finishCurrentBlock(
@@ -2050,6 +2143,82 @@ test "parseSseStream with tool calls" {
     try std.testing.expect(event5.message.?.content[0] == .tool_call);
     try std.testing.expectEqualStrings("call_123", event5.message.?.content[0].tool_call.id);
     try std.testing.expectEqualStrings("NYC", event5.message.?.content[0].tool_call.arguments.object.get("city").?.string);
+}
+
+test "parseSseStream keeps interleaved indexed tool arguments separated" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"unit\\\":\\\"\"}},{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"Ber\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_city\",\"function\":{\"name\":\"get_city\",\"arguments\":\"lin\\\"}\"}},{\"index\":1,\"id\":\"call_unit\",\"function\":{\"name\":\"get_unit\",\"arguments\":\"C\\\"}\"}}]}}]}\n" ++
+        "data: [DONE]\n");
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const start_unit = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, start_unit.event_type);
+    try std.testing.expectEqual(@as(u32, 0), start_unit.content_index.?);
+    const unit_delta_1 = stream.next().?;
+    defer freeEvent(allocator, unit_delta_1);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, unit_delta_1.event_type);
+    try std.testing.expectEqual(@as(u32, 0), unit_delta_1.content_index.?);
+
+    const start_city = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, start_city.event_type);
+    try std.testing.expectEqual(@as(u32, 1), start_city.content_index.?);
+    const city_delta_1 = stream.next().?;
+    defer freeEvent(allocator, city_delta_1);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, city_delta_1.event_type);
+    try std.testing.expectEqual(@as(u32, 1), city_delta_1.content_index.?);
+
+    const city_delta_2 = stream.next().?;
+    defer freeEvent(allocator, city_delta_2);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, city_delta_2.event_type);
+    try std.testing.expectEqual(@as(u32, 1), city_delta_2.content_index.?);
+    const unit_delta_2 = stream.next().?;
+    defer freeEvent(allocator, unit_delta_2);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, unit_delta_2.event_type);
+    try std.testing.expectEqual(@as(u32, 0), unit_delta_2.content_index.?);
+
+    const unit_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, unit_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), unit_end.content_index.?);
+    try std.testing.expectEqualStrings("call_unit", unit_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("C", unit_end.tool_call.?.arguments.object.get("unit").?.string);
+    const city_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, city_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), city_end.content_index.?);
+    try std.testing.expectEqualStrings("call_city", city_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("Berlin", city_end.tool_call.?.arguments.object.get("city").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.tool_calls.?.len);
+    try std.testing.expectEqualStrings("call_unit", done.message.?.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("call_city", done.message.?.content[1].tool_call.id);
 }
 
 test "parseSseStream with reasoning content" {

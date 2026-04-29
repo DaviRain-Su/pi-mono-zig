@@ -1513,6 +1513,14 @@ fn countedEchoToolExecute(
     return try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
 }
 
+fn requireValuePrepareArguments(
+    allocator: std.mem.Allocator,
+    args: std.json.Value,
+) !std.json.Value {
+    _ = try getStringArg(args, "value");
+    return try cloneJsonValue(allocator, args);
+}
+
 fn failingToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
@@ -1909,6 +1917,64 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     }
     try std.testing.expect(saw_tool_start);
     try std.testing.expect(saw_tool_end);
+}
+
+test "runAgentLoop sends fallback tool arguments through normal validation" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const empty_args = try std.json.ObjectMap.init(arena.allocator(), &.{}, &.{});
+    const blocks = try arena.allocator().alloc(faux.FauxContentBlock, 1);
+    blocks[0] = try faux.fauxToolCall(
+        arena.allocator(),
+        "echo",
+        .{ .object = empty_args },
+        .{ .id = "tool-1" },
+    );
+    const response = faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use });
+    try registration.setResponses(&[_]faux.FauxResponseStep{.{ .message = response }});
+
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .prepare_arguments = requireValuePrepareArguments,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
+    };
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        runAgentLoop(
+            arena.allocator(),
+            std.Io.failing,
+            prompts[0..],
+            .{
+                .system_prompt = "",
+                .messages = &.{},
+                .tools = &[_]types.AgentTool{tool},
+            },
+            .{
+                .model = registration.getModel(),
+                .convert_to_llm = defaultConvertToLlmForTest,
+            },
+            null,
+            ignoreEvent,
+            null,
+            null,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
 }
 
 test "streamAssistantResponse frees owned streaming deltas after consumption" {
