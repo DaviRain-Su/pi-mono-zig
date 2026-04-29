@@ -47,6 +47,11 @@ const ActiveToolCallBlock = struct {
     partial_json: std.ArrayList(u8),
 };
 
+const PendingFinalizedToolCallBlock = struct {
+    event_index: usize,
+    tool_call: types.ToolCall,
+};
+
 const ContinuationAnchor = struct {
     response_id: []const u8,
     message_start_index: usize,
@@ -320,19 +325,27 @@ fn parseSseStreamLines(
         active_tool_calls.deinit(allocator);
     }
 
+    var pending_tool_calls = std.ArrayList(PendingFinalizedToolCallBlock).empty;
+    defer {
+        for (pending_tool_calls.items) |pending| {
+            freeToolCallOwned(allocator, pending.tool_call);
+        }
+        pending_tool_calls.deinit(allocator);
+    }
+
     stream_ptr.push(.{ .event_type = .start });
 
     while (true) {
         const maybe_line = streaming.readLine() catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &content_blocks, &tool_calls, err);
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, err);
                 return;
             },
         };
         const line = maybe_line orelse break;
         if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &content_blocks, &tool_calls, error.RequestAborted);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, error.RequestAborted);
             return;
         }
 
@@ -344,7 +357,7 @@ fn parseSseStreamLines(
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &content_blocks, &tool_calls, err);
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, err);
                 return;
             },
         };
@@ -365,7 +378,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             const item_value = value.object.get("item") orelse continue;
-            try handleOutputItemAdded(allocator, value, item_value, &current_block, &active_tool_calls, &content_blocks, stream_ptr);
+            try handleOutputItemAdded(allocator, value, item_value, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, stream_ptr);
             continue;
         }
 
@@ -443,7 +456,7 @@ fn parseSseStreamLines(
             const delta_value = value.object.get("delta") orelse continue;
             if (delta_value != .string) continue;
             const ref = extractToolCallRef(value, null);
-            const tool_call = try ensureActiveToolCall(allocator, &active_tool_calls, stream_ptr, content_blocks.items.len, ref, null);
+            const tool_call = try ensureActiveToolCall(allocator, &active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, null);
             try tool_call.partial_json.appendSlice(allocator, delta_value.string);
             stream_ptr.push(.{
                 .event_type = .toolcall_delta,
@@ -458,7 +471,7 @@ fn parseSseStreamLines(
             const arguments_value = value.object.get("arguments") orelse continue;
             if (arguments_value != .string) continue;
             const ref = extractToolCallRef(value, null);
-            const tool_call = try ensureActiveToolCall(allocator, &active_tool_calls, stream_ptr, content_blocks.items.len, ref, null);
+            const tool_call = try ensureActiveToolCall(allocator, &active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, null);
             const previous = tool_call.partial_json.items;
             if (std.mem.startsWith(u8, arguments_value.string, previous)) {
                 const delta = arguments_value.string[previous.len..];
@@ -482,9 +495,10 @@ fn parseSseStreamLines(
         if (std.mem.eql(u8, event_type, "response.output_item.done")) {
             const item_value = value.object.get("item") orelse continue;
             if (isFunctionCallItem(item_value)) {
-                try finalizeActiveToolCallForItem(allocator, value, item_value, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
+                try finalizeActiveToolCallForItem(allocator, value, item_value, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
             } else {
                 try finalizeCurrentBlock(allocator, item_value, &current_block, &content_blocks, &tool_calls, stream_ptr);
+                try flushPendingFinalizedToolCalls(allocator, &pending_tool_calls, &content_blocks, &tool_calls);
             }
             continue;
         }
@@ -498,7 +512,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "response.failed")) {
             const error_message = try extractFailureMessage(allocator, value.object.get("response"));
-            try finalizeOutputFromPartials(allocator, &output, &current_block, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
+            try finalizeOutputFromPartials(allocator, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
             output.stop_reason = .error_reason;
             output.error_message = error_message;
             stream_ptr.push(.{
@@ -512,7 +526,7 @@ fn parseSseStreamLines(
 
         if (std.mem.eql(u8, event_type, "error")) {
             const error_message = try extractTopLevelErrorMessage(allocator, value);
-            try finalizeOutputFromPartials(allocator, &output, &current_block, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
+            try finalizeOutputFromPartials(allocator, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
             output.stop_reason = .error_reason;
             output.error_message = error_message;
             stream_ptr.push(.{
@@ -526,7 +540,8 @@ fn parseSseStreamLines(
     }
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
-    try finalizeActiveToolCalls(allocator, &active_tool_calls, &content_blocks, &tool_calls, stream_ptr);
+    try flushPendingFinalizedToolCalls(allocator, &pending_tool_calls, &content_blocks, &tool_calls);
+    try finalizeActiveToolCalls(allocator, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
     output.content = try content_blocks.toOwnedSlice(allocator);
     output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
 
@@ -550,12 +565,14 @@ fn finalizeOutputFromPartials(
     output: *types.AssistantMessage,
     current_block: *?CurrentBlock,
     active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     try finalizeCurrentBlock(allocator, null, current_block, content_blocks, tool_calls, stream_ptr);
-    try finalizeActiveToolCalls(allocator, active_tool_calls, content_blocks, tool_calls, stream_ptr);
+    try flushPendingFinalizedToolCalls(allocator, pending_tool_calls, content_blocks, tool_calls);
+    try finalizeActiveToolCalls(allocator, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
     if (output.content.len == 0 and content_blocks.items.len > 0) {
         output.content = try content_blocks.toOwnedSlice(allocator);
     }
@@ -570,11 +587,12 @@ fn emitRuntimeFailure(
     output: *types.AssistantMessage,
     current_block: *?CurrentBlock,
     active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     err: anyerror,
 ) !void {
-    try finalizeOutputFromPartials(allocator, output, current_block, active_tool_calls, content_blocks, tool_calls, stream_ptr);
+    try finalizeOutputFromPartials(allocator, output, current_block, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
     output.stop_reason = provider_error.runtimeStopReason(err);
     output.error_message = provider_error.runtimeErrorMessage(err);
     provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
@@ -586,6 +604,7 @@ fn handleOutputItemAdded(
     item_value: std.json.Value,
     current_block: *?CurrentBlock,
     active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
@@ -617,7 +636,7 @@ fn handleOutputItemAdded(
 
     if (std.mem.eql(u8, item_type_value.string, "function_call")) {
         const ref = extractToolCallRef(event_value, item_value);
-        const tool_call = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, content_blocks.items.len, ref, item_value);
+        const tool_call = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, item_value);
         if (item_value.object.get("arguments")) |arguments_value| {
             if (arguments_value == .string and arguments_value.string.len > 0) {
                 try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
@@ -757,6 +776,7 @@ fn finalizeActiveToolCallAt(
     index: usize,
     maybe_item_value: ?std.json.Value,
     active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -790,12 +810,17 @@ fn finalizeActiveToolCallAt(
         .name = try allocator.dupe(u8, final_name),
         .arguments = arguments,
     };
-    try tool_calls.append(allocator, stored_tool_call);
-    try content_blocks.append(allocator, .{ .tool_call = .{
-        .id = try allocator.dupe(u8, stored_tool_call.id),
-        .name = try allocator.dupe(u8, stored_tool_call.name),
-        .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
-    } });
+    errdefer freeToolCallOwned(allocator, stored_tool_call);
+
+    if (tool_call.event_index == content_blocks.items.len) {
+        try appendFinalizedToolCallCopies(allocator, stored_tool_call, content_blocks, tool_calls);
+        try flushPendingFinalizedToolCalls(allocator, pending_tool_calls, content_blocks, tool_calls);
+    } else {
+        try pending_tool_calls.append(allocator, .{
+            .event_index = tool_call.event_index,
+            .tool_call = try cloneToolCallOwned(allocator, stored_tool_call),
+        });
+    }
     stream_ptr.push(.{
         .event_type = .toolcall_end,
         .content_index = @intCast(tool_call.event_index),
@@ -805,6 +830,7 @@ fn finalizeActiveToolCallAt(
             .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
         },
     });
+    freeToolCallOwned(allocator, stored_tool_call);
 }
 
 fn finalizeActiveToolCallForItem(
@@ -812,6 +838,7 @@ fn finalizeActiveToolCallForItem(
     event_value: std.json.Value,
     item_value: std.json.Value,
     active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -820,24 +847,58 @@ fn finalizeActiveToolCallForItem(
     var index: usize = 0;
     while (index < active_tool_calls.items.len) : (index += 1) {
         if (matchesToolCallRef(active_tool_calls.items[index], ref)) {
-            try finalizeActiveToolCallAt(allocator, index, item_value, active_tool_calls, content_blocks, tool_calls, stream_ptr);
+            try finalizeActiveToolCallAt(allocator, index, item_value, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
             return;
         }
     }
 
-    _ = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, content_blocks.items.len, ref, item_value);
-    try finalizeActiveToolCallAt(allocator, active_tool_calls.items.len - 1, item_value, active_tool_calls, content_blocks, tool_calls, stream_ptr);
+    _ = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, item_value);
+    try finalizeActiveToolCallAt(allocator, active_tool_calls.items.len - 1, item_value, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
 }
 
 fn finalizeActiveToolCalls(
     allocator: std.mem.Allocator,
     active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     while (active_tool_calls.items.len > 0) {
-        try finalizeActiveToolCallAt(allocator, 0, null, active_tool_calls, content_blocks, tool_calls, stream_ptr);
+        try finalizeActiveToolCallAt(allocator, 0, null, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
+    }
+    try flushPendingFinalizedToolCalls(allocator, pending_tool_calls, content_blocks, tool_calls);
+}
+
+fn appendFinalizedToolCallCopies(
+    allocator: std.mem.Allocator,
+    source: types.ToolCall,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+) !void {
+    try tool_calls.append(allocator, try cloneToolCallOwned(allocator, source));
+    try content_blocks.append(allocator, .{ .tool_call = try cloneToolCallOwned(allocator, source) });
+}
+
+fn flushPendingFinalizedToolCalls(
+    allocator: std.mem.Allocator,
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+) !void {
+    while (true) {
+        var pending_index: ?usize = null;
+        for (pending_tool_calls.items, 0..) |pending, index| {
+            if (pending.event_index == content_blocks.items.len) {
+                pending_index = index;
+                break;
+            }
+        }
+
+        const index = pending_index orelse return;
+        const pending = pending_tool_calls.orderedRemove(index);
+        try appendFinalizedToolCallCopies(allocator, pending.tool_call, content_blocks, tool_calls);
+        freeToolCallOwned(allocator, pending.tool_call);
     }
 }
 
@@ -1554,6 +1615,15 @@ fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) vo
     freeJsonValue(allocator, tool_call.arguments);
 }
 
+fn cloneToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) !types.ToolCall {
+    return .{
+        .id = try allocator.dupe(u8, tool_call.id),
+        .name = try allocator.dupe(u8, tool_call.name),
+        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+    };
+}
+
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
     for (message.content) |block| {
         switch (block) {
@@ -2197,6 +2267,89 @@ test "parseSseStreamLines separates interleaved calls and lets final/object argu
     try std.testing.expect(message.tool_calls.?[1].arguments.object.get("nested").?.object.get("ok").?.bool);
     try std.testing.expectEqualStrings("Berlin", message.content[0].tool_call.arguments.object.get("city").?.string);
     try std.testing.expectEqual(@as(i64, 2), message.content[1].tool_call.arguments.object.get("count").?.integer);
+
+    freeAssistantMessageOwned(allocator, message);
+}
+
+test "parseSseStreamLines preserves reserved indexes for out-of-order tool call done events" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"first_tool\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"second_tool\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"second_tool\",\"arguments\":\"{\\\"value\\\":2}\"}}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"first_tool\",\"arguments\":\"{\\\"value\\\":1}\"}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"status\":\"completed\"}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    const start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, start.event_type);
+
+    const first_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, first_start.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), first_start.content_index);
+
+    const second_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, second_start.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), second_start.content_index);
+
+    const second_end = stream.next().?;
+    defer freeEventOwned(allocator, second_end);
+    try std.testing.expectEqual(types.EventType.toolcall_end, second_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), second_end.content_index);
+    try std.testing.expectEqualStrings("call_2|fc_2", second_end.tool_call.?.id);
+
+    const first_end = stream.next().?;
+    defer freeEventOwned(allocator, first_end);
+    try std.testing.expectEqual(types.EventType.toolcall_end, first_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), first_end.content_index);
+    try std.testing.expectEqualStrings("call_1|fc_1", first_end.tool_call.?.id);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    const message = done.message.?;
+    try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), message.tool_calls.?.len);
+    try std.testing.expectEqual(@as(usize, 2), message.content.len);
+    try std.testing.expect(message.content[0] == .tool_call);
+    try std.testing.expect(message.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("call_1|fc_1", message.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("call_2|fc_2", message.tool_calls.?[1].id);
+    try std.testing.expectEqualStrings("call_1|fc_1", message.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("call_2|fc_2", message.content[1].tool_call.id);
+    try std.testing.expectEqual(@as(i64, 1), message.content[0].tool_call.arguments.object.get("value").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), message.content[1].tool_call.arguments.object.get("value").?.integer);
+    try std.testing.expect(stream.next() == null);
 
     freeAssistantMessageOwned(allocator, message);
 }
