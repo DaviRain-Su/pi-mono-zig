@@ -1,0 +1,21 @@
+{
+  "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
+  "fixtureCount": 5,
+  "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
+  "network": "local mocked global fetch only; unhandled requests throw",
+  "scenarioIds": [
+    "openai-basic-text",
+    "openai-on-payload-replacement",
+    "header-merge-option-override",
+    "chutes-max-tokens-scaffold",
+    "tool-choice-and-history-scaffold"
+  ],
+  "schemaVersion": 1,
+  "sourceCitations": [
+    "packages/ai/src/providers/openai-completions.ts:111-153",
+    "packages/ai/src/providers/openai-completions.ts:426-579",
+    "packages/ai/src/providers/openai-completions.ts:582-778",
+    "packages/ai/src/providers/openai-completions.ts:941-1122",
+    "packages/ai/src/types.ts:278-347"
+  ]
+}

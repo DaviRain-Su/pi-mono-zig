@@ -1,0 +1,74 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "https://llm.chutes.ai/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "max_tokens": 96,
+        "messages": [
+          {
+            "content": "You are the deterministic OpenAI Chat fixture assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Return a concise fixture response.",
+            "role": "user"
+          }
+        ],
+        "model": "qwen-fixture",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "url": "https://llm.chutes.ai/v1/chat/completions"
+    }
+  },
+  "id": "chutes-max-tokens-scaffold",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic OpenAI Chat fixture assistant."
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://llm.chutes.ai/v1",
+      "id": "qwen-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Qwen Fixture",
+      "provider": "chutes",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "none",
+      "maxTokens": 96
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Non-standard OpenAI-compatible base URL scaffold captures max_tokens compatibility"
+}

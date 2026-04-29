@@ -1,0 +1,101 @@
+{
+  "expected": {
+    "onPayload": {
+      "observedPayload": {
+        "max_completion_tokens": 32,
+        "messages": [
+          {
+            "content": "Use replacement payload when the callback returns one.",
+            "role": "developer"
+          },
+          {
+            "content": "This original prompt is replaced.",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-replacement-fixture",
+        "reasoning_effort": "low",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "replacementPayload": {
+        "fixture_marker": "on-payload-replacement",
+        "messages": [
+          {
+            "content": "payload replaced by deterministic fixture callback",
+            "role": "user"
+          }
+        ],
+        "model": "fixture-replacement-model",
+        "stream": true
+      }
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "fixture_marker": "on-payload-replacement",
+        "messages": [
+          {
+            "content": "payload replaced by deterministic fixture callback",
+            "role": "user"
+          }
+        ],
+        "model": "fixture-replacement-model",
+        "stream": true
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "url": "https://api.openai.com/v1/chat/completions"
+    }
+  },
+  "id": "openai-on-payload-replacement",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "This original prompt is replaced.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "Use replacement payload when the callback returns one."
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.openai.com/v1",
+      "id": "gpt-4.1-replacement-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 4.1 Fixture",
+      "provider": "openai",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "maxTokens": 32,
+      "onPayload": "replace-with-fixture-payload",
+      "reasoningEffort": "low"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "onPayload replacement is the submitted request body"
+}
