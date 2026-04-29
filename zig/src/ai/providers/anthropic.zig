@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const provider_error = @import("../shared/provider_error.zig");
 
 const AnthropicError = error{
     UnknownStopReason,
@@ -124,23 +125,7 @@ pub const AnthropicProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAll(allocator);
             defer allocator.free(response_body);
-            const error_message = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ response.status, response_body });
-            const message = types.AssistantMessage{
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = error_message,
-                .timestamp = 0,
-            };
-            stream_instance.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = message,
-            });
-            stream_instance.end(message);
+            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
         }
 
@@ -1060,6 +1045,56 @@ test "stream on_response receives actual response headers" {
 
     try std.testing.expect(OnResponseCapture.called);
     try std.testing.expectEqual(@as(u16, 200), OnResponseCapture.status);
+}
+
+test "stream HTTP status error is terminal sanitized event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body = "{\"type\":\"error\",\"error\":{\"message\":\"bad request\",\"authorization\":\"Bearer sk-anthropic-secret\",\"request_id\":\"req_anthropic_random_123456\"},\"trace\":\"/Users/alice/pi/anthropic.zig\"}";
+    var server = try provider_error.TestStatusServer.init(io, 401, "Unauthorized", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try AnthropicProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 401: "));
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "bad request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-anthropic-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_anthropic_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("anthropic-messages", result.api);
 }
 
 fn parseSseStreamLines(

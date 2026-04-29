@@ -9,6 +9,7 @@ pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
 pub const stream_module = @import("stream.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
+pub const provider_error = @import("shared/provider_error.zig");
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
     pub const openai_responses = @import("providers/openai_responses.zig");
@@ -66,5 +67,6 @@ test {
     _ = @import("model_discovery.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
+    _ = @import("shared/provider_error.zig");
     _ = @import("providers/faux.zig");
 }
