@@ -1376,6 +1376,53 @@ test "route-a m1 stringifies streaming toolcall message updates" {
     }
 }
 
+test "partial toolcall message update serializes malformed argument fallback as empty object" {
+    const allocator = std.testing.allocator;
+
+    const args_object = try initObject(allocator);
+    defer common.deinitJsonValue(allocator, .{ .object = args_object });
+    const args_value: std.json.Value = .{ .object = args_object };
+
+    const content = [_]ai.ContentBlock{
+        .{ .text = .{ .text = "before tool" } },
+        .{ .tool_call = .{
+            .id = "",
+            .name = "",
+            .arguments = args_value,
+        } },
+    };
+    const assistant_message = ai.AssistantMessage{
+        .content = content[0..],
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 10,
+    };
+
+    const line = try stringifyAgentEventLine(allocator, .{
+        .event_type = .message_update,
+        .message = .{ .assistant = assistant_message },
+        .assistant_message_event = .{
+            .event_type = .toolcall_delta,
+            .content_index = 1,
+            .delta = "not-json",
+            .message = assistant_message,
+        },
+    });
+    defer allocator.free(line);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    try validateAgentEventJson(allocator, parsed.value);
+    const message = parsed.value.object.get("message").?.object;
+    const tool_call = message.get("content").?.array.items[1].object;
+    const arguments = tool_call.get("arguments").?;
+    try std.testing.expect(arguments == .object);
+    try std.testing.expectEqual(@as(usize, 0), arguments.object.count());
+}
+
 test "assistant event done reason must match nested message stopReason" {
     const allocator = std.testing.allocator;
     const json =

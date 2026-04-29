@@ -130,7 +130,7 @@
 		{
 			"path": "m5-thinking.jsonl",
 			"description": "live runRpcMode stdout bytes for the M5 thinking-delta production parity scenario.",
-			"byteLength": 6715,
+			"byteLength": 7377,
 			"lineCount": 16
 		},
 		{

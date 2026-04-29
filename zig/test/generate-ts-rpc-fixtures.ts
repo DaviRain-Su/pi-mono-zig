@@ -649,30 +649,47 @@ function emitM5Thinking(emit: (event: AgentSessionEvent) => void): void {
 	emit({ type: "message_start", message: user } satisfies AgentEvent);
 	emit({ type: "message_end", message: user } satisfies AgentEvent);
 	emit({ type: "message_start", message: emptyAssistant } satisfies AgentEvent);
+	const thinkingStarted = m5Assistant([{ type: "thinking", thinking: "" }], usageValue);
 	emit({
 		type: "message_update",
-		message: emptyAssistant,
-		assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: emptyAssistant },
+		message: thinkingStarted,
+		assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: thinkingStarted },
 	} satisfies AgentEvent);
+	let thinking = "";
 	for (const delta of ["Need exact b", "ytes."]) {
+		thinking += delta;
+		const partial = m5Assistant([{ type: "thinking", thinking }], usageValue);
 		emit({
 			type: "message_update",
-			message: emptyAssistant,
-			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta, partial: emptyAssistant },
+			message: partial,
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta, partial },
 		} satisfies AgentEvent);
 	}
+	const thinkingDone = m5Assistant([{ type: "thinking", thinking: "Need exact bytes." }], usageValue);
 	emit({
 		type: "message_update",
-		message: emptyAssistant,
-		assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "Need exact bytes.", partial: emptyAssistant },
+		message: thinkingDone,
+		assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "Need exact bytes.", partial: thinkingDone },
 	} satisfies AgentEvent);
-	const textStarted = m5Assistant([{ type: "text", text: "" }], usageValue);
+	const textStarted = m5Assistant(
+		[
+			{ type: "thinking", thinking: "Need exact bytes." },
+			{ type: "text", text: "" },
+		],
+		usageValue,
+	);
 	emit({
 		type: "message_update",
 		message: textStarted,
 		assistantMessageEvent: { type: "text_start", contentIndex: 1, partial: textStarted },
 	} satisfies AgentEvent);
-	const textDone = m5Assistant([{ type: "text", text: "final answer" }], usageValue);
+	const textDone = m5Assistant(
+		[
+			{ type: "thinking", thinking: "Need exact bytes." },
+			{ type: "text", text: "final answer" },
+		],
+		usageValue,
+	);
 	emit({
 		type: "message_update",
 		message: textDone,
