@@ -669,6 +669,11 @@ test "parse anthropic stream emits tool call and thinking events" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expect(done.message.?.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("todoWrite", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("item", done.message.?.content[1].tool_call.arguments.object.get("todos").?.string);
+    try std.testing.expectEqualStrings(done.message.?.tool_calls.?[0].id, done.message.?.content[1].tool_call.id);
 }
 
 test "mapStopReason covers anthropic variants" {
@@ -1265,7 +1270,11 @@ fn finalizeOutputFromPartials(
                     .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
                 };
                 try tool_calls.append(allocator, final_tool_call);
-                try content_blocks.append(allocator, .{ .text = .{ .text = TOOL_PLACEHOLDER_TEXT } });
+                try content_blocks.append(allocator, .{ .tool_call = .{
+                    .id = try allocator.dupe(u8, final_tool_call.id),
+                    .name = try allocator.dupe(u8, final_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+                } });
                 stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
             },
         }
@@ -1720,7 +1729,11 @@ fn handleContentBlockStop(
                 .arguments = arguments,
             };
             try tool_calls.append(allocator, final_tool_call);
-            try content_blocks.append(allocator, .{ .text = .{ .text = TOOL_PLACEHOLDER_TEXT } });
+            try content_blocks.append(allocator, .{ .tool_call = .{
+                .id = try allocator.dupe(u8, final_tool_call.id),
+                .name = try allocator.dupe(u8, final_tool_call.name),
+                .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+            } });
             stream_ptr.push(.{
                 .event_type = .toolcall_end,
                 .content_index = @intCast(entry.event_index),
@@ -2490,7 +2503,6 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
         .max_tokens = 4096,
     };
 }
-
 
 test "parseSseStreamLines preserves partial Anthropic text before malformed terminal error" {
     const allocator = std.heap.page_allocator;

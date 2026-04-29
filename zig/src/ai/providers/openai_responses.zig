@@ -711,7 +711,11 @@ fn finalizeCurrentBlock(
                     .arguments = arguments,
                 };
                 try tool_calls.append(allocator, stored_tool_call);
-                try content_blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, "") } });
+                try content_blocks.append(allocator, .{ .tool_call = .{
+                    .id = try allocator.dupe(u8, stored_tool_call.id),
+                    .name = try allocator.dupe(u8, stored_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
+                } });
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),
@@ -1816,6 +1820,10 @@ test "parseSseStreamLines streams tool calls and finalizes arguments" {
     try std.testing.expectEqual(@as(usize, 1), event6.message.?.tool_calls.?.len);
     try std.testing.expectEqualStrings("call_1|fc_1", event6.message.?.tool_calls.?[0].id);
     try std.testing.expectEqualStrings("Berlin", event6.message.?.tool_calls.?[0].arguments.object.get("city").?.string);
+    try std.testing.expectEqual(@as(usize, 1), event6.message.?.content.len);
+    try std.testing.expect(event6.message.?.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("call_1|fc_1", event6.message.?.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("Berlin", event6.message.?.content[0].tool_call.arguments.object.get("city").?.string);
     try std.testing.expectEqual(types.StopReason.tool_use, event6.message.?.stop_reason);
     try std.testing.expectEqualStrings("resp_tool", event6.message.?.response_id.?);
 
@@ -1978,7 +1986,6 @@ test "buildRequestHeaders omits session_id when compat disables it" {
     try std.testing.expectEqualStrings("sess-1", headers.get("x-client-request-id").?);
     try std.testing.expect(headers.get("session_id") == null);
 }
-
 
 test "parseSseStreamLines finalizes partial text before response.failed terminal error" {
     const allocator = std.heap.page_allocator;

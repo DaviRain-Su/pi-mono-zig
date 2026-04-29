@@ -1278,7 +1278,11 @@ fn handleContentBlockStop(
                 .arguments = arguments,
             };
             try tool_calls.append(allocator, final_tool_call);
-            try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+            try content_blocks.append(allocator, .{ .tool_call = .{
+                .id = try allocator.dupe(u8, final_tool_call.id),
+                .name = try allocator.dupe(u8, final_tool_call.name),
+                .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+            } });
             stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
         },
     }
@@ -1361,7 +1365,11 @@ fn finalizeOutputFromPartials(
                     .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
                 };
                 try tool_calls.append(allocator, final_tool_call);
-                try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                try content_blocks.append(allocator, .{ .tool_call = .{
+                    .id = try allocator.dupe(u8, final_tool_call.id),
+                    .name = try allocator.dupe(u8, final_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+                } });
                 stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
             },
         }
@@ -1860,7 +1868,6 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
     };
 }
 
-
 test "parseTextStreamLines preserves partial Bedrock text before malformed terminal error" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
@@ -1933,6 +1940,9 @@ test "parseEventStreamFrames finalizes partial Bedrock blocks before provider ex
     try std.testing.expect(terminal.message != null);
     try std.testing.expectEqualStrings("partial text", terminal.message.?.content[0].text.text);
     try std.testing.expectEqualStrings("partial thought", terminal.message.?.content[1].thinking.thinking);
+    try std.testing.expect(terminal.message.?.content[2] == .tool_call);
+    try std.testing.expectEqualStrings("get_weather", terminal.message.?.content[2].tool_call.name);
+    try std.testing.expectEqualStrings("Berlin", terminal.message.?.content[2].tool_call.arguments.object.get("city").?.string);
     try std.testing.expectEqualStrings("Berlin", terminal.message.?.tool_calls.?[0].arguments.object.get("city").?.string);
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "sk-bedrock-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);

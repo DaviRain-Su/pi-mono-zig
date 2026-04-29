@@ -1447,8 +1447,20 @@ fn toolCallStreamForAgentLoopTest(
         .name = try result_allocator.dupe(u8, "bash"),
         .arguments = .{ .object = args_object },
     };
+    var content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
+    try content_args_object.put(
+        result_allocator,
+        try result_allocator.dupe(u8, "command"),
+        .{ .string = try result_allocator.dupe(u8, "echo hi") },
+    );
+    const content = try result_allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .tool_call = .{
+        .id = try result_allocator.dupe(u8, "tool-1"),
+        .name = try result_allocator.dupe(u8, "bash"),
+        .arguments = .{ .object = content_args_object },
+    } };
     const final_message = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
+        .content = content,
         .tool_calls = tool_calls,
         .api = model.api,
         .provider = model.provider,
@@ -1841,12 +1853,17 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     };
     try registration.setResponses(responses[0..]);
 
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
     const tool = types.AgentTool{
         .name = "echo",
         .description = "Echo input",
         .label = "Echo",
         .parameters = .null,
-        .execute = echoToolExecute,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
     };
 
     var capture = ToolExecutionCapture.init(std.testing.allocator);
@@ -1878,6 +1895,7 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     try std.testing.expectEqualStrings("echo", result[2].tool_result.tool_name);
     try std.testing.expectEqualStrings("echoed: hello", result[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("done", result[3].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), fixture.execute_count);
     const end_ms = types.nowMilliseconds();
     try std.testing.expect(result[2].tool_result.timestamp > 0);
     try std.testing.expect(result[2].tool_result.timestamp >= start_ms - 2000);
@@ -1960,6 +1978,9 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
     );
 
     try std.testing.expectEqual(@as(usize, 1), assistant.tool_calls.?.len);
+    try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
+    try std.testing.expect(assistant.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("tool-1", assistant.content[0].tool_call.id);
     const expected = [_]ai.EventType{ .toolcall_start, .toolcall_delta, .toolcall_end };
     var next_expected: usize = 0;
     for (capture.events.items) |event| {

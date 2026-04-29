@@ -400,13 +400,24 @@ fn parseSseStreamLines(
                                     else
                                         try generateToolCallId(allocator, &generated_tool_call_count);
 
+                                    const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
+                                        if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
+                                    else
+                                        null;
+
                                     const tool_call = types.ToolCall{
                                         .id = tool_call_id,
                                         .name = try allocator.dupe(u8, name_value.?.string),
                                         .arguments = args,
+                                        .thought_signature = thought_signature,
                                     };
                                     try tool_calls.append(allocator, tool_call);
-                                    try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                                    try content_blocks.append(allocator, .{ .tool_call = .{
+                                        .id = try allocator.dupe(u8, tool_call.id),
+                                        .name = try allocator.dupe(u8, tool_call.name),
+                                        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+                                        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+                                    } });
 
                                     stream_ptr.push(.{
                                         .event_type = .toolcall_start,
@@ -1234,7 +1245,6 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
         .max_tokens = 4096,
     };
 }
-
 
 test "parseSseStreamLines preserves partial Gemini CLI text before malformed terminal error" {
     const allocator = std.heap.page_allocator;

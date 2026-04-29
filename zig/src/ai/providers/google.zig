@@ -276,13 +276,24 @@ fn parseSseStreamLines(
                                     else
                                         try generateToolCallId(allocator, &generated_tool_call_count);
 
+                                    const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
+                                        if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
+                                    else
+                                        null;
+
                                     const tool_call = types.ToolCall{
                                         .id = tool_call_id,
                                         .name = try allocator.dupe(u8, name_value.?.string),
                                         .arguments = args,
+                                        .thought_signature = thought_signature,
                                     };
                                     try tool_calls.append(allocator, tool_call);
-                                    try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                                    try content_blocks.append(allocator, .{ .tool_call = .{
+                                        .id = try allocator.dupe(u8, tool_call.id),
+                                        .name = try allocator.dupe(u8, tool_call.name),
+                                        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+                                        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+                                    } });
 
                                     stream_ptr.push(.{
                                         .event_type = .toolcall_start,
@@ -558,11 +569,11 @@ fn buildAssistantMessageValue(
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
                 try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
-                if (tool_call.thought_signature) |signature| {
-                    try function_call.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
-                }
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                if (tool_call.thought_signature) |signature| {
+                    try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                }
                 try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
                 try parts.append(.{ .object = part });
             },
@@ -967,12 +978,13 @@ test "buildRequestPayload converts assistant tool calls and tool results" {
                 .content = &[_]types.ContentBlock{
                     .{ .thinking = .{ .thinking = "Need weather data", .signature = "c2ln", .redacted = false } },
                     .{ .text = .{ .text = "Calling tool" } },
+                    .{ .tool_call = .{
+                        .id = "tool-1",
+                        .name = "get_weather",
+                        .arguments = tool_args_value,
+                        .thought_signature = "tool-thought-sig",
+                    } },
                 },
-                .tool_calls = &[_]types.ToolCall{.{
-                    .id = "tool-1",
-                    .name = "get_weather",
-                    .arguments = tool_args_value,
-                }},
                 .api = "google-generative-ai",
                 .provider = "google",
                 .model = "gemini-2.5-pro",
@@ -1017,6 +1029,8 @@ test "buildRequestPayload converts assistant tool calls and tool results" {
     try std.testing.expectEqual(@as(usize, 3), assistant_parts.items.len);
     try std.testing.expect(assistant_parts.items[0].object.get("thought") != null);
     try std.testing.expect(assistant_parts.items[2].object.get("functionCall") != null);
+    try std.testing.expectEqualStrings("tool-thought-sig", assistant_parts.items[2].object.get("thoughtSignature").?.string);
+    try std.testing.expect(assistant_parts.items[2].object.get("functionCall").?.object.get("thoughtSignature") == null);
 
     const tool_result_message = contents.array.items[1];
     try std.testing.expectEqualStrings("user", tool_result_message.object.get("role").?.string);
@@ -1033,7 +1047,7 @@ test "parse stream emits text events" {
 
     const body = try allocator.dupe(
         u8,
-        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"text-sig\",\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n" ++
             "data: [DONE]\n",
     );
 
@@ -1080,7 +1094,7 @@ test "parse stream emits thinking and tool call events" {
 
     const body = try allocator.dupe(
         u8,
-        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Need tool\"},{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Berlin\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"cachedContentTokenCount\":2,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3,\"totalTokenCount\":30}}\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Need tool\"},{\"thoughtSignature\":\"tool-sig\",\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Berlin\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"cachedContentTokenCount\":2,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3,\"totalTokenCount\":30}}\n" ++
             "data: [DONE]\n",
     );
 
@@ -1125,6 +1139,10 @@ test "parse stream emits thinking and tool call events" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expect(done.message.?.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("tool-sig", done.message.?.content[1].tool_call.thought_signature.?);
+    try std.testing.expectEqualStrings("tool-sig", done.message.?.tool_calls.?[0].thought_signature.?);
     try std.testing.expectEqual(@as(u32, 18), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.output);
 }
@@ -1191,7 +1209,6 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
         .max_tokens = 4096,
     };
 }
-
 
 test "parseSseStreamLines preserves partial Google text before malformed terminal error" {
     const allocator = std.heap.page_allocator;
