@@ -1134,22 +1134,23 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (try streaming.readLine()) |line| {
+    while (true) {
+        const maybe_line = streaming.readLine() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+        };
+        const line = maybe_line orelse break;
         if (isAbortRequested(options)) {
-            output.stop_reason = .aborted;
-            output.error_message = "Request was aborted";
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = output.error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
             return;
         }
 
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) {
-            if (try processAnthropicSseEvent(
+            const event_finished = processAnthropicSseEvent(
                 allocator,
                 stream_ptr,
                 sse_event.items,
@@ -1160,7 +1161,14 @@ fn parseSseStreamLines(
                 &active_blocks,
                 context,
                 options,
-            )) return;
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                    return;
+                },
+            };
+            if (event_finished) return;
             sse_event.clearRetainingCapacity();
             sse_data.clearRetainingCapacity();
             continue;
@@ -1171,7 +1179,7 @@ fn parseSseStreamLines(
     }
 
     if (sse_data.items.len > 0) {
-        if (try processAnthropicSseEvent(
+        const event_finished = processAnthropicSseEvent(
             allocator,
             stream_ptr,
             sse_event.items,
@@ -1182,7 +1190,14 @@ fn parseSseStreamLines(
             &active_blocks,
             context,
             options,
-        )) return;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+        };
+        if (event_finished) return;
     }
 
     if (content_blocks.items.len == 0 and tool_calls.items.len == 0) {
@@ -1208,6 +1223,67 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn finalizeOutputFromPartials(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
+) !void {
+    while (active_blocks.items.len > 0) {
+        var entry = active_blocks.orderedRemove(0);
+        defer deinitCurrentBlock(allocator, &entry.block);
+        switch (entry.block) {
+            .text => |text| {
+                const owned = try allocator.dupe(u8, text.items);
+                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+                stream_ptr.push(.{ .event_type = .text_end, .content_index = @intCast(entry.event_index), .content = owned });
+            },
+            .thinking => |thinking| {
+                const text = try allocator.dupe(u8, thinking.text.items);
+                const signature = if (thinking.signature) |sig| try allocator.dupe(u8, sig) else null;
+                try content_blocks.append(allocator, .{ .thinking = .{ .thinking = text, .signature = signature, .redacted = thinking.redacted } });
+                stream_ptr.push(.{ .event_type = .thinking_end, .content_index = @intCast(entry.event_index), .content = text });
+            },
+            .tool_call => |tool| {
+                var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
+                defer parsed_arguments.deinit();
+                const final_tool_call = types.ToolCall{
+                    .id = try allocator.dupe(u8, tool.id),
+                    .name = try allocator.dupe(u8, tool.name),
+                    .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
+                };
+                try tool_calls.append(allocator, final_tool_call);
+                try content_blocks.append(allocator, .{ .text = .{ .text = TOOL_PLACEHOLDER_TEXT } });
+                stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
+            },
+        }
+    }
+
+    output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
+    calculateCost(model, &output.usage);
+    if (output.content.len == 0 and content_blocks.items.len > 0) output.content = try content_blocks.toOwnedSlice(allocator);
+    if (output.tool_calls == null and tool_calls.items.len > 0) output.tool_calls = try tool_calls.toOwnedSlice(allocator);
+}
+
+fn emitRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
+    err: anyerror,
+) !void {
+    try finalizeOutputFromPartials(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model);
+    output.stop_reason = provider_error.runtimeStopReason(err);
+    output.error_message = provider_error.runtimeErrorMessage(err);
+    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
 }
 
 fn appendSseField(
@@ -1245,7 +1321,7 @@ fn processAnthropicSseEvent(
     if (data.len == 0) return false;
     if (std.mem.eql(u8, std.mem.trim(u8, data, " \t\r\n"), "[DONE]")) return true;
 
-    var parsed = json_parse.parseStreamingJson(allocator, data) catch |err| {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| {
         if (std.mem.eql(u8, sse_event, "error")) {
             try emitAnthropicStreamError(allocator, stream_ptr, output, data);
             return true;
@@ -2358,4 +2434,58 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
         },
         else => {},
     }
+}
+
+fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {
+    return .{
+        .id = "runtime-test-model",
+        .name = "Runtime Test Model",
+        .api = api,
+        .provider = provider,
+        .base_url = "https://example.test",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
+
+
+test "parseSseStreamLines preserves partial Anthropic text before malformed terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "event: message_start\n" ++
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"anthropic-runtime\"}}\n\n" ++
+            "event: content_block_start\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n" ++
+            "data: {not-json}\n\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+    const context = types.Context{ .messages = &[_]types.Message{} };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("anthropic-messages", "anthropic"), context, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("anthropic-runtime", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }

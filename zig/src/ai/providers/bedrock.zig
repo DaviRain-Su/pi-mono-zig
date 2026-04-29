@@ -793,21 +793,39 @@ fn parseEventStreamFrames(
             return;
         }
 
-        if (body.len - cursor < 16) return BedrockError.InvalidBedrockEventStream;
+        if (body.len - cursor < 16) {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, BedrockError.InvalidBedrockEventStream);
+            return;
+        }
         const total_length = readBigEndianU32(body[cursor..][0..4]);
         const headers_length = readBigEndianU32(body[cursor..][4..8]);
-        if (total_length < 16 or cursor + total_length > body.len) return BedrockError.InvalidBedrockEventStream;
+        if (total_length < 16 or cursor + total_length > body.len) {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, BedrockError.InvalidBedrockEventStream);
+            return;
+        }
         const headers_start = cursor + 12;
         const headers_end = headers_start + headers_length;
-        if (headers_end + 4 > cursor + total_length) return BedrockError.InvalidBedrockEventStream;
+        if (headers_end + 4 > cursor + total_length) {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, BedrockError.InvalidBedrockEventStream);
+            return;
+        }
         const payload_end = cursor + total_length - 4;
 
-        const parsed_headers = try parseEventStreamHeaders(body[headers_start..headers_end]);
+        const parsed_headers = parseEventStreamHeaders(body[headers_start..headers_end]) catch |err| {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+            return;
+        };
         const payload = body[headers_end..payload_end];
         cursor += total_length;
 
         if (payload.len == 0) continue;
-        try parseWrappedEventPayload(allocator, stream_ptr, payload, parsed_headers.event_type, parsed_headers.exception_type, &output, &content_blocks, &tool_calls, &active_blocks, model);
+        parseWrappedEventPayload(allocator, stream_ptr, payload, parsed_headers.event_type, parsed_headers.exception_type, &output, &content_blocks, &tool_calls, &active_blocks, model) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+        };
         if (output.stop_reason == .error_reason and output.error_message != null and stream_ptr.result() != null) return;
     }
 
@@ -875,7 +893,7 @@ fn parseWrappedEventPayload(
     active_blocks: *std.ArrayList(BlockEntry),
     model: types.Model,
 ) !void {
-    var parsed = try json_parse.parseStreamingJson(allocator, payload);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object or !containsKnownEventField(parsed.value)) {
@@ -960,12 +978,17 @@ fn parseTextStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (try streaming.readLine()) |line| {
+    while (true) {
+        const maybe_line = streaming.readLine() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+        };
+        const line = maybe_line orelse break;
         if (isAbortRequested(options)) {
-            output.stop_reason = .aborted;
-            output.error_message = "Request was aborted";
-            stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output });
-            stream_ptr.end(output);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
             return;
         }
 
@@ -974,9 +997,21 @@ fn parseTextStreamLines(
         const payload = if (std.mem.startsWith(u8, trimmed, "data: ")) trimmed[6..] else trimmed;
         if (payload.len == 0) continue;
 
-        var parsed = try json_parse.parseStreamingJson(allocator, payload);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+        };
         defer parsed.deinit();
-        try handleEventValue(allocator, stream_ptr, parsed.value, &output, &content_blocks, &tool_calls, &active_blocks, model);
+        handleEventValue(allocator, stream_ptr, parsed.value, &output, &content_blocks, &tool_calls, &active_blocks, model) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+        };
         if (stream_ptr.result() != null) return;
     }
 
@@ -1277,6 +1312,67 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
     usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+}
+
+fn finalizeOutputFromPartials(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
+) !void {
+    _ = model;
+    while (active_blocks.items.len > 0) {
+        var entry = active_blocks.orderedRemove(0);
+        defer deinitCurrentBlock(allocator, &entry.block);
+        switch (entry.block) {
+            .text => |text| {
+                const owned = try allocator.dupe(u8, text.items);
+                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+                stream_ptr.push(.{ .event_type = .text_end, .content_index = @intCast(entry.event_index), .content = owned });
+            },
+            .thinking => |thinking| {
+                const owned = try allocator.dupe(u8, thinking.text.items);
+                const signature = if (thinking.signature) |value_bytes| try allocator.dupe(u8, value_bytes) else null;
+                try content_blocks.append(allocator, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
+                stream_ptr.push(.{ .event_type = .thinking_end, .content_index = @intCast(entry.event_index), .content = owned });
+            },
+            .tool_call => |tool| {
+                var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
+                defer parsed_arguments.deinit();
+                const final_tool_call = types.ToolCall{
+                    .id = try allocator.dupe(u8, tool.id),
+                    .name = try allocator.dupe(u8, tool.name),
+                    .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
+                };
+                try tool_calls.append(allocator, final_tool_call);
+                try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
+            },
+        }
+    }
+
+    output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
+    output.tool_calls = if (output.tool_calls == null and tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else output.tool_calls;
+    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
+}
+
+fn emitRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
+    err: anyerror,
+) !void {
+    try finalizeOutputFromPartials(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model);
+    output.stop_reason = provider_error.runtimeStopReason(err);
+    output.error_message = provider_error.runtimeErrorMessage(err);
+    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
 }
 
 fn finalizeOutput(
@@ -1736,4 +1832,51 @@ test "parseEventStreamFrames joins split tool call input fragments" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+}
+
+fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {
+    return .{
+        .id = "runtime-test-model",
+        .name = "Runtime Test Model",
+        .api = api,
+        .provider = provider,
+        .base_url = "https://example.test",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
+
+
+test "parseTextStreamLines preserves partial Bedrock text before malformed terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"contentBlockDelta\":{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial\"}}}\n" ++
+            "data: {not-json}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseTextStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("bedrock-converse-stream", "bedrock"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }
