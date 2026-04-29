@@ -123,7 +123,7 @@ pub const AnthropicProvider = struct {
         }
 
         if (response.status != 200) {
-            const response_body = try response.readAll(allocator);
+            const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
             try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
@@ -1159,6 +1159,7 @@ fn parseSseStreamLines(
                 &content_blocks,
                 &tool_calls,
                 &active_blocks,
+                model,
                 context,
                 options,
             ) catch |err| switch (err) {
@@ -1188,6 +1189,7 @@ fn parseSseStreamLines(
             &content_blocks,
             &tool_calls,
             &active_blocks,
+            model,
             context,
             options,
         ) catch |err| switch (err) {
@@ -1198,6 +1200,11 @@ fn parseSseStreamLines(
             },
         };
         if (event_finished) return;
+    }
+
+    if (active_blocks.items.len > 0) {
+        try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, AnthropicError.InvalidAnthropicChunk);
+        return;
     }
 
     if (content_blocks.items.len == 0 and tool_calls.items.len == 0) {
@@ -1315,6 +1322,7 @@ fn processAnthropicSseEvent(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
 ) !bool {
@@ -1323,7 +1331,7 @@ fn processAnthropicSseEvent(
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| {
         if (std.mem.eql(u8, sse_event, "error")) {
-            try emitAnthropicStreamError(allocator, stream_ptr, output, data);
+            try emitAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, data);
             return true;
         }
         return err;
@@ -1334,14 +1342,14 @@ fn processAnthropicSseEvent(
 
     if (std.mem.eql(u8, sse_event, "error")) {
         const error_message = try formatAnthropicStreamError(allocator, value, data);
-        try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+        try emitOwnedAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, error_message);
         return true;
     }
 
     const event_type = value.object.get("type") orelse {
         if (value.object.get("error") != null) {
             const error_message = try formatAnthropicStreamError(allocator, value, data);
-            try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+            try emitOwnedAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, error_message);
             return true;
         }
         return AnthropicError.InvalidAnthropicChunk;
@@ -1401,7 +1409,7 @@ fn processAnthropicSseEvent(
 
     if (std.mem.eql(u8, event_type.string, "error")) {
         const error_message = try formatAnthropicStreamError(allocator, value, data);
-        try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+        try emitOwnedAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, error_message);
         return true;
     }
 
@@ -1412,17 +1420,29 @@ fn emitAnthropicStreamError(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
     data: []const u8,
 ) !void {
-    const error_message = try std.fmt.allocPrint(allocator, "Provider stream error: {s}", .{data});
-    try emitOwnedAnthropicStreamError(stream_ptr, output, error_message);
+    const detail = try provider_error.sanitizeProviderErrorDetail(allocator, data);
+    defer allocator.free(detail);
+    const error_message = try std.fmt.allocPrint(allocator, "Provider stream error: {s}", .{detail});
+    try emitOwnedAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, error_message);
 }
 
 fn emitOwnedAnthropicStreamError(
+    allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
     error_message: []const u8,
 ) !void {
+    try finalizeOutputFromPartials(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model);
     output.stop_reason = .error_reason;
     output.error_message = error_message;
     stream_ptr.push(.{
@@ -1449,14 +1469,18 @@ fn formatAnthropicStreamError(
                     if (message_value == .string) message_value.string else raw
                 else
                     raw;
-                return std.fmt.allocPrint(allocator, "{s}: {s}", .{ error_type, message });
+                const detail = try provider_error.sanitizeProviderErrorDetail(allocator, message);
+                defer allocator.free(detail);
+                return std.fmt.allocPrint(allocator, "{s}: {s}", .{ error_type, detail });
             }
         }
         if (value.object.get("message")) |message_value| {
-            if (message_value == .string) return allocator.dupe(u8, message_value.string);
+            if (message_value == .string) return provider_error.sanitizeProviderErrorDetail(allocator, message_value.string);
         }
     }
-    return std.fmt.allocPrint(allocator, "Provider stream error: {s}", .{raw});
+    const detail = try provider_error.sanitizeProviderErrorDetail(allocator, raw);
+    defer allocator.free(detail);
+    return std.fmt.allocPrint(allocator, "Provider stream error: {s}", .{detail});
 }
 
 fn handleContentBlockStart(
@@ -2488,4 +2512,100 @@ test "parseSseStreamLines preserves partial Anthropic text before malformed term
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseSseStreamLines finalizes partial Anthropic blocks before provider error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "event: message_start\n" ++
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"anthropic-provider-error\"}}\n\n" ++
+            "event: content_block_start\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial text\"}}\n\n" ++
+            "event: content_block_start\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"partial thought\"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-1\"}}\n\n" ++
+            "event: content_block_start\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"todoWrite\",\"input\":{}}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"todos\\\":\\\"item\\\"}\"}}\n\n" ++
+            "event: error\n" ++
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider failed with sk-anthropic-secret at /Users/alice/file.zig\"}}\n\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+    const context = types.Context{ .messages = &[_]types.Message{} };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("anthropic-messages", "anthropic"), context, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_delta, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_delta, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, stream.next().?.event_type);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial text", text_end.content.?);
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqualStrings("partial thought", thinking_end.content.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqualStrings("todoWrite", tool_end.tool_call.?.name);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("anthropic-provider-error", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial text", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("partial thought", terminal.message.?.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("sig-1", terminal.message.?.content[1].thinking.signature.?);
+    try std.testing.expectEqualStrings("item", terminal.message.?.tool_calls.?[0].arguments.object.get("todos").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "sk-anthropic-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "parseSseStreamLines finalizes partial Anthropic text before EOF terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "event: content_block_start\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial before eof\"}}\n\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+    const context = types.Context{ .messages = &[_]types.Message{} };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("anthropic-messages", "anthropic"), context, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_delta, stream.next().?.event_type);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial before eof", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("partial before eof", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
 }

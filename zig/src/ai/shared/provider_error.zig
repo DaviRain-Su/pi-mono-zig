@@ -2,7 +2,8 @@ const std = @import("std");
 const event_stream = @import("../event_stream.zig");
 const types = @import("../types.zig");
 
-const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 512;
+pub const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 512;
+pub const MAX_PROVIDER_ERROR_BODY_READ_BYTES: usize = MAX_PROVIDER_ERROR_BODY_BYTES + 1;
 
 pub fn formatHttpStatusError(
     allocator: std.mem.Allocator,

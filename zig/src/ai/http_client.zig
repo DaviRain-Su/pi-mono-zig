@@ -103,6 +103,57 @@ pub const StreamingResponse = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    /// Consume up to max_bytes from the rest of the stream into a single buffer.
+    /// This is intended for provider error bodies where callers only need enough
+    /// bytes for bounded diagnostics and should not read an unbounded response.
+    pub fn readAllBounded(self: *StreamingResponse, allocator: std.mem.Allocator, max_bytes: usize) ![]const u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+
+        if (max_bytes == 0) {
+            self.done = true;
+            return result.toOwnedSlice(allocator);
+        }
+
+        if (self.reader == null) {
+            if (self.pos >= self.body.len) {
+                self.done = true;
+                return result.toOwnedSlice(allocator);
+            }
+            const remaining = self.body[self.pos..];
+            const copy_len = @min(remaining.len, max_bytes);
+            try result.appendSlice(allocator, remaining[0..copy_len]);
+            self.pos += copy_len;
+            if (self.pos >= self.body.len or result.items.len >= max_bytes) self.done = true;
+            return result.toOwnedSlice(allocator);
+        }
+
+        try self.ensureWatchdogStarted();
+        const reader = self.reader.?;
+        while (result.items.len < max_bytes) {
+            if (self.currentTerminationReason()) |reason| {
+                self.done = true;
+                return terminationError(reason);
+            }
+
+            const byte = reader.takeByte() catch |err| {
+                if (self.currentTerminationReason()) |reason| {
+                    self.done = true;
+                    return terminationError(reason);
+                }
+                if (err == error.EndOfStream) {
+                    self.done = true;
+                    break;
+                }
+                return err;
+            };
+            try result.append(allocator, byte);
+        }
+
+        if (result.items.len >= max_bytes) self.done = true;
+        return result.toOwnedSlice(allocator);
+    }
+
     fn readBufferedLine(self: *StreamingResponse) !?[]const u8 {
         if (self.pos >= self.body.len) {
             self.done = true;
@@ -558,6 +609,27 @@ test "StreamingResponse readAll" {
     defer allocator.free(all);
 
     try std.testing.expectEqualStrings("line1\nline2\nline3\n", all);
+}
+
+test "StreamingResponse readAllBounded caps buffered body" {
+    const allocator = std.testing.allocator;
+
+    const body = try allocator.dupe(u8, "0123456789abcdef");
+
+    var stream = StreamingResponse{
+        .status = 500,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer stream.deinit();
+
+    const bounded = try stream.readAllBounded(allocator, 6);
+    defer allocator.free(bounded);
+
+    try std.testing.expectEqualStrings("012345", bounded);
+    try std.testing.expect(stream.done);
+    try std.testing.expectEqual(@as(usize, 6), stream.pos);
 }
 
 test "StreamingResponse empty body" {

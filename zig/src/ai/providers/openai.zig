@@ -52,7 +52,7 @@ pub const OpenAIProvider = struct {
         defer streaming.deinit();
 
         if (streaming.status != 200) {
-            const response_body = try streaming.readAll(allocator);
+            const response_body = try streaming.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
             try provider_error.pushHttpStatusError(allocator, &event_stream_instance, model, streaming.status, response_body);
             return event_stream_instance;
