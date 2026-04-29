@@ -861,7 +861,11 @@ fn finalizeCurrentBlock(
                     .arguments = arguments,
                 };
                 try tool_calls.append(allocator, stored_tool_call);
-                try content_blocks.append(allocator, .{ .text = .{ .text = "" } });
+                try content_blocks.append(allocator, .{ .tool_call = .{
+                    .id = try allocator.dupe(u8, stored_tool_call.id),
+                    .name = try allocator.dupe(u8, stored_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
+                } });
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),

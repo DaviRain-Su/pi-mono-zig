@@ -359,11 +359,11 @@ fn cloneContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) !t
         .thinking => |thinking| blk: {
             const signature = types.thinkingSignature(thinking);
             break :blk .{ .thinking = .{
-            .thinking = try allocator.dupe(u8, thinking.thinking),
-            .thinking_signature = if (signature) |value| try allocator.dupe(u8, value) else null,
-            .signature = if (signature) |value| try allocator.dupe(u8, value) else null,
-            .redacted = thinking.redacted,
-        } };
+                .thinking = try allocator.dupe(u8, thinking.thinking),
+                .thinking_signature = if (signature) |value| try allocator.dupe(u8, value) else null,
+                .signature = if (signature) |value| try allocator.dupe(u8, value) else null,
+                .redacted = thinking.redacted,
+            } };
         },
         .tool_call => |tool_call| .{ .tool_call = try cloneToolCall(allocator, tool_call) },
     };
@@ -645,7 +645,7 @@ test "transformMessages normalizes cross model tool call ids and matching tool r
     try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[1].tool_result.tool_call_id);
 }
 
-test "transformMessages inserts synthetic tool results for orphaned calls and drops errored assistants" {
+test "transformMessages inserts synthetic tool results for orphaned calls and drops errored or aborted assistants" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "claude-sonnet",
@@ -684,10 +684,26 @@ test "transformMessages inserts synthetic tool results for orphaned calls and dr
         .timestamp = 6,
     };
 
+    const aborted_assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .tool_call = .{
+            .id = "aborted-tool",
+            .name = "lookup",
+            .arguments = .null,
+        } }},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "claude-sonnet",
+        .usage = types.Usage.init(),
+        .stop_reason = .aborted,
+        .error_message = "aborted",
+        .timestamp = 8,
+    };
+
     const transformed = try transformMessages(allocator, &[_]types.Message{
         .{ .assistant = orphaned_assistant },
         .{ .user = .{ .content = &[_]types.ContentBlock{.{ .text = .{ .text = "next" } }}, .timestamp = 7 } },
         .{ .assistant = errored_assistant },
+        .{ .assistant = aborted_assistant },
     }, model, null);
     defer freeMessages(allocator, transformed);
 

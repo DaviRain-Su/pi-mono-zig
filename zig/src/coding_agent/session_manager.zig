@@ -1870,7 +1870,7 @@ fn appendOwnedVisibleMessage(
     var owned = message;
     switch (message) {
         .assistant => |assistant_message| {
-            if (assistant_message.stop_reason == .error_reason) {
+            if (assistant_message.stop_reason == .error_reason or assistant_message.stop_reason == .aborted) {
                 deinitMessage(allocator, &owned);
                 return;
             }
@@ -3061,6 +3061,43 @@ test "session manager persists messages to jsonl and resumes from disk" {
     try std.testing.expectEqual(tool_result_timestamp, context.messages[2].tool_result.timestamp);
     try std.testing.expectEqualStrings("faux", context.model.?.provider);
     try std.testing.expectEqualStrings("faux-session", context.model.?.model_id);
+}
+
+test "session context excludes aborted assistant messages from replay" {
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var manager = try SessionManager.inMemory(std.testing.allocator, std.testing.io, "/tmp/project");
+    defer manager.deinit();
+
+    var user = try userTextMessage(std.testing.allocator, "hello", 1);
+    defer deinitMessage(std.testing.allocator, &user);
+    _ = try manager.appendMessage(user);
+
+    var aborted = try assistantTextMessage(std.testing.allocator, "partial signed output", model, 2);
+    defer deinitMessage(std.testing.allocator, &aborted);
+    aborted.assistant.stop_reason = .aborted;
+    aborted.assistant.error_message = try std.testing.allocator.dupe(u8, "aborted");
+    _ = try manager.appendMessage(aborted);
+
+    var next = try userTextMessage(std.testing.allocator, "continue", 3);
+    defer deinitMessage(std.testing.allocator, &next);
+    _ = try manager.appendMessage(next);
+
+    var context = try manager.buildSessionContext(std.testing.allocator);
+    defer context.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqualStrings("hello", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("continue", context.messages[1].user.content[0].text.text);
 }
 
 test "session manager persists session names and labels" {

@@ -516,9 +516,11 @@ fn finishCurrentBlock(
                     .arguments = args,
                 };
                 try tool_calls.append(allocator, final_tool_call);
-                try content_blocks.append(allocator, types.ContentBlock{
-                    .text = .{ .text = "" }, // Placeholder - tool calls stored separately
-                });
+                try content_blocks.append(allocator, types.ContentBlock{ .tool_call = .{
+                    .id = try allocator.dupe(u8, final_tool_call.id),
+                    .name = try allocator.dupe(u8, final_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+                } });
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(content_blocks.items.len - 1),
@@ -2044,6 +2046,10 @@ test "parseSseStream with tool calls" {
     try std.testing.expectEqual(@as(usize, 1), event5.message.?.tool_calls.?.len);
     try std.testing.expectEqualStrings("call_123", event5.message.?.tool_calls.?[0].id);
     try std.testing.expectEqualStrings("get_weather", event5.message.?.tool_calls.?[0].name);
+    try std.testing.expectEqual(@as(usize, 1), event5.message.?.content.len);
+    try std.testing.expect(event5.message.?.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("call_123", event5.message.?.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("NYC", event5.message.?.content[0].tool_call.arguments.object.get("city").?.string);
 }
 
 test "parseSseStream with reasoning content" {
