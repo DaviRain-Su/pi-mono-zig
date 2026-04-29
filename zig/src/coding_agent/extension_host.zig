@@ -191,6 +191,7 @@ pub const ProtocolState = struct {
     allocator: std.mem.Allocator,
     ready_seen: bool = false,
     shutdown_complete_seen: bool = false,
+    pending_requests_closed: bool = false,
     pending_request_ids: std.StringHashMap(void),
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     ui_requests: std.ArrayList(ExtensionUiRequest) = .empty,
@@ -232,6 +233,7 @@ pub const ProtocolState = struct {
                     try self.addDiagnostic(.host_error, .@"error", "host emitted UI request before readiness");
                     return;
                 }
+                if (self.pending_requests_closed) return;
                 if (request.response_required) {
                     if (self.pending_request_ids.contains(request.id)) {
                         try self.addDiagnostic(.duplicate_pending_request, .@"error", "host emitted duplicate pending request id");
@@ -255,6 +257,11 @@ pub const ProtocolState = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.pending_request_ids.clearRetainingCapacity();
+    }
+
+    pub fn closePendingRequests(self: *ProtocolState) void {
+        self.clearPendingRequests();
+        self.pending_requests_closed = true;
     }
 
     pub fn pendingCount(self: *const ProtocolState) usize {
@@ -415,7 +422,7 @@ pub const HostProcess = struct {
             const ready = self.state.ready_seen;
             self.mutex.unlock(self.io);
             if (ready) return;
-            if (self.wait_done.load(.seq_cst)) break;
+            if (self.wait_done.load(.seq_cst) and self.reader_done.load(.seq_cst)) break;
             std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
         }
         return error.HostNotReady;
@@ -431,6 +438,16 @@ pub const HostProcess = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.state.diagnostics.items.len;
+    }
+
+    pub fn diagnosticCategoryCount(self: *HostProcess, category: DiagnosticCategory) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var count: usize = 0;
+        for (self.state.diagnostics.items) |diagnostic| {
+            if (diagnostic.category == category) count += 1;
+        }
+        return count;
     }
 
     pub fn hasShutdownComplete(self: *HostProcess) bool {
@@ -485,7 +502,7 @@ pub const HostProcess = struct {
     fn markExited(self: *HostProcess) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.state.clearPendingRequests();
+        self.state.closePendingRequests();
         if (!self.shutdown_requested.load(.seq_cst) and !self.exit_recorded) {
             self.state.addDiagnostic(.host_exit, .@"error", "extension host exited before shutdown") catch {};
         }
@@ -785,6 +802,12 @@ test "M6 host lifecycle contains unexpected exit without respawn and clears pend
     try std.testing.expectEqual(@as(usize, 1), host.start_count);
     try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
     try std.testing.expect(host.diagnosticCount() >= 1);
+    while (!host.reader_done.load(.seq_cst) and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(host.reader_done.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), host.diagnosticCategoryCount(.host_exit));
 }
 
 test "M6 host lifecycle reports startup failure deterministically" {
