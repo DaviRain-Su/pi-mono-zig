@@ -1160,24 +1160,38 @@ fn buildAssistantMessageValue(
                 var thought_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try thought_part.put(allocator, try allocator.dupe(u8, "thought"), .{ .bool = true });
                 try thought_part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
-                if (thinking.signature) |signature| {
+                if (types.thinkingSignature(thinking)) |signature| {
                     try thought_part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
                 }
                 try parts.append(.{ .object = thought_part });
             },
             .image => {},
+            .tool_call => |tool_call| {
+                var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+
+                var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                if (tool_call.thought_signature) |signature| {
+                    try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                }
+                try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
+                try parts.append(.{ .object = part });
+            },
         }
     }
 
-    if (assistant.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| {
-            var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-            try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+    if (!types.hasInlineToolCalls(assistant)) {
+        if (assistant.tool_calls) |tool_calls| {
+            for (tool_calls) |tool_call| {
+                var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
 
-            var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
-            try parts.append(.{ .object = part });
+                var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
+                try parts.append(.{ .object = part });
+            }
         }
     }
 
@@ -1253,7 +1267,7 @@ fn buildPartsArray(
                     inserted_placeholder = true;
                 }
             },
-            .thinking => {},
+            .thinking, .tool_call => {},
         }
     }
 
@@ -1309,6 +1323,7 @@ fn buildToolResultText(
                 try text.appendSlice(allocator, thinking.thinking);
                 has_text = true;
             },
+            .tool_call => {},
         }
     }
 

@@ -857,6 +857,12 @@ fn writeContentBlocksHtml(writer: *std.Io.Writer, blocks: []const ai.ContentBloc
                 try writer.writeAll("</figcaption></figure>");
                 wrote_any = true;
             },
+            .tool_call => |tool_call| {
+                try writer.writeAll("<pre class=\"tool-preview\">");
+                try writeEscapedHtml(writer, tool_call.name);
+                try writer.writeAll("</pre>");
+                wrote_any = true;
+            },
         }
     }
 
@@ -1056,6 +1062,13 @@ fn blocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) !
                 try writer.writer.print("![image](data:{s};base64,{s})", .{ image.mime_type, image.data });
                 wrote_any = true;
             },
+            .tool_call => |tool_call| {
+                if (wrote_any) try writer.writer.writeAll("\n");
+                const args = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{ .whitespace = .indent_2 });
+                defer allocator.free(args);
+                try writer.writer.print("- `{s}` `{s}`\n```json\n{s}\n```", .{ tool_call.name, tool_call.id, args });
+                wrote_any = true;
+            },
         }
     }
 
@@ -1089,10 +1102,12 @@ fn estimateMessageTokens(message: agent.AgentMessage) u32 {
         .assistant => |assistant_message| {
             if (assistant_message.stop_reason == .error_reason) return 0;
             chars += estimateContentBlockChars(assistant_message.content);
-            if (assistant_message.tool_calls) |calls| {
-                for (calls) |call| {
-                    chars += call.name.len;
-                    chars += jsonValueCharCount(call.arguments);
+            if (!ai.hasInlineToolCalls(assistant_message)) {
+                if (assistant_message.tool_calls) |calls| {
+                    for (calls) |call| {
+                        chars += call.name.len;
+                        chars += jsonValueCharCount(call.arguments);
+                    }
                 }
             }
         },
@@ -1108,6 +1123,10 @@ fn estimateContentBlockChars(blocks: []const ai.ContentBlock) usize {
             .text => |text| chars += text.text.len,
             .thinking => |thinking| chars += thinking.thinking.len,
             .image => chars += 4800,
+            .tool_call => |tool_call| {
+                chars += tool_call.name.len;
+                chars += jsonValueCharCount(tool_call.arguments);
+            },
         }
     }
     return chars;

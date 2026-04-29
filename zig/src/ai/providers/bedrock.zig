@@ -281,7 +281,7 @@ fn buildUserMessageValue(allocator: std.mem.Allocator, user: types.UserMessage) 
                 try content.append(try buildTextBlockObject(allocator, text.text));
             },
             .image => try content.append(try buildTextBlockObject(allocator, "(image omitted: binary Bedrock image upload not implemented)")),
-            .thinking => {},
+            .thinking, .tool_call => {},
         }
     }
 
@@ -301,7 +301,7 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, assistant: types.Ass
             },
             .thinking => |thinking| {
                 if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
-                if (thinking.signature) |signature| {
+                if (types.thinkingSignature(thinking)) |signature| {
                     var reasoning_text = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                     try reasoning_text.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
                     try reasoning_text.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, signature) });
@@ -317,19 +317,31 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, assistant: types.Ass
                 }
             },
             .image => {},
+            .tool_call => |tool_call| {
+                var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
+                try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
+                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+
+                var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
+                try content.append(.{ .object = object });
+            },
         }
     }
 
-    if (assistant.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| {
-            var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
-            try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-            try tool_use.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+    if (!types.hasInlineToolCalls(assistant)) {
+        if (assistant.tool_calls) |tool_calls| {
+            for (tool_calls) |tool_call| {
+                var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
+                try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
+                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
 
-            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
-            try content.append(.{ .object = object });
+                var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
+                try content.append(.{ .object = object });
+            }
         }
     }
 
@@ -355,6 +367,7 @@ fn buildToolResultMessageValue(
                         .text => |text| try tool_result_blocks.append(try buildTextBlockObject(allocator, text.text)),
                         .image => try tool_result_blocks.append(try buildTextBlockObject(allocator, "(image omitted)")),
                         .thinking => |thinking| try tool_result_blocks.append(try buildTextBlockObject(allocator, thinking.thinking)),
+                        .tool_call => {},
                     }
                 }
                 if (tool_result_blocks.items.len == 0) {

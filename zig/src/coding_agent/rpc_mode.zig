@@ -736,6 +736,7 @@ fn blocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) !
                 defer allocator.free(placeholder);
                 try out.appendSlice(allocator, placeholder);
             },
+            .tool_call => |tool_call| try out.appendSlice(allocator, tool_call.name),
         }
     }
 

@@ -1155,21 +1155,27 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
     freeJsonValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
     for (message.content) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
             },
             .image => |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
             },
+            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
         }
     }
     allocator.free(message.content);

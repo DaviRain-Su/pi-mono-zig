@@ -259,7 +259,7 @@ fn buildUserMessage(
                     try part.put(allocator, try allocator.dupe(u8, "image_url"), .{ .object = image_value });
                     try content.append(.{ .object = part });
                 },
-                .thinking => {},
+                .thinking, .tool_call => {},
             }
         }
 
@@ -285,7 +285,7 @@ fn buildUserMessage(
                     try text.appendSlice(allocator, "(image omitted: model does not support images)");
                 }
             },
-            .thinking => {},
+            .thinking, .tool_call => {},
         }
     }
 
@@ -317,7 +317,7 @@ fn buildAssistantMessage(
                 if (reasoning.items.len > 0) try reasoning.appendSlice(allocator, "\n");
                 try reasoning.appendSlice(allocator, thinking.thinking);
             },
-            .image => {},
+            .image, .tool_call => {},
         }
     }
 
@@ -377,8 +377,7 @@ fn buildToolResultMessage(
                 if (content.items.len > 0) try content.appendSlice(allocator, "\n");
                 try content.appendSlice(allocator, text.text);
             },
-            .image => {},
-            .thinking => {},
+            .image, .thinking, .tool_call => {},
         }
     }
 
@@ -938,18 +937,24 @@ fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) v
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
     freeJsonValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
     for (message.content) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
             },
             .image => {},
+            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
         }
     }
     allocator.free(message.content);

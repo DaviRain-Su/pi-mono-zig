@@ -753,6 +753,10 @@ fn estimateMessageTokens(message: agent.AgentMessage) u32 {
                     .text => |text| chars += text.text.len,
                     .image => chars += 4800,
                     .thinking => |thinking| chars += thinking.thinking.len,
+                    .tool_call => |tool_call| {
+                        chars += tool_call.name.len;
+                        chars += jsonValueCharCount(tool_call.arguments);
+                    },
                 }
             }
         },
@@ -763,12 +767,18 @@ fn estimateMessageTokens(message: agent.AgentMessage) u32 {
                     .text => |text| chars += text.text.len,
                     .image => chars += 4800,
                     .thinking => |thinking| chars += thinking.thinking.len,
+                    .tool_call => |tool_call| {
+                        chars += tool_call.name.len;
+                        chars += jsonValueCharCount(tool_call.arguments);
+                    },
                 }
             }
-            if (assistant_message.tool_calls) |tool_calls| {
-                for (tool_calls) |tool_call| {
-                    chars += tool_call.name.len;
-                    chars += jsonValueCharCount(tool_call.arguments);
+            if (!ai.hasInlineToolCalls(assistant_message)) {
+                if (assistant_message.tool_calls) |tool_calls| {
+                    for (tool_calls) |tool_call| {
+                        chars += tool_call.name.len;
+                        chars += jsonValueCharCount(tool_call.arguments);
+                    }
                 }
             }
         },
@@ -778,6 +788,10 @@ fn estimateMessageTokens(message: agent.AgentMessage) u32 {
                     .text => |text| chars += text.text.len,
                     .image => chars += 4800,
                     .thinking => |thinking| chars += thinking.thinking.len,
+                    .tool_call => |tool_call| {
+                        chars += tool_call.name.len;
+                        chars += jsonValueCharCount(tool_call.arguments);
+                    },
                 }
             }
         },

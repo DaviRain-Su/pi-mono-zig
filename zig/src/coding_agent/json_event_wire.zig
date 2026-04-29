@@ -730,7 +730,8 @@ fn assistantMessageToJsonValue(allocator: std.mem.Allocator, assistant: ai.Assis
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
     try putStringField(&object, allocator, "role", "assistant");
-    try putField(&object, allocator, "content", try contentBlocksToJsonValue(allocator, assistant.content, true, assistant.tool_calls));
+    const mirror_tool_calls = if (ai.hasInlineToolCalls(assistant)) null else assistant.tool_calls;
+    try putField(&object, allocator, "content", try contentBlocksToJsonValue(allocator, assistant.content, true, mirror_tool_calls));
     try putStringField(&object, allocator, "api", assistant.api);
     try putStringField(&object, allocator, "provider", assistant.provider);
     try putStringField(&object, allocator, "model", assistant.model);
@@ -776,6 +777,9 @@ fn contentBlocksToJsonValue(
             .text => |text| {
                 try putStringField(&object, allocator, "type", "text");
                 try putStringField(&object, allocator, "text", text.text);
+                if (text.text_signature) |signature| {
+                    try putStringField(&object, allocator, "textSignature", signature);
+                }
             },
             .image => |image| {
                 try putStringField(&object, allocator, "type", "image");
@@ -785,12 +789,17 @@ fn contentBlocksToJsonValue(
             .thinking => |thinking| {
                 try putStringField(&object, allocator, "type", "thinking");
                 try putStringField(&object, allocator, "thinking", thinking.thinking);
-                if (thinking.signature) |signature| {
+                if (ai.thinkingSignature(thinking)) |signature| {
                     try putStringField(&object, allocator, "thinkingSignature", signature);
                 }
                 if (thinking.redacted) {
                     try putBoolField(&object, allocator, "redacted", true);
                 }
+            },
+            .tool_call => |tool_call| {
+                common.deinitJsonValue(allocator, .{ .object = object });
+                try array.append(try toolCallToJsonValue(allocator, tool_call));
+                continue;
             },
         }
         try array.append(.{ .object = object });
@@ -836,6 +845,9 @@ fn toolCallToJsonValue(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !st
     try putStringField(&object, allocator, "id", tool_call.id);
     try putStringField(&object, allocator, "name", tool_call.name);
     try putField(&object, allocator, "arguments", try common.cloneJsonValue(allocator, tool_call.arguments));
+    if (tool_call.thought_signature) |signature| {
+        try putStringField(&object, allocator, "thoughtSignature", signature);
+    }
     return .{ .object = object };
 }
 

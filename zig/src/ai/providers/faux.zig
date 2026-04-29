@@ -296,6 +296,10 @@ fn contentToText(allocator: std.mem.Allocator, content: []const types.ContentBlo
             .text => |text| try writer.writeAll(text.text),
             .image => |image| try writer.print("[image:{s}:{d}]", .{ image.mime_type, image.data.len }),
             .thinking => |thinking| try writer.writeAll(thinking.thinking),
+            .tool_call => |tool_call| {
+                try writer.print("{s}:", .{tool_call.name});
+                try writeJsonString(writer, tool_call.arguments);
+            },
         }
     }
 
@@ -334,11 +338,13 @@ fn messageToText(allocator: std.mem.Allocator, message: types.Message) ![]u8 {
             defer allocator.free(content_text);
             try writer.writeAll(content_text);
 
-            if (assistant.tool_calls) |tool_calls| {
-                for (tool_calls) |tool_call| {
-                    if (out.written().len > 0) try writer.writeAll("\n");
-                    try writer.print("{s}:", .{tool_call.name});
-                    try writeJsonString(writer, tool_call.arguments);
+            if (!types.hasInlineToolCalls(assistant)) {
+                if (assistant.tool_calls) |tool_calls| {
+                    for (tool_calls) |tool_call| {
+                        if (out.written().len > 0) try writer.writeAll("\n");
+                        try writer.print("{s}:", .{tool_call.name});
+                        try writeJsonString(writer, tool_call.arguments);
+                    }
                 }
             }
 
@@ -515,15 +521,20 @@ fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
 fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const types.ContentBlock) void {
     for (blocks) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .image => |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
             },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
             },
+            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
         }
     }
     allocator.free(blocks);
@@ -532,15 +543,20 @@ fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const types.Conte
 fn deinitContentBlocksPartial(allocator: std.mem.Allocator, allocated: []const types.ContentBlock, initialized_len: usize) void {
     for (allocated[0..initialized_len]) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .image => |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
             },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
             },
+            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
         }
     }
     allocator.free(allocated);
@@ -548,20 +564,23 @@ fn deinitContentBlocksPartial(allocator: std.mem.Allocator, allocated: []const t
 
 fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const types.ToolCall) void {
     for (tool_calls) |tool_call| {
-        allocator.free(tool_call.id);
-        allocator.free(tool_call.name);
-        deinitJsonValue(allocator, tool_call.arguments);
+        deinitToolCall(allocator, tool_call);
     }
     allocator.free(tool_calls);
 }
 
 fn deinitToolCallsPartial(allocator: std.mem.Allocator, allocated: []const types.ToolCall, initialized_len: usize) void {
     for (allocated[0..initialized_len]) |tool_call| {
-        allocator.free(tool_call.id);
-        allocator.free(tool_call.name);
-        deinitJsonValue(allocator, tool_call.arguments);
+        deinitToolCall(allocator, tool_call);
     }
     allocator.free(allocated);
+}
+
+fn deinitToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
+    deinitJsonValue(allocator, tool_call.arguments);
 }
 
 fn deinitAssistantMessage(allocator: std.mem.Allocator, message: *types.AssistantMessage) void {
@@ -613,9 +632,9 @@ fn buildStreamPlan(
     var tool_call_count: usize = 0;
     for (response.content) |block| {
         switch (block) {
-            .text, .thinking => content_count += 1,
-            .tool_call => tool_call_count += 1,
+            .text, .thinking, .tool_call => content_count += 1,
         }
+        if (block == .tool_call) tool_call_count += 1;
     }
 
     const content_blocks = try allocator.alloc(types.ContentBlock, content_count);
@@ -650,6 +669,13 @@ fn buildStreamPlan(
                 };
                 const finalized_tool_call = tool_calls.?[tool_call_index];
                 const serialized_arguments = try std.json.Stringify.valueAlloc(allocator, finalized_tool_call.arguments, .{});
+                content_blocks[content_index] = .{ .tool_call = .{
+                    .id = try allocator.dupe(u8, finalized_tool_call.id),
+                    .name = try allocator.dupe(u8, finalized_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, finalized_tool_call.arguments),
+                    .thought_signature = if (finalized_tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+                } };
+                content_index += 1;
 
                 blocks[index] = .{ .tool_call = .{
                     .id = finalized_tool_call.id,

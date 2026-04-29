@@ -292,6 +292,11 @@ fn blocksToTextFiltered(allocator: std.mem.Allocator, blocks: []const ai.Content
                 try out.appendSlice(allocator, note);
                 appended = true;
             },
+            .tool_call => |tool_call| {
+                if (appended) try out.appendSlice(allocator, "\n");
+                try out.appendSlice(allocator, tool_call.name);
+                appended = true;
+            },
         }
     }
 

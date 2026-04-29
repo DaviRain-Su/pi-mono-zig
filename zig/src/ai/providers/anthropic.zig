@@ -1829,7 +1829,7 @@ fn buildUserMessageValue(allocator: std.mem.Allocator, user: types.UserMessage) 
                 try object.put(allocator, try allocator.dupe(u8, "source"), .{ .object = source });
                 try content.append(.{ .object = object });
             },
-            .thinking => {},
+            .thinking, .tool_call => {},
         }
     }
 
@@ -1854,35 +1854,46 @@ fn buildAssistantMessageValue(
                 try content.append(try buildTextBlockObject(allocator, text.text, null));
             },
             .thinking => |thinking| {
+                const signature = types.thinkingSignature(thinking);
                 if (thinking.redacted) {
                     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "redacted_thinking") });
-                    try object.put(allocator, try allocator.dupe(u8, "data"), .{ .string = try allocator.dupe(u8, thinking.signature orelse "") });
+                    try object.put(allocator, try allocator.dupe(u8, "data"), .{ .string = try allocator.dupe(u8, signature orelse "") });
                     try content.append(.{ .object = object });
                     continue;
                 }
-                if (thinking.signature) |signature| {
+                if (signature) |value| {
                     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "thinking") });
                     try object.put(allocator, try allocator.dupe(u8, "thinking"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
-                    try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, signature) });
+                    try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, value) });
                     try content.append(.{ .object = object });
                 } else {
                     try content.append(try buildTextBlockObject(allocator, thinking.thinking, null));
                 }
             },
             .image => {},
+            .tool_call => |tool_call| {
+                var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool_use") });
+                try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
+                try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(tool_call.name) else tool_call.name) });
+                try object.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+                try content.append(.{ .object = object });
+            },
         }
     }
 
-    if (assistant.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| {
-            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool_use") });
-            try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
-            try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(tool_call.name) else tool_call.name) });
-            try object.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
-            try content.append(.{ .object = object });
+    if (!types.hasInlineToolCalls(assistant)) {
+        if (assistant.tool_calls) |tool_calls| {
+            for (tool_calls) |tool_call| {
+                var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool_use") });
+                try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
+                try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(tool_call.name) else tool_call.name) });
+                try object.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+                try content.append(.{ .object = object });
+            }
         }
     }
 
@@ -1961,6 +1972,7 @@ fn buildToolResultContentValue(allocator: std.mem.Allocator, content: []const ty
                 try array.append(.{ .object = object });
             },
             .thinking => |thinking| try array.append(try buildTextBlockObject(allocator, thinking.thinking, null)),
+            .tool_call => {},
         }
     }
     return .{ .array = array };
@@ -2379,21 +2391,27 @@ fn drainStreamAndFreeDoneMessage(
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
     freeJsonValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
     for (message.content) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
             .thinking => |thinking| {
                 allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
                 if (thinking.signature) |signature| allocator.free(signature);
             },
             .image => |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
             },
+            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
         }
     }
     if (message.content.len > 0) allocator.free(message.content);
