@@ -152,6 +152,7 @@ const StreamPlanToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments: std.json.Value,
+    thought_signature: ?[]const u8 = null,
     serialized_arguments: []const u8,
 };
 
@@ -666,6 +667,7 @@ fn buildStreamPlan(
                     .id = try allocator.dupe(u8, tool_call.id),
                     .name = try allocator.dupe(u8, tool_call.name),
                     .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+                    .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
                 };
                 const finalized_tool_call = tool_calls.?[tool_call_index];
                 const serialized_arguments = try std.json.Stringify.valueAlloc(allocator, finalized_tool_call.arguments, .{});
@@ -681,6 +683,7 @@ fn buildStreamPlan(
                     .id = finalized_tool_call.id,
                     .name = finalized_tool_call.name,
                     .arguments = finalized_tool_call.arguments,
+                    .thought_signature = finalized_tool_call.thought_signature,
                     .serialized_arguments = serialized_arguments,
                 } };
                 tool_call_index += 1;
@@ -859,6 +862,7 @@ fn runStreamPlan(plan: *StreamPlan) void {
                         .id = tool_call.id,
                         .name = tool_call.name,
                         .arguments = tool_call.arguments,
+                        .thought_signature = tool_call.thought_signature,
                     },
                 });
             },
@@ -1123,6 +1127,58 @@ test "registerFauxProvider queues responses and estimates usage" {
     try std.testing.expectEqual(types.StopReason.error_reason, exhausted.stop_reason);
     try std.testing.expectEqualStrings("No more faux responses queued", exhausted.error_message.?);
     try std.testing.expectEqual(@as(usize, 3), registration.state.call_count);
+}
+
+test "VAL-MSG-002 VAL-MSG-011 faux tool-call thought signature mirrors inline and legacy content" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try arguments.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
+    const arguments_value = std.json.Value{ .object = arguments };
+    defer deinitJsonValue(allocator, arguments_value);
+
+    const tool_call = types.ToolCall{
+        .id = "tool-1",
+        .name = "get_weather",
+        .arguments = arguments_value,
+        .thought_signature = "faux-tool-thought-sig",
+    };
+    const content = [_]FauxContentBlock{.{ .tool_call = tool_call }};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(content[0..], .{ .stop_reason = .tool_use }) },
+    });
+
+    var stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), .{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "weather" } }},
+            .timestamp = 1,
+        } }},
+    }, null);
+    defer stream.deinit();
+
+    var saw_tool_end = false;
+    var saw_done = false;
+    while (stream.next()) |event| {
+        defer event.deinitTransient(allocator);
+        if (event.event_type == .toolcall_end) {
+            saw_tool_end = true;
+            try std.testing.expectEqualStrings("faux-tool-thought-sig", event.tool_call.?.thought_signature.?);
+        } else if (event.event_type == .done) {
+            saw_done = true;
+        }
+    }
+    try std.testing.expect(saw_tool_end);
+    try std.testing.expect(saw_done);
+
+    var result = stream.result().?;
+    defer deinitAssistantMessage(allocator, &result);
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expect(result.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("faux-tool-thought-sig", result.content[0].tool_call.thought_signature.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.?.len);
+    try std.testing.expectEqualStrings("faux-tool-thought-sig", result.tool_calls.?[0].thought_signature.?);
 }
 
 test "registerFauxProvider aborts mid-stream and stops emitting events" {

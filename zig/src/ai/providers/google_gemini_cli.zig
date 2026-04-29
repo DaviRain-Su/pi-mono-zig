@@ -115,7 +115,10 @@ pub const GoogleGeminiCliProvider = struct {
 };
 
 const CurrentBlock = union(enum) {
-    text: std.ArrayList(u8),
+    text: struct {
+        text: std.ArrayList(u8),
+        signature: ?[]const u8,
+    },
     thinking: struct {
         text: std.ArrayList(u8),
         signature: ?[]const u8,
@@ -353,7 +356,7 @@ fn parseSseStreamLines(
                                         current_block = if (is_thinking)
                                             .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
                                         else
-                                            .{ .text = std.ArrayList(u8).empty };
+                                            .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
                                         stream_ptr.push(.{
                                             .event_type = if (is_thinking) .thinking_start else .text_start,
                                             .content_index = @intCast(content_blocks.items.len),
@@ -362,7 +365,15 @@ fn parseSseStreamLines(
 
                                     if (current_block) |*block| {
                                         switch (block.*) {
-                                            .text => |*text| try text.appendSlice(allocator, text_value.string),
+                                            .text => |*text| {
+                                                try text.text.appendSlice(allocator, text_value.string);
+                                                if (part.object.get("thoughtSignature")) |signature_value| {
+                                                    if (signature_value == .string and signature_value.string.len > 0) {
+                                                        if (text.signature) |existing| allocator.free(existing);
+                                                        text.signature = try allocator.dupe(u8, signature_value.string);
+                                                    }
+                                                }
+                                            },
                                             .thinking => |*thinking| {
                                                 try thinking.text.appendSlice(allocator, text_value.string);
                                                 if (part.object.get("thoughtSignature")) |signature_value| {
@@ -515,8 +526,12 @@ fn finishCurrentBlock(
     if (current_block.*) |*block| {
         switch (block.*) {
             .text => |text| {
-                const owned = try allocator.dupe(u8, text.items);
-                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+                const owned = try allocator.dupe(u8, text.text.items);
+                const signature = if (text.signature) |value| try allocator.dupe(u8, value) else null;
+                try content_blocks.append(allocator, .{ .text = .{
+                    .text = owned,
+                    .text_signature = signature,
+                } });
                 stream_ptr.push(.{
                     .event_type = .text_end,
                     .content_index = @intCast(content_blocks.items.len - 1),
@@ -545,7 +560,10 @@ fn finishCurrentBlock(
 
 fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
     switch (block.*) {
-        .text => |*text| text.deinit(allocator),
+        .text => |*text| {
+            text.text.deinit(allocator);
+            if (text.signature) |signature| allocator.free(signature);
+        },
         .thinking => |*thinking| {
             thinking.text.deinit(allocator);
             if (thinking.signature) |signature| allocator.free(signature);
@@ -676,7 +694,7 @@ fn buildAssistantMessageValue(
         switch (block) {
             .text => |text| {
                 if (std.mem.trim(u8, text.text, " \t\r\n").len == 0) continue;
-                try parts.append(try buildTextPartValue(allocator, text.text));
+                try parts.append(try buildTextPartWithSignatureValue(allocator, text.text, text.text_signature));
             },
             .thinking => |thinking| {
                 if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
@@ -712,6 +730,9 @@ fn buildAssistantMessageValue(
                 try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                if (tool_call.thought_signature) |signature| {
+                    try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                }
                 try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
                 try parts.append(.{ .object = part });
             }
@@ -801,8 +822,17 @@ fn buildPartsArray(
 }
 
 fn buildTextPartValue(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
+    return buildTextPartWithSignatureValue(allocator, text, null);
+}
+
+fn buildTextPartWithSignatureValue(allocator: std.mem.Allocator, text: []const u8, signature: ?[]const u8) !std.json.Value {
     var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+    if (signature) |thought_signature| {
+        if (thought_signature.len > 0) {
+            try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, thought_signature) });
+        }
+    }
     return .{ .object = part };
 }
 
