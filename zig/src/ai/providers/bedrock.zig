@@ -145,7 +145,7 @@ pub const BedrockProvider = struct {
         }
 
         if (response.status != 200) {
-            const response_body = try response.readAll(allocator);
+            const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
             try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
@@ -786,10 +786,7 @@ fn parseEventStreamFrames(
     var cursor: usize = 0;
     while (cursor < body.len) {
         if (isAbortRequested(options)) {
-            output.stop_reason = .aborted;
-            output.error_message = "Request was aborted";
-            stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output });
-            stream_ptr.end(output);
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
             return;
         }
 
@@ -1039,6 +1036,7 @@ fn handleEventValue(
     };
     inline for (exception_fields) |field| {
         if (value.object.get(field)) |exception_value| {
+            try finalizeOutputFromPartials(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model);
             output.stop_reason = .error_reason;
             output.error_message = try buildExceptionMessage(allocator, field, exception_value);
             stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output.* });
@@ -1077,10 +1075,12 @@ fn handleEventValue(
 }
 
 fn buildExceptionMessage(allocator: std.mem.Allocator, field: []const u8, value: std.json.Value) ![]const u8 {
-    const detail = if (value == .object and value.object.get("message") != null and value.object.get("message").? == .string)
+    const raw_detail = if (value == .object and value.object.get("message") != null and value.object.get("message").? == .string)
         value.object.get("message").?.string
     else
         "Bedrock streaming request failed";
+    const detail = try provider_error.sanitizeProviderErrorDetail(allocator, raw_detail);
+    defer allocator.free(detail);
     return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ field, detail });
 }
 
@@ -1879,4 +1879,92 @@ test "parseTextStreamLines preserves partial Bedrock text before malformed termi
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseEventStreamFrames finalizes partial Bedrock blocks before provider exception" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock");
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial text\"}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":1,\"delta\":{\"reasoningContent\":{\"text\":\"partial thought\",\"signature\":\"sig-1\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStart", "{\"contentBlockIndex\":2,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-1\",\"name\":\"get_weather\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":2,\"delta\":{\"toolUse\":{\"input\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}}");
+    try appendEventStreamFrame(allocator, &body, "modelStreamErrorException", "{\"message\":\"provider failed with sk-bedrock-secret at /Users/alice/file.zig\"}");
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseEventStreamFrames(allocator, &stream, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_delta, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_delta, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, stream.next().?.event_type);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial text", text_end.content.?);
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqualStrings("partial thought", thinking_end.content.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("partial text", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("partial thought", terminal.message.?.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("Berlin", terminal.message.?.tool_calls.?[0].arguments.object.get("city").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "sk-bedrock-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "Bedrock abort terminal finalizes active binary partial blocks" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock");
+    var output = initOutput(model);
+    var content_blocks = std.ArrayList(types.ContentBlock).empty;
+    defer content_blocks.deinit(allocator);
+    var tool_calls = std.ArrayList(types.ToolCall).empty;
+    defer tool_calls.deinit(allocator);
+    var active_blocks = std.ArrayList(BlockEntry).empty;
+    defer {
+        for (active_blocks.items) |*entry| deinitCurrentBlock(allocator, &entry.block);
+        active_blocks.deinit(allocator);
+    }
+
+    var text = std.ArrayList(u8).empty;
+    try text.appendSlice(allocator, "partial before abort");
+    try active_blocks.append(allocator, .{
+        .bedrock_index = 0,
+        .event_index = 0,
+        .block = .{ .text = text },
+    });
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+    stream.push(.{ .event_type = .start });
+
+    try emitRuntimeFailure(allocator, &stream, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial before abort", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("partial before abort", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
 }

@@ -145,7 +145,7 @@ pub const AzureOpenAIResponsesProvider = struct {
         }
 
         if (response.status != 200) {
-            const response_body = try response.readAll(allocator);
+            const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
             try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
             return stream_instance;
