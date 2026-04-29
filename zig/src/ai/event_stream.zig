@@ -107,6 +107,8 @@ fn extractResult(event: types.AssistantMessageEvent) types.AssistantMessage {
     if (event.event_type == .done) {
         return event.message.?;
     } else if (event.event_type == .error_event) {
+        if (event.message) |message| return message;
+
         // For error events, create an error message
         return .{
             .role = "assistant",
@@ -189,6 +191,100 @@ test "EventStream basic operations" {
     // Check final result
     const result = stream.result().?;
     try std.testing.expectEqualStrings("gpt-4", result.model);
+}
+
+test "AssistantMessageEventStream error event result preserves terminal message identity" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    var stream = createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .response_id = "resp_123",
+        .usage = .{
+            .input = 1,
+            .output = 2,
+            .total_tokens = 3,
+        },
+        .stop_reason = .error_reason,
+        .error_message = "HTTP 500: upstream failed",
+        .timestamp = 42,
+    };
+
+    stream.push(.{
+        .event_type = .error_event,
+        .message = message,
+        .error_message = message.error_message,
+    });
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, terminal.error_message.?);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(terminal.message.?.role, result.role);
+    try std.testing.expectEqualStrings(terminal.message.?.api, result.api);
+    try std.testing.expectEqualStrings(terminal.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(terminal.message.?.model, result.model);
+    try std.testing.expectEqualStrings(terminal.message.?.response_id.?, result.response_id.?);
+    try std.testing.expectEqual(terminal.message.?.usage.input, result.usage.input);
+    try std.testing.expectEqual(terminal.message.?.usage.output, result.usage.output);
+    try std.testing.expectEqual(terminal.message.?.usage.total_tokens, result.usage.total_tokens);
+    try std.testing.expectEqual(terminal.message.?.stop_reason, result.stop_reason);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(terminal.message.?.timestamp, result.timestamp);
+}
+
+test "AssistantMessageEventStream ignores events after terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    var stream = createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-model",
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "ProviderParseFailure",
+        .timestamp = 0,
+    };
+
+    stream.push(.{
+        .event_type = .error_event,
+        .message = message,
+        .error_message = message.error_message,
+    });
+    stream.push(.{ .event_type = .text_delta, .delta = "late" });
+    stream.push(.{
+        .event_type = .done,
+        .message = .{
+            .content = &[_]types.ContentBlock{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-model",
+            .usage = types.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        },
+    });
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("ProviderParseFailure", result.error_message.?);
 }
 
 test "EventStream end without events" {

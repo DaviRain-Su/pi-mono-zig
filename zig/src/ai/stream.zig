@@ -2,11 +2,11 @@ const std = @import("std");
 const api_registry = @import("api_registry.zig");
 const event_stream = @import("event_stream.zig");
 const model_registry = @import("model_registry.zig");
+const register_builtins = @import("providers/register_builtins.zig");
 const simple_options_mod = @import("shared/simple_options.zig");
 const types = @import("types.zig");
 
 const EntryFunctionError = error{
-    ProviderNotFound,
     MissingCompletionResult,
 };
 
@@ -17,8 +17,17 @@ pub fn stream(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !event_stream.AssistantMessageEventStream {
-    const provider = api_registry.get(model.api) orelse return EntryFunctionError.ProviderNotFound;
-    return try provider.stream(allocator, io, model, context, options);
+    if (isAbortRequested(options)) {
+        return createProviderContractErrorStream(allocator, io, model, .aborted, "Request was aborted");
+    }
+
+    const provider = api_registry.get(model.api) orelse
+        return createProviderContractErrorStream(allocator, io, model, .error_reason, "ProviderNotFound");
+
+    return provider.stream(allocator, io, model, context, options) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return createProviderContractErrorStream(allocator, io, model, .error_reason, @errorName(err)),
+    };
 }
 
 pub fn complete(
@@ -166,6 +175,38 @@ fn mapThinkingLevelToAnthropicEffort(
     };
 }
 
+fn isAbortRequested(options: ?types.StreamOptions) bool {
+    const stream_options = options orelse return false;
+    const signal = stream_options.signal orelse return false;
+    return signal.load(.monotonic);
+}
+
+fn createProviderContractErrorStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    stop_reason: types.StopReason,
+    error_message: []const u8,
+) !event_stream.AssistantMessageEventStream {
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = stop_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    stream_instance.push(.{
+        .event_type = .error_event,
+        .message = message,
+        .error_message = message.error_message,
+    });
+    return stream_instance;
+}
+
 const RecordingState = struct {
     stream_calls: usize = 0,
     stream_simple_calls: usize = 0,
@@ -236,6 +277,23 @@ fn recordingStream(
     return stream_instance;
 }
 
+const StreamContractFixtureError = error{
+    CallbackFailed,
+};
+
+var failing_stream_calls: usize = 0;
+
+fn failingContractStream(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: types.Model,
+    _: types.Context,
+    _: ?types.StreamOptions,
+) !event_stream.AssistantMessageEventStream {
+    failing_stream_calls += 1;
+    return StreamContractFixtureError.CallbackFailed;
+}
+
 fn recordingStreamSimple(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -293,6 +351,48 @@ fn ownedDeltaStream(
         },
     });
     return stream_instance;
+}
+
+fn streamContractTestModel(api: []const u8, provider: []const u8, id: []const u8) types.Model {
+    return .{
+        .id = id,
+        .name = "Stream Contract Model",
+        .api = api,
+        .provider = provider,
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+}
+
+fn expectSingleTerminalError(
+    stream_instance: *event_stream.AssistantMessageEventStream,
+    expected_api: []const u8,
+    expected_provider: []const u8,
+    expected_model: []const u8,
+    expected_stop_reason: types.StopReason,
+    expected_error: []const u8,
+) !void {
+    const event = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(expected_error, event.error_message.?);
+    try std.testing.expectEqualStrings(expected_error, event.message.?.error_message.?);
+    try std.testing.expectEqualStrings(expected_api, event.message.?.api);
+    try std.testing.expectEqualStrings(expected_provider, event.message.?.provider);
+    try std.testing.expectEqualStrings(expected_model, event.message.?.model);
+    try std.testing.expectEqual(expected_stop_reason, event.message.?.stop_reason);
+    try std.testing.expectEqual(@as(i64, 0), event.message.?.timestamp);
+    try std.testing.expect(stream_instance.next() == null);
+
+    const result = stream_instance.result().?;
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+    try std.testing.expectEqual(event.message.?.stop_reason, result.stop_reason);
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(event.message.?.timestamp, result.timestamp);
 }
 
 test "stream routes to registered provider" {
@@ -770,4 +870,200 @@ test "completeSimple returns final assistant message from simple options" {
     try std.testing.expectEqualStrings("simple complete", result.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
     try std.testing.expectEqual(@as(usize, 0), recording_state.stream_simple_calls);
+}
+
+test "stream returns terminal error stream for unknown provider lookup failure" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    const model = streamContractTestModel("missing-contract-api", "missing-provider", "missing-model");
+    var stream_instance = try stream(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+    defer stream_instance.deinit();
+
+    try expectSingleTerminalError(
+        &stream_instance,
+        "missing-contract-api",
+        "missing-provider",
+        "missing-model",
+        .error_reason,
+        "ProviderNotFound",
+    );
+}
+
+test "stream converts provider setup callback failure into terminal error stream" {
+    api_registry.clear();
+    defer api_registry.clear();
+    failing_stream_calls = 0;
+
+    try api_registry.register(.{
+        .api = "recording:test:callback-failure",
+        .stream = failingContractStream,
+        .stream_simple = failingContractStream,
+    });
+
+    const model = streamContractTestModel("recording:test:callback-failure", "recording", "recording-model");
+    var stream_instance = try stream(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+    defer stream_instance.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), failing_stream_calls);
+    try expectSingleTerminalError(
+        &stream_instance,
+        "recording:test:callback-failure",
+        "recording",
+        "recording-model",
+        .error_reason,
+        "CallbackFailed",
+    );
+}
+
+test "complete and streamSimple preserve provider failure stream semantics" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "recording:test:simple-failure",
+        .stream = failingContractStream,
+        .stream_simple = failingContractStream,
+    });
+
+    const model = streamContractTestModel("recording:test:simple-failure", "recording", "recording-model");
+    var simple_stream = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .api_key = "fixture-key" },
+    );
+    defer simple_stream.deinit();
+
+    try expectSingleTerminalError(
+        &simple_stream,
+        "recording:test:simple-failure",
+        "recording",
+        "recording-model",
+        .error_reason,
+        "CallbackFailed",
+    );
+
+    const result = try complete(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+
+    try std.testing.expectEqualStrings("recording:test:simple-failure", result.api);
+    try std.testing.expectEqualStrings("recording", result.provider);
+    try std.testing.expectEqualStrings("recording-model", result.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    try std.testing.expectEqualStrings("CallbackFailed", result.error_message.?);
+}
+
+test "pre-start abort takes precedence over provider lookup and setup failures" {
+    api_registry.clear();
+    defer api_registry.clear();
+    failing_stream_calls = 0;
+
+    try api_registry.register(.{
+        .api = "recording:test:abort-precedence",
+        .stream = failingContractStream,
+        .stream_simple = failingContractStream,
+    });
+
+    var aborted = std.atomic.Value(bool).init(true);
+    const options = types.StreamOptions{ .signal = &aborted };
+    const model = streamContractTestModel("recording:test:abort-precedence", "recording", "recording-model");
+    var stream_instance = try stream(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        options,
+    );
+    defer stream_instance.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), failing_stream_calls);
+    try expectSingleTerminalError(
+        &stream_instance,
+        "recording:test:abort-precedence",
+        "recording",
+        "recording-model",
+        .aborted,
+        "Request was aborted",
+    );
+
+    var missing_provider_stream = try stream(
+        std.testing.allocator,
+        std.Io.failing,
+        streamContractTestModel("missing-contract-api", "missing-provider", "missing-model"),
+        .{ .messages = &[_]types.Message{} },
+        options,
+    );
+    defer missing_provider_stream.deinit();
+
+    try expectSingleTerminalError(
+        &missing_provider_stream,
+        "missing-contract-api",
+        "missing-provider",
+        "missing-model",
+        .aborted,
+        "Request was aborted",
+    );
+}
+
+test "built-in representative provider families convert setup failures into terminal streams" {
+    api_registry.resetForTesting();
+    defer api_registry.clear();
+
+    const cases = [_]struct {
+        api: []const u8,
+        provider: []const u8,
+    }{
+        .{ .api = "openai-completions", .provider = "openai" },
+        .{ .api = "openai-responses", .provider = "openai" },
+        .{ .api = "anthropic-messages", .provider = "anthropic" },
+        .{ .api = "google-generative-ai", .provider = "google" },
+    };
+
+    for (cases) |case| {
+        try register_builtins.setProviderOverride(case.api, .{
+            .stream = failingContractStream,
+            .stream_simple = failingContractStream,
+        });
+    }
+    api_registry.resetToBuiltIns();
+
+    for (cases) |case| {
+        const model = streamContractTestModel(case.api, case.provider, "fixture-model");
+        var stream_instance = try stream(
+            std.testing.allocator,
+            std.Io.failing,
+            model,
+            .{ .messages = &[_]types.Message{} },
+            null,
+        );
+        defer stream_instance.deinit();
+
+        try expectSingleTerminalError(
+            &stream_instance,
+            case.api,
+            case.provider,
+            "fixture-model",
+            .error_reason,
+            "CallbackFailed",
+        );
+    }
 }
