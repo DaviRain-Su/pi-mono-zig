@@ -6,6 +6,7 @@ const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
+const openai_responses = @import("openai_responses.zig");
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
@@ -91,26 +92,8 @@ pub const OpenAICodexResponsesProvider = struct {
         const url = try resolveCodexUrl(allocator, model.base_url);
         defer allocator.free(url);
 
-        var headers = std.StringHashMap([]const u8).init(allocator);
+        var headers = try buildRequestHeaders(allocator, model, options, normalized_token, account_id, .sse);
         defer deinitOwnedHeaders(allocator, &headers);
-        try mergeHeaders(allocator, &headers, model.headers);
-        if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
-        }
-        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
-        try putOwnedHeader(allocator, &headers, "OpenAI-Beta", "responses=experimental");
-        try putOwnedHeader(allocator, &headers, "originator", "pi");
-        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{normalized_token});
-        defer allocator.free(auth_header);
-        try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
-        try putOwnedHeader(allocator, &headers, "chatgpt-account-id", account_id);
-        if (options) |stream_options| {
-            if (stream_options.session_id) |session_id| {
-                try putOwnedHeader(allocator, &headers, "session_id", session_id);
-                try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
-            }
-        }
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -266,6 +249,67 @@ pub fn buildRequestPayload(
     }
 
     return .{ .object = payload };
+}
+
+pub fn buildRequestSnapshotValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    snapshot_options: openai_responses.RequestSnapshotOptions,
+) !std.json.Value {
+    var payload = if (snapshot_options.payload_override) |override|
+        try cloneJsonValue(allocator, override)
+    else
+        try buildRequestPayload(allocator, model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+
+    const api_key = if (options) |stream_options| stream_options.api_key orelse "fixture-api-key-redacted" else "fixture-api-key-redacted";
+    const normalized_token = stripBearerPrefix(std.mem.trim(u8, api_key, " \t\r\n"));
+    const account_id = try extractAccountId(allocator, normalized_token);
+    defer allocator.free(account_id);
+
+    const sse_url = try resolveCodexUrl(allocator, model.base_url);
+    defer allocator.free(sse_url);
+    const websocket = snapshot_options.transport_mode == .deferred_websocket and std.mem.eql(u8, snapshot_options.method, "WEBSOCKET");
+    const url = if (websocket) try buildWebSocketUrl(allocator, sse_url) else try allocator.dupe(u8, sse_url);
+    defer allocator.free(url);
+
+    var headers = try buildRequestHeaders(
+        allocator,
+        model,
+        options,
+        normalized_token,
+        account_id,
+        if (websocket) .deferred_websocket else .sse,
+    );
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    if (websocket) {
+        payload = try buildWebSocketRequestPayload(allocator, payload);
+    }
+
+    var snapshot = try initObject(allocator);
+    errdefer snapshot.deinit(allocator);
+
+    try snapshot.put(allocator, try allocator.dupe(u8, "baseUrl"), .{ .string = try openai_responses.inferResponsesBaseUrlFromUrl(allocator, url, snapshot_options.provider_family) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "headers"), .{ .object = try openai_responses.normalizeSemanticHeaders(allocator, headers) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "jsonPayload"), payload);
+    payload = .null;
+    try snapshot.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, snapshot_options.method) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try openai_responses.buildResponsesRequestPathFromUrl(allocator, url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "query"), .{ .object = try openai_responses.buildResponsesRequestQueryObjectFromUrl(allocator, url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "requestOptions"), .{ .object = try openai_responses.buildRequestOptionsSnapshotObject(allocator, options, false) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "transportMetadata"), .{ .object = try openai_responses.buildTransportMetadataSnapshotObject(
+        allocator,
+        snapshot_options.scenario_id,
+        snapshot_options.provider_family,
+        snapshot_options.transport_mode,
+        snapshot_options.mocked_status,
+    ) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "url"), .{ .string = try allocator.dupe(u8, url) });
+
+    return .{ .object = snapshot };
 }
 
 fn appendInputItemsForMessage(
@@ -1011,6 +1055,65 @@ fn resolveCodexUrl(allocator: std.mem.Allocator, raw_base_url: []const u8) ![]co
     if (std.mem.endsWith(u8, base_url, "/codex/responses")) return try allocator.dupe(u8, base_url);
     if (std.mem.endsWith(u8, base_url, "/codex")) return try std.fmt.allocPrint(allocator, "{s}/responses", .{base_url});
     return try std.fmt.allocPrint(allocator, "{s}/codex/responses", .{base_url});
+}
+
+fn buildWebSocketUrl(allocator: std.mem.Allocator, http_url: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, http_url, "https://")) return try std.fmt.allocPrint(allocator, "wss://{s}", .{http_url["https://".len..]});
+    if (std.mem.startsWith(u8, http_url, "http://")) return try std.fmt.allocPrint(allocator, "ws://{s}", .{http_url["http://".len..]});
+    return try allocator.dupe(u8, http_url);
+}
+
+fn buildWebSocketRequestPayload(allocator: std.mem.Allocator, payload: std.json.Value) !std.json.Value {
+    var message = try initObject(allocator);
+    errdefer message.deinit(allocator);
+
+    try message.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "response.create") });
+    if (payload == .object) {
+        var iterator = payload.object.iterator();
+        while (iterator.next()) |entry| {
+            try message.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
+        }
+    }
+    freeJsonValue(allocator, payload);
+    return .{ .object = message };
+}
+
+fn buildRequestHeaders(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    normalized_token: []const u8,
+    account_id: []const u8,
+    transport_mode: openai_responses.RequestSnapshotTransportMode,
+) !std.StringHashMap([]const u8) {
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitOwnedHeaders(allocator, &headers);
+
+    try mergeHeaders(allocator, &headers, model.headers);
+    if (options) |stream_options| {
+        try mergeHeaders(allocator, &headers, stream_options.headers);
+    }
+
+    if (transport_mode == .deferred_websocket) {
+        try putOwnedHeader(allocator, &headers, "OpenAI-Beta", "responses_websockets=2026-02-06");
+    } else {
+        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+        try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        try putOwnedHeader(allocator, &headers, "OpenAI-Beta", "responses=experimental");
+    }
+    try putOwnedHeader(allocator, &headers, "originator", "pi");
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{normalized_token});
+    defer allocator.free(auth_header);
+    try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+    try putOwnedHeader(allocator, &headers, "chatgpt-account-id", account_id);
+    if (options) |stream_options| {
+        if (stream_options.session_id) |session_id| {
+            try putOwnedHeader(allocator, &headers, "session_id", session_id);
+            try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
+        }
+    }
+
+    return headers;
 }
 
 fn updateResponseIdFromResponseObject(allocator: std.mem.Allocator, output: *types.AssistantMessage, response_value: std.json.Value) !void {
