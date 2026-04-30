@@ -8,6 +8,9 @@ const transform_messages = @import("../shared/transform_messages.zig");
 const simple_options = @import("../shared/simple_options.zig");
 const openai = @import("openai.zig");
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 const SERVICE_NAME = "bedrock";
 const SHA256_HEX_LEN = std.crypto.hash.sha2.Sha256.digest_length * 2;
 
@@ -190,22 +193,8 @@ pub const BedrockProvider = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ endpoint.base_url, request_path });
         defer allocator.free(url);
 
-        var headers = std.StringHashMap([]const u8).init(allocator);
-        defer headers.deinit();
-        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try mergeHeaders(allocator, &headers, model.headers);
-        if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
-        }
-        switch (auth) {
-            .sigv4 => |credentials| try signRequestHeaders(allocator, &headers, endpoint.base_url, request_path, json_body, credentials, timestamp, endpoint.region),
-            .bearer => |token| {
-                const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-                defer allocator.free(authorization);
-                try putOwnedHeader(allocator, &headers, "Authorization", authorization);
-            },
-            .profile => {},
-        }
+        var headers = try buildBedrockRequestHeaders(allocator, model, options, auth, endpoint, request_path, json_body, timestamp);
+        defer deinitHeaderMap(allocator, &headers);
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -416,22 +405,41 @@ pub fn buildRequestSurfaceSnapshotValue(
     payload: std.json.Value,
     fixture_env: FixtureEnv,
 ) !std.json.Value {
+    var scoped_env = try ScopedFixtureEnv.init(allocator, fixture_env);
+    defer scoped_env.deinit();
+
     const request_path = try buildRequestPath(allocator, model.id);
     defer allocator.free(request_path);
-    const region = resolveFixtureRegion(model.base_url, options, fixture_env);
-    const endpoint = try resolveFixtureEndpoint(allocator, model.base_url, region, fixture_env, options);
-    defer if (endpoint.value) |value| allocator.free(value);
-    const use_http_boundary = useFixtureHttpRequestBoundary(options, fixture_env);
+    const endpoint = try resolveBedrockEndpoint(allocator, model.base_url, options);
+    defer endpoint.deinit(allocator);
+    const region = requestSurfaceRegionSnapshot(model.base_url, options, fixture_env, endpoint);
+    const use_http_boundary = useProductionHttpRequestBoundary(options, fixture_env);
 
     const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json_body);
+
+    const auth = resolveBedrockAuth(allocator, options) catch |err| blk: {
+        if (err == error.MissingAwsAccessKeyId or err == error.MissingAwsSecretAccessKey) {
+            break :blk null;
+        }
+        return err;
+    };
+    defer if (auth) |resolved| resolved.deinit(allocator);
+
+    const fixed_timestamp = RequestTimestamp{ .amz_date = "20250115T120000Z", .date_stamp = "20250115" };
+    var headers = if (use_http_boundary and auth != null)
+        try buildBedrockRequestHeaders(allocator, model, options, auth.?, endpoint, request_path, json_body, fixed_timestamp)
+    else
+        std.StringHashMap([]const u8).init(allocator);
+    defer deinitHeaderMap(allocator, &headers);
 
     var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer root.deinit(allocator);
     try root.put(allocator, try allocator.dupe(u8, "boundary"), .{ .string = try allocator.dupe(u8, if (use_http_boundary) "aws-sdk-finalized-http-request" else "aws-sdk-client-config-boundary") });
     try root.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
     try root.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, request_path) });
-    if (endpoint.value) |base_url| {
+    const surface_endpoint = requestSurfaceEndpointSnapshot(model.base_url, options, fixture_env, endpoint, use_http_boundary);
+    if (surface_endpoint.value) |base_url| {
         const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, request_path });
         try root.put(allocator, try allocator.dupe(u8, "url"), .{ .string = url });
     } else {
@@ -439,8 +447,8 @@ pub fn buildRequestSurfaceSnapshotValue(
     }
 
     var endpoint_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try endpoint_object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, if (use_http_boundary) "sdk-http-request" else endpoint.mode) });
-    if (endpoint.value) |value| try endpoint_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
+    try endpoint_object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, surface_endpoint.mode) });
+    if (surface_endpoint.value) |value| try endpoint_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
     try root.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .object = endpoint_object });
 
     var region_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -453,14 +461,14 @@ pub fn buildRequestSurfaceSnapshotValue(
         if (stream_options.bedrock_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
     }
     if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
-    if (!use_http_boundary and std.mem.eql(u8, endpoint.mode, "explicit")) {
-        if (endpoint.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .string = try allocator.dupe(u8, value) });
+    if (!use_http_boundary and std.mem.eql(u8, surface_endpoint.mode, "explicit")) {
+        if (surface_endpoint.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .string = try allocator.dupe(u8, value) });
     }
     if (region.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, value) });
     try root.put(allocator, try allocator.dupe(u8, "clientConfig"), .{ .object = client_config });
 
-    const auth = try buildFixtureAuthSnapshot(allocator, options, fixture_env, region, if (use_http_boundary) json_body else null);
-    try root.put(allocator, try allocator.dupe(u8, "auth"), auth);
+    const auth_snapshot = try buildProductionAuthSnapshot(allocator, auth, options, fixture_env, region, &headers);
+    try root.put(allocator, try allocator.dupe(u8, "auth"), auth_snapshot);
     try root.put(allocator, try allocator.dupe(u8, "redaction"), .{ .string = try allocator.dupe(u8, "secrets-redacted") });
     return .{ .object = root };
 }
@@ -1469,6 +1477,45 @@ fn mergeHeaders(
     }
 }
 
+fn deinitHeaderMap(allocator: std.mem.Allocator, headers: *std.StringHashMap([]const u8)) void {
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    headers.deinit();
+}
+
+fn buildBedrockRequestHeaders(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    auth: BedrockAuth,
+    endpoint: ResolvedBedrockEndpoint,
+    request_path: []const u8,
+    json_body: []const u8,
+    timestamp: RequestTimestamp,
+) !std.StringHashMap([]const u8) {
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitHeaderMap(allocator, &headers);
+
+    try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+    try mergeHeaders(allocator, &headers, model.headers);
+    if (options) |stream_options| {
+        try mergeHeaders(allocator, &headers, stream_options.headers);
+    }
+    switch (auth) {
+        .sigv4 => |credentials| try signRequestHeaders(allocator, &headers, endpoint.base_url, request_path, json_body, credentials, timestamp, endpoint.region),
+        .bearer => |token| {
+            const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+            defer allocator.free(authorization);
+            try putOwnedHeader(allocator, &headers, "Authorization", authorization);
+        },
+        .profile => {},
+    }
+    return headers;
+}
+
 fn parseStreamBody(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -2399,60 +2446,105 @@ fn nonEmpty(value: ?[]const u8) ?[]const u8 {
     return text;
 }
 
-fn standardEndpointRegion(base_url: []const u8) ?[]const u8 {
-    const prefix = "https://";
-    const rest = if (std.mem.startsWith(u8, base_url, prefix)) base_url[prefix.len..] else base_url;
-    const host_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-    const host = rest[0..host_end];
-    const prefixes = [_][]const u8{ "bedrock-runtime.", "bedrock-runtime-fips." };
-    for (prefixes) |pattern| {
-        if (std.mem.startsWith(u8, host, pattern)) {
-            const after = host[pattern.len..];
-            if (std.mem.indexOf(u8, after, ".amazonaws.com.cn")) |end| return after[0..end];
-            if (std.mem.indexOf(u8, after, ".amazonaws.com")) |end| return after[0..end];
+const fixture_env_names = [_][]const u8{
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_BEDROCK_SKIP_AUTH",
+};
+
+const ScopedFixtureEnv = struct {
+    allocator: std.mem.Allocator,
+    saved: [fixture_env_names.len]?[]u8,
+
+    fn init(allocator: std.mem.Allocator, fixture_env: FixtureEnv) !ScopedFixtureEnv {
+        var scoped = ScopedFixtureEnv{
+            .allocator = allocator,
+            .saved = [_]?[]u8{null} ** fixture_env_names.len,
+        };
+        errdefer scoped.deinit();
+
+        inline for (fixture_env_names, 0..) |name, index| {
+            scoped.saved[index] = try loadEnvOptional(allocator, name);
+            try setProcessEnvOptional(allocator, name, fixtureEnvValue(fixture_env, index));
+        }
+        return scoped;
+    }
+
+    fn deinit(self: *ScopedFixtureEnv) void {
+        inline for (fixture_env_names, 0..) |name, index| {
+            setProcessEnvOptional(self.allocator, name, self.saved[index]) catch {};
+            if (self.saved[index]) |value| self.allocator.free(value);
+            self.saved[index] = null;
         }
     }
-    return null;
+};
+
+fn fixtureEnvValue(env: FixtureEnv, comptime index: usize) ?[]const u8 {
+    return switch (index) {
+        0 => env.aws_access_key_id,
+        1 => env.aws_secret_access_key,
+        2 => env.aws_session_token,
+        3 => env.aws_profile,
+        4 => env.aws_bearer_token_bedrock,
+        5 => env.aws_region,
+        6 => env.aws_default_region,
+        7 => env.aws_bedrock_skip_auth,
+        else => @compileError("unsupported fixture env index"),
+    };
 }
 
-fn resolveFixtureRegion(base_url: []const u8, options: ?types.StreamOptions, env: FixtureEnv) FixtureRegion {
+fn setProcessEnvOptional(allocator: std.mem.Allocator, name: []const u8, value: ?[]const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    if (value) |text| {
+        const value_z = try allocator.dupeZ(u8, text);
+        defer allocator.free(value_z);
+        if (setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.SetEnvironmentFailed;
+    } else {
+        if (unsetenv(name_z.ptr) != 0) return error.SetEnvironmentFailed;
+    }
+}
+
+fn requestSurfaceRegionSnapshot(base_url: []const u8, options: ?types.StreamOptions, env: FixtureEnv, endpoint: ResolvedBedrockEndpoint) FixtureRegion {
     if (options) |stream_options| {
-        if (nonEmpty(stream_options.bedrock_region)) |region| return .{ .source = "options.region", .value = region };
+        if (nonEmpty(stream_options.bedrock_region) != null) return .{ .source = "options.region", .value = endpoint.region };
     }
-    if (nonEmpty(env.aws_region)) |region| return .{ .source = "AWS_REGION", .value = region };
-    if (nonEmpty(env.aws_default_region)) |region| return .{ .source = "AWS_DEFAULT_REGION", .value = region };
-    if (standardEndpointRegion(base_url)) |region| {
-        if (nonEmpty(env.aws_profile) == null) return .{ .source = "endpoint", .value = region };
-    }
+    if (nonEmpty(env.aws_region) != null) return .{ .source = "AWS_REGION", .value = endpoint.region };
+    if (nonEmpty(env.aws_default_region) != null) return .{ .source = "AWS_DEFAULT_REGION", .value = endpoint.region };
+    if (standardEndpointRegion(base_url) != null and nonEmpty(env.aws_profile) == null) return .{ .source = "endpoint", .value = endpoint.region };
     if (nonEmpty(env.aws_profile) != null) return .{ .source = "sdk-profile-resolution" };
-    return .{ .source = "default", .value = "us-east-1" };
+    return .{ .source = "default", .value = endpoint.region };
 }
 
-fn hasConfiguredFixtureRegion(options: ?types.StreamOptions, env: FixtureEnv) bool {
+fn requestSurfaceEndpointSnapshot(
+    base_url: []const u8,
+    options: ?types.StreamOptions,
+    env: FixtureEnv,
+    endpoint: ResolvedBedrockEndpoint,
+    use_http_boundary: bool,
+) FixtureEndpoint {
+    if (use_http_boundary) return .{ .mode = "sdk-http-request", .value = endpoint.base_url };
+    if (nonEmpty(env.aws_profile) != null and !hasRequestSurfaceConfiguredRegion(options, env)) {
+        return .{ .mode = "sdk-profile-resolution" };
+    }
+    if (standardEndpointRegion(base_url) == null) return .{ .mode = "explicit", .value = endpoint.base_url };
+    if (hasRequestSurfaceConfiguredRegion(options, env)) return .{ .mode = "sdk-default", .value = endpoint.base_url };
+    return .{ .mode = "explicit", .value = endpoint.base_url };
+}
+
+fn hasRequestSurfaceConfiguredRegion(options: ?types.StreamOptions, env: FixtureEnv) bool {
     if (options) |stream_options| {
         if (nonEmpty(stream_options.bedrock_region) != null) return true;
     }
     return nonEmpty(env.aws_region) != null or nonEmpty(env.aws_default_region) != null;
 }
 
-fn resolveFixtureEndpoint(
-    allocator: std.mem.Allocator,
-    base_url: []const u8,
-    region: FixtureRegion,
-    env: FixtureEnv,
-    options: ?types.StreamOptions,
-) !FixtureEndpoint {
-    const endpoint_region = standardEndpointRegion(base_url);
-    const use_explicit_endpoint = endpoint_region == null or (!hasConfiguredFixtureRegion(options, env) and nonEmpty(env.aws_profile) == null);
-    if (use_explicit_endpoint) {
-        return .{ .mode = "explicit", .value = try allocator.dupe(u8, trimTrailingSlash(base_url)) };
-    }
-    const region_value = region.value orelse return .{ .mode = "sdk-profile-resolution" };
-    const suffix = if (std.mem.startsWith(u8, region_value, "cn-")) "amazonaws.com.cn" else "amazonaws.com";
-    return .{ .mode = "sdk-default", .value = try std.fmt.allocPrint(allocator, "https://bedrock-runtime.{s}.{s}", .{ region_value, suffix }) };
-}
-
-fn useFixtureHttpRequestBoundary(options: ?types.StreamOptions, env: FixtureEnv) bool {
+fn useProductionHttpRequestBoundary(options: ?types.StreamOptions, env: FixtureEnv) bool {
     if (std.mem.eql(u8, nonEmpty(env.aws_bedrock_skip_auth) orelse "", "1")) return false;
     if (options) |stream_options| {
         if (nonEmpty(stream_options.bedrock_bearer_token) != null) return true;
@@ -2461,12 +2553,13 @@ fn useFixtureHttpRequestBoundary(options: ?types.StreamOptions, env: FixtureEnv)
     return nonEmpty(env.aws_access_key_id) != null and nonEmpty(env.aws_secret_access_key) != null;
 }
 
-fn buildFixtureAuthSnapshot(
+fn buildProductionAuthSnapshot(
     allocator: std.mem.Allocator,
+    auth: ?BedrockAuth,
     options: ?types.StreamOptions,
     env: FixtureEnv,
     region: FixtureRegion,
-    signed_body: ?[]const u8,
+    headers: *const std.StringHashMap([]const u8),
 ) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer object.deinit(allocator);
@@ -2482,56 +2575,130 @@ fn buildFixtureAuthSnapshot(
         return .{ .object = object };
     }
 
-    if (option_bearer != null or env_bearer != null) {
-        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "bearer") });
-        try object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, if (option_bearer != null) "options.bearerToken" else "env.bearerToken") });
-        try object.put(allocator, try allocator.dupe(u8, "token"), .{ .string = try allocator.dupe(u8, "redacted") });
-        try object.put(allocator, try allocator.dupe(u8, "sigv4"), .{ .bool = false });
+    const resolved_auth = auth orelse {
+        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "missing-credentials") });
+        try object.put(allocator, try allocator.dupe(u8, "errorSurface"), .{ .string = try allocator.dupe(u8, "async-stream-error") });
+        try object.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, "Bedrock requires AWS_ACCESS_KEY_ID.") });
+        try object.put(allocator, try allocator.dupe(u8, "network"), .{ .string = try allocator.dupe(u8, "not-attempted") });
         return .{ .object = object };
-    }
+    };
 
-    if ((options != null and nonEmpty(options.?.bedrock_profile) != null) or nonEmpty(env.aws_profile) != null) {
-        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "profile") });
-        if (options) |stream_options| {
-            if (nonEmpty(stream_options.bedrock_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
-        }
-        if (nonEmpty(env.aws_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
-        try object.put(allocator, try allocator.dupe(u8, "credentialDiscovery"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
-        return .{ .object = object };
-    }
+    switch (resolved_auth) {
+        .bearer => {
+            try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "bearer") });
+            try object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, if (option_bearer != null) "options.bearerToken" else "env.bearerToken") });
+            try object.put(allocator, try allocator.dupe(u8, "token"), .{ .string = try allocator.dupe(u8, "redacted") });
+            try object.put(allocator, try allocator.dupe(u8, "sigv4"), .{ .bool = false });
+        },
+        .profile => {
+            try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "profile") });
+            if (options) |stream_options| {
+                if (nonEmpty(stream_options.bedrock_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
+            }
+            if (nonEmpty(env.aws_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
+            try object.put(allocator, try allocator.dupe(u8, "credentialDiscovery"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
+        },
+        .sigv4 => {
+            const authorization = headerValueIgnoreCase(headers, "authorization");
+            const credential_scope = if (authorization) |value| try parseCredentialScope(allocator, value, region.value orelse "us-east-1") else try defaultCredentialScope(allocator, region.value orelse "us-east-1");
 
-    if (nonEmpty(env.aws_access_key_id) != null and nonEmpty(env.aws_secret_access_key) != null) {
-        const signing_region = region.value orelse "us-east-1";
-        _ = signed_body;
-        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "sigv4") });
-        try object.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
-        try object.put(allocator, try allocator.dupe(u8, "query"), .{ .string = try allocator.dupe(u8, "") });
-        try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
-        try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, signing_region) });
-        try object.put(allocator, try allocator.dupe(u8, "amzDate"), .{ .string = try allocator.dupe(u8, "20250115T120000Z") });
-        var credential_scope = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try credential_scope.put(allocator, try allocator.dupe(u8, "date"), .{ .string = try allocator.dupe(u8, "20250115") });
-        try credential_scope.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, signing_region) });
-        try credential_scope.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
-        try credential_scope.put(allocator, try allocator.dupe(u8, "terminal"), .{ .string = try allocator.dupe(u8, "aws4_request") });
-        try object.put(allocator, try allocator.dupe(u8, "credentialScope"), .{ .object = credential_scope });
-        var signed_headers = std.json.Array.init(allocator);
-        inline for (&[_][]const u8{ "content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token" }) |header| {
-            try signed_headers.append(.{ .string = try allocator.dupe(u8, header) });
-        }
-        try object.put(allocator, try allocator.dupe(u8, "signedHeaders"), .{ .array = signed_headers });
-        try object.put(allocator, try allocator.dupe(u8, "bodySha256"), .{ .string = try allocator.dupe(u8, "normalized-payload-sha256") });
-        if (nonEmpty(env.aws_session_token) != null) try object.put(allocator, try allocator.dupe(u8, "sessionToken"), .{ .string = try allocator.dupe(u8, "redacted") });
-        try object.put(allocator, try allocator.dupe(u8, "accessKeyId"), .{ .string = try allocator.dupe(u8, "redacted") });
-        try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, "normalized") });
-        return .{ .object = object };
+            try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "sigv4") });
+            try object.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
+            try object.put(allocator, try allocator.dupe(u8, "query"), .{ .string = try allocator.dupe(u8, "") });
+            try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
+            try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, credential_scope.get("region").?.string) });
+            try object.put(allocator, try allocator.dupe(u8, "amzDate"), .{ .string = try allocator.dupe(u8, "20250115T120000Z") });
+            try object.put(allocator, try allocator.dupe(u8, "credentialScope"), .{ .object = credential_scope });
+            try object.put(allocator, try allocator.dupe(u8, "signedHeaders"), try parseSignedHeadersValue(allocator, authorization orelse ""));
+            try object.put(allocator, try allocator.dupe(u8, "bodySha256"), .{ .string = try allocator.dupe(u8, if (headerValueIgnoreCase(headers, "x-amz-content-sha256") != null) "normalized-payload-sha256" else "missing") });
+            if (headerValueIgnoreCase(headers, "x-amz-security-token") != null) try object.put(allocator, try allocator.dupe(u8, "sessionToken"), .{ .string = try allocator.dupe(u8, "redacted") });
+            try object.put(allocator, try allocator.dupe(u8, "accessKeyId"), .{ .string = try allocator.dupe(u8, "redacted") });
+            try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, "normalized") });
+        },
     }
-
-    try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "missing-credentials") });
-    try object.put(allocator, try allocator.dupe(u8, "errorSurface"), .{ .string = try allocator.dupe(u8, "async-stream-error") });
-    try object.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, "Bedrock requires AWS_ACCESS_KEY_ID.") });
-    try object.put(allocator, try allocator.dupe(u8, "network"), .{ .string = try allocator.dupe(u8, "not-attempted") });
     return .{ .object = object };
+}
+
+fn headerValueIgnoreCase(headers: *const std.StringHashMap([]const u8), name: []const u8) ?[]const u8 {
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+fn parseCredentialScope(allocator: std.mem.Allocator, authorization: []const u8, fallback_region: []const u8) !std.json.ObjectMap {
+    const credential = extractAuthorizationParameter(authorization, "Credential") orelse return defaultCredentialScope(allocator, fallback_region);
+    var parts = std.mem.splitScalar(u8, credential, '/');
+    _ = parts.next();
+    _ = parts.next();
+    const parsed_region = parts.next() orelse fallback_region;
+    const parsed_service = parts.next() orelse SERVICE_NAME;
+    const parsed_terminal = parts.next() orelse "aws4_request";
+
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try object.put(allocator, try allocator.dupe(u8, "date"), .{ .string = try allocator.dupe(u8, "20250115") });
+    try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, parsed_region) });
+    try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, parsed_service) });
+    try object.put(allocator, try allocator.dupe(u8, "terminal"), .{ .string = try allocator.dupe(u8, parsed_terminal) });
+    return object;
+}
+
+fn defaultCredentialScope(allocator: std.mem.Allocator, region: []const u8) !std.json.ObjectMap {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try object.put(allocator, try allocator.dupe(u8, "date"), .{ .string = try allocator.dupe(u8, "20250115") });
+    try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, region) });
+    try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
+    try object.put(allocator, try allocator.dupe(u8, "terminal"), .{ .string = try allocator.dupe(u8, "aws4_request") });
+    return object;
+}
+
+fn extractAuthorizationParameter(authorization: []const u8, name: []const u8) ?[]const u8 {
+    const prefix = std.fmt.allocPrint(std.heap.page_allocator, "{s}=", .{name}) catch return null;
+    defer std.heap.page_allocator.free(prefix);
+    const start = std.mem.indexOf(u8, authorization, prefix) orelse return null;
+    const value_start = start + prefix.len;
+    const rest = authorization[value_start..];
+    const value_end = std.mem.indexOfAny(u8, rest, ", ") orelse rest.len;
+    return rest[0..value_end];
+}
+
+fn parseSignedHeadersValue(allocator: std.mem.Allocator, authorization: []const u8) !std.json.Value {
+    var array = std.json.Array.init(allocator);
+    errdefer array.deinit();
+    const signed_headers = extractAuthorizationParameter(authorization, "SignedHeaders") orelse "";
+    var iterator = std.mem.splitScalar(u8, signed_headers, ';');
+    while (iterator.next()) |header| {
+        if (isSemanticSignedHeader(header)) {
+            try array.append(.{ .string = try allocator.dupe(u8, header) });
+        }
+    }
+    return .{ .array = array };
+}
+
+fn isSemanticSignedHeader(header: []const u8) bool {
+    inline for (&[_][]const u8{ "content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token" }) |semantic| {
+        if (std.mem.eql(u8, header, semantic)) return true;
+    }
+    return false;
+}
+
+fn standardEndpointRegion(base_url: []const u8) ?[]const u8 {
+    const prefix = "https://";
+    const rest = if (std.mem.startsWith(u8, base_url, prefix)) base_url[prefix.len..] else base_url;
+    const host_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const host = rest[0..host_end];
+    const prefixes = [_][]const u8{ "bedrock-runtime.", "bedrock-runtime-fips." };
+    for (prefixes) |pattern| {
+        if (std.mem.startsWith(u8, host, pattern)) {
+            const after = host[pattern.len..];
+            if (std.mem.indexOf(u8, after, ".amazonaws.com.cn")) |end| return after[0..end];
+            if (std.mem.indexOf(u8, after, ".amazonaws.com")) |end| return after[0..end];
+        }
+    }
+    return null;
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
