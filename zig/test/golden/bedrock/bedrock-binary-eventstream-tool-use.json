@@ -1,0 +1,338 @@
+{
+  "expected": {
+    "binaryEventStream": {
+      "base64": "AAAAPwAAABsAAAAACzpldmVudC10eXBlBwAMbWVzc2FnZVN0YXJ0eyJyb2xlIjoiYXNzaXN0YW50In0AAAAAAAAAkQAAACAAAAAACzpldmVudC10eXBlBwARY29udGVudEJsb2NrRGVsdGF7ImNvbnRlbnRCbG9ja0luZGV4IjowLCJkZWx0YSI6eyJyZWFzb25pbmdDb250ZW50Ijp7InRleHQiOiJOZWVkIHdlYXRoZXIuIiwic2lnbmF0dXJlIjoic2lnLTEifX19AAAAAAAAAEYAAAAfAAAAAAs6ZXZlbnQtdHlwZQcAEGNvbnRlbnRCbG9ja1N0b3B7ImNvbnRlbnRCbG9ja0luZGV4IjowfQAAAAAAAACHAAAAIAAAAAALOmV2ZW50LXR5cGUHABFjb250ZW50QmxvY2tTdGFydHsiY29udGVudEJsb2NrSW5kZXgiOjEsInN0YXJ0Ijp7InRvb2xVc2UiOnsidG9vbFVzZUlkIjoidG9vbC0xIiwibmFtZSI6ImdldF93ZWF0aGVyIn19fQAAAAAAAAB3AAAAIAAAAAALOmV2ZW50LXR5cGUHABFjb250ZW50QmxvY2tEZWx0YXsiY29udGVudEJsb2NrSW5kZXgiOjEsImRlbHRhIjp7InRvb2xVc2UiOnsiaW5wdXQiOiJ7XCJjaXR5XCI6XCJCZXIifX19AAAAAAAAAIMAAAAgAAAAAAs6ZXZlbnQtdHlwZQcAEWNvbnRlbnRCbG9ja0RlbHRheyJjb250ZW50QmxvY2tJbmRleCI6MSwiZGVsdGEiOnsidG9vbFVzZSI6eyJpbnB1dCI6ImxpblwiLFwidW5pdFwiOlwiY2Vsc2l1c1wifSJ9fX0AAAAAAAAARgAAAB8AAAAACzpldmVudC10eXBlBwAQY29udGVudEJsb2NrU3RvcHsiY29udGVudEJsb2NrSW5kZXgiOjF9AAAAAAAAAEMAAAAaAAAAAAs6ZXZlbnQtdHlwZQcAC21lc3NhZ2VTdG9weyJzdG9wUmVhc29uIjoidG9vbF91c2UifQAAAAAAAABlAAAAFwAAAAALOmV2ZW50LXR5cGUHAAhtZXRhZGF0YXsidXNhZ2UiOnsiaW5wdXRUb2tlbnMiOjIxLCJvdXRwdXRUb2tlbnMiOjksInRvdGFsVG9rZW5zIjozMH19AAAAAA==",
+      "encoding": "base64",
+      "eventTypes": [
+        "messageStart",
+        "contentBlockDelta",
+        "contentBlockStop",
+        "contentBlockStart",
+        "contentBlockDelta",
+        "contentBlockDelta",
+        "contentBlockStop",
+        "messageStop",
+        "metadata"
+      ],
+      "format": "aws-eventstream"
+    },
+    "typeScriptRequest": {
+      "mode": "streamBedrock",
+      "payload": {
+        "inferenceConfig": {
+          "maxTokens": 80
+        },
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "Return a concise Bedrock fixture response."
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "system": [
+          {
+            "text": "You are the deterministic Bedrock fixture assistant."
+          }
+        ],
+        "toolConfig": {
+          "tools": [
+            {
+              "toolSpec": {
+                "description": "Return deterministic weather for a city.",
+                "inputSchema": {
+                  "json": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "unit": {
+                        "anyOf": [
+                          {
+                            "const": "celsius",
+                            "type": "string"
+                          },
+                          {
+                            "const": "fahrenheit",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "unit"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "name": "get_weather"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "typeScriptStream": [
+      {
+        "type": "start"
+      },
+      {
+        "contentIndex": 0,
+        "type": "thinking_start"
+      },
+      {
+        "contentIndex": 0,
+        "delta": "Need weather.",
+        "type": "thinking_delta"
+      },
+      {
+        "content": "Need weather.",
+        "contentIndex": 0,
+        "type": "thinking_end"
+      },
+      {
+        "contentIndex": 1,
+        "type": "toolcall_start"
+      },
+      {
+        "contentIndex": 1,
+        "delta": "{\"city\":\"Ber",
+        "type": "toolcall_delta"
+      },
+      {
+        "contentIndex": 1,
+        "delta": "lin\",\"unit\":\"celsius\"}",
+        "type": "toolcall_delta"
+      },
+      {
+        "contentIndex": 1,
+        "toolCall": {
+          "arguments": {
+            "city": "Berlin",
+            "unit": "celsius"
+          },
+          "id": "tool-1",
+          "name": "get_weather"
+        },
+        "type": "toolcall_end"
+      },
+      {
+        "message": {
+          "api": "bedrock-converse-stream",
+          "content": [
+            {
+              "thinking": "Need weather.",
+              "thinkingSignature": "sig-1",
+              "type": "thinking"
+            },
+            {
+              "arguments": {
+                "city": "Berlin",
+                "unit": "celsius"
+              },
+              "id": "tool-1",
+              "name": "get_weather",
+              "type": "toolCall"
+            }
+          ],
+          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "provider": "amazon-bedrock",
+          "role": "assistant",
+          "stopReason": "toolUse",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 21,
+            "output": 9,
+            "totalTokens": 30
+          }
+        },
+        "type": "done"
+      }
+    ]
+  },
+  "id": "bedrock-binary-eventstream-tool-use",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise Bedrock fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic Bedrock fixture assistant.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "localStream": {
+      "events": [
+        {
+          "messageStart": {
+            "role": "assistant"
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 0,
+            "delta": {
+              "reasoningContent": {
+                "signature": "sig-1",
+                "text": "Need weather."
+              }
+            }
+          }
+        },
+        {
+          "contentBlockStop": {
+            "contentBlockIndex": 0
+          }
+        },
+        {
+          "contentBlockStart": {
+            "contentBlockIndex": 1,
+            "start": {
+              "toolUse": {
+                "name": "get_weather",
+                "toolUseId": "tool-1"
+              }
+            }
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 1,
+            "delta": {
+              "toolUse": {
+                "input": "{\"city\":\"Ber"
+              }
+            }
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 1,
+            "delta": {
+              "toolUse": {
+                "input": "lin\",\"unit\":\"celsius\"}"
+              }
+            }
+          }
+        },
+        {
+          "contentBlockStop": {
+            "contentBlockIndex": 1
+          }
+        },
+        {
+          "messageStop": {
+            "stopReason": "tool_use"
+          }
+        },
+        {
+          "metadata": {
+            "usage": {
+              "inputTokens": 21,
+              "outputTokens": 9,
+              "totalTokens": 30
+            }
+          }
+        }
+      ],
+      "format": "aws-eventstream"
+    },
+    "mode": "streamBedrock",
+    "model": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "input": [
+        "text"
+      ],
+      "name": "Claude 3.7 Sonnet Bedrock Fixture",
+      "provider": "amazon-bedrock",
+      "reasoning": true
+    },
+    "options": {
+      "cacheRetention": "none",
+      "maxTokens": 80
+    }
+  },
+  "metadata": {
+    "allowlists": {
+      "ignoredPaths": [
+        "id",
+        "title",
+        "input",
+        "metadata",
+        "schemaVersion",
+        "expected.onResponse",
+        "expected.binaryEventStream"
+      ],
+      "localStreamFormats": [
+        "json-lines",
+        "aws-eventstream"
+      ],
+      "modelIds": [
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "amazon.nova-pro-v1:0"
+      ],
+      "scenarioIds": [
+        "bedrock-stream-basic-text",
+        "bedrock-stream-metadata-response",
+        "bedrock-simple-explicit-tokens",
+        "bedrock-binary-eventstream-tool-use"
+      ]
+    },
+    "captureBoundary": "streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+    "captureMethod": "BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
+    "network": "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
+    "sourceCitations": [
+      "packages/ai/src/providers/amazon-bedrock.ts:73-260",
+      "packages/ai/src/providers/amazon-bedrock.ts:311-348",
+      "packages/ai/src/providers/amazon-bedrock.ts:598-957",
+      "zig/src/ai/providers/bedrock.zig:169-754",
+      "zig/src/ai/providers/bedrock.zig:781-1427"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Bedrock binary AWS EventStream fixture covers thinking and tool-use chunks"
+}

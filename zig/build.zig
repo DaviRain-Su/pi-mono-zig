@@ -131,6 +131,27 @@ pub fn build(b: *std.Build) void {
     const openai_responses_parity_step = b.step("test-openai-responses-parity", "Run OpenAI Responses TypeScript-vs-Zig semantic request parity harness");
     openai_responses_parity_step.dependOn(&openai_responses_parity.step);
 
+    const bedrock_parity_exe_mod = b.createModule(.{
+        .root_source_file = b.path("test/bedrock_parity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bedrock_parity_exe_mod.addImport("ai", ai_mod);
+    const bedrock_parity_exe = b.addExecutable(.{
+        .name = "bedrock-parity",
+        .root_module = bedrock_parity_exe_mod,
+    });
+    const run_bedrock_parity = b.addRunArtifact(bedrock_parity_exe);
+    const run_bedrock_parity_step = b.step("run-bedrock-parity", "Run Zig Bedrock fixture parity comparator");
+    run_bedrock_parity_step.dependOn(external_tool_check_step);
+    run_bedrock_parity_step.dependOn(&run_bedrock_parity.step);
+
+    const bedrock_parity = b.addSystemCommand(&.{"bash"});
+    bedrock_parity.addFileArg(b.path("test/bedrock-parity.sh"));
+    bedrock_parity.step.dependOn(external_tool_check_step);
+    const bedrock_parity_step = b.step("test-bedrock-parity", "Run Bedrock TypeScript-vs-Zig semantic request and stream parity harness");
+    bedrock_parity_step.dependOn(&bedrock_parity.step);
+
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
     });

@@ -200,6 +200,84 @@ pub fn buildRequestPayload(
     return .{ .object = payload };
 }
 
+pub fn buildRequestSnapshotValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    mode: []const u8,
+) !std.json.Value {
+    var request = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer request.deinit(allocator);
+    try request.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, mode) });
+
+    var payload = try buildRequestPayload(allocator, model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+    try payload.object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
+    try request.put(allocator, try allocator.dupe(u8, "payload"), payload);
+    return .{ .object = request };
+}
+
+pub fn buildStreamSnapshotValueFromLocalEvents(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    events: []const std.json.Value,
+) !std.json.Value {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parse_allocator = arena.allocator();
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(parse_allocator, io);
+    defer stream_instance.deinit();
+
+    var output = initOutput(model);
+    var content_blocks = std.ArrayList(types.ContentBlock).empty;
+    defer content_blocks.deinit(parse_allocator);
+    var tool_calls = std.ArrayList(types.ToolCall).empty;
+    defer tool_calls.deinit(parse_allocator);
+    var active_blocks = std.ArrayList(BlockEntry).empty;
+    defer {
+        for (active_blocks.items) |*entry| deinitCurrentBlock(parse_allocator, &entry.block);
+        active_blocks.deinit(parse_allocator);
+    }
+
+    stream_instance.push(.{ .event_type = .start });
+    for (events) |event_value| {
+        var failed = false;
+        handleEventValue(parse_allocator, &stream_instance, event_value, &output, &content_blocks, &tool_calls, &active_blocks, model) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                failed = true;
+            },
+        };
+        if (failed) break;
+        if (stream_instance.result() != null) break;
+    }
+    if (stream_instance.result() == null) {
+        try finalizeOutput(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, model);
+    }
+
+    return try snapshotStreamEvents(allocator, parse_allocator, &stream_instance);
+}
+
+pub fn buildStreamSnapshotValueFromBinaryBody(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    body: []const u8,
+) !std.json.Value {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parse_allocator = arena.allocator();
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(parse_allocator, io);
+    defer stream_instance.deinit();
+    try parseEventStreamFrames(parse_allocator, &stream_instance, body, model, null);
+    return try snapshotStreamEvents(allocator, parse_allocator, &stream_instance);
+}
+
 fn buildSystemValue(allocator: std.mem.Allocator, system_prompt: []const u8) !std.json.Value {
     var blocks = std.json.Array.init(allocator);
     errdefer blocks.deinit();
@@ -1505,6 +1583,149 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
             return .{ .object = clone };
         },
     }
+}
+
+fn putStringField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+}
+
+fn putIntegerField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: anytype) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .integer = @intCast(value) });
+}
+
+fn eventTypeName(event_type: types.EventType) []const u8 {
+    return switch (event_type) {
+        .start => "start",
+        .text_start => "text_start",
+        .text_delta => "text_delta",
+        .text_end => "text_end",
+        .thinking_start => "thinking_start",
+        .thinking_delta => "thinking_delta",
+        .thinking_end => "thinking_end",
+        .toolcall_start => "toolcall_start",
+        .toolcall_delta => "toolcall_delta",
+        .toolcall_end => "toolcall_end",
+        .done => "done",
+        .error_event => "error_event",
+    };
+}
+
+fn stopReasonName(stop_reason: types.StopReason) []const u8 {
+    return switch (stop_reason) {
+        .stop => "stop",
+        .length => "length",
+        .tool_use => "toolUse",
+        .error_reason => "error",
+        .aborted => "aborted",
+    };
+}
+
+fn snapshotCostValue(allocator: std.mem.Allocator, cost: types.UsageCost) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try object.put(allocator, try allocator.dupe(u8, "cacheRead"), if (cost.cache_read == 0) .{ .integer = 0 } else .{ .float = cost.cache_read });
+    try object.put(allocator, try allocator.dupe(u8, "cacheWrite"), if (cost.cache_write == 0) .{ .integer = 0 } else .{ .float = cost.cache_write });
+    try object.put(allocator, try allocator.dupe(u8, "input"), if (cost.input == 0) .{ .integer = 0 } else .{ .float = cost.input });
+    try object.put(allocator, try allocator.dupe(u8, "output"), if (cost.output == 0) .{ .integer = 0 } else .{ .float = cost.output });
+    try object.put(allocator, try allocator.dupe(u8, "total"), if (cost.total == 0) .{ .integer = 0 } else .{ .float = cost.total });
+    return .{ .object = object };
+}
+
+fn snapshotUsageValue(allocator: std.mem.Allocator, usage: types.Usage) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try putIntegerField(allocator, &object, "cacheRead", usage.cache_read);
+    try putIntegerField(allocator, &object, "cacheWrite", usage.cache_write);
+    try object.put(allocator, try allocator.dupe(u8, "cost"), try snapshotCostValue(allocator, usage.cost));
+    try putIntegerField(allocator, &object, "input", usage.input);
+    try putIntegerField(allocator, &object, "output", usage.output);
+    try putIntegerField(allocator, &object, "totalTokens", usage.total_tokens);
+    return .{ .object = object };
+}
+
+fn snapshotToolCallValue(allocator: std.mem.Allocator, tool_call: types.ToolCall) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, tool_call.arguments));
+    try putStringField(allocator, &object, "id", tool_call.id);
+    try putStringField(allocator, &object, "name", tool_call.name);
+    return .{ .object = object };
+}
+
+fn snapshotContentBlockValue(allocator: std.mem.Allocator, block: types.ContentBlock) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    switch (block) {
+        .text => |text| {
+            try putStringField(allocator, &object, "text", text.text);
+            try putStringField(allocator, &object, "type", "text");
+        },
+        .thinking => |thinking| {
+            try putStringField(allocator, &object, "thinking", thinking.thinking);
+            if (types.thinkingSignature(thinking)) |signature| {
+                try putStringField(allocator, &object, "thinkingSignature", signature);
+            }
+            try putStringField(allocator, &object, "type", "thinking");
+        },
+        .tool_call => |tool_call| {
+            try object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, tool_call.arguments));
+            try putStringField(allocator, &object, "id", tool_call.id);
+            try putStringField(allocator, &object, "name", tool_call.name);
+            try putStringField(allocator, &object, "type", "toolCall");
+        },
+        .image => return BedrockError.InvalidBedrockChunk,
+    }
+    return .{ .object = object };
+}
+
+fn snapshotMessageValue(allocator: std.mem.Allocator, message: types.AssistantMessage) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try putStringField(allocator, &object, "api", message.api);
+    var content = std.json.Array.init(allocator);
+    errdefer content.deinit();
+    for (message.content) |block| {
+        try content.append(try snapshotContentBlockValue(allocator, block));
+    }
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .array = content });
+    if (message.error_message) |error_message| try putStringField(allocator, &object, "errorMessage", error_message);
+    try putStringField(allocator, &object, "model", message.model);
+    try putStringField(allocator, &object, "provider", message.provider);
+    try putStringField(allocator, &object, "role", "assistant");
+    try putStringField(allocator, &object, "stopReason", stopReasonName(message.stop_reason));
+    try object.put(allocator, try allocator.dupe(u8, "usage"), try snapshotUsageValue(allocator, message.usage));
+    return .{ .object = object };
+}
+
+fn snapshotEventValue(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    if (event.content) |content| try putStringField(allocator, &object, "content", content);
+    if (event.content_index) |content_index| try putIntegerField(allocator, &object, "contentIndex", content_index);
+    if (event.delta) |delta| try putStringField(allocator, &object, "delta", delta);
+    if (event.error_message) |error_message| try putStringField(allocator, &object, "errorMessage", error_message);
+    if (event.message) |message| try object.put(allocator, try allocator.dupe(u8, "message"), try snapshotMessageValue(allocator, message));
+    if (event.tool_call) |tool_call| try object.put(allocator, try allocator.dupe(u8, "toolCall"), try snapshotToolCallValue(allocator, tool_call));
+    try putStringField(allocator, &object, "type", eventTypeName(event.event_type));
+    return .{ .object = object };
+}
+
+fn snapshotStreamEvents(
+    allocator: std.mem.Allocator,
+    event_allocator: std.mem.Allocator,
+    stream_instance: *event_stream.AssistantMessageEventStream,
+) !std.json.Value {
+    var events = std.json.Array.init(allocator);
+    errdefer events.deinit();
+    while (stream_instance.next()) |event| {
+        defer event.deinitTransient(event_allocator);
+        try events.append(try snapshotEventValue(allocator, event));
+    }
+    return .{ .array = events };
+}
+
+pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    freeJsonValue(allocator, value);
 }
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {

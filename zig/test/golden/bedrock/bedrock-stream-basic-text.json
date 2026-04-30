@@ -1,0 +1,183 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "mode": "streamBedrock",
+      "payload": {
+        "inferenceConfig": {
+          "maxTokens": 64,
+          "temperature": 0
+        },
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "Return a concise Bedrock fixture response."
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "system": [
+          {
+            "text": "You are the deterministic Bedrock fixture assistant."
+          }
+        ]
+      }
+    },
+    "typeScriptStream": [
+      {
+        "type": "start"
+      },
+      {
+        "contentIndex": 0,
+        "type": "text_start"
+      },
+      {
+        "contentIndex": 0,
+        "delta": "Bedrock fixture response.",
+        "type": "text_delta"
+      },
+      {
+        "content": "Bedrock fixture response.",
+        "contentIndex": 0,
+        "type": "text_end"
+      },
+      {
+        "message": {
+          "api": "bedrock-converse-stream",
+          "content": [
+            {
+              "text": "Bedrock fixture response.",
+              "type": "text"
+            }
+          ],
+          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "provider": "amazon-bedrock",
+          "role": "assistant",
+          "stopReason": "stop",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 7,
+            "output": 5,
+            "totalTokens": 12
+          }
+        },
+        "type": "done"
+      }
+    ]
+  },
+  "id": "bedrock-stream-basic-text",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise Bedrock fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+    },
+    "localStream": {
+      "events": [
+        {
+          "messageStart": {
+            "role": "assistant"
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 0,
+            "delta": {
+              "text": "Bedrock fixture response."
+            }
+          }
+        },
+        {
+          "contentBlockStop": {
+            "contentBlockIndex": 0
+          }
+        },
+        {
+          "messageStop": {
+            "stopReason": "end_turn"
+          }
+        },
+        {
+          "metadata": {
+            "usage": {
+              "inputTokens": 7,
+              "outputTokens": 5,
+              "totalTokens": 12
+            }
+          }
+        }
+      ],
+      "format": "json-lines"
+    },
+    "mode": "streamBedrock",
+    "model": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "input": [
+        "text"
+      ],
+      "name": "Claude 3.7 Sonnet Bedrock Fixture",
+      "provider": "amazon-bedrock",
+      "reasoning": true
+    },
+    "options": {
+      "cacheRetention": "none",
+      "maxTokens": 64,
+      "temperature": 0
+    }
+  },
+  "metadata": {
+    "allowlists": {
+      "ignoredPaths": [
+        "id",
+        "title",
+        "input",
+        "metadata",
+        "schemaVersion",
+        "expected.onResponse",
+        "expected.binaryEventStream"
+      ],
+      "localStreamFormats": [
+        "json-lines",
+        "aws-eventstream"
+      ],
+      "modelIds": [
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "amazon.nova-pro-v1:0"
+      ],
+      "scenarioIds": [
+        "bedrock-stream-basic-text",
+        "bedrock-stream-metadata-response",
+        "bedrock-simple-explicit-tokens",
+        "bedrock-binary-eventstream-tool-use"
+      ]
+    },
+    "captureBoundary": "streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+    "captureMethod": "BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
+    "network": "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
+    "sourceCitations": [
+      "packages/ai/src/providers/amazon-bedrock.ts:73-260",
+      "packages/ai/src/providers/amazon-bedrock.ts:311-348",
+      "packages/ai/src/providers/amazon-bedrock.ts:598-957",
+      "zig/src/ai/providers/bedrock.zig:169-754",
+      "zig/src/ai/providers/bedrock.zig:781-1427"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Bedrock streamBedrock captures a basic Converse request and text stream locally"
+}
