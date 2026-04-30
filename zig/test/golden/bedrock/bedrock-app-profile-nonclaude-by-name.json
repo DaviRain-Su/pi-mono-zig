@@ -4,27 +4,24 @@
       "mode": "streamBedrock",
       "payload": {
         "inferenceConfig": {
-          "maxTokens": 64
+          "maxTokens": 128
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Describe this."
-              },
-              {
-                "image": {
-                  "format": "png",
-                  "source": {
-                    "bytes": "aGVsbG8="
-                  }
-                }
+                "text": "Return a concise Bedrock fixture response."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-5-haiku-20241022-v1:0"
+        "modelId": "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/fixture-profile",
+        "system": [
+          {
+            "text": "You are the deterministic Bedrock fixture assistant."
+          }
+        ]
       }
     },
     "typeScriptStream": [
@@ -54,7 +51,7 @@
               "type": "text"
             }
           ],
-          "model": "anthropic.claude-3-5-haiku-20241022-v1:0",
+          "model": "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/fixture-profile",
           "provider": "amazon-bedrock",
           "role": "assistant",
           "stopReason": "stop",
@@ -77,25 +74,16 @@
       }
     ]
   },
-  "id": "bedrock-vision-image-block",
+  "id": "bedrock-app-profile-nonclaude-by-name",
   "input": {
     "context": {
       "messages": [
         {
-          "content": [
-            {
-              "text": "Describe this.",
-              "type": "text"
-            },
-            {
-              "data": "aGVsbG8=",
-              "mimeType": "image/png",
-              "type": "image"
-            }
-          ],
+          "content": "Return a concise Bedrock fixture response.",
           "role": "user"
         }
-      ]
+      ],
+      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
     },
     "localStream": {
       "events": [
@@ -138,18 +126,18 @@
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "id": "anthropic.claude-3-5-haiku-20241022-v1:0",
+      "id": "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/fixture-profile",
       "input": [
-        "text",
-        "image"
+        "text"
       ],
-      "name": "Claude 3.5 Haiku Bedrock Vision Fixture",
+      "name": "Nova Pro Application Profile Fixture",
       "provider": "amazon-bedrock",
-      "reasoning": false
+      "reasoning": true
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 64
+      "maxTokens": 128,
+      "reasoning": "high"
     }
   },
   "metadata": {
@@ -238,5 +226,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock vision-capable models convert image content to Bedrock image blocks"
+  "title": "Bedrock application inference profiles omit reasoning fields when model.name is not Claude"
 }
