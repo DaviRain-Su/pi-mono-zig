@@ -493,6 +493,8 @@ const TsRpcServer = struct {
     deferred_responses: std.ArrayList(DeferredResponse) = .empty,
     deferred_responses_mutex: std.Io.Mutex = .init,
     deferred_flush_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    deferred_flush_input_backlog: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    deferred_flush_last_activity_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     deferred_flush_thread: ?std.Thread = null,
     next_deferred_response_sequence: usize = 0,
     next_bash_response_sequence: usize = 0,
@@ -522,6 +524,7 @@ const TsRpcServer = struct {
     fn start(self: *TsRpcServer) !void {
         try self.attachToCurrentSession();
         self.deferred_flush_stop.store(false, .seq_cst);
+        self.markDeferredFlushActivity();
         self.deferred_flush_thread = try std.Thread.spawn(.{}, deferredFlushMain, .{self});
     }
 
@@ -617,6 +620,26 @@ const TsRpcServer = struct {
             if (!task.isDone()) return true;
         }
         return false;
+    }
+
+    fn markDeferredFlushActivity(self: *TsRpcServer) void {
+        self.deferred_flush_last_activity_ms.store(self.deferredFlushNowMs(), .seq_cst);
+    }
+
+    fn setDeferredFlushInputBacklog(self: *TsRpcServer, has_backlog: bool) void {
+        self.deferred_flush_input_backlog.store(has_backlog, .seq_cst);
+        if (has_backlog) self.markDeferredFlushActivity();
+    }
+
+    fn shouldHoldDeferredFlush(self: *TsRpcServer) bool {
+        if (self.deferred_flush_input_backlog.load(.seq_cst)) return true;
+        const last_activity_ms = self.deferred_flush_last_activity_ms.load(.seq_cst);
+        if (last_activity_ms == 0) return false;
+        return self.deferredFlushNowMs() - last_activity_ms < DEFERRED_RESPONSE_FLUSH_INTERVAL_MS;
+    }
+
+    fn deferredFlushNowMs(self: *TsRpcServer) i64 {
+        return @intCast(@divFloor(std.Io.Clock.now(.awake, self.io).nanoseconds, std.time.ns_per_ms));
     }
 
     fn abortActivePromptWork(self: *TsRpcServer) void {
@@ -838,6 +861,9 @@ const TsRpcServer = struct {
     }
 
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
+        self.markDeferredFlushActivity();
+        defer self.markDeferredFlushActivity();
+
         const ts_line = stripTrailingCarriageReturn(line);
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, ts_line, .{}) catch {
             const message = try self.parseErrorMessage(ts_line);
@@ -2064,6 +2090,7 @@ fn deferredFlushMain(server: *TsRpcServer) void {
     while (!server.deferred_flush_stop.load(.seq_cst)) {
         std.Io.sleep(server.io, .fromMilliseconds(DEFERRED_RESPONSE_FLUSH_INTERVAL_MS), .awake) catch {};
         if (server.deferred_flush_stop.load(.seq_cst)) break;
+        if (server.shouldHoldDeferredFlush()) continue;
         server.flushDeferredResponses() catch {};
     }
 }
@@ -2112,9 +2139,11 @@ pub fn runTsRpcMode(
             error.EndOfStream => break,
             else => return err,
         };
+        server.setDeferredFlushInputBacklog(stdin_reader.interface.bufferedLen() > 0);
         if (byte == '\n') {
             try server.handleLine(line_buffer.items);
             line_buffer.clearRetainingCapacity();
+            server.setDeferredFlushInputBacklog(stdin_reader.interface.bufferedLen() > 0);
             if (service_extension_host) {
                 try server.serviceExtensionHostIdleTick(0);
             } else {
@@ -2125,6 +2154,7 @@ pub fn runTsRpcMode(
         try line_buffer.append(allocator, byte);
     }
 
+    server.setDeferredFlushInputBacklog(false);
     if (line_buffer.items.len > 0) {
         try server.handleLine(line_buffer.items);
         if (service_extension_host) {
@@ -3256,11 +3286,14 @@ fn runTsRpcModeScript(
     var server = TsRpcServer.init(allocator, io, session, stdout_writer, stderr_writer);
     try server.start();
     defer server.finish() catch {};
+    server.setDeferredFlushInputBacklog(lines.len > 0);
+    defer server.setDeferredFlushInputBacklog(false);
 
     for (lines) |line| {
         try server.handleLine(line);
     }
 
+    server.setDeferredFlushInputBacklog(false);
     try waitForNoInFlightPrompt(&server, 30_000);
     try waitForNoActiveBashTask(&server, 30_000);
     try server.finish();
@@ -3277,10 +3310,13 @@ fn runTsRpcModeBytes(
     var server = TsRpcServer.init(allocator, io, session, stdout_writer, stderr_writer);
     try server.start();
     defer server.finish() catch {};
+    server.setDeferredFlushInputBacklog(bytes.len > 0);
+    defer server.setDeferredFlushInputBacklog(false);
     var line_buffer = std.ArrayList(u8).empty;
     defer line_buffer.deinit(allocator);
 
-    for (bytes) |byte| {
+    for (bytes, 0..) |byte, index| {
+        server.setDeferredFlushInputBacklog(index + 1 < bytes.len);
         if (byte == '\n') {
             try server.handleLine(line_buffer.items);
             line_buffer.clearRetainingCapacity();
@@ -3293,6 +3329,7 @@ fn runTsRpcModeBytes(
         try server.handleLine(line_buffer.items);
     }
 
+    server.setDeferredFlushInputBacklog(false);
     if (server.hasInFlightPrompt()) {
         server.suppress_events = true;
         server.abortActivePromptWork();
