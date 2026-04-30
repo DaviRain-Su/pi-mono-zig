@@ -17,6 +17,17 @@ pub fn stream(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !event_stream.AssistantMessageEventStream {
+    return dispatchProviderStream(allocator, io, model, context, options, false);
+}
+
+fn dispatchProviderStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    simple: bool,
+) !event_stream.AssistantMessageEventStream {
     if (isAbortRequested(options)) {
         return createProviderContractErrorStream(allocator, io, model, .aborted, "Request was aborted");
     }
@@ -24,7 +35,8 @@ pub fn stream(
     const provider = api_registry.get(model.api) orelse
         return createProviderContractErrorStream(allocator, io, model, .error_reason, "ProviderNotFound");
 
-    return provider.stream(allocator, io, model, context, options) catch |err| switch (err) {
+    const stream_fn = if (simple) provider.stream_simple else provider.stream;
+    return stream_fn(allocator, io, model, context, options) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return createProviderContractErrorStream(allocator, io, model, .error_reason, @errorName(err)),
     };
@@ -61,7 +73,7 @@ pub fn streamSimple(
         applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
         break :blk mapped;
     } else null;
-    return try stream(allocator, io, model, context, stream_options);
+    return try dispatchProviderStream(allocator, io, model, context, stream_options, true);
 }
 
 pub fn completeSimple(
@@ -71,14 +83,14 @@ pub fn completeSimple(
     context: types.Context,
     options: ?types.SimpleStreamOptions,
 ) !types.AssistantMessage {
-    const stream_options = if (options) |simple_options| blk: {
-        var mapped = simple_options_mod.buildBaseOptions(model, simple_options, null);
-        applyAnthropicSimpleOptions(&mapped, model, simple_options);
-        applyResponsesSimpleOptions(&mapped, model, simple_options.reasoning);
-        applyMistralSimpleOptions(&mapped, model, simple_options.reasoning);
-        break :blk mapped;
-    } else null;
-    return try complete(allocator, io, model, context, stream_options);
+    var stream_instance = try streamSimple(allocator, io, model, context, options);
+    defer stream_instance.deinit();
+
+    while (stream_instance.next()) |event| {
+        defer event.deinitTransient(allocator);
+    }
+
+    return stream_instance.result() orelse EntryFunctionError.MissingCompletionResult;
 }
 
 fn applyAnthropicSimpleOptions(
@@ -222,6 +234,8 @@ const RecordingState = struct {
     saw_anthropic_thinking_enabled: ?bool = null,
     saw_anthropic_thinking_budget_tokens: ?u32 = null,
     saw_anthropic_effort: ?types.AnthropicEffort = null,
+    saw_bedrock_reasoning: ?types.ThinkingLevel = null,
+    saw_bedrock_thinking_budgets: ?types.ThinkingBudgets = null,
     response_text: []const u8 = "recorded response",
 };
 
@@ -254,6 +268,8 @@ fn recordingStream(
         recording_state.saw_anthropic_thinking_enabled = stream_options.anthropic_thinking_enabled;
         recording_state.saw_anthropic_thinking_budget_tokens = stream_options.anthropic_thinking_budget_tokens;
         recording_state.saw_anthropic_effort = stream_options.anthropic_effort;
+        recording_state.saw_bedrock_reasoning = stream_options.bedrock_reasoning;
+        recording_state.saw_bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
     }
 
     const result_allocator = std.heap.page_allocator;
@@ -531,7 +547,7 @@ test "phase4 provider expansion models route through shared api streams" {
     }
 }
 
-test "streamSimple maps simple options and routes through stream" {
+test "streamSimple maps simple options and routes through provider streamSimple" {
     api_registry.clear();
     defer api_registry.clear();
     resetRecordingState();
@@ -569,12 +585,75 @@ test "streamSimple maps simple options and routes through stream" {
     while (stream_instance.next()) |_| {}
 
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
-    try std.testing.expectEqual(@as(usize, 0), recording_state.stream_simple_calls);
+    try std.testing.expectEqual(@as(usize, 1), recording_state.stream_simple_calls);
     try std.testing.expectEqual(@as(?u32, 42), recording_state.saw_max_tokens);
     try std.testing.expectEqual(@as(?f32, 0.25), recording_state.saw_temperature);
     try std.testing.expectEqualStrings("test-key", recording_state.saw_api_key.?);
     try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
     try std.testing.expect(recording_state.saw_mistral_reasoning_effort == null);
+}
+
+test "streamSimple routes Bedrock fixed reasoning through provider adjustment" {
+    api_registry.clear();
+    defer api_registry.clear();
+
+    try api_registry.register(.{
+        .api = "bedrock-converse-stream",
+        .stream = recordingStream,
+        .stream_simple = struct {
+            fn f(
+                allocator: std.mem.Allocator,
+                io: std.Io,
+                model: types.Model,
+                context: types.Context,
+                options: ?types.StreamOptions,
+            ) !event_stream.AssistantMessageEventStream {
+                recording_state.stream_simple_calls += 1;
+                const base = options orelse types.StreamOptions{};
+                const adjusted = simple_options_mod.adjustMaxTokensForThinking(
+                    base.max_tokens orelse 0,
+                    model.max_tokens,
+                    base.bedrock_reasoning.?,
+                    base.bedrock_thinking_budgets,
+                );
+                var provider_options = base;
+                provider_options.max_tokens = adjusted.max_tokens;
+                var budgets = provider_options.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+                budgets.high = adjusted.thinking_budget;
+                provider_options.bedrock_thinking_budgets = budgets;
+                return recordingStream(allocator, io, model, context, provider_options);
+            }
+        }.f,
+    });
+
+    const model = types.Model{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude 3.7 Sonnet",
+        .api = "bedrock-converse-stream",
+        .provider = "bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+
+    resetRecordingState();
+    var stream_instance = try streamSimple(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        .{ .max_tokens = 128, .reasoning = .high },
+    );
+    defer stream_instance.deinit();
+    while (stream_instance.next()) |_| {}
+
+    try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
+    try std.testing.expectEqual(@as(usize, 1), recording_state.stream_simple_calls);
+    try std.testing.expectEqual(@as(?u32, 4096), recording_state.saw_max_tokens);
+    try std.testing.expectEqual(@as(?types.ThinkingLevel, .high), recording_state.saw_bedrock_reasoning);
+    try std.testing.expectEqual(@as(u32, 3072), recording_state.saw_bedrock_thinking_budgets.?.high);
 }
 
 test "streamSimple maps Mistral reasoning to provider options" {
@@ -907,7 +986,7 @@ test "completeSimple returns final assistant message from simple options" {
 
     try std.testing.expectEqualStrings("simple complete", result.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
-    try std.testing.expectEqual(@as(usize, 0), recording_state.stream_simple_calls);
+    try std.testing.expectEqual(@as(usize, 1), recording_state.stream_simple_calls);
 }
 
 test "stream returns terminal error stream for unknown provider lookup failure" {

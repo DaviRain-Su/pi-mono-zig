@@ -16,6 +16,7 @@ import {
 	type BedrockOptions,
 	streamSimpleBedrock,
 } from "../../packages/ai/src/providers/amazon-bedrock.js";
+import { streamSimple } from "../../packages/ai/src/stream.js";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -38,6 +39,7 @@ const maxStringLength = 12_000;
 const sourceCitations = [
 	"packages/ai/src/providers/amazon-bedrock.ts:73-260",
 	"packages/ai/src/providers/amazon-bedrock.ts:311-348",
+	"packages/ai/src/stream.ts:43-48",
 	"packages/ai/src/providers/amazon-bedrock.ts:598-957",
 	"zig/src/ai/providers/bedrock.zig:169-754",
 	"zig/src/ai/providers/bedrock.zig:781-1427",
@@ -90,6 +92,8 @@ const allowedScenarioIds = [
 	"bedrock-reasoning-adaptive-display-omitted",
 	"bedrock-reasoning-govcloud-fixed-model",
 	"bedrock-reasoning-govcloud-adaptive-region",
+	"bedrock-reasoning-govcloud-adaptive-aws-region",
+	"bedrock-reasoning-govcloud-adaptive-aws-default-region",
 	"bedrock-reasoning-govcloud-adaptive-arn",
 	"bedrock-reasoning-interleaved-default",
 	"bedrock-reasoning-interleaved-true",
@@ -97,6 +101,7 @@ const allowedScenarioIds = [
 	"bedrock-app-profile-fixed-by-name",
 	"bedrock-app-profile-nonclaude-by-name",
 	"bedrock-simple-fixed-reasoning-adjust",
+	"bedrock-public-simple-fixed-reasoning-adjust",
 	"bedrock-simple-fixed-reasoning-custom-cap",
 	"bedrock-simple-no-reasoning-no-adjust",
 	"bedrock-simple-adaptive-no-adjust",
@@ -207,7 +212,7 @@ interface DeclarativeContext {
 }
 
 interface ScenarioInput {
-	mode: "streamBedrock" | "streamSimpleBedrock";
+	mode: "streamBedrock" | "streamSimpleBedrock" | "streamSimple";
 	model: FixtureModelInput;
 	context: DeclarativeContext;
 	options: SerializableOptions;
@@ -584,6 +589,7 @@ function reasoningScenario(
 	model: FixtureModelInput,
 	options: SerializableOptions,
 	mode: ScenarioInput["mode"] = "streamBedrock",
+	env?: FixtureEnv,
 ): Scenario {
 	return {
 		id,
@@ -593,6 +599,7 @@ function reasoningScenario(
 			model,
 			context: baseContext,
 			options: { cacheRetention: "none", ...options },
+			...(env ? { env } : {}),
 			localStream: { format: "json-lines", events: textEvents },
 		},
 	};
@@ -1095,6 +1102,22 @@ const scenarios: Scenario[] = [
 		{ region: "us-gov-west-1", maxTokens: 128, reasoning: "high", thinkingDisplay: "omitted" },
 	),
 	reasoningScenario(
+		"bedrock-reasoning-govcloud-adaptive-aws-region",
+		"Bedrock AWS_REGION GovCloud config omits thinking display for adaptive Claude",
+		opus47Model,
+		{ maxTokens: 128, reasoning: "high", thinkingDisplay: "omitted" },
+		"streamBedrock",
+		{ AWS_REGION: "us-gov-west-1" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-govcloud-adaptive-aws-default-region",
+		"Bedrock AWS_DEFAULT_REGION GovCloud config omits thinking display for adaptive Claude",
+		opus47Model,
+		{ maxTokens: 128, reasoning: "high", thinkingDisplay: "omitted" },
+		"streamBedrock",
+		{ AWS_DEFAULT_REGION: "us-gov-west-1" },
+	),
+	reasoningScenario(
 		"bedrock-reasoning-govcloud-adaptive-arn",
 		"Bedrock GovCloud ARNs omit thinking display for adaptive Claude",
 		govCloudAdaptiveArnModel,
@@ -1136,6 +1159,13 @@ const scenarios: Scenario[] = [
 		baseModel,
 		{ maxTokens: 128, reasoning: "high" },
 		"streamSimpleBedrock",
+	),
+	reasoningScenario(
+		"bedrock-public-simple-fixed-reasoning-adjust",
+		"Bedrock public streamSimple fixed Claude reasoning applies provider-specific max token adjustment",
+		baseModel,
+		{ maxTokens: 128, reasoning: "high" },
+		"streamSimple",
 	),
 	reasoningScenario(
 		"bedrock-simple-fixed-reasoning-custom-cap",
@@ -1771,7 +1801,9 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 			const stream =
 				scenario.input.mode === "streamSimpleBedrock"
 					? streamSimpleBedrock(runtimeModel, runtimeContext, runtimeOptions as SimpleStreamOptions)
-					: streamBedrock(runtimeModel, runtimeContext, runtimeOptions);
+					: scenario.input.mode === "streamSimple"
+						? streamSimple(runtimeModel, runtimeContext, runtimeOptions as SimpleStreamOptions)
+						: streamBedrock(runtimeModel, runtimeContext, runtimeOptions);
 			const events: SemanticEvent[] = [];
 			for await (const event of stream) {
 				events.push(semanticEvent(event));
@@ -1815,7 +1847,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 				},
 				metadata: {
 					captureBoundary:
-						"streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+						"streamBedrock, streamSimpleBedrock, and streamSimple after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
 					captureMethod:
 						"BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
 					network: "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",

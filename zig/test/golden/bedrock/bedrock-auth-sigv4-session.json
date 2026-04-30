@@ -256,6 +256,8 @@
         "bedrock-reasoning-adaptive-display-omitted",
         "bedrock-reasoning-govcloud-fixed-model",
         "bedrock-reasoning-govcloud-adaptive-region",
+        "bedrock-reasoning-govcloud-adaptive-aws-region",
+        "bedrock-reasoning-govcloud-adaptive-aws-default-region",
         "bedrock-reasoning-govcloud-adaptive-arn",
         "bedrock-reasoning-interleaved-default",
         "bedrock-reasoning-interleaved-true",
@@ -263,6 +265,7 @@
         "bedrock-app-profile-fixed-by-name",
         "bedrock-app-profile-nonclaude-by-name",
         "bedrock-simple-fixed-reasoning-adjust",
+        "bedrock-public-simple-fixed-reasoning-adjust",
         "bedrock-simple-fixed-reasoning-custom-cap",
         "bedrock-simple-no-reasoning-no-adjust",
         "bedrock-simple-adaptive-no-adjust",
@@ -287,12 +290,13 @@
         "bedrock-auth-missing-credentials"
       ]
     },
-    "captureBoundary": "streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+    "captureBoundary": "streamBedrock, streamSimpleBedrock, and streamSimple after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
     "captureMethod": "BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
     "network": "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
     "sourceCitations": [
       "packages/ai/src/providers/amazon-bedrock.ts:73-260",
       "packages/ai/src/providers/amazon-bedrock.ts:311-348",
+      "packages/ai/src/stream.ts:43-48",
       "packages/ai/src/providers/amazon-bedrock.ts:598-957",
       "zig/src/ai/providers/bedrock.zig:169-754",
       "zig/src/ai/providers/bedrock.zig:781-1427"

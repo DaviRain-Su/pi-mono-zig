@@ -3,23 +3,33 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
+        "additionalModelRequestFields": {
+          "output_config": {
+            "effort": "high"
+          },
+          "thinking": {
+            "type": "adaptive"
+          }
+        },
         "inferenceConfig": {
-          "maxTokens": 7
+          "maxTokens": 128
         },
         "messages": [
           {
             "content": [
               {
-                "text": "replacement payload"
+                "text": "Return a concise Bedrock fixture response."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "requestMetadata": {
-          "replacement": "true"
-        }
+        "modelId": "global.anthropic.claude-opus-4-7-v1",
+        "system": [
+          {
+            "text": "You are the deterministic Bedrock fixture assistant."
+          }
+        ]
       }
     },
     "typeScriptStream": [
@@ -49,7 +59,7 @@
               "type": "text"
             }
           ],
-          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "model": "global.anthropic.claude-opus-4-7-v1",
           "provider": "amazon-bedrock",
           "role": "assistant",
           "stopReason": "stop",
@@ -72,7 +82,7 @@
       }
     ]
   },
-  "id": "bedrock-onpayload-replacement",
+  "id": "bedrock-reasoning-govcloud-adaptive-aws-region",
   "input": {
     "context": {
       "messages": [
@@ -82,6 +92,9 @@
         }
       ],
       "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+    },
+    "env": {
+      "AWS_REGION": "us-gov-west-1"
     },
     "localStream": {
       "events": [
@@ -124,18 +137,19 @@
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "id": "global.anthropic.claude-opus-4-7-v1",
       "input": [
         "text"
       ],
-      "name": "Claude 3.7 Sonnet Bedrock Fixture",
+      "name": "Claude Opus 4.7 Global Fixture",
       "provider": "amazon-bedrock",
       "reasoning": true
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 64,
-      "onPayload": "replace"
+      "maxTokens": 128,
+      "reasoning": "high",
+      "thinkingDisplay": "omitted"
     }
   },
   "metadata": {
@@ -259,5 +273,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock onPayload replacement sends exactly the replacement payload"
+  "title": "Bedrock AWS_REGION GovCloud config omits thinking display for adaptive Claude"
 }

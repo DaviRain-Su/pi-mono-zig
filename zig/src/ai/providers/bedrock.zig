@@ -292,6 +292,16 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
+    return try buildRequestPayloadWithFixtureEnv(allocator, model, context, options, null);
+}
+
+fn buildRequestPayloadWithFixtureEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    fixture_env: ?FixtureEnv,
+) !std.json.Value {
     var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer payload.deinit(allocator);
 
@@ -317,7 +327,7 @@ pub fn buildRequestPayload(
         if (try buildRequestMetadataValue(allocator, stream_options.bedrock_request_metadata)) |request_metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "requestMetadata"), request_metadata);
         }
-        if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options)) |additional_fields| {
+        if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options, fixture_env)) |additional_fields| {
             try payload.put(allocator, try allocator.dupe(u8, "additionalModelRequestFields"), additional_fields);
         }
     }
@@ -332,18 +342,29 @@ pub fn buildRequestSnapshotValue(
     options: ?types.StreamOptions,
     mode: []const u8,
 ) !std.json.Value {
+    return try buildRequestSnapshotValueWithFixtureEnv(allocator, model, context, options, mode, null);
+}
+
+pub fn buildRequestSnapshotValueWithFixtureEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    mode: []const u8,
+    fixture_env: ?FixtureEnv,
+) !std.json.Value {
     var request = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer request.deinit(allocator);
     try request.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, mode) });
 
     var snapshot_options = options;
     var simple_snapshot_options: types.StreamOptions = undefined;
-    if (std.mem.eql(u8, mode, "streamSimpleBedrock")) {
+    if (std.mem.eql(u8, mode, "streamSimpleBedrock") or std.mem.eql(u8, mode, "streamSimple")) {
         simple_snapshot_options = buildStreamSimpleBedrockOptions(model, options);
         snapshot_options = simple_snapshot_options;
     }
 
-    var payload = try buildRequestPayload(allocator, model, context, snapshot_options);
+    var payload = try buildRequestPayloadWithFixtureEnv(allocator, model, context, snapshot_options, fixture_env);
     errdefer freeJsonValue(allocator, payload);
     try payload.object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
     if (snapshot_options) |stream_options| {
@@ -683,11 +704,29 @@ fn supportsPromptCaching(model: types.Model) bool {
         modelMatchCandidateContains(model, "claude-3-5-haiku");
 }
 
-fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions) bool {
-    if (options.bedrock_region) |region| {
+fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions, fixture_env: ?FixtureEnv) bool {
+    if (configuredBedrockRegion(options, fixture_env)) |region| {
         if (asciiStartsWithIgnoreCase(region, "us-gov-")) return true;
     }
     return asciiStartsWithIgnoreCase(model.id, "us-gov.") or asciiStartsWithIgnoreCase(model.id, "arn:aws-us-gov:");
+}
+
+fn configuredBedrockRegion(options: types.StreamOptions, fixture_env: ?FixtureEnv) ?[]const u8 {
+    if (options.bedrock_region) |region| return region;
+    if (fixture_env) |env| {
+        if (nonEmpty(env.aws_region)) |region| return region;
+        if (nonEmpty(env.aws_default_region)) |region| return region;
+        return null;
+    }
+    if (std.c.getenv("AWS_REGION")) |region| {
+        const value = std.mem.span(region);
+        if (value.len > 0) return value;
+    }
+    if (std.c.getenv("AWS_DEFAULT_REGION")) |region| {
+        const value = std.mem.span(region);
+        if (value.len > 0) return value;
+    }
+    return null;
 }
 
 fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -713,11 +752,12 @@ fn buildAdditionalModelRequestFieldsValue(
     allocator: std.mem.Allocator,
     model: types.Model,
     options: types.StreamOptions,
+    fixture_env: ?FixtureEnv,
 ) !?std.json.Value {
     const reasoning = options.bedrock_reasoning orelse return null;
     if (!model.reasoning or !isAnthropicClaudeModel(model)) return null;
 
-    const display = if (isGovCloudBedrockTarget(model, options)) null else options.bedrock_thinking_display orelse .summarized;
+    const display = if (isGovCloudBedrockTarget(model, options, fixture_env)) null else options.bedrock_thinking_display orelse .summarized;
     var result = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer result.deinit(allocator);
 

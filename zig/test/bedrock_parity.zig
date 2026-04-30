@@ -105,11 +105,11 @@ fn buildActualFixtureComparisonRoot(allocator: std.mem.Allocator, io: std.Io, fi
     const options_value = getObjectField(input, "options");
     const options = try parseOptions(scenario_allocator, options_value);
     const mode = getObjectField(input, "mode").string;
+    const fixture_env = parseFixtureEnv(optionalField(input, "env"));
 
-    var actual_request = try bedrock.buildRequestSnapshotValue(allocator, model, context, options, mode);
+    var actual_request = try bedrock.buildRequestSnapshotValueWithFixtureEnv(allocator, model, context, options, mode, fixture_env);
     errdefer bedrock.freeOwnedJsonValue(allocator, actual_request);
     if (optionalField(getObjectField(getObjectField(fixture, "expected"), "typeScriptRequest"), "requestSurface") != null) {
-        const fixture_env = parseFixtureEnv(optionalField(input, "env"));
         const request_surface = try bedrock.buildRequestSurfaceSnapshotValue(
             allocator,
             model,
