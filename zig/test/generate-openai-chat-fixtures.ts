@@ -1058,6 +1058,26 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "qwen-reasoning-disabled-no-effort",
+		title: "Qwen thinking format emits enable_thinking false and omits incompatible reasoning fields without effort",
+		input: {
+			model: buildModel({
+				id: "qwen-disabled-no-effort-fixture",
+				name: "Qwen Disabled No Effort Fixture",
+				provider: "qwen",
+				baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				reasoning: true,
+				compat: {
+					thinkingFormat: "qwen",
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
 		id: "qwen-chat-template-reasoning-enabled-exclusive",
 		title: "Qwen chat-template thinking format emits chat_template_kwargs and omits incompatible reasoning fields",
 		input: {
