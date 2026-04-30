@@ -48,25 +48,6 @@ pub const OpenAICodexResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
-
-        if (options) |stream_options| {
-            if (stream_options.on_payload) |callback| {
-                const maybe_replacement = callback(allocator, payload, model) catch |err| {
-                    const error_message = try std.fmt.allocPrint(allocator, "onPayload callback failed: {s}", .{@errorName(err)});
-                    return emitErrorMessage(allocator, &stream_instance, model, error_message);
-                };
-                if (maybe_replacement) |replacement| {
-                    freeJsonValue(allocator, payload);
-                    payload = replacement;
-                }
-            }
-        }
-
-        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        defer allocator.free(json_body);
-
         var env_api_key: ?[]u8 = null;
         defer if (env_api_key) |key| allocator.free(key);
 
@@ -88,6 +69,25 @@ pub const OpenAICodexResponsesProvider = struct {
             return emitErrorMessage(allocator, &stream_instance, model, error_message);
         };
         defer allocator.free(account_id);
+
+        var payload = try buildRequestPayload(allocator, model, context, options);
+        defer freeJsonValue(allocator, payload);
+
+        if (options) |stream_options| {
+            if (stream_options.on_payload) |callback| {
+                const maybe_replacement = callback(allocator, payload, model) catch |err| {
+                    const error_message = try std.fmt.allocPrint(allocator, "onPayload callback failed: {s}", .{@errorName(err)});
+                    return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                };
+                if (maybe_replacement) |replacement| {
+                    freeJsonValue(allocator, payload);
+                    payload = replacement;
+                }
+            }
+        }
+
+        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        defer allocator.free(json_body);
 
         const url = try resolveCodexUrl(allocator, model.base_url);
         defer allocator.free(url);
@@ -1759,8 +1759,75 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings("openai-codex-responses", result.api);
 }
 
+fn buildTestCodexApiKey(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    const payload_json = try std.fmt.allocPrint(allocator, "{{\"https://api.openai.com/auth\":{{\"chatgpt_account_id\":\"{s}\"}}}}", .{account_id});
+    defer allocator.free(payload_json);
+
+    const encoded_payload = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload_json.len));
+    defer allocator.free(encoded_payload);
+    const payload_segment = std.base64.url_safe_no_pad.Encoder.encode(encoded_payload, payload_json);
+
+    return try std.fmt.allocPrint(allocator, "aaa.{s}.sig", .{payload_segment});
+}
+
+const CodexOnPayloadObservation = struct {
+    var called = false;
+
+    fn reset() void {
+        called = false;
+    }
+
+    fn observe(_: std.mem.Allocator, _: std.json.Value, _: types.Model) anyerror!?std.json.Value {
+        called = true;
+        return null;
+    }
+};
+
+test "stream invalid account id fails before onPayload is observed" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    CodexOnPayloadObservation.reset();
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, std.Io.failing, model, context, .{
+        .api_key = "not-a-jwt-before-onPayload",
+        .on_payload = CodexOnPayloadObservation.observe,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    defer allocator.free(event.error_message.?);
+    try std.testing.expect(!CodexOnPayloadObservation.called);
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "InvalidJwt") != null);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "stream onPayload failure is terminal error event" {
     const allocator = std.testing.allocator;
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
     const model = types.Model{
         .id = "gpt-5.1-codex",
         .name = "GPT-5.1 Codex",
@@ -1787,7 +1854,7 @@ test "stream onPayload failure is terminal error event" {
     };
 
     var stream = try OpenAICodexResponsesProvider.stream(allocator, std.Io.failing, model, context, .{
-        .api_key = "not-a-jwt-but-not-needed-before-onPayload",
+        .api_key = api_key,
         .on_payload = Callback.fail,
     });
     defer stream.deinit();
