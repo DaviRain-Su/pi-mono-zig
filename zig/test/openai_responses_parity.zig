@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const fixture_dir = "test/golden/openai-responses";
+const default_codex_base_url = "https://chatgpt.com/backend-api";
 const max_diff_output_bytes: usize = 12_000;
 const max_value_bytes: usize = 512;
 const max_diffs: usize = 20;
@@ -121,7 +122,9 @@ fn buildRequestFromFixtureInput(allocator: std.mem.Allocator, input: std.json.Va
     } else payload;
 
     var request = try initObject(allocator);
-    try putString(allocator, &request, "method", "POST");
+    const is_codex_websocket = std.mem.eql(u8, provider_family, "openai-codex") and
+        if (optionalString(options, "transport")) |transport| std.mem.eql(u8, transport, "websocket") else false;
+    try putString(allocator, &request, "method", if (is_codex_websocket) "WEBSOCKET" else "POST");
 
     const url_parts = try buildUrlParts(allocator, model, options, env, provider_family);
     try putString(allocator, &request, "url", url_parts.url);
@@ -129,7 +132,11 @@ fn buildRequestFromFixtureInput(allocator: std.mem.Allocator, input: std.json.Va
     try putString(allocator, &request, "path", url_parts.path);
     try putValue(allocator, &request, "query", .{ .object = url_parts.query });
     try putValue(allocator, &request, "headers", .{ .object = try buildHeaders(allocator, model, context, options, provider_family) });
-    try putValue(allocator, &request, "jsonPayload", final_payload);
+    const request_payload = if (is_codex_websocket)
+        try buildCodexWebSocketMessage(allocator, final_payload)
+    else
+        final_payload;
+    try putValue(allocator, &request, "jsonPayload", request_payload);
     try putValue(allocator, &request, "requestOptions", .{ .object = try buildRequestOptions(allocator, options) });
     try putValue(allocator, &request, "transportMetadata", .{ .object = try buildTransportMetadata(allocator, scenario_id, provider_family) });
     return .{ .object = request };
@@ -157,14 +164,22 @@ fn buildUrlParts(allocator: std.mem.Allocator, model: std.json.Value, options: s
     }
 
     if (std.mem.eql(u8, provider_family, "openai-codex")) {
-        const base = try trimTrailingSlashAlloc(allocator, getObjectField(model, "baseUrl").string);
+        const raw_base = try trimTrailingSlashAlloc(allocator, getObjectField(model, "baseUrl").string);
+        const base = if (raw_base.len > 0) raw_base else default_codex_base_url;
         const url = if (std.mem.endsWith(u8, base, "/codex/responses"))
             try allocator.dupe(u8, base)
         else if (std.mem.endsWith(u8, base, "/codex"))
             try std.fmt.allocPrint(allocator, "{s}/responses", .{base})
         else
             try std.fmt.allocPrint(allocator, "{s}/codex/responses", .{base});
-        return .{ .url = url, .base_url = base, .path = try pathFromUrl(allocator, url), .query = try initObject(allocator) };
+        if (optionalString(options, "transport")) |transport| {
+            if (std.mem.eql(u8, transport, "websocket")) {
+                const websocket_url = try codexWebSocketUrl(allocator, url);
+                const snapshot_base = try codexSnapshotBaseUrl(allocator, url);
+                return .{ .url = websocket_url, .base_url = try codexWebSocketUrl(allocator, snapshot_base), .path = try pathFromUrl(allocator, websocket_url), .query = try initObject(allocator) };
+            }
+        }
+        return .{ .url = url, .base_url = try codexSnapshotBaseUrl(allocator, url), .path = try pathFromUrl(allocator, url), .query = try initObject(allocator) };
     }
 
     const base = try trimTrailingSlashAlloc(allocator, getObjectField(model, "baseUrl").string);
@@ -262,6 +277,34 @@ fn queryObjectFromUrl(allocator: std.mem.Allocator, url: []const u8) !std.json.O
 
 fn trimTrailingSlashAlloc(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     return try allocator.dupe(u8, std.mem.trimEnd(u8, std.mem.trim(u8, value, " \t\r\n"), "/"));
+}
+
+fn codexWebSocketUrl(allocator: std.mem.Allocator, http_url: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, http_url, "https://")) return try std.fmt.allocPrint(allocator, "wss://{s}", .{http_url["https://".len..]});
+    if (std.mem.startsWith(u8, http_url, "http://")) return try std.fmt.allocPrint(allocator, "ws://{s}", .{http_url["http://".len..]});
+    return try allocator.dupe(u8, http_url);
+}
+
+fn codexSnapshotBaseUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const suffix = "/codex/responses";
+    const query_index = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
+    const without_query = url[0..query_index];
+    if (std.mem.endsWith(u8, without_query, suffix)) {
+        return try allocator.dupe(u8, without_query[0 .. without_query.len - suffix.len]);
+    }
+    return try allocator.dupe(u8, without_query);
+}
+
+fn buildCodexWebSocketMessage(allocator: std.mem.Allocator, payload: std.json.Value) !std.json.Value {
+    var message = try initObject(allocator);
+    try putString(allocator, &message, "type", "response.create");
+    if (payload == .object) {
+        var iterator = payload.object.iterator();
+        while (iterator.next()) |entry| {
+            try putValue(allocator, &message, entry.key_ptr.*, try cloneJsonValue(allocator, entry.value_ptr.*));
+        }
+    }
+    return .{ .object = message };
 }
 
 fn buildOpenAIResponsesPayload(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, options: std.json.Value, provider_family: []const u8) !std.json.Value {
@@ -390,10 +433,41 @@ fn buildCodexPayload(allocator: std.mem.Allocator, model: std.json.Value, contex
     try putValue(allocator, &payload, "include", .{ .array = try stringArray(allocator, &[_][]const u8{"reasoning.encrypted_content"}) });
     if (optionalString(options, "sessionId")) |session_id| try putString(allocator, &payload, "prompt_cache_key", session_id);
     if (optionalString(options, "serviceTier")) |service_tier| try putString(allocator, &payload, "service_tier", service_tier);
+    if (optionalNumber(options, "temperature")) |temperature| try putFloat(allocator, &payload, "temperature", temperature);
+    if (optionalField(context, "tools")) |tools| {
+        if (tools == .array and tools.array.items.len > 0) try putValue(allocator, &payload, "tools", .{ .array = try buildTools(allocator, tools, true) });
+    }
     var text = try initObject(allocator);
     try putString(allocator, &text, "verbosity", optionalString(options, "textVerbosity") orelse "low");
     try putValue(allocator, &payload, "text", .{ .object = text });
+    if (optionalString(options, "reasoningEffort")) |effort| {
+        try addReasoning(allocator, &payload, try clampCodexReasoningEffort(allocator, getObjectField(model, "id").string, effort), codexReasoningSummary(options));
+    } else if (optionalString(options, "simpleReasoning")) |effort| {
+        try addReasoning(allocator, &payload, try clampCodexReasoningEffort(allocator, getObjectField(model, "id").string, effort), codexReasoningSummary(options));
+    }
     return .{ .object = payload };
+}
+
+fn codexReasoningSummary(options: std.json.Value) []const u8 {
+    if (optionalString(options, "reasoningSummary")) |summary| return summary;
+    return "auto";
+}
+
+fn clampCodexReasoningEffort(allocator: std.mem.Allocator, model_id: []const u8, effort: []const u8) ![]const u8 {
+    const id = if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |index| model_id[index + 1 ..] else model_id;
+    if ((std.mem.startsWith(u8, id, "gpt-5.2") or
+        std.mem.startsWith(u8, id, "gpt-5.3") or
+        std.mem.startsWith(u8, id, "gpt-5.4") or
+        std.mem.startsWith(u8, id, "gpt-5.5")) and std.mem.eql(u8, effort, "minimal"))
+    {
+        return "low";
+    }
+    if (std.mem.eql(u8, id, "gpt-5.1") and std.mem.eql(u8, effort, "xhigh")) return "high";
+    if (std.mem.eql(u8, id, "gpt-5.1-codex-mini")) {
+        if (std.mem.eql(u8, effort, "high") or std.mem.eql(u8, effort, "xhigh")) return "high";
+        return "medium";
+    }
+    return try allocator.dupe(u8, effort);
 }
 
 fn buildResponsesInput(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, include_system_prompt: bool) !std.json.Array {
@@ -703,9 +777,14 @@ fn buildHeaders(allocator: std.mem.Allocator, model: std.json.Value, context: st
         try putHeader(allocator, &headers, "Authorization", "<redacted-present>");
         try putHeader(allocator, &headers, "chatgpt-account-id", "fixture-account");
         try putHeader(allocator, &headers, "originator", "pi");
-        try putHeader(allocator, &headers, "OpenAI-Beta", "responses=experimental");
-        try putHeader(allocator, &headers, "accept", "text/event-stream");
-        try putHeader(allocator, &headers, "content-type", "application/json");
+        const websocket = if (optionalString(options, "transport")) |transport| std.mem.eql(u8, transport, "websocket") else false;
+        if (websocket) {
+            try putHeader(allocator, &headers, "OpenAI-Beta", "responses_websockets=2026-02-06");
+        } else {
+            try putHeader(allocator, &headers, "OpenAI-Beta", "responses=experimental");
+            try putHeader(allocator, &headers, "accept", "text/event-stream");
+            try putHeader(allocator, &headers, "content-type", "application/json");
+        }
         if (optionalString(options, "sessionId")) |session_id| {
             try putHeader(allocator, &headers, "session_id", session_id);
             try putHeader(allocator, &headers, "x-client-request-id", session_id);
@@ -771,13 +850,29 @@ fn buildRequestOptions(allocator: std.mem.Allocator, options: std.json.Value) !s
 fn buildTransportMetadata(allocator: std.mem.Allocator, scenario_id: []const u8, provider_family: []const u8) !std.json.ObjectMap {
     var object = try initObject(allocator);
     var response_headers = try initObject(allocator);
-    try putString(allocator, &response_headers, "content-type", "text/event-stream");
     try putString(allocator, &response_headers, "x-fixture-response", scenario_id);
+    const deferred = std.mem.startsWith(u8, scenario_id, "codex-responses-transport-auto") or
+        std.mem.startsWith(u8, scenario_id, "codex-responses-transport-websocket");
+    const websocket = std.mem.startsWith(u8, scenario_id, "codex-responses-transport-websocket");
+    if (!deferred) try putString(allocator, &response_headers, "content-type", "text/event-stream");
     try putValue(allocator, &object, "mockedResponseHeaders", .{ .object = response_headers });
-    try putInteger(allocator, &object, "mockedStatus", 200);
-    try putString(allocator, &object, "mode", "sse");
+    try putInteger(allocator, &object, "mockedStatus", if (websocket) 101 else 200);
+    const mode: []const u8 = if (std.mem.startsWith(u8, scenario_id, "codex-responses-transport-auto") or
+        std.mem.startsWith(u8, scenario_id, "codex-responses-transport-websocket"))
+        "deferred-websocket"
+    else
+        "sse";
+    try putString(allocator, &object, "mode", mode);
     try putString(allocator, &object, "providerFamily", provider_family);
-    try putString(allocator, &object, "requestBoundary", "before local mocked SSE response body is consumed");
+    try putString(
+        allocator,
+        &object,
+        "requestBoundary",
+        if (std.mem.eql(u8, mode, "deferred-websocket"))
+            "before local mocked WebSocket message stream is consumed; no live socket opened"
+        else
+            "before local mocked SSE response body is consumed",
+    );
     return object;
 }
 

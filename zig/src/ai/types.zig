@@ -402,6 +402,8 @@ pub const StreamOptions = struct {
     responses_reasoning_summary: ?[]const u8 = null,
     /// Responses API service tier forwarded as service_tier.
     responses_service_tier: ?[]const u8 = null,
+    /// OpenAI Codex Responses text verbosity forwarded as text.verbosity.
+    responses_text_verbosity: ?[]const u8 = null,
     /// Azure OpenAI Responses API version override forwarded as api-version.
     azure_api_version: ?[]const u8 = null,
     /// Azure OpenAI resource name override used to build the default Azure base URL.
@@ -472,6 +474,7 @@ pub const SimpleStreamOptions = struct {
             .anthropic_interleaved_thinking = null,
             .anthropic_tool_choice = null,
             .responses_reasoning_effort = self.reasoning,
+            .responses_text_verbosity = null,
             .azure_api_version = self.azure_api_version,
             .azure_resource_name = self.azure_resource_name,
             .azure_base_url = self.azure_base_url,

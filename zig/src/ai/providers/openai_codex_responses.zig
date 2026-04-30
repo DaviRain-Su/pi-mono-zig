@@ -89,6 +89,10 @@ pub const OpenAICodexResponsesProvider = struct {
 
         var headers = std.StringHashMap([]const u8).init(allocator);
         defer deinitOwnedHeaders(allocator, &headers);
+        try mergeHeaders(allocator, &headers, model.headers);
+        if (options) |stream_options| {
+            try mergeHeaders(allocator, &headers, stream_options.headers);
+        }
         try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
         try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
         try putOwnedHeader(allocator, &headers, "OpenAI-Beta", "responses=experimental");
@@ -97,9 +101,7 @@ pub const OpenAICodexResponsesProvider = struct {
         defer allocator.free(auth_header);
         try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
         try putOwnedHeader(allocator, &headers, "chatgpt-account-id", account_id);
-        try mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
             if (stream_options.session_id) |session_id| {
                 try putOwnedHeader(allocator, &headers, "session_id", session_id);
                 try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
@@ -203,7 +205,11 @@ pub fn buildRequestPayload(
 
     var text_config = try initObject(allocator);
     errdefer text_config.deinit(allocator);
-    try text_config.put(allocator, try allocator.dupe(u8, "verbosity"), .{ .string = try allocator.dupe(u8, "medium") });
+    const text_verbosity = if (options) |stream_options|
+        stream_options.responses_text_verbosity orelse "low"
+    else
+        "low";
+    try text_config.put(allocator, try allocator.dupe(u8, "verbosity"), .{ .string = try allocator.dupe(u8, text_verbosity) });
     try payload.put(allocator, try allocator.dupe(u8, "text"), .{ .object = text_config });
 
     var include = std.json.Array.init(allocator);
@@ -211,34 +217,31 @@ pub fn buildRequestPayload(
     try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
     try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
 
-    const instructions = if (context.system_prompt) |system_prompt|
-        try openai.sanitizeSurrogates(allocator, system_prompt)
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(instructions);
-    try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
+    if (context.system_prompt) |system_prompt| {
+        const instructions = try openai.sanitizeSurrogates(allocator, system_prompt);
+        defer allocator.free(instructions);
+        try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
+    }
 
     if (options) |stream_options| {
         if (stream_options.temperature) |temperature| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
         }
+        if (stream_options.responses_service_tier) |service_tier| {
+            try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
+        }
         if (stream_options.metadata) |metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "metadata"), try cloneJsonValue(allocator, metadata));
         }
         if (stream_options.session_id) |session_id| {
-            if (stream_options.cache_retention != .none) {
-                try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), .{ .string = try allocator.dupe(u8, session_id) });
-            }
-            if (stream_options.cache_retention == .long) {
-                try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), .{ .string = try allocator.dupe(u8, "24h") });
-            }
+            try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), .{ .string = try allocator.dupe(u8, session_id) });
         }
         if (model.reasoning) {
             if (stream_options.responses_reasoning_effort) |reasoning_effort| {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, thinkingLevelString(reasoning_effort)) });
-                try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, "auto") });
+                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, clampReasoningEffort(model.id, reasoning_effort)) });
+                try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, stream_options.responses_reasoning_summary orelse "auto") });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
             }
         }
@@ -460,7 +463,7 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Val
     try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
     try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
     try object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
-    try object.put(allocator, try allocator.dupe(u8, "strict"), .{ .bool = false });
+    try object.put(allocator, try allocator.dupe(u8, "strict"), .null);
     return .{ .object = object };
 }
 
@@ -945,6 +948,25 @@ fn thinkingLevelString(level: types.ThinkingLevel) []const u8 {
     };
 }
 
+fn clampReasoningEffort(model_id: []const u8, level: types.ThinkingLevel) []const u8 {
+    const id = if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |index| model_id[index + 1 ..] else model_id;
+    if ((std.mem.startsWith(u8, id, "gpt-5.2") or
+        std.mem.startsWith(u8, id, "gpt-5.3") or
+        std.mem.startsWith(u8, id, "gpt-5.4") or
+        std.mem.startsWith(u8, id, "gpt-5.5")) and level == .minimal)
+    {
+        return "low";
+    }
+    if (std.mem.eql(u8, id, "gpt-5.1") and level == .xhigh) return "high";
+    if (std.mem.eql(u8, id, "gpt-5.1-codex-mini")) {
+        return switch (level) {
+            .high, .xhigh => "high",
+            else => "medium",
+        };
+    }
+    return thinkingLevelString(level);
+}
+
 fn stripBearerPrefix(token: []const u8) []const u8 {
     if (std.mem.startsWith(u8, token, "Bearer ")) {
         return std.mem.trim(u8, token["Bearer ".len..], " \t\r\n");
@@ -1375,7 +1397,7 @@ test "buildRequestPayload uses Codex-specific request shape" {
 
     const text_config = payload.object.get("text").?;
     try std.testing.expect(text_config == .object);
-    try std.testing.expectEqualStrings("medium", text_config.object.get("verbosity").?.string);
+    try std.testing.expectEqualStrings("low", text_config.object.get("verbosity").?.string);
 
     const include = payload.object.get("include").?;
     try std.testing.expect(include == .array);
@@ -1627,7 +1649,7 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings("openai-codex-responses", result.api);
 }
 
-test "buildRequestPayload includes empty instructions when no system prompt is provided" {
+test "buildRequestPayload omits instructions when no system prompt is provided" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "gpt-5.5",
@@ -1644,7 +1666,7 @@ test "buildRequestPayload includes empty instructions when no system prompt is p
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, null);
     defer freeJsonValue(allocator, payload);
 
-    try std.testing.expectEqualStrings("", payload.object.get("instructions").?.string);
+    try std.testing.expect(payload.object.get("instructions") == null);
 }
 
 test "buildRequestPayload preserves xhigh reasoning for GPT-5.5" {
@@ -1670,6 +1692,38 @@ test "buildRequestPayload preserves xhigh reasoning for GPT-5.5" {
     try std.testing.expect(reasoning == .object);
     try std.testing.expectEqualStrings("xhigh", reasoning.object.get("effort").?.string);
     try std.testing.expectEqualStrings("auto", reasoning.object.get("summary").?.string);
+}
+
+test "buildRequestPayload applies Codex request option parity fields" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5.3-codex",
+        .name = "Codex GPT-5.3",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, .{
+        .cache_retention = .none,
+        .responses_reasoning_effort = .minimal,
+        .responses_reasoning_summary = "concise",
+        .responses_service_tier = "priority",
+        .responses_text_verbosity = "high",
+        .session_id = "codex-session",
+    });
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expectEqualStrings("codex-session", payload.object.get("prompt_cache_key").?.string);
+    try std.testing.expect(payload.object.get("prompt_cache_retention") == null);
+    try std.testing.expectEqualStrings("priority", payload.object.get("service_tier").?.string);
+    try std.testing.expectEqualStrings("high", payload.object.get("text").?.object.get("verbosity").?.string);
+    try std.testing.expectEqualStrings("low", payload.object.get("reasoning").?.object.get("effort").?.string);
+    try std.testing.expectEqualStrings("concise", payload.object.get("reasoning").?.object.get("summary").?.string);
 }
 
 test "buildRequestPayload omits empty tools array" {

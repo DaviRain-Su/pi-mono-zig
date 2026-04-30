@@ -1,0 +1,98 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "headers": {
+        "accept": "text/event-stream",
+        "authorization": "<redacted-present>",
+        "chatgpt-account-id": "fixture-account",
+        "content-type": "application/json",
+        "openai-beta": "responses=experimental",
+        "originator": "pi"
+      },
+      "jsonPayload": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "Use the default Codex URL.",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-5.1-codex-default-url",
+        "parallel_tool_calls": true,
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        },
+        "tool_choice": "auto"
+      },
+      "method": "POST",
+      "path": "/backend-api/codex/responses",
+      "query": {},
+      "requestOptions": {
+        "signal": "not-provided"
+      },
+      "transportMetadata": {
+        "mockedResponseHeaders": {
+          "content-type": "text/event-stream",
+          "x-fixture-response": "codex-responses-default-url-no-session"
+        },
+        "mockedStatus": 200,
+        "mode": "sse",
+        "providerFamily": "openai-codex",
+        "requestBoundary": "before local mocked SSE response body is consumed"
+      },
+      "url": "https://chatgpt.com/backend-api/codex/responses"
+    }
+  },
+  "id": "codex-responses-default-url-no-session",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Use the default Codex URL.",
+          "role": "user"
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-codex-responses",
+      "baseUrl": "",
+      "id": "gpt-5.1-codex-default-url",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 5.1 Codex Fixture",
+      "provider": "openai-codex",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-codex-jwt",
+      "transport": "sse"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "Responses-family request after model/options resolution, payload conversion, header merge, callbacks, and before live HTTP/WebSocket transport",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records final request semantics and rejects unhandled hosts",
+    "diffOutputBoundBytes": 12000,
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-responses.ts",
+      "packages/ai/src/providers/openai-responses-shared.ts",
+      "packages/ai/src/providers/github-copilot-headers.ts",
+      "packages/ai/src/providers/azure-openai-responses.ts",
+      "packages/ai/src/providers/openai-codex-responses.ts"
+    ]
+  },
+  "providerFamily": "openai-codex",
+  "schemaVersion": 1,
+  "title": "OpenAI Codex Responses defaults blank base URL, omits optional fields, and omits instructions without a system prompt"
+}
