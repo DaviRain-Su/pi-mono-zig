@@ -883,6 +883,201 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "openai-reasoning-no-effort",
+		title: "OpenAI-style reasoning-capable model omits reasoning_effort when no effort is requested",
+		input: {
+			model: buildModel({
+				id: "openai-no-effort-fixture",
+				name: "OpenAI No Effort Fixture",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "openai-reasoning-effort-map-override",
+		title: "OpenAI-style reasoning_effort applies explicit reasoning effort map before serialization",
+		input: {
+			model: buildModel({
+				id: "openai-effort-map-fixture",
+				name: "OpenAI Effort Map Fixture",
+				reasoning: true,
+				compat: {
+					reasoningEffortMap: {
+						low: "fixture-low",
+					},
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "low",
+			},
+		},
+	},
+	{
+		id: "openai-reasoning-effort-disabled",
+		title: "supportsReasoningEffort false gates only OpenAI-style reasoning_effort",
+		input: {
+			model: buildModel({
+				id: "openai-effort-disabled-fixture",
+				name: "OpenAI Effort Disabled Fixture",
+				reasoning: true,
+				compat: {
+					supportsReasoningEffort: false,
+					thinkingFormat: "openai",
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "high",
+			},
+		},
+	},
+	{
+		id: "openrouter-reasoning-no-effort-none",
+		title: "OpenRouter reasoning-capable model emits nested reasoning effort none without top-level effort",
+		input: {
+			model: buildModel({
+				id: "openrouter-no-effort-fixture",
+				name: "OpenRouter No Effort Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "openrouter-reasoning-effort-map-supports-false",
+		title: "OpenRouter reasoning ignores supportsReasoningEffort false and applies explicit effort map",
+		input: {
+			model: buildModel({
+				id: "openrouter-effort-map-fixture",
+				name: "OpenRouter Effort Map Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+				compat: {
+					supportsReasoningEffort: false,
+					reasoningEffortMap: {
+						high: "router-high",
+					},
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "high",
+			},
+		},
+	},
+	{
+		id: "deepseek-reasoning-disabled-no-effort",
+		title: "DeepSeek thinking format emits disabled thinking and omits reasoning_effort without effort",
+		input: {
+			model: buildModel({
+				id: "deepseek-disabled-fixture",
+				name: "DeepSeek Disabled Fixture",
+				provider: "deepseek",
+				baseUrl: "https://api.deepseek.com/v1",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "deepseek-reasoning-map-supports-false",
+		title: "DeepSeek thinking format ignores supportsReasoningEffort false and applies mapped effort",
+		input: {
+			model: buildModel({
+				id: "deepseek-supports-false-fixture",
+				name: "DeepSeek Supports False Fixture",
+				provider: "deepseek",
+				baseUrl: "https://api.deepseek.com/v1",
+				reasoning: true,
+				compat: {
+					supportsReasoningEffort: false,
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "xhigh",
+			},
+		},
+	},
+	{
+		id: "zai-reasoning-enabled-exclusive",
+		title: "Z.AI thinking format emits enable_thinking true and omits incompatible reasoning fields",
+		input: {
+			model: buildModel({
+				id: "glm-4.5-enabled-fixture",
+				name: "Z.AI Enabled Fixture",
+				provider: "zai",
+				baseUrl: "https://api.z.ai/api/paas/v4",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "high",
+			},
+		},
+	},
+	{
+		id: "qwen-reasoning-enabled-exclusive",
+		title: "Qwen thinking format emits enable_thinking true and omits incompatible reasoning fields",
+		input: {
+			model: buildModel({
+				id: "qwen-enabled-fixture",
+				name: "Qwen Enabled Fixture",
+				provider: "qwen",
+				baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				reasoning: true,
+				compat: {
+					thinkingFormat: "qwen",
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "minimal",
+			},
+		},
+	},
+	{
+		id: "qwen-chat-template-reasoning-enabled-exclusive",
+		title: "Qwen chat-template thinking format emits chat_template_kwargs and omits incompatible reasoning fields",
+		input: {
+			model: buildModel({
+				id: "qwen-chat-template-enabled-fixture",
+				name: "Qwen Chat Template Enabled Fixture",
+				provider: "qwen",
+				baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+				reasoning: true,
+				compat: {
+					thinkingFormat: "qwen-chat-template",
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "low",
+			},
+		},
+	},
+	{
 		id: "nonstandard-explicit-store-usage-override",
 		title: "Non-standard provider explicit compat enables store and streaming usage fields",
 		input: {

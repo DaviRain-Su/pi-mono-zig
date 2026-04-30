@@ -1,0 +1,92 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": false,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": false,
+      "supportsStore": false,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "zai",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "enable_thinking": true,
+        "messages": [
+          {
+            "content": "You are the deterministic OpenAI Chat fixture assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Return a concise fixture response.",
+            "role": "user"
+          }
+        ],
+        "model": "glm-4.5-enabled-fixture",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "method": "POST",
+      "path": "/api/paas/v4/chat/completions",
+      "url": "https://api.z.ai/api/paas/v4/chat/completions"
+    }
+  },
+  "id": "zai-reasoning-enabled-exclusive",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic OpenAI Chat fixture assistant."
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "id": "glm-4.5-enabled-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Z.AI Enabled Fixture",
+      "provider": "zai",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "reasoningEffort": "high"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Z.AI thinking format emits enable_thinking true and omits incompatible reasoning fields"
+}
