@@ -43,12 +43,12 @@ pub const OpenAIProvider = struct {
         var headers = try buildRequestHeaders(allocator, model, options);
         defer deinitOwnedHeaders(allocator, &headers);
 
-        const request_url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url});
-        defer allocator.free(request_url);
+        const request_target = try buildOpenAIChatRequestTarget(allocator, model.base_url);
+        defer request_target.deinit(allocator);
 
         const req = http_client.HttpRequest{
             .method = .POST,
-            .url = request_url,
+            .url = request_target.url,
             .headers = headers,
             .body = json_out.written(),
             .timeout_ms = if (options) |opts| opts.timeout_ms orelse 0 else 0,
@@ -1625,39 +1625,54 @@ pub fn buildRequestSnapshotValueWithCacheRetentionEnv(
     var snapshot = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer snapshot.deinit(allocator);
 
-    const request_path = try buildRequestPath(allocator, model.base_url);
-    defer allocator.free(request_path);
-    const request_url = try buildSemanticRequestUrl(allocator, model.base_url, request_path);
-    defer allocator.free(request_url);
+    const request_target = try buildOpenAIChatRequestTarget(allocator, model.base_url);
+    defer request_target.deinit(allocator);
 
     try snapshot.put(allocator, try allocator.dupe(u8, "baseUrl"), std.json.Value{ .string = try allocator.dupe(u8, model.base_url) });
     try snapshot.put(allocator, try allocator.dupe(u8, "headers"), .{ .object = try normalizeSemanticHeaders(allocator, headers) });
     try snapshot.put(allocator, try allocator.dupe(u8, "jsonPayload"), payload);
     payload = .null;
     try snapshot.put(allocator, try allocator.dupe(u8, "method"), std.json.Value{ .string = try allocator.dupe(u8, "POST") });
-    try snapshot.put(allocator, try allocator.dupe(u8, "path"), std.json.Value{ .string = try allocator.dupe(u8, request_path) });
-    try snapshot.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, request_url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "path"), std.json.Value{ .string = try allocator.dupe(u8, request_target.path) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, request_target.url) });
 
     return .{ .object = snapshot };
 }
 
-fn buildRequestPath(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
-    const scheme = std.mem.indexOf(u8, base_url, "://") orelse return try allocator.dupe(u8, "/chat/completions");
-    const after_origin = base_url[scheme + 3 ..];
-    const slash_index = std.mem.indexOfScalar(u8, after_origin, '/') orelse return try allocator.dupe(u8, "/chat/completions");
-    const base_path_raw = after_origin[slash_index..];
-    const base_path = trimRightScalar(base_path_raw, '/');
-    if (base_path.len == 0) return try allocator.dupe(u8, "/chat/completions");
-    return try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_path});
+const OpenAIChatRequestTarget = struct {
+    url: []const u8,
+    path: []const u8,
+
+    fn deinit(self: OpenAIChatRequestTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.url);
+    }
+};
+
+fn buildOpenAIChatRequestTarget(allocator: std.mem.Allocator, base_url: []const u8) !OpenAIChatRequestTarget {
+    const url = try buildOpenAIChatRequestUrl(allocator, base_url);
+    errdefer allocator.free(url);
+
+    const path = try buildRequestPathFromUrl(allocator, url);
+    errdefer allocator.free(path);
+
+    return .{
+        .url = url,
+        .path = path,
+    };
 }
 
-fn buildSemanticRequestUrl(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) ![]const u8 {
-    const scheme = std.mem.indexOf(u8, base_url, "://") orelse return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path });
+fn buildOpenAIChatRequestUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    const normalized_base_url = trimRightScalar(base_url, '/');
+    return try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{normalized_base_url});
+}
+
+fn buildRequestPathFromUrl(allocator: std.mem.Allocator, request_url: []const u8) ![]const u8 {
+    const scheme = std.mem.indexOf(u8, request_url, "://") orelse return try allocator.dupe(u8, "/chat/completions");
     const after_scheme_index = scheme + 3;
-    const after_origin = base_url[after_scheme_index..];
-    const slash_index = std.mem.indexOfScalar(u8, after_origin, '/') orelse return try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path });
-    const origin = base_url[0 .. after_scheme_index + slash_index];
-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, path });
+    const after_origin = request_url[after_scheme_index..];
+    const slash_index = std.mem.indexOfScalar(u8, after_origin, '/') orelse return try allocator.dupe(u8, "/");
+    return try allocator.dupe(u8, request_url[after_scheme_index + slash_index ..]);
 }
 
 fn normalizeSemanticHeaders(
@@ -2429,6 +2444,25 @@ test "buildRequestHeaders merges model and option headers" {
     var anonymous_headers = try buildRequestHeaders(allocator, model, .{});
     defer deinitOwnedHeaders(allocator, &anonymous_headers);
     try std.testing.expect(anonymous_headers.get("Authorization") == null);
+}
+
+test "OpenAI Chat request target uses one production URL builder for trailing slash and base path" {
+    const allocator = std.testing.allocator;
+
+    const base_path_target = try buildOpenAIChatRequestTarget(allocator, "https://proxy.example.test/custom/openai/v1/");
+    defer base_path_target.deinit(allocator);
+    try std.testing.expectEqualStrings("https://proxy.example.test/custom/openai/v1/chat/completions", base_path_target.url);
+    try std.testing.expectEqualStrings("/custom/openai/v1/chat/completions", base_path_target.path);
+
+    const root_target = try buildOpenAIChatRequestTarget(allocator, "https://api.openai.com");
+    defer root_target.deinit(allocator);
+    try std.testing.expectEqualStrings("https://api.openai.com/chat/completions", root_target.url);
+    try std.testing.expectEqualStrings("/chat/completions", root_target.path);
+
+    const standard_target = try buildOpenAIChatRequestTarget(allocator, "https://api.openai.com/v1");
+    defer standard_target.deinit(allocator);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/chat/completions", standard_target.url);
+    try std.testing.expectEqualStrings("/v1/chat/completions", standard_target.path);
 }
 
 test "OpenAI Chat cache retention resolver preserves explicit values over env fallback" {
