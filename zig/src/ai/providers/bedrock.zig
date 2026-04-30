@@ -2158,10 +2158,7 @@ fn finalizeOutputFromPartials(
                 stream_ptr.push(.{ .event_type = .thinking_end, .content_index = @intCast(entry.event_index), .content = owned });
             },
             .tool_call => |tool| {
-                var parsed_arguments = json_parse.parseStreamingJson(allocator, tool.partial_json.items) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => continue,
-                };
+                var parsed_arguments = (try parseCompleteToolArguments(allocator, tool.partial_json.items)) orelse continue;
                 defer parsed_arguments.deinit();
                 const final_tool_call = types.ToolCall{
                     .id = try allocator.dupe(u8, tool.id),
@@ -2205,10 +2202,7 @@ fn collectOutputFromPartials(
                 try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
             },
             .tool_call => |tool| {
-                var parsed_arguments = json_parse.parseStreamingJson(allocator, tool.partial_json.items) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => continue,
-                };
+                var parsed_arguments = (try parseCompleteToolArguments(allocator, tool.partial_json.items)) orelse continue;
                 defer parsed_arguments.deinit();
                 const final_tool_call = types.ToolCall{
                     .id = try allocator.dupe(u8, tool.id),
@@ -2228,6 +2222,15 @@ fn collectOutputFromPartials(
     output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
     output.tool_calls = if (output.tool_calls == null and tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else output.tool_calls;
     output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
+}
+
+fn parseCompleteToolArguments(allocator: std.mem.Allocator, input: []const u8) !?std.json.Parsed(std.json.Value) {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
 }
 
 fn emitStreamFailureMessage(
@@ -2995,7 +2998,7 @@ test "signRequestHeaders creates sigv4 authorization and security token" {
     try signRequestHeaders(
         allocator,
         &headers,
-        model,
+        model.base_url,
         "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream",
         "{}",
         .{
@@ -3007,7 +3010,7 @@ test "signRequestHeaders creates sigv4 authorization and security token" {
             .amz_date = "20250115T120000Z",
             .date_stamp = "20250115",
         },
-        null,
+        "us-east-1",
     );
 
     try std.testing.expectEqualStrings("bedrock-runtime.us-east-1.amazonaws.com", headers.get("host").?);
