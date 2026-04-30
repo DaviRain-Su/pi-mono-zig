@@ -1,11 +1,12 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 30,
+  "fixtureCount": 31,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
     "openai-basic-text",
     "openai-on-payload-replacement",
+    "openai-on-payload-pass-through",
     "header-merge-option-override",
     "chutes-max-tokens-scaffold",
     "openrouter-anthropic-compat",

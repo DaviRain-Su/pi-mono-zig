@@ -20,7 +20,13 @@ pub const OpenAIProvider = struct {
         errdefer event_stream_instance.deinit();
 
         // Build request payload
-        const payload = try buildFinalRequestPayload(allocator, model, context, options);
+        const payload = buildFinalRequestPayload(allocator, model, context, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                pushEarlyTerminalError(&event_stream_instance, model, err);
+                return event_stream_instance;
+            },
+        };
         defer freeJsonValue(allocator, payload);
 
         // Serialize payload to JSON
@@ -28,28 +34,53 @@ pub const OpenAIProvider = struct {
         const json_writer = &json_out.writer;
         defer json_out.deinit();
 
-        try std.json.Stringify.value(payload, .{}, json_writer);
+        std.json.Stringify.value(payload, .{}, json_writer) catch |err| {
+            pushEarlyTerminalError(&event_stream_instance, model, err);
+            return event_stream_instance;
+        };
 
         // Build HTTP request
         var headers = try buildRequestHeaders(allocator, model, options);
         defer deinitOwnedHeaders(allocator, &headers);
 
+        const request_url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url});
+        defer allocator.free(request_url);
+
         const req = http_client.HttpRequest{
             .method = .POST,
-            .url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}),
+            .url = request_url,
             .headers = headers,
             .body = json_out.written(),
             .timeout_ms = if (options) |opts| opts.timeout_ms orelse 0 else 0,
             .aborted = if (options) |opts| opts.signal else null,
         };
-        defer allocator.free(req.url);
 
         // Send request and process response
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
 
-        var streaming = try client.requestStreaming(req);
+        var streaming = client.requestStreaming(req) catch |err| switch (err) {
+            error.InvalidUrl => {
+                pushEarlyTerminalError(&event_stream_instance, model, err);
+                return event_stream_instance;
+            },
+            else => return err,
+        };
         defer streaming.deinit();
+
+        if (options) |opts| {
+            if (opts.on_response) |on_response| {
+                var response_headers = try normalizedResponseHeaders(allocator, streaming.response_headers);
+                defer deinitOwnedHeaders(allocator, &response_headers);
+                on_response(streaming.status, response_headers, model) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        pushEarlyTerminalError(&event_stream_instance, model, err);
+                        return event_stream_instance;
+                    },
+                };
+            }
+        }
 
         if (streaming.status != 200) {
             const response_body = try streaming.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
@@ -127,6 +158,45 @@ fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) v
     }
     // Do NOT free event.content or event.message - they are shared with content_blocks
     if (event.error_message) |em| allocator.free(em);
+}
+
+fn pushEarlyTerminalError(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    err: anyerror,
+) void {
+    const error_message = provider_error.runtimeErrorMessage(err);
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
+
+fn normalizedResponseHeaders(
+    allocator: std.mem.Allocator,
+    maybe_headers: ?std.StringHashMap([]const u8),
+) !std.StringHashMap([]const u8) {
+    var normalized = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitOwnedHeaders(allocator, &normalized);
+
+    if (maybe_headers) |headers| {
+        var iterator = headers.iterator();
+        while (iterator.next()) |entry| {
+            const lower = try asciiLowerAlloc(allocator, entry.key_ptr.*);
+            defer allocator.free(lower);
+            try putOwnedHeader(allocator, &normalized, lower, entry.value_ptr.*);
+        }
+    }
+
+    return normalized;
 }
 
 fn parseSseStreamLines(
@@ -2500,6 +2570,279 @@ fn runtimeFailureContext() types.Context {
             } },
         },
     };
+}
+
+const OnPayloadPassThrough = struct {
+    var called = false;
+    var observed_post_compat_fields = false;
+
+    fn reset() void {
+        called = false;
+        observed_post_compat_fields = false;
+    }
+
+    fn callback(allocator: std.mem.Allocator, payload: std.json.Value, model: types.Model) !?std.json.Value {
+        _ = allocator;
+        called = true;
+        try std.testing.expectEqualStrings("gpt-4", model.id);
+        try std.testing.expect(payload == .object);
+        observed_post_compat_fields = payload.object.get("stream_options") != null and
+            payload.object.get("store") != null and
+            payload.object.get("messages") != null;
+        return null;
+    }
+};
+
+const OnPayloadReplacement = struct {
+    var called = false;
+
+    fn reset() void {
+        called = false;
+    }
+
+    fn callback(allocator: std.mem.Allocator, payload: std.json.Value, model: types.Model) !?std.json.Value {
+        _ = model;
+        called = true;
+        try std.testing.expect(payload == .object);
+        try std.testing.expect(payload.object.get("messages") != null);
+
+        var replacement = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        errdefer replacement.deinit(allocator);
+        try replacement.put(allocator, try allocator.dupe(u8, "fixture_marker"), .{ .string = try allocator.dupe(u8, "replacement") });
+        try replacement.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
+        return .{ .object = replacement };
+    }
+};
+
+fn failingOnPayload(allocator: std.mem.Allocator, payload: std.json.Value, model: types.Model) !?std.json.Value {
+    _ = allocator;
+    _ = payload;
+    _ = model;
+    return error.FixtureOnPayloadFailure;
+}
+
+const OnResponseCapture = struct {
+    var called = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+        called = true;
+        status = callback_status;
+        try std.testing.expectEqualStrings("openai-completions", model.api);
+        try std.testing.expectEqualStrings("application/json", headers.get("content-type").?);
+        try std.testing.expectEqualStrings("callback-fixture", headers.get("x-fixture-response").?);
+        try std.testing.expect(headers.get("Content-Type") == null);
+    }
+};
+
+const OnResponseFailure = struct {
+    var called = false;
+
+    fn reset() void {
+        called = false;
+    }
+
+    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+        _ = model;
+        called = true;
+        try std.testing.expectEqual(@as(u16, 200), callback_status);
+        try std.testing.expectEqualStrings("callback-fixture", headers.get("x-fixture-response").?);
+        return error.FixtureOnResponseFailure;
+    }
+};
+
+fn openAiCallbackTestModel(base_url: []const u8) types.Model {
+    return .{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+}
+
+fn openAiCallbackTestContext() types.Context {
+    return .{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello callback" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+}
+
+fn expectOnlyTerminalError(
+    stream: *event_stream.AssistantMessageEventStream,
+    expected_error: []const u8,
+) !void {
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expectEqualStrings(expected_error, event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+}
+
+test "buildFinalRequestPayload on_payload observes post-compat payload and passes through" {
+    const allocator = std.testing.allocator;
+    OnPayloadPassThrough.reset();
+
+    var payload = try buildFinalRequestPayload(
+        allocator,
+        openAiCallbackTestModel("https://api.openai.com/v1"),
+        openAiCallbackTestContext(),
+        .{ .api_key = "test-key", .on_payload = &OnPayloadPassThrough.callback },
+    );
+    defer freeOwnedJsonValue(allocator, payload);
+
+    try std.testing.expect(OnPayloadPassThrough.called);
+    try std.testing.expect(OnPayloadPassThrough.observed_post_compat_fields);
+    try std.testing.expect(payload.object.get("fixture_marker") == null);
+    try std.testing.expectEqualStrings("gpt-4", payload.object.get("model").?.string);
+    try std.testing.expect(payload.object.get("stream_options") != null);
+}
+
+test "buildFinalRequestPayload on_payload replacement becomes submitted payload" {
+    const allocator = std.testing.allocator;
+    OnPayloadReplacement.reset();
+
+    var payload = try buildFinalRequestPayload(
+        allocator,
+        openAiCallbackTestModel("https://api.openai.com/v1"),
+        openAiCallbackTestContext(),
+        .{ .api_key = "test-key", .on_payload = &OnPayloadReplacement.callback },
+    );
+    defer freeOwnedJsonValue(allocator, payload);
+
+    try std.testing.expect(OnPayloadReplacement.called);
+    try std.testing.expectEqualStrings("replacement", payload.object.get("fixture_marker").?.string);
+    try std.testing.expect(payload.object.get("messages") == null);
+}
+
+test "stream on_payload failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIProvider.stream(
+        allocator,
+        io,
+        openAiCallbackTestModel("https://api.openai.com/v1"),
+        openAiCallbackTestContext(),
+        .{ .api_key = "test-key", .on_payload = failingOnPayload },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalError(&stream, "FixtureOnPayloadFailure");
+}
+
+test "stream on_response observes mocked status and normalized headers before body" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    OnResponseCapture.reset();
+
+    const body = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n" ++
+        "data: [DONE]\n";
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        200,
+        "OK",
+        "x-fixture-response: callback-fixture\r\n",
+        body,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try OpenAIProvider.stream(
+        allocator,
+        io,
+        openAiCallbackTestModel(url),
+        openAiCallbackTestContext(),
+        .{ .api_key = "test-key", .on_response = &OnResponseCapture.callback },
+    );
+    defer stream.deinit();
+
+    try std.testing.expect(OnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 200), OnResponseCapture.status);
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    var saw_done = false;
+    while (stream.next()) |event| {
+        if (event.event_type == .done) {
+            saw_done = true;
+            try std.testing.expect(event.message != null);
+            try std.testing.expectEqual(types.StopReason.stop, event.message.?.stop_reason);
+            break;
+        }
+    }
+    try std.testing.expect(saw_done);
+}
+
+test "stream on_response failure returns one terminal error event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    OnResponseFailure.reset();
+
+    const body = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"unread\"},\"finish_reason\":null}]}\n" ++
+        "data: [DONE]\n";
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        200,
+        "OK",
+        "x-fixture-response: callback-fixture\r\n",
+        body,
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try OpenAIProvider.stream(
+        allocator,
+        io,
+        openAiCallbackTestModel(url),
+        openAiCallbackTestContext(),
+        .{ .api_key = "test-key", .on_response = &OnResponseFailure.callback },
+    );
+    defer stream.deinit();
+
+    try std.testing.expect(OnResponseFailure.called);
+    try expectOnlyTerminalError(&stream, "FixtureOnResponseFailure");
+}
+
+test "stream URL construction failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIProvider.stream(
+        allocator,
+        io,
+        openAiCallbackTestModel("http://[::1"),
+        openAiCallbackTestContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalError(&stream, "InvalidUrl");
 }
 
 test "parseSseStreamLines preserves partial text before malformed event JSON terminal error" {

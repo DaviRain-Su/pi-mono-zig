@@ -241,6 +241,23 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "openai-on-payload-pass-through",
+		title: "onPayload pass-through preserves the final post-compat request body",
+		input: {
+			model: buildModel({ id: "gpt-4.1-pass-through-fixture" }),
+			context: {
+				systemPrompt: "Observe the post-compat payload and pass it through unchanged.",
+				messages: [{ role: "user", content: "This prompt should remain in the submitted payload." }],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				maxTokens: 24,
+				onPayload: "pass-through",
+				temperature: 0,
+			},
+		},
+	},
+	{
 		id: "header-merge-option-override",
 		title: "Model headers, generated auth, session affinity, and option overrides share one capture boundary",
 		input: {

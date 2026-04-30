@@ -145,11 +145,11 @@ pub const OpenAIResponsesProvider = struct {
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
                 if (response.response_headers) |response_headers| {
-                    callback(response.status, response_headers, model);
+                    try callback(response.status, response_headers, model);
                 } else {
                     var response_headers = std.StringHashMap([]const u8).init(allocator);
                     defer response_headers.deinit();
-                    callback(response.status, response_headers, model);
+                    try callback(response.status, response_headers, model);
                 }
             }
         }
@@ -1765,7 +1765,7 @@ const OnResponseCapture = struct {
         status = 0;
     }
 
-    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) void {
+    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
         called = true;
         status = callback_status;
         std.testing.expectEqualStrings("openai-responses", model.api) catch unreachable;

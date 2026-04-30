@@ -177,11 +177,11 @@ pub const MistralProvider = struct {
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
                 if (response.response_headers) |response_headers| {
-                    callback(response.status, response_headers, model);
+                    try callback(response.status, response_headers, model);
                 } else {
                     var response_headers = std.StringHashMap([]const u8).init(allocator);
                     defer response_headers.deinit();
-                    callback(response.status, response_headers, model);
+                    try callback(response.status, response_headers, model);
                 }
             }
         }
@@ -1569,7 +1569,6 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
         .max_tokens = 4096,
     };
 }
-
 
 test "parseSseStreamLines preserves partial Mistral text before malformed terminal error" {
     const allocator = std.heap.page_allocator;

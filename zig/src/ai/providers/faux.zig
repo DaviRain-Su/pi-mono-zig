@@ -905,12 +905,12 @@ fn createErrorMessage(
     };
 }
 
-fn invokeOnResponse(options: ?types.StreamOptions, model: types.Model) void {
+fn invokeOnResponse(options: ?types.StreamOptions, model: types.Model) !void {
     if (options) |stream_options| {
         if (stream_options.on_response) |callback| {
             var headers = std.StringHashMap([]const u8).init(std.heap.page_allocator);
             defer headers.deinit();
-            callback(200, headers, model);
+            try callback(200, headers, model);
         }
     }
 }
@@ -929,7 +929,7 @@ pub const FauxProvider = struct {
         errdefer stream_instance.deinit();
 
         const state = lookupState(model.api) orelse return FauxProviderError.MissingProviderState;
-        invokeOnResponse(options, model);
+        try invokeOnResponse(options, model);
 
         const step = if (state.pending_responses.items.len > 0)
             state.pending_responses.orderedRemove(0)
