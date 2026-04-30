@@ -38,12 +38,24 @@ const AwsCredentials = struct {
 const BedrockAuth = union(enum) {
     sigv4: AwsCredentials,
     bearer: []const u8,
+    profile,
 
     fn deinit(self: BedrockAuth, allocator: std.mem.Allocator) void {
         switch (self) {
             .sigv4 => |credentials| credentials.deinit(allocator),
             .bearer => |token| allocator.free(token),
+            .profile => {},
         }
+    }
+};
+
+const ResolvedBedrockEndpoint = struct {
+    base_url: []const u8,
+    region: []const u8,
+
+    fn deinit(self: ResolvedBedrockEndpoint, allocator: std.mem.Allocator) void {
+        allocator.free(self.base_url);
+        allocator.free(self.region);
     }
 };
 
@@ -157,7 +169,10 @@ pub const BedrockProvider = struct {
         const request_path = try buildRequestPath(allocator, model.id);
         defer allocator.free(request_path);
 
-        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ trimTrailingSlash(model.base_url), request_path });
+        const endpoint = try resolveBedrockEndpoint(allocator, model.base_url, options);
+        defer endpoint.deinit(allocator);
+
+        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ endpoint.base_url, request_path });
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
@@ -168,12 +183,13 @@ pub const BedrockProvider = struct {
             try mergeHeaders(allocator, &headers, stream_options.headers);
         }
         switch (auth) {
-            .sigv4 => |credentials| try signRequestHeaders(allocator, &headers, model, request_path, json_body, credentials, timestamp, options),
+            .sigv4 => |credentials| try signRequestHeaders(allocator, &headers, endpoint.base_url, request_path, json_body, credentials, timestamp, endpoint.region),
             .bearer => |token| {
                 const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
                 defer allocator.free(authorization);
                 try putOwnedHeader(allocator, &headers, "Authorization", authorization);
             },
+            .profile => {},
         }
 
         var client = try http_client.HttpClient.init(allocator, io);
@@ -395,6 +411,7 @@ pub fn buildRequestSurfaceSnapshotValue(
 
     var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer root.deinit(allocator);
+    try root.put(allocator, try allocator.dupe(u8, "boundary"), .{ .string = try allocator.dupe(u8, "production-request-boundary") });
     try root.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
     try root.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, request_path) });
     if (endpoint.value) |base_url| {
@@ -1102,6 +1119,14 @@ fn resolveBedrockAuth(allocator: std.mem.Allocator, options: ?types.StreamOption
         return .{ .bearer = token };
     }
 
+    if (options) |stream_options| {
+        if (nonEmpty(stream_options.bedrock_profile) != null) return .profile;
+    }
+    if (try loadEnvOptional(allocator, "AWS_PROFILE")) |profile| {
+        allocator.free(profile);
+        return .profile;
+    }
+
     return .{ .sigv4 = try resolveAwsCredentials(allocator) };
 }
 
@@ -1196,6 +1221,51 @@ fn resolveBedrockRegion(allocator: std.mem.Allocator, base_url: []const u8, opti
     return try allocator.dupe(u8, "us-east-1");
 }
 
+fn hasConfiguredBedrockRegion(allocator: std.mem.Allocator, options: ?types.StreamOptions) !bool {
+    if (options) |stream_options| {
+        if (nonEmpty(stream_options.bedrock_region) != null) return true;
+    }
+    if (try loadEnvOptional(allocator, "AWS_REGION")) |region| {
+        allocator.free(region);
+        return true;
+    }
+    if (try loadEnvOptional(allocator, "AWS_DEFAULT_REGION")) |region| {
+        allocator.free(region);
+        return true;
+    }
+    return false;
+}
+
+fn hasConfiguredAwsProfile(allocator: std.mem.Allocator) !bool {
+    if (try loadEnvOptional(allocator, "AWS_PROFILE")) |profile| {
+        allocator.free(profile);
+        return true;
+    }
+    return false;
+}
+
+fn sdkDefaultBedrockEndpoint(allocator: std.mem.Allocator, region: []const u8) ![]u8 {
+    const suffix = if (std.mem.startsWith(u8, region, "cn-")) "amazonaws.com.cn" else "amazonaws.com";
+    return try std.fmt.allocPrint(allocator, "https://bedrock-runtime.{s}.{s}", .{ region, suffix });
+}
+
+fn resolveBedrockEndpoint(allocator: std.mem.Allocator, base_url: []const u8, options: ?types.StreamOptions) !ResolvedBedrockEndpoint {
+    const region = try resolveBedrockRegion(allocator, base_url, options);
+    errdefer allocator.free(region);
+
+    const endpoint_region = standardEndpointRegion(base_url);
+    const use_explicit_endpoint = endpoint_region == null or (!(try hasConfiguredBedrockRegion(allocator, options)) and !(try hasConfiguredAwsProfile(allocator)));
+    const resolved_base_url = if (use_explicit_endpoint)
+        try allocator.dupe(u8, trimTrailingSlash(base_url))
+    else
+        try sdkDefaultBedrockEndpoint(allocator, region);
+
+    return .{
+        .base_url = resolved_base_url,
+        .region = region,
+    };
+}
+
 fn extractHostFromUrl(allocator: std.mem.Allocator, url_text: []const u8) ![]u8 {
     const uri = try std.Uri.parse(url_text);
     const host = uri.host orelse return error.InvalidUrl;
@@ -1205,17 +1275,15 @@ fn extractHostFromUrl(allocator: std.mem.Allocator, url_text: []const u8) ![]u8 
 fn signRequestHeaders(
     allocator: std.mem.Allocator,
     headers: *std.StringHashMap([]const u8),
-    model: types.Model,
+    endpoint_base_url: []const u8,
     request_path: []const u8,
     body: []const u8,
     credentials: AwsCredentials,
     timestamp: RequestTimestamp,
-    options: ?types.StreamOptions,
+    region: []const u8,
 ) !void {
-    const host = try extractHostFromUrl(allocator, model.base_url);
+    const host = try extractHostFromUrl(allocator, endpoint_base_url);
     defer allocator.free(host);
-    const region = try resolveBedrockRegion(allocator, model.base_url, options);
-    defer allocator.free(region);
 
     try putOwnedHeader(allocator, headers, "host", host);
 
@@ -2579,6 +2647,119 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
         },
         else => {},
     }
+}
+
+const BedrockOnResponseCapture = struct {
+    var called: bool = false;
+    var status: u16 = 0;
+    var header_count: usize = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+        header_count = 0;
+    }
+
+    fn callback(response_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) anyerror!void {
+        called = true;
+        status = response_status;
+        header_count = headers.count();
+        try std.testing.expectEqualStrings("bedrock-converse-stream", model.api);
+    }
+};
+
+fn bedrockTestModel(base_url: []const u8) types.Model {
+    return .{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Bedrock",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+}
+
+fn bedrockTestContext() types.Context {
+    return .{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+}
+
+test "Bedrock production endpoint resolver replaces standard endpoint when region is configured" {
+    const allocator = std.testing.allocator;
+
+    const standard = try resolveBedrockEndpoint(
+        allocator,
+        "https://bedrock-runtime.eu-central-1.amazonaws.com",
+        .{ .bedrock_region = "us-west-2" },
+    );
+    defer standard.deinit(allocator);
+    try std.testing.expectEqualStrings("https://bedrock-runtime.us-west-2.amazonaws.com", standard.base_url);
+    try std.testing.expectEqualStrings("us-west-2", standard.region);
+
+    const custom = try resolveBedrockEndpoint(
+        allocator,
+        "https://bedrock-vpc.example.com",
+        .{ .bedrock_region = "us-west-2" },
+    );
+    defer custom.deinit(allocator);
+    try std.testing.expectEqualStrings("https://bedrock-vpc.example.com", custom.base_url);
+    try std.testing.expectEqualStrings("us-west-2", custom.region);
+}
+
+test "Bedrock profile-only auth surface does not require IAM environment credentials" {
+    const allocator = std.testing.allocator;
+    const auth = try resolveBedrockAuth(allocator, .{ .bedrock_profile = "fixture-option-profile" });
+    defer auth.deinit(allocator);
+
+    switch (auth) {
+        .profile => {},
+        else => return error.TestExpectedProfileAuth,
+    }
+}
+
+test "Bedrock stream on_response observes non-200 metadata before sanitized error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    BedrockOnResponseCapture.reset();
+
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        503,
+        "Service Unavailable",
+        "x-amzn-requestid: fixture-request-id\r\n",
+        "{\"message\":\"service unavailable fixture\"}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try BedrockProvider.stream(
+        allocator,
+        io,
+        bedrockTestModel(url),
+        bedrockTestContext(),
+        .{ .bedrock_bearer_token = "fixture-token", .on_response = &BedrockOnResponseCapture.callback },
+    );
+    defer stream.deinit();
+
+    try std.testing.expect(BedrockOnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 503), BedrockOnResponseCapture.status);
+    try std.testing.expect(BedrockOnResponseCapture.header_count > 0);
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 503:"));
 }
 
 test "VAL-MSG-010 Bedrock skips failed assistants" {

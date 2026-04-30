@@ -193,6 +193,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			config.authSchemePreference = ["httpBearerAuth"];
 		}
 
+		let observedResponseMetadata = false;
 		try {
 			const client = new BedrockRuntimeClient(config);
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
@@ -221,6 +222,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 					responseHeaders["x-amzn-requestid"] = response.$metadata.requestId;
 				}
 				await options?.onResponse?.({ status: response.$metadata.httpStatusCode, headers: responseHeaders }, model);
+				observedResponseMetadata = true;
 			}
 
 			for await (const item of response.stream!) {
@@ -263,13 +265,23 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			let finalError = error;
+			if (!observedResponseMetadata) {
+				try {
+					if (await emitBedrockErrorResponseMetadata(error, options, model)) {
+						observedResponseMetadata = true;
+					}
+				} catch (metadataError) {
+					finalError = metadataError;
+				}
+			}
 			for (const block of output.content) {
 				delete (block as Block).index;
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as Block).partialJson;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(error);
+			output.errorMessage = formatBedrockError(finalError);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -277,6 +289,23 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 
 	return stream;
 };
+
+async function emitBedrockErrorResponseMetadata(
+	error: unknown,
+	options: BedrockOptions | undefined,
+	model: Model<"bedrock-converse-stream">,
+): Promise<boolean> {
+	if (!(error instanceof BedrockRuntimeServiceException)) return false;
+	const status = error.$metadata?.httpStatusCode;
+	if (status === undefined) return false;
+	const headers: Record<string, string> = {};
+	const requestId = error.$metadata?.requestId;
+	if (requestId) {
+		headers["x-amzn-requestid"] = requestId;
+	}
+	await options?.onResponse?.({ status, headers }, model);
+	return true;
+}
 
 /**
  * Human-readable prefixes for Bedrock SDK exception names.

@@ -333,7 +333,7 @@ fn parseStopReason(value: []const u8) types.StopReason {
 
 fn parseTerminalFailure(value: std.json.Value) ?bedrock.FixtureTerminalFailure {
     if (optionalString(value, "sendException")) |send_exception| {
-        if (std.mem.eql(u8, send_exception, "ServiceUnavailableException")) {
+        if (std.mem.eql(u8, send_exception, "ServiceUnavailableException") or std.mem.eql(u8, send_exception, "ServiceUnavailableExceptionWithMetadata")) {
             return .{
                 .timing = .before_events,
                 .stop_reason = .error_reason,

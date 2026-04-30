@@ -2,18 +2,31 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const bedrockMock = vi.hoisted(() => ({
 	constructorCalls: [] as Array<Record<string, unknown>>,
+	send: () => Promise.reject(new Error("mock send")) as Promise<unknown>,
 }));
 
 vi.mock("@aws-sdk/client-bedrock-runtime", () => {
-	class BedrockRuntimeServiceException extends Error {}
+	class BedrockRuntimeServiceException extends Error {
+		readonly $metadata: { httpStatusCode?: number; requestId?: string };
+
+		constructor(options: {
+			name?: string;
+			message: string;
+			$metadata?: { httpStatusCode?: number; requestId?: string };
+		}) {
+			super(options.message);
+			this.name = options.name ?? "BedrockRuntimeServiceException";
+			this.$metadata = options.$metadata ?? {};
+		}
+	}
 
 	class BedrockRuntimeClient {
 		constructor(config: Record<string, unknown>) {
 			bedrockMock.constructorCalls.push(config);
 		}
 
-		send(): Promise<never> {
-			return Promise.reject(new Error("mock send"));
+		send(): Promise<unknown> {
+			return bedrockMock.send();
 		}
 	}
 
@@ -44,6 +57,7 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 	};
 });
 
+import { BedrockRuntimeServiceException } from "@aws-sdk/client-bedrock-runtime";
 import { getModel } from "../src/models.js";
 import { streamBedrock } from "../src/providers/amazon-bedrock.js";
 import type { Context, Model } from "../src/types.js";
@@ -60,6 +74,7 @@ const originalAwsBedrockSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
 
 beforeEach(() => {
 	bedrockMock.constructorCalls.length = 0;
+	bedrockMock.send = () => Promise.reject(new Error("mock send")) as Promise<unknown>;
 	delete process.env.AWS_REGION;
 	delete process.env.AWS_DEFAULT_REGION;
 	delete process.env.AWS_PROFILE;
@@ -192,5 +207,29 @@ describe("bedrock endpoint resolution", () => {
 			accessKeyId: "dummy-access-key",
 			secretAccessKey: "dummy-secret-key",
 		});
+	});
+
+	it("emits non-200 SDK exception response metadata before sanitized stream error", async () => {
+		const observedResponses: Array<{ status?: number; headers?: Record<string, string> }> = [];
+		bedrockMock.send = () =>
+			Promise.reject(
+				new BedrockRuntimeServiceException({
+					$fault: "server",
+					name: "ServiceUnavailableException",
+					message: "service unavailable fixture",
+					$metadata: { httpStatusCode: 503, requestId: "fixture-request-id" },
+				}),
+			);
+		const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-7");
+
+		const result = await streamBedrock(model, context, {
+			cacheRetention: "none",
+			onResponse: (response) => {
+				observedResponses.push(response);
+			},
+		}).result();
+
+		expect(observedResponses).toEqual([{ status: 503, headers: { "x-amzn-requestid": "fixture-request-id" } }]);
+		expect(result.errorMessage).toBe("Service unavailable: service unavailable fixture");
 	});
 });

@@ -119,6 +119,7 @@ const allowedScenarioIds = [
 	"bedrock-auth-aws-profile-env",
 	"bedrock-auth-options-profile",
 	"bedrock-auth-custom-endpoint-region",
+	"bedrock-auth-non-200-onresponse",
 	"bedrock-auth-bearer-option",
 	"bedrock-auth-bearer-env",
 	"bedrock-auth-skip-auth-proxy",
@@ -189,7 +190,7 @@ interface SerializableOptions {
 	onPayload?: "pass-through" | "replace";
 	onResponse?: "capture";
 	requestSurface?: "capture";
-	sendException?: "ServiceUnavailableException";
+	sendException?: "ServiceUnavailableException" | "ServiceUnavailableExceptionWithMetadata";
 	abort?: "pre" | "mid";
 }
 
@@ -1309,6 +1310,22 @@ const scenarios: Scenario[] = [
 		{ region: "us-west-2" },
 		{ AWS_BEDROCK_SKIP_AUTH: "1" },
 	),
+	{
+		id: "bedrock-auth-non-200-onresponse",
+		title: "Bedrock non-200 SDK response metadata is captured before sanitized error handling",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: {
+				cacheRetention: "none",
+				maxTokens: 32,
+				onResponse: "capture",
+				sendException: "ServiceUnavailableExceptionWithMetadata",
+			},
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
 	authScenario(
 		"bedrock-auth-bearer-option",
 		"Bedrock bearer token option wins over environment bearer token",
@@ -1452,6 +1469,34 @@ function scenarioEnv(scenario: Scenario, key: FixtureEnvKey): string | undefined
 	return nonEmpty(scenario.input.env?.[key]);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
+async function resolveProviderValue(value: unknown): Promise<unknown> {
+	if (typeof value === "function") {
+		return await (value as () => Promise<unknown> | unknown)();
+	}
+	return value;
+}
+
+function endpointBaseUrlFromParts(value: unknown): string | undefined {
+	if (value instanceof URL) return trimTrailingSlash(value.href);
+	if (!isRecord(value)) return undefined;
+	const protocol = typeof value.protocol === "string" ? value.protocol : "https:";
+	const hostname = typeof value.hostname === "string" ? value.hostname : undefined;
+	if (!hostname) return undefined;
+	const port = typeof value.port === "number" ? `:${value.port}` : "";
+	const rawPath = typeof value.path === "string" ? value.path : "/";
+	const path = rawPath === "/" ? "" : trimTrailingSlash(rawPath);
+	return trimTrailingSlash(`${protocol}//${hostname}${port}${path}`);
+}
+
+function endpointBaseUrlFromProviderResult(value: unknown): string | undefined {
+	if (!isRecord(value)) return undefined;
+	return endpointBaseUrlFromParts(value.url);
+}
+
 function configuredRegion(scenario: Scenario): { source: string; value?: string } {
 	if (scenario.input.options.region) return { source: "options.region", value: scenario.input.options.region };
 	const awsRegion = scenarioEnv(scenario, "AWS_REGION");
@@ -1464,24 +1509,50 @@ function configuredRegion(scenario: Scenario): { source: string; value?: string 
 	return { source: "default", value: "us-east-1" };
 }
 
-function requestBaseUrl(scenario: Scenario, region: { source: string; value?: string }): { mode: string; value?: string } {
-	const endpointRegion = standardEndpointRegion(scenario.input.model.baseUrl);
-	const hasConfiguredRegion =
-		scenario.input.options.region || scenarioEnv(scenario, "AWS_REGION") || scenarioEnv(scenario, "AWS_DEFAULT_REGION");
-	const useExplicitEndpoint = !endpointRegion || (!hasConfiguredRegion && !scenarioEnv(scenario, "AWS_PROFILE"));
-	if (useExplicitEndpoint) return { mode: "explicit", value: trimTrailingSlash(scenario.input.model.baseUrl) };
+async function sdkRegionSnapshot(
+	config: Record<string, unknown>,
+	scenario: Scenario,
+): Promise<{ source: string; value?: string }> {
+	const expected = configuredRegion(scenario);
+	if (expected.source === "sdk-profile-resolution") return expected;
+	const resolved = await resolveProviderValue(config.region);
+	if (typeof resolved === "string" && resolved.length > 0) return { source: expected.source, value: resolved };
+	return expected;
+}
+
+async function sdkRequestBaseUrl(
+	config: Record<string, unknown>,
+	region: { source: string; value?: string },
+): Promise<{ mode: string; value?: string }> {
+	if (config.endpoint !== undefined) {
+		const endpoint = endpointBaseUrlFromParts(await resolveProviderValue(config.endpoint));
+		if (endpoint) return { mode: "explicit", value: endpoint };
+	}
 	if (!region.value) return { mode: "sdk-profile-resolution" };
+	if (typeof config.endpointProvider === "function") {
+		const endpoint = endpointBaseUrlFromProviderResult(
+			(config.endpointProvider as (parameters: { Region: string }) => unknown)({ Region: region.value }),
+		);
+		if (endpoint) return { mode: "sdk-default", value: endpoint };
+	}
 	const suffix = region.value.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
 	return { mode: "sdk-default", value: `https://bedrock-runtime.${region.value}.${suffix}` };
 }
 
-function authSnapshot(scenario: Scenario, region: { source: string; value?: string }, payload: unknown): unknown {
+async function authSnapshot(
+	config: Record<string, unknown>,
+	scenario: Scenario,
+	region: { source: string; value?: string },
+	payload: unknown,
+): Promise<unknown> {
 	// The fixture compares SigV4 semantics, not volatile SDK byte-for-byte signing internals.
 	// Body hashing is normalized to the semantic field because TS command input and Zig
 	// local snapshots intentionally canonicalize payload object ordering for comparison.
 	void payload;
 	const bearerToken = scenario.input.options.bearerToken ?? scenarioEnv(scenario, "AWS_BEARER_TOKEN_BEDROCK");
 	if (scenarioEnv(scenario, "AWS_BEDROCK_SKIP_AUTH") === "1") {
+		const credentials = await resolveProviderValue(config.credentials);
+		void credentials;
 		return {
 			mode: "skip-auth",
 			credentialSource: "proxy-dummy",
@@ -1490,6 +1561,10 @@ function authSnapshot(scenario: Scenario, region: { source: string; value?: stri
 		};
 	}
 	if (bearerToken) {
+		const authSchemePreference = await resolveProviderValue(config.authSchemePreference);
+		const token = await resolveProviderValue(config.token);
+		void authSchemePreference;
+		void token;
 		return {
 			mode: "bearer",
 			source: scenario.input.options.bearerToken ? "options.bearerToken" : "env.bearerToken",
@@ -1508,6 +1583,8 @@ function authSnapshot(scenario: Scenario, region: { source: string; value?: stri
 	const accessKey = scenarioEnv(scenario, "AWS_ACCESS_KEY_ID");
 	const secretKey = scenarioEnv(scenario, "AWS_SECRET_ACCESS_KEY");
 	if (accessKey && secretKey) {
+		const credentials = await resolveProviderValue(config.credentials);
+		void credentials;
 		return {
 			mode: "sigv4",
 			method: "POST",
@@ -1536,11 +1613,13 @@ function authSnapshot(scenario: Scenario, region: { source: string; value?: stri
 	};
 }
 
-function buildRequestSurfaceSnapshot(scenario: Scenario, payload: unknown): unknown {
+async function buildRequestSurfaceSnapshot(scenario: Scenario, payload: unknown, sdkClient: unknown): Promise<unknown> {
+	const config = isRecord(sdkClient) && isRecord(sdkClient.config) ? sdkClient.config : {};
 	const path = `/model/${percentEncodePathSegment(scenario.input.model.id)}/converse-stream`;
-	const region = configuredRegion(scenario);
-	const baseUrl = requestBaseUrl(scenario, region);
+	const region = await sdkRegionSnapshot(config, scenario);
+	const baseUrl = await sdkRequestBaseUrl(config, region);
 	return {
+		boundary: "production-request-boundary",
 		method: "POST",
 		path,
 		url: baseUrl.value ? `${baseUrl.value}${path}` : "sdk-profile-resolution",
@@ -1552,7 +1631,7 @@ function buildRequestSurfaceSnapshot(scenario: Scenario, payload: unknown): unkn
 			endpoint: baseUrl.mode === "explicit" ? baseUrl.value : undefined,
 			region: region.value,
 		},
-		auth: authSnapshot(scenario, region, payload),
+		auth: await authSnapshot(config, scenario, region, payload),
 		redaction: "secrets-redacted",
 	};
 }
@@ -1743,14 +1822,27 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	};
 	const originalSend = prototype.send;
 	let capturedPayload: unknown;
+	let capturedRequestSurface: unknown;
 	let capturedResponse: FixtureRecord["expected"]["onResponse"];
 	let activeAbortController: AbortController | undefined;
 
-	prototype.send = async function (command: unknown): Promise<ConverseStreamOutput> {
+	prototype.send = async function (this: unknown, command: unknown): Promise<ConverseStreamOutput> {
 		const commandWithInput = command as { input?: unknown };
 		capturedPayload = stableValue(commandWithInput.input);
+		if (scenario.input.options.requestSurface === "capture") {
+			capturedRequestSurface = await buildRequestSurfaceSnapshot(scenario, capturedPayload, this);
+		}
 		if (scenario.input.options.sendException === "ServiceUnavailableException") {
 			throw new ServiceUnavailableException({ message: "service unavailable fixture", $metadata: {} });
+		}
+		if (scenario.input.options.sendException === "ServiceUnavailableExceptionWithMetadata") {
+			throw new ServiceUnavailableException({
+				message: "service unavailable fixture",
+				$metadata: {
+					httpStatusCode: 503,
+					requestId: `fixture-request-${scenario.id}`,
+				},
+			});
 		}
 		return {
 			$metadata: {
@@ -1815,6 +1907,9 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 			if (capturedPayload === undefined) {
 				throw new Error(`Scenario ${scenario.id} did not capture a Bedrock Converse command input`);
 			}
+			if (scenario.input.options.requestSurface === "capture" && capturedRequestSurface === undefined) {
+				throw new Error(`Scenario ${scenario.id} did not capture a Bedrock SDK request surface`);
+			}
 			if (scenario.input.options.onResponse === "capture" && capturedResponse === undefined) {
 				throw new Error(`Scenario ${scenario.id} did not capture onResponse metadata`);
 			}
@@ -1829,7 +1924,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 						mode: scenario.input.mode,
 						payload: capturedPayload,
 						...(scenario.input.options.requestSurface === "capture"
-							? { requestSurface: buildRequestSurfaceSnapshot(scenario, capturedPayload) }
+							? { requestSurface: capturedRequestSurface }
 							: {}),
 					},
 					typeScriptStream: events,

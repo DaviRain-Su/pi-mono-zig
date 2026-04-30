@@ -24,6 +24,7 @@
           "envProfile": "fixture-env-profile",
           "mode": "profile"
         },
+        "boundary": "production-request-boundary",
         "clientConfig": {
           "envProfile": "fixture-env-profile"
         },
@@ -258,6 +259,7 @@
         "bedrock-auth-aws-profile-env",
         "bedrock-auth-options-profile",
         "bedrock-auth-custom-endpoint-region",
+        "bedrock-auth-non-200-onresponse",
         "bedrock-auth-bearer-option",
         "bedrock-auth-bearer-env",
         "bedrock-auth-skip-auth-proxy",
