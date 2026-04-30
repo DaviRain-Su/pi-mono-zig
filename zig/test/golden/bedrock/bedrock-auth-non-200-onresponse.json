@@ -1,20 +1,16 @@
 {
   "expected": {
+    "onResponse": {
+      "headers": {
+        "x-amzn-requestid": "fixture-request-bedrock-auth-non-200-onresponse"
+      },
+      "status": 503
+    },
     "typeScriptRequest": {
-      "mode": "streamSimple",
+      "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 3072,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 4096
+          "maxTokens": 32
         },
         "messages": [
           {
@@ -36,35 +32,15 @@
     },
     "typeScriptStream": [
       {
-        "type": "start"
-      },
-      {
-        "contentIndex": 0,
-        "type": "text_start"
-      },
-      {
-        "contentIndex": 0,
-        "delta": "Bedrock fixture response.",
-        "type": "text_delta"
-      },
-      {
-        "content": "Bedrock fixture response.",
-        "contentIndex": 0,
-        "type": "text_end"
-      },
-      {
+        "errorMessage": "Service unavailable: service unavailable fixture",
         "message": {
           "api": "bedrock-converse-stream",
-          "content": [
-            {
-              "text": "Bedrock fixture response.",
-              "type": "text"
-            }
-          ],
+          "content": [],
+          "errorMessage": "Service unavailable: service unavailable fixture",
           "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
           "provider": "amazon-bedrock",
           "role": "assistant",
-          "stopReason": "stop",
+          "stopReason": "error",
           "usage": {
             "cacheRead": 0,
             "cacheWrite": 0,
@@ -75,16 +51,16 @@
               "output": 0,
               "total": 0
             },
-            "input": 7,
-            "output": 5,
-            "totalTokens": 12
+            "input": 0,
+            "output": 0,
+            "totalTokens": 0
           }
         },
-        "type": "done"
+        "type": "error"
       }
     ]
   },
-  "id": "bedrock-public-simple-fixed-reasoning-adjust",
+  "id": "bedrock-auth-non-200-onresponse",
   "input": {
     "context": {
       "messages": [
@@ -132,7 +108,7 @@
       ],
       "format": "json-lines"
     },
-    "mode": "streamSimple",
+    "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -146,8 +122,9 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 128,
-      "reasoning": "high"
+      "maxTokens": 32,
+      "onResponse": "capture",
+      "sendException": "ServiceUnavailableExceptionWithMetadata"
     }
   },
   "metadata": {
@@ -272,5 +249,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock public streamSimple fixed Claude reasoning applies provider-specific max token adjustment"
+  "title": "Bedrock non-200 SDK response metadata is captured before sanitized error handling"
 }

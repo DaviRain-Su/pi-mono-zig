@@ -44,6 +44,7 @@
             "x-amz-security-token"
           ]
         },
+        "boundary": "production-request-boundary",
         "clientConfig": {
           "region": "us-east-1"
         },
@@ -283,6 +284,7 @@
         "bedrock-auth-aws-profile-env",
         "bedrock-auth-options-profile",
         "bedrock-auth-custom-endpoint-region",
+        "bedrock-auth-non-200-onresponse",
         "bedrock-auth-bearer-option",
         "bedrock-auth-bearer-env",
         "bedrock-auth-skip-auth-proxy",

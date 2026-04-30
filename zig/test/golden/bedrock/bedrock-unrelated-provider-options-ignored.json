@@ -311,6 +311,7 @@
         "bedrock-auth-aws-profile-env",
         "bedrock-auth-options-profile",
         "bedrock-auth-custom-endpoint-region",
+        "bedrock-auth-non-200-onresponse",
         "bedrock-auth-bearer-option",
         "bedrock-auth-bearer-env",
         "bedrock-auth-skip-auth-proxy",

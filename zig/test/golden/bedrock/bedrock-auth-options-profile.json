@@ -24,6 +24,7 @@
           "mode": "profile",
           "optionsProfile": "fixture-option-profile"
         },
+        "boundary": "production-request-boundary",
         "clientConfig": {
           "endpoint": "https://bedrock-runtime.eu-central-1.amazonaws.com",
           "profile": "fixture-option-profile",
@@ -261,6 +262,7 @@
         "bedrock-auth-aws-profile-env",
         "bedrock-auth-options-profile",
         "bedrock-auth-custom-endpoint-region",
+        "bedrock-auth-non-200-onresponse",
         "bedrock-auth-bearer-option",
         "bedrock-auth-bearer-env",
         "bedrock-auth-skip-auth-proxy",
