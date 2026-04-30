@@ -3,35 +3,44 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 16384,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 20000
+          "maxTokens": 32
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Auth surface fixture bedrock-auth-options-profile."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0"
+      },
+      "requestSurface": {
+        "auth": {
+          "credentialDiscovery": "sdk-profile-resolution",
+          "mode": "profile",
+          "optionsProfile": "fixture-option-profile"
+        },
+        "clientConfig": {
+          "endpoint": "https://bedrock-runtime.eu-central-1.amazonaws.com",
+          "profile": "fixture-option-profile",
+          "region": "eu-central-1"
+        },
+        "endpoint": {
+          "mode": "explicit",
+          "value": "https://bedrock-runtime.eu-central-1.amazonaws.com"
+        },
+        "method": "POST",
+        "path": "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream",
+        "redaction": "secrets-redacted",
+        "region": {
+          "source": "endpoint",
+          "value": "eu-central-1"
+        },
+        "url": "https://bedrock-runtime.eu-central-1.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream"
       }
     },
     "typeScriptStream": [
@@ -84,17 +93,17 @@
       }
     ]
   },
-  "id": "bedrock-reasoning-fixed-default-xhigh",
+  "id": "bedrock-auth-options-profile",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Auth surface fixture bedrock-auth-options-profile.",
           "role": "user"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
     },
+    "env": {},
     "localStream": {
       "events": [
         {
@@ -135,7 +144,7 @@
     "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "baseUrl": "https://bedrock-runtime.eu-central-1.amazonaws.com",
       "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
       "input": [
         "text"
@@ -146,8 +155,9 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 20000,
-      "reasoning": "xhigh"
+      "maxTokens": 32,
+      "profile": "fixture-option-profile",
+      "requestSurface": "capture"
     }
   },
   "metadata": {
@@ -251,5 +261,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock fixed Claude xhigh reasoning clamps to the high default token budget"
+  "title": "Bedrock options.profile is passed to SDK config without suppressing endpoint region derivation"
 }

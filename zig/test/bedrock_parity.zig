@@ -106,8 +106,19 @@ fn buildActualFixtureComparisonRoot(allocator: std.mem.Allocator, io: std.Io, fi
     const options = try parseOptions(scenario_allocator, options_value);
     const mode = getObjectField(input, "mode").string;
 
-    const actual_request = try bedrock.buildRequestSnapshotValue(allocator, model, context, options, mode);
+    var actual_request = try bedrock.buildRequestSnapshotValue(allocator, model, context, options, mode);
     errdefer bedrock.freeOwnedJsonValue(allocator, actual_request);
+    if (optionalField(getObjectField(getObjectField(fixture, "expected"), "typeScriptRequest"), "requestSurface") != null) {
+        const fixture_env = parseFixtureEnv(optionalField(input, "env"));
+        const request_surface = try bedrock.buildRequestSurfaceSnapshotValue(
+            allocator,
+            model,
+            options,
+            getObjectField(actual_request, "payload"),
+            fixture_env,
+        );
+        try actual_request.object.put(allocator, try allocator.dupe(u8, "requestSurface"), request_surface);
+    }
 
     const local_stream = getObjectField(input, "localStream");
     const stream_format = getObjectField(local_stream, "format").string;
@@ -273,6 +284,8 @@ fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !?types.Str
         .cache_retention = parseCacheRetention(optionalString(value, "cacheRetention")),
         .google_tool_choice = optionalString(value, "googleToolChoice"),
         .bedrock_region = optionalString(value, "region"),
+        .bedrock_profile = optionalString(value, "profile"),
+        .bedrock_bearer_token = optionalString(value, "bearerToken"),
         .bedrock_tool_choice = try parseBedrockToolChoice(allocator, optionalField(value, "toolChoice")),
         .bedrock_reasoning = parseThinkingLevel(optionalString(value, "reasoning")),
         .bedrock_thinking_budgets = try parseThinkingBudgets(optionalField(value, "thinkingBudgets")),
@@ -280,6 +293,20 @@ fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !?types.Str
         .bedrock_thinking_display = parseThinkingDisplay(optionalString(value, "thinkingDisplay")),
         .bedrock_request_metadata = try cloneJsonOptional(allocator, optionalField(value, "requestMetadata")),
         .on_payload = parseOnPayload(optionalString(value, "onPayload")),
+    };
+}
+
+fn parseFixtureEnv(value: ?std.json.Value) bedrock.FixtureEnv {
+    const object = value orelse return .{};
+    return .{
+        .aws_access_key_id = optionalString(object, "AWS_ACCESS_KEY_ID"),
+        .aws_secret_access_key = optionalString(object, "AWS_SECRET_ACCESS_KEY"),
+        .aws_session_token = optionalString(object, "AWS_SESSION_TOKEN"),
+        .aws_profile = optionalString(object, "AWS_PROFILE"),
+        .aws_bearer_token_bedrock = optionalString(object, "AWS_BEARER_TOKEN_BEDROCK"),
+        .aws_region = optionalString(object, "AWS_REGION"),
+        .aws_default_region = optionalString(object, "AWS_DEFAULT_REGION"),
+        .aws_bedrock_skip_auth = optionalString(object, "AWS_BEDROCK_SKIP_AUTH"),
     };
 }
 

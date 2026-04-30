@@ -3,35 +3,44 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 16384,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 20000
+          "maxTokens": 32
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Auth surface fixture bedrock-auth-bearer-env."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0"
+      },
+      "requestSurface": {
+        "auth": {
+          "mode": "bearer",
+          "sigv4": false,
+          "source": "env.bearerToken",
+          "token": "redacted"
+        },
+        "clientConfig": {
+          "endpoint": "https://bedrock-runtime.us-east-1.amazonaws.com",
+          "region": "us-east-1"
+        },
+        "endpoint": {
+          "mode": "explicit",
+          "value": "https://bedrock-runtime.us-east-1.amazonaws.com"
+        },
+        "method": "POST",
+        "path": "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream",
+        "redaction": "secrets-redacted",
+        "region": {
+          "source": "endpoint",
+          "value": "us-east-1"
+        },
+        "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream"
       }
     },
     "typeScriptStream": [
@@ -84,16 +93,18 @@
       }
     ]
   },
-  "id": "bedrock-reasoning-fixed-default-xhigh",
+  "id": "bedrock-auth-bearer-env",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Auth surface fixture bedrock-auth-bearer-env.",
           "role": "user"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
+    },
+    "env": {
+      "AWS_BEARER_TOKEN_BEDROCK": "fixture-bearer-env"
     },
     "localStream": {
       "events": [
@@ -146,8 +157,8 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 20000,
-      "reasoning": "xhigh"
+      "maxTokens": 32,
+      "requestSurface": "capture"
     }
   },
   "metadata": {
@@ -251,5 +262,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock fixed Claude xhigh reasoning clamps to the high default token budget"
+  "title": "Bedrock bearer token environment auth is represented without SigV4 scope"
 }

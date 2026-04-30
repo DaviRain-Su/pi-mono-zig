@@ -55,12 +55,16 @@ const context: Context = {
 const originalAwsRegion = process.env.AWS_REGION;
 const originalAwsDefaultRegion = process.env.AWS_DEFAULT_REGION;
 const originalAwsProfile = process.env.AWS_PROFILE;
+const originalAwsBearerTokenBedrock = process.env.AWS_BEARER_TOKEN_BEDROCK;
+const originalAwsBedrockSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
 
 beforeEach(() => {
 	bedrockMock.constructorCalls.length = 0;
 	delete process.env.AWS_REGION;
 	delete process.env.AWS_DEFAULT_REGION;
 	delete process.env.AWS_PROFILE;
+	delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+	delete process.env.AWS_BEDROCK_SKIP_AUTH;
 });
 
 afterEach(() => {
@@ -81,10 +85,25 @@ afterEach(() => {
 	} else {
 		process.env.AWS_PROFILE = originalAwsProfile;
 	}
+
+	if (originalAwsBearerTokenBedrock === undefined) {
+		delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+	} else {
+		process.env.AWS_BEARER_TOKEN_BEDROCK = originalAwsBearerTokenBedrock;
+	}
+
+	if (originalAwsBedrockSkipAuth === undefined) {
+		delete process.env.AWS_BEDROCK_SKIP_AUTH;
+	} else {
+		process.env.AWS_BEDROCK_SKIP_AUTH = originalAwsBedrockSkipAuth;
+	}
 });
 
-async function captureClientConfig(model: Model<"bedrock-converse-stream">): Promise<Record<string, unknown>> {
-	await streamBedrock(model, context, { cacheRetention: "none" }).result();
+async function captureClientConfig(
+	model: Model<"bedrock-converse-stream">,
+	options: Parameters<typeof streamBedrock>[2] = {},
+): Promise<Record<string, unknown>> {
+	await streamBedrock(model, context, { cacheRetention: "none", ...options }).result();
 	expect(bedrockMock.constructorCalls).toHaveLength(1);
 	return bedrockMock.constructorCalls[0];
 }
@@ -127,5 +146,51 @@ describe("bedrock endpoint resolution", () => {
 
 		expect(config.endpoint).toBe("https://bedrock-vpc.example.com");
 		expect(config.region).toBe("us-west-2");
+	});
+
+	it("leaves region to SDK profile resolution when AWS_PROFILE is configured", async () => {
+		process.env.AWS_PROFILE = "fixture-env-profile";
+		const model = getModel("amazon-bedrock", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0");
+
+		const config = await captureClientConfig(model);
+
+		expect(config.endpoint).toBeUndefined();
+		expect(config.region).toBeUndefined();
+		expect(config.profile).toBeUndefined();
+	});
+
+	it("passes options.profile without treating it like AWS_PROFILE", async () => {
+		const model = getModel("amazon-bedrock", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0");
+
+		const config = await captureClientConfig(model, { profile: "fixture-option-profile" });
+
+		expect(config.profile).toBe("fixture-option-profile");
+		expect(config.endpoint).toBe("https://bedrock-runtime.eu-central-1.amazonaws.com");
+		expect(config.region).toBe("eu-central-1");
+	});
+
+	it("prefers bearer token options over bearer token environment auth", async () => {
+		process.env.AWS_BEARER_TOKEN_BEDROCK = "fixture-env-bearer";
+		const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-7");
+
+		const config = await captureClientConfig(model, { bearerToken: "fixture-option-bearer" });
+
+		expect(config.token).toEqual({ token: "fixture-option-bearer" });
+		expect(config.authSchemePreference).toEqual(["httpBearerAuth"]);
+	});
+
+	it("suppresses bearer auth and uses dummy credentials when skip auth is enabled", async () => {
+		process.env.AWS_BEARER_TOKEN_BEDROCK = "fixture-env-bearer";
+		process.env.AWS_BEDROCK_SKIP_AUTH = "1";
+		const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-7");
+
+		const config = await captureClientConfig(model);
+
+		expect(config.token).toBeUndefined();
+		expect(config.authSchemePreference).toBeUndefined();
+		expect(config.credentials).toEqual({
+			accessKeyId: "dummy-access-key",
+			secretAccessKey: "dummy-secret-key",
+		});
 	});
 });
