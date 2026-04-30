@@ -84,6 +84,7 @@ pub const AnthropicToolChoice = union(enum) {
 };
 
 pub const CacheRetention = enum {
+    unset,
     none,
     short,
     long,
@@ -356,7 +357,7 @@ pub const StreamOptions = struct {
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
     transport: Transport = .auto,
-    cache_retention: CacheRetention = .short,
+    cache_retention: CacheRetention = .unset,
     session_id: ?[]const u8 = null,
     headers: ?std.StringHashMap([]const u8) = null,
     /// Optional callback for inspecting or replacing provider payloads before sending.
@@ -408,7 +409,7 @@ pub const SimpleStreamOptions = struct {
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
     transport: Transport = .auto,
-    cache_retention: CacheRetention = .short,
+    cache_retention: CacheRetention = .unset,
     session_id: ?[]const u8 = null,
     headers: ?std.StringHashMap([]const u8) = null,
     timeout_ms: ?u32 = null,

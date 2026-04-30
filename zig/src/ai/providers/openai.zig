@@ -884,13 +884,42 @@ pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) v
     freeJsonValue(allocator, value);
 }
 
+fn processCacheRetentionEnv() ?[]const u8 {
+    const value = std.c.getenv("PI_CACHE_RETENTION") orelse return null;
+    return std.mem.span(value);
+}
+
+fn resolveCacheRetention(cache_retention: types.CacheRetention, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return switch (cache_retention) {
+        .unset => if (pi_cache_retention_env) |value|
+            if (std.mem.eql(u8, value, "long")) .long else .short
+        else
+            .short,
+        .none, .short, .long => cache_retention,
+    };
+}
+
+fn resolveOptionsCacheRetention(options: ?types.StreamOptions, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return resolveCacheRetention(if (options) |opts| opts.cache_retention else .unset, pi_cache_retention_env);
+}
+
 pub fn buildFinalRequestPayload(
     allocator: std.mem.Allocator,
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    var payload = try buildRequestPayload(allocator, model, context, options);
+    return buildFinalRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, processCacheRetentionEnv());
+}
+
+fn buildFinalRequestPayloadWithCacheRetentionEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    pi_cache_retention_env: ?[]const u8,
+) !std.json.Value {
+    var payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, pi_cache_retention_env);
     errdefer freeJsonValue(allocator, payload);
 
     if (options) |opts| {
@@ -912,7 +941,18 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
+    return buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, processCacheRetentionEnv());
+}
+
+fn buildRequestPayloadWithCacheRetentionEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    pi_cache_retention_env: ?[]const u8,
+) !std.json.Value {
     const compat = getCompat(model);
+    const cache_retention = resolveOptionsCacheRetention(options, pi_cache_retention_env);
     const transformed_messages = try transform_messages.transformMessages(
         allocator,
         context.messages,
@@ -985,14 +1025,11 @@ pub fn buildRequestPayload(
 
     if (options) |opts| {
         if (opts.session_id) |session_id| {
-            if ((std.mem.indexOf(u8, model.base_url, "api.openai.com") != null and opts.cache_retention != .none) or
-                (opts.cache_retention == .long and compat.supports_long_cache_retention))
+            if ((std.mem.indexOf(u8, model.base_url, "api.openai.com") != null and cache_retention != .none) or
+                (cache_retention == .long and compat.supports_long_cache_retention))
             {
                 try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), std.json.Value{ .string = try allocator.dupe(u8, session_id) });
             }
-        }
-        if (opts.cache_retention == .long and compat.supports_long_cache_retention) {
-            try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), std.json.Value{ .string = try allocator.dupe(u8, "24h") });
         }
         if (opts.temperature) |temp| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), std.json.Value{ .float = temp });
@@ -1004,6 +1041,10 @@ pub fn buildRequestPayload(
         if (opts.openai_tool_choice) |tool_choice| {
             try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try cloneJsonValue(allocator, tool_choice));
         }
+    }
+
+    if (cache_retention == .long and compat.supports_long_cache_retention) {
+        try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), std.json.Value{ .string = try allocator.dupe(u8, "24h") });
     }
 
     // Add tools if present
@@ -1025,7 +1066,7 @@ pub fn buildRequestPayload(
         try payload.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = std.json.Array.init(allocator) });
     }
 
-    if (try buildCompatCacheControl(allocator, compat, if (options) |opts| opts.cache_retention else .short)) |cache_control| {
+    if (try buildCompatCacheControl(allocator, compat, cache_retention)) |cache_control| {
         defer freeJsonValue(allocator, cache_control);
         try applyAnthropicCacheControl(allocator, &payload, cache_control);
     }
@@ -1377,9 +1418,19 @@ fn buildRequestHeaders(
     model: types.Model,
     options: ?types.StreamOptions,
 ) !std.StringHashMap([]const u8) {
+    return buildRequestHeadersWithCacheRetentionEnv(allocator, model, options, processCacheRetentionEnv());
+}
+
+fn buildRequestHeadersWithCacheRetentionEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    pi_cache_retention_env: ?[]const u8,
+) !std.StringHashMap([]const u8) {
     var headers = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitOwnedHeaders(allocator, &headers);
     const compat = getCompat(model);
+    const cache_retention = resolveOptionsCacheRetention(options, pi_cache_retention_env);
 
     try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
     try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
@@ -1393,7 +1444,7 @@ fn buildRequestHeaders(
 
     try mergeHeaders(allocator, &headers, model.headers);
     if (options) |stream_options| {
-        if (stream_options.cache_retention != .none and stream_options.session_id != null and compat.send_session_affinity_headers) {
+        if (cache_retention != .none and stream_options.session_id != null and compat.send_session_affinity_headers) {
             const session_id = stream_options.session_id.?;
             try putOwnedHeader(allocator, &headers, "session_id", session_id);
             try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
@@ -1555,10 +1606,20 @@ pub fn buildRequestSnapshotValue(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    var payload = try buildFinalRequestPayload(allocator, model, context, options);
+    return buildRequestSnapshotValueWithCacheRetentionEnv(allocator, model, context, options, processCacheRetentionEnv());
+}
+
+pub fn buildRequestSnapshotValueWithCacheRetentionEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    pi_cache_retention_env: ?[]const u8,
+) !std.json.Value {
+    var payload = try buildFinalRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, pi_cache_retention_env);
     errdefer freeJsonValue(allocator, payload);
 
-    var headers = try buildRequestHeaders(allocator, model, options);
+    var headers = try buildRequestHeadersWithCacheRetentionEnv(allocator, model, options, pi_cache_retention_env);
     defer deinitOwnedHeaders(allocator, &headers);
 
     var snapshot = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -2368,6 +2429,150 @@ test "buildRequestHeaders merges model and option headers" {
     var anonymous_headers = try buildRequestHeaders(allocator, model, .{});
     defer deinitOwnedHeaders(allocator, &anonymous_headers);
     try std.testing.expect(anonymous_headers.get("Authorization") == null);
+}
+
+test "OpenAI Chat cache retention resolver preserves explicit values over env fallback" {
+    try std.testing.expectEqual(types.CacheRetention.long, resolveCacheRetention(.unset, "long"));
+    try std.testing.expectEqual(types.CacheRetention.short, resolveCacheRetention(.unset, null));
+    try std.testing.expectEqual(types.CacheRetention.short, resolveCacheRetention(.short, "long"));
+    try std.testing.expectEqual(types.CacheRetention.none, resolveCacheRetention(.none, "long"));
+    try std.testing.expectEqual(types.CacheRetention.long, resolveCacheRetention(.long, null));
+}
+
+test "buildRequestPayload uses production cache retention resolver for prompt cache fields" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+    const context = types.Context{ .messages = &[_]types.Message{} };
+
+    const env_long_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .session_id = "session-env-long",
+        .cache_retention = .unset,
+    }, "long");
+    defer freeJsonValue(allocator, env_long_payload);
+    try std.testing.expectEqualStrings("session-env-long", env_long_payload.object.get("prompt_cache_key").?.string);
+    try std.testing.expectEqualStrings("24h", env_long_payload.object.get("prompt_cache_retention").?.string);
+
+    const explicit_short_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .session_id = "session-short",
+        .cache_retention = .short,
+    }, "long");
+    defer freeJsonValue(allocator, explicit_short_payload);
+    try std.testing.expectEqualStrings("session-short", explicit_short_payload.object.get("prompt_cache_key").?.string);
+    try std.testing.expect(explicit_short_payload.object.get("prompt_cache_retention") == null);
+
+    const explicit_none_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .session_id = "session-none",
+        .cache_retention = .none,
+    }, "long");
+    defer freeJsonValue(allocator, explicit_none_payload);
+    try std.testing.expect(explicit_none_payload.object.get("prompt_cache_key") == null);
+    try std.testing.expect(explicit_none_payload.object.get("prompt_cache_retention") == null);
+
+    const omitted_without_env_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .session_id = "session-default-short",
+        .cache_retention = .unset,
+    }, null);
+    defer freeJsonValue(allocator, omitted_without_env_payload);
+    try std.testing.expectEqualStrings("session-default-short", omitted_without_env_payload.object.get("prompt_cache_key").?.string);
+    try std.testing.expect(omitted_without_env_payload.object.get("prompt_cache_retention") == null);
+}
+
+test "buildRequestHeaders uses production cache retention resolver for session affinity" {
+    const allocator = std.testing.allocator;
+
+    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try compat.put(allocator, try allocator.dupe(u8, "sendSessionAffinityHeaders"), .{ .bool = true });
+    const compat_value = std.json.Value{ .object = compat };
+    defer freeJsonValue(allocator, compat_value);
+
+    const model = types.Model{
+        .id = "openrouter-session-affinity",
+        .name = "OpenRouter Session Affinity",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+        .compat = compat_value,
+    };
+
+    var env_long_headers = try buildRequestHeadersWithCacheRetentionEnv(allocator, model, .{
+        .session_id = "session-env-long",
+        .cache_retention = .unset,
+    }, "long");
+    defer deinitOwnedHeaders(allocator, &env_long_headers);
+    try std.testing.expectEqualStrings("session-env-long", env_long_headers.get("session_id").?);
+    try std.testing.expectEqualStrings("session-env-long", env_long_headers.get("x-client-request-id").?);
+    try std.testing.expectEqualStrings("session-env-long", env_long_headers.get("x-session-affinity").?);
+
+    var explicit_none_headers = try buildRequestHeadersWithCacheRetentionEnv(allocator, model, .{
+        .session_id = "session-none",
+        .cache_retention = .none,
+    }, "long");
+    defer deinitOwnedHeaders(allocator, &explicit_none_headers);
+    try std.testing.expect(explicit_none_headers.get("session_id") == null);
+    try std.testing.expect(explicit_none_headers.get("x-client-request-id") == null);
+    try std.testing.expect(explicit_none_headers.get("x-session-affinity") == null);
+}
+
+test "buildRequestPayload uses production cache retention resolver for Anthropic cache control" {
+    const allocator = std.testing.allocator;
+
+    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try compat.put(allocator, try allocator.dupe(u8, "cacheControlFormat"), .{ .string = try allocator.dupe(u8, "anthropic") });
+    const compat_value = std.json.Value{ .object = compat };
+    defer freeJsonValue(allocator, compat_value);
+
+    const model = types.Model{
+        .id = "anthropic-cache-control",
+        .name = "Anthropic Cache Control",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+        .compat = compat_value,
+    };
+    const context = types.Context{
+        .system_prompt = "Cache the instruction.",
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Cache the user text." } }},
+                .timestamp = 0,
+            } },
+        },
+    };
+
+    const env_long_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .cache_retention = .unset,
+    }, "long");
+    defer freeJsonValue(allocator, env_long_payload);
+    const env_long_messages = env_long_payload.object.get("messages").?.array.items;
+    const env_long_instruction_content = env_long_messages[0].object.get("content").?.array.items;
+    const env_long_cache_control = env_long_instruction_content[0].object.get("cache_control").?.object;
+    try std.testing.expectEqualStrings("ephemeral", env_long_cache_control.get("type").?.string);
+    try std.testing.expectEqualStrings("1h", env_long_cache_control.get("ttl").?.string);
+
+    const explicit_short_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .cache_retention = .short,
+    }, "long");
+    defer freeJsonValue(allocator, explicit_short_payload);
+    const explicit_short_messages = explicit_short_payload.object.get("messages").?.array.items;
+    const explicit_short_instruction_content = explicit_short_messages[0].object.get("content").?.array.items;
+    const explicit_short_cache_control = explicit_short_instruction_content[0].object.get("cache_control").?.object;
+    try std.testing.expectEqualStrings("ephemeral", explicit_short_cache_control.get("type").?.string);
+    try std.testing.expect(explicit_short_cache_control.get("ttl") == null);
 }
 
 test "buildRequestPayload transforms orphaned tool calls and normalizes ids" {

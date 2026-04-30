@@ -19,7 +19,7 @@ pub fn buildBaseOptions(
             defaultMaxTokens(model),
         .api_key = api_key orelse if (options) |value| value.api_key else null,
         .transport = if (options) |value| value.transport else .auto,
-        .cache_retention = if (options) |value| value.cache_retention else .short,
+        .cache_retention = if (options) |value| value.cache_retention else .unset,
         .session_id = if (options) |value| value.session_id else null,
         .headers = if (options) |value| value.headers else null,
         .on_payload = if (options) |value| value.on_payload else null,

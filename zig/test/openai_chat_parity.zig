@@ -100,9 +100,11 @@ fn buildActualRequestFromFixture(allocator: std.mem.Allocator, fixture: std.json
     const input = getObjectField(fixture, "input");
     const model = try parseModel(scenario_allocator, getObjectField(input, "model"));
     const context = try parseContext(scenario_allocator, getObjectField(input, "context"));
-    const options = try parseOptions(scenario_allocator, getObjectField(input, "options"));
+    const options_value = getObjectField(input, "options");
+    const options = try parseOptions(scenario_allocator, options_value);
+    const cache_retention_env = fixtureCacheRetentionEnv(options_value);
 
-    return try openai.buildRequestSnapshotValue(allocator, model, context, options);
+    return try openai.buildRequestSnapshotValueWithCacheRetentionEnv(allocator, model, context, options, cache_retention_env);
 }
 
 fn buildActualCompatFromFixture(allocator: std.mem.Allocator, fixture: std.json.Value) !std.json.Value {
@@ -337,11 +339,18 @@ fn parseStopReason(value: ?[]const u8) types.StopReason {
 }
 
 fn parseCacheRetention(value: ?[]const u8) types.CacheRetention {
-    const retention = value orelse return .short;
+    const retention = value orelse return .unset;
     if (std.mem.eql(u8, retention, "none")) return .none;
+    if (std.mem.eql(u8, retention, "short")) return .short;
     if (std.mem.eql(u8, retention, "long")) return .long;
-    if (std.mem.eql(u8, retention, "env-long")) return .long;
-    return .short;
+    if (std.mem.eql(u8, retention, "env-long")) return .unset;
+    return .unset;
+}
+
+fn fixtureCacheRetentionEnv(options: std.json.Value) ?[]const u8 {
+    const retention = optionalString(options, "cacheRetention") orelse return null;
+    if (std.mem.eql(u8, retention, "env-long")) return "long";
+    return null;
 }
 
 fn getObjectField(value: std.json.Value, key: []const u8) std.json.Value {
