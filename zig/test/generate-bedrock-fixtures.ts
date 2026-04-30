@@ -1870,6 +1870,46 @@ function validateSecretFree(value: unknown, path: string): void {
 	}
 }
 
+const usageCostTolerance = 1e-12;
+
+function validateUsageNumber(recordId: string, field: string, value: number): void {
+	if (!Number.isFinite(value) || value < 0) {
+		throw new Error(`HARNESS_USAGE_STOP: ${recordId} invalid usage ${field}`);
+	}
+}
+
+function validateUsageCost(recordId: string, field: string, actual: number, expected: number): void {
+	validateUsageNumber(recordId, `cost.${field}`, actual);
+	if (Math.abs(actual - expected) > usageCostTolerance) {
+		throw new Error(`HARNESS_USAGE_STOP: ${recordId} corrupt usage cost.${field}`);
+	}
+}
+
+function validateTerminalUsage(record: FixtureRecord, usage: SemanticMessage["usage"]): void {
+	validateUsageNumber(record.id, "input", usage.input);
+	validateUsageNumber(record.id, "output", usage.output);
+	validateUsageNumber(record.id, "cacheRead", usage.cacheRead);
+	validateUsageNumber(record.id, "cacheWrite", usage.cacheWrite);
+	validateUsageNumber(record.id, "totalTokens", usage.totalTokens);
+	if (usage.totalTokens !== usage.input + usage.output) {
+		throw new Error(`HARNESS_USAGE_STOP: ${record.id} corrupt usage total`);
+	}
+
+	const cost = record.input.model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	const expectedCost = {
+		input: (cost.input / 1_000_000) * usage.input,
+		output: (cost.output / 1_000_000) * usage.output,
+		cacheRead: (cost.cacheRead / 1_000_000) * usage.cacheRead,
+		cacheWrite: (cost.cacheWrite / 1_000_000) * usage.cacheWrite,
+	};
+	const expectedTotal = expectedCost.input + expectedCost.output + expectedCost.cacheRead + expectedCost.cacheWrite;
+	validateUsageCost(record.id, "input", usage.cost.input, expectedCost.input);
+	validateUsageCost(record.id, "output", usage.cost.output, expectedCost.output);
+	validateUsageCost(record.id, "cacheRead", usage.cost.cacheRead, expectedCost.cacheRead);
+	validateUsageCost(record.id, "cacheWrite", usage.cost.cacheWrite, expectedCost.cacheWrite);
+	validateUsageCost(record.id, "total", usage.cost.total, expectedTotal);
+}
+
 function validateStreamEvents(record: FixtureRecord): void {
 	let sawStart = false;
 	let terminalCount = 0;
@@ -1899,10 +1939,7 @@ function validateStreamEvents(record: FixtureRecord): void {
 			if (!["stop", "length", "toolUse", "error", "aborted"].includes(event.message.stopReason)) {
 				throw new Error(`HARNESS_USAGE_STOP: ${record.id} invalid stopReason ${event.message.stopReason}`);
 			}
-			const usage = event.message.usage;
-			if (usage.totalTokens !== usage.input + usage.output && usage.totalTokens === 0) {
-				throw new Error(`HARNESS_USAGE_STOP: ${record.id} corrupt usage total`);
-			}
+			validateTerminalUsage(record, event.message.usage);
 		}
 	}
 	if (terminalCount !== 1) {
@@ -2026,6 +2063,30 @@ function runNegativeSuite(records: FixtureRecord[]): string[] {
 			const record = cloneRecord(first);
 			const terminal = record.expected.typeScriptStream.at(-1);
 			if (terminal?.message) terminal.message.stopReason = "unsupported";
+			validateFixture(record);
+		}),
+	);
+	output.push(
+		expectNegative("corrupted-usage-total-nonzero", "HARNESS_USAGE_STOP", () => {
+			const record = cloneRecord(first);
+			const terminal = record.expected.typeScriptStream.at(-1);
+			if (terminal?.message) {
+				terminal.message.usage.input = 7;
+				terminal.message.usage.output = 5;
+				terminal.message.usage.totalTokens = 999;
+			}
+			validateFixture(record);
+		}),
+	);
+	output.push(
+		expectNegative("corrupted-usage-cache-nonzero", "HARNESS_USAGE_STOP", () => {
+			const source = records.find((candidate) => candidate.id === "bedrock-stream-usage-cache-total-fallback") ?? first;
+			const record = cloneRecord(source);
+			const terminal = record.expected.typeScriptStream.at(-1);
+			if (terminal?.message) {
+				terminal.message.usage.cacheRead = 13;
+				terminal.message.usage.cacheWrite = 8;
+			}
 			validateFixture(record);
 		}),
 	);
