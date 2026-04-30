@@ -1,7 +1,7 @@
 {
   "captureBoundary": "TypeScript Responses-family request after final payload/header/options resolution and before live transport",
   "diffOutputBoundBytes": 12000,
-  "fixtureCount": 50,
+  "fixtureCount": 51,
   "generatedBy": "zig/test/generate-openai-responses-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "providerFamilies": [
@@ -41,6 +41,7 @@
     "codex-responses-url-already-complete",
     "codex-responses-url-proxy-base",
     "codex-responses-on-payload-replacement-and-request-options",
+    "codex-responses-on-payload-pass-through",
     "codex-responses-transport-auto-deferred-fallback",
     "codex-responses-transport-websocket-deferred",
     "openai-responses-on-payload-replacement",

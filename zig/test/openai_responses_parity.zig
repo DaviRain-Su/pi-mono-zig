@@ -146,7 +146,7 @@ fn buildRequestFromFixtureInput(allocator: std.mem.Allocator, input: std.json.Va
     else
         final_payload;
     try putValue(allocator, &request, "jsonPayload", request_payload);
-    try putValue(allocator, &request, "requestOptions", .{ .object = try buildRequestOptions(allocator, options) });
+    try putValue(allocator, &request, "requestOptions", .{ .object = try buildRequestOptions(allocator, options, provider_family) });
     try putValue(allocator, &request, "transportMetadata", .{ .object = try buildTransportMetadata(allocator, scenario_id, provider_family) });
     return .{ .object = request };
 }
@@ -459,6 +459,7 @@ fn streamOptionsFromFixtureInput(allocator: std.mem.Allocator, model: std.json.V
         .timeout_ms = optionalU32(options, "timeoutMs"),
         .max_retries = optionalU32(options, "maxRetries"),
         .max_tokens = optionalU32(options, "maxTokens"),
+        .metadata = optionalField(options, "metadata"),
         .responses_reasoning_summary = optionalString(options, "reasoningSummary"),
         .responses_service_tier = optionalString(options, "serviceTier"),
         .responses_text_verbosity = optionalString(options, "textVerbosity"),
@@ -1060,11 +1061,13 @@ fn hasCopilotVisionInput(context: std.json.Value) bool {
     return false;
 }
 
-fn buildRequestOptions(allocator: std.mem.Allocator, options: std.json.Value) !std.json.ObjectMap {
+fn buildRequestOptions(allocator: std.mem.Allocator, options: std.json.Value, provider_family: []const u8) !std.json.ObjectMap {
     var object = try initObject(allocator);
-    if (optionalU32(options, "maxRetries")) |value| try putInteger(allocator, &object, "maxRetries", value);
     try putString(allocator, &object, "signal", optionalString(options, "signal") orelse "not-provided");
-    if (optionalU32(options, "timeoutMs")) |value| try putInteger(allocator, &object, "timeoutMs", value);
+    if (!std.mem.eql(u8, provider_family, "openai-codex")) {
+        if (optionalU32(options, "maxRetries")) |value| try putInteger(allocator, &object, "maxRetries", value);
+        if (optionalU32(options, "timeoutMs")) |value| try putInteger(allocator, &object, "timeoutMs", value);
+    }
     return object;
 }
 
@@ -1570,7 +1573,7 @@ fn runProductionRequestBuilderProofSelfTest(allocator: std.mem.Allocator) !void 
         "openai-codex",
         "{\"id\":\"gpt-5.1-codex\",\"name\":\"proof\",\"api\":\"openai-codex-responses\",\"provider\":\"openai-codex\",\"baseUrl\":\"https://chatgpt.com/backend-api\",\"reasoning\":true,\"input\":[\"text\"]}",
         "{\"systemPrompt\":\"Codex proof instructions.\",\"messages\":[{\"role\":\"user\",\"content\":\"Proof Codex.\"}]}",
-        "{\"apiKeyMode\":\"fixture-codex-jwt\",\"sessionId\":\"codex-proof-session\",\"textVerbosity\":\"low\",\"reasoningEffort\":\"minimal\",\"serviceTier\":\"flex\"}",
+        "{\"apiKeyMode\":\"fixture-codex-jwt\",\"sessionId\":\"codex-proof-session\",\"textVerbosity\":\"low\",\"reasoningEffort\":\"minimal\",\"serviceTier\":\"flex\",\"metadata\":{\"fixture\":\"codex-metadata-should-be-omitted\"}}",
     );
 }
 

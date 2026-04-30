@@ -9,14 +9,14 @@
           {
             "content": [
               {
-                "text": "This Codex payload will be replaced.",
+                "text": "This Codex payload should pass through.",
                 "type": "input_text"
               }
             ],
             "role": "user"
           }
         ],
-        "model": "gpt-5.1-codex-payload-replacement",
+        "model": "gpt-5.1-codex-payload-pass-through",
         "parallel_tool_calls": true,
         "store": false,
         "stream": true,
@@ -24,22 +24,6 @@
           "verbosity": "low"
         },
         "tool_choice": "auto"
-      },
-      "replacementPayload": {
-        "fixture_marker": "codex-on-payload-replacement",
-        "input": [
-          {
-            "content": [
-              {
-                "text": "codex payload replaced",
-                "type": "input_text"
-              }
-            ],
-            "role": "user"
-          }
-        ],
-        "model": "gpt-5.1-codex-payload-replacement",
-        "stream": true
       }
     },
     "typeScriptRequest": {
@@ -53,20 +37,28 @@
         "originator": "pi"
       },
       "jsonPayload": {
-        "fixture_marker": "codex-on-payload-replacement",
+        "include": [
+          "reasoning.encrypted_content"
+        ],
         "input": [
           {
             "content": [
               {
-                "text": "codex payload replaced",
+                "text": "This Codex payload should pass through.",
                 "type": "input_text"
               }
             ],
             "role": "user"
           }
         ],
-        "model": "gpt-5.1-codex-payload-replacement",
-        "stream": true
+        "model": "gpt-5.1-codex-payload-pass-through",
+        "parallel_tool_calls": true,
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        },
+        "tool_choice": "auto"
       },
       "method": "POST",
       "path": "/backend-api/codex/responses",
@@ -77,7 +69,7 @@
       "transportMetadata": {
         "mockedResponseHeaders": {
           "content-type": "text/event-stream",
-          "x-fixture-response": "codex-responses-on-payload-replacement-and-request-options"
+          "x-fixture-response": "codex-responses-on-payload-pass-through"
         },
         "mockedStatus": 200,
         "mode": "sse",
@@ -87,12 +79,12 @@
       "url": "https://chatgpt.com/backend-api/codex/responses"
     }
   },
-  "id": "codex-responses-on-payload-replacement-and-request-options",
+  "id": "codex-responses-on-payload-pass-through",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "This Codex payload will be replaced.",
+          "content": "This Codex payload should pass through.",
           "role": "user"
         }
       ]
@@ -100,7 +92,7 @@
     "model": {
       "api": "openai-codex-responses",
       "baseUrl": "https://chatgpt.com/backend-api",
-      "id": "gpt-5.1-codex-payload-replacement",
+      "id": "gpt-5.1-codex-payload-pass-through",
       "input": [
         "text"
       ],
@@ -110,28 +102,7 @@
     },
     "options": {
       "apiKeyMode": "fixture-codex-jwt",
-      "maxRetries": 2,
-      "metadata": {
-        "fixture": "codex-metadata-should-be-omitted"
-      },
-      "onPayload": "replace-with-fixture-payload",
-      "payloadReplacement": {
-        "fixture_marker": "codex-on-payload-replacement",
-        "input": [
-          {
-            "content": [
-              {
-                "text": "codex payload replaced",
-                "type": "input_text"
-              }
-            ],
-            "role": "user"
-          }
-        ],
-        "model": "gpt-5.1-codex-payload-replacement",
-        "stream": true
-      },
-      "timeoutMs": 2468,
+      "onPayload": "pass-through",
       "transport": "sse"
     }
   },
@@ -150,5 +121,5 @@
   },
   "providerFamily": "openai-codex",
   "schemaVersion": 1,
-  "title": "OpenAI Codex Responses onPayload observes the final SSE payload and replacement omits unsupported request options"
+  "title": "OpenAI Codex Responses onPayload pass-through observes the final SSE payload without replacing it"
 }
