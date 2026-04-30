@@ -1,6 +1,5 @@
 import {
 	BedrockRuntimeClient,
-	type ConversationRole,
 	type ConverseStreamOutput,
 } from "@aws-sdk/client-bedrock-runtime";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -40,14 +39,29 @@ const sourceCitations = [
 ] as const;
 
 const allowedScenarioIds = [
+	"bedrock-stream-no-explicit-inference",
 	"bedrock-stream-basic-text",
 	"bedrock-stream-metadata-response",
+	"bedrock-tools-choice-none",
+	"bedrock-tools-choice-auto",
+	"bedrock-tools-choice-any",
+	"bedrock-tools-choice-specific",
+	"bedrock-unrelated-provider-options-ignored",
+	"bedrock-message-history-tool-results",
+	"bedrock-vision-image-block",
+	"bedrock-nonvision-image-downgrade",
+	"bedrock-cache-points-long",
+	"bedrock-onpayload-pass-through",
+	"bedrock-onpayload-replacement",
+	"bedrock-reasoning-fields",
+	"bedrock-transform-replay-edge-cases",
 	"bedrock-simple-explicit-tokens",
 	"bedrock-binary-eventstream-tool-use",
 ] as const;
 
 const allowedModelIds = [
 	"anthropic.claude-3-7-sonnet-20250219-v1:0",
+	"anthropic.claude-3-5-haiku-20241022-v1:0",
 	"amazon.nova-pro-v1:0",
 ] as const;
 
@@ -78,10 +92,17 @@ interface FixtureModelInput {
 }
 
 interface SerializableOptions {
-	cacheRetention?: "none";
-	maxTokens: number;
+	cacheRetention?: "none" | "short" | "long";
+	maxTokens?: number;
 	temperature?: number;
+	toolChoice?: BedrockOptions["toolChoice"];
+	googleToolChoice?: "auto" | "any" | "none";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	thinkingBudgets?: BedrockOptions["thinkingBudgets"];
+	interleavedThinking?: boolean;
+	thinkingDisplay?: BedrockOptions["thinkingDisplay"];
 	requestMetadata?: Record<string, string>;
+	onPayload?: "pass-through" | "replace";
 	onResponse?: "capture";
 }
 
@@ -214,6 +235,14 @@ const novaModel: FixtureModelInput = {
 	reasoning: false,
 };
 
+const visionModel: FixtureModelInput = {
+	...baseModel,
+	id: "anthropic.claude-3-5-haiku-20241022-v1:0",
+	name: "Claude 3.5 Haiku Bedrock Vision Fixture",
+	reasoning: false,
+	input: ["text", "image"],
+};
+
 const baseContext = {
 	systemPrompt: "You are the deterministic Bedrock fixture assistant.",
 	messages: [{ role: "user", content: "Return a concise Bedrock fixture response." }],
@@ -227,6 +256,63 @@ const fixtureTool = {
 		unit: Type.Union([Type.Literal("celsius"), Type.Literal("fahrenheit")]),
 	}),
 };
+
+const secondFixtureTool = {
+	name: "lookup_order",
+	description: "Return deterministic order details.",
+	parameters: Type.Object({
+		orderId: Type.String(),
+	}),
+};
+
+const toolArguments = { city: "Berlin", unit: "celsius" };
+
+const sameModelAssistant = {
+	role: "assistant",
+	content: [
+		{ type: "text", text: "I will call a tool." },
+		{
+			type: "thinking",
+			thinking: "Need weather.",
+			thinkingSignature: "thinking-signature-1",
+		},
+		{ type: "toolCall", id: "tool-call-1", name: "get_weather", arguments: toolArguments },
+	],
+	api: "bedrock-converse-stream",
+	provider: "amazon-bedrock",
+	model: baseModel.id,
+	usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	stopReason: "toolUse",
+} satisfies DeclarativeMessage;
+
+const externalAssistantWithLongToolId = {
+	role: "assistant",
+	content: [
+		{ type: "thinking", thinking: "Cross model thinking becomes text.", thinkingSignature: "external-thinking-signature" },
+		{
+			type: "toolCall",
+			id: "tool.call/with:special#chars-and-a-very-long-identifier-that-exceeds-sixty-four-characters",
+			name: "get_weather",
+			arguments: toolArguments,
+		},
+	],
+	api: "openai-responses",
+	provider: "openai",
+	model: "gpt-5",
+	usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	stopReason: "toolUse",
+} satisfies DeclarativeMessage;
+
+const erroredAssistant = {
+	role: "assistant",
+	content: [{ type: "text", text: "partial failure" }],
+	api: "bedrock-converse-stream",
+	provider: "amazon-bedrock",
+	model: baseModel.id,
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	stopReason: "error",
+	errorMessage: "failed",
+} satisfies DeclarativeMessage;
 
 const textEvents: ConverseStreamFixtureEvent[] = [
 	{ messageStart: { role: "assistant" } },
@@ -255,6 +341,17 @@ const toolUseEvents: ConverseStreamFixtureEvent[] = [
 
 const scenarios: Scenario[] = [
 	{
+		id: "bedrock-stream-no-explicit-inference",
+		title: "Bedrock streamBedrock omits low-level max token defaults when no inference options are explicit",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { messages: [{ role: "user", content: "No explicit inference config." }] },
+			options: { cacheRetention: "none" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
 		id: "bedrock-stream-basic-text",
 		title: "Bedrock streamBedrock captures a basic Converse request and text stream locally",
 		input: {
@@ -281,6 +378,185 @@ const scenarios: Scenario[] = [
 				requestMetadata: { project: "m8c", scenario: "metadata-response" },
 				onResponse: "capture",
 			},
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-tools-choice-none",
+		title: "Bedrock toolChoice none omits toolConfig even when tools are present",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 64, toolChoice: "none" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-tools-choice-auto",
+		title: "Bedrock toolChoice auto maps to toolConfig.toolChoice.auto",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 64, toolChoice: "auto" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-tools-choice-any",
+		title: "Bedrock toolChoice any maps to toolConfig.toolChoice.any",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 64, toolChoice: "any" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-tools-choice-specific",
+		title: "Bedrock specific toolChoice maps to toolConfig.toolChoice.tool.name",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool, secondFixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 64, toolChoice: { type: "tool", name: "lookup_order" } },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-unrelated-provider-options-ignored",
+		title: "Bedrock ignores unrelated provider option fields while honoring dedicated Bedrock options",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 64, googleToolChoice: "any", toolChoice: "auto" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-message-history-tool-results",
+		title: "Bedrock converts assistant history, normalizes cross-provider tool ids, and groups tool results",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: {
+				messages: [
+					{ role: "user", content: "Use tool history." },
+					sameModelAssistant,
+					{ role: "toolResult", toolCallId: "tool-call-1", toolName: "get_weather", content: [{ type: "text", text: "sunny" }] },
+					externalAssistantWithLongToolId,
+					{
+						role: "toolResult",
+						toolCallId: "tool.call/with:special#chars-and-a-very-long-identifier-that-exceeds-sixty-four-characters",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "rain" }],
+						isError: true,
+					},
+					{ role: "toolResult", toolCallId: "second-tool", toolName: "lookup_order", content: [{ type: "text", text: "second" }] },
+				],
+				tools: [fixtureTool, secondFixtureTool],
+			},
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-vision-image-block",
+		title: "Bedrock vision-capable models convert image content to Bedrock image blocks",
+		input: {
+			mode: "streamBedrock",
+			model: visionModel,
+			context: {
+				messages: [{ role: "user", content: [{ type: "text", text: "Describe this." }, { type: "image", mimeType: "image/png", data: "aGVsbG8=" }] }],
+			},
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-nonvision-image-downgrade",
+		title: "Bedrock non-vision models downgrade user and tool-result images to deterministic text placeholders",
+		input: {
+			mode: "streamBedrock",
+			model: novaModel,
+			context: {
+				messages: [
+					{ role: "user", content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] },
+					{
+						role: "toolResult",
+						toolCallId: "tool-image",
+						toolName: "get_weather",
+						content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }],
+					},
+				],
+			},
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-cache-points-long",
+		title: "Bedrock Claude cache retention adds long cache points to system and last user messages",
+		input: {
+			mode: "streamBedrock",
+			model: visionModel,
+			context: baseContext,
+			options: { cacheRetention: "long", maxTokens: 64 },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-onpayload-pass-through",
+		title: "Bedrock onPayload pass-through preserves the generated payload",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64, onPayload: "pass-through" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-onpayload-replacement",
+		title: "Bedrock onPayload replacement sends exactly the replacement payload",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64, onPayload: "replace" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-reasoning-fields",
+		title: "Bedrock Claude reasoning emits additional model request fields",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 20000, reasoning: "medium", thinkingBudgets: { medium: 4096 }, thinkingDisplay: "omitted", interleavedThinking: false },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-transform-replay-edge-cases",
+		title: "Bedrock transformMessages skips failed assistants and synthesizes orphaned tool results",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: {
+				messages: [
+					{ role: "user", content: "Replay edge cases." },
+					erroredAssistant,
+					externalAssistantWithLongToolId,
+					{ role: "user", content: "Continue after orphaned call." },
+				],
+				tools: [fixtureTool],
+			},
+			options: { cacheRetention: "none", maxTokens: 64 },
 			localStream: { format: "json-lines", events: textEvents },
 		},
 	},
@@ -333,10 +609,16 @@ function toRuntimeContext(context: DeclarativeContext): Context {
 function toRuntimeOptions(options: SerializableOptions): BedrockOptions {
 	return {
 		...(options.cacheRetention !== undefined ? { cacheRetention: options.cacheRetention } : {}),
-		maxTokens: options.maxTokens,
+		...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
 		...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+		...(options.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
+		...(options.googleToolChoice !== undefined ? { googleToolChoice: options.googleToolChoice } : {}),
+		...(options.reasoning !== undefined ? { reasoning: options.reasoning } : {}),
+		...(options.thinkingBudgets !== undefined ? { thinkingBudgets: options.thinkingBudgets } : {}),
+		...(options.interleavedThinking !== undefined ? { interleavedThinking: options.interleavedThinking } : {}),
+		...(options.thinkingDisplay !== undefined ? { thinkingDisplay: options.thinkingDisplay } : {}),
 		...(options.requestMetadata !== undefined ? { requestMetadata: options.requestMetadata } : {}),
-	};
+	} as BedrockOptions;
 }
 
 function stableValue(value: unknown): unknown {
@@ -510,6 +792,16 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 		const runtimeModel = toRuntimeModel(scenario.input.model);
 		const runtimeContext = toRuntimeContext(scenario.input.context);
 		const runtimeOptions = toRuntimeOptions(scenario.input.options);
+		if (scenario.input.options.onPayload === "pass-through") {
+			runtimeOptions.onPayload = () => undefined;
+		} else if (scenario.input.options.onPayload === "replace") {
+			runtimeOptions.onPayload = () => ({
+				modelId: scenario.input.model.id,
+				messages: [{ role: "user", content: [{ text: "replacement payload" }] }],
+				inferenceConfig: { maxTokens: 7 },
+				requestMetadata: { replacement: "true" },
+			});
+		}
 		if (scenario.input.options.onResponse === "capture") {
 			runtimeOptions.onResponse = (response) => {
 				capturedResponse = {

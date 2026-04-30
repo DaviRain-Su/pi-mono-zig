@@ -1,10 +1,10 @@
 {
   "expected": {
     "typeScriptRequest": {
-      "mode": "streamSimpleBedrock",
+      "mode": "streamBedrock",
       "payload": {
         "inferenceConfig": {
-          "maxTokens": 128
+          "maxTokens": 64
         },
         "messages": [
           {
@@ -16,7 +16,7 @@
             "role": "user"
           }
         ],
-        "modelId": "amazon.nova-pro-v1:0",
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
         "system": [
           {
             "text": "You are the deterministic Bedrock fixture assistant."
@@ -51,7 +51,7 @@
               "type": "text"
             }
           ],
-          "model": "amazon.nova-pro-v1:0",
+          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
           "provider": "amazon-bedrock",
           "role": "assistant",
           "stopReason": "stop",
@@ -74,7 +74,7 @@
       }
     ]
   },
-  "id": "bedrock-simple-explicit-tokens",
+  "id": "bedrock-onpayload-pass-through",
   "input": {
     "context": {
       "messages": [
@@ -122,21 +122,22 @@
       ],
       "format": "json-lines"
     },
-    "mode": "streamSimpleBedrock",
+    "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "id": "amazon.nova-pro-v1:0",
+      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
       "input": [
         "text"
       ],
-      "name": "Nova Pro Bedrock Fixture",
+      "name": "Claude 3.7 Sonnet Bedrock Fixture",
       "provider": "amazon-bedrock",
-      "reasoning": false
+      "reasoning": true
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 128
+      "maxTokens": 64,
+      "onPayload": "pass-through"
     }
   },
   "metadata": {
@@ -192,5 +193,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock streamSimpleBedrock uses the real simple-option path with explicit max tokens"
+  "title": "Bedrock onPayload pass-through preserves the generated payload"
 }

@@ -4,6 +4,9 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const transform_messages = @import("../shared/transform_messages.zig");
+const simple_options = @import("../shared/simple_options.zig");
+const openai = @import("openai.zig");
 
 const SERVICE_NAME = "bedrock";
 const SHA256_HEX_LEN = std.crypto.hash.sha2.Sha256.digest_length * 2;
@@ -162,7 +165,30 @@ pub const BedrockProvider = struct {
         context: types.Context,
         options: ?types.StreamOptions,
     ) !event_stream.AssistantMessageEventStream {
-        return stream(allocator, io, model, context, options);
+        var base = simple_options.buildBaseOptions(model, null, null);
+        if (options) |stream_options| {
+            base = stream_options;
+        }
+        if (base.bedrock_reasoning) |reasoning| {
+            if (isAnthropicClaudeModel(model) and !supportsAdaptiveThinking(model.id, model.name)) {
+                const adjusted = simple_options.adjustMaxTokensForThinking(
+                    base.max_tokens orelse 0,
+                    model.max_tokens,
+                    reasoning,
+                    base.bedrock_thinking_budgets,
+                );
+                base.max_tokens = adjusted.max_tokens;
+                var budgets = base.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+                switch (simple_options.clampReasoning(reasoning).?) {
+                    .minimal => budgets.minimal = adjusted.thinking_budget,
+                    .low => budgets.low = adjusted.thinking_budget,
+                    .medium => budgets.medium = adjusted.thinking_budget,
+                    .high, .xhigh => budgets.high = adjusted.thinking_budget,
+                }
+                base.bedrock_thinking_budgets = budgets;
+            }
+        }
+        return stream(allocator, io, model, context, base);
     }
 };
 
@@ -175,10 +201,12 @@ pub fn buildRequestPayload(
     var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer payload.deinit(allocator);
 
-    try payload.put(allocator, try allocator.dupe(u8, "messages"), try buildMessagesValue(allocator, context.messages));
+    const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
+
+    try payload.put(allocator, try allocator.dupe(u8, "messages"), try buildMessagesValue(allocator, model, context.messages, cache_retention));
 
     if (context.system_prompt) |system_prompt| {
-        try payload.put(allocator, try allocator.dupe(u8, "system"), try buildSystemValue(allocator, system_prompt));
+        try payload.put(allocator, try allocator.dupe(u8, "system"), try buildSystemValue(allocator, system_prompt, model, cache_retention));
     }
 
     try payload.put(allocator, try allocator.dupe(u8, "inferenceConfig"), try buildInferenceConfigValue(allocator, model, options));
@@ -192,8 +220,11 @@ pub fn buildRequestPayload(
     }
 
     if (options) |stream_options| {
-        if (try buildRequestMetadataValue(allocator, stream_options.metadata)) |request_metadata| {
+        if (try buildRequestMetadataValue(allocator, stream_options.bedrock_request_metadata)) |request_metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "requestMetadata"), request_metadata);
+        }
+        if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options)) |additional_fields| {
+            try payload.put(allocator, try allocator.dupe(u8, "additionalModelRequestFields"), additional_fields);
         }
     }
 
@@ -214,6 +245,14 @@ pub fn buildRequestSnapshotValue(
     var payload = try buildRequestPayload(allocator, model, context, options);
     errdefer freeJsonValue(allocator, payload);
     try payload.object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
+    if (options) |stream_options| {
+        if (stream_options.on_payload) |callback| {
+            if (try callback(allocator, payload, model)) |replacement| {
+                freeJsonValue(allocator, payload);
+                payload = replacement;
+            }
+        }
+    }
     try request.put(allocator, try allocator.dupe(u8, "payload"), payload);
     return .{ .object = request };
 }
@@ -278,10 +317,18 @@ pub fn buildStreamSnapshotValueFromBinaryBody(
     return try snapshotStreamEvents(allocator, parse_allocator, &stream_instance);
 }
 
-fn buildSystemValue(allocator: std.mem.Allocator, system_prompt: []const u8) !std.json.Value {
+fn buildSystemValue(
+    allocator: std.mem.Allocator,
+    system_prompt: []const u8,
+    model: types.Model,
+    cache_retention: types.CacheRetention,
+) !std.json.Value {
     var blocks = std.json.Array.init(allocator);
     errdefer blocks.deinit();
     try blocks.append(try buildTextBlockObject(allocator, system_prompt));
+    if (cache_retention != .none and supportsPromptCaching(model)) {
+        try blocks.append(try buildCachePointBlockObject(allocator, cache_retention));
+    }
     return .{ .array = blocks };
 }
 
@@ -290,16 +337,14 @@ fn buildInferenceConfigValue(
     model: types.Model,
     options: ?types.StreamOptions,
 ) !std.json.Value {
+    _ = model;
     var config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer config.deinit(allocator);
 
-    const max_tokens = if (options) |stream_options|
-        stream_options.max_tokens orelse @max(@as(u32, 1), @min(model.max_tokens, @as(u32, 4096)))
-    else
-        @max(@as(u32, 1), @min(model.max_tokens, @as(u32, 4096)));
-    try config.put(allocator, try allocator.dupe(u8, "maxTokens"), .{ .integer = @intCast(max_tokens) });
-
     if (options) |stream_options| {
+        if (stream_options.max_tokens) |max_tokens| {
+            try config.put(allocator, try allocator.dupe(u8, "maxTokens"), .{ .integer = @intCast(max_tokens) });
+        }
         if (stream_options.temperature) |temperature| {
             try config.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
         }
@@ -324,33 +369,255 @@ fn buildRequestMetadataValue(allocator: std.mem.Allocator, metadata: ?std.json.V
     return null;
 }
 
-fn buildMessagesValue(allocator: std.mem.Allocator, messages: []const types.Message) !std.json.Value {
+fn processCacheRetentionEnv() ?[]const u8 {
+    const value = std.c.getenv("PI_CACHE_RETENTION") orelse return null;
+    return std.mem.span(value);
+}
+
+fn resolveCacheRetention(cache_retention: types.CacheRetention, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return switch (cache_retention) {
+        .unset => if (pi_cache_retention_env) |value|
+            if (std.mem.eql(u8, value, "long")) .long else .short
+        else
+            .short,
+        else => cache_retention,
+    };
+}
+
+fn resolveOptionsCacheRetention(options: ?types.StreamOptions, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return resolveCacheRetention(if (options) |stream_options| stream_options.cache_retention else .unset, pi_cache_retention_env);
+}
+
+fn buildCachePointBlockObject(allocator: std.mem.Allocator, cache_retention: types.CacheRetention) !std.json.Value {
+    var cache_point = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try cache_point.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "default") });
+    if (cache_retention == .long) {
+        try cache_point.put(allocator, try allocator.dupe(u8, "ttl"), .{ .string = try allocator.dupe(u8, "1h") });
+    }
+
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try object.put(allocator, try allocator.dupe(u8, "cachePoint"), .{ .object = cache_point });
+    return .{ .object = object };
+}
+
+fn buildImageBlockObject(allocator: std.mem.Allocator, image: types.ImageContent) !std.json.Value {
+    const format = try bedrockImageFormat(image.mime_type);
+
+    var source = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try source.put(allocator, try allocator.dupe(u8, "bytes"), .{ .string = try allocator.dupe(u8, image.data) });
+
+    var image_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try image_object.put(allocator, try allocator.dupe(u8, "source"), .{ .object = source });
+    try image_object.put(allocator, try allocator.dupe(u8, "format"), .{ .string = try allocator.dupe(u8, format) });
+
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try object.put(allocator, try allocator.dupe(u8, "image"), .{ .object = image_object });
+    return .{ .object = object };
+}
+
+fn bedrockImageFormat(mime_type: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, mime_type, "image/jpeg") or std.mem.eql(u8, mime_type, "image/jpg")) return "jpeg";
+    if (std.mem.eql(u8, mime_type, "image/png")) return "png";
+    if (std.mem.eql(u8, mime_type, "image/gif")) return "gif";
+    if (std.mem.eql(u8, mime_type, "image/webp")) return "webp";
+    return error.UnknownBedrockImageType;
+}
+
+fn normalizeBedrockToolCallIdForTransform(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    model: types.Model,
+    source: types.AssistantMessage,
+) ![]const u8 {
+    _ = model;
+    _ = source;
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    for (id) |char| {
+        if (std.ascii.isAlphanumeric(char) or char == '_' or char == '-') {
+            try output.append(allocator, char);
+        } else {
+            try output.append(allocator, '_');
+        }
+        if (output.items.len == 64) break;
+    }
+    return try output.toOwnedSlice(allocator);
+}
+
+fn modelMatchCandidateContains(model: types.Model, needle: []const u8) bool {
+    return textMatchCandidateContains(model.id, needle) or textMatchCandidateContains(model.name, needle);
+}
+
+fn textMatchCandidateContains(value: []const u8, needle: []const u8) bool {
+    var buffer: [512]u8 = undefined;
+    const lower = std.ascii.lowerString(buffer[0..@min(value.len, buffer.len)], value[0..@min(value.len, buffer.len)]);
+    if (std.mem.indexOf(u8, lower, needle) != null) return true;
+    var normalized: [512]u8 = undefined;
+    for (lower, 0..) |char, index| {
+        normalized[index] = switch (char) {
+            ' ', '_', '.', ':' => '-',
+            else => char,
+        };
+    }
+    return std.mem.indexOf(u8, normalized[0..lower.len], needle) != null;
+}
+
+fn isAnthropicClaudeModel(model: types.Model) bool {
+    return modelMatchCandidateContains(model, "anthropic.claude") or
+        modelMatchCandidateContains(model, "anthropic/claude") or
+        modelMatchCandidateContains(model, "claude");
+}
+
+fn supportsAdaptiveThinking(model_id: []const u8, model_name: []const u8) bool {
+    const model = types.Model{
+        .id = model_id,
+        .name = model_name,
+        .api = "",
+        .provider = "",
+        .base_url = "",
+        .input_types = &[_][]const u8{},
+        .context_window = 0,
+        .max_tokens = 0,
+    };
+    return modelMatchCandidateContains(model, "opus-4-6") or
+        modelMatchCandidateContains(model, "opus-4-7") or
+        modelMatchCandidateContains(model, "sonnet-4-6");
+}
+
+fn supportsPromptCaching(model: types.Model) bool {
+    if (!modelMatchCandidateContains(model, "claude")) {
+        const forced = std.c.getenv("AWS_BEDROCK_FORCE_CACHE") orelse return false;
+        return std.mem.eql(u8, std.mem.span(forced), "1");
+    }
+    return modelMatchCandidateContains(model, "-4-") or
+        modelMatchCandidateContains(model, "claude-3-7-sonnet") or
+        modelMatchCandidateContains(model, "claude-3-5-haiku");
+}
+
+fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions) bool {
+    if (options.bedrock_region) |region| {
+        if (std.mem.startsWith(u8, region, "us-gov-")) return true;
+    }
+    const id = model.id;
+    return std.mem.startsWith(u8, id, "us-gov.") or std.mem.startsWith(u8, id, "arn:aws-us-gov:");
+}
+
+fn mapThinkingLevelToEffort(level: types.ThinkingLevel, model: types.Model) []const u8 {
+    return switch (level) {
+        .minimal, .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => if (modelMatchCandidateContains(model, "opus-4-6"))
+            "max"
+        else if (modelMatchCandidateContains(model, "opus-4-7"))
+            "xhigh"
+        else
+            "high",
+    };
+}
+
+fn buildAdditionalModelRequestFieldsValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: types.StreamOptions,
+) !?std.json.Value {
+    const reasoning = options.bedrock_reasoning orelse return null;
+    if (!model.reasoning or !isAnthropicClaudeModel(model)) return null;
+
+    const display = if (isGovCloudBedrockTarget(model, options)) null else options.bedrock_thinking_display orelse .summarized;
+    var result = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer result.deinit(allocator);
+
+    if (supportsAdaptiveThinking(model.id, model.name)) {
+        var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "adaptive") });
+        if (display) |display_value| {
+            try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, thinkingDisplayString(display_value)) });
+        }
+        try result.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+
+        var output_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        try output_config.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, mapThinkingLevelToEffort(reasoning, model)) });
+        try result.put(allocator, try allocator.dupe(u8, "output_config"), .{ .object = output_config });
+    } else {
+        const budgets = options.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+        const budget = switch (reasoning) {
+            .minimal => budgets.minimal,
+            .low => budgets.low,
+            .medium => budgets.medium,
+            .high, .xhigh => budgets.high,
+        };
+        var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "enabled") });
+        try thinking.put(allocator, try allocator.dupe(u8, "budget_tokens"), .{ .integer = budget });
+        if (display) |display_value| {
+            try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, thinkingDisplayString(display_value)) });
+        }
+        try result.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+        if (options.bedrock_interleaved_thinking orelse true) {
+            var beta = std.json.Array.init(allocator);
+            try beta.append(.{ .string = try allocator.dupe(u8, "interleaved-thinking-2025-05-14") });
+            try result.put(allocator, try allocator.dupe(u8, "anthropic_beta"), .{ .array = beta });
+        }
+    }
+
+    return .{ .object = result };
+}
+
+fn thinkingDisplayString(display: types.AnthropicThinkingDisplay) []const u8 {
+    return switch (display) {
+        .summarized => "summarized",
+        .omitted => "omitted",
+    };
+}
+
+fn buildMessagesValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    messages: []const types.Message,
+    cache_retention: types.CacheRetention,
+) !std.json.Value {
     var array = std.json.Array.init(allocator);
     errdefer array.deinit();
 
+    const transformed_messages = try transform_messages.transformMessages(allocator, messages, model, normalizeBedrockToolCallIdForTransform);
+    defer transform_messages.freeMessages(allocator, transformed_messages);
+
     var index: usize = 0;
-    while (index < messages.len) : (index += 1) {
-        switch (messages[index]) {
-            .user => |user| try array.append(try buildUserMessageValue(allocator, user)),
+    while (index < transformed_messages.len) : (index += 1) {
+        switch (transformed_messages[index]) {
+            .user => |user| try array.append(try buildUserMessageValue(allocator, model, user)),
             .assistant => |assistant| {
                 if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                    if (try buildAssistantMessageValue(allocator, assistant)) |message_value| {
+                    if (try buildAssistantMessageValue(allocator, model, assistant)) |message_value| {
                         try array.append(message_value);
                     }
                 }
             },
             .tool_result => {
-                const grouped = try buildToolResultMessageValue(allocator, messages[index..]);
+                const grouped = try buildToolResultMessageValue(allocator, model, transformed_messages[index..]);
                 try array.append(grouped.value);
                 index += grouped.consumed - 1;
             },
         }
     }
 
+    if (cache_retention != .none and supportsPromptCaching(model) and array.items.len > 0) {
+        const last_message = &array.items[array.items.len - 1];
+        if (last_message.* == .object) {
+            const role = last_message.object.get("role");
+            const content = last_message.object.getPtr("content");
+            if (role != null and role.? == .string and std.mem.eql(u8, role.?.string, "user") and content != null and content.?.* == .array) {
+                try content.?.array.append(try buildCachePointBlockObject(allocator, cache_retention));
+            }
+        }
+    }
+
     return .{ .array = array };
 }
 
-fn buildUserMessageValue(allocator: std.mem.Allocator, user: types.UserMessage) !std.json.Value {
+fn buildUserMessageValue(allocator: std.mem.Allocator, model: types.Model, user: types.UserMessage) !std.json.Value {
+    _ = model;
     var content = std.json.Array.init(allocator);
     errdefer content.deinit();
 
@@ -360,7 +627,7 @@ fn buildUserMessageValue(allocator: std.mem.Allocator, user: types.UserMessage) 
                 if (std.mem.trim(u8, text.text, " \t\r\n").len == 0) continue;
                 try content.append(try buildTextBlockObject(allocator, text.text));
             },
-            .image => try content.append(try buildTextBlockObject(allocator, "(image omitted: binary Bedrock image upload not implemented)")),
+            .image => |image| try content.append(try buildImageBlockObject(allocator, image)),
             .thinking, .tool_call => {},
         }
     }
@@ -369,7 +636,7 @@ fn buildUserMessageValue(allocator: std.mem.Allocator, user: types.UserMessage) 
     return try buildRoleMessageObject(allocator, "user", .{ .array = content });
 }
 
-fn buildAssistantMessageValue(allocator: std.mem.Allocator, assistant: types.AssistantMessage) !?std.json.Value {
+fn buildAssistantMessageValue(allocator: std.mem.Allocator, model: types.Model, assistant: types.AssistantMessage) !?std.json.Value {
     var content = std.json.Array.init(allocator);
     errdefer content.deinit();
 
@@ -381,10 +648,28 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, assistant: types.Ass
             },
             .thinking => |thinking| {
                 if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
-                if (types.thinkingSignature(thinking)) |signature| {
+                if (isAnthropicClaudeModel(model)) {
+                    if (types.thinkingSignature(thinking)) |signature| {
+                        var reasoning_text = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                        const sanitized = try openai.sanitizeSurrogates(allocator, thinking.thinking);
+                        defer allocator.free(sanitized);
+                        try reasoning_text.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
+                        try reasoning_text.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, signature) });
+
+                        var reasoning_content = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                        try reasoning_content.put(allocator, try allocator.dupe(u8, "reasoningText"), .{ .object = reasoning_text });
+
+                        var block_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                        try block_object.put(allocator, try allocator.dupe(u8, "reasoningContent"), .{ .object = reasoning_content });
+                        try content.append(.{ .object = block_object });
+                    } else {
+                        try content.append(try buildTextBlockObject(allocator, thinking.thinking));
+                    }
+                } else {
                     var reasoning_text = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                    try reasoning_text.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
-                    try reasoning_text.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, signature) });
+                    const sanitized = try openai.sanitizeSurrogates(allocator, thinking.thinking);
+                    defer allocator.free(sanitized);
+                    try reasoning_text.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
 
                     var reasoning_content = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                     try reasoning_content.put(allocator, try allocator.dupe(u8, "reasoningText"), .{ .object = reasoning_text });
@@ -392,11 +677,9 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, assistant: types.Ass
                     var block_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                     try block_object.put(allocator, try allocator.dupe(u8, "reasoningContent"), .{ .object = reasoning_content });
                     try content.append(.{ .object = block_object });
-                } else {
-                    try content.append(try buildTextBlockObject(allocator, thinking.thinking));
                 }
             },
-            .image => {},
+            .image => |image| try content.append(try buildImageBlockObject(allocator, image)),
             .tool_call => |tool_call| {
                 var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
@@ -431,8 +714,10 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, assistant: types.Ass
 
 fn buildToolResultMessageValue(
     allocator: std.mem.Allocator,
+    model: types.Model,
     messages: []const types.Message,
 ) !struct { value: std.json.Value, consumed: usize } {
+    _ = model;
     var content = std.json.Array.init(allocator);
     errdefer content.deinit();
 
@@ -445,7 +730,7 @@ fn buildToolResultMessageValue(
                 for (tool_result.content) |block| {
                     switch (block) {
                         .text => |text| try tool_result_blocks.append(try buildTextBlockObject(allocator, text.text)),
-                        .image => try tool_result_blocks.append(try buildTextBlockObject(allocator, "(image omitted)")),
+                        .image => |image| try tool_result_blocks.append(try buildImageBlockObject(allocator, image)),
                         .thinking => |thinking| try tool_result_blocks.append(try buildTextBlockObject(allocator, thinking.thinking)),
                         .tool_call => {},
                     }
@@ -483,8 +768,8 @@ fn buildToolConfigValue(
     options: ?types.StreamOptions,
 ) !?std.json.Value {
     if (options) |stream_options| {
-        if (stream_options.google_tool_choice) |tool_choice| {
-            if (std.ascii.eqlIgnoreCase(tool_choice, "none")) return null;
+        if (stream_options.bedrock_tool_choice) |tool_choice| {
+            if (tool_choice == .none) return null;
         }
     }
 
@@ -508,7 +793,7 @@ fn buildToolConfigValue(
     try config.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tool_entries });
 
     if (options) |stream_options| {
-        if (stream_options.google_tool_choice) |tool_choice| {
+        if (stream_options.bedrock_tool_choice) |tool_choice| {
             if (try buildToolChoiceValue(allocator, tool_choice)) |choice_value| {
                 try config.put(allocator, try allocator.dupe(u8, "toolChoice"), choice_value);
             }
@@ -518,19 +803,26 @@ fn buildToolConfigValue(
     return .{ .object = config };
 }
 
-fn buildToolChoiceValue(allocator: std.mem.Allocator, tool_choice: []const u8) !?std.json.Value {
-    if (std.ascii.eqlIgnoreCase(tool_choice, "auto")) {
-        return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{try allocator.dupe(u8, "auto")}, &[_]std.json.Value{.{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) }}) };
+fn buildToolChoiceValue(allocator: std.mem.Allocator, tool_choice: types.BedrockToolChoice) !?std.json.Value {
+    switch (tool_choice) {
+        .none => return null,
+        .auto => return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{try allocator.dupe(u8, "auto")}, &[_]std.json.Value{.{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) }}) },
+        .any => return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{try allocator.dupe(u8, "any")}, &[_]std.json.Value{.{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) }}) },
+        .tool => |name| {
+            var tool = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            try tool.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, name) });
+            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            try object.put(allocator, try allocator.dupe(u8, "tool"), .{ .object = tool });
+            return .{ .object = object };
+        },
     }
-    if (std.ascii.eqlIgnoreCase(tool_choice, "any")) {
-        return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{try allocator.dupe(u8, "any")}, &[_]std.json.Value{.{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) }}) };
-    }
-    return null;
 }
 
 fn buildTextBlockObject(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+    const sanitized = try openai.sanitizeSurrogates(allocator, text);
+    defer allocator.free(sanitized);
+    try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
     return .{ .object = object };
 }
 

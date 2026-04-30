@@ -1,37 +1,64 @@
 {
   "expected": {
-    "onResponse": {
-      "headers": {
-        "x-amzn-requestid": "fixture-request-bedrock-stream-metadata-response"
-      },
-      "status": 200
-    },
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
         "inferenceConfig": {
-          "maxTokens": 96
+          "maxTokens": 64
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Replay edge cases."
+              }
+            ],
+            "role": "user"
+          },
+          {
+            "content": [
+              {
+                "text": "Cross model thinking becomes text."
+              },
+              {
+                "toolUse": {
+                  "input": {
+                    "city": "Berlin",
+                    "unit": "celsius"
+                  },
+                  "name": "get_weather",
+                  "toolUseId": "tool_call_with_special_chars-and-a-very-long-identifier-that-exc"
+                }
+              }
+            ],
+            "role": "assistant"
+          },
+          {
+            "content": [
+              {
+                "toolResult": {
+                  "content": [
+                    {
+                      "text": "No result provided"
+                    }
+                  ],
+                  "status": "error",
+                  "toolUseId": "tool_call_with_special_chars-and-a-very-long-identifier-that-exc"
+                }
+              }
+            ],
+            "role": "user"
+          },
+          {
+            "content": [
+              {
+                "text": "Continue after orphaned call."
               }
             ],
             "role": "user"
           }
         ],
         "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "requestMetadata": {
-          "project": "m8c",
-          "scenario": "metadata-response"
-        },
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ],
         "toolConfig": {
           "tools": [
             {
@@ -120,16 +147,84 @@
       }
     ]
   },
-  "id": "bedrock-stream-metadata-response",
+  "id": "bedrock-transform-replay-edge-cases",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Replay edge cases.",
+          "role": "user"
+        },
+        {
+          "api": "bedrock-converse-stream",
+          "content": [
+            {
+              "text": "partial failure",
+              "type": "text"
+            }
+          ],
+          "errorMessage": "failed",
+          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "provider": "amazon-bedrock",
+          "role": "assistant",
+          "stopReason": "error",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 0,
+            "output": 0,
+            "totalTokens": 0
+          }
+        },
+        {
+          "api": "openai-responses",
+          "content": [
+            {
+              "thinking": "Cross model thinking becomes text.",
+              "thinkingSignature": "external-thinking-signature",
+              "type": "thinking"
+            },
+            {
+              "arguments": {
+                "city": "Berlin",
+                "unit": "celsius"
+              },
+              "id": "tool.call/with:special#chars-and-a-very-long-identifier-that-exceeds-sixty-four-characters",
+              "name": "get_weather",
+              "type": "toolCall"
+            }
+          ],
+          "model": "gpt-5",
+          "provider": "openai",
+          "role": "assistant",
+          "stopReason": "toolUse",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 1,
+            "output": 1,
+            "totalTokens": 2
+          }
+        },
+        {
+          "content": "Continue after orphaned call.",
           "role": "user"
         }
       ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant.",
       "tools": [
         {
           "description": "Return deterministic weather for a city.",
@@ -212,12 +307,7 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 96,
-      "onResponse": "capture",
-      "requestMetadata": {
-        "project": "m8c",
-        "scenario": "metadata-response"
-      }
+      "maxTokens": 64
     }
   },
   "metadata": {
@@ -273,5 +363,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock streamBedrock preserves request metadata and response callback metadata"
+  "title": "Bedrock transformMessages skips failed assistants and synthesizes orphaned tool results"
 }
