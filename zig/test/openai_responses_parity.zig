@@ -212,7 +212,11 @@ fn buildOpenAIResponsesPayload(allocator: std.mem.Allocator, model: std.json.Val
         try putString(allocator, &payload, "prompt_cache_key", session_id);
     }
 
-    if (optionalU32(options, "maxTokens")) |max_tokens| try putInteger(allocator, &payload, "max_output_tokens", max_tokens);
+    if (optionalU32(options, "maxTokens")) |max_tokens| {
+        try putInteger(allocator, &payload, "max_output_tokens", max_tokens);
+    } else if (optionalString(options, "simpleReasoning") != null) {
+        try putInteger(allocator, &payload, "max_output_tokens", 4096);
+    }
     if (optionalNumber(options, "temperature")) |temperature| try putFloat(allocator, &payload, "temperature", temperature);
     if (optionalString(options, "serviceTier")) |service_tier| try putString(allocator, &payload, "service_tier", service_tier);
     if (optionalField(context, "tools")) |tools| {
@@ -221,8 +225,16 @@ fn buildOpenAIResponsesPayload(allocator: std.mem.Allocator, model: std.json.Val
 
     const reasoning = optionalBool(model, "reasoning") orelse false;
     if (reasoning) {
-        if (optionalString(options, "reasoningEffort")) |effort| {
-            try addReasoning(allocator, &payload, effort, optionalString(options, "reasoningSummary") orelse "auto");
+        const effort = if (optionalString(options, "reasoningEffort")) |value|
+            value
+        else if (optionalString(options, "simpleReasoning")) |value|
+            try clampSimpleReasoning(allocator, getObjectField(model, "id").string, value)
+        else
+            null;
+        if (effort) |value| {
+            try addReasoning(allocator, &payload, value, optionalString(options, "reasoningSummary") orelse "auto");
+        } else if (optionalString(options, "reasoningSummary")) |summary| {
+            try addReasoning(allocator, &payload, "medium", summary);
         } else if (!std.mem.eql(u8, provider_family, "github-copilot")) {
             var reasoning_object = try initObject(allocator);
             try putString(allocator, &reasoning_object, "effort", "none");
@@ -231,6 +243,25 @@ fn buildOpenAIResponsesPayload(allocator: std.mem.Allocator, model: std.json.Val
     }
 
     return .{ .object = payload };
+}
+
+fn clampSimpleReasoning(allocator: std.mem.Allocator, model_id: []const u8, effort: []const u8) ![]const u8 {
+    if (!std.mem.eql(u8, effort, "xhigh")) return effort;
+    if (supportsXhigh(model_id)) return effort;
+    return try allocator.dupe(u8, "high");
+}
+
+fn supportsXhigh(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "gpt-5.2") != null or
+        std.mem.indexOf(u8, model_id, "gpt-5.3") != null or
+        std.mem.indexOf(u8, model_id, "gpt-5.4") != null or
+        std.mem.indexOf(u8, model_id, "gpt-5.5") != null or
+        std.mem.indexOf(u8, model_id, "deepseek-v4-pro") != null or
+        std.mem.indexOf(u8, model_id, "deepseek-v4-flash") != null or
+        std.mem.indexOf(u8, model_id, "opus-4-6") != null or
+        std.mem.indexOf(u8, model_id, "opus-4.6") != null or
+        std.mem.indexOf(u8, model_id, "opus-4-7") != null or
+        std.mem.indexOf(u8, model_id, "opus-4.7") != null;
 }
 
 fn buildAzurePayload(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, options: std.json.Value) !std.json.Value {
@@ -264,6 +295,7 @@ fn buildCodexPayload(allocator: std.mem.Allocator, model: std.json.Value, contex
 
 fn buildResponsesInput(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, include_system_prompt: bool) !std.json.Array {
     var input = std.json.Array.init(allocator);
+    var normalized_tool_call_ids = std.StringHashMap([]const u8).init(allocator);
     if (include_system_prompt) {
         if (optionalString(context, "systemPrompt")) |system_prompt| {
             var item = try initObject(allocator);
@@ -272,13 +304,20 @@ fn buildResponsesInput(allocator: std.mem.Allocator, model: std.json.Value, cont
             try input.append(.{ .object = item });
         }
     }
-    for (getObjectField(context, "messages").array.items) |message| {
+    for (getObjectField(context, "messages").array.items, 0..) |message, msg_index| {
         const role = getObjectField(message, "role").string;
-        if (!std.mem.eql(u8, role, "user")) continue;
-        var item = try initObject(allocator);
-        try putString(allocator, &item, "role", "user");
-        try putValue(allocator, &item, "content", .{ .array = try buildUserContent(allocator, getObjectField(message, "content")) });
-        try input.append(.{ .object = item });
+        if (std.mem.eql(u8, role, "user")) {
+            const content = try buildUserContent(allocator, getObjectField(message, "content"));
+            if (getObjectField(message, "content") == .array and content.items.len == 0) continue;
+            var item = try initObject(allocator);
+            try putString(allocator, &item, "role", "user");
+            try putValue(allocator, &item, "content", .{ .array = content });
+            try input.append(.{ .object = item });
+        } else if (std.mem.eql(u8, role, "assistant")) {
+            try appendAssistantInputItems(allocator, &input, model, message, msg_index, &normalized_tool_call_ids);
+        } else if (std.mem.eql(u8, role, "toolResult")) {
+            try input.append(try buildToolResultInputItem(allocator, model, message, &normalized_tool_call_ids));
+        }
     }
     return input;
 }
@@ -307,6 +346,227 @@ fn buildUserContent(allocator: std.mem.Allocator, content: std.json.Value) !std.
         try parts.append(.{ .object = part });
     }
     return parts;
+}
+
+fn appendAssistantInputItems(
+    allocator: std.mem.Allocator,
+    input: *std.json.Array,
+    model: std.json.Value,
+    assistant: std.json.Value,
+    msg_index: usize,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
+) !void {
+    for (getObjectField(assistant, "content").array.items) |block| {
+        const block_type = getObjectField(block, "type").string;
+        if (std.mem.eql(u8, block_type, "thinking")) {
+            if (optionalString(block, "thinkingSignature")) |signature| {
+                var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch continue;
+                defer parsed.deinit();
+                try input.append(try cloneJsonValue(allocator, parsed.value));
+            }
+        } else if (std.mem.eql(u8, block_type, "text")) {
+            var message_object = try initObject(allocator);
+            try putString(allocator, &message_object, "type", "message");
+            try putString(allocator, &message_object, "role", "assistant");
+            try putString(allocator, &message_object, "status", "completed");
+            const parsed_signature = try parseTextSignature(allocator, optionalString(block, "textSignature"), msg_index);
+            try putString(allocator, &message_object, "id", parsed_signature.id);
+            if (parsed_signature.phase) |phase| try putString(allocator, &message_object, "phase", phase);
+
+            var content = std.json.Array.init(allocator);
+            var text_object = try initObject(allocator);
+            try putString(allocator, &text_object, "type", "output_text");
+            try putString(allocator, &text_object, "text", getObjectField(block, "text").string);
+            try putValue(allocator, &text_object, "annotations", .{ .array = std.json.Array.init(allocator) });
+            try content.append(.{ .object = text_object });
+            try putValue(allocator, &message_object, "content", .{ .array = content });
+            try input.append(.{ .object = message_object });
+        } else if (std.mem.eql(u8, block_type, "toolCall")) {
+            const original_id = getObjectField(block, "id").string;
+            const normalized_id = try normalizeToolCallId(allocator, original_id, model, assistant);
+            if (!std.mem.eql(u8, original_id, normalized_id)) try normalized_tool_call_ids.put(original_id, normalized_id);
+            const split = splitToolCallId(normalized_id);
+            var tool_call_object = try initObject(allocator);
+            try putString(allocator, &tool_call_object, "type", "function_call");
+            try putString(allocator, &tool_call_object, "call_id", split.call_id);
+            if (split.item_id) |item_id| try putString(allocator, &tool_call_object, "id", item_id);
+            try putString(allocator, &tool_call_object, "name", getObjectField(block, "name").string);
+            const arguments_json = try std.json.Stringify.valueAlloc(allocator, getObjectField(block, "arguments"), .{});
+            try putString(allocator, &tool_call_object, "arguments", arguments_json);
+            try input.append(.{ .object = tool_call_object });
+        }
+    }
+}
+
+const ParsedTextSignature = struct {
+    id: []const u8,
+    phase: ?[]const u8,
+};
+
+fn parseTextSignature(allocator: std.mem.Allocator, signature: ?[]const u8, msg_index: usize) !ParsedTextSignature {
+    const value = signature orelse return .{ .id = try std.fmt.allocPrint(allocator, "msg_{d}", .{msg_index}), .phase = null };
+    if (std.mem.startsWith(u8, value, "{")) {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch {
+            return .{ .id = try allocator.dupe(u8, value), .phase = null };
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("v")) |version| {
+                if (version == .integer and version.integer == 1) {
+                    if (optionalString(parsed.value, "id")) |id| {
+                        const phase = optionalString(parsed.value, "phase");
+                        if (phase != null and (std.mem.eql(u8, phase.?, "commentary") or std.mem.eql(u8, phase.?, "final_answer"))) {
+                            return .{ .id = try allocator.dupe(u8, id), .phase = try allocator.dupe(u8, phase.?) };
+                        }
+                        return .{ .id = try allocator.dupe(u8, id), .phase = null };
+                    }
+                }
+            }
+        }
+    }
+    return .{ .id = try allocator.dupe(u8, value), .phase = null };
+}
+
+fn buildToolResultInputItem(
+    allocator: std.mem.Allocator,
+    model: std.json.Value,
+    tool_result: std.json.Value,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
+) !std.json.Value {
+    const original_id = getObjectField(tool_result, "toolCallId").string;
+    const normalized_id = normalized_tool_call_ids.get(original_id) orelse original_id;
+    const split = splitToolCallId(normalized_id);
+    var object = try initObject(allocator);
+    try putString(allocator, &object, "type", "function_call_output");
+    try putString(allocator, &object, "call_id", split.call_id);
+
+    const supports_images = modelSupportsImages(model);
+    var text_parts = std.ArrayList(u8).empty;
+    var image_count: usize = 0;
+    for (getObjectField(tool_result, "content").array.items) |block| {
+        const block_type = getObjectField(block, "type").string;
+        if (std.mem.eql(u8, block_type, "text")) {
+            if (text_parts.items.len > 0) try text_parts.appendSlice(allocator, "\n");
+            try text_parts.appendSlice(allocator, getObjectField(block, "text").string);
+        } else if (std.mem.eql(u8, block_type, "image")) {
+            image_count += 1;
+        }
+    }
+
+    if (supports_images and image_count > 0) {
+        var output = std.json.Array.init(allocator);
+        if (text_parts.items.len > 0) {
+            var text_object = try initObject(allocator);
+            try putString(allocator, &text_object, "type", "input_text");
+            try putString(allocator, &text_object, "text", text_parts.items);
+            try output.append(.{ .object = text_object });
+        }
+        for (getObjectField(tool_result, "content").array.items) |block| {
+            if (!std.mem.eql(u8, getObjectField(block, "type").string, "image")) continue;
+            var image_object = try initObject(allocator);
+            try putString(allocator, &image_object, "type", "input_image");
+            try putString(allocator, &image_object, "detail", "auto");
+            const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ getObjectField(block, "mimeType").string, getObjectField(block, "data").string });
+            try putString(allocator, &image_object, "image_url", image_url);
+            try output.append(.{ .object = image_object });
+        }
+        try putValue(allocator, &object, "output", .{ .array = output });
+    } else {
+        const output = if (text_parts.items.len > 0) text_parts.items else "(see attached image)";
+        try putString(allocator, &object, "output", output);
+    }
+
+    return .{ .object = object };
+}
+
+fn normalizeToolCallId(allocator: std.mem.Allocator, id: []const u8, model: std.json.Value, source: std.json.Value) ![]const u8 {
+    if (!std.mem.eql(u8, getObjectField(model, "provider").string, "openai") and
+        !std.mem.eql(u8, getObjectField(model, "provider").string, "openai-codex") and
+        !std.mem.eql(u8, getObjectField(model, "provider").string, "opencode"))
+    {
+        return normalizeIdPart(allocator, id);
+    }
+    const separator = std.mem.indexOfScalar(u8, id, '|') orelse return normalizeIdPart(allocator, id);
+    const call_id = try normalizeIdPart(allocator, id[0..separator]);
+    const item_id = id[separator + 1 ..];
+    const is_foreign = !std.mem.eql(u8, getObjectField(source, "provider").string, getObjectField(model, "provider").string) or
+        !std.mem.eql(u8, getObjectField(source, "api").string, getObjectField(model, "api").string);
+    var normalized_item_id = if (is_foreign)
+        try buildForeignResponsesItemId(allocator, item_id)
+    else
+        try normalizeIdPart(allocator, item_id);
+    if (!std.mem.startsWith(u8, normalized_item_id, "fc_")) {
+        const prefixed = try std.fmt.allocPrint(allocator, "fc_{s}", .{normalized_item_id});
+        normalized_item_id = try normalizeIdPart(allocator, prefixed);
+    }
+    return try std.fmt.allocPrint(allocator, "{s}|{s}", .{ call_id, normalized_item_id });
+}
+
+fn normalizeIdPart(allocator: std.mem.Allocator, part: []const u8) ![]const u8 {
+    var buffer = std.ArrayList(u8).empty;
+    for (part) |char| {
+        const normalized = if (std.ascii.isAlphanumeric(char) or char == '_' or char == '-') char else '_';
+        try buffer.append(allocator, normalized);
+        if (buffer.items.len == 64) break;
+    }
+    while (buffer.items.len > 0 and buffer.items[buffer.items.len - 1] == '_') _ = buffer.pop();
+    return try buffer.toOwnedSlice(allocator);
+}
+
+fn buildForeignResponsesItemId(allocator: std.mem.Allocator, item_id: []const u8) ![]const u8 {
+    const hash = try shortHash(allocator, item_id);
+    const prefixed = try std.fmt.allocPrint(allocator, "fc_{s}", .{hash});
+    if (prefixed.len > 64) return try allocator.dupe(u8, prefixed[0..64]);
+    return prefixed;
+}
+
+fn splitToolCallId(id: []const u8) struct { call_id: []const u8, item_id: ?[]const u8 } {
+    if (std.mem.indexOfScalar(u8, id, '|')) |separator_index| {
+        const item_id = id[separator_index + 1 ..];
+        return .{
+            .call_id = id[0..separator_index],
+            .item_id = if (item_id.len > 0) item_id else null,
+        };
+    }
+    return .{ .call_id = id, .item_id = null };
+}
+
+fn modelSupportsImages(model: std.json.Value) bool {
+    const input = optionalField(model, "input") orelse return false;
+    if (input != .array) return false;
+    for (input.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, "image")) return true;
+    }
+    return false;
+}
+
+fn shortHash(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var h1: u32 = 0xdeadbeef;
+    var h2: u32 = 0x41c6ce57;
+    for (input) |char| {
+        const ch: u32 = char;
+        h1 = (h1 ^ ch) *% 2654435761;
+        h2 = (h2 ^ ch) *% 1597334677;
+    }
+    h1 = ((h1 ^ (h1 >> 16)) *% 2246822507) ^ ((h2 ^ (h2 >> 13)) *% 3266489909);
+    h2 = ((h2 ^ (h2 >> 16)) *% 2246822507) ^ ((h1 ^ (h1 >> 13)) *% 3266489909);
+    const high = try u32ToBase36(allocator, h2);
+    const low = try u32ToBase36(allocator, h1);
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ high, low });
+}
+
+fn u32ToBase36(allocator: std.mem.Allocator, value: u32) ![]const u8 {
+    if (value == 0) return try allocator.dupe(u8, "0");
+    var digits: [16]u8 = undefined;
+    var current = value;
+    var index: usize = digits.len;
+    while (current > 0) {
+        index -= 1;
+        const digit: u8 = @intCast(current % 36);
+        digits[index] = if (digit < 10) '0' + digit else 'a' + (digit - 10);
+        current /= 36;
+    }
+    return try allocator.dupe(u8, digits[index..]);
 }
 
 fn buildTools(allocator: std.mem.Allocator, tools: std.json.Value, strict_null: bool) !std.json.Array {

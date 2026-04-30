@@ -1,0 +1,206 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "accept": "application/json",
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": "Replay prior Responses items.",
+            "role": "developer"
+          },
+          {
+            "encrypted_content": "encrypted_fixture",
+            "id": "rs_fixture",
+            "summary": [
+              {
+                "text": "cached thought",
+                "type": "summary_text"
+              }
+            ],
+            "type": "reasoning"
+          },
+          {
+            "content": [
+              {
+                "annotations": [],
+                "text": "I will call a tool.",
+                "type": "output_text"
+              }
+            ],
+            "id": "msg_fixture_signed",
+            "phase": "final_answer",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
+          },
+          {
+            "arguments": "{\"query\":\"weather\"}",
+            "call_id": "call_fixture",
+            "id": "fc_fixture_item",
+            "name": "lookup_fixture",
+            "type": "function_call"
+          },
+          {
+            "call_id": "call_fixture",
+            "output": [
+              {
+                "text": "Tool text result",
+                "type": "input_text"
+              },
+              {
+                "detail": "auto",
+                "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                "type": "input_image"
+              }
+            ],
+            "type": "function_call_output"
+          },
+          {
+            "content": [
+              {
+                "text": "Continue after replay.",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-5-mini-replay",
+        "reasoning": {
+          "effort": "medium",
+          "summary": "auto"
+        },
+        "store": false,
+        "stream": true
+      },
+      "method": "POST",
+      "path": "/v1/responses",
+      "query": {},
+      "requestOptions": {
+        "signal": "not-provided"
+      },
+      "transportMetadata": {
+        "mockedResponseHeaders": {
+          "content-type": "text/event-stream",
+          "x-fixture-response": "openai-responses-assistant-tool-result-replay"
+        },
+        "mockedStatus": 200,
+        "mode": "sse",
+        "providerFamily": "openai",
+        "requestBoundary": "before local mocked SSE response body is consumed"
+      },
+      "url": "https://api.openai.com/v1/responses"
+    }
+  },
+  "id": "openai-responses-assistant-tool-result-replay",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "api": "openai-responses",
+          "content": [
+            {
+              "thinking": "cached",
+              "thinkingSignature": "{\"id\":\"rs_fixture\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"cached thought\"}],\"encrypted_content\":\"encrypted_fixture\"}",
+              "type": "thinking"
+            },
+            {
+              "text": "I will call a tool.",
+              "textSignature": "{\"v\":1,\"id\":\"msg_fixture_signed\",\"phase\":\"final_answer\"}",
+              "type": "text"
+            },
+            {
+              "arguments": {
+                "query": "weather"
+              },
+              "id": "call_fixture|fc_fixture_item",
+              "name": "lookup_fixture",
+              "type": "toolCall"
+            }
+          ],
+          "model": "gpt-5-mini-replay",
+          "provider": "openai",
+          "responseId": "resp_previous_fixture",
+          "role": "assistant",
+          "stopReason": "toolUse",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 0,
+            "output": 0,
+            "totalTokens": 0
+          }
+        },
+        {
+          "content": [
+            {
+              "text": "Tool text result",
+              "type": "text"
+            },
+            {
+              "data": "iVBORw0KGgo=",
+              "mimeType": "image/png",
+              "type": "image"
+            }
+          ],
+          "isError": false,
+          "role": "toolResult",
+          "toolCallId": "call_fixture|fc_fixture_item",
+          "toolName": "lookup_fixture"
+        },
+        {
+          "content": "Continue after replay.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "Replay prior Responses items."
+    },
+    "model": {
+      "api": "openai-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "id": "gpt-5-mini-replay",
+      "input": [
+        "text",
+        "image"
+      ],
+      "name": "GPT 4.1 Responses Fixture",
+      "provider": "openai",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "reasoningEffort": "medium"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "Responses-family request after model/options resolution, payload conversion, header merge, callbacks, and before live HTTP/WebSocket transport",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records final request semantics and rejects unhandled hosts",
+    "diffOutputBoundBytes": 12000,
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-responses.ts",
+      "packages/ai/src/providers/openai-responses-shared.ts",
+      "packages/ai/src/providers/github-copilot-headers.ts",
+      "packages/ai/src/providers/azure-openai-responses.ts",
+      "packages/ai/src/providers/openai-codex-responses.ts"
+    ]
+  },
+  "providerFamily": "openai",
+  "schemaVersion": 1,
+  "title": "OpenAI Responses assistant replay, tool result replay, and previous_response_id absence match TypeScript"
+}

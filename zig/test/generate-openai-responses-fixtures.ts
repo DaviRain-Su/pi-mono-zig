@@ -12,9 +12,10 @@ import {
 } from "../../packages/ai/src/providers/openai-codex-responses.js";
 import {
 	streamOpenAIResponses,
+	streamSimpleOpenAIResponses,
 	type OpenAIResponsesOptions,
 } from "../../packages/ai/src/providers/openai-responses.js";
-import type { AssistantMessageEvent, Context, Message, Model } from "../../packages/ai/src/types.js";
+import type { AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions } from "../../packages/ai/src/types.js";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = dirname(scriptPath);
@@ -64,6 +65,7 @@ interface SerializableOptions {
 	payloadReplacement?: unknown;
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
 	reasoningSummary?: "auto" | "detailed" | "concise" | "off" | "on" | null;
+	simpleReasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
 	serviceTier?: "auto" | "default" | "flex" | "priority";
 	sessionId?: string;
 	temperature?: number;
@@ -307,6 +309,242 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	{
+		id: "openai-responses-cache-long-retention",
+		title: "OpenAI Responses long prompt cache retention emits 24h when supported",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-responses-cache-long" }),
+			context: { messages: [{ role: "user", content: "Cache this prompt." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				sessionId: "fixture-long-cache-session",
+			},
+		},
+	},
+	{
+		id: "openai-responses-cache-none-omits-session",
+		title: "OpenAI Responses cacheRetention none omits prompt cache and session-affinity headers",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-responses-cache-none" }),
+			context: { messages: [{ role: "user", content: "Do not cache this prompt." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				sessionId: "fixture-cache-none-session",
+			},
+		},
+	},
+	{
+		id: "openai-responses-cache-env-long-unsupported",
+		title: "OpenAI Responses PI_CACHE_RETENTION long fallback honors supportsLongCacheRetention false",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({
+				id: "gpt-4.1-responses-cache-env-unsupported",
+				compat: { supportsLongCacheRetention: false },
+			}),
+			context: { messages: [{ role: "user", content: "Environment cache fallback." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "env-long",
+				sessionId: "fixture-env-long-session",
+			},
+		},
+	},
+	{
+		id: "openai-responses-session-header-option-override",
+		title: "OpenAI Responses session header compat and explicit option header overrides match TypeScript",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({
+				id: "gpt-4.1-responses-session-override",
+				headers: { "x-client-request-id": "model-request-id", "x-fixture-model-header": "model-session" },
+				compat: { sendSessionIdHeader: false },
+			}),
+			context: { messages: [{ role: "user", content: "Override session headers." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "short",
+				headers: { "X-Client-Request-Id": "option-request-id", session_id: "option-session-id" },
+				sessionId: "generated-session-id",
+			},
+		},
+	},
+	{
+		id: "openai-responses-reasoning-default-none",
+		title: "OpenAI Responses reasoning-capable non-Copilot models emit default effort none and developer system role",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-responses-fixture", reasoning: true }),
+			context: { systemPrompt: "Developer instructions for reasoning model.", messages: [{ role: "user", content: "Reason briefly." }] },
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "openai-responses-reasoning-effort-only",
+		title: "OpenAI Responses reasoning effort defaults summary to auto and includes encrypted reasoning content",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-responses-effort", reasoning: true }),
+			context: { messages: [{ role: "user", content: "Use high effort." }] },
+			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "high" },
+		},
+	},
+	{
+		id: "openai-responses-reasoning-summary-only",
+		title: "OpenAI Responses reasoning summary defaults missing effort to medium",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-responses-summary", reasoning: true }),
+			context: { messages: [{ role: "user", content: "Summarize reasoning concisely." }] },
+			options: { apiKeyMode: "fixture-placeholder", reasoningSummary: "concise" },
+		},
+	},
+	{
+		id: "openai-responses-reasoning-summary-null",
+		title: "OpenAI Responses reasoningSummary null follows TypeScript falsy default semantics without JSON null",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-responses-summary-null", reasoning: true }),
+			context: { messages: [{ role: "user", content: "Null summary should not serialize." }] },
+			options: { apiKeyMode: "fixture-placeholder", reasoningSummary: null },
+		},
+	},
+	{
+		id: "openai-responses-simple-reasoning-xhigh-clamped",
+		title: "OpenAI Responses simple reasoning xhigh clamps for non-xhigh models",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-simple-responses", reasoning: true }),
+			context: { messages: [{ role: "user", content: "Clamp simple reasoning." }] },
+			options: { apiKeyMode: "fixture-placeholder", simpleReasoning: "xhigh" },
+		},
+	},
+	{
+		id: "openai-responses-simple-reasoning-xhigh-supported",
+		title: "OpenAI Responses simple reasoning preserves xhigh for supported models",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5.5-simple-responses", reasoning: true }),
+			context: { messages: [{ role: "user", content: "Preserve simple xhigh reasoning." }] },
+			options: { apiKeyMode: "fixture-placeholder", simpleReasoning: "xhigh" },
+		},
+	},
+	{
+		id: "openai-responses-service-tier-priority",
+		title: "OpenAI Responses service tier serializes when provided",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-responses-service-tier" }),
+			context: { messages: [{ role: "user", content: "Use priority service tier." }] },
+			options: { apiKeyMode: "fixture-placeholder", serviceTier: "priority" },
+		},
+	},
+	{
+		id: "openai-responses-empty-tools-omitted",
+		title: "OpenAI Responses empty tool arrays are omitted from the payload",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-responses-empty-tools" }),
+			context: { messages: [{ role: "user", content: "No tools should be sent." }], tools: [] },
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "openai-responses-proxy-url-trailing-slash",
+		title: "OpenAI Responses proxy base URL with trailing slash appends exactly one responses path",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-responses-proxy", baseUrl: "https://proxy.example.test/custom/v1/" }),
+			context: { messages: [{ role: "user", content: "Proxy URL parity." }] },
+			options: { apiKeyMode: "fixture-placeholder", maxRetries: 2, timeoutMs: 4567 },
+		},
+	},
+	{
+		id: "openai-responses-user-image-and-empty-content",
+		title: "OpenAI Responses user image conversion preserves image parts and skips empty user arrays",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-4.1-responses-vision", input: ["text", "image"] }),
+			context: {
+				messages: [
+					{ role: "user", content: [] },
+					{ role: "user", content: [{ type: "text", text: "Look at this." }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }] },
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "openai-responses-assistant-tool-result-replay",
+		title: "OpenAI Responses assistant replay, tool result replay, and previous_response_id absence match TypeScript",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-replay", reasoning: true, input: ["text", "image"] }),
+			context: {
+				systemPrompt: "Replay prior Responses items.",
+				messages: [
+					{
+						role: "assistant",
+						api: "openai-responses",
+						provider: "openai",
+						model: "gpt-5-mini-replay",
+						responseId: "resp_previous_fixture",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "toolUse",
+						content: [
+							{ type: "thinking", thinking: "cached", thinkingSignature: "{\"id\":\"rs_fixture\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"cached thought\"}],\"encrypted_content\":\"encrypted_fixture\"}" },
+							{ type: "text", text: "I will call a tool.", textSignature: "{\"v\":1,\"id\":\"msg_fixture_signed\",\"phase\":\"final_answer\"}" },
+							{ type: "toolCall", id: "call_fixture|fc_fixture_item", name: "lookup_fixture", arguments: { query: "weather" } },
+						],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture|fc_fixture_item",
+						toolName: "lookup_fixture",
+						content: [{ type: "text", text: "Tool text result" }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+						isError: false,
+					},
+					{ role: "user", content: "Continue after replay." },
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "medium" },
+		},
+	},
+	{
+		id: "openai-responses-tool-call-id-normalization",
+		title: "OpenAI Responses cross-provider tool-call IDs normalize call and foreign item parts like TypeScript",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-id-normalization", reasoning: true }),
+			context: {
+				messages: [
+					{
+						role: "assistant",
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: "claude-foreign-fixture",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "toolUse",
+						content: [{ type: "toolCall", id: "call:foreign/with spaces|foreign-item-id-with-symbols-and-a-very-very-very-long-suffix", name: "lookup_fixture", arguments: { query: "foreign" } }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call:foreign/with spaces|foreign-item-id-with-symbols-and-a-very-very-very-long-suffix",
+						toolName: "lookup_fixture",
+						content: [{ type: "text", text: "Foreign result" }],
+						isError: false,
+					},
+					{ role: "user", content: "Use normalized tool history." },
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "low" },
+		},
+	},
+
 ];
 
 function buildFakeJwt(accountId: string): string {
@@ -484,6 +722,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	let observedPayload: unknown;
 
 	applySentinelCredentialEnv();
+	if (scenario.input.options.cacheRetention === "env-long") process.env.PI_CACHE_RETENTION = "long";
 
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const request = input instanceof Request ? input : new Request(input, init);
@@ -588,11 +827,15 @@ function runScenarioStream(scenario: Scenario, onPayload: (payload: unknown) => 
 	}
 	const options = commonRuntimeOptions(scenario.input.options);
 	if (scenario.input.options.onPayload) options.onPayload = (payload) => onPayload(payload);
-	return streamOpenAIResponses(
-		toRuntimeModel<"openai-responses">(scenario.input.model),
-		toRuntimeContext(scenario.input.context),
-		options,
-	);
+	const model = toRuntimeModel<"openai-responses">(scenario.input.model);
+	const context = toRuntimeContext(scenario.input.context);
+	if (scenario.input.options.simpleReasoning) {
+		return streamSimpleOpenAIResponses(model, context, {
+			...options,
+			reasoning: scenario.input.options.simpleReasoning,
+		} satisfies SimpleStreamOptions);
+	}
+	return streamOpenAIResponses(model, context, options);
 }
 
 function saveCredentialEnv(): Record<string, string | undefined> {
