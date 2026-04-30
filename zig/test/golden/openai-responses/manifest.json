@@ -1,7 +1,7 @@
 {
   "captureBoundary": "TypeScript Responses-family request after final payload/header/options resolution and before live transport",
   "diffOutputBoundBytes": 12000,
-  "fixtureCount": 51,
+  "fixtureCount": 53,
   "generatedBy": "zig/test/generate-openai-responses-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "providerFamilies": [
@@ -60,6 +60,8 @@
     "openai-responses-proxy-url-trailing-slash",
     "openai-responses-user-image-and-empty-content",
     "openai-responses-assistant-tool-result-replay",
+    "openai-responses-different-model-fc-id-omission",
+    "openai-responses-skipped-empty-message-fallback-id",
     "openai-responses-long-text-signature-replay",
     "openai-responses-tool-call-id-normalization"
   ],

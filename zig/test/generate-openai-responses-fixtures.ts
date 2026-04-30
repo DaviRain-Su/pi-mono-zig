@@ -1009,6 +1009,62 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "openai-responses-different-model-fc-id-omission",
+		title: "OpenAI Responses same-provider different-model replay omits paired function_call item ids",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-target-replay", reasoning: true }),
+			context: {
+				messages: [
+					{
+						role: "assistant",
+						api: "openai-responses",
+						provider: "openai",
+						model: "gpt-5-mini-source-replay",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "toolUse",
+						content: [
+							{ type: "toolCall", id: "call_same_provider|fc_same_provider_item", name: "lookup_fixture", arguments: { query: "same-provider" } },
+						],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_same_provider|fc_same_provider_item",
+						toolName: "lookup_fixture",
+						content: [{ type: "text", text: "Same-provider result" }],
+						isError: false,
+					},
+					{ role: "user", content: "Continue after different model tool replay." },
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "medium" },
+		},
+	},
+	{
+		id: "openai-responses-skipped-empty-message-fallback-id",
+		title: "OpenAI Responses fallback assistant replay ids use post-skip message counter",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-skip-counter", reasoning: true }),
+			context: {
+				messages: [
+					{ role: "user", content: [] },
+					{
+						role: "assistant",
+						api: "openai-responses",
+						provider: "openai",
+						model: "gpt-5-mini-source-skip-counter",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "stop",
+						content: [{ type: "text", text: "Fallback id should ignore the skipped empty user message." }],
+					},
+					{ role: "user", content: "Continue after skipped empty content." },
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "medium" },
+		},
+	},
+	{
 		id: "openai-responses-long-text-signature-replay",
 		title: "OpenAI Responses assistant replay hashes long textSignature ids and preserves valid phase",
 		providerFamily: "openai",

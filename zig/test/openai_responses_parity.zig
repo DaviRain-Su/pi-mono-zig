@@ -795,6 +795,22 @@ fn runProductionRequestBuilderProofSelfTest(allocator: std.mem.Allocator) !void 
     );
     try runProductionSnapshotProofCase(
         allocator,
+        "production-openai-responses-different-model-fc-id-proof",
+        "openai",
+        "{\"id\":\"gpt-5-mini-target-replay\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":true,\"input\":[\"text\"]}",
+        "{\"messages\":[{\"role\":\"assistant\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"model\":\"gpt-5-mini-source-replay\",\"stopReason\":\"toolUse\",\"content\":[{\"type\":\"toolCall\",\"id\":\"call_same_provider|fc_same_provider_item\",\"name\":\"lookup_fixture\",\"arguments\":{\"query\":\"same-provider\"}}]},{\"role\":\"toolResult\",\"toolCallId\":\"call_same_provider|fc_same_provider_item\",\"toolName\":\"lookup_fixture\",\"content\":[{\"type\":\"text\",\"text\":\"Same-provider result\"}],\"isError\":false},{\"role\":\"user\",\"content\":\"Continue after different model tool replay.\"}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\",\"reasoningEffort\":\"medium\"}",
+    );
+    try runProductionSnapshotProofCase(
+        allocator,
+        "production-openai-responses-skipped-empty-message-id-proof",
+        "openai",
+        "{\"id\":\"gpt-5-mini-skip-counter\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":true,\"input\":[\"text\"]}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"assistant\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"model\":\"gpt-5-mini-source-skip-counter\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"Fallback id should ignore the skipped empty user message.\"}]},{\"role\":\"user\",\"content\":\"Continue after skipped empty content.\"}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\",\"reasoningEffort\":\"medium\"}",
+    );
+    try runProductionSnapshotProofCase(
+        allocator,
         "production-azure-responses-snapshot-proof",
         "azure-openai",
         "{\"id\":\"gpt-4.1-azure-proof\",\"name\":\"proof\",\"api\":\"azure-openai-responses\",\"provider\":\"azure-openai-responses\",\"baseUrl\":\"https://fixture-resource.openai.azure.com\",\"reasoning\":false,\"input\":[\"text\"]}",

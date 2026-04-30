@@ -200,8 +200,11 @@ pub fn buildRequestPayload(
         normalized_tool_call_ids.deinit();
     }
 
-    for (context.messages, 0..) |message, message_index| {
-        try appendInputItemsForMessage(allocator, &input, model, message, message_index, &normalized_tool_call_ids);
+    var replay_message_index: usize = 0;
+    for (context.messages) |message| {
+        if (try appendInputItemsForMessage(allocator, &input, model, message, replay_message_index, &normalized_tool_call_ids)) {
+            replay_message_index += 1;
+        }
     }
 
     var payload = try initObject(allocator);
@@ -1103,19 +1106,25 @@ fn appendInputItemsForMessage(
     message: types.Message,
     message_index: usize,
     normalized_tool_call_ids: *std.StringHashMap([]const u8),
-) !void {
+) !bool {
     switch (message) {
         .user => |user| {
             if (try buildUserInputItem(allocator, model, user)) |item| {
                 try input.append(item);
+                return true;
             }
+            return false;
         },
         .assistant => |assistant| {
             if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                try appendAssistantInputItems(allocator, input, model, assistant, message_index, normalized_tool_call_ids);
+                return try appendAssistantInputItems(allocator, input, model, assistant, message_index, normalized_tool_call_ids);
             }
+            return false;
         },
-        .tool_result => |tool_result| try input.append(try buildToolResultInputItem(allocator, model, tool_result, normalized_tool_call_ids)),
+        .tool_result => |tool_result| {
+            try input.append(try buildToolResultInputItem(allocator, model, tool_result, normalized_tool_call_ids));
+            return true;
+        },
     }
 }
 
@@ -1170,11 +1179,15 @@ fn appendAssistantInputItems(
     assistant: types.AssistantMessage,
     message_index: usize,
     normalized_tool_call_ids: *std.StringHashMap([]const u8),
-) !void {
-    const is_same_model =
+) !bool {
+    const is_same_provider_api =
         std.mem.eql(u8, assistant.provider, model.provider) and
-        std.mem.eql(u8, assistant.api, model.api) and
+        std.mem.eql(u8, assistant.api, model.api);
+    const is_same_model =
+        is_same_provider_api and
         std.mem.eql(u8, assistant.model, model.id);
+    const is_different_model_same_provider_api = is_same_provider_api and !is_same_model;
+    const input_start_index = input.items.len;
 
     for (assistant.content) |block| {
         switch (block) {
@@ -1249,7 +1262,9 @@ fn appendAssistantInputItems(
             try tool_call_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "function_call") });
             try tool_call_object.put(allocator, try allocator.dupe(u8, "call_id"), .{ .string = try allocator.dupe(u8, split.call_id) });
             if (split.item_id) |item_id| {
-                try tool_call_object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, item_id) });
+                if (!(is_different_model_same_provider_api and std.mem.startsWith(u8, item_id, "fc_"))) {
+                    try tool_call_object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, item_id) });
+                }
             }
             try tool_call_object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
             const arguments_json = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{});
@@ -1258,6 +1273,8 @@ fn appendAssistantInputItems(
             try input.append(.{ .object = tool_call_object });
         }
     }
+
+    return input.items.len > input_start_index;
 }
 
 fn buildToolResultInputItem(
