@@ -182,21 +182,17 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    const anchor = findContinuationAnchor(context, model);
     const compat = getCompat(model);
-    const start_index = if (anchor) |value| value.message_start_index else 0;
-    const include_system_prompt = anchor == null;
+    const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
 
     var input = std.json.Array.init(allocator);
     errdefer input.deinit();
 
-    if (include_system_prompt) {
-        if (context.system_prompt) |system_prompt| {
-            try input.append(try buildSystemInputItem(allocator, model, system_prompt));
-        }
+    if (context.system_prompt) |system_prompt| {
+        try input.append(try buildSystemInputItem(allocator, model, system_prompt));
     }
 
-    for (context.messages[start_index..], start_index..) |message, message_index| {
+    for (context.messages, 0..) |message, message_index| {
         try appendInputItemsForMessage(allocator, &input, model, message, message_index);
     }
 
@@ -207,10 +203,6 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "input"), .{ .array = input });
     try payload.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
     try payload.put(allocator, try allocator.dupe(u8, "store"), .{ .bool = false });
-
-    if (anchor) |value| {
-        try payload.put(allocator, try allocator.dupe(u8, "previous_response_id"), .{ .string = try allocator.dupe(u8, value.response_id) });
-    }
 
     if (options) |stream_options| {
         if (stream_options.max_tokens) |max_tokens| {
@@ -223,27 +215,43 @@ pub fn buildRequestPayload(
             try payload.put(allocator, try allocator.dupe(u8, "metadata"), try cloneJsonValue(allocator, metadata));
         }
         if (stream_options.session_id) |session_id| {
-            if (stream_options.cache_retention != .none) {
+            if (cache_retention != .none) {
                 try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), .{ .string = try allocator.dupe(u8, session_id) });
             }
-            if (stream_options.cache_retention == .long and compat.supports_long_cache_retention) {
+            if (cache_retention == .long and compat.supports_long_cache_retention) {
                 try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), .{ .string = try allocator.dupe(u8, "24h") });
             }
         }
+        if (stream_options.responses_service_tier) |service_tier| {
+            try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
+        }
         if (model.reasoning) {
-            if (stream_options.responses_reasoning_effort) |reasoning_effort| {
+            if (stream_options.responses_reasoning_effort != null or stream_options.responses_reasoning_summary != null) {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, thinkingLevelString(reasoning_effort)) });
-                try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, "auto") });
+                const effort = if (stream_options.responses_reasoning_effort) |reasoning_effort| thinkingLevelString(reasoning_effort) else "medium";
+                const summary = stream_options.responses_reasoning_summary orelse "auto";
+                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, effort) });
+                try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, summary) });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
 
                 var include = std.json.Array.init(allocator);
                 errdefer include.deinit();
                 try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
                 try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
+            } else if (!std.mem.eql(u8, model.provider, "github-copilot")) {
+                var reasoning = try initObject(allocator);
+                errdefer reasoning.deinit(allocator);
+                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, "none") });
+                try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
             }
         }
+    }
+    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot")) {
+        var reasoning = try initObject(allocator);
+        errdefer reasoning.deinit(allocator);
+        try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, "none") });
+        try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
     }
 
     if (context.tools) |tools| {
@@ -267,26 +275,27 @@ fn buildRequestHeaders(
 ) !std.StringHashMap([]const u8) {
     const api_key = options.api_key orelse return error.MissingApiKey;
     const compat = getCompat(model);
+    const cache_retention = resolveCacheRetention(options.cache_retention, processCacheRetentionEnv());
 
     var headers = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitOwnedHeaders(allocator, &headers);
 
     try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-    try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+    try putOwnedHeader(allocator, &headers, "Accept", "application/json");
     const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(authorization);
     try putOwnedHeader(allocator, &headers, "Authorization", authorization);
     try mergeHeaders(allocator, &headers, model.headers);
-    try mergeHeaders(allocator, &headers, options.headers);
 
     if (options.session_id) |session_id| {
-        if (options.cache_retention != .none) {
+        if (cache_retention != .none) {
             try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
             if (compat.send_session_id_header) {
                 try putOwnedHeader(allocator, &headers, "session_id", session_id);
             }
         }
     }
+    try mergeHeaders(allocator, &headers, options.headers);
 
     return headers;
 }
@@ -1488,6 +1497,25 @@ fn getCompat(model: types.Model) ResponsesCompat {
     };
 }
 
+fn processCacheRetentionEnv() ?[]const u8 {
+    const value = std.c.getenv("PI_CACHE_RETENTION") orelse return null;
+    return std.mem.span(value);
+}
+
+fn resolveCacheRetention(cache_retention: types.CacheRetention, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return switch (cache_retention) {
+        .unset => if (pi_cache_retention_env) |value|
+            if (std.mem.eql(u8, value, "long")) .long else .short
+        else
+            .short,
+        else => cache_retention,
+    };
+}
+
+fn resolveOptionsCacheRetention(options: ?types.StreamOptions, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return resolveCacheRetention(if (options) |stream_options| stream_options.cache_retention else .unset, pi_cache_retention_env);
+}
+
 fn compatBoolField(compat: ?std.json.Value, key: []const u8) ?bool {
     const value = compat orelse return null;
     if (value != .object) return null;
@@ -1932,7 +1960,7 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings("openai-responses", result.api);
 }
 
-test "VAL-MSG-010 OpenAI Responses skips failed assistants and anchors on valid responses" {
+test "VAL-MSG-010 OpenAI Responses skips failed assistants and replays valid responses" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "gpt-5-mini",
@@ -1954,7 +1982,7 @@ test "VAL-MSG-010 OpenAI Responses skips failed assistants and anchors on valid 
     const user_after_anchor = [_]types.ContentBlock{.{ .text = .{ .text = "After anchor" } }};
     const final_user = [_]types.ContentBlock{.{ .text = .{ .text = "Continue" } }};
     const context = types.Context{
-        .system_prompt = "System prompt should be omitted when previous_response_id is used.",
+        .system_prompt = "System prompt should be replayed with Responses input history.",
         .messages = &[_]types.Message{
             .{ .assistant = .{
                 .content = &ok_content,
@@ -1996,14 +2024,16 @@ test "VAL-MSG-010 OpenAI Responses skips failed assistants and anchors on valid 
     const payload = try buildRequestPayload(allocator, model, context, null);
     defer freeJsonValue(allocator, payload);
 
-    try std.testing.expectEqualStrings("resp_ok", payload.object.get("previous_response_id").?.string);
+    try std.testing.expect(payload.object.get("previous_response_id") == null);
     const input = payload.object.get("input").?.array;
-    try std.testing.expectEqual(@as(usize, 2), input.items.len);
-    try std.testing.expectEqualStrings("user", input.items[0].object.get("role").?.string);
-    try std.testing.expectEqualStrings("user", input.items[1].object.get("role").?.string);
+    try std.testing.expectEqual(@as(usize, 4), input.items.len);
+    try std.testing.expectEqualStrings("developer", input.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("message", input.items[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("user", input.items[2].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", input.items[3].object.get("role").?.string);
 }
 
-test "buildRequestPayload uses previous_response_id for continuation" {
+test "buildRequestPayload replays assistant history without previous_response_id" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "gpt-5-mini",
@@ -2043,14 +2073,22 @@ test "buildRequestPayload uses previous_response_id for continuation" {
     defer freeJsonValue(allocator, payload);
 
     try std.testing.expect(payload == .object);
-    try std.testing.expectEqualStrings("resp_prev", payload.object.get("previous_response_id").?.string);
+    try std.testing.expect(payload.object.get("previous_response_id") == null);
     try std.testing.expectEqualStrings("sess-1", payload.object.get("prompt_cache_key").?.string);
 
     const input = payload.object.get("input").?;
     try std.testing.expect(input == .array);
-    try std.testing.expectEqual(@as(usize, 1), input.array.items.len);
+    try std.testing.expectEqual(@as(usize, 3), input.array.items.len);
 
-    const user_item = input.array.items[0];
+    const system_item = input.array.items[0];
+    try std.testing.expect(system_item == .object);
+    try std.testing.expectEqualStrings("developer", system_item.object.get("role").?.string);
+
+    const assistant_item = input.array.items[1];
+    try std.testing.expect(assistant_item == .object);
+    try std.testing.expectEqualStrings("message", assistant_item.object.get("type").?.string);
+
+    const user_item = input.array.items[2];
     try std.testing.expect(user_item == .object);
     try std.testing.expectEqualStrings("user", user_item.object.get("role").?.string);
     try std.testing.expect(user_item.object.get("content").? == .array);

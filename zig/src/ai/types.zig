@@ -398,6 +398,10 @@ pub const StreamOptions = struct {
     anthropic_tool_choice: ?AnthropicToolChoice = null,
     /// Responses API reasoning effort level.
     responses_reasoning_effort: ?ThinkingLevel = null,
+    /// Responses API reasoning summary level. OpenAI Responses currently accepts values such as "auto", "concise", and "detailed".
+    responses_reasoning_summary: ?[]const u8 = null,
+    /// Responses API service tier forwarded as service_tier.
+    responses_service_tier: ?[]const u8 = null,
     /// Mistral prompt mode, e.g. "reasoning".
     mistral_prompt_mode: ?[]const u8 = null,
     /// Mistral reasoning effort, e.g. "high".

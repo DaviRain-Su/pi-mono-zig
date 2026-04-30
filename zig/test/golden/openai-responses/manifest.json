@@ -1,7 +1,7 @@
 {
   "captureBoundary": "TypeScript Responses-family request after final payload/header/options resolution and before live transport",
   "diffOutputBoundBytes": 12000,
-  "fixtureCount": 5,
+  "fixtureCount": 21,
   "generatedBy": "zig/test/generate-openai-responses-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "providerFamilies": [
@@ -15,7 +15,23 @@
     "copilot-responses-dynamic-headers",
     "azure-responses-basic-override-request",
     "codex-responses-sse-basic-request",
-    "openai-responses-on-payload-replacement"
+    "openai-responses-on-payload-replacement",
+    "openai-responses-cache-long-retention",
+    "openai-responses-cache-none-omits-session",
+    "openai-responses-cache-env-long-unsupported",
+    "openai-responses-session-header-option-override",
+    "openai-responses-reasoning-default-none",
+    "openai-responses-reasoning-effort-only",
+    "openai-responses-reasoning-summary-only",
+    "openai-responses-reasoning-summary-null",
+    "openai-responses-simple-reasoning-xhigh-clamped",
+    "openai-responses-simple-reasoning-xhigh-supported",
+    "openai-responses-service-tier-priority",
+    "openai-responses-empty-tools-omitted",
+    "openai-responses-proxy-url-trailing-slash",
+    "openai-responses-user-image-and-empty-content",
+    "openai-responses-assistant-tool-result-replay",
+    "openai-responses-tool-call-id-normalization"
   ],
   "schemaVersion": 1,
   "sourceCitations": [
