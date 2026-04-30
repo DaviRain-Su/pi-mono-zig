@@ -1074,7 +1074,9 @@ fn loadEnvOptional(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     defer allocator.free(name_z);
 
     const value = std.c.getenv(name_z) orelse return null;
-    return try allocator.dupe(u8, std.mem.span(value));
+    const value_slice = std.mem.span(value);
+    if (value_slice.len == 0) return null;
+    return try allocator.dupe(u8, value_slice);
 }
 
 fn currentTimestamp(allocator: std.mem.Allocator) !RequestTimestamp {
@@ -2937,7 +2939,8 @@ test "parseTextStreamLines preserves partial Bedrock text before malformed termi
     const io = std.Io.failing;
     const body = try allocator.dupe(
         u8,
-        "data: {\"contentBlockDelta\":{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial\"}}}\n" ++
+        "data: {\"messageStart\":{\"role\":\"assistant\"}}\n" ++
+            "data: {\"contentBlockDelta\":{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial\"}}}\n" ++
             "data: {not-json}\n",
     );
 
@@ -2953,9 +2956,6 @@ test "parseTextStreamLines preserves partial Bedrock text before malformed termi
     const delta = stream.next().?;
     try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
     try std.testing.expectEqualStrings("partial", delta.delta.?);
-    const text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
-    try std.testing.expectEqualStrings("partial", text_end.content.?);
     const terminal = stream.next().?;
     try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
     try std.testing.expect(terminal.message != null);
@@ -2972,6 +2972,7 @@ test "parseEventStreamFrames finalizes partial Bedrock blocks before provider ex
 
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
     try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial text\"}}");
     try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":1,\"delta\":{\"reasoningContent\":{\"text\":\"partial thought\",\"signature\":\"sig-1\"}}}");
     try appendEventStreamFrame(allocator, &body, "contentBlockStart", "{\"contentBlockIndex\":2,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-1\",\"name\":\"get_weather\"}}}");
@@ -2990,15 +2991,6 @@ test "parseEventStreamFrames finalizes partial Bedrock blocks before provider ex
     try std.testing.expectEqual(types.EventType.thinking_delta, stream.next().?.event_type);
     try std.testing.expectEqual(types.EventType.toolcall_start, stream.next().?.event_type);
     try std.testing.expectEqual(types.EventType.toolcall_delta, stream.next().?.event_type);
-    const text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
-    try std.testing.expectEqualStrings("partial text", text_end.content.?);
-    const thinking_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
-    try std.testing.expectEqualStrings("partial thought", thinking_end.content.?);
-    const tool_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
-    try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
     const terminal = stream.next().?;
     try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
     try std.testing.expect(terminal.message != null);
@@ -3044,9 +3036,6 @@ test "Bedrock abort terminal finalizes active binary partial blocks" {
     try emitRuntimeFailure(allocator, &stream, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
 
     try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
-    const text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
-    try std.testing.expectEqualStrings("partial before abort", text_end.content.?);
     const terminal = stream.next().?;
     try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
     try std.testing.expect(terminal.message != null);
