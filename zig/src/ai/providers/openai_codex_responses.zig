@@ -1690,6 +1690,7 @@ test "stream onPayload failure is terminal error event" {
     defer stream.deinit();
 
     const event = stream.next().?;
+    defer allocator.free(event.error_message.?);
     try std.testing.expectEqual(types.EventType.error_event, event.event_type);
     try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "PayloadCallbackFailed") != null);
     try std.testing.expect(event.message != null);
@@ -1750,6 +1751,7 @@ test "stream onResponse failure is terminal error event" {
     defer stream.deinit();
 
     const event = stream.next().?;
+    defer allocator.free(event.error_message.?);
     try std.testing.expectEqual(types.EventType.error_event, event.event_type);
     try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "ResponseCallbackFailed") != null);
     try std.testing.expect(event.message != null);
@@ -1806,7 +1808,7 @@ test "buildRequestPayload preserves xhigh reasoning for GPT-5.5" {
 test "buildRequestPayload applies Codex request option parity fields" {
     const allocator = std.testing.allocator;
     var metadata = try initObject(allocator);
-    defer metadata.deinit(allocator);
+    defer freeJsonValue(allocator, .{ .object = metadata });
     try metadata.put(allocator, try allocator.dupe(u8, "fixture"), .{ .string = try allocator.dupe(u8, "codex-metadata-is-not-emitted") });
 
     const model = types.Model{
