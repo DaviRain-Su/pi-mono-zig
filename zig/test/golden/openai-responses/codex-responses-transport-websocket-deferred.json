@@ -1,0 +1,100 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "wss://chatgpt.com/backend-api",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "chatgpt-account-id": "fixture-account",
+        "openai-beta": "responses_websockets=2026-02-06",
+        "originator": "pi",
+        "session_id": "fixture-codex-websocket-session",
+        "x-client-request-id": "fixture-codex-websocket-session"
+      },
+      "jsonPayload": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "Use websocket transport without live sockets.",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-5.1-codex-websocket-transport",
+        "parallel_tool_calls": true,
+        "prompt_cache_key": "fixture-codex-websocket-session",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        },
+        "tool_choice": "auto",
+        "type": "response.create"
+      },
+      "method": "WEBSOCKET",
+      "path": "/backend-api/codex/responses",
+      "query": {},
+      "requestOptions": {
+        "signal": "not-provided"
+      },
+      "transportMetadata": {
+        "mockedResponseHeaders": {
+          "x-fixture-response": "codex-responses-transport-websocket-deferred"
+        },
+        "mockedStatus": 101,
+        "mode": "deferred-websocket",
+        "providerFamily": "openai-codex",
+        "requestBoundary": "before local mocked WebSocket message stream is consumed; no live socket opened"
+      },
+      "url": "wss://chatgpt.com/backend-api/codex/responses"
+    }
+  },
+  "id": "codex-responses-transport-websocket-deferred",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Use websocket transport without live sockets.",
+          "role": "user"
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-codex-responses",
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "id": "gpt-5.1-codex-websocket-transport",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 5.1 Codex Fixture",
+      "provider": "openai-codex",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-codex-jwt",
+      "sessionId": "fixture-codex-websocket-session",
+      "transport": "websocket"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "Responses-family request after model/options resolution, payload conversion, header merge, callbacks, and before live HTTP/WebSocket transport",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records final request semantics and rejects unhandled hosts",
+    "diffOutputBoundBytes": 12000,
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-responses.ts",
+      "packages/ai/src/providers/openai-responses-shared.ts",
+      "packages/ai/src/providers/github-copilot-headers.ts",
+      "packages/ai/src/providers/azure-openai-responses.ts",
+      "packages/ai/src/providers/openai-codex-responses.ts"
+    ]
+  },
+  "providerFamily": "openai-codex",
+  "schemaVersion": 1,
+  "title": "OpenAI Codex Responses websocket transport records unsupported deferred metadata without opening a live socket"
+}

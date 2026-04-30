@@ -1,0 +1,101 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "headers": {
+        "accept": "text/event-stream",
+        "authorization": "<redacted-present>",
+        "chatgpt-account-id": "fixture-account",
+        "content-type": "application/json",
+        "openai-beta": "responses=experimental",
+        "originator": "pi",
+        "session_id": "fixture-codex-auto-session",
+        "x-client-request-id": "fixture-codex-auto-session"
+      },
+      "jsonPayload": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "input": [
+          {
+            "content": [
+              {
+                "text": "Use auto transport without live sockets.",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-5.1-codex-auto-transport",
+        "parallel_tool_calls": true,
+        "prompt_cache_key": "fixture-codex-auto-session",
+        "store": false,
+        "stream": true,
+        "text": {
+          "verbosity": "low"
+        },
+        "tool_choice": "auto"
+      },
+      "method": "POST",
+      "path": "/backend-api/codex/responses",
+      "query": {},
+      "requestOptions": {
+        "signal": "not-provided"
+      },
+      "transportMetadata": {
+        "mockedResponseHeaders": {
+          "x-fixture-response": "codex-responses-transport-auto-deferred-fallback"
+        },
+        "mockedStatus": 200,
+        "mode": "deferred-websocket",
+        "providerFamily": "openai-codex",
+        "requestBoundary": "before local mocked WebSocket message stream is consumed; no live socket opened"
+      },
+      "url": "https://chatgpt.com/backend-api/codex/responses"
+    }
+  },
+  "id": "codex-responses-transport-auto-deferred-fallback",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Use auto transport without live sockets.",
+          "role": "user"
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-codex-responses",
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "id": "gpt-5.1-codex-auto-transport",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 5.1 Codex Fixture",
+      "provider": "openai-codex",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-codex-jwt",
+      "sessionId": "fixture-codex-auto-session",
+      "transport": "auto"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "Responses-family request after model/options resolution, payload conversion, header merge, callbacks, and before live HTTP/WebSocket transport",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records final request semantics and rejects unhandled hosts",
+    "diffOutputBoundBytes": 12000,
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-responses.ts",
+      "packages/ai/src/providers/openai-responses-shared.ts",
+      "packages/ai/src/providers/github-copilot-headers.ts",
+      "packages/ai/src/providers/azure-openai-responses.ts",
+      "packages/ai/src/providers/openai-codex-responses.ts"
+    ]
+  },
+  "providerFamily": "openai-codex",
+  "schemaVersion": 1,
+  "title": "OpenAI Codex Responses auto transport records deterministic websocket deferral metadata and falls back to SSE"
+}

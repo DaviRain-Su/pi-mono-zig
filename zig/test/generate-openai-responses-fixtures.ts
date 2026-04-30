@@ -554,6 +554,221 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "codex-responses-default-url-no-session",
+		title: "OpenAI Codex Responses defaults blank base URL, omits optional fields, and omits instructions without a system prompt",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-default-url", baseUrl: "" }),
+			context: { messages: [{ role: "user", content: "Use the default Codex URL." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-text-verbosity-high-temperature",
+		title: "OpenAI Codex Responses forwards explicit high text verbosity and zero temperature",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-verbosity-high" }),
+			context: { messages: [{ role: "user", content: "Use high verbosity." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				temperature: 0,
+				textVerbosity: "high",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-text-verbosity-medium-service-auto",
+		title: "OpenAI Codex Responses forwards medium text verbosity and auto service tier",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-verbosity-medium" }),
+			context: { messages: [{ role: "user", content: "Use medium verbosity and auto tier." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				serviceTier: "auto",
+				textVerbosity: "medium",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-service-tier-flex",
+		title: "OpenAI Codex Responses forwards flex service tier",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-tier-flex" }),
+			context: { messages: [{ role: "user", content: "Use flex tier." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				serviceTier: "flex",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-service-tier-priority-cache-none",
+		title: "OpenAI Codex Responses forwards priority service tier and keeps prompt cache key when cache retention is none",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-tier-priority" }),
+			context: { messages: [{ role: "user", content: "Use priority tier and cache-none session." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				cacheRetention: "none",
+				serviceTier: "priority",
+				sessionId: "fixture-codex-cache-none-session",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-reasoning-summary-null-tools",
+		title: "OpenAI Codex Responses clamps minimal reasoning, defaults null summary to auto, and emits tools with strict null",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.3-codex", input: ["text", "image"] }),
+			context: {
+				messages: [{ role: "user", content: "Use tools and minimal reasoning." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				reasoningEffort: "minimal",
+				reasoningSummary: null,
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-reasoning-summary-only-omitted",
+		title: "OpenAI Codex Responses omits reasoning when only reasoning summary is provided without effort",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-summary-only" }),
+			context: { messages: [{ role: "user", content: "Summary alone should not emit reasoning." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				reasoningSummary: "concise",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-reasoning-summary-on-mini-clamp",
+		title: "OpenAI Codex Responses preserves on summary and applies gpt-5.1-codex-mini effort clamp",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-mini" }),
+			context: { messages: [{ role: "user", content: "Use mini clamp with on summary." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				reasoningEffort: "low",
+				reasoningSummary: "on",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-reasoning-summary-off-xhigh-clamp",
+		title: "OpenAI Codex Responses preserves off summary and clamps gpt-5.1 xhigh to high",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1" }),
+			context: { messages: [{ role: "user", content: "Use xhigh clamp with off summary." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				reasoningEffort: "xhigh",
+				reasoningSummary: "off",
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-url-trailing-codex",
+		title: "OpenAI Codex Responses appends responses to a trailing /codex base URL exactly once",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-url-codex", baseUrl: "https://proxy.example.test/custom/codex/" }),
+			context: { messages: [{ role: "user", content: "Use codex path URL." }] },
+			options: { apiKeyMode: "fixture-codex-jwt", transport: "sse" },
+		},
+	},
+	{
+		id: "codex-responses-url-already-complete",
+		title: "OpenAI Codex Responses preserves a base URL already ending in /codex/responses",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-url-complete", baseUrl: "https://proxy.example.test/custom/codex/responses/" }),
+			context: { messages: [{ role: "user", content: "Use complete codex responses URL." }] },
+			options: { apiKeyMode: "fixture-codex-jwt", transport: "sse" },
+		},
+	},
+	{
+		id: "codex-responses-url-proxy-base",
+		title: "OpenAI Codex Responses appends /codex/responses to custom proxy base URLs",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-url-proxy", baseUrl: "https://proxy.example.test/custom/v1" }),
+			context: { messages: [{ role: "user", content: "Use proxy base URL." }] },
+			options: { apiKeyMode: "fixture-codex-jwt", transport: "sse" },
+		},
+	},
+	{
+		id: "codex-responses-on-payload-replacement-and-request-options",
+		title: "OpenAI Codex Responses onPayload observes the final SSE payload and replacement preserves request options",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-payload-replacement" }),
+			context: { messages: [{ role: "user", content: "This Codex payload will be replaced." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				maxRetries: 2,
+				onPayload: "replace-with-fixture-payload",
+				payloadReplacement: {
+					model: "gpt-5.1-codex-payload-replacement",
+					input: [{ role: "user", content: [{ type: "input_text", text: "codex payload replaced" }] }],
+					stream: true,
+					fixture_marker: "codex-on-payload-replacement",
+				},
+				timeoutMs: 2468,
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-transport-auto-deferred-fallback",
+		title: "OpenAI Codex Responses auto transport records deterministic websocket deferral metadata and falls back to SSE",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-auto-transport" }),
+			context: { messages: [{ role: "user", content: "Use auto transport without live sockets." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				sessionId: "fixture-codex-auto-session",
+				transport: "auto",
+			},
+		},
+	},
+	{
+		id: "codex-responses-transport-websocket-deferred",
+		title: "OpenAI Codex Responses websocket transport records unsupported deferred metadata without opening a live socket",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-websocket-transport" }),
+			context: { messages: [{ role: "user", content: "Use websocket transport without live sockets." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				sessionId: "fixture-codex-websocket-session",
+				transport: "websocket",
+			},
+		},
+	},
+	{
 		id: "openai-responses-on-payload-replacement",
 		title: "OpenAI Responses onPayload replacement is captured at the final request boundary",
 		providerFamily: "openai",
@@ -1000,16 +1215,132 @@ function buildMockStream(providerFamily: ProviderFamily): ReadableStream<Uint8Ar
 	});
 }
 
+function buildTransportMetadata(
+	scenario: Scenario,
+	mode: "sse" | "deferred-websocket",
+	status = 200,
+): CapturedRequest["transportMetadata"] {
+	return {
+		mode,
+		mockedStatus: status,
+		mockedResponseHeaders: {
+			...(mode === "sse" ? { "content-type": "text/event-stream" } : {}),
+			"x-fixture-response": scenario.id,
+		},
+		providerFamily: scenario.providerFamily,
+		requestBoundary:
+			mode === "sse"
+				? "before local mocked SSE response body is consumed"
+				: "before local mocked WebSocket message stream is consumed; no live socket opened",
+	};
+}
+
+function installThrowingWebSocket(): () => void {
+	const holder = globalThis as { WebSocket?: unknown };
+	const original = holder.WebSocket;
+	holder.WebSocket = class {
+		constructor() {
+			throw new Error("Fixture WebSocket disabled; falling back without a live socket");
+		}
+	};
+	return () => {
+		holder.WebSocket = original;
+	};
+}
+
+function installMockWebSocket(capture: (url: string, headers: Record<string, string>, body: unknown) => void): () => void {
+	const holder = globalThis as { WebSocket?: unknown };
+	const original = holder.WebSocket;
+	holder.WebSocket = class {
+		readyState = 0;
+		#listeners = new Map<string, Set<(event: unknown) => void>>();
+		#url: string;
+		#headers: Record<string, string>;
+
+		constructor(url: string, protocols?: string | string[] | { headers?: Record<string, string> }) {
+			this.#url = url;
+			this.#headers =
+				protocols && typeof protocols === "object" && !Array.isArray(protocols) && "headers" in protocols
+					? protocols.headers || {}
+					: {};
+			queueMicrotask(() => this.#emit("open", {}));
+		}
+
+		close(): void {
+			this.readyState = 3;
+			this.#emit("close", { code: 1000, reason: "fixture" });
+		}
+
+		send(data: string): void {
+			const body = JSON.parse(data) as unknown;
+			capture(this.#url, this.#headers, body);
+			const terminal = {
+				type: "response.completed",
+				response: {
+					id: "resp_openai_codex_websocket",
+					status: "completed",
+					usage: { input_tokens: 7, output_tokens: 5, total_tokens: 12, input_tokens_details: { cached_tokens: 0 } },
+				},
+			};
+			queueMicrotask(() => this.#emit("message", { data: JSON.stringify(terminal) }));
+		}
+
+		addEventListener(type: string, listener: (event: unknown) => void): void {
+			const listeners = this.#listeners.get(type) || new Set<(event: unknown) => void>();
+			listeners.add(listener);
+			this.#listeners.set(type, listeners);
+		}
+
+		removeEventListener(type: string, listener: (event: unknown) => void): void {
+			this.#listeners.get(type)?.delete(listener);
+		}
+
+		#emit(type: string, event: unknown): void {
+			for (const listener of this.#listeners.get(type) || []) listener(event);
+		}
+	};
+	return () => {
+		holder.WebSocket = original;
+	};
+}
+
 async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	const originalFetch = globalThis.fetch;
 	const originalEnv = saveCredentialEnv();
 	const allowedHosts = collectAllowedHosts(scenario);
 	let capturedFetch: CapturedFetch | undefined;
+	let restoreWebSocket: (() => void) | undefined;
 	let observedPayload: unknown;
 
 	applySentinelCredentialEnv();
 	applyScenarioEnv(scenario.input.env);
 	if (scenario.input.options.cacheRetention === "env-long") process.env.PI_CACHE_RETENTION = "long";
+
+	if (scenario.providerFamily === "openai-codex" && scenario.input.options.transport === "auto") {
+		restoreWebSocket = installThrowingWebSocket();
+	}
+	if (scenario.providerFamily === "openai-codex" && scenario.input.options.transport === "websocket") {
+		restoreWebSocket = installMockWebSocket((url, headers, body) => {
+			const requestUrl = new URL(url);
+			capturedFetch = {
+				request: {
+					method: "WEBSOCKET",
+					url: `${requestUrl.origin}${requestUrl.pathname}${requestUrl.search}`,
+					baseUrl: inferBaseUrl(requestUrl, scenario.providerFamily),
+					path: requestUrl.pathname,
+					query: queryRecord(requestUrl),
+					headers: normalizeHeaders(new Headers(headers)),
+					jsonPayload: body,
+					requestOptions: {
+						...(scenario.input.options.timeoutMs !== undefined ? { timeoutMs: scenario.input.options.timeoutMs } : {}),
+						...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
+						signal: "not-provided",
+					},
+					transportMetadata: buildTransportMetadata(scenario, "deferred-websocket", 101),
+				},
+			};
+		});
+	}
 
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const request = input instanceof Request ? input : new Request(input, init);
@@ -1031,13 +1362,12 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 					...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
 					signal: "not-provided",
 				},
-				transportMetadata: {
-					mode: "sse",
-					mockedStatus: 200,
-					mockedResponseHeaders: { "content-type": "text/event-stream", "x-fixture-response": scenario.id },
-					providerFamily: scenario.providerFamily,
-					requestBoundary: "before local mocked SSE response body is consumed",
-				},
+				transportMetadata: buildTransportMetadata(
+					scenario,
+					scenario.providerFamily === "openai-codex" && scenario.input.options.transport === "auto"
+						? "deferred-websocket"
+						: "sse",
+				),
 			},
 		};
 		return new Response(buildMockStream(scenario.providerFamily), {
@@ -1089,6 +1419,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 		};
 	} finally {
 		globalThis.fetch = originalFetch;
+		restoreWebSocket?.();
 		restoreCredentialEnv(originalEnv);
 	}
 }
@@ -1206,7 +1537,12 @@ function validateFixture(record: FixtureRecord): void {
 	if (!requiredCategories.includes(record.providerFamily)) throw new Error(`Fixture ${record.id} has unsupported providerFamily`);
 	if (!record.id || !/^[a-z0-9][a-z0-9-]*$/.test(record.id)) throw new Error(`Fixture ${record.id} must have a stable kebab-case id`);
 	const request = record.expected.typeScriptRequest;
-	if (request.method !== "POST") throw new Error(`Fixture ${record.id} must capture POST method`);
+	if (
+		(request.transportMetadata.mode === "sse" && request.method !== "POST") ||
+		(request.transportMetadata.mode === "deferred-websocket" && request.method !== "POST" && request.method !== "WEBSOCKET")
+	) {
+		throw new Error(`Fixture ${record.id} must capture POST or WEBSOCKET method for deferred transport`);
+	}
 	if (!request.url || !request.path || !request.baseUrl) throw new Error(`Fixture ${record.id} must capture URL/baseUrl/path`);
 	if (!request.headers || !request.jsonPayload || !request.requestOptions || !request.transportMetadata) {
 		throw new Error(`Fixture ${record.id} must capture headers, JSON payload, request options, and transport metadata`);
