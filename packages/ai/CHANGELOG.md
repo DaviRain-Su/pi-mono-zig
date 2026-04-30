@@ -2,18 +2,32 @@
 
 ## [Unreleased]
 
+## [0.71.0] - 2026-04-30
+
+### Breaking Changes
+
+- Removed built-in Google Gemini CLI and Google Antigravity support, including provider registration, model metadata, OAuth, and package exports. Existing callers must switch to another supported provider.
+
 ### Added
 
-- Added `AssistantMessage.responseModel` on the openai-completions path: surfaces the concrete `chunk.model` when it differs from the requested id (e.g. OpenRouter `auto` -> `anthropic/...`).
+- Added Cloudflare AI Gateway as a built-in provider with OpenAI, Anthropic, and Workers AI gateway routing plus `CLOUDFLARE_API_KEY`/`CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_GATEWAY_ID` authentication ([#3856](https://github.com/badlogic/pi-mono/pull/3856) by [@mchenco](https://github.com/mchenco)).
+- Added Moonshot AI as a built-in OpenAI-compatible provider with model catalog generation and `MOONSHOT_API_KEY` authentication.
+- Added Mistral Medium 3.5 model metadata and reasoning-mode handling ([#4009](https://github.com/badlogic/pi-mono/pull/4009) by [@technocidal](https://github.com/technocidal)).
+- Added `AssistantMessage.responseModel` on the openai-completions path: surfaces the concrete `chunk.model` when it differs from the requested id (e.g. OpenRouter `auto` -> `anthropic/...`) ([#3968](https://github.com/badlogic/pi-mono/pull/3968) by [@purrgrammer](https://github.com/purrgrammer)).
 
 ### Fixed
 
+- Fixed Google Vertex Gemini 3 tool call replay by no longer sending the non-Vertex `skip_thought_signature_validator` sentinel for unsigned tool calls ([#4032](https://github.com/badlogic/pi-mono/issues/4032)).
 - Updated `@anthropic-ai/sdk` to `^0.91.1` to clear GHSA-p7fg-763f-g4gf audit findings ([#3992](https://github.com/badlogic/pi-mono/issues/3992)).
 - Fixed DeepSeek V4 Flash `xhigh` thinking support so requests preserve `xhigh` and map it to DeepSeek's `max` reasoning effort ([#3944](https://github.com/badlogic/pi-mono/issues/3944)).
 - Fixed Anthropic streams that end before `message_stop` to be treated as errors instead of successful partial responses ([#3936](https://github.com/badlogic/pi-mono/issues/3936)).
 - Fixed generated OpenAI-compatible DeepSeek V4 models to carry the provider-specific reasoning effort mapping outside the direct DeepSeek provider ([#3940](https://github.com/badlogic/pi-mono/issues/3940)).
 - Fixed DeepSeek V4 Flash and V4 Pro pricing metadata to match current official rates ([#3910](https://github.com/badlogic/pi-mono/issues/3910)).
 - Fixed DeepSeek prompt cache hits to be tracked from `prompt_cache_hit_tokens` in OpenAI-compatible usage responses ([#3880](https://github.com/badlogic/pi-mono/issues/3880)).
+
+### Removed
+
+- Removed built-in Google Gemini CLI and Google Antigravity provider, model, OAuth, and export support.
 
 ## [0.70.6] - 2026-04-28
 

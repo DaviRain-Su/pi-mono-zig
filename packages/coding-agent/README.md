@@ -104,8 +104,6 @@ For each built-in provider, pi maintains a list of tool-capable models, updated 
 - Anthropic Claude Pro/Max
 - OpenAI ChatGPT Plus/Pro (Codex)
 - GitHub Copilot
-- Google Gemini CLI
-- Google Antigravity
 
 **API keys:**
 - Anthropic
@@ -118,6 +116,7 @@ For each built-in provider, pi maintains a list of tool-capable models, updated 
 - Mistral
 - Groq
 - Cerebras
+- Cloudflare AI Gateway
 - Cloudflare Workers AI
 - xAI
 - OpenRouter
@@ -621,6 +620,7 @@ pi --thinking high "Solve this complex problem"
 | Variable | Description |
 |----------|-------------|
 | `PI_CODING_AGENT_DIR` | Override config directory (default: `~/.pi/agent`) |
+| `PI_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
 | `PI_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
 | `PI_OFFLINE` | Disable startup network operations, including update checks, package update checks, and install/update telemetry |
 | `PI_SKIP_VERSION_CHECK` | Skip the Pi version update check at startup. This prevents the `pi.dev` latest-version request |
@@ -643,5 +643,5 @@ MIT
 ## See Also
 
 - [@mariozechner/pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai): Core LLM toolkit
-- [@mariozechner/pi-agent](https://www.npmjs.com/package/@mariozechner/pi-agent): Agent framework
+- [@mariozechner/pi-agent-core](https://www.npmjs.com/package/@mariozechner/pi-agent-core): Agent framework
 - [@mariozechner/pi-tui](https://www.npmjs.com/package/@mariozechner/pi-tui): Terminal UI components
