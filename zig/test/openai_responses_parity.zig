@@ -798,17 +798,24 @@ fn parseTextSignature(allocator: std.mem.Allocator, signature: ?[]const u8, msg_
             if (parsed.value.object.get("v")) |version| {
                 if (version == .integer and version.integer == 1) {
                     if (optionalString(parsed.value, "id")) |id| {
+                        const normalized_id = try normalizeMessageIdFromSignature(allocator, id);
                         const phase = optionalString(parsed.value, "phase");
                         if (phase != null and (std.mem.eql(u8, phase.?, "commentary") or std.mem.eql(u8, phase.?, "final_answer"))) {
-                            return .{ .id = try allocator.dupe(u8, id), .phase = try allocator.dupe(u8, phase.?) };
+                            return .{ .id = normalized_id, .phase = try allocator.dupe(u8, phase.?) };
                         }
-                        return .{ .id = try allocator.dupe(u8, id), .phase = null };
+                        return .{ .id = normalized_id, .phase = null };
                     }
                 }
             }
         }
     }
-    return .{ .id = try allocator.dupe(u8, value), .phase = null };
+    return .{ .id = try normalizeMessageIdFromSignature(allocator, value), .phase = null };
+}
+
+fn normalizeMessageIdFromSignature(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
+    if (id.len <= 64) return try allocator.dupe(u8, id);
+    const hash = try shortHash(allocator, id);
+    return try std.fmt.allocPrint(allocator, "msg_{s}", .{hash});
 }
 
 fn buildToolResultInputItem(
@@ -1517,6 +1524,30 @@ fn runProductionRequestBuilderProofSelfTest(allocator: std.mem.Allocator) !void 
         "{\"id\":\"gpt-5-mini-proof\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":true,\"input\":[\"text\"]}",
         "{\"systemPrompt\":\"Proof prompt.\",\"messages\":[{\"role\":\"user\",\"content\":\"Proof user.\"}],\"tools\":[{\"name\":\"lookup_fixture\",\"description\":\"Lookup.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}}]}",
         "{\"apiKeyMode\":\"fixture-placeholder\",\"cacheRetention\":\"long\",\"sessionId\":\"proof-session\",\"reasoningEffort\":\"high\",\"reasoningSummary\":\"concise\",\"maxTokens\":64,\"temperature\":0}",
+    );
+    try runProductionPayloadProofCase(
+        allocator,
+        "production-openai-responses-empty-user-proof",
+        "openai",
+        "{\"id\":\"gpt-4.1-responses-vision\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":false,\"input\":[\"text\",\"image\"]}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Look at this.\"},{\"type\":\"image\",\"data\":\"iVBORw0KGgo=\",\"mimeType\":\"image/png\"}]}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\"}",
+    );
+    try runProductionPayloadProofCase(
+        allocator,
+        "production-openai-responses-text-signature-proof",
+        "openai",
+        "{\"id\":\"gpt-5-mini-long-signature\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":true,\"input\":[\"text\"]}",
+        "{\"messages\":[{\"role\":\"assistant\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"model\":\"gpt-5-mini-long-signature\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"Signed assistant text with long id.\",\"textSignature\":\"{\\\"v\\\":1,\\\"id\\\":\\\"message-id-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"phase\\\":\\\"commentary\\\"}\"}]},{\"role\":\"user\",\"content\":\"Continue after long signed replay.\"}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\",\"reasoningEffort\":\"medium\"}",
+    );
+    try runProductionPayloadProofCase(
+        allocator,
+        "production-openai-responses-tool-id-proof",
+        "openai",
+        "{\"id\":\"gpt-5-mini-id-normalization\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":true,\"input\":[\"text\"]}",
+        "{\"messages\":[{\"role\":\"assistant\",\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-foreign-fixture\",\"stopReason\":\"toolUse\",\"content\":[{\"type\":\"toolCall\",\"id\":\"call:foreign/with spaces|foreign-item-id-with-symbols-and-a-very-very-very-long-suffix\",\"name\":\"lookup_fixture\",\"arguments\":{\"query\":\"foreign\"}}]},{\"role\":\"toolResult\",\"toolCallId\":\"call:foreign/with spaces|foreign-item-id-with-symbols-and-a-very-very-very-long-suffix\",\"toolName\":\"lookup_fixture\",\"content\":[{\"type\":\"text\",\"text\":\"Foreign result\"}],\"isError\":false},{\"role\":\"user\",\"content\":\"Use normalized tool history.\"}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\",\"reasoningEffort\":\"low\"}",
     );
     try runProductionPayloadProofCase(
         allocator,

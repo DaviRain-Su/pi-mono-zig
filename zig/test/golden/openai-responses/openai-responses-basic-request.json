@@ -57,7 +57,6 @@
       "path": "/v1/responses",
       "query": {},
       "requestOptions": {
-        "maxRetries": 0,
         "signal": "not-provided",
         "timeoutMs": 1234
       },
@@ -122,7 +121,6 @@
       "headers": {
         "x-fixture-option-header": "option-openai"
       },
-      "maxRetries": 0,
       "maxTokens": 64,
       "sessionId": "fixture-openai-session",
       "temperature": 0,

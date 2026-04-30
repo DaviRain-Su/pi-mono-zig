@@ -164,6 +164,7 @@ const baseContext = {
 	systemPrompt: "You are the deterministic Responses fixture assistant.",
 	messages: [{ role: "user", content: "Return a concise fixture response." }],
 } satisfies DeclarativeContext;
+const longTextSignatureId = `message-id-${"a".repeat(80)}`;
 
 function buildOpenAIModel(overrides: Partial<FixtureModelInput> = {}): FixtureModelInput {
 	return {
@@ -234,7 +235,6 @@ const scenarios: Scenario[] = [
 				apiKeyMode: "fixture-placeholder",
 				cacheRetention: "short",
 				headers: { "x-fixture-option-header": "option-openai" },
-				maxRetries: 0,
 				maxTokens: 64,
 				sessionId: "fixture-openai-session",
 				temperature: 0,
@@ -938,7 +938,7 @@ const scenarios: Scenario[] = [
 		input: {
 			model: buildOpenAIModel({ id: "gpt-4.1-responses-proxy", baseUrl: "https://proxy.example.test/custom/v1/" }),
 			context: { messages: [{ role: "user", content: "Proxy URL parity." }] },
-			options: { apiKeyMode: "fixture-placeholder", maxRetries: 2, timeoutMs: 4567 },
+			options: { apiKeyMode: "fixture-placeholder", timeoutMs: 4567 },
 		},
 	},
 	{
@@ -987,6 +987,35 @@ const scenarios: Scenario[] = [
 						isError: false,
 					},
 					{ role: "user", content: "Continue after replay." },
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "medium" },
+		},
+	},
+	{
+		id: "openai-responses-long-text-signature-replay",
+		title: "OpenAI Responses assistant replay hashes long textSignature ids and preserves valid phase",
+		providerFamily: "openai",
+		input: {
+			model: buildOpenAIModel({ id: "gpt-5-mini-long-signature", reasoning: true }),
+			context: {
+				messages: [
+					{
+						role: "assistant",
+						api: "openai-responses",
+						provider: "openai",
+						model: "gpt-5-mini-long-signature",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "stop",
+						content: [
+							{
+								type: "text",
+								text: "Signed assistant text with long id.",
+								textSignature: JSON.stringify({ v: 1, id: longTextSignatureId, phase: "commentary" }),
+							},
+						],
+					},
+					{ role: "user", content: "Continue after long signed replay." },
 				],
 			},
 			options: { apiKeyMode: "fixture-placeholder", reasoningEffort: "medium" },
