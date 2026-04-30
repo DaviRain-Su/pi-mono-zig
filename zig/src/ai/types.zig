@@ -402,6 +402,14 @@ pub const StreamOptions = struct {
     responses_reasoning_summary: ?[]const u8 = null,
     /// Responses API service tier forwarded as service_tier.
     responses_service_tier: ?[]const u8 = null,
+    /// Azure OpenAI Responses API version override forwarded as api-version.
+    azure_api_version: ?[]const u8 = null,
+    /// Azure OpenAI resource name override used to build the default Azure base URL.
+    azure_resource_name: ?[]const u8 = null,
+    /// Azure OpenAI base URL override.
+    azure_base_url: ?[]const u8 = null,
+    /// Azure OpenAI deployment name override used as the Responses model value.
+    azure_deployment_name: ?[]const u8 = null,
     /// Mistral prompt mode, e.g. "reasoning".
     mistral_prompt_mode: ?[]const u8 = null,
     /// Mistral reasoning effort, e.g. "high".
@@ -429,6 +437,10 @@ pub const SimpleStreamOptions = struct {
     google_thinking: ?GoogleThinkingOptions = null,
     openai_tool_choice: ?std.json.Value = null,
     openai_reasoning_effort: ?[]const u8 = null,
+    azure_api_version: ?[]const u8 = null,
+    azure_resource_name: ?[]const u8 = null,
+    azure_base_url: ?[]const u8 = null,
+    azure_deployment_name: ?[]const u8 = null,
     mistral_prompt_mode: ?[]const u8 = null,
     mistral_reasoning_effort: ?[]const u8 = null,
 
@@ -460,6 +472,10 @@ pub const SimpleStreamOptions = struct {
             .anthropic_interleaved_thinking = null,
             .anthropic_tool_choice = null,
             .responses_reasoning_effort = self.reasoning,
+            .azure_api_version = self.azure_api_version,
+            .azure_resource_name = self.azure_resource_name,
+            .azure_base_url = self.azure_base_url,
+            .azure_deployment_name = self.azure_deployment_name,
             .mistral_prompt_mode = self.mistral_prompt_mode,
             .mistral_reasoning_effort = self.mistral_reasoning_effort,
         };

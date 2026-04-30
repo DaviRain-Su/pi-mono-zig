@@ -29,6 +29,10 @@ pub fn buildBaseOptions(
         .metadata = if (options) |value| value.metadata else null,
         .google_tool_choice = if (options) |value| value.google_tool_choice else null,
         .google_thinking = if (options) |value| value.google_thinking else null,
+        .azure_api_version = if (options) |value| value.azure_api_version else null,
+        .azure_resource_name = if (options) |value| value.azure_resource_name else null,
+        .azure_base_url = if (options) |value| value.azure_base_url else null,
+        .azure_deployment_name = if (options) |value| value.azure_deployment_name else null,
         .mistral_prompt_mode = if (options) |value| value.mistral_prompt_mode else null,
         .mistral_reasoning_effort = if (options) |value| value.mistral_reasoning_effort else null,
     };
