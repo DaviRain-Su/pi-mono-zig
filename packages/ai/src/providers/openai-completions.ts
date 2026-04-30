@@ -1125,3 +1125,9 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
 	};
 }
+
+export function getOpenAICompletionsCompatForTesting(
+	model: Model<"openai-completions">,
+): ResolvedOpenAICompletionsCompat {
+	return getCompat(model);
+}

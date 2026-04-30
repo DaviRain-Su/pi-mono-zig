@@ -1,17 +1,23 @@
 {
   "expected": {
     "resolvedCompat": {
-      "maxTokensField": "max_tokens",
+      "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {},
+      "reasoningEffortMap": {
+        "high": "high",
+        "low": "high",
+        "medium": "high",
+        "minimal": "high",
+        "xhigh": "max"
+      },
       "requiresAssistantAfterToolResult": false,
-      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresReasoningContentOnAssistantMessages": true,
       "requiresThinkingAsText": false,
-      "requiresToolResultName": false,
+      "requiresToolResultName": true,
       "sendSessionAffinityHeaders": false,
       "supportsDeveloperRole": false,
       "supportsLongCacheRetention": true,
-      "supportsReasoningEffort": true,
+      "supportsReasoningEffort": false,
       "supportsStore": false,
       "supportsStrictMode": true,
       "supportsUsageInStreaming": true,
@@ -20,13 +26,12 @@
       "zaiToolStream": false
     },
     "typeScriptRequest": {
-      "baseUrl": "https://llm.chutes.ai/v1",
+      "baseUrl": "https://api.deepseek.com/v1",
       "headers": {
         "authorization": "<redacted-present>",
         "content-type": "application/json"
       },
       "jsonPayload": {
-        "max_tokens": 96,
         "messages": [
           {
             "content": "You are the deterministic OpenAI Chat fixture assistant.",
@@ -37,7 +42,7 @@
             "role": "user"
           }
         ],
-        "model": "qwen-fixture",
+        "model": "partial-compat-fixture",
         "stream": true,
         "stream_options": {
           "include_usage": true
@@ -45,10 +50,10 @@
       },
       "method": "POST",
       "path": "/v1/chat/completions",
-      "url": "https://llm.chutes.ai/v1/chat/completions"
+      "url": "https://api.deepseek.com/v1/chat/completions"
     }
   },
-  "id": "chutes-max-tokens-scaffold",
+  "id": "explicit-partial-compat-override",
   "input": {
     "context": {
       "messages": [
@@ -61,19 +66,23 @@
     },
     "model": {
       "api": "openai-completions",
-      "baseUrl": "https://llm.chutes.ai/v1",
-      "id": "qwen-fixture",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "compat": {
+        "requiresToolResultName": true,
+        "supportsReasoningEffort": false,
+        "thinkingFormat": "openai"
+      },
+      "id": "partial-compat-fixture",
       "input": [
         "text"
       ],
-      "name": "Qwen Fixture",
-      "provider": "chutes",
-      "reasoning": false
+      "name": "Partial Compat Fixture",
+      "provider": "deepseek",
+      "reasoning": true
     },
     "options": {
       "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "none",
-      "maxTokens": 96
+      "reasoningEffort": "high"
     }
   },
   "metadata": {
@@ -89,5 +98,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Non-standard OpenAI-compatible base URL scaffold captures max_tokens compatibility"
+  "title": "Partial explicit compat override replaces only named fields and preserves detected defaults"
 }

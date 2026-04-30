@@ -1,7 +1,7 @@
 {
   "expected": {
     "resolvedCompat": {
-      "maxTokensField": "max_tokens",
+      "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
       "reasoningEffortMap": {},
       "requiresAssistantAfterToolResult": false,
@@ -9,10 +9,10 @@
       "requiresThinkingAsText": false,
       "requiresToolResultName": false,
       "sendSessionAffinityHeaders": false,
-      "supportsDeveloperRole": false,
+      "supportsDeveloperRole": true,
       "supportsLongCacheRetention": true,
       "supportsReasoningEffort": true,
-      "supportsStore": false,
+      "supportsStore": true,
       "supportsStrictMode": true,
       "supportsUsageInStreaming": true,
       "thinkingFormat": "openai",
@@ -20,13 +20,13 @@
       "zaiToolStream": false
     },
     "typeScriptRequest": {
-      "baseUrl": "https://llm.chutes.ai/v1",
+      "baseUrl": "https://llm-proxy.example.test/openai/v1",
       "headers": {
         "authorization": "<redacted-present>",
         "content-type": "application/json"
       },
       "jsonPayload": {
-        "max_tokens": 96,
+        "max_completion_tokens": 24,
         "messages": [
           {
             "content": "You are the deterministic OpenAI Chat fixture assistant.",
@@ -37,18 +37,19 @@
             "role": "user"
           }
         ],
-        "model": "qwen-fixture",
+        "model": "proxy-gpt",
+        "store": false,
         "stream": true,
         "stream_options": {
           "include_usage": true
         }
       },
       "method": "POST",
-      "path": "/v1/chat/completions",
-      "url": "https://llm.chutes.ai/v1/chat/completions"
+      "path": "/openai/v1/chat/completions",
+      "url": "https://llm-proxy.example.test/openai/v1/chat/completions"
     }
   },
-  "id": "chutes-max-tokens-scaffold",
+  "id": "generic-proxy-compat",
   "input": {
     "context": {
       "messages": [
@@ -61,19 +62,18 @@
     },
     "model": {
       "api": "openai-completions",
-      "baseUrl": "https://llm.chutes.ai/v1",
-      "id": "qwen-fixture",
+      "baseUrl": "https://llm-proxy.example.test/openai/v1",
+      "id": "proxy-gpt",
       "input": [
         "text"
       ],
-      "name": "Qwen Fixture",
-      "provider": "chutes",
+      "name": "Generic Proxy Fixture",
+      "provider": "custom-openai-proxy",
       "reasoning": false
     },
     "options": {
       "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "none",
-      "maxTokens": 96
+      "maxTokens": 24
     }
   },
   "metadata": {
@@ -89,5 +89,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Non-standard OpenAI-compatible base URL scaffold captures max_tokens compatibility"
+  "title": "Generic OpenAI-compatible proxy preserves OpenAI defaults when no known provider/url matches"
 }

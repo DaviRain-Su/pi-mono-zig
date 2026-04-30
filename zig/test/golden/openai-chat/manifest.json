@@ -1,6 +1,6 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 5,
+  "fixtureCount": 18,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
@@ -8,6 +8,19 @@
     "openai-on-payload-replacement",
     "header-merge-option-override",
     "chutes-max-tokens-scaffold",
+    "openrouter-anthropic-compat",
+    "deepseek-reasoning-replay",
+    "groq-qwen3-effort-map",
+    "zai-nonstandard-compat",
+    "xai-grok-compat",
+    "cerebras-nonstandard-compat",
+    "cloudflare-workers-ai-compat",
+    "opencode-nonstandard-compat",
+    "generic-proxy-compat",
+    "mixed-openrouter-deepseek-url",
+    "explicit-partial-compat-override",
+    "explicit-false-compat-override",
+    "explicit-full-compat-all-fields",
     "tool-choice-and-history-scaffold"
   ],
   "schemaVersion": 1,

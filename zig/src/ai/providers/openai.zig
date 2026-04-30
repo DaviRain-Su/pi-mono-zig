@@ -866,16 +866,23 @@ pub fn buildRequestPayload(
     }
 
     // Add conversation messages
+    var last_role: ?[]const u8 = null;
     for (transformed_messages) |msg| {
+        if (compat.requires_assistant_after_tool_result and last_role != null and std.mem.eql(u8, last_role.?, "toolResult") and msg == .user) {
+            try messages.append(.{ .object = try buildMessageObject(allocator, "assistant", "I have processed the tool results.") });
+        }
         switch (msg) {
             .user => |user_msg| {
                 try messages.append(try buildUserMessage(allocator, model, user_msg));
+                last_role = "user";
             },
             .assistant => |assistant_msg| {
                 try messages.append(try buildAssistantMessage(allocator, model, assistant_msg));
+                last_role = "assistant";
             },
             .tool_result => |tool_result| {
-                try appendToolResultMessages(allocator, &messages, model, tool_result);
+                const appended_image_user = try appendToolResultMessages(allocator, &messages, model, tool_result);
+                last_role = if (appended_image_user) "user" else "toolResult";
             },
         }
     }
@@ -919,11 +926,6 @@ pub fn buildRequestPayload(
         if (opts.openai_tool_choice) |tool_choice| {
             try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try cloneJsonValue(allocator, tool_choice));
         }
-        if (opts.openai_reasoning_effort) |effort| {
-            if (model.reasoning and compat.supports_reasoning_effort and std.mem.eql(u8, compat.thinking_format, "openai")) {
-                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), std.json.Value{ .string = try allocator.dupe(u8, effort) });
-            }
-        }
     }
 
     // Add tools if present
@@ -932,25 +934,98 @@ pub fn buildRequestPayload(
             var tools_array = std.json.Array.init(allocator);
             errdefer tools_array.deinit();
             for (tools) |tool| {
-                try tools_array.append(try buildToolObject(allocator, tool));
+                try tools_array.append(try buildToolObject(allocator, tool, compat));
             }
             try payload.put(allocator, try allocator.dupe(u8, "tools"), std.json.Value{ .array = tools_array });
+            if (compat.zai_tool_stream) {
+                try payload.put(allocator, try allocator.dupe(u8, "tool_stream"), .{ .bool = true });
+            }
+        }
+    }
+
+    if (model.reasoning) {
+        const effort = if (options) |opts| opts.openai_reasoning_effort else null;
+        if (std.mem.eql(u8, compat.thinking_format, "zai") or std.mem.eql(u8, compat.thinking_format, "qwen")) {
+            try payload.put(allocator, try allocator.dupe(u8, "enable_thinking"), .{ .bool = effort != null });
+        } else if (std.mem.eql(u8, compat.thinking_format, "qwen-chat-template")) {
+            var template_kwargs = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer template_kwargs.deinit(allocator);
+            try template_kwargs.put(allocator, try allocator.dupe(u8, "enable_thinking"), .{ .bool = effort != null });
+            try template_kwargs.put(allocator, try allocator.dupe(u8, "preserve_thinking"), .{ .bool = true });
+            try payload.put(allocator, try allocator.dupe(u8, "chat_template_kwargs"), .{ .object = template_kwargs });
+        } else if (std.mem.eql(u8, compat.thinking_format, "deepseek")) {
+            var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer thinking.deinit(allocator);
+            try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, if (effort != null) "enabled" else "disabled") });
+            try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+            if (effort) |value| {
+                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, mapReasoningEffort(compat, value)) });
+            }
+        } else if (std.mem.eql(u8, compat.thinking_format, "openrouter")) {
+            var reasoning = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer reasoning.deinit(allocator);
+            const value = if (effort) |requested| mapReasoningEffort(compat, requested) else "none";
+            try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, value) });
+            try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
+        } else if (effort) |value| {
+            if (compat.supports_reasoning_effort) {
+                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, mapReasoningEffort(compat, value)) });
+            }
+        }
+    }
+
+    if (std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null) {
+        if (compat.open_router_routing) |routing| {
+            try payload.put(allocator, try allocator.dupe(u8, "provider"), try cloneJsonValue(allocator, routing));
+        }
+    }
+
+    if (std.mem.indexOf(u8, model.base_url, "ai-gateway.vercel.sh") != null) {
+        if (compat.vercel_gateway_routing) |routing| {
+            if (routing == .object and (routing.object.get("only") != null or routing.object.get("order") != null)) {
+                var gateway = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                errdefer gateway.deinit(allocator);
+                if (routing.object.get("only")) |only| {
+                    try gateway.put(allocator, try allocator.dupe(u8, "only"), try cloneJsonValue(allocator, only));
+                }
+                if (routing.object.get("order")) |order| {
+                    try gateway.put(allocator, try allocator.dupe(u8, "order"), try cloneJsonValue(allocator, order));
+                }
+                var provider_options = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+                errdefer provider_options.deinit(allocator);
+                try provider_options.put(allocator, try allocator.dupe(u8, "gateway"), .{ .object = gateway });
+                try payload.put(allocator, try allocator.dupe(u8, "providerOptions"), .{ .object = provider_options });
+            }
         }
     }
 
     return std.json.Value{ .object = payload };
 }
 
+const ReasoningEffortMap = union(enum) {
+    empty,
+    deepseek,
+    groq_qwen3,
+    explicit: std.json.Value,
+};
+
 const OpenAICompat = struct {
     supports_store: bool = true,
     supports_developer_role: bool = true,
     supports_reasoning_effort: bool = true,
+    reasoning_effort_map: ReasoningEffortMap = .empty,
     supports_usage_in_streaming: bool = true,
     max_tokens_field: []const u8 = "max_completion_tokens",
+    requires_tool_result_name: bool = false,
+    requires_assistant_after_tool_result: bool = false,
     requires_thinking_as_text: bool = false,
     requires_reasoning_content_on_assistant_messages: bool = false,
-    requires_tool_result_name: bool = false,
     thinking_format: []const u8 = "openai",
+    open_router_routing: ?std.json.Value = null,
+    vercel_gateway_routing: ?std.json.Value = null,
+    zai_tool_stream: bool = false,
+    supports_strict_mode: bool = true,
+    cache_control_format: ?[]const u8 = null,
     send_session_affinity_headers: bool = false,
     supports_long_cache_retention: bool = true,
 };
@@ -959,8 +1034,15 @@ fn getCompat(model: types.Model) OpenAICompat {
     const is_non_standard = isNonStandardProvider(model);
     const is_chutes = std.mem.indexOf(u8, model.base_url, "chutes.ai") != null;
     const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null;
+    const is_groq = std.mem.eql(u8, model.provider, "groq") or std.mem.indexOf(u8, model.base_url, "groq.com") != null;
     const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
     const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
+    const detected_reasoning_effort_map: ReasoningEffortMap = if (is_deepseek)
+        .deepseek
+    else if (is_groq and std.mem.eql(u8, model.id, "qwen/qwen3-32b"))
+        .groq_qwen3
+    else
+        .empty;
     const detected_thinking_format = if (is_deepseek)
         "deepseek"
     else if (is_zai)
@@ -969,17 +1051,28 @@ fn getCompat(model: types.Model) OpenAICompat {
         "openrouter"
     else
         "openai";
+    const detected_cache_control_format: ?[]const u8 = if (std.mem.eql(u8, model.provider, "openrouter") and std.mem.startsWith(u8, model.id, "anthropic/"))
+        "anthropic"
+    else
+        null;
 
     return .{
         .supports_store = compatBoolField(model.compat, "supportsStore") orelse !is_non_standard,
         .supports_developer_role = compatBoolField(model.compat, "supportsDeveloperRole") orelse !is_non_standard,
         .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai),
+        .reasoning_effort_map = compatObjectField(model.compat, "reasoningEffortMap") orelse detected_reasoning_effort_map,
         .supports_usage_in_streaming = compatBoolField(model.compat, "supportsUsageInStreaming") orelse true,
         .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes) "max_tokens" else "max_completion_tokens",
-        .requires_thinking_as_text = compatBoolField(model.compat, "requiresThinkingAsText") orelse false,
-        .requires_reasoning_content_on_assistant_messages = compatBoolField(model.compat, "requiresReasoningContentOnAssistantMessages") orelse false,
         .requires_tool_result_name = compatBoolField(model.compat, "requiresToolResultName") orelse false,
+        .requires_assistant_after_tool_result = compatBoolField(model.compat, "requiresAssistantAfterToolResult") orelse false,
+        .requires_thinking_as_text = compatBoolField(model.compat, "requiresThinkingAsText") orelse false,
+        .requires_reasoning_content_on_assistant_messages = compatBoolField(model.compat, "requiresReasoningContentOnAssistantMessages") orelse is_deepseek,
         .thinking_format = compatStringField(model.compat, "thinkingFormat") orelse detected_thinking_format,
+        .open_router_routing = compatObjectValueField(model.compat, "openRouterRouting") orelse null,
+        .vercel_gateway_routing = compatObjectValueField(model.compat, "vercelGatewayRouting") orelse null,
+        .zai_tool_stream = compatBoolField(model.compat, "zaiToolStream") orelse false,
+        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse true,
+        .cache_control_format = compatStringField(model.compat, "cacheControlFormat") orelse detected_cache_control_format,
         .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse false,
         .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse true,
     };
@@ -1001,6 +1094,22 @@ fn compatStringField(compat: ?std.json.Value, key: []const u8) ?[]const u8 {
     return field.string;
 }
 
+fn compatObjectField(compat: ?std.json.Value, key: []const u8) ?ReasoningEffortMap {
+    const value = compat orelse return null;
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    if (field != .object) return null;
+    return .{ .explicit = field };
+}
+
+fn compatObjectValueField(compat: ?std.json.Value, key: []const u8) ?std.json.Value {
+    const value = compat orelse return null;
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    if (field != .object) return null;
+    return field;
+}
+
 fn isNonStandardProvider(model: types.Model) bool {
     const provider = model.provider;
     const base_url = model.base_url;
@@ -1008,7 +1117,8 @@ fn isNonStandardProvider(model: types.Model) bool {
     if (std.mem.eql(u8, provider, "cerebras") or
         std.mem.eql(u8, provider, "xai") or
         std.mem.eql(u8, provider, "zai") or
-        std.mem.eql(u8, provider, "opencode"))
+        std.mem.eql(u8, provider, "opencode") or
+        std.mem.eql(u8, provider, "cloudflare-workers-ai"))
     {
         return true;
     }
@@ -1018,7 +1128,8 @@ fn isNonStandardProvider(model: types.Model) bool {
         std.mem.indexOf(u8, base_url, "chutes.ai") != null or
         std.mem.indexOf(u8, base_url, "deepseek.com") != null or
         std.mem.indexOf(u8, base_url, "api.z.ai") != null or
-        std.mem.indexOf(u8, base_url, "opencode.ai") != null)
+        std.mem.indexOf(u8, base_url, "opencode.ai") != null or
+        std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null)
     {
         return true;
     }
@@ -1110,6 +1221,97 @@ fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap(
         allocator.free(entry.value_ptr.*);
     }
     headers.deinit();
+}
+
+pub fn buildResolvedCompatSnapshotValue(allocator: std.mem.Allocator, model: types.Model) !std.json.Value {
+    const compat = getCompat(model);
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+
+    try putBoolValue(allocator, &object, "requiresAssistantAfterToolResult", compat.requires_assistant_after_tool_result);
+    try putBoolValue(allocator, &object, "requiresReasoningContentOnAssistantMessages", compat.requires_reasoning_content_on_assistant_messages);
+    try putBoolValue(allocator, &object, "requiresThinkingAsText", compat.requires_thinking_as_text);
+    try putBoolValue(allocator, &object, "requiresToolResultName", compat.requires_tool_result_name);
+    try putObjectValue(allocator, &object, "openRouterRouting", if (compat.open_router_routing) |routing| try cloneJsonValue(allocator, routing) else try emptyObjectValue(allocator));
+    try putObjectValue(allocator, &object, "reasoningEffortMap", try buildReasoningEffortMapValue(allocator, compat.reasoning_effort_map));
+    try putBoolValue(allocator, &object, "sendSessionAffinityHeaders", compat.send_session_affinity_headers);
+    try putBoolValue(allocator, &object, "supportsDeveloperRole", compat.supports_developer_role);
+    try putBoolValue(allocator, &object, "supportsLongCacheRetention", compat.supports_long_cache_retention);
+    try putBoolValue(allocator, &object, "supportsReasoningEffort", compat.supports_reasoning_effort);
+    try putBoolValue(allocator, &object, "supportsStore", compat.supports_store);
+    try putBoolValue(allocator, &object, "supportsStrictMode", compat.supports_strict_mode);
+    try putBoolValue(allocator, &object, "supportsUsageInStreaming", compat.supports_usage_in_streaming);
+    try putStringValue(allocator, &object, "maxTokensField", compat.max_tokens_field);
+    try putStringValue(allocator, &object, "thinkingFormat", compat.thinking_format);
+    try putObjectValue(allocator, &object, "vercelGatewayRouting", if (compat.vercel_gateway_routing) |routing| try cloneJsonValue(allocator, routing) else try emptyObjectValue(allocator));
+    try putBoolValue(allocator, &object, "zaiToolStream", compat.zai_tool_stream);
+    if (compat.cache_control_format) |format| {
+        try putStringValue(allocator, &object, "cacheControlFormat", format);
+    }
+
+    return .{ .object = object };
+}
+
+fn putBoolValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .bool = value });
+}
+
+fn putStringValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+}
+
+fn putObjectValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+fn emptyObjectValue(allocator: std.mem.Allocator) !std.json.Value {
+    return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+}
+
+fn buildReasoningEffortMapValue(allocator: std.mem.Allocator, map: ReasoningEffortMap) !std.json.Value {
+    switch (map) {
+        .empty => return try emptyObjectValue(allocator),
+        .explicit => |value| return try cloneJsonValue(allocator, value),
+        .deepseek => {
+            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer object.deinit(allocator);
+            try putStringValue(allocator, &object, "high", "high");
+            try putStringValue(allocator, &object, "low", "high");
+            try putStringValue(allocator, &object, "medium", "high");
+            try putStringValue(allocator, &object, "minimal", "high");
+            try putStringValue(allocator, &object, "xhigh", "max");
+            return .{ .object = object };
+        },
+        .groq_qwen3 => {
+            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer object.deinit(allocator);
+            try putStringValue(allocator, &object, "high", "default");
+            try putStringValue(allocator, &object, "low", "default");
+            try putStringValue(allocator, &object, "medium", "default");
+            try putStringValue(allocator, &object, "minimal", "default");
+            try putStringValue(allocator, &object, "xhigh", "default");
+            return .{ .object = object };
+        },
+    }
+}
+
+fn mapReasoningEffort(compat: OpenAICompat, effort: []const u8) []const u8 {
+    switch (compat.reasoning_effort_map) {
+        .empty => return effort,
+        .deepseek => {
+            if (std.mem.eql(u8, effort, "xhigh")) return "max";
+            return "high";
+        },
+        .groq_qwen3 => return "default",
+        .explicit => |value| {
+            if (value == .object) {
+                if (value.object.get(effort)) |mapped| {
+                    if (mapped == .string) return mapped.string;
+                }
+            }
+            return effort;
+        },
+    }
 }
 
 pub fn buildRequestSnapshotValue(
@@ -1393,20 +1595,40 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
     }
 
     if (compat.requires_thinking_as_text and thinking_parts.items.len > 0) {
-        if (text_parts.items.len > 0) {
-            try thinking_parts.appendSlice(allocator, "\n\n");
-            try thinking_parts.appendSlice(allocator, text_parts.items);
-        }
-        text_parts.clearRetainingCapacity();
-        try text_parts.appendSlice(allocator, thinking_parts.items);
-    }
+        var content_parts = std.json.Array.init(allocator);
+        errdefer content_parts.deinit();
 
-    const content = if (text_parts.items.len > 0) try sanitizeSurrogates(allocator, text_parts.items) else try allocator.dupe(u8, "");
-    defer allocator.free(content);
-    if (content.len == 0 and has_tool_calls) {
-        try obj.put(allocator, try allocator.dupe(u8, "content"), .null);
+        const sanitized_thinking = try sanitizeSurrogates(allocator, thinking_parts.items);
+        defer allocator.free(sanitized_thinking);
+        var thinking_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        errdefer thinking_part.deinit(allocator);
+        try thinking_part.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
+        try thinking_part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized_thinking) });
+        try content_parts.append(.{ .object = thinking_part });
+
+        if (text_parts.items.len > 0) {
+            const sanitized_text = try sanitizeSurrogates(allocator, text_parts.items);
+            defer allocator.free(sanitized_text);
+            var text_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer text_part.deinit(allocator);
+            try text_part.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
+            try text_part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized_text) });
+            try content_parts.append(.{ .object = text_part });
+        }
+
+        try obj.put(allocator, try allocator.dupe(u8, "content"), .{ .array = content_parts });
     } else {
-        try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+        const content = if (text_parts.items.len > 0) try sanitizeSurrogates(allocator, text_parts.items) else try allocator.dupe(u8, "");
+        defer allocator.free(content);
+        if (content.len == 0 and has_tool_calls) {
+            if (compat.requires_assistant_after_tool_result) {
+                try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, "") });
+            } else {
+                try obj.put(allocator, try allocator.dupe(u8, "content"), .null);
+            }
+        } else {
+            try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+        }
     }
 
     if (!compat.requires_thinking_as_text and thinking_parts.items.len > 0 and reasoning_field_name != null) {
@@ -1453,11 +1675,17 @@ fn appendToolResultMessages(
     messages: *std.json.Array,
     model: types.Model,
     tool_result: types.ToolResultMessage,
-) !void {
+) !bool {
+    const compat = getCompat(model);
     try messages.append(try buildToolResultMessage(allocator, model, tool_result));
     if (try buildToolResultImageUserMessage(allocator, model, tool_result)) |image_message| {
+        if (compat.requires_assistant_after_tool_result) {
+            try messages.append(.{ .object = try buildMessageObject(allocator, "assistant", "I have processed the tool results.") });
+        }
         try messages.append(image_message);
+        return true;
     }
+    return false;
 }
 
 fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool_result: types.ToolResultMessage) !std.json.Value {
@@ -1553,7 +1781,7 @@ fn buildToolResultImageUserMessage(
     return .{ .object = obj };
 }
 
-fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Value {
+fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool, compat: OpenAICompat) !std.json.Value {
     var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer obj.deinit(allocator);
     try obj.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "function") });
@@ -1563,7 +1791,9 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Val
     try func_obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tool.name) });
     try func_obj.put(allocator, try allocator.dupe(u8, "description"), std.json.Value{ .string = try allocator.dupe(u8, tool.description) });
     try func_obj.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
-    try func_obj.put(allocator, try allocator.dupe(u8, "strict"), std.json.Value{ .bool = false });
+    if (compat.supports_strict_mode) {
+        try func_obj.put(allocator, try allocator.dupe(u8, "strict"), std.json.Value{ .bool = false });
+    }
 
     try obj.put(allocator, try allocator.dupe(u8, "function"), std.json.Value{ .object = func_obj });
     return std.json.Value{ .object = obj };
