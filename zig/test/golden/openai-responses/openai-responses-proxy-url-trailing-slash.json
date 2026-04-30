@@ -27,7 +27,6 @@
       "path": "/custom/v1/responses",
       "query": {},
       "requestOptions": {
-        "maxRetries": 2,
         "signal": "not-provided",
         "timeoutMs": 4567
       },
@@ -67,7 +66,6 @@
     },
     "options": {
       "apiKeyMode": "fixture-placeholder",
-      "maxRetries": 2,
       "timeoutMs": 4567
     }
   },

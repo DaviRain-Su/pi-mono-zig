@@ -121,7 +121,7 @@ pub const OpenAIResponsesProvider = struct {
             return stream_instance;
         }
 
-        const url = try std.fmt.allocPrint(allocator, "{s}/responses", .{model.base_url});
+        const url = try buildRequestUrl(allocator, model.base_url);
         defer allocator.free(url);
 
         var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
@@ -138,6 +138,7 @@ pub const OpenAIResponsesProvider = struct {
             .url = url,
             .headers = headers,
             .body = json_body,
+            .timeout_ms = if (options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
             .aborted = if (options) |stream_options| stream_options.signal else null,
         });
         defer response.deinit();
@@ -192,8 +193,15 @@ pub fn buildRequestPayload(
         try input.append(try buildSystemInputItem(allocator, model, system_prompt));
     }
 
+    var normalized_tool_call_ids = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var iterator = normalized_tool_call_ids.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.value_ptr.*);
+        normalized_tool_call_ids.deinit();
+    }
+
     for (context.messages, 0..) |message, message_index| {
-        try appendInputItemsForMessage(allocator, &input, model, message, message_index);
+        try appendInputItemsForMessage(allocator, &input, model, message, message_index, &normalized_tool_call_ids);
     }
 
     var payload = try initObject(allocator);
@@ -1094,19 +1102,24 @@ fn appendInputItemsForMessage(
     model: types.Model,
     message: types.Message,
     message_index: usize,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
 ) !void {
     switch (message) {
-        .user => |user| try input.append(try buildUserInputItem(allocator, model, user)),
-        .assistant => |assistant| {
-            if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                try appendAssistantInputItems(allocator, input, assistant, message_index);
+        .user => |user| {
+            if (try buildUserInputItem(allocator, model, user)) |item| {
+                try input.append(item);
             }
         },
-        .tool_result => |tool_result| try input.append(try buildToolResultInputItem(allocator, model, tool_result)),
+        .assistant => |assistant| {
+            if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                try appendAssistantInputItems(allocator, input, model, assistant, message_index, normalized_tool_call_ids);
+            }
+        },
+        .tool_result => |tool_result| try input.append(try buildToolResultInputItem(allocator, model, tool_result, normalized_tool_call_ids)),
     }
 }
 
-fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: types.UserMessage) !std.json.Value {
+fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: types.UserMessage) !?std.json.Value {
     var content = std.json.Array.init(allocator);
     errdefer content.deinit();
 
@@ -1138,6 +1151,11 @@ fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: ty
         }
     }
 
+    if (content.items.len == 0) {
+        content.deinit();
+        return null;
+    }
+
     var object = try initObject(allocator);
     errdefer object.deinit(allocator);
     try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "user") });
@@ -1148,9 +1166,16 @@ fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: ty
 fn appendAssistantInputItems(
     allocator: std.mem.Allocator,
     input: *std.json.Array,
+    model: types.Model,
     assistant: types.AssistantMessage,
     message_index: usize,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
 ) !void {
+    const is_same_model =
+        std.mem.eql(u8, assistant.provider, model.provider) and
+        std.mem.eql(u8, assistant.api, model.api) and
+        std.mem.eql(u8, assistant.model, model.id);
+
     for (assistant.content) |block| {
         switch (block) {
             .thinking => |thinking| {
@@ -1166,9 +1191,18 @@ fn appendAssistantInputItems(
                 try message_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "message") });
                 try message_object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "assistant") });
                 try message_object.put(allocator, try allocator.dupe(u8, "status"), .{ .string = try allocator.dupe(u8, "completed") });
-                const message_id = try std.fmt.allocPrint(allocator, "msg_{d}", .{message_index});
-                defer allocator.free(message_id);
-                try message_object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, message_id) });
+                const parsed_signature = if (is_same_model)
+                    try parseTextSignature(allocator, text.text_signature, message_index)
+                else
+                    try parseTextSignature(allocator, null, message_index);
+                defer {
+                    allocator.free(parsed_signature.id);
+                    if (parsed_signature.phase) |phase| allocator.free(phase);
+                }
+                try message_object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, parsed_signature.id) });
+                if (parsed_signature.phase) |phase| {
+                    try message_object.put(allocator, try allocator.dupe(u8, "phase"), .{ .string = try allocator.dupe(u8, phase) });
+                }
 
                 var content = std.json.Array.init(allocator);
                 errdefer content.deinit();
@@ -1196,7 +1230,20 @@ fn appendAssistantInputItems(
 
     if (tool_calls_source orelse assistant.tool_calls) |tool_calls| {
         for (tool_calls) |tool_call| {
-            const split = splitToolCallId(tool_call.id);
+            const normalized_id = if (is_same_model)
+                try allocator.dupe(u8, tool_call.id)
+            else
+                try normalizeToolCallId(allocator, tool_call.id, model, assistant);
+            defer allocator.free(normalized_id);
+            if (!std.mem.eql(u8, tool_call.id, normalized_id)) {
+                if (normalized_tool_call_ids.get(tool_call.id)) |existing| {
+                    allocator.free(existing);
+                    try normalized_tool_call_ids.put(tool_call.id, try allocator.dupe(u8, normalized_id));
+                } else {
+                    try normalized_tool_call_ids.put(tool_call.id, try allocator.dupe(u8, normalized_id));
+                }
+            }
+            const split = splitToolCallId(normalized_id);
             var tool_call_object = try initObject(allocator);
             errdefer tool_call_object.deinit(allocator);
             try tool_call_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "function_call") });
@@ -1217,7 +1264,9 @@ fn buildToolResultInputItem(
     allocator: std.mem.Allocator,
     model: types.Model,
     tool_result: types.ToolResultMessage,
+    normalized_tool_call_ids: *std.StringHashMap([]const u8),
 ) !std.json.Value {
+    const normalized_id = normalized_tool_call_ids.get(tool_result.tool_call_id) orelse tool_result.tool_call_id;
     const supports_images = modelSupportsImages(model);
 
     var text_parts = std.ArrayList(u8).empty;
@@ -1239,7 +1288,7 @@ fn buildToolResultInputItem(
     var object = try initObject(allocator);
     errdefer object.deinit(allocator);
     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "function_call_output") });
-    try object.put(allocator, try allocator.dupe(u8, "call_id"), .{ .string = try allocator.dupe(u8, splitToolCallId(tool_result.tool_call_id).call_id) });
+    try object.put(allocator, try allocator.dupe(u8, "call_id"), .{ .string = try allocator.dupe(u8, splitToolCallId(normalized_id).call_id) });
 
     if (supports_images and image_count > 0) {
         var output_parts = std.json.Array.init(allocator);
@@ -1299,6 +1348,142 @@ fn modelSupportsImages(model: types.Model) bool {
         if (std.mem.eql(u8, input_type, "image")) return true;
     }
     return false;
+}
+
+const ParsedTextSignature = struct {
+    id: []const u8,
+    phase: ?[]const u8,
+};
+
+pub fn buildRequestUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    const trimmed = trimRightScalar(std.mem.trim(u8, base_url, " \t\r\n"), '/');
+    return try std.fmt.allocPrint(allocator, "{s}/responses", .{trimmed});
+}
+
+fn parseTextSignature(allocator: std.mem.Allocator, signature: ?[]const u8, message_index: usize) !ParsedTextSignature {
+    const value = signature orelse return .{ .id = try std.fmt.allocPrint(allocator, "msg_{d}", .{message_index}), .phase = null };
+    if (std.mem.startsWith(u8, value, "{")) {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, value, .{}) catch {
+            return .{ .id = try normalizedMessageIdFromSignature(allocator, value), .phase = null };
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("v")) |version| {
+                if (version == .integer and version.integer == 1) {
+                    if (extractStringField(parsed.value, "id")) |id| {
+                        const phase = extractStringField(parsed.value, "phase");
+                        const normalized_id = try normalizedMessageIdFromSignature(allocator, id);
+                        if (phase != null and (std.mem.eql(u8, phase.?, "commentary") or std.mem.eql(u8, phase.?, "final_answer"))) {
+                            return .{ .id = normalized_id, .phase = try allocator.dupe(u8, phase.?) };
+                        }
+                        return .{ .id = normalized_id, .phase = null };
+                    }
+                }
+            }
+        }
+    }
+    return .{ .id = try normalizedMessageIdFromSignature(allocator, value), .phase = null };
+}
+
+fn normalizedMessageIdFromSignature(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
+    if (id.len <= 64) return try allocator.dupe(u8, id);
+    const hash = try shortHash(allocator, id);
+    defer allocator.free(hash);
+    return try std.fmt.allocPrint(allocator, "msg_{s}", .{hash});
+}
+
+fn normalizeToolCallId(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    model: types.Model,
+    source: types.AssistantMessage,
+) ![]const u8 {
+    if (!isOpenAIResponsesToolCallProvider(model.provider)) return normalizeIdPart(allocator, id);
+    const separator = std.mem.indexOfScalar(u8, id, '|') orelse return normalizeIdPart(allocator, id);
+    const call_id = try normalizeIdPart(allocator, id[0..separator]);
+    defer allocator.free(call_id);
+
+    const item_id = id[separator + 1 ..];
+    const is_foreign = !std.mem.eql(u8, source.provider, model.provider) or !std.mem.eql(u8, source.api, model.api);
+    var normalized_item_id = if (is_foreign)
+        try buildForeignResponsesItemId(allocator, item_id)
+    else
+        try normalizeIdPart(allocator, item_id);
+    defer allocator.free(normalized_item_id);
+
+    if (!std.mem.startsWith(u8, normalized_item_id, "fc_")) {
+        const prefixed = try std.fmt.allocPrint(allocator, "fc_{s}", .{normalized_item_id});
+        defer allocator.free(prefixed);
+        const updated = try normalizeIdPart(allocator, prefixed);
+        allocator.free(normalized_item_id);
+        normalized_item_id = updated;
+    }
+
+    return try std.fmt.allocPrint(allocator, "{s}|{s}", .{ call_id, normalized_item_id });
+}
+
+fn isOpenAIResponsesToolCallProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "openai") or
+        std.mem.eql(u8, provider, "openai-codex") or
+        std.mem.eql(u8, provider, "opencode");
+}
+
+fn normalizeIdPart(allocator: std.mem.Allocator, part: []const u8) ![]const u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    for (part) |char| {
+        const normalized: u8 = if (std.ascii.isAlphanumeric(char) or char == '_' or char == '-') char else '_';
+        try buffer.append(allocator, normalized);
+        if (buffer.items.len == 64) break;
+    }
+    while (buffer.items.len > 0 and buffer.items[buffer.items.len - 1] == '_') _ = buffer.pop();
+    return try buffer.toOwnedSlice(allocator);
+}
+
+fn buildForeignResponsesItemId(allocator: std.mem.Allocator, item_id: []const u8) ![]const u8 {
+    const hash = try shortHash(allocator, item_id);
+    defer allocator.free(hash);
+    const prefixed = try std.fmt.allocPrint(allocator, "fc_{s}", .{hash});
+    defer allocator.free(prefixed);
+    if (prefixed.len > 64) return try allocator.dupe(u8, prefixed[0..64]);
+    return try allocator.dupe(u8, prefixed);
+}
+
+fn shortHash(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var h1: u32 = 0xdeadbeef;
+    var h2: u32 = 0x41c6ce57;
+    for (input) |char| {
+        const ch: u32 = char;
+        h1 = (h1 ^ ch) *% 2654435761;
+        h2 = (h2 ^ ch) *% 1597334677;
+    }
+    h1 = ((h1 ^ (h1 >> 16)) *% 2246822507) ^ ((h2 ^ (h2 >> 13)) *% 3266489909);
+    h2 = ((h2 ^ (h2 >> 16)) *% 2246822507) ^ ((h1 ^ (h1 >> 13)) *% 3266489909);
+    const high = try u32ToBase36(allocator, h2);
+    defer allocator.free(high);
+    const low = try u32ToBase36(allocator, h1);
+    defer allocator.free(low);
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ high, low });
+}
+
+fn u32ToBase36(allocator: std.mem.Allocator, value: u32) ![]const u8 {
+    if (value == 0) return try allocator.dupe(u8, "0");
+    var digits: [16]u8 = undefined;
+    var current = value;
+    var index: usize = digits.len;
+    while (current > 0) {
+        index -= 1;
+        const digit: u8 = @intCast(current % 36);
+        digits[index] = if (digit < 10) '0' + digit else 'a' + (digit - 10);
+        current /= 36;
+    }
+    return try allocator.dupe(u8, digits[index..]);
+}
+
+fn trimRightScalar(value: []const u8, scalar: u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == scalar) : (end -= 1) {}
+    return value[0..end];
 }
 
 fn splitToolCallId(id: []const u8) struct { call_id: []const u8, item_id: ?[]const u8 } {
@@ -1738,6 +1923,7 @@ const ResponseHeaderServer = struct {
     server: std.Io.net.Server,
     response_headers: []const u8,
     body: []const u8,
+    body_delay_ms: u64 = 0,
     thread: ?std.Thread = null,
 
     fn init(io: std.Io, response_headers: []const u8, body: []const u8) !ResponseHeaderServer {
@@ -1747,6 +1933,12 @@ const ResponseHeaderServer = struct {
             .response_headers = response_headers,
             .body = body,
         };
+    }
+
+    fn initDelayed(io: std.Io, response_headers: []const u8, body: []const u8, body_delay_ms: u64) !ResponseHeaderServer {
+        var server = try init(io, response_headers, body);
+        server.body_delay_ms = body_delay_ms;
+        return server;
     }
 
     fn start(self: *ResponseHeaderServer) !void {
@@ -1815,6 +2007,10 @@ const ResponseHeaderServer = struct {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n{s}\r\n",
             .{ self.body.len, self.response_headers },
         );
+        try writer.interface.flush();
+        if (self.body_delay_ms > 0) {
+            std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.body_delay_ms)), .awake) catch {};
+        }
         try writer.interface.writeAll(self.body);
         try writer.interface.flush();
     }
@@ -1956,6 +2152,62 @@ test "stream on_response receives actual response headers" {
 
     try std.testing.expect(OnResponseCapture.called);
     try std.testing.expectEqual(@as(u16, 200), OnResponseCapture.status);
+}
+
+test "buildRequestUrl trims trailing slash before responses path" {
+    const allocator = std.testing.allocator;
+    const url = try buildRequestUrl(allocator, "https://proxy.example.test/custom/v1/");
+    defer allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://proxy.example.test/custom/v1/responses", url);
+}
+
+test "stream forwards timeout_ms to HTTP streaming request" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_timeout\",\"status\":\"completed\"}}\n";
+    var server = try ResponseHeaderServer.initDelayed(io, "", body, 250);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try OpenAIResponsesProvider.stream(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .timeout_ms = 50,
+    });
+    defer stream.deinit();
+
+    var saw_timeout = false;
+    while (stream.next()) |event| {
+        if (event.event_type == .error_event) {
+            saw_timeout = true;
+            try std.testing.expectEqualStrings("Timeout", event.error_message.?);
+            break;
+        }
+    }
+    try std.testing.expect(saw_timeout);
 }
 
 test "stream HTTP status error is terminal sanitized event" {
