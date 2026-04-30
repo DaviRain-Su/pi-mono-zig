@@ -1,0 +1,215 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "cacheControlFormat": "anthropic",
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openrouter",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "Cache this instruction.",
+                "type": "text"
+              }
+            ],
+            "role": "system"
+          },
+          {
+            "content": "Earlier user text is not the last conversation breakpoint.",
+            "role": "user"
+          },
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "First assistant text.Last assistant text gets the cache marker.",
+                "type": "text"
+              }
+            ],
+            "role": "assistant"
+          }
+        ],
+        "model": "anthropic/cache-short-fixture",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "function": {
+              "description": "Return deterministic weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "anyOf": [
+                      {
+                        "const": "celsius",
+                        "type": "string"
+                      },
+                      {
+                        "const": "fahrenheit",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "city",
+                  "unit"
+                ],
+                "type": "object"
+              },
+              "strict": false
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+  },
+  "id": "anthropic-cache-control-short-markers",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Earlier user text is not the last conversation breakpoint.",
+          "role": "user"
+        },
+        {
+          "api": "openai-completions",
+          "content": [
+            {
+              "text": "First assistant text.",
+              "type": "text"
+            },
+            {
+              "text": "Last assistant text gets the cache marker.",
+              "type": "text"
+            }
+          ],
+          "model": "anthropic/cache-short-fixture",
+          "provider": "openrouter",
+          "role": "assistant",
+          "stopReason": "stop",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 7,
+            "output": 5,
+            "totalTokens": 12
+          }
+        }
+      ],
+      "systemPrompt": "Cache this instruction.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "compat": {
+        "cacheControlFormat": "anthropic"
+      },
+      "id": "anthropic/cache-short-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Anthropic Cache Short Fixture",
+      "provider": "openrouter",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "short",
+      "sessionId": "fixture-anthropic-cache-short"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Anthropic cache-control markers apply to instruction, last tool, and last assistant text"
+}

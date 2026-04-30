@@ -1,0 +1,96 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": false,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openai",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://llm-proxy.example.test/openai/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": "You are the deterministic OpenAI Chat fixture assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Return a concise fixture response.",
+            "role": "user"
+          }
+        ],
+        "model": "proxy-long-cache-unsupported-fixture",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "method": "POST",
+      "path": "/openai/v1/chat/completions",
+      "url": "https://llm-proxy.example.test/openai/v1/chat/completions"
+    }
+  },
+  "id": "prompt-cache-proxy-long-unsupported",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic OpenAI Chat fixture assistant."
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://llm-proxy.example.test/openai/v1",
+      "compat": {
+        "supportsLongCacheRetention": false
+      },
+      "id": "proxy-long-cache-unsupported-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Proxy Long Cache Unsupported Fixture",
+      "provider": "custom-openai-proxy",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "long",
+      "sessionId": "fixture-proxy-long-cache-unsupported"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Non-OpenAI proxy without long-cache support omits prompt cache fields"
+}

@@ -1,0 +1,185 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "cacheControlFormat": "anthropic",
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openrouter",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "ttl": "1h",
+                  "type": "ephemeral"
+                },
+                "text": "Cache this long-retention instruction.",
+                "type": "text"
+              }
+            ],
+            "role": "system"
+          },
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "ttl": "1h",
+                  "type": "ephemeral"
+                },
+                "text": "Last user text gets long cache control.",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "anthropic/cache-long-fixture",
+        "prompt_cache_key": "fixture-anthropic-cache-long",
+        "prompt_cache_retention": "24h",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "cache_control": {
+              "ttl": "1h",
+              "type": "ephemeral"
+            },
+            "function": {
+              "description": "Return deterministic weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "anyOf": [
+                      {
+                        "const": "celsius",
+                        "type": "string"
+                      },
+                      {
+                        "const": "fahrenheit",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "city",
+                  "unit"
+                ],
+                "type": "object"
+              },
+              "strict": false
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+  },
+  "id": "anthropic-cache-control-long-ttl",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Last user text gets long cache control.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "Cache this long-retention instruction.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "compat": {
+        "cacheControlFormat": "anthropic"
+      },
+      "id": "anthropic/cache-long-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Anthropic Cache Long Fixture",
+      "provider": "openrouter",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "long",
+      "sessionId": "fixture-anthropic-cache-long"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Anthropic long cache-control markers include ttl 1h when long cache is supported"
+}

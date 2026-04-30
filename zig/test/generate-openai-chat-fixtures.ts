@@ -49,7 +49,7 @@ interface FixtureModelInput {
 
 interface SerializableOptions {
 	apiKeyMode: "fixture-placeholder";
-	cacheRetention?: "none" | "short" | "long";
+	cacheRetention?: "none" | "short" | "long" | "env-long";
 	headers?: Record<string, string>;
 	maxRetries?: number;
 	maxTokens?: number;
@@ -182,9 +182,10 @@ function toRuntimeModel(model: FixtureModelInput): Model<"openai-completions"> {
 }
 
 function toRuntimeOptions(options: SerializableOptions): OpenAICompletionsOptions {
-	const { apiKeyMode: _apiKeyMode, onPayload: _onPayload, ...rest } = options;
+	const { apiKeyMode: _apiKeyMode, cacheRetention, onPayload: _onPayload, ...rest } = options;
 	return {
 		...rest,
+		...(cacheRetention && cacheRetention !== "env-long" ? { cacheRetention } : {}),
 		apiKey: fixtureApiKey,
 	};
 }
@@ -1182,6 +1183,369 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	{
+		id: "openrouter-routing-full-object",
+		title: "OpenRouter URL serializes the full explicit provider routing object",
+		input: {
+			model: buildModel({
+				id: "openrouter-routing-fixture",
+				name: "OpenRouter Routing Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				compat: {
+					openRouterRouting: {
+						allow_fallbacks: false,
+						require_parameters: true,
+						data_collection: "deny",
+						zdr: true,
+						enforce_distillable_text: true,
+						order: ["Anthropic", "OpenAI", "Google"],
+						only: ["Anthropic", "OpenAI"],
+						ignore: ["Other"],
+						quantizations: ["fp16", "bf16", "int8"],
+						sort: { by: "latency", partition: null },
+						max_price: { prompt: 0.5, completion: "1.25", image: 0.01, audio: "0.02", request: 0 },
+						preferred_min_throughput: 12,
+						preferred_max_latency: { p50: 1, p75: 2, p90: 3, p99: 4 },
+					},
+				},
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "openrouter-routing-empty-object",
+		title: "OpenRouter URL preserves an explicitly empty provider routing object",
+		input: {
+			model: buildModel({
+				id: "openrouter-empty-routing-fixture",
+				name: "OpenRouter Empty Routing Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				compat: { openRouterRouting: {} },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "openrouter-routing-non-openrouter-omitted",
+		title: "OpenRouter routing compat is omitted from non-OpenRouter request bodies",
+		input: {
+			model: buildModel({
+				id: "non-openrouter-routing-fixture",
+				name: "Non OpenRouter Routing Fixture",
+				compat: { openRouterRouting: { only: ["OpenAI"], order: ["OpenAI", "Anthropic"] } },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "vercel-gateway-routing-only",
+		title: "Vercel AI Gateway serializes providerOptions.gateway.only",
+		input: {
+			model: buildModel({
+				id: "vercel-only-routing-fixture",
+				name: "Vercel Only Routing Fixture",
+				provider: "vercel-ai-gateway",
+				baseUrl: "https://ai-gateway.vercel.sh/v1",
+				compat: { vercelGatewayRouting: { only: ["anthropic", "openai"] } },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "vercel-gateway-routing-order",
+		title: "Vercel AI Gateway serializes providerOptions.gateway.order",
+		input: {
+			model: buildModel({
+				id: "vercel-order-routing-fixture",
+				name: "Vercel Order Routing Fixture",
+				provider: "vercel-ai-gateway",
+				baseUrl: "https://ai-gateway.vercel.sh/v1",
+				compat: { vercelGatewayRouting: { order: ["openai", "anthropic"] } },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "vercel-gateway-routing-combined",
+		title: "Vercel AI Gateway preserves combined only/order routing order",
+		input: {
+			model: buildModel({
+				id: "vercel-combined-routing-fixture",
+				name: "Vercel Combined Routing Fixture",
+				provider: "vercel-ai-gateway",
+				baseUrl: "https://ai-gateway.vercel.sh/v1",
+				compat: { vercelGatewayRouting: { only: ["bedrock", "openai"], order: ["bedrock", "openai"] } },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "vercel-gateway-routing-empty",
+		title: "Vercel AI Gateway omits providerOptions for empty routing",
+		input: {
+			model: buildModel({
+				id: "vercel-empty-routing-fixture",
+				name: "Vercel Empty Routing Fixture",
+				provider: "vercel-ai-gateway",
+				baseUrl: "https://ai-gateway.vercel.sh/v1",
+				compat: { vercelGatewayRouting: {} },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "vercel-gateway-routing-non-gateway-omitted",
+		title: "Vercel routing compat is omitted for non-gateway URLs",
+		input: {
+			model: buildModel({
+				id: "non-vercel-routing-fixture",
+				name: "Non Vercel Routing Fixture",
+				compat: { vercelGatewayRouting: { only: ["openai"], order: ["anthropic", "openai"] } },
+			}),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "none" },
+		},
+	},
+	{
+		id: "prompt-cache-direct-openai-long",
+		title: "Direct OpenAI long cache retention emits prompt cache key and 24h retention",
+		input: {
+			model: buildModel({ id: "openai-long-cache-fixture" }),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				sessionId: "fixture-openai-long-cache",
+			},
+		},
+	},
+	{
+		id: "prompt-cache-direct-openai-none",
+		title: "Direct OpenAI cache none omits prompt cache fields",
+		input: {
+			model: buildModel({ id: "openai-cache-none-fixture" }),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				sessionId: "fixture-openai-cache-none",
+			},
+		},
+	},
+	{
+		id: "prompt-cache-proxy-long-supported",
+		title: "Non-OpenAI proxy with long-cache support emits prompt cache key and 24h retention",
+		input: {
+			model: buildModel({
+				id: "proxy-long-cache-fixture",
+				name: "Proxy Long Cache Fixture",
+				provider: "custom-openai-proxy",
+				baseUrl: "https://llm-proxy.example.test/openai/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				sessionId: "fixture-proxy-long-cache",
+			},
+		},
+	},
+	{
+		id: "prompt-cache-proxy-long-unsupported",
+		title: "Non-OpenAI proxy without long-cache support omits prompt cache fields",
+		input: {
+			model: buildModel({
+				id: "proxy-long-cache-unsupported-fixture",
+				name: "Proxy Long Cache Unsupported Fixture",
+				provider: "custom-openai-proxy",
+				baseUrl: "https://llm-proxy.example.test/openai/v1",
+				compat: { supportsLongCacheRetention: false },
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				sessionId: "fixture-proxy-long-cache-unsupported",
+			},
+		},
+	},
+	{
+		id: "prompt-cache-long-missing-session",
+		title: "Long cache retention without session emits retention but no null prompt cache key",
+		input: {
+			model: buildModel({ id: "openai-long-cache-missing-session-fixture" }),
+			context: baseContext,
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "long" },
+		},
+	},
+	{
+		id: "prompt-cache-env-long-retention",
+		title: "PI_CACHE_RETENTION=long drives long prompt cache semantics when options omit retention",
+		input: {
+			model: buildModel({ id: "openai-env-long-cache-fixture" }),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "env-long",
+				sessionId: "fixture-env-long-cache",
+			},
+		},
+	},
+	{
+		id: "session-affinity-option-overrides",
+		title: "Explicit option headers override generated session-affinity headers",
+		input: {
+			model: buildModel({
+				id: "session-affinity-override-fixture",
+				compat: { sendSessionAffinityHeaders: true },
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "short",
+				headers: {
+					session_id: "option-session-id",
+					"x-client-request-id": "option-client-request",
+					"x-session-affinity": "option-affinity",
+				},
+				sessionId: "generated-session-should-be-overridden",
+			},
+		},
+	},
+	{
+		id: "anthropic-cache-control-short-markers",
+		title: "Anthropic cache-control markers apply to instruction, last tool, and last assistant text",
+		input: {
+			model: buildModel({
+				id: "anthropic/cache-short-fixture",
+				name: "Anthropic Cache Short Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				compat: { cacheControlFormat: "anthropic" },
+			}),
+			context: {
+				systemPrompt: "Cache this instruction.",
+				messages: [
+					{ role: "user", content: "Earlier user text is not the last conversation breakpoint." },
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "First assistant text." },
+							{ type: "text", text: "Last assistant text gets the cache marker." },
+						],
+						api: "openai-completions",
+						provider: "openrouter",
+						model: "anthropic/cache-short-fixture",
+						usage,
+						stopReason: "stop",
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "short",
+				sessionId: "fixture-anthropic-cache-short",
+			},
+		},
+	},
+	{
+		id: "anthropic-cache-control-long-ttl",
+		title: "Anthropic long cache-control markers include ttl 1h when long cache is supported",
+		input: {
+			model: buildModel({
+				id: "anthropic/cache-long-fixture",
+				name: "Anthropic Cache Long Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				compat: { cacheControlFormat: "anthropic" },
+			}),
+			context: {
+				systemPrompt: "Cache this long-retention instruction.",
+				messages: [{ role: "user", content: "Last user text gets long cache control." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				sessionId: "fixture-anthropic-cache-long",
+			},
+		},
+	},
+	{
+		id: "anthropic-cache-control-long-unsupported",
+		title: "Anthropic long cache-control markers omit ttl when long cache is unsupported",
+		input: {
+			model: buildModel({
+				id: "anthropic/cache-long-unsupported-fixture",
+				name: "Anthropic Cache Long Unsupported Fixture",
+				compat: { cacheControlFormat: "anthropic", supportsLongCacheRetention: false },
+			}),
+			context: {
+				systemPrompt: "Cache without long ttl support.",
+				messages: [{ role: "user", content: "Last user text gets short cache control shape." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				sessionId: "fixture-anthropic-cache-long-unsupported",
+			},
+		},
+	},
+	{
+		id: "anthropic-cache-control-no-text-breakpoints",
+		title: "Anthropic cache control does not rewrite non-text content to carry markers",
+		input: {
+			model: buildModel({
+				id: "anthropic/cache-no-text-fixture",
+				name: "Anthropic Cache No Text Fixture",
+				input: ["text", "image"],
+				compat: { cacheControlFormat: "anthropic" },
+			}),
+			context: {
+				messages: [
+					{
+						role: "user",
+						content: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+					},
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder", cacheRetention: "short" },
+		},
+	},
+	{
+		id: "anthropic-cache-control-cache-none",
+		title: "Cache retention none suppresses Anthropic cache-control markers",
+		input: {
+			model: buildModel({
+				id: "anthropic/cache-none-fixture",
+				name: "Anthropic Cache None Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				compat: { cacheControlFormat: "anthropic" },
+			}),
+			context: {
+				systemPrompt: "This instruction should not receive cache control.",
+				messages: [{ role: "user", content: "This user text should not receive cache control." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				sessionId: "fixture-anthropic-cache-none",
+			},
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {
@@ -1267,11 +1631,18 @@ function buildMockStream(): ReadableStream<Uint8Array> {
 
 async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	const originalFetch = globalThis.fetch;
+	const originalCacheRetention = process.env.PI_CACHE_RETENTION;
 	const allowedOrigin = new URL(scenario.input.model.baseUrl).origin;
 	let capturedFetch: CapturedFetch | undefined;
 	let observedPayload: unknown;
 	const runtimeModel = toRuntimeModel(scenario.input.model);
 	const resolvedCompat = stableValue(getOpenAICompletionsCompatForTesting(runtimeModel));
+
+	if (scenario.input.options.cacheRetention === "env-long") {
+		process.env.PI_CACHE_RETENTION = "long";
+	} else {
+		delete process.env.PI_CACHE_RETENTION;
+	}
 
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const request = input instanceof Request ? input : new Request(input, init);
@@ -1356,6 +1727,11 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 		};
 	} finally {
 		globalThis.fetch = originalFetch;
+		if (originalCacheRetention === undefined) {
+			delete process.env.PI_CACHE_RETENTION;
+		} else {
+			process.env.PI_CACHE_RETENTION = originalCacheRetention;
+		}
 	}
 }
 

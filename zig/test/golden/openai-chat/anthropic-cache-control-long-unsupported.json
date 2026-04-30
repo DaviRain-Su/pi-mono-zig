@@ -1,0 +1,182 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "cacheControlFormat": "anthropic",
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": false,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openai",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "Cache without long ttl support.",
+                "type": "text"
+              }
+            ],
+            "role": "system"
+          },
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "Last user text gets short cache control shape.",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "anthropic/cache-long-unsupported-fixture",
+        "prompt_cache_key": "fixture-anthropic-cache-long-unsupported",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "function": {
+              "description": "Return deterministic weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "anyOf": [
+                      {
+                        "const": "celsius",
+                        "type": "string"
+                      },
+                      {
+                        "const": "fahrenheit",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "city",
+                  "unit"
+                ],
+                "type": "object"
+              },
+              "strict": false
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "url": "https://api.openai.com/v1/chat/completions"
+    }
+  },
+  "id": "anthropic-cache-control-long-unsupported",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Last user text gets short cache control shape.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "Cache without long ttl support.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.openai.com/v1",
+      "compat": {
+        "cacheControlFormat": "anthropic",
+        "supportsLongCacheRetention": false
+      },
+      "id": "anthropic/cache-long-unsupported-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Anthropic Cache Long Unsupported Fixture",
+      "provider": "openai",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "long",
+      "sessionId": "fixture-anthropic-cache-long-unsupported"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Anthropic long cache-control markers omit ttl when long cache is unsupported"
+}
