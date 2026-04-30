@@ -6,6 +6,16 @@ cd "$(dirname "$0")/.."
 for name in "${!PI_M6_EXTENSION_HOST_@}"; do
 	unset "$name"
 done
+for name in "${!PI_@}"; do
+	unset "$name"
+done
+
+TS_RPC_PARITY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/pi-ts-rpc-parity-home.XXXXXX")"
+trap 'rm -rf "$TS_RPC_PARITY_HOME"' EXIT
+export HOME="$TS_RPC_PARITY_HOME"
+export USERPROFILE="$TS_RPC_PARITY_HOME"
+export PI_CODING_AGENT_DIR="$TS_RPC_PARITY_HOME/.pi/agent"
+export npm_config_update_notifier=false
 
 echo "TS-RPC parity: checking TypeScript fixtures are current and read-only"
 npx tsx test/generate-ts-rpc-fixtures.ts --check
@@ -78,13 +88,18 @@ SCENARIOS = [
 ]
 
 M6_HOST_ENV_PREFIX = "PI_M6_EXTENSION_HOST_"
+TEST_HOME = os.environ["HOME"]
+TEST_AGENT_DIR = os.environ["PI_CODING_AGENT_DIR"]
 
 def clean_child_env(env_extra=None):
 	env = {
 		key: value
 		for key, value in os.environ.items()
-		if not key.startswith(M6_HOST_ENV_PREFIX)
+		if not key.startswith("PI_") and key != "HOME" and key != "USERPROFILE"
 	}
+	env["HOME"] = TEST_HOME
+	env["USERPROFILE"] = TEST_HOME
+	env["PI_CODING_AGENT_DIR"] = TEST_AGENT_DIR
 	if env_extra:
 		env.update(env_extra)
 	return env
@@ -529,13 +544,18 @@ import time
 from pathlib import Path
 
 M6_HOST_ENV_PREFIX = "PI_M6_EXTENSION_HOST_"
+TEST_HOME = os.environ["HOME"]
+TEST_AGENT_DIR = os.environ["PI_CODING_AGENT_DIR"]
 
 def clean_child_env(env_extra=None):
 	env = {
 		key: value
 		for key, value in os.environ.items()
-		if not key.startswith(M6_HOST_ENV_PREFIX)
+		if not key.startswith("PI_") and key != "HOME" and key != "USERPROFILE"
 	}
+	env["HOME"] = TEST_HOME
+	env["USERPROFILE"] = TEST_HOME
+	env["PI_CODING_AGENT_DIR"] = TEST_AGENT_DIR
 	if env_extra:
 		env.update(env_extra)
 	return env

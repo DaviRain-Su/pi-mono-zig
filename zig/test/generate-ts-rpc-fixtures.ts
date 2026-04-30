@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
@@ -111,6 +112,14 @@ function deterministicCryptoPreload(): string {
 }
 
 function captureRuntimeStdout(scenario: RuntimeScenario, options: RuntimeCaptureOptions = {}): string {
+	const cleanHome = mkdtempSync(join(tmpdir(), "pi-ts-rpc-fixture-home-"));
+	const env = {
+		...process.env,
+		HOME: cleanHome,
+		USERPROFILE: cleanHome,
+		PI_CODING_AGENT_DIR: join(cleanHome, ".pi", "agent"),
+		npm_config_update_notifier: "false",
+	};
 	const result = spawnSync(
 		process.execPath,
 		["--import", deterministicCryptoPreload(), "--import", "tsx", scriptPath, `--runtime-child=${scenario}`],
@@ -118,10 +127,11 @@ function captureRuntimeStdout(scenario: RuntimeScenario, options: RuntimeCapture
 			cwd: repoRoot,
 			input: options.input ?? "",
 			encoding: "utf8",
-			env: process.env,
+			env,
 			maxBuffer: 1024 * 1024 * 10,
 		},
 	);
+	rmSync(cleanHome, { recursive: true, force: true });
 
 	if (result.error) {
 		throw result.error;
@@ -577,7 +587,7 @@ function m5Assistant(
 		content,
 		api: "faux",
 		provider: "faux",
-		model: "gpt-5.5",
+		model: "faux-1",
 		usage: usageValue,
 		stopReason,
 		...(errorMessage === undefined ? {} : { errorMessage }),
@@ -637,12 +647,12 @@ function emitM5TextTurn(
 }
 
 function emitM5SimplePrompt(emit: (event: AgentSessionEvent) => void): void {
-	emitM5TextTurn(emit, "hello", "faux response", ["faux respons", "e"], m5Usage(1247, 4, 0, 1247, 2498));
+	emitM5TextTurn(emit, "hello", "faux response", ["faux respons", "e"], m5Usage(1124, 4, 0, 1124, 2252));
 }
 
 function emitM5Thinking(emit: (event: AgentSessionEvent) => void): void {
 	const user = m5User("think");
-	const usageValue = m5Usage(1247, 8, 0, 1247, 2502);
+	const usageValue = m5Usage(1124, 8, 0, 1124, 2256);
 	const emptyAssistant = m5Assistant([], usageValue);
 	emit({ type: "agent_start" } satisfies AgentEvent);
 	emit({ type: "turn_start" } satisfies AgentEvent);
@@ -714,7 +724,7 @@ function emitM5Thinking(emit: (event: AgentSessionEvent) => void): void {
 
 function emitM5Tool(emit: (event: AgentSessionEvent) => void): void {
 	const user = m5User("run tool");
-	const firstUsage = m5Usage(1248, 9, 0, 1248, 2505);
+	const firstUsage = m5Usage(1125, 9, 0, 1125, 2259);
 	const firstEmpty = m5Assistant([], firstUsage, "toolUse");
 	const toolCall = { type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "printf tool-ok" } } satisfies ToolCall;
 	emit({ type: "agent_start" } satisfies AgentEvent);
@@ -762,7 +772,7 @@ function emitM5Tool(emit: (event: AgentSessionEvent) => void): void {
 	emit({ type: "message_end", message: toolResultMessage } satisfies AgentEvent);
 	emit({ type: "turn_end", message: toolAssistant, toolResults: [toolResultMessage] } satisfies AgentEvent);
 
-	const secondUsage = m5Usage(1110, 1, 156, 1110, 2377);
+	const secondUsage = m5Usage(1110, 1, 32, 1110, 2253);
 	const secondEmpty = m5Assistant([], secondUsage);
 	emit({ type: "turn_start" } satisfies AgentEvent);
 	emit({ type: "message_start", message: secondEmpty } satisfies AgentEvent);
@@ -789,7 +799,7 @@ function emitM5Tool(emit: (event: AgentSessionEvent) => void): void {
 }
 
 function emitM5Retry(emit: (event: AgentSessionEvent) => void): void {
-	emitM5TextTurn(emit, "retry", "faux response", ["faux respons", "e"], m5Usage(1247, 4, 0, 1247, 2498), {
+	emitM5TextTurn(emit, "retry", "faux response", ["faux respons", "e"], m5Usage(1124, 4, 0, 1124, 2252), {
 		stopReason: "error",
 		errorMessage: "503 service unavailable",
 	});
