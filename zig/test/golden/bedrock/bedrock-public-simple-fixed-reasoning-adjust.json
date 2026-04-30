@@ -1,25 +1,37 @@
 {
   "expected": {
     "typeScriptRequest": {
-      "mode": "streamBedrock",
+      "mode": "streamSimple",
       "payload": {
+        "additionalModelRequestFields": {
+          "anthropic_beta": [
+            "interleaved-thinking-2025-05-14"
+          ],
+          "thinking": {
+            "budget_tokens": 3072,
+            "display": "summarized",
+            "type": "enabled"
+          }
+        },
         "inferenceConfig": {
-          "maxTokens": 7
+          "maxTokens": 4096
         },
         "messages": [
           {
             "content": [
               {
-                "text": "replacement payload"
+                "text": "Return a concise Bedrock fixture response."
               }
             ],
             "role": "user"
           }
         ],
         "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "requestMetadata": {
-          "replacement": "true"
-        }
+        "system": [
+          {
+            "text": "You are the deterministic Bedrock fixture assistant."
+          }
+        ]
       }
     },
     "typeScriptStream": [
@@ -72,7 +84,7 @@
       }
     ]
   },
-  "id": "bedrock-onpayload-replacement",
+  "id": "bedrock-public-simple-fixed-reasoning-adjust",
   "input": {
     "context": {
       "messages": [
@@ -120,7 +132,7 @@
       ],
       "format": "json-lines"
     },
-    "mode": "streamBedrock",
+    "mode": "streamSimple",
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -134,8 +146,8 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 64,
-      "onPayload": "replace"
+      "maxTokens": 128,
+      "reasoning": "high"
     }
   },
   "metadata": {
@@ -259,5 +271,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock onPayload replacement sends exactly the replacement payload"
+  "title": "Bedrock public streamSimple fixed Claude reasoning applies provider-specific max token adjustment"
 }
