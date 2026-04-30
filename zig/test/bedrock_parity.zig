@@ -154,8 +154,16 @@ fn parseModel(allocator: std.mem.Allocator, value: std.json.Value) !types.Model 
         .reasoning = optionalBool(value, "reasoning") orelse false,
         .input_types = input_types,
         .context_window = 200_000,
-        .max_tokens = 4096,
+        .max_tokens = parseOptionalModelMaxTokens(value) orelse 4096,
     };
+}
+
+
+fn parseOptionalModelMaxTokens(value: std.json.Value) ?u32 {
+    const field_name = [_]u8{ 'm', 'a', 'x', 'T', 'o', 'k', 'e', 'n', 's' };
+    const field = optionalField(value, field_name[0..]) orelse return null;
+    if (field != .integer) return null;
+    return std.math.cast(u32, field.integer) orelse null;
 }
 
 fn parseContext(allocator: std.mem.Allocator, value: std.json.Value) !types.Context {
@@ -264,6 +272,7 @@ fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !?types.Str
         .max_tokens = parsed_limit,
         .cache_retention = parseCacheRetention(optionalString(value, "cacheRetention")),
         .google_tool_choice = optionalString(value, "googleToolChoice"),
+        .bedrock_region = optionalString(value, "region"),
         .bedrock_tool_choice = try parseBedrockToolChoice(allocator, optionalField(value, "toolChoice")),
         .bedrock_reasoning = parseThinkingLevel(optionalString(value, "reasoning")),
         .bedrock_thinking_budgets = try parseThinkingBudgets(optionalField(value, "thinkingBudgets")),

@@ -165,32 +165,66 @@ pub const BedrockProvider = struct {
         context: types.Context,
         options: ?types.StreamOptions,
     ) !event_stream.AssistantMessageEventStream {
-        var base = simple_options.buildBaseOptions(model, null, null);
-        if (options) |stream_options| {
-            base = stream_options;
-        }
-        if (base.bedrock_reasoning) |reasoning| {
-            if (isAnthropicClaudeModel(model) and !supportsAdaptiveThinking(model.id, model.name)) {
-                const adjusted = simple_options.adjustMaxTokensForThinking(
-                    base.max_tokens orelse 0,
-                    model.max_tokens,
-                    reasoning,
-                    base.bedrock_thinking_budgets,
-                );
-                base.max_tokens = adjusted.max_tokens;
-                var budgets = base.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
-                switch (simple_options.clampReasoning(reasoning).?) {
-                    .minimal => budgets.minimal = adjusted.thinking_budget,
-                    .low => budgets.low = adjusted.thinking_budget,
-                    .medium => budgets.medium = adjusted.thinking_budget,
-                    .high, .xhigh => budgets.high = adjusted.thinking_budget,
-                }
-                base.bedrock_thinking_budgets = budgets;
-            }
-        }
+        const base = buildStreamSimpleBedrockOptions(model, options);
         return stream(allocator, io, model, context, base);
     }
 };
+
+fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOptions) types.StreamOptions {
+    const stream_options = options orelse types.StreamOptions{};
+    var base = types.StreamOptions{
+        .temperature = stream_options.temperature,
+        .max_tokens = stream_options.max_tokens orelse defaultSimpleMaxTokens(model),
+        .api_key = stream_options.api_key,
+        .transport = stream_options.transport,
+        .cache_retention = stream_options.cache_retention,
+        .session_id = stream_options.session_id,
+        .headers = stream_options.headers,
+        .timeout_ms = stream_options.timeout_ms,
+        .max_retries = stream_options.max_retries,
+        .on_payload = stream_options.on_payload,
+        .on_response = stream_options.on_response,
+        .signal = stream_options.signal,
+        .max_retry_delay_ms = stream_options.max_retry_delay_ms,
+        .metadata = stream_options.metadata,
+    };
+
+    const reasoning = stream_options.bedrock_reasoning orelse return base;
+    if (isAnthropicClaudeModel(model)) {
+        if (supportsAdaptiveThinking(model.id, model.name)) {
+            base.bedrock_reasoning = reasoning;
+            base.bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
+            return base;
+        }
+
+        const adjusted = simple_options.adjustMaxTokensForThinking(
+            base.max_tokens orelse 0,
+            model.max_tokens,
+            reasoning,
+            stream_options.bedrock_thinking_budgets,
+        );
+        base.max_tokens = adjusted.max_tokens;
+        var budgets = stream_options.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+        switch (simple_options.clampReasoning(reasoning).?) {
+            .minimal => budgets.minimal = adjusted.thinking_budget,
+            .low => budgets.low = adjusted.thinking_budget,
+            .medium => budgets.medium = adjusted.thinking_budget,
+            .high, .xhigh => budgets.high = adjusted.thinking_budget,
+        }
+        base.bedrock_reasoning = reasoning;
+        base.bedrock_thinking_budgets = budgets;
+        return base;
+    }
+
+    base.bedrock_reasoning = reasoning;
+    base.bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
+    return base;
+}
+
+fn defaultSimpleMaxTokens(model: types.Model) ?u32 {
+    if (model.max_tokens == 0) return null;
+    return @min(model.max_tokens, @as(u32, 32000));
+}
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
@@ -242,10 +276,17 @@ pub fn buildRequestSnapshotValue(
     errdefer request.deinit(allocator);
     try request.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, mode) });
 
-    var payload = try buildRequestPayload(allocator, model, context, options);
+    var snapshot_options = options;
+    var simple_snapshot_options: types.StreamOptions = undefined;
+    if (std.mem.eql(u8, mode, "streamSimpleBedrock")) {
+        simple_snapshot_options = buildStreamSimpleBedrockOptions(model, options);
+        snapshot_options = simple_snapshot_options;
+    }
+
+    var payload = try buildRequestPayload(allocator, model, context, snapshot_options);
     errdefer freeJsonValue(allocator, payload);
     try payload.object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
-    if (options) |stream_options| {
+    if (snapshot_options) |stream_options| {
         if (stream_options.on_payload) |callback| {
             if (try callback(allocator, payload, model)) |replacement| {
                 freeJsonValue(allocator, payload);
@@ -496,10 +537,14 @@ fn supportsPromptCaching(model: types.Model) bool {
 
 fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions) bool {
     if (options.bedrock_region) |region| {
-        if (std.mem.startsWith(u8, region, "us-gov-")) return true;
+        if (asciiStartsWithIgnoreCase(region, "us-gov-")) return true;
     }
-    const id = model.id;
-    return std.mem.startsWith(u8, id, "us-gov.") or std.mem.startsWith(u8, id, "arn:aws-us-gov:");
+    return asciiStartsWithIgnoreCase(model.id, "us-gov.") or asciiStartsWithIgnoreCase(model.id, "arn:aws-us-gov:");
+}
+
+fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
 fn mapThinkingLevelToEffort(level: types.ThinkingLevel, model: types.Model) []const u8 {

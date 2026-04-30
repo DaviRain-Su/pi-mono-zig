@@ -54,6 +54,32 @@ const allowedScenarioIds = [
 	"bedrock-onpayload-pass-through",
 	"bedrock-onpayload-replacement",
 	"bedrock-reasoning-fields",
+	"bedrock-reasoning-fixed-default-minimal",
+	"bedrock-reasoning-fixed-default-low",
+	"bedrock-reasoning-fixed-default-medium",
+	"bedrock-reasoning-fixed-default-high",
+	"bedrock-reasoning-fixed-default-xhigh",
+	"bedrock-reasoning-fixed-custom-low",
+	"bedrock-reasoning-fixed-custom-high",
+	"bedrock-reasoning-fixed-custom-xhigh",
+	"bedrock-reasoning-adaptive-opus46-xhigh",
+	"bedrock-reasoning-adaptive-opus47-xhigh",
+	"bedrock-reasoning-adaptive-sonnet46-xhigh",
+	"bedrock-reasoning-adaptive-minimal-effort",
+	"bedrock-reasoning-adaptive-display-omitted",
+	"bedrock-reasoning-govcloud-fixed-model",
+	"bedrock-reasoning-govcloud-adaptive-region",
+	"bedrock-reasoning-govcloud-adaptive-arn",
+	"bedrock-reasoning-interleaved-default",
+	"bedrock-reasoning-interleaved-true",
+	"bedrock-app-profile-adaptive-by-name",
+	"bedrock-app-profile-fixed-by-name",
+	"bedrock-app-profile-nonclaude-by-name",
+	"bedrock-simple-fixed-reasoning-adjust",
+	"bedrock-simple-fixed-reasoning-custom-cap",
+	"bedrock-simple-no-reasoning-no-adjust",
+	"bedrock-simple-adaptive-no-adjust",
+	"bedrock-simple-nonclaude-no-adjust",
 	"bedrock-transform-replay-edge-cases",
 	"bedrock-simple-explicit-tokens",
 	"bedrock-binary-eventstream-tool-use",
@@ -63,6 +89,13 @@ const allowedModelIds = [
 	"anthropic.claude-3-7-sonnet-20250219-v1:0",
 	"anthropic.claude-3-5-haiku-20241022-v1:0",
 	"amazon.nova-pro-v1:0",
+	"us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"global.anthropic.claude-opus-4-6-v1",
+	"global.anthropic.claude-opus-4-7-v1",
+	"global.anthropic.claude-sonnet-4-6-v1",
+	"arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/global.anthropic.claude-opus-4-7-v1",
+	"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/fixture-profile",
 ] as const;
 
 const allowedLocalStreamFormats = ["json-lines", "aws-eventstream"] as const;
@@ -89,10 +122,12 @@ interface FixtureModelInput {
 	baseUrl: string;
 	reasoning: boolean;
 	input: ("text" | "image")[];
+	maxTokens?: number;
 }
 
 interface SerializableOptions {
 	cacheRetention?: "none" | "short" | "long";
+	region?: string;
 	maxTokens?: number;
 	temperature?: number;
 	toolChoice?: BedrockOptions["toolChoice"];
@@ -243,6 +278,64 @@ const visionModel: FixtureModelInput = {
 	input: ["text", "image"],
 };
 
+const sonnet45Model: FixtureModelInput = {
+	...baseModel,
+	id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	name: "Claude Sonnet 4.5 Bedrock Fixture",
+};
+
+const govCloudSonnet45Model: FixtureModelInput = {
+	...sonnet45Model,
+	id: "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	name: "Claude Sonnet 4.5 GovCloud Fixture",
+};
+
+const opus46Model: FixtureModelInput = {
+	...baseModel,
+	id: "global.anthropic.claude-opus-4-6-v1",
+	name: "Claude Opus 4.6 Global Fixture",
+};
+
+const opus47Model: FixtureModelInput = {
+	...baseModel,
+	id: "global.anthropic.claude-opus-4-7-v1",
+	name: "Claude Opus 4.7 Global Fixture",
+};
+
+const sonnet46Model: FixtureModelInput = {
+	...baseModel,
+	id: "global.anthropic.claude-sonnet-4-6-v1",
+	name: "Claude Sonnet 4.6 Global Fixture",
+};
+
+const govCloudAdaptiveArnModel: FixtureModelInput = {
+	...baseModel,
+	id: "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/global.anthropic.claude-opus-4-7-v1",
+	name: "Claude Opus 4.7 GovCloud ARN Fixture",
+};
+
+const appProfileAdaptiveModel: FixtureModelInput = {
+	...baseModel,
+	id: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/fixture-profile",
+	name: "Claude Opus 4.6 Application Profile Fixture",
+};
+
+const appProfileFixedModel: FixtureModelInput = {
+	...appProfileAdaptiveModel,
+	name: "Claude Sonnet 4.5 Application Profile Fixture",
+};
+
+const appProfileNonClaudeModel: FixtureModelInput = {
+	...appProfileAdaptiveModel,
+	name: "Nova Pro Application Profile Fixture",
+};
+
+const cappedClaudeModel: FixtureModelInput = {
+	...baseModel,
+	name: "Claude 3.7 Sonnet Capped Fixture",
+	maxTokens: 10_000,
+};
+
 const baseContext = {
 	systemPrompt: "You are the deterministic Bedrock fixture assistant.",
 	messages: [{ role: "user", content: "Return a concise Bedrock fixture response." }],
@@ -338,6 +431,26 @@ const toolUseEvents: ConverseStreamFixtureEvent[] = [
 	{ messageStop: { stopReason: "tool_use" } },
 	{ metadata: { usage: { inputTokens: 21, outputTokens: 9, totalTokens: 30 } } },
 ];
+
+function reasoningScenario(
+	id: ScenarioId,
+	title: string,
+	model: FixtureModelInput,
+	options: SerializableOptions,
+	mode: ScenarioInput["mode"] = "streamBedrock",
+): Scenario {
+	return {
+		id,
+		title,
+		input: {
+			mode,
+			model,
+			context: baseContext,
+			options: { cacheRetention: "none", ...options },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	};
+}
 
 const scenarios: Scenario[] = [
 	{
@@ -541,6 +654,167 @@ const scenarios: Scenario[] = [
 			localStream: { format: "json-lines", events: textEvents },
 		},
 	},
+	reasoningScenario(
+		"bedrock-reasoning-fixed-default-minimal",
+		"Bedrock fixed Claude minimal reasoning uses the default 1024 token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "minimal" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-default-low",
+		"Bedrock fixed Claude low reasoning uses the default 2048 token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "low" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-default-medium",
+		"Bedrock fixed Claude medium reasoning uses the default 8192 token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "medium" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-default-high",
+		"Bedrock fixed Claude high reasoning uses the default 16384 token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "high" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-default-xhigh",
+		"Bedrock fixed Claude xhigh reasoning clamps to the high default token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "xhigh" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-custom-low",
+		"Bedrock fixed Claude low reasoning honors a custom token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "low", thinkingBudgets: { low: 3072 } },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-custom-high",
+		"Bedrock fixed Claude high reasoning honors a custom token budget and explicit interleaved true",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "high", thinkingBudgets: { high: 12_000 }, interleavedThinking: true },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-fixed-custom-xhigh",
+		"Bedrock fixed Claude xhigh reasoning uses the custom high token budget",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "xhigh", thinkingBudgets: { high: 14_000 } },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-adaptive-opus46-xhigh",
+		"Bedrock adaptive Claude Opus 4.6 maps xhigh reasoning to max effort",
+		opus46Model,
+		{ maxTokens: 128, reasoning: "xhigh" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-adaptive-opus47-xhigh",
+		"Bedrock adaptive Claude Opus 4.7 maps xhigh reasoning to xhigh effort",
+		opus47Model,
+		{ maxTokens: 128, reasoning: "xhigh" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-adaptive-sonnet46-xhigh",
+		"Bedrock adaptive Claude Sonnet 4.6 maps xhigh reasoning to high effort",
+		sonnet46Model,
+		{ maxTokens: 128, reasoning: "xhigh" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-adaptive-minimal-effort",
+		"Bedrock adaptive Claude minimal reasoning maps to low effort",
+		opus47Model,
+		{ maxTokens: 128, reasoning: "minimal" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-adaptive-display-omitted",
+		"Bedrock adaptive Claude forwards explicit omitted thinking display outside GovCloud",
+		opus47Model,
+		{ maxTokens: 128, reasoning: "high", thinkingDisplay: "omitted" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-govcloud-fixed-model",
+		"Bedrock GovCloud fixed Claude model ids omit thinking display",
+		govCloudSonnet45Model,
+		{ maxTokens: 20_000, reasoning: "high", thinkingDisplay: "omitted" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-govcloud-adaptive-region",
+		"Bedrock GovCloud regions omit thinking display for adaptive Claude",
+		opus47Model,
+		{ region: "us-gov-west-1", maxTokens: 128, reasoning: "high", thinkingDisplay: "omitted" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-govcloud-adaptive-arn",
+		"Bedrock GovCloud ARNs omit thinking display for adaptive Claude",
+		govCloudAdaptiveArnModel,
+		{ maxTokens: 128, reasoning: "high" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-interleaved-default",
+		"Bedrock fixed Claude reasoning emits interleaved thinking beta by default",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "high" },
+	),
+	reasoningScenario(
+		"bedrock-reasoning-interleaved-true",
+		"Bedrock fixed Claude reasoning emits interleaved thinking beta when explicitly true",
+		baseModel,
+		{ maxTokens: 20_000, reasoning: "medium", interleavedThinking: true },
+	),
+	reasoningScenario(
+		"bedrock-app-profile-adaptive-by-name",
+		"Bedrock application inference profiles use model.name for adaptive Claude reasoning",
+		appProfileAdaptiveModel,
+		{ maxTokens: 128, reasoning: "xhigh" },
+	),
+	reasoningScenario(
+		"bedrock-app-profile-fixed-by-name",
+		"Bedrock application inference profiles use model.name for fixed-budget Claude reasoning",
+		appProfileFixedModel,
+		{ maxTokens: 20_000, reasoning: "high" },
+	),
+	reasoningScenario(
+		"bedrock-app-profile-nonclaude-by-name",
+		"Bedrock application inference profiles omit reasoning fields when model.name is not Claude",
+		appProfileNonClaudeModel,
+		{ maxTokens: 128, reasoning: "high" },
+	),
+	reasoningScenario(
+		"bedrock-simple-fixed-reasoning-adjust",
+		"Bedrock streamSimple fixed Claude reasoning adjusts max tokens and thinking budget within the model cap",
+		baseModel,
+		{ maxTokens: 128, reasoning: "high" },
+		"streamSimpleBedrock",
+	),
+	reasoningScenario(
+		"bedrock-simple-fixed-reasoning-custom-cap",
+		"Bedrock streamSimple fixed Claude reasoning preserves custom budget when the capped max tokens allow output",
+		cappedClaudeModel,
+		{ maxTokens: 7000, reasoning: "high", thinkingBudgets: { high: 5000 } },
+		"streamSimpleBedrock",
+	),
+	reasoningScenario(
+		"bedrock-simple-no-reasoning-no-adjust",
+		"Bedrock streamSimple without reasoning keeps explicit max tokens and omits reasoning fields",
+		baseModel,
+		{ maxTokens: 128 },
+		"streamSimpleBedrock",
+	),
+	reasoningScenario(
+		"bedrock-simple-adaptive-no-adjust",
+		"Bedrock streamSimple adaptive Claude reasoning does not apply fixed-budget token reserve",
+		opus47Model,
+		{ maxTokens: 128, reasoning: "xhigh" },
+		"streamSimpleBedrock",
+	),
+	reasoningScenario(
+		"bedrock-simple-nonclaude-no-adjust",
+		"Bedrock streamSimple non-Claude reasoning does not apply fixed-budget token reserve",
+		novaModel,
+		{ maxTokens: 128, reasoning: "high" },
+		"streamSimpleBedrock",
+	),
 	{
 		id: "bedrock-transform-replay-edge-cases",
 		title: "Bedrock transformMessages skips failed assistants and synthesizes orphaned tool results",
@@ -592,7 +866,7 @@ function toRuntimeModel(model: FixtureModelInput): Model<"bedrock-converse-strea
 		...model,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200_000,
-		maxTokens: 4096,
+		maxTokens: model.maxTokens ?? 4096,
 	};
 }
 
@@ -609,6 +883,7 @@ function toRuntimeContext(context: DeclarativeContext): Context {
 function toRuntimeOptions(options: SerializableOptions): BedrockOptions {
 	return {
 		...(options.cacheRetention !== undefined ? { cacheRetention: options.cacheRetention } : {}),
+		...(options.region !== undefined ? { region: options.region } : {}),
 		...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
 		...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
 		...(options.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
