@@ -219,6 +219,23 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "openai-base-path-trailing-slash-url",
+		title: "OpenAI-compatible base URL with nested base path and trailing slash uses the submitted request URL",
+		input: {
+			model: buildModel({
+				id: "gpt-4.1-base-path-fixture",
+				name: "GPT 4.1 Base Path Fixture",
+				baseUrl: "https://llm-proxy.example.test/custom/openai/v1/",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				maxTokens: 16,
+			},
+		},
+	},
+	{
 		id: "openai-on-payload-replacement",
 		title: "onPayload replacement is the submitted request body",
 		input: {
