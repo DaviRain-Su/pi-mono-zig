@@ -7,6 +7,7 @@ import {
 	ThrottlingException,
 	ValidationException,
 } from "@aws-sdk/client-bedrock-runtime";
+import type { HttpHandlerOptions, HttpRequest, HttpResponse, RequestHandler } from "@smithy/types";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -155,6 +156,8 @@ const fixtureTimestamp = {
 	amzDate: "20250115T120000Z",
 	dateStamp: "20250115",
 } as const;
+
+const sdkRequestCaptureError = Symbol("bedrock-sdk-request-captured");
 
 type ScenarioId = (typeof allowedScenarioIds)[number];
 type LocalStreamFormat = (typeof allowedLocalStreamFormats)[number];
@@ -1422,7 +1425,12 @@ async function withScenarioEnv<T>(scenario: Scenario, action: () => Promise<T>):
 	>;
 	try {
 		for (const key of fixtureEnvKeys) {
-			process.env[key] = scenario.input.env?.[key] ?? "";
+			const value = scenario.input.env?.[key];
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
 		}
 		process.env.AWS_EC2_METADATA_DISABLED = "true";
 		return await action();
@@ -1509,6 +1517,16 @@ function configuredRegion(scenario: Scenario): { source: string; value?: string 
 	return { source: "default", value: "us-east-1" };
 }
 
+class CapturingRequestHandler implements RequestHandler<HttpRequest, HttpResponse, HttpHandlerOptions> {
+	capturedRequest: HttpRequest | undefined;
+	readonly metadata = { handlerProtocol: "fixture-local" };
+
+	async handle(request: HttpRequest): Promise<{ response: HttpResponse }> {
+		this.capturedRequest = request;
+		throw sdkRequestCaptureError;
+	}
+}
+
 async function sdkRegionSnapshot(
 	config: Record<string, unknown>,
 	scenario: Scenario,
@@ -1539,20 +1557,64 @@ async function sdkRequestBaseUrl(
 	return { mode: "sdk-default", value: `https://bedrock-runtime.${region.value}.${suffix}` };
 }
 
-async function authSnapshot(
+function requestBaseUrl(request: HttpRequest): string {
+	const port = request.port === undefined ? "" : `:${request.port}`;
+	return trimTrailingSlash(`${request.protocol}//${request.hostname}${port}`);
+}
+
+function requestUrl(request: HttpRequest): string {
+	const queryText = requestQueryString(request);
+	return `${requestBaseUrl(request)}${request.path}${queryText ? `?${queryText}` : ""}`;
+}
+
+function requestQueryString(request: HttpRequest): string {
+	const query = new URLSearchParams();
+	for (const [key, value] of Object.entries(request.query ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+		if (Array.isArray(value)) {
+			for (const item of value) query.append(key, item);
+		} else if (value !== null) {
+			query.append(key, value);
+		}
+	}
+	return query.toString();
+}
+
+function headerValue(headers: Record<string, string>, name: string): string | undefined {
+	const target = name.toLowerCase();
+	for (const [key, value] of Object.entries(headers)) {
+		if (key.toLowerCase() === target) return value;
+	}
+	return undefined;
+}
+
+function parseCredentialScope(authorization: string): Record<string, string> | undefined {
+	const credentialMatch = /Credential=([^,\s]+)/.exec(authorization);
+	const credential = credentialMatch?.[1];
+	if (!credential) return undefined;
+	const parts = credential.split("/");
+	if (parts.length < 5) return undefined;
+	return {
+		date: fixtureTimestamp.dateStamp,
+		region: parts[2],
+		service: parts[3],
+		terminal: parts[4],
+	};
+}
+
+function parseSignedHeaders(authorization: string): string[] {
+	const signedHeadersMatch = /SignedHeaders=([^,\s]+)/.exec(authorization);
+	const semanticHeaders = new Set(["content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token"]);
+	return signedHeadersMatch?.[1]?.split(";").filter((header) => semanticHeaders.has(header)) ?? [];
+}
+
+function normalizeCapturedAuthSnapshot(
 	config: Record<string, unknown>,
 	scenario: Scenario,
 	region: { source: string; value?: string },
-	payload: unknown,
-): Promise<unknown> {
-	// The fixture compares SigV4 semantics, not volatile SDK byte-for-byte signing internals.
-	// Body hashing is normalized to the semantic field because TS command input and Zig
-	// local snapshots intentionally canonicalize payload object ordering for comparison.
-	void payload;
+	request: HttpRequest | undefined,
+): unknown {
 	const bearerToken = scenario.input.options.bearerToken ?? scenarioEnv(scenario, "AWS_BEARER_TOKEN_BEDROCK");
 	if (scenarioEnv(scenario, "AWS_BEDROCK_SKIP_AUTH") === "1") {
-		const credentials = await resolveProviderValue(config.credentials);
-		void credentials;
 		return {
 			mode: "skip-auth",
 			credentialSource: "proxy-dummy",
@@ -1560,17 +1622,34 @@ async function authSnapshot(
 			secrets: "redacted",
 		};
 	}
-	if (bearerToken) {
-		const authSchemePreference = await resolveProviderValue(config.authSchemePreference);
-		const token = await resolveProviderValue(config.token);
-		void authSchemePreference;
-		void token;
-		return {
-			mode: "bearer",
-			source: scenario.input.options.bearerToken ? "options.bearerToken" : "env.bearerToken",
-			token: "redacted",
-			sigv4: false,
-		};
+	if (request) {
+		const authorization = headerValue(request.headers, "authorization");
+		if (authorization?.startsWith("Bearer ")) {
+			void config;
+			return {
+				mode: "bearer",
+				source: scenario.input.options.bearerToken ? "options.bearerToken" : "env.bearerToken",
+				token: "redacted",
+				sigv4: false,
+			};
+		}
+		if (authorization?.includes("Credential=")) {
+			const credentialScope = parseCredentialScope(authorization);
+			return {
+				mode: "sigv4",
+				method: request.method,
+				query: requestQueryString(request),
+				service: credentialScope?.service ?? "bedrock",
+				region: credentialScope?.region ?? region.value ?? "us-east-1",
+				amzDate: fixtureTimestamp.amzDate,
+				credentialScope,
+				signedHeaders: parseSignedHeaders(authorization),
+				bodySha256: headerValue(request.headers, "x-amz-content-sha256") ? "normalized-payload-sha256" : "missing",
+				sessionToken: headerValue(request.headers, "x-amz-security-token") ? "redacted" : undefined,
+				accessKeyId: "redacted",
+				signature: "normalized",
+			};
+		}
 	}
 	if (scenario.input.options.profile || scenarioEnv(scenario, "AWS_PROFILE")) {
 		return {
@@ -1578,31 +1657,6 @@ async function authSnapshot(
 			optionsProfile: scenario.input.options.profile,
 			envProfile: scenarioEnv(scenario, "AWS_PROFILE"),
 			credentialDiscovery: "sdk-profile-resolution",
-		};
-	}
-	const accessKey = scenarioEnv(scenario, "AWS_ACCESS_KEY_ID");
-	const secretKey = scenarioEnv(scenario, "AWS_SECRET_ACCESS_KEY");
-	if (accessKey && secretKey) {
-		const credentials = await resolveProviderValue(config.credentials);
-		void credentials;
-		return {
-			mode: "sigv4",
-			method: "POST",
-			query: "",
-			service: "bedrock",
-			region: region.value ?? "us-east-1",
-			amzDate: fixtureTimestamp.amzDate,
-			credentialScope: {
-				date: fixtureTimestamp.dateStamp,
-				region: region.value ?? "us-east-1",
-				service: "bedrock",
-				terminal: "aws4_request",
-			},
-			signedHeaders: ["content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token"],
-			bodySha256: "normalized-payload-sha256",
-			sessionToken: scenarioEnv(scenario, "AWS_SESSION_TOKEN") ? "redacted" : undefined,
-			accessKeyId: "redacted",
-			signature: "normalized",
 		};
 	}
 	return {
@@ -1613,16 +1667,56 @@ async function authSnapshot(
 	};
 }
 
-async function buildRequestSurfaceSnapshot(scenario: Scenario, payload: unknown, sdkClient: unknown): Promise<unknown> {
+function shouldCaptureFinalizedSdkRequest(scenario: Scenario): boolean {
+	if (scenarioEnv(scenario, "AWS_BEDROCK_SKIP_AUTH") === "1") return false;
+	if (scenario.input.options.bearerToken || scenarioEnv(scenario, "AWS_BEARER_TOKEN_BEDROCK")) return true;
+	return Boolean(scenarioEnv(scenario, "AWS_ACCESS_KEY_ID") && scenarioEnv(scenario, "AWS_SECRET_ACCESS_KEY"));
+}
+
+async function captureFinalizedSdkRequest(
+	scenario: Scenario,
+	sdkClient: unknown,
+	command: unknown,
+	options: unknown,
+	originalSend: (this: unknown, command: unknown, options?: unknown) => Promise<ConverseStreamOutput>,
+): Promise<HttpRequest | undefined> {
+	const client = sdkClient as {
+		config?: Record<string, unknown>;
+		middlewareStack?: { clone?: () => unknown };
+	};
+	if (!isRecord(client.config)) return undefined;
+
+	const originalRequestHandler = client.config.requestHandler;
+	const captureHandler = new CapturingRequestHandler();
+	client.config.requestHandler = captureHandler;
+	try {
+		await originalSend.call(sdkClient, command, options);
+	} catch (error) {
+		if (error !== sdkRequestCaptureError && captureHandler.capturedRequest === undefined) {
+			return undefined;
+		}
+	} finally {
+		client.config.requestHandler = originalRequestHandler;
+	}
+	return captureHandler.capturedRequest;
+}
+
+async function buildRequestSurfaceSnapshot(
+	scenario: Scenario,
+	payload: unknown,
+	sdkClient: unknown,
+	request: HttpRequest | undefined,
+): Promise<unknown> {
+	void payload;
 	const config = isRecord(sdkClient) && isRecord(sdkClient.config) ? sdkClient.config : {};
 	const path = `/model/${percentEncodePathSegment(scenario.input.model.id)}/converse-stream`;
 	const region = await sdkRegionSnapshot(config, scenario);
-	const baseUrl = await sdkRequestBaseUrl(config, region);
+	const baseUrl = request ? { mode: "sdk-http-request", value: requestBaseUrl(request) } : await sdkRequestBaseUrl(config, region);
 	return {
-		boundary: "production-request-boundary",
-		method: "POST",
-		path,
-		url: baseUrl.value ? `${baseUrl.value}${path}` : "sdk-profile-resolution",
+		boundary: request ? "aws-sdk-finalized-http-request" : "aws-sdk-client-config-boundary",
+		method: request?.method ?? "POST",
+		path: request?.path ?? path,
+		url: request ? requestUrl(request) : baseUrl.value ? `${baseUrl.value}${path}` : "sdk-profile-resolution",
 		endpoint: baseUrl,
 		region,
 		clientConfig: {
@@ -1631,7 +1725,7 @@ async function buildRequestSurfaceSnapshot(scenario: Scenario, payload: unknown,
 			endpoint: baseUrl.mode === "explicit" ? baseUrl.value : undefined,
 			region: region.value,
 		},
-		auth: await authSnapshot(config, scenario, region, payload),
+		auth: normalizeCapturedAuthSnapshot(config, scenario, region, request),
 		redaction: "secrets-redacted",
 	};
 }
@@ -1826,11 +1920,14 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	let capturedResponse: FixtureRecord["expected"]["onResponse"];
 	let activeAbortController: AbortController | undefined;
 
-	prototype.send = async function (this: unknown, command: unknown): Promise<ConverseStreamOutput> {
+	prototype.send = async function (this: unknown, command: unknown, options?: unknown): Promise<ConverseStreamOutput> {
 		const commandWithInput = command as { input?: unknown };
 		capturedPayload = stableValue(commandWithInput.input);
 		if (scenario.input.options.requestSurface === "capture") {
-			capturedRequestSurface = await buildRequestSurfaceSnapshot(scenario, capturedPayload, this);
+			const capturedRequest = shouldCaptureFinalizedSdkRequest(scenario)
+				? await captureFinalizedSdkRequest(scenario, this, command, options, originalSend)
+				: undefined;
+			capturedRequestSurface = await buildRequestSurfaceSnapshot(scenario, capturedPayload, this, capturedRequest);
 		}
 		if (scenario.input.options.sendException === "ServiceUnavailableException") {
 			throw new ServiceUnavailableException({ message: "service unavailable fixture", $metadata: {} });
@@ -1942,10 +2039,17 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 				},
 				metadata: {
 					captureBoundary:
-						"streamBedrock, streamSimpleBedrock, and streamSimple after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+						scenario.input.options.requestSurface === "capture"
+							? "streamBedrock through TypeScript Converse command construction plus AWS SDK finalized local request capture for request-surface fixtures"
+							: "streamBedrock, streamSimpleBedrock, and streamSimple after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
 					captureMethod:
-						"BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
-					network: "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
+						scenario.input.options.requestSurface === "capture"
+							? "Request-surface fixtures use AWS SDK local request capture when bearer/SigV4 signing can finalize locally, and SDK client config capture for profile/missing-credential surfaces"
+							: "BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
+					network:
+						scenario.input.options.requestSurface === "capture"
+							? "AWS SDK requestHandler fixture throws before network when local HTTP boundary capture runs; no live AWS calls are allowed"
+							: "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
 					allowlists: {
 						scenarioIds: allowedScenarioIds,
 						modelIds: allowedModelIds,
@@ -2288,17 +2392,10 @@ async function buildRecords(): Promise<FixtureRecord[]> {
 		AWS_EC2_METADATA_DISABLED: process.env.AWS_EC2_METADATA_DISABLED,
 		AWS_BEDROCK_SKIP_AUTH: process.env.AWS_BEDROCK_SKIP_AUTH,
 	};
-	Object.assign(process.env, {
-		AWS_ACCESS_KEY_ID: "",
-		AWS_SECRET_ACCESS_KEY: "",
-		AWS_SESSION_TOKEN: "",
-		AWS_PROFILE: "",
-		AWS_BEARER_TOKEN_BEDROCK: "",
-		AWS_REGION: "",
-		AWS_DEFAULT_REGION: "",
-		AWS_EC2_METADATA_DISABLED: "true",
-		AWS_BEDROCK_SKIP_AUTH: "",
-	});
+	for (const key of fixtureEnvKeys) {
+		delete process.env[key];
+	}
+	process.env.AWS_EC2_METADATA_DISABLED = "true";
 	try {
 		const records: FixtureRecord[] = [];
 		for (const scenario of scenarios) {
@@ -2378,7 +2475,7 @@ async function main(): Promise<void> {
 	console.log(`Bedrock manifest/schema validation passed (${records.length} fixtures)`);
 	console.log(`Bedrock negative suite passed (${negatives.join(", ")})`);
 	console.log("Bedrock secret scan passed");
-	console.log("Bedrock deterministic local generator used mocked BedrockRuntimeClient.send; no live AWS calls");
+	console.log("Bedrock deterministic local generator used SDK local request capture/mocked send; no live AWS calls");
 }
 
 main().catch((error: unknown) => {

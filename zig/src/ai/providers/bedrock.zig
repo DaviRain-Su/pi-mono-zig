@@ -416,16 +416,19 @@ pub fn buildRequestSurfaceSnapshotValue(
     payload: std.json.Value,
     fixture_env: FixtureEnv,
 ) !std.json.Value {
-    _ = payload;
     const request_path = try buildRequestPath(allocator, model.id);
     defer allocator.free(request_path);
     const region = resolveFixtureRegion(model.base_url, options, fixture_env);
     const endpoint = try resolveFixtureEndpoint(allocator, model.base_url, region, fixture_env, options);
     defer if (endpoint.value) |value| allocator.free(value);
+    const use_http_boundary = useFixtureHttpRequestBoundary(options, fixture_env);
+
+    const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json_body);
 
     var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer root.deinit(allocator);
-    try root.put(allocator, try allocator.dupe(u8, "boundary"), .{ .string = try allocator.dupe(u8, "production-request-boundary") });
+    try root.put(allocator, try allocator.dupe(u8, "boundary"), .{ .string = try allocator.dupe(u8, if (use_http_boundary) "aws-sdk-finalized-http-request" else "aws-sdk-client-config-boundary") });
     try root.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
     try root.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, request_path) });
     if (endpoint.value) |base_url| {
@@ -436,7 +439,7 @@ pub fn buildRequestSurfaceSnapshotValue(
     }
 
     var endpoint_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try endpoint_object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, endpoint.mode) });
+    try endpoint_object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, if (use_http_boundary) "sdk-http-request" else endpoint.mode) });
     if (endpoint.value) |value| try endpoint_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
     try root.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .object = endpoint_object });
 
@@ -450,13 +453,13 @@ pub fn buildRequestSurfaceSnapshotValue(
         if (stream_options.bedrock_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
     }
     if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
-    if (std.mem.eql(u8, endpoint.mode, "explicit")) {
+    if (!use_http_boundary and std.mem.eql(u8, endpoint.mode, "explicit")) {
         if (endpoint.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .string = try allocator.dupe(u8, value) });
     }
     if (region.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, value) });
     try root.put(allocator, try allocator.dupe(u8, "clientConfig"), .{ .object = client_config });
 
-    const auth = try buildFixtureAuthSnapshot(allocator, options, fixture_env, region);
+    const auth = try buildFixtureAuthSnapshot(allocator, options, fixture_env, region, if (use_http_boundary) json_body else null);
     try root.put(allocator, try allocator.dupe(u8, "auth"), auth);
     try root.put(allocator, try allocator.dupe(u8, "redaction"), .{ .string = try allocator.dupe(u8, "secrets-redacted") });
     return .{ .object = root };
@@ -2449,11 +2452,21 @@ fn resolveFixtureEndpoint(
     return .{ .mode = "sdk-default", .value = try std.fmt.allocPrint(allocator, "https://bedrock-runtime.{s}.{s}", .{ region_value, suffix }) };
 }
 
+fn useFixtureHttpRequestBoundary(options: ?types.StreamOptions, env: FixtureEnv) bool {
+    if (std.mem.eql(u8, nonEmpty(env.aws_bedrock_skip_auth) orelse "", "1")) return false;
+    if (options) |stream_options| {
+        if (nonEmpty(stream_options.bedrock_bearer_token) != null) return true;
+    }
+    if (nonEmpty(env.aws_bearer_token_bedrock) != null) return true;
+    return nonEmpty(env.aws_access_key_id) != null and nonEmpty(env.aws_secret_access_key) != null;
+}
+
 fn buildFixtureAuthSnapshot(
     allocator: std.mem.Allocator,
     options: ?types.StreamOptions,
     env: FixtureEnv,
     region: FixtureRegion,
+    signed_body: ?[]const u8,
 ) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer object.deinit(allocator);
@@ -2489,6 +2502,7 @@ fn buildFixtureAuthSnapshot(
 
     if (nonEmpty(env.aws_access_key_id) != null and nonEmpty(env.aws_secret_access_key) != null) {
         const signing_region = region.value orelse "us-east-1";
+        _ = signed_body;
         try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "sigv4") });
         try object.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
         try object.put(allocator, try allocator.dupe(u8, "query"), .{ .string = try allocator.dupe(u8, "") });
