@@ -13,8 +13,6 @@ const AZURE_BASE_URL_ENV = "AZURE_OPENAI_BASE_URL";
 const AZURE_RESOURCE_NAME_ENV = "AZURE_OPENAI_RESOURCE_NAME";
 const AZURE_API_VERSION_ENV = "AZURE_OPENAI_API_VERSION";
 const AZURE_DEPLOYMENT_MAP_ENV = "AZURE_OPENAI_DEPLOYMENT_NAME_MAP";
-const AZURE_AD_TOKEN_ENV = "AZURE_OPENAI_AD_TOKEN";
-const AZURE_TOKEN_ENV = "AZURE_OPENAI_TOKEN";
 
 const MessagePartKind = enum {
     output_text,
@@ -63,7 +61,7 @@ pub const AzureOpenAIResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        const deployment_name = resolveDeploymentName(allocator, model.id) catch |err| {
+        const deployment_name = resolveDeploymentName(allocator, model.id, options) catch |err| {
             return emitProviderError(allocator, &stream_instance, model, err);
         };
         defer allocator.free(deployment_name);
@@ -71,7 +69,7 @@ pub const AzureOpenAIResponsesProvider = struct {
         var request_model = model;
         request_model.id = deployment_name;
 
-        var payload = openai_responses.buildRequestPayload(allocator, request_model, context, options) catch |err| {
+        var payload = buildAzureRequestPayload(allocator, request_model, context, options) catch |err| {
             return emitProviderError(allocator, &stream_instance, model, err);
         };
         defer freeJsonValue(allocator, payload);
@@ -88,12 +86,12 @@ pub const AzureOpenAIResponsesProvider = struct {
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
 
-        const base_url = resolveAzureBaseUrl(allocator, model) catch |err| {
+        const base_url = resolveAzureBaseUrl(allocator, model, options) catch |err| {
             return emitProviderError(allocator, &stream_instance, model, err);
         };
         defer allocator.free(base_url);
 
-        const api_version = resolveAzureApiVersion(allocator) catch |err| {
+        const api_version = resolveAzureApiVersion(allocator, options) catch |err| {
             return emitProviderError(allocator, &stream_instance, model, err);
         };
         defer if (api_version.owned) allocator.free(api_version.value);
@@ -106,19 +104,17 @@ pub const AzureOpenAIResponsesProvider = struct {
         var headers = std.StringHashMap([]const u8).init(allocator);
         defer deinitOwnedHeaders(allocator, &headers);
         try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        try putOwnedHeader(allocator, &headers, "Accept", "application/json");
         try mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
         }
 
-        if (!headers.contains("Authorization") and !headers.contains("api-key")) {
-            const auth = resolveAzureAuthHeader(allocator, options) catch |err| {
-                return emitProviderError(allocator, &stream_instance, model, err);
-            };
-            defer auth.deinit(allocator);
-            try putOwnedHeader(allocator, &headers, auth.name, auth.value);
-        }
+        const auth = resolveAzureAuthHeader(allocator, options) catch |err| {
+            return emitProviderError(allocator, &stream_instance, model, err);
+        };
+        defer auth.deinit(allocator);
+        try putOwnedHeader(allocator, &headers, auth.name, auth.value);
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -166,6 +162,36 @@ pub const AzureOpenAIResponsesProvider = struct {
     }
 };
 
+fn buildAzureRequestPayload(
+    allocator: std.mem.Allocator,
+    request_model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !std.json.Value {
+    var payload = try openai_responses.buildRequestPayload(allocator, request_model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+
+    try removeObjectField(allocator, &payload, "store");
+    try removeObjectField(allocator, &payload, "prompt_cache_retention");
+    try removeObjectField(allocator, &payload, "service_tier");
+    try removeObjectField(allocator, &payload, "metadata");
+
+    if (options) |stream_options| {
+        if (stream_options.session_id) |session_id| {
+            try removeObjectField(allocator, &payload, "prompt_cache_key");
+            if (payload == .object) {
+                try payload.object.put(
+                    allocator,
+                    try allocator.dupe(u8, "prompt_cache_key"),
+                    .{ .string = try allocator.dupe(u8, session_id) },
+                );
+            }
+        }
+    }
+
+    return payload;
+}
+
 const ResolvedApiVersion = struct {
     value: []const u8,
     owned: bool,
@@ -207,7 +233,13 @@ fn emitErrorMessage(
     return stream_instance.*;
 }
 
-fn resolveDeploymentName(allocator: std.mem.Allocator, model_id: []const u8) ![]const u8 {
+fn resolveDeploymentName(allocator: std.mem.Allocator, model_id: []const u8, options: ?types.StreamOptions) ![]const u8 {
+    if (options) |stream_options| {
+        if (stream_options.azure_deployment_name) |deployment_name| {
+            if (deployment_name.len > 0) return try allocator.dupe(u8, deployment_name);
+        }
+    }
+
     const env_value = try loadEnvOptional(allocator, AZURE_DEPLOYMENT_MAP_ENV);
     defer if (env_value) |value| allocator.free(value);
 
@@ -228,12 +260,29 @@ fn resolveDeploymentName(allocator: std.mem.Allocator, model_id: []const u8) ![]
     return try allocator.dupe(u8, model_id);
 }
 
-fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model) ![]const u8 {
+fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model, options: ?types.StreamOptions) ![]const u8 {
+    if (options) |stream_options| {
+        if (stream_options.azure_base_url) |value| {
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
+                return try normalizeAzureBaseUrl(allocator, value);
+            }
+        }
+    }
+
     const env_base_url = try loadEnvOptional(allocator, AZURE_BASE_URL_ENV);
     defer if (env_base_url) |value| allocator.free(value);
     if (env_base_url) |value| {
         if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
             return try normalizeAzureBaseUrl(allocator, value);
+        }
+    }
+
+    if (options) |stream_options| {
+        if (stream_options.azure_resource_name) |value| {
+            const resource_name = std.mem.trim(u8, value, " \t\r\n");
+            if (resource_name.len > 0) {
+                return try std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{resource_name});
+            }
         }
     }
 
@@ -253,7 +302,14 @@ fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model) ![]cons
     return error.MissingAzureBaseUrl;
 }
 
-fn resolveAzureApiVersion(allocator: std.mem.Allocator) !ResolvedApiVersion {
+fn resolveAzureApiVersion(allocator: std.mem.Allocator, options: ?types.StreamOptions) !ResolvedApiVersion {
+    if (options) |stream_options| {
+        if (stream_options.azure_api_version) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len > 0) return .{ .value = trimmed, .owned = false };
+        }
+    }
+
     const env_api_version = try loadEnvOptional(allocator, AZURE_API_VERSION_ENV);
     if (env_api_version) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -273,29 +329,31 @@ fn resolveAzureApiVersion(allocator: std.mem.Allocator) !ResolvedApiVersion {
 fn normalizeAzureBaseUrl(allocator: std.mem.Allocator, raw_base_url: []const u8) ![]const u8 {
     const trimmed = std.mem.trimEnd(u8, std.mem.trim(u8, raw_base_url, " \t\r\n"), "/");
     if (trimmed.len == 0) return error.MissingAzureBaseUrl;
+    const uri = std.Uri.parse(trimmed) catch return error.InvalidAzureBaseUrl;
+    const host = uri.host orelse return error.InvalidAzureBaseUrl;
+    const host_text = host.percent_encoded;
+    const path_text = uri.path.percent_encoded;
+    const normalized_path = std.mem.trimEnd(u8, path_text, "/");
+    const is_azure_host = std.mem.endsWith(u8, host_text, ".openai.azure.com") or
+        std.mem.endsWith(u8, host_text, ".cognitiveservices.azure.com");
 
-    if (std.mem.indexOf(u8, trimmed, "/openai/deployments/")) |index| {
-        return try std.fmt.allocPrint(allocator, "{s}/openai/v1", .{trimmed[0..index]});
+    if (is_azure_host and (normalized_path.len == 0 or std.mem.eql(u8, normalized_path, "/") or std.mem.eql(u8, normalized_path, "/openai"))) {
+        return try std.fmt.allocPrint(allocator, "{s}://{s}/openai/v1", .{ uri.scheme, host_text });
     }
-    if (std.mem.indexOf(u8, trimmed, "/openai/v1")) |index| {
-        return try allocator.dupe(u8, trimmed[0 .. index + "/openai/v1".len]);
-    }
-    if (std.mem.endsWith(u8, trimmed, "/openai")) {
-        return try std.fmt.allocPrint(allocator, "{s}/v1", .{trimmed});
-    }
-    if (std.mem.endsWith(u8, trimmed, "/responses")) {
-        const base = trimmed[0 .. trimmed.len - "/responses".len];
-        if (std.mem.endsWith(u8, base, "/openai/v1")) return try allocator.dupe(u8, base);
-    }
-    return try std.fmt.allocPrint(allocator, "{s}/openai/v1", .{trimmed});
+
+    return try allocator.dupe(u8, trimmed);
 }
 
 fn buildRequestUrl(allocator: std.mem.Allocator, raw_base_url: []const u8, api_version: []const u8) ![]const u8 {
     const base_url = try normalizeAzureBaseUrl(allocator, raw_base_url);
     defer allocator.free(base_url);
 
-    if (std.mem.eql(u8, api_version, DEFAULT_AZURE_API_VERSION)) {
-        return try std.fmt.allocPrint(allocator, "{s}/responses", .{base_url});
+    if (std.mem.indexOfScalar(u8, base_url, '?')) |query_index| {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}?api-version={s}",
+            .{ base_url[0..query_index], api_version },
+        );
     }
     return try std.fmt.allocPrint(allocator, "{s}/responses?api-version={s}", .{ base_url, api_version });
 }
@@ -309,38 +367,17 @@ fn resolveAzureAuthHeader(allocator: std.mem.Allocator, options: ?types.StreamOp
         env_api_key = try env_api_keys.getEnvApiKey(allocator, "azure-openai-responses");
     }
 
-    const env_ad_token = try loadEnvOptional(allocator, AZURE_AD_TOKEN_ENV);
-    defer if (env_ad_token) |value| allocator.free(value);
-
-    var free_env_token = false;
-    const env_token = if (env_ad_token != null)
-        env_ad_token
-    else blk: {
-        free_env_token = true;
-        break :blk try loadEnvOptional(allocator, AZURE_TOKEN_ENV);
-    };
-    defer if (free_env_token) {
-        if (env_token) |value| allocator.free(value);
-    };
-
-    return resolveAuthHeaderValue(allocator, provided, env_api_key, env_token);
+    return resolveAuthHeaderValue(allocator, provided, env_api_key);
 }
 
 fn resolveAuthHeaderValue(
     allocator: std.mem.Allocator,
     provided_auth: ?[]const u8,
     env_api_key: ?[]const u8,
-    env_ad_token: ?[]const u8,
 ) !OwnedHeader {
     if (provided_auth) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len > 0) {
-            if (std.mem.startsWith(u8, trimmed, "Bearer ")) {
-                return .{
-                    .name = try allocator.dupe(u8, "Authorization"),
-                    .value = try allocator.dupe(u8, trimmed),
-                };
-            }
             return .{
                 .name = try allocator.dupe(u8, "api-key"),
                 .value = try allocator.dupe(u8, trimmed),
@@ -354,22 +391,6 @@ fn resolveAuthHeaderValue(
             return .{
                 .name = try allocator.dupe(u8, "api-key"),
                 .value = try allocator.dupe(u8, trimmed),
-            };
-        }
-    }
-
-    if (env_ad_token) |value| {
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len > 0) {
-            if (std.mem.startsWith(u8, trimmed, "Bearer ")) {
-                return .{
-                    .name = try allocator.dupe(u8, "Authorization"),
-                    .value = try allocator.dupe(u8, trimmed),
-                };
-            }
-            return .{
-                .name = try allocator.dupe(u8, "Authorization"),
-                .value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{trimmed}),
             };
         }
     }
@@ -391,6 +412,20 @@ fn putOwnedHeader(
     name: []const u8,
     value: []const u8,
 ) !void {
+    var existing_name: ?[]const u8 = null;
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
+            existing_name = entry.key_ptr.*;
+            break;
+        }
+    }
+    if (existing_name) |key| {
+        if (headers.fetchRemove(key)) |removed| {
+            allocator.free(removed.key);
+            allocator.free(removed.value);
+        }
+    }
     try headers.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
 }
 
@@ -1102,6 +1137,27 @@ fn isAbortRequested(options: ?types.StreamOptions) bool {
     return false;
 }
 
+fn removeObjectField(allocator: std.mem.Allocator, payload: *std.json.Value, field_name: []const u8) !void {
+    if (payload.* != .object) return;
+
+    var old_object = payload.object;
+    var new_object = try initObject(allocator);
+    errdefer new_object.deinit(allocator);
+
+    var iterator = old_object.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, field_name)) {
+            allocator.free(entry.key_ptr.*);
+            freeJsonValue(allocator, entry.value_ptr.*);
+            continue;
+        }
+        try new_object.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    old_object.deinit(allocator);
+    payload.* = .{ .object = new_object };
+}
+
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
 }
@@ -1202,7 +1258,7 @@ test "buildRequestUrl normalizes Azure resource endpoints" {
     defer allocator.free(url);
 
     try std.testing.expectEqualStrings(
-        "https://example.openai.azure.com/openai/v1/responses",
+        "https://example.openai.azure.com/openai/v1/responses?api-version=v1",
         url,
     );
 }
@@ -1220,19 +1276,19 @@ test "buildRequestUrl appends api-version for dated Azure APIs" {
 
 test "resolveAuthHeaderValue prefers api-key for plain credentials" {
     const allocator = std.testing.allocator;
-    const auth = try resolveAuthHeaderValue(allocator, "azure-key", null, null);
+    const auth = try resolveAuthHeaderValue(allocator, "azure-key", null);
     defer auth.deinit(allocator);
 
     try std.testing.expectEqualStrings("api-key", auth.name);
     try std.testing.expectEqualStrings("azure-key", auth.value);
 }
 
-test "resolveAuthHeaderValue supports bearer token authentication" {
+test "resolveAuthHeaderValue treats bearer-looking credentials as Azure API keys" {
     const allocator = std.testing.allocator;
-    const auth = try resolveAuthHeaderValue(allocator, "Bearer entra-token", null, null);
+    const auth = try resolveAuthHeaderValue(allocator, "Bearer entra-token", null);
     defer auth.deinit(allocator);
 
-    try std.testing.expectEqualStrings("Authorization", auth.name);
+    try std.testing.expectEqualStrings("api-key", auth.name);
     try std.testing.expectEqualStrings("Bearer entra-token", auth.value);
 }
 

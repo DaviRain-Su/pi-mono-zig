@@ -1,0 +1,100 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "baseUrl": "https://cache-none-resource.openai.azure.com/openai/v1",
+      "headers": {
+        "accept": "application/json",
+        "api-key": "<redacted-present>",
+        "content-type": "application/json",
+        "x-fixture-model-header": "option-overrides-model",
+        "x-fixture-preserved-header": "model-preserved"
+      },
+      "jsonPayload": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "Azure cache none still includes prompt cache key.",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-azure-cache-none",
+        "prompt_cache_key": "fixture-azure-cache-none-session",
+        "stream": true
+      },
+      "method": "POST",
+      "path": "/openai/v1/responses",
+      "query": {
+        "api-version": "v1"
+      },
+      "requestOptions": {
+        "signal": "not-provided"
+      },
+      "transportMetadata": {
+        "mockedResponseHeaders": {
+          "content-type": "text/event-stream",
+          "x-fixture-response": "azure-responses-cache-none-still-sends-prompt-cache-key"
+        },
+        "mockedStatus": 200,
+        "mode": "sse",
+        "providerFamily": "azure-openai",
+        "requestBoundary": "before local mocked SSE response body is consumed"
+      },
+      "url": "https://cache-none-resource.openai.azure.com/openai/v1/responses?api-version=v1"
+    }
+  },
+  "id": "azure-responses-cache-none-still-sends-prompt-cache-key",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Azure cache none still includes prompt cache key.",
+          "role": "user"
+        }
+      ]
+    },
+    "model": {
+      "api": "azure-openai-responses",
+      "baseUrl": "https://fixture-resource.openai.azure.com",
+      "headers": {
+        "x-fixture-model-header": "model-before-option",
+        "x-fixture-preserved-header": "model-preserved"
+      },
+      "id": "gpt-4.1-azure-cache-none",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 4.1 Azure Fixture",
+      "provider": "azure-openai-responses",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "azureResourceName": "cache-none-resource",
+      "cacheRetention": "none",
+      "headers": {
+        "X-Fixture-Model-Header": "option-overrides-model"
+      },
+      "sessionId": "fixture-azure-cache-none-session"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "Responses-family request after model/options resolution, payload conversion, header merge, callbacks, and before live HTTP/WebSocket transport",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records final request semantics and rejects unhandled hosts",
+    "diffOutputBoundBytes": 12000,
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-responses.ts",
+      "packages/ai/src/providers/openai-responses-shared.ts",
+      "packages/ai/src/providers/github-copilot-headers.ts",
+      "packages/ai/src/providers/azure-openai-responses.ts",
+      "packages/ai/src/providers/openai-codex-responses.ts"
+    ]
+  },
+  "providerFamily": "azure-openai",
+  "schemaVersion": 1,
+  "title": "Azure OpenAI Responses keeps prompt_cache_key with cacheRetention none and option headers override model headers"
+}

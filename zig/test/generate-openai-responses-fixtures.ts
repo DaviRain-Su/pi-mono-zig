@@ -78,6 +78,13 @@ interface SerializableOptions {
 	azureResourceName?: string;
 }
 
+interface SerializableEnvironment {
+	AZURE_OPENAI_API_VERSION?: string;
+	AZURE_OPENAI_BASE_URL?: string;
+	AZURE_OPENAI_DEPLOYMENT_NAME_MAP?: string;
+	AZURE_OPENAI_RESOURCE_NAME?: string;
+}
+
 interface DeclarativeContext {
 	systemPrompt?: string;
 	messages: DeclarativeMessage[];
@@ -88,6 +95,7 @@ interface ScenarioInput {
 	model: FixtureModelInput;
 	context: DeclarativeContext;
 	options: SerializableOptions;
+	env?: SerializableEnvironment;
 }
 
 interface Scenario {
@@ -370,6 +378,161 @@ const scenarios: Scenario[] = [
 				maxTokens: 32,
 				sessionId: "fixture-azure-session",
 				timeoutMs: 2345,
+			},
+		},
+	},
+	{
+		id: "azure-responses-base-url-option-precedence-default-version",
+		title: "Azure OpenAI Responses azureBaseUrl overrides env base, resource names, model base URL, and defaults api-version to v1",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({ id: "gpt-4.1-azure-base-precedence", baseUrl: "https://model-resource.openai.azure.com" }),
+			context: { messages: [{ role: "user", content: "Use the request base URL override." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				azureBaseUrl: "https://option-resource.openai.azure.com?ignored=true",
+				azureResourceName: "option-resource-name-lower-precedence",
+			},
+			env: {
+				AZURE_OPENAI_API_VERSION: "",
+				AZURE_OPENAI_BASE_URL: "https://env-resource.openai.azure.com",
+				AZURE_OPENAI_RESOURCE_NAME: "env-resource-name",
+			},
+		},
+	},
+	{
+		id: "azure-responses-env-proxy-base-url-query",
+		title: "Azure OpenAI Responses environment proxy base URL preserves explicit path while SDK request query is controlled by env api-version",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({ id: "gpt-4.1-azure-env-proxy", baseUrl: "https://model-resource.openai.azure.com/openai/v1" }),
+			context: { messages: [{ role: "user", content: "Use the environment proxy URL." }] },
+			options: { apiKeyMode: "fixture-placeholder" },
+			env: {
+				AZURE_OPENAI_API_VERSION: "2024-12-01-preview",
+				AZURE_OPENAI_BASE_URL: "https://proxy.example.test/custom/v1?fixture=true",
+				AZURE_OPENAI_RESOURCE_NAME: "env-resource-lower-precedence",
+			},
+		},
+	},
+	{
+		id: "azure-responses-cognitive-url-normalization",
+		title: "Azure OpenAI Responses normalizes Cognitive Services /openai URLs to /openai/v1 and strips stale query strings",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({ id: "gpt-4.1-azure-cognitive-normalized" }),
+			context: { messages: [{ role: "user", content: "Normalize the Cognitive Services URL." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				azureBaseUrl: "https://cognitive-fixture.cognitiveservices.azure.com/openai?api-version=stale",
+				azureApiVersion: "2025-01-01-preview",
+			},
+		},
+	},
+	{
+		id: "azure-responses-model-base-url-fallback",
+		title: "Azure OpenAI Responses falls back to model baseUrl and model id deployment with default api-version",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({
+				id: "gpt-4.1-azure-model-fallback",
+				baseUrl: "https://model-fallback.cognitiveservices.azure.com/openai/v1",
+			}),
+			context: { messages: [{ role: "user", content: "Use the model base URL fallback." }] },
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "azure-responses-env-deployment-map",
+		title: "Azure OpenAI Responses deployment name falls back to matching env map entries and ignores malformed or unrelated entries",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({ id: "gpt-4.1-azure-map-target" }),
+			context: { messages: [{ role: "user", content: "Use the deployment map." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				azureResourceName: "deployment-map-resource",
+			},
+			env: {
+				AZURE_OPENAI_DEPLOYMENT_NAME_MAP:
+					"malformed-entry, other-model = ignored-deployment, gpt-4.1-azure-map-target = mapped deployment/name",
+			},
+		},
+	},
+	{
+		id: "azure-responses-cache-none-still-sends-prompt-cache-key",
+		title: "Azure OpenAI Responses keeps prompt_cache_key with cacheRetention none and option headers override model headers",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({
+				id: "gpt-4.1-azure-cache-none",
+				headers: { "x-fixture-model-header": "model-before-option", "x-fixture-preserved-header": "model-preserved" },
+			}),
+			context: { messages: [{ role: "user", content: "Azure cache none still includes prompt cache key." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				azureResourceName: "cache-none-resource",
+				cacheRetention: "none",
+				headers: { "X-Fixture-Model-Header": "option-overrides-model" },
+				sessionId: "fixture-azure-cache-none-session",
+			},
+		},
+	},
+	{
+		id: "azure-responses-reasoning-tools-and-images",
+		title: "Azure OpenAI Responses preserves shared Responses reasoning, tools, and image-capable replay while omitting OpenAI-only fields",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({
+				id: "gpt-5-mini-azure-reasoning",
+				baseUrl: "https://reasoning-resource.openai.azure.com/openai/v1",
+				reasoning: true,
+				input: ["text", "image"],
+			}),
+			context: {
+				systemPrompt: "Developer instructions for Azure reasoning.",
+				messages: [
+					{
+						role: "toolResult",
+						toolCallId: "call_azure_fixture|fc_azure_fixture",
+						toolName: "lookup_fixture",
+						content: [{ type: "text", text: "Azure tool text." }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+						isError: false,
+					},
+					{ role: "user", content: [{ type: "text", text: "Use Azure reasoning with tools." }] },
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				azureDeploymentName: "azure-reasoning-deployment",
+				reasoningSummary: "concise",
+				serviceTier: "priority",
+				sessionId: "fixture-azure-reasoning-session",
+			},
+		},
+	},
+	{
+		id: "azure-responses-on-payload-replacement-and-request-options",
+		title: "Azure OpenAI Responses onPayload observes resolved Azure payload and replacement preserves request options",
+		providerFamily: "azure-openai",
+		input: {
+			model: buildAzureModel({ id: "gpt-4.1-azure-payload-replacement" }),
+			context: { messages: [{ role: "user", content: "This Azure payload will be replaced." }] },
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				azureApiVersion: "2025-04-01-preview",
+				azureBaseUrl: "https://replacement-resource.openai.azure.com/openai/v1/",
+				azureDeploymentName: "azure-replacement-deployment",
+				maxRetries: 3,
+				onPayload: "replace-with-fixture-payload",
+				payloadReplacement: {
+					model: "azure-replacement-deployment",
+					input: [{ role: "user", content: [{ type: "input_text", text: "azure payload replaced" }] }],
+					stream: true,
+					fixture_marker: "azure-on-payload-replacement",
+				},
+				timeoutMs: 3456,
 			},
 		},
 	},
@@ -764,6 +927,35 @@ function inferBaseUrl(url: URL, providerFamily: ProviderFamily): string {
 	return `${url.origin}${path}`;
 }
 
+function addAllowedHost(allowedHosts: Set<string>, value: string | undefined): void {
+	if (!value) return;
+	try {
+		allowedHosts.add(new URL(value).host);
+	} catch {
+		// Invalid URL scenarios are handled by provider error assertions, not by the fetch guard.
+	}
+}
+
+function collectAllowedHosts(scenario: Scenario): Set<string> {
+	const allowedHosts = new Set<string>([
+		new URL(scenario.input.model.baseUrl || "https://chatgpt.com/backend-api").host,
+		"api.openai.com",
+		"chatgpt.com",
+		"fixture-resource-override.openai.azure.com",
+		"fixture-resource.openai.azure.com",
+	]);
+	addAllowedHost(allowedHosts, scenario.input.model.baseUrl);
+	addAllowedHost(allowedHosts, scenario.input.options.azureBaseUrl);
+	addAllowedHost(allowedHosts, scenario.input.env?.AZURE_OPENAI_BASE_URL);
+	for (const resourceName of [
+		scenario.input.options.azureResourceName,
+		scenario.input.env?.AZURE_OPENAI_RESOURCE_NAME,
+	]) {
+		if (resourceName) allowedHosts.add(`${resourceName}.openai.azure.com`);
+	}
+	return allowedHosts;
+}
+
 async function requestBody(request: Request): Promise<unknown> {
 	const text = await request.text();
 	return text.length > 0 ? (JSON.parse(text) as unknown) : null;
@@ -811,17 +1003,12 @@ function buildMockStream(providerFamily: ProviderFamily): ReadableStream<Uint8Ar
 async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	const originalFetch = globalThis.fetch;
 	const originalEnv = saveCredentialEnv();
-	const allowedHosts = new Set<string>([
-		new URL(scenario.input.model.baseUrl || "https://chatgpt.com/backend-api").host,
-		"api.openai.com",
-		"chatgpt.com",
-		"fixture-resource-override.openai.azure.com",
-		"fixture-resource.openai.azure.com",
-	]);
+	const allowedHosts = collectAllowedHosts(scenario);
 	let capturedFetch: CapturedFetch | undefined;
 	let observedPayload: unknown;
 
 	applySentinelCredentialEnv();
+	applyScenarioEnv(scenario.input.env);
 	if (scenario.input.options.cacheRetention === "env-long") process.env.PI_CACHE_RETENTION = "long";
 
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -964,6 +1151,14 @@ function applySentinelCredentialEnv(): void {
 	process.env.GITHUB_TOKEN = "fixture-env-sentinel-not-read";
 	process.env.OPENAI_API_KEY = "fixture-env-sentinel-not-read";
 	delete process.env.PI_CACHE_RETENTION;
+}
+
+function applyScenarioEnv(env: SerializableEnvironment | undefined): void {
+	if (!env) return;
+	for (const [key, value] of Object.entries(env)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
 }
 
 function restoreCredentialEnv(env: Record<string, string | undefined>): void {

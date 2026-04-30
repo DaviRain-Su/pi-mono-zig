@@ -1,7 +1,7 @@
 {
   "captureBoundary": "TypeScript Responses-family request after final payload/header/options resolution and before live transport",
   "diffOutputBoundBytes": 12000,
-  "fixtureCount": 26,
+  "fixtureCount": 34,
   "generatedBy": "zig/test/generate-openai-responses-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "providerFamilies": [
@@ -19,6 +19,14 @@
     "copilot-responses-option-header-overrides",
     "copilot-responses-explicit-reasoning-options",
     "azure-responses-basic-override-request",
+    "azure-responses-base-url-option-precedence-default-version",
+    "azure-responses-env-proxy-base-url-query",
+    "azure-responses-cognitive-url-normalization",
+    "azure-responses-model-base-url-fallback",
+    "azure-responses-env-deployment-map",
+    "azure-responses-cache-none-still-sends-prompt-cache-key",
+    "azure-responses-reasoning-tools-and-images",
+    "azure-responses-on-payload-replacement-and-request-options",
     "codex-responses-sse-basic-request",
     "openai-responses-on-payload-replacement",
     "openai-responses-cache-long-retention",

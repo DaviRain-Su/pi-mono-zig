@@ -104,9 +104,10 @@ fn buildRequestFromFixtureInput(allocator: std.mem.Allocator, input: std.json.Va
     const model = getObjectField(input, "model");
     const context = getObjectField(input, "context");
     const options = getObjectField(input, "options");
+    const env = optionalField(input, "env");
 
     const payload = if (std.mem.eql(u8, provider_family, "azure-openai"))
-        try buildAzurePayload(allocator, model, context, options)
+        try buildAzurePayload(allocator, model, context, options, env)
     else if (std.mem.eql(u8, provider_family, "openai-codex"))
         try buildCodexPayload(allocator, model, context, options)
     else
@@ -122,7 +123,7 @@ fn buildRequestFromFixtureInput(allocator: std.mem.Allocator, input: std.json.Va
     var request = try initObject(allocator);
     try putString(allocator, &request, "method", "POST");
 
-    const url_parts = try buildUrlParts(allocator, model, options, provider_family);
+    const url_parts = try buildUrlParts(allocator, model, options, env, provider_family);
     try putString(allocator, &request, "url", url_parts.url);
     try putString(allocator, &request, "baseUrl", url_parts.base_url);
     try putString(allocator, &request, "path", url_parts.path);
@@ -141,16 +142,17 @@ const UrlParts = struct {
     query: std.json.ObjectMap,
 };
 
-fn buildUrlParts(allocator: std.mem.Allocator, model: std.json.Value, options: std.json.Value, provider_family: []const u8) !UrlParts {
+fn buildUrlParts(allocator: std.mem.Allocator, model: std.json.Value, options: std.json.Value, env: ?std.json.Value, provider_family: []const u8) !UrlParts {
     if (std.mem.eql(u8, provider_family, "azure-openai")) {
-        const base = try azureBaseUrl(allocator, model, options);
-        const api_version = optionalString(options, "azureApiVersion") orelse "v1";
-        const url = try std.fmt.allocPrint(allocator, "{s}/responses?api-version={s}", .{ base, api_version });
+        const base = try azureBaseUrl(allocator, model, options, env);
+        const api_version = azureApiVersion(options, env);
+        const url = try azureRequestUrl(allocator, base, api_version);
+        const snapshot_base = try azureSnapshotBaseUrl(allocator, base);
         return .{
             .url = url,
-            .base_url = base,
+            .base_url = snapshot_base,
             .path = try pathFromUrl(allocator, url),
-            .query = try oneStringFieldObject(allocator, "api-version", api_version),
+            .query = try queryObjectFromUrl(allocator, url),
         };
     }
 
@@ -170,17 +172,69 @@ fn buildUrlParts(allocator: std.mem.Allocator, model: std.json.Value, options: s
     return .{ .url = url, .base_url = base, .path = try pathFromUrl(allocator, url), .query = try initObject(allocator) };
 }
 
-fn azureBaseUrl(allocator: std.mem.Allocator, model: std.json.Value, options: std.json.Value) ![]const u8 {
+fn azureBaseUrl(allocator: std.mem.Allocator, model: std.json.Value, options: std.json.Value, env: ?std.json.Value) ![]const u8 {
     if (optionalString(options, "azureBaseUrl")) |base| return try normalizeAzureBaseUrl(allocator, base);
+    if (env) |env_value| {
+        if (optionalString(env_value, "AZURE_OPENAI_BASE_URL")) |base| {
+            if (std.mem.trim(u8, base, " \t\r\n").len > 0) return try normalizeAzureBaseUrl(allocator, base);
+        }
+    }
     if (optionalString(options, "azureResourceName")) |resource| return try std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{resource});
+    if (env) |env_value| {
+        if (optionalString(env_value, "AZURE_OPENAI_RESOURCE_NAME")) |resource| {
+            if (std.mem.trim(u8, resource, " \t\r\n").len > 0) return try std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{resource});
+        }
+    }
     return try normalizeAzureBaseUrl(allocator, getObjectField(model, "baseUrl").string);
 }
 
 fn normalizeAzureBaseUrl(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     const trimmed = std.mem.trimEnd(u8, std.mem.trim(u8, raw, " \t\r\n"), "/");
-    if (std.mem.endsWith(u8, trimmed, "/openai/v1")) return try allocator.dupe(u8, trimmed);
-    if (std.mem.endsWith(u8, trimmed, "/openai")) return try std.fmt.allocPrint(allocator, "{s}/v1", .{trimmed});
-    return try std.fmt.allocPrint(allocator, "{s}/openai/v1", .{trimmed});
+    const scheme_index = std.mem.indexOf(u8, trimmed, "://") orelse return error.InvalidUrl;
+    const host_start = scheme_index + 3;
+    const after_host = trimmed[host_start..];
+    const slash_index = std.mem.indexOfScalar(u8, after_host, '/');
+    const query_index = std.mem.indexOfScalar(u8, after_host, '?');
+    const host_end_relative = if (slash_index) |slash|
+        if (query_index) |query| @min(slash, query) else slash
+    else if (query_index) |query|
+        query
+    else
+        after_host.len;
+    const host = after_host[0..host_end_relative];
+    const path_start = host_start + host_end_relative;
+    const path_end = if (std.mem.indexOfScalar(u8, trimmed[path_start..], '?')) |query_offset| path_start + query_offset else trimmed.len;
+    const path = if (path_start < path_end and trimmed[path_start] == '/') trimmed[path_start..path_end] else "";
+    const normalized_path = std.mem.trimEnd(u8, path, "/");
+    const is_azure_host = std.mem.endsWith(u8, host, ".openai.azure.com") or std.mem.endsWith(u8, host, ".cognitiveservices.azure.com");
+    if (is_azure_host and (normalized_path.len == 0 or std.mem.eql(u8, normalized_path, "/") or std.mem.eql(u8, normalized_path, "/openai"))) {
+        return try std.fmt.allocPrint(allocator, "{s}/openai/v1", .{trimmed[0 .. host_start + host.len]});
+    }
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn azureApiVersion(options: std.json.Value, env: ?std.json.Value) []const u8 {
+    if (optionalString(options, "azureApiVersion")) |api_version| {
+        if (std.mem.trim(u8, api_version, " \t\r\n").len > 0) return api_version;
+    }
+    if (env) |env_value| {
+        if (optionalString(env_value, "AZURE_OPENAI_API_VERSION")) |api_version| {
+            if (std.mem.trim(u8, api_version, " \t\r\n").len > 0) return api_version;
+        }
+    }
+    return "v1";
+}
+
+fn azureRequestUrl(allocator: std.mem.Allocator, base: []const u8, api_version: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, base, '?')) |query_index| {
+        return try std.fmt.allocPrint(allocator, "{s}?api-version={s}", .{ base[0..query_index], api_version });
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/responses?api-version={s}", .{ base, api_version });
+}
+
+fn azureSnapshotBaseUrl(allocator: std.mem.Allocator, base: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, base, '?')) |query_index| return try allocator.dupe(u8, base[0..query_index]);
+    return try allocator.dupe(u8, base);
 }
 
 fn pathFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
@@ -190,6 +244,20 @@ fn pathFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     const path_query = after_host[slash..];
     const query = std.mem.indexOfScalar(u8, path_query, '?') orelse return try allocator.dupe(u8, path_query);
     return try allocator.dupe(u8, path_query[0..query]);
+}
+
+fn queryObjectFromUrl(allocator: std.mem.Allocator, url: []const u8) !std.json.ObjectMap {
+    var object = try initObject(allocator);
+    const query_index = std.mem.indexOfScalar(u8, url, '?') orelse return object;
+    var entries = std.mem.splitScalar(u8, url[query_index + 1 ..], '&');
+    while (entries.next()) |entry| {
+        if (entry.len == 0) continue;
+        const separator = std.mem.indexOfScalar(u8, entry, '=') orelse entry.len;
+        const key = entry[0..separator];
+        const value = if (separator < entry.len) entry[separator + 1 ..] else "";
+        try putString(allocator, &object, key, value);
+    }
+    return object;
 }
 
 fn trimTrailingSlashAlloc(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -264,15 +332,50 @@ fn supportsXhigh(model_id: []const u8) bool {
         std.mem.indexOf(u8, model_id, "opus-4.7") != null;
 }
 
-fn buildAzurePayload(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, options: std.json.Value) !std.json.Value {
+fn buildAzurePayload(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, options: std.json.Value, env: ?std.json.Value) !std.json.Value {
     var payload = try initObject(allocator);
-    try putString(allocator, &payload, "model", optionalString(options, "azureDeploymentName") orelse getObjectField(model, "id").string);
+    try putString(allocator, &payload, "model", azureDeploymentName(model, options, env));
     try putValue(allocator, &payload, "input", .{ .array = try buildResponsesInput(allocator, model, context, true) });
     try putBool(allocator, &payload, "stream", true);
     if (optionalString(options, "sessionId")) |session_id| try putString(allocator, &payload, "prompt_cache_key", session_id);
     if (optionalU32(options, "maxTokens")) |max_tokens| try putInteger(allocator, &payload, "max_output_tokens", max_tokens);
     if (optionalNumber(options, "temperature")) |temperature| try putFloat(allocator, &payload, "temperature", temperature);
+    if (optionalField(context, "tools")) |tools| {
+        if (tools == .array and tools.array.items.len > 0) try putValue(allocator, &payload, "tools", .{ .array = try buildTools(allocator, tools, false) });
+    }
+    if (optionalBool(model, "reasoning") orelse false) {
+        if (optionalString(options, "reasoningEffort")) |effort| {
+            try addReasoning(allocator, &payload, effort, optionalString(options, "reasoningSummary") orelse "auto");
+        } else if (optionalString(options, "reasoningSummary")) |summary| {
+            try addReasoning(allocator, &payload, "medium", summary);
+        } else {
+            var reasoning_object = try initObject(allocator);
+            try putString(allocator, &reasoning_object, "effort", "none");
+            try putValue(allocator, &payload, "reasoning", .{ .object = reasoning_object });
+        }
+    }
     return .{ .object = payload };
+}
+
+fn azureDeploymentName(model: std.json.Value, options: std.json.Value, env: ?std.json.Value) []const u8 {
+    if (optionalString(options, "azureDeploymentName")) |deployment_name| {
+        if (deployment_name.len > 0) return deployment_name;
+    }
+    if (env) |env_value| {
+        if (optionalString(env_value, "AZURE_OPENAI_DEPLOYMENT_NAME_MAP")) |deployment_map| {
+            const model_id = getObjectField(model, "id").string;
+            var entries = std.mem.splitScalar(u8, deployment_map, ',');
+            while (entries.next()) |entry| {
+                const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+                const separator = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+                const lhs = std.mem.trim(u8, trimmed[0..separator], " \t\r\n");
+                const rhs = std.mem.trim(u8, trimmed[separator + 1 ..], " \t\r\n");
+                if (lhs.len == 0 or rhs.len == 0) continue;
+                if (std.mem.eql(u8, lhs, model_id)) return rhs;
+            }
+        }
+    }
+    return getObjectField(model, "id").string;
 }
 
 fn buildCodexPayload(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, options: std.json.Value) !std.json.Value {
