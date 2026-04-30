@@ -1,0 +1,331 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "cacheControlFormat": "anthropic",
+      "maxTokensField": "max_tokens",
+      "openRouterRouting": {
+        "allow_fallbacks": false,
+        "only": [
+          "Anthropic"
+        ],
+        "order": [
+          "Anthropic",
+          "OpenAI"
+        ],
+        "require_parameters": true
+      },
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": true,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": true,
+      "sendSessionAffinityHeaders": true,
+      "supportsDeveloperRole": false,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": false,
+      "supportsStrictMode": false,
+      "supportsUsageInStreaming": false,
+      "thinkingFormat": "openrouter",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json",
+        "session_id": "fixture-composed-cross-session",
+        "x-client-request-id": "fixture-composed-cross-session",
+        "x-fixture-composed": "option-header",
+        "x-session-affinity": "fixture-composed-cross-session"
+      },
+      "jsonPayload": {
+        "max_tokens": 99,
+        "messages": [
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "ttl": "1h",
+                  "type": "ephemeral"
+                },
+                "text": "Compose routing, cache, reasoning, and tool history in one request.",
+                "type": "text"
+              }
+            ],
+            "role": "system"
+          },
+          {
+            "content": "Use the weather tool through the routed provider.",
+            "role": "user"
+          },
+          {
+            "content": "I will inspect deterministic weather.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"city\":\"Berlin\",\"unit\":\"celsius\"}",
+                  "name": "get_weather"
+                },
+                "id": "call_fixture_weather",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "Composed weather result.",
+            "name": "get_weather",
+            "role": "tool",
+            "tool_call_id": "call_fixture_weather"
+          },
+          {
+            "content": "I have processed the tool results.",
+            "role": "assistant"
+          },
+          {
+            "content": [
+              {
+                "cache_control": {
+                  "ttl": "1h",
+                  "type": "ephemeral"
+                },
+                "text": "Return the cached routed summary.",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "anthropic/composed-cross-fixture",
+        "prompt_cache_key": "fixture-composed-cross-session",
+        "prompt_cache_retention": "24h",
+        "provider": {
+          "allow_fallbacks": false,
+          "only": [
+            "Anthropic"
+          ],
+          "order": [
+            "Anthropic",
+            "OpenAI"
+          ],
+          "require_parameters": true
+        },
+        "reasoning": {
+          "effort": "high"
+        },
+        "stream": true,
+        "tool_choice": {
+          "function": {
+            "name": "get_weather"
+          },
+          "type": "function"
+        },
+        "tools": [
+          {
+            "cache_control": {
+              "ttl": "1h",
+              "type": "ephemeral"
+            },
+            "function": {
+              "description": "Return deterministic weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "anyOf": [
+                      {
+                        "const": "celsius",
+                        "type": "string"
+                      },
+                      {
+                        "const": "fahrenheit",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "city",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+  },
+  "id": "composed-tool-history-reasoning-routing-cache-compat",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Use the weather tool through the routed provider.",
+          "role": "user"
+        },
+        {
+          "api": "openai-completions",
+          "content": [
+            {
+              "thinking": "Route to the preferred provider and preserve tool history.",
+              "type": "thinking"
+            },
+            {
+              "text": "I will inspect deterministic weather.",
+              "type": "text"
+            },
+            {
+              "arguments": {
+                "city": "Berlin",
+                "unit": "celsius"
+              },
+              "id": "call_fixture_weather",
+              "name": "get_weather",
+              "type": "toolCall"
+            }
+          ],
+          "model": "anthropic/composed-cross-fixture",
+          "provider": "openrouter",
+          "role": "assistant",
+          "stopReason": "toolUse",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 7,
+            "output": 5,
+            "totalTokens": 12
+          }
+        },
+        {
+          "content": [
+            {
+              "text": "Composed weather result.",
+              "type": "text"
+            }
+          ],
+          "isError": false,
+          "role": "toolResult",
+          "toolCallId": "call_fixture_weather",
+          "toolName": "get_weather"
+        },
+        {
+          "content": "Return the cached routed summary.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "Compose routing, cache, reasoning, and tool history in one request.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "compat": {
+        "cacheControlFormat": "anthropic",
+        "maxTokensField": "max_tokens",
+        "openRouterRouting": {
+          "allow_fallbacks": false,
+          "only": [
+            "Anthropic"
+          ],
+          "order": [
+            "Anthropic",
+            "OpenAI"
+          ],
+          "require_parameters": true
+        },
+        "requiresAssistantAfterToolResult": true,
+        "requiresToolResultName": true,
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false,
+        "supportsLongCacheRetention": true,
+        "supportsStore": false,
+        "supportsStrictMode": false,
+        "supportsUsageInStreaming": false,
+        "thinkingFormat": "openrouter"
+      },
+      "id": "anthropic/composed-cross-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Composed Cross Regression Fixture",
+      "provider": "openrouter",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "long",
+      "headers": {
+        "x-fixture-composed": "option-header"
+      },
+      "maxTokens": 99,
+      "reasoningEffort": "high",
+      "sessionId": "fixture-composed-cross-session",
+      "toolChoice": {
+        "function": {
+          "name": "get_weather"
+        },
+        "type": "function"
+      }
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Composed tool history, OpenRouter reasoning, routing, cache, and explicit compat overrides"
+}

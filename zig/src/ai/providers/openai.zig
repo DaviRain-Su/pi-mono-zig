@@ -3113,6 +3113,133 @@ test "stream preserves partial text before mid-stream abort terminal event" {
     try std.testing.expect(stream.next() == null);
 }
 
+test "parseSseStreamLines preserves successful ordered OpenAI-compatible final assistant semantics" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"chatcmpl_cross\",\"choices\":[{\"delta\":{\"reasoning_content\":\"Think.\"},\"finish_reason\":null}]}\n" ++
+            "data: {\"id\":\"chatcmpl_cross\",\"choices\":[{\"delta\":{\"content\":\"Answer.\"},\"finish_reason\":null}]}\n" ++
+            "data: {\"id\":\"chatcmpl_cross\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"\"}}]},\"finish_reason\":null}]}\n" ++
+            "data: {\"id\":\"chatcmpl_cross\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"Berlin\\\"}\"}}]},\"finish_reason\":null}]}\n" ++
+            "data: {\"id\":\"chatcmpl_cross\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_write_tokens\":1}}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4.1-fixture",
+        .name = "GPT 4.1 Fixture",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+
+    const thinking_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
+    const thinking_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
+    try std.testing.expectEqualStrings("Think.", thinking_delta.delta.?);
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    try std.testing.expectEqualStrings("Think.", thinking_end.content.?);
+
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), text_start.content_index.?);
+    const text_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("Answer.", text_delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), text_end.content_index.?);
+    try std.testing.expectEqualStrings("Answer.", text_end.content.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_start.content_index.?);
+    const tool_delta_1 = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_1.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_delta_1.content_index.?);
+    try std.testing.expectEqualStrings("{\"city\":\"", tool_delta_1.delta.?);
+    const tool_delta_2 = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_2.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_delta_2.content_index.?);
+    try std.testing.expectEqualStrings("Berlin\"}", tool_delta_2.delta.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_end.content_index.?);
+    try std.testing.expect(tool_end.tool_call != null);
+    try std.testing.expectEqualStrings("call_weather", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expect(stream.next() == null);
+
+    const message = done.message.?;
+    try std.testing.expectEqualStrings("assistant", message.role);
+    try std.testing.expectEqualStrings("openai-completions", message.api);
+    try std.testing.expectEqualStrings("openai", message.provider);
+    try std.testing.expectEqualStrings("gpt-4.1-fixture", message.model);
+    try std.testing.expectEqualStrings("chatcmpl_cross", message.response_id.?);
+    try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
+    try std.testing.expectEqual(@as(u32, 7), message.usage.input);
+    try std.testing.expectEqual(@as(u32, 5), message.usage.output);
+    try std.testing.expectEqual(@as(u32, 2), message.usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 1), message.usage.cache_write);
+    try std.testing.expectEqual(@as(u32, 15), message.usage.total_tokens);
+    try std.testing.expectEqual(@as(usize, 3), message.content.len);
+    try std.testing.expectEqualStrings("Think.", message.content[0].thinking.thinking);
+    try std.testing.expectEqualStrings("Answer.", message.content[1].text.text);
+    try std.testing.expectEqualStrings("call_weather", message.content[2].tool_call.id);
+    try std.testing.expect(message.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), message.tool_calls.?.len);
+    try std.testing.expectEqualStrings("call_weather", message.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("get_weather", message.tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("Berlin", message.tool_calls.?[0].arguments.object.get("city").?.string);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(message.role, result.role);
+    try std.testing.expectEqualStrings(message.api, result.api);
+    try std.testing.expectEqualStrings(message.provider, result.provider);
+    try std.testing.expectEqualStrings(message.model, result.model);
+    try std.testing.expectEqualStrings(message.response_id.?, result.response_id.?);
+    try std.testing.expectEqual(message.stop_reason, result.stop_reason);
+    try std.testing.expectEqual(message.usage.input, result.usage.input);
+    try std.testing.expectEqual(message.usage.output, result.usage.output);
+    try std.testing.expectEqual(message.usage.cache_read, result.usage.cache_read);
+    try std.testing.expectEqual(message.usage.cache_write, result.usage.cache_write);
+    try std.testing.expectEqual(message.usage.total_tokens, result.usage.total_tokens);
+    try std.testing.expectEqualStrings(message.content[0].thinking.thinking, result.content[0].thinking.thinking);
+    try std.testing.expectEqualStrings(message.content[1].text.text, result.content[1].text.text);
+    try std.testing.expectEqualStrings(message.content[2].tool_call.id, result.content[2].tool_call.id);
+}
+
 test "parseSseStream with tool calls" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;

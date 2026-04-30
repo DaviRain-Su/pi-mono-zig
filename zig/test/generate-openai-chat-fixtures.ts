@@ -1546,6 +1546,75 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	{
+		id: "composed-tool-history-reasoning-routing-cache-compat",
+		title: "Composed tool history, OpenRouter reasoning, routing, cache, and explicit compat overrides",
+		input: {
+			model: buildModel({
+				id: "anthropic/composed-cross-fixture",
+				name: "Composed Cross Regression Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+				compat: {
+					supportsStore: false,
+					supportsDeveloperRole: false,
+					supportsUsageInStreaming: false,
+					maxTokensField: "max_tokens",
+					requiresToolResultName: true,
+					requiresAssistantAfterToolResult: true,
+					thinkingFormat: "openrouter",
+					openRouterRouting: {
+						allow_fallbacks: false,
+						require_parameters: true,
+						order: ["Anthropic", "OpenAI"],
+						only: ["Anthropic"],
+					},
+					supportsStrictMode: false,
+					cacheControlFormat: "anthropic",
+					sendSessionAffinityHeaders: true,
+					supportsLongCacheRetention: true,
+				},
+			}),
+			context: {
+				systemPrompt: "Compose routing, cache, reasoning, and tool history in one request.",
+				messages: [
+					{ role: "user", content: "Use the weather tool through the routed provider." },
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "Route to the preferred provider and preserve tool history." },
+							{ type: "text", text: "I will inspect deterministic weather." },
+							assistantToolCall,
+						],
+						api: "openai-completions",
+						provider: "openrouter",
+						model: "anthropic/composed-cross-fixture",
+						usage,
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture_weather",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Composed weather result." }],
+						isError: false,
+					},
+					{ role: "user", content: "Return the cached routed summary." },
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				headers: { "x-fixture-composed": "option-header" },
+				maxTokens: 99,
+				reasoningEffort: "high",
+				sessionId: "fixture-composed-cross-session",
+				toolChoice: { type: "function", function: { name: "get_weather" } },
+			},
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {
