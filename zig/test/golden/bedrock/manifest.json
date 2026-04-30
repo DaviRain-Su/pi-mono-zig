@@ -1,0 +1,54 @@
+{
+  "allowlists": {
+    "ignoredPaths": [
+      "id",
+      "title",
+      "input",
+      "metadata",
+      "schemaVersion",
+      "expected.onResponse",
+      "expected.binaryEventStream"
+    ],
+    "localStreamFormats": [
+      "json-lines",
+      "aws-eventstream"
+    ],
+    "modelIds": [
+      "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "amazon.nova-pro-v1:0"
+    ],
+    "scenarioIds": [
+      "bedrock-stream-basic-text",
+      "bedrock-stream-metadata-response",
+      "bedrock-simple-explicit-tokens",
+      "bedrock-binary-eventstream-tool-use"
+    ]
+  },
+  "captureBoundary": "TypeScript Bedrock Converse request/stream snapshots after provider conversion and before live AWS SDK send",
+  "comparatorMode": "semantic-request-and-stream",
+  "fixtureCount": 4,
+  "generatedBy": "zig/test/generate-bedrock-fixtures.ts",
+  "localStreamFormats": [
+    "json-lines",
+    "aws-eventstream"
+  ],
+  "modelIds": [
+    "anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "amazon.nova-pro-v1:0"
+  ],
+  "network": "local BedrockRuntimeClient.send mock only; no AWS metadata, credential store, or remote Bedrock access",
+  "scenarioIds": [
+    "bedrock-stream-basic-text",
+    "bedrock-stream-metadata-response",
+    "bedrock-simple-explicit-tokens",
+    "bedrock-binary-eventstream-tool-use"
+  ],
+  "schemaVersion": 1,
+  "sourceCitations": [
+    "packages/ai/src/providers/amazon-bedrock.ts:73-260",
+    "packages/ai/src/providers/amazon-bedrock.ts:311-348",
+    "packages/ai/src/providers/amazon-bedrock.ts:598-957",
+    "zig/src/ai/providers/bedrock.zig:169-754",
+    "zig/src/ai/providers/bedrock.zig:781-1427"
+  ]
+}
