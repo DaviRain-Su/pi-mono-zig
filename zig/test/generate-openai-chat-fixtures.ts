@@ -650,6 +650,187 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	{
+		id: "tool-choice-auto",
+		title: "String toolChoice auto serializes as tool_choice auto",
+		input: {
+			model: buildModel(),
+			context: {
+				...baseContext,
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				toolChoice: "auto",
+			},
+		},
+	},
+	{
+		id: "tool-choice-none",
+		title: "String toolChoice none serializes as tool_choice none",
+		input: {
+			model: buildModel(),
+			context: {
+				...baseContext,
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				toolChoice: "none",
+			},
+		},
+	},
+	{
+		id: "tool-choice-required",
+		title: "String toolChoice required serializes as tool_choice required",
+		input: {
+			model: buildModel(),
+			context: {
+				...baseContext,
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				toolChoice: "required",
+			},
+		},
+	},
+	{
+		id: "openai-reasoning-developer-role",
+		title: "Reasoning-capable OpenAI model uses developer role after message transform",
+		input: {
+			model: buildModel({
+				id: "o4-mini-fixture",
+				name: "OpenAI Reasoning Fixture",
+				reasoning: true,
+			}),
+			context: {
+				systemPrompt: "Use the developer role only when TypeScript does.",
+				messages: [
+					{ role: "user", content: "Confirm role selection." },
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "Prior transformed assistant message." }],
+						api: "openai-completions",
+						provider: "openai",
+						model: "o4-mini-fixture",
+						usage,
+						stopReason: "stop",
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				maxTokens: 16,
+				reasoningEffort: "minimal",
+			},
+		},
+	},
+	{
+		id: "nonstandard-explicit-store-usage-override",
+		title: "Non-standard provider explicit compat enables store and streaming usage fields",
+		input: {
+			model: buildModel({
+				id: "deepseek-explicit-store-fixture",
+				name: "DeepSeek Explicit Store Fixture",
+				provider: "deepseek",
+				baseUrl: "https://api.deepseek.com/v1",
+				compat: {
+					supportsStore: true,
+					supportsUsageInStreaming: true,
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "max-tokens-explicit-compat-field",
+		title: "Explicit maxTokensField override selects max_tokens exclusively",
+		input: {
+			model: buildModel({
+				id: "explicit-max-tokens-field-fixture",
+				name: "Explicit Max Tokens Field Fixture",
+				compat: {
+					maxTokensField: "max_tokens",
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				maxTokens: 77,
+			},
+		},
+	},
+	{
+		id: "tool-compat-name-and-no-strict",
+		title: "Tool result name and strict omission follow explicit compat flags",
+		input: {
+			model: buildModel({
+				id: "tool-compat-name-no-strict-fixture",
+				name: "Tool Compat Name No Strict Fixture",
+				compat: {
+					requiresToolResultName: true,
+					supportsStrictMode: false,
+				},
+			}),
+			context: {
+				systemPrompt: "Validate dedicated tool compat flags.",
+				messages: [
+					{
+						role: "assistant",
+						content: [assistantToolCall],
+						api: "openai-completions",
+						provider: "openai",
+						model: "tool-compat-name-no-strict-fixture",
+						usage,
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture_weather",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Named tool result." }],
+						isError: false,
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "tool-compat-name-required-but-missing",
+		title: "Required tool result name is omitted when the source tool result has no name",
+		input: {
+			model: buildModel({
+				id: "tool-compat-missing-name-fixture",
+				name: "Tool Compat Missing Name Fixture",
+				compat: {
+					requiresToolResultName: true,
+				},
+			}),
+			context: {
+				messages: [
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture_weather",
+						toolName: "",
+						content: [{ type: "text", text: "Unnamed tool result." }],
+						isError: false,
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {
