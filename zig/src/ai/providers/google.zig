@@ -65,11 +65,11 @@ pub const GoogleProvider = struct {
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
                 if (response.response_headers) |response_headers| {
-                    callback(response.status, response_headers, model);
+                    try callback(response.status, response_headers, model);
                 } else {
                     var response_headers = std.StringHashMap([]const u8).init(allocator);
                     defer response_headers.deinit();
-                    callback(response.status, response_headers, model);
+                    try callback(response.status, response_headers, model);
                 }
             }
         }

@@ -367,7 +367,7 @@ pub const StreamOptions = struct {
     /// In Zig, this is a function pointer taking allocator, payload json.Value, model, and returning an optional modified payload.
     on_payload: ?*const fn (std.mem.Allocator, std.json.Value, Model) anyerror!?std.json.Value = null,
     /// Optional callback invoked after an HTTP response is received and before its body stream is consumed.
-    on_response: ?*const fn (u16, std.StringHashMap([]const u8), Model) void = null,
+    on_response: ?*const fn (u16, std.StringHashMap([]const u8), Model) anyerror!void = null,
     /// Optional abort signal checked during streaming.
     signal: ?*const std.atomic.Value(bool) = null,
     /// Maximum delay in milliseconds to wait for a retry when the server requests a long wait.
@@ -414,7 +414,7 @@ pub const SimpleStreamOptions = struct {
     timeout_ms: ?u32 = null,
     max_retries: ?u32 = null,
     on_payload: ?*const fn (std.mem.Allocator, std.json.Value, Model) anyerror!?std.json.Value = null,
-    on_response: ?*const fn (u16, std.StringHashMap([]const u8), Model) void = null,
+    on_response: ?*const fn (u16, std.StringHashMap([]const u8), Model) anyerror!void = null,
     max_retry_delay_ms: u32 = 60000,
     metadata: ?std.json.Value = null,
     signal: ?*const std.atomic.Value(bool) = null,
