@@ -1,0 +1,210 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openai",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": null,
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"city\":\"Berlin\",\"unit\":\"celsius\"}",
+                  "name": "get_weather"
+                },
+                "id": "call_fixture_weather",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": "{\"flags\":[\"safe\",\"deterministic\"],\"request\":{\"count\":2,\"kind\":\"thumbnail\"}}",
+                  "name": "inspect_image"
+                },
+                "id": "call_fixture_nested",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "First tool text.",
+            "role": "tool",
+            "tool_call_id": "call_fixture_weather"
+          },
+          {
+            "content": "(see attached image)",
+            "role": "tool",
+            "tool_call_id": "call_fixture_nested"
+          },
+          {
+            "content": [
+              {
+                "text": "Attached image(s) from tool result:",
+                "type": "text"
+              },
+              {
+                "image_url": {
+                  "url": "data:image/png;base64,Zmlyc3Q="
+                },
+                "type": "image_url"
+              },
+              {
+                "image_url": {
+                  "url": "data:image/jpeg;base64,c2Vjb25k"
+                },
+                "type": "image_url"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-tool-image-fixture",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": []
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "url": "https://api.openai.com/v1/chat/completions"
+    }
+  },
+  "id": "tool-result-consecutive-image-routing",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "api": "openai-completions",
+          "content": [
+            {
+              "arguments": {
+                "city": "Berlin",
+                "unit": "celsius"
+              },
+              "id": "call_fixture_weather",
+              "name": "get_weather",
+              "type": "toolCall"
+            },
+            {
+              "arguments": {
+                "flags": [
+                  "safe",
+                  "deterministic"
+                ],
+                "request": {
+                  "count": 2,
+                  "kind": "thumbnail"
+                }
+              },
+              "id": "call_fixture_nested",
+              "name": "inspect_image",
+              "type": "toolCall"
+            }
+          ],
+          "model": "gpt-4.1-tool-image-fixture",
+          "provider": "openai",
+          "role": "assistant",
+          "stopReason": "toolUse",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 7,
+            "output": 5,
+            "totalTokens": 12
+          }
+        },
+        {
+          "content": [
+            {
+              "text": "First tool text.",
+              "type": "text"
+            },
+            {
+              "data": "Zmlyc3Q=",
+              "mimeType": "image/png",
+              "type": "image"
+            }
+          ],
+          "isError": false,
+          "role": "toolResult",
+          "toolCallId": "call_fixture_weather",
+          "toolName": "get_weather"
+        },
+        {
+          "content": [
+            {
+              "data": "c2Vjb25k",
+              "mimeType": "image/jpeg",
+              "type": "image"
+            }
+          ],
+          "isError": false,
+          "role": "toolResult",
+          "toolCallId": "call_fixture_nested",
+          "toolName": "inspect_image"
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.openai.com/v1",
+      "id": "gpt-4.1-tool-image-fixture",
+      "input": [
+        "text",
+        "image"
+      ],
+      "name": "GPT 4.1 Tool Image Fixture",
+      "provider": "openai",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Consecutive text and image tool results become tool messages plus one follow-up user image batch"
+}

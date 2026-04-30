@@ -133,6 +133,13 @@ const assistantToolCall = {
 	arguments: { city: "Berlin", unit: "celsius" },
 } satisfies ToolCall;
 
+const assistantToolCallWithNestedArgs = {
+	type: "toolCall",
+	id: "call_fixture_nested",
+	name: "inspect_image",
+	arguments: { flags: ["safe", "deterministic"], request: { count: 2, kind: "thumbnail" } },
+} satisfies ToolCall;
+
 const baseContext = {
 	systemPrompt: "You are the deterministic OpenAI Chat fixture assistant.",
 	messages: [
@@ -647,6 +654,138 @@ const scenarios: Scenario[] = [
 			options: {
 				apiKeyMode: "fixture-placeholder",
 				toolChoice: { type: "function", function: { name: "get_weather" } },
+			},
+		},
+	},
+	{
+		id: "user-image-content",
+		title: "User text and image content serializes to OpenAI image_url parts and skips empty arrays",
+		input: {
+			model: buildModel({
+				id: "gpt-4.1-vision-fixture",
+				name: "GPT 4.1 Vision Fixture",
+				input: ["text", "image"],
+			}),
+			context: {
+				systemPrompt: "Preserve user image content ordering.",
+				messages: [
+					{ role: "user", content: [] },
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: "Inspect this fixture image." },
+							{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+							{ type: "text", text: "Then answer with a caption." },
+						],
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "assistant-tool-call-replay-mixed-content",
+		title: "Assistant replay preserves text joining, tool call ids, names, and JSON-stringified arguments",
+		input: {
+			model: buildModel(),
+			context: {
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "text", text: "First text part." },
+							assistantToolCallWithNestedArgs,
+							{ type: "text", text: "Second text part." },
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage,
+						stopReason: "toolUse",
+					},
+					{
+						role: "assistant",
+						content: [],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage,
+						stopReason: "stop",
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "tool-result-consecutive-image-routing",
+		title: "Consecutive text and image tool results become tool messages plus one follow-up user image batch",
+		input: {
+			model: buildModel({
+				id: "gpt-4.1-tool-image-fixture",
+				name: "GPT 4.1 Tool Image Fixture",
+				input: ["text", "image"],
+			}),
+			context: {
+				messages: [
+					{
+						role: "assistant",
+						content: [assistantToolCall, assistantToolCallWithNestedArgs],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-tool-image-fixture",
+						usage,
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture_weather",
+						toolName: "get_weather",
+						content: [
+							{ type: "text", text: "First tool text." },
+							{ type: "image", data: "Zmlyc3Q=", mimeType: "image/png" },
+						],
+						isError: false,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture_nested",
+						toolName: "inspect_image",
+						content: [{ type: "image", data: "c2Vjb25k", mimeType: "image/jpeg" }],
+						isError: false,
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "empty-tools-with-prior-tool-history",
+		title: "Prior assistant tool-call history emits an empty tools array when no current tools are configured",
+		input: {
+			model: buildModel(),
+			context: {
+				messages: [
+					{ role: "user", content: "Use previous tool history without current tool definitions." },
+					{
+						role: "assistant",
+						content: [assistantToolCall],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage,
+						stopReason: "toolUse",
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
 			},
 		},
 	},

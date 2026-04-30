@@ -1,6 +1,6 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 26,
+  "fixtureCount": 30,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
@@ -22,6 +22,10 @@
     "explicit-false-compat-override",
     "explicit-full-compat-all-fields",
     "tool-choice-and-history-scaffold",
+    "user-image-content",
+    "assistant-tool-call-replay-mixed-content",
+    "tool-result-consecutive-image-routing",
+    "empty-tools-with-prior-tool-history",
     "tool-choice-auto",
     "tool-choice-none",
     "tool-choice-required",
