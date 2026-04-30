@@ -52,7 +52,11 @@ pub const OpenAICodexResponsesProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
-                if (try callback(allocator, payload, model)) |replacement| {
+                const maybe_replacement = callback(allocator, payload, model) catch |err| {
+                    const error_message = try std.fmt.allocPrint(allocator, "onPayload callback failed: {s}", .{@errorName(err)});
+                    return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                };
+                if (maybe_replacement) |replacement| {
                     freeJsonValue(allocator, payload);
                     payload = replacement;
                 }
@@ -123,11 +127,17 @@ pub const OpenAICodexResponsesProvider = struct {
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
                 if (response.response_headers) |response_headers| {
-                    try callback(response.status, response_headers, model);
+                    callback(response.status, response_headers, model) catch |err| {
+                        const error_message = try std.fmt.allocPrint(allocator, "onResponse callback failed: {s}", .{@errorName(err)});
+                        return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                    };
                 } else {
                     var response_headers = std.StringHashMap([]const u8).init(allocator);
                     defer response_headers.deinit();
-                    try callback(response.status, response_headers, model);
+                    callback(response.status, response_headers, model) catch |err| {
+                        const error_message = try std.fmt.allocPrint(allocator, "onResponse callback failed: {s}", .{@errorName(err)});
+                        return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                    };
                 }
             }
         }
@@ -229,9 +239,6 @@ pub fn buildRequestPayload(
         }
         if (stream_options.responses_service_tier) |service_tier| {
             try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
-        }
-        if (stream_options.metadata) |metadata| {
-            try payload.put(allocator, try allocator.dupe(u8, "metadata"), try cloneJsonValue(allocator, metadata));
         }
         if (stream_options.session_id) |session_id| {
             try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), .{ .string = try allocator.dupe(u8, session_id) });
@@ -1649,6 +1656,108 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings("openai-codex-responses", result.api);
 }
 
+test "stream onPayload failure is terminal error event" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    const Callback = struct {
+        fn fail(_: std.mem.Allocator, _: std.json.Value, _: types.Model) anyerror!?std.json.Value {
+            return error.PayloadCallbackFailed;
+        }
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, std.Io.failing, model, context, .{
+        .api_key = "not-a-jwt-but-not-needed-before-onPayload",
+        .on_payload = Callback.fail,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "PayloadCallbackFailed") != null);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream onResponse failure is terminal error event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+    var server = try provider_error.TestStatusServer.init(io, 200, "OK", "x-fixture-response: codex\r\n", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const payload_json = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acc_test\"}}";
+    var encoded_payload: [std.base64.url_safe_no_pad.Encoder.calcSize(payload_json.len)]u8 = undefined;
+    const payload_segment = std.base64.url_safe_no_pad.Encoder.encode(&encoded_payload, payload_json);
+    const api_key = try std.fmt.allocPrint(allocator, "aaa.{s}.sig", .{payload_segment});
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    const Callback = struct {
+        fn fail(status: u16, headers: std.StringHashMap([]const u8), _: types.Model) anyerror!void {
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expect(headers.get("x-fixture-response") != null);
+            return error.ResponseCallbackFailed;
+        }
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, context, .{
+        .api_key = api_key,
+        .on_response = Callback.fail,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "ResponseCallbackFailed") != null);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "buildRequestPayload omits instructions when no system prompt is provided" {
     const allocator = std.testing.allocator;
     const model = types.Model{
@@ -1696,6 +1805,10 @@ test "buildRequestPayload preserves xhigh reasoning for GPT-5.5" {
 
 test "buildRequestPayload applies Codex request option parity fields" {
     const allocator = std.testing.allocator;
+    var metadata = try initObject(allocator);
+    defer metadata.deinit(allocator);
+    try metadata.put(allocator, try allocator.dupe(u8, "fixture"), .{ .string = try allocator.dupe(u8, "codex-metadata-is-not-emitted") });
+
     const model = types.Model{
         .id = "gpt-5.3-codex",
         .name = "Codex GPT-5.3",
@@ -1715,11 +1828,13 @@ test "buildRequestPayload applies Codex request option parity fields" {
         .responses_service_tier = "priority",
         .responses_text_verbosity = "high",
         .session_id = "codex-session",
+        .metadata = .{ .object = metadata },
     });
     defer freeJsonValue(allocator, payload);
 
     try std.testing.expectEqualStrings("codex-session", payload.object.get("prompt_cache_key").?.string);
     try std.testing.expect(payload.object.get("prompt_cache_retention") == null);
+    try std.testing.expect(payload.object.get("metadata") == null);
     try std.testing.expectEqualStrings("priority", payload.object.get("service_tier").?.string);
     try std.testing.expectEqualStrings("high", payload.object.get("text").?.object.get("verbosity").?.string);
     try std.testing.expectEqualStrings("low", payload.object.get("reasoning").?.object.get("effort").?.string);

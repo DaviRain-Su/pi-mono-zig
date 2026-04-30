@@ -76,7 +76,168 @@ function buildSSEPayload({
 	return `${events.join("\n\n")}\n\n`;
 }
 
+function buildCodexModel(overrides: Partial<Model<"openai-codex-responses">> = {}): Model<"openai-codex-responses"> {
+	return {
+		id: "gpt-5.1-codex",
+		name: "GPT-5.1 Codex",
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 400000,
+		maxTokens: 128000,
+		...overrides,
+	};
+}
+
+function buildCodexContext(): Context {
+	return {
+		systemPrompt: "You are a helpful assistant.",
+		messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+	};
+}
+
+function buildCodexResponse(status = 200, headers: Record<string, string> = {}): Response {
+	const encoder = new TextEncoder();
+	const sse = buildSSEPayload({ status: "completed" });
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(encoder.encode(sse));
+			controller.close();
+		},
+	});
+	return new Response(stream, {
+		status,
+		headers: { "content-type": "text/event-stream", ...headers },
+	});
+}
+
+function installCodexFetch(
+	onCodexRequest: (init?: RequestInit) => Response | Promise<Response>,
+): ReturnType<typeof vi.fn> {
+	const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+		const url = typeof input === "string" ? input : input.toString();
+		if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
+			return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
+		}
+		if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
+			return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
+		}
+		if (url === "https://chatgpt.com/backend-api/codex/responses") {
+			return onCodexRequest(init);
+		}
+		return new Response("not found", { status: 404 });
+	});
+	global.fetch = fetchMock as typeof fetch;
+	return fetchMock;
+}
+
 describe("openai-codex streaming", () => {
+	it("allows onPayload to observe and pass through the final SSE payload", async () => {
+		const token = mockToken();
+		let observedPayload: unknown;
+		let submittedPayload: unknown;
+
+		installCodexFetch((init) => {
+			submittedPayload = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : null;
+			return buildCodexResponse();
+		});
+
+		const result = await streamOpenAICodexResponses(buildCodexModel(), buildCodexContext(), {
+			apiKey: token,
+			onPayload: (payload) => {
+				observedPayload = payload;
+				return undefined;
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(observedPayload).toMatchObject({ model: "gpt-5.1-codex", text: { verbosity: "low" } });
+		expect(submittedPayload).toEqual(observedPayload);
+	});
+
+	it("allows onPayload to replace the submitted SSE payload", async () => {
+		const token = mockToken();
+		const replacementPayload = {
+			model: "gpt-5.1-codex",
+			input: [{ role: "user", content: [{ type: "input_text", text: "replacement" }] }],
+			stream: true,
+			fixture_marker: "codex-replacement",
+		};
+		let submittedPayload: unknown;
+
+		installCodexFetch((init) => {
+			submittedPayload = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : null;
+			return buildCodexResponse();
+		});
+
+		const result = await streamOpenAICodexResponses(buildCodexModel(), buildCodexContext(), {
+			apiKey: token,
+			onPayload: () => replacementPayload,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(submittedPayload).toEqual(replacementPayload);
+	});
+
+	it("converts onPayload failures into terminal stream errors without fetching", async () => {
+		const token = mockToken();
+		const fetchMock = vi.fn(async () => new Response("unexpected fetch", { status: 500 }));
+		global.fetch = fetchMock as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(buildCodexModel(), buildCodexContext(), {
+			apiKey: token,
+			onPayload: () => {
+				throw new Error("payload callback failed");
+			},
+		}).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("payload callback failed");
+	});
+
+	it("passes deterministic response metadata to onResponse before stream processing", async () => {
+		const token = mockToken();
+		let responseMetadata: { status: number; headers: Record<string, string> } | undefined;
+
+		installCodexFetch(() => buildCodexResponse(202, { "x-fixture-response": "codex-metadata" }));
+
+		const result = await streamOpenAICodexResponses(buildCodexModel(), buildCodexContext(), {
+			apiKey: token,
+			onResponse: (metadata) => {
+				responseMetadata = metadata;
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(responseMetadata).toEqual({
+			status: 202,
+			headers: {
+				"content-type": "text/event-stream",
+				"x-fixture-response": "codex-metadata",
+			},
+		});
+	});
+
+	it("converts onResponse failures into terminal stream errors without retrying", async () => {
+		const token = mockToken();
+		const fetchMock = installCodexFetch(() => buildCodexResponse());
+
+		const result = await streamOpenAICodexResponses(buildCodexModel(), buildCodexContext(), {
+			apiKey: token,
+			onResponse: () => {
+				throw new Error("response callback failed");
+			},
+		}).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("response callback failed");
+	});
+
 	it("streams SSE responses into AssistantMessageEventStream", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;

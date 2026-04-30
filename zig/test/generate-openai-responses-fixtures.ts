@@ -61,6 +61,7 @@ interface SerializableOptions {
 	headers?: Record<string, string>;
 	maxRetries?: number;
 	maxTokens?: number;
+	metadata?: Record<string, unknown>;
 	onPayload?: "pass-through" | "replace-with-fixture-payload";
 	payloadReplacement?: unknown;
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -720,13 +721,14 @@ const scenarios: Scenario[] = [
 	},
 	{
 		id: "codex-responses-on-payload-replacement-and-request-options",
-		title: "OpenAI Codex Responses onPayload observes the final SSE payload and replacement preserves request options",
+		title: "OpenAI Codex Responses onPayload observes the final SSE payload and replacement omits unsupported request options",
 		providerFamily: "openai-codex",
 		input: {
 			model: buildCodexModel({ id: "gpt-5.1-codex-payload-replacement" }),
 			context: { messages: [{ role: "user", content: "This Codex payload will be replaced." }] },
 			options: {
 				apiKeyMode: "fixture-codex-jwt",
+				metadata: { fixture: "codex-metadata-should-be-omitted" },
 				maxRetries: 2,
 				onPayload: "replace-with-fixture-payload",
 				payloadReplacement: {
@@ -736,6 +738,20 @@ const scenarios: Scenario[] = [
 					fixture_marker: "codex-on-payload-replacement",
 				},
 				timeoutMs: 2468,
+				transport: "sse",
+			},
+		},
+	},
+	{
+		id: "codex-responses-on-payload-pass-through",
+		title: "OpenAI Codex Responses onPayload pass-through observes the final SSE payload without replacing it",
+		providerFamily: "openai-codex",
+		input: {
+			model: buildCodexModel({ id: "gpt-5.1-codex-payload-pass-through" }),
+			context: { messages: [{ role: "user", content: "This Codex payload should pass through." }] },
+			options: {
+				apiKeyMode: "fixture-codex-jwt",
+				onPayload: "pass-through",
 				transport: "sse",
 			},
 		},
@@ -1099,6 +1115,7 @@ function commonRuntimeOptions(options: SerializableOptions): OpenAIResponsesOpti
 		...(options.headers ? { headers: options.headers } : {}),
 		...(options.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 		...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+		...(options.metadata ? { metadata: options.metadata } : {}),
 		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
 		...(options.reasoningSummary !== undefined && (options.reasoningSummary === null || options.reasoningSummary === "auto" || options.reasoningSummary === "detailed" || options.reasoningSummary === "concise")
 			? { reasoningSummary: options.reasoningSummary }
@@ -1361,11 +1378,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 					query: queryRecord(requestUrl),
 					headers: normalizeHeaders(new Headers(headers)),
 					jsonPayload: body,
-					requestOptions: {
-						...(scenario.input.options.timeoutMs !== undefined ? { timeoutMs: scenario.input.options.timeoutMs } : {}),
-						...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
-						signal: scenario.input.options.signal ?? "not-provided",
-					},
+					requestOptions: { signal: "not-provided" },
 					transportMetadata: buildTransportMetadata(scenario, "deferred-websocket", 101),
 				},
 			};
@@ -1387,11 +1400,14 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 				query: queryRecord(requestUrl),
 				headers: normalizeHeaders(request.headers),
 				jsonPayload: await requestBody(request),
-				requestOptions: {
-					...(scenario.input.options.timeoutMs !== undefined ? { timeoutMs: scenario.input.options.timeoutMs } : {}),
-					...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
-					signal: scenario.input.options.signal ?? "not-provided",
-				},
+				requestOptions:
+					scenario.providerFamily === "openai-codex"
+						? { signal: init?.signal ? "provided" : "not-provided" }
+						: {
+								...(scenario.input.options.timeoutMs !== undefined ? { timeoutMs: scenario.input.options.timeoutMs } : {}),
+								...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
+								signal: scenario.input.options.signal ?? "not-provided",
+							},
 				transportMetadata: buildTransportMetadata(
 					scenario,
 					scenario.providerFamily === "openai-codex" && scenario.input.options.transport === "auto"
