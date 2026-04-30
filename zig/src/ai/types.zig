@@ -83,6 +83,13 @@ pub const AnthropicToolChoice = union(enum) {
     tool: []const u8,
 };
 
+pub const BedrockToolChoice = union(enum) {
+    auto,
+    any,
+    none,
+    tool: []const u8,
+};
+
 pub const CacheRetention = enum {
     unset,
     none,
@@ -376,6 +383,24 @@ pub const StreamOptions = struct {
     max_retry_delay_ms: u32 = 60000,
     /// Optional metadata to include in API requests.
     metadata: ?std.json.Value = null,
+    /// Bedrock Converse region override.
+    bedrock_region: ?[]const u8 = null,
+    /// Bedrock Converse profile override.
+    bedrock_profile: ?[]const u8 = null,
+    /// Bedrock Converse bearer token override.
+    bedrock_bearer_token: ?[]const u8 = null,
+    /// Bedrock Converse tool choice override.
+    bedrock_tool_choice: ?BedrockToolChoice = null,
+    /// Bedrock Converse reasoning level.
+    bedrock_reasoning: ?ThinkingLevel = null,
+    /// Bedrock Converse custom thinking budgets.
+    bedrock_thinking_budgets: ?ThinkingBudgets = null,
+    /// Bedrock Converse interleaved thinking beta toggle.
+    bedrock_interleaved_thinking: ?bool = null,
+    /// Bedrock Converse thinking display mode.
+    bedrock_thinking_display: ?AnthropicThinkingDisplay = null,
+    /// Bedrock Converse request metadata.
+    bedrock_request_metadata: ?std.json.Value = null,
     /// Google provider tool choice: "auto", "none", or "any".
     google_tool_choice: ?[]const u8 = null,
     /// Google provider thinking configuration.
@@ -435,6 +460,13 @@ pub const SimpleStreamOptions = struct {
     signal: ?*const std.atomic.Value(bool) = null,
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
+    bedrock_region: ?[]const u8 = null,
+    bedrock_profile: ?[]const u8 = null,
+    bedrock_bearer_token: ?[]const u8 = null,
+    bedrock_tool_choice: ?BedrockToolChoice = null,
+    bedrock_interleaved_thinking: ?bool = null,
+    bedrock_thinking_display: ?AnthropicThinkingDisplay = null,
+    bedrock_request_metadata: ?std.json.Value = null,
     google_tool_choice: ?[]const u8 = null,
     google_thinking: ?GoogleThinkingOptions = null,
     openai_tool_choice: ?std.json.Value = null,
@@ -463,6 +495,15 @@ pub const SimpleStreamOptions = struct {
             .max_retry_delay_ms = self.max_retry_delay_ms,
             .metadata = self.metadata,
             .signal = self.signal,
+            .bedrock_region = self.bedrock_region,
+            .bedrock_profile = self.bedrock_profile,
+            .bedrock_bearer_token = self.bedrock_bearer_token,
+            .bedrock_tool_choice = self.bedrock_tool_choice,
+            .bedrock_reasoning = self.reasoning,
+            .bedrock_thinking_budgets = self.thinking_budgets,
+            .bedrock_interleaved_thinking = self.bedrock_interleaved_thinking,
+            .bedrock_thinking_display = self.bedrock_thinking_display,
+            .bedrock_request_metadata = self.bedrock_request_metadata,
             .google_tool_choice = self.google_tool_choice,
             .google_thinking = self.google_thinking,
             .openai_tool_choice = self.openai_tool_choice,

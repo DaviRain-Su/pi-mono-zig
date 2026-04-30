@@ -1,25 +1,37 @@
 {
   "expected": {
     "typeScriptRequest": {
-      "mode": "streamSimpleBedrock",
+      "mode": "streamBedrock",
       "payload": {
         "inferenceConfig": {
-          "maxTokens": 128
+          "maxTokens": 64
         },
         "messages": [
           {
             "content": [
               {
                 "text": "Return a concise Bedrock fixture response."
+              },
+              {
+                "cachePoint": {
+                  "ttl": "1h",
+                  "type": "default"
+                }
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "amazon.nova-pro-v1:0",
+        "modelId": "anthropic.claude-3-5-haiku-20241022-v1:0",
         "system": [
           {
             "text": "You are the deterministic Bedrock fixture assistant."
+          },
+          {
+            "cachePoint": {
+              "ttl": "1h",
+              "type": "default"
+            }
           }
         ]
       }
@@ -51,7 +63,7 @@
               "type": "text"
             }
           ],
-          "model": "amazon.nova-pro-v1:0",
+          "model": "anthropic.claude-3-5-haiku-20241022-v1:0",
           "provider": "amazon-bedrock",
           "role": "assistant",
           "stopReason": "stop",
@@ -74,7 +86,7 @@
       }
     ]
   },
-  "id": "bedrock-simple-explicit-tokens",
+  "id": "bedrock-cache-points-long",
   "input": {
     "context": {
       "messages": [
@@ -122,21 +134,22 @@
       ],
       "format": "json-lines"
     },
-    "mode": "streamSimpleBedrock",
+    "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "id": "amazon.nova-pro-v1:0",
+      "id": "anthropic.claude-3-5-haiku-20241022-v1:0",
       "input": [
-        "text"
+        "text",
+        "image"
       ],
-      "name": "Nova Pro Bedrock Fixture",
+      "name": "Claude 3.5 Haiku Bedrock Vision Fixture",
       "provider": "amazon-bedrock",
       "reasoning": false
     },
     "options": {
-      "cacheRetention": "none",
-      "maxTokens": 128
+      "cacheRetention": "long",
+      "maxTokens": 64
     }
   },
   "metadata": {
@@ -192,5 +205,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock streamSimpleBedrock uses the real simple-option path with explicit max tokens"
+  "title": "Bedrock Claude cache retention adds long cache points to system and last user messages"
 }

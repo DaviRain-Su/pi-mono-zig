@@ -1,27 +1,38 @@
 {
   "expected": {
     "typeScriptRequest": {
-      "mode": "streamSimpleBedrock",
+      "mode": "streamBedrock",
       "payload": {
         "inferenceConfig": {
-          "maxTokens": 128
+          "maxTokens": 64
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "(image omitted: model does not support images)"
+              }
+            ],
+            "role": "user"
+          },
+          {
+            "content": [
+              {
+                "toolResult": {
+                  "content": [
+                    {
+                      "text": "(tool image omitted: model does not support images)"
+                    }
+                  ],
+                  "status": "success",
+                  "toolUseId": "tool-image"
+                }
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "amazon.nova-pro-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "amazon.nova-pro-v1:0"
       }
     },
     "typeScriptStream": [
@@ -74,16 +85,33 @@
       }
     ]
   },
-  "id": "bedrock-simple-explicit-tokens",
+  "id": "bedrock-nonvision-image-downgrade",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": [
+            {
+              "data": "aGVsbG8=",
+              "mimeType": "image/png",
+              "type": "image"
+            }
+          ],
           "role": "user"
+        },
+        {
+          "content": [
+            {
+              "data": "aGVsbG8=",
+              "mimeType": "image/png",
+              "type": "image"
+            }
+          ],
+          "role": "toolResult",
+          "toolCallId": "tool-image",
+          "toolName": "get_weather"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
     },
     "localStream": {
       "events": [
@@ -122,7 +150,7 @@
       ],
       "format": "json-lines"
     },
-    "mode": "streamSimpleBedrock",
+    "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -136,7 +164,7 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 128
+      "maxTokens": 64
     }
   },
   "metadata": {
@@ -192,5 +220,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock streamSimpleBedrock uses the real simple-option path with explicit max tokens"
+  "title": "Bedrock non-vision models downgrade user and tool-result images to deterministic text placeholders"
 }

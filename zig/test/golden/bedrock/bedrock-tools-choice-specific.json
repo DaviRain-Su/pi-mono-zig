@@ -1,10 +1,10 @@
 {
   "expected": {
     "typeScriptRequest": {
-      "mode": "streamSimpleBedrock",
+      "mode": "streamBedrock",
       "payload": {
         "inferenceConfig": {
-          "maxTokens": 128
+          "maxTokens": 64
         },
         "messages": [
           {
@@ -16,12 +16,72 @@
             "role": "user"
           }
         ],
-        "modelId": "amazon.nova-pro-v1:0",
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
         "system": [
           {
             "text": "You are the deterministic Bedrock fixture assistant."
           }
-        ]
+        ],
+        "toolConfig": {
+          "toolChoice": {
+            "tool": {
+              "name": "lookup_order"
+            }
+          },
+          "tools": [
+            {
+              "toolSpec": {
+                "description": "Return deterministic weather for a city.",
+                "inputSchema": {
+                  "json": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "unit": {
+                        "anyOf": [
+                          {
+                            "const": "celsius",
+                            "type": "string"
+                          },
+                          {
+                            "const": "fahrenheit",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "unit"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "name": "get_weather"
+              }
+            },
+            {
+              "toolSpec": {
+                "description": "Return deterministic order details.",
+                "inputSchema": {
+                  "json": {
+                    "properties": {
+                      "orderId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "orderId"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "name": "lookup_order"
+              }
+            }
+          ]
+        }
       }
     },
     "typeScriptStream": [
@@ -51,7 +111,7 @@
               "type": "text"
             }
           ],
-          "model": "amazon.nova-pro-v1:0",
+          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
           "provider": "amazon-bedrock",
           "role": "assistant",
           "stopReason": "stop",
@@ -74,7 +134,7 @@
       }
     ]
   },
-  "id": "bedrock-simple-explicit-tokens",
+  "id": "bedrock-tools-choice-specific",
   "input": {
     "context": {
       "messages": [
@@ -83,7 +143,52 @@
           "role": "user"
         }
       ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      "systemPrompt": "You are the deterministic Bedrock fixture assistant.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "description": "Return deterministic order details.",
+          "name": "lookup_order",
+          "parameters": {
+            "properties": {
+              "orderId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "orderId"
+            ],
+            "type": "object"
+          }
+        }
+      ]
     },
     "localStream": {
       "events": [
@@ -122,21 +227,25 @@
       ],
       "format": "json-lines"
     },
-    "mode": "streamSimpleBedrock",
+    "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "id": "amazon.nova-pro-v1:0",
+      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
       "input": [
         "text"
       ],
-      "name": "Nova Pro Bedrock Fixture",
+      "name": "Claude 3.7 Sonnet Bedrock Fixture",
       "provider": "amazon-bedrock",
-      "reasoning": false
+      "reasoning": true
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 128
+      "maxTokens": 64,
+      "toolChoice": {
+        "name": "lookup_order",
+        "type": "tool"
+      }
     }
   },
   "metadata": {
@@ -192,5 +301,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock streamSimpleBedrock uses the real simple-option path with explicit max tokens"
+  "title": "Bedrock specific toolChoice maps to toolConfig.toolChoice.tool.name"
 }

@@ -15,18 +15,33 @@
     ],
     "modelIds": [
       "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "anthropic.claude-3-5-haiku-20241022-v1:0",
       "amazon.nova-pro-v1:0"
     ],
     "scenarioIds": [
+      "bedrock-stream-no-explicit-inference",
       "bedrock-stream-basic-text",
       "bedrock-stream-metadata-response",
+      "bedrock-tools-choice-none",
+      "bedrock-tools-choice-auto",
+      "bedrock-tools-choice-any",
+      "bedrock-tools-choice-specific",
+      "bedrock-unrelated-provider-options-ignored",
+      "bedrock-message-history-tool-results",
+      "bedrock-vision-image-block",
+      "bedrock-nonvision-image-downgrade",
+      "bedrock-cache-points-long",
+      "bedrock-onpayload-pass-through",
+      "bedrock-onpayload-replacement",
+      "bedrock-reasoning-fields",
+      "bedrock-transform-replay-edge-cases",
       "bedrock-simple-explicit-tokens",
       "bedrock-binary-eventstream-tool-use"
     ]
   },
   "captureBoundary": "TypeScript Bedrock Converse request/stream snapshots after provider conversion and before live AWS SDK send",
   "comparatorMode": "semantic-request-and-stream",
-  "fixtureCount": 4,
+  "fixtureCount": 18,
   "generatedBy": "zig/test/generate-bedrock-fixtures.ts",
   "localStreamFormats": [
     "json-lines",
@@ -34,12 +49,27 @@
   ],
   "modelIds": [
     "anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "anthropic.claude-3-5-haiku-20241022-v1:0",
     "amazon.nova-pro-v1:0"
   ],
   "network": "local BedrockRuntimeClient.send mock only; no AWS metadata, credential store, or remote Bedrock access",
   "scenarioIds": [
+    "bedrock-stream-no-explicit-inference",
     "bedrock-stream-basic-text",
     "bedrock-stream-metadata-response",
+    "bedrock-tools-choice-none",
+    "bedrock-tools-choice-auto",
+    "bedrock-tools-choice-any",
+    "bedrock-tools-choice-specific",
+    "bedrock-unrelated-provider-options-ignored",
+    "bedrock-message-history-tool-results",
+    "bedrock-vision-image-block",
+    "bedrock-nonvision-image-downgrade",
+    "bedrock-cache-points-long",
+    "bedrock-onpayload-pass-through",
+    "bedrock-onpayload-replacement",
+    "bedrock-reasoning-fields",
+    "bedrock-transform-replay-edge-cases",
     "bedrock-simple-explicit-tokens",
     "bedrock-binary-eventstream-tool-use"
   ],

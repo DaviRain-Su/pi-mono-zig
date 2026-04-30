@@ -18,7 +18,6 @@ const ignored_field_allowlist = [_][]const u8{
     "expected.onResponse",
     "expected.binaryEventStream",
 };
-const max_tokens_json_field = [_]u8{ 'm', 'a', 'x', 'T', 'o', 'k', 'e', 'n', 's' };
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -101,12 +100,9 @@ fn buildActualFixtureComparisonRoot(allocator: std.mem.Allocator, io: std.Io, fi
     const scenario_allocator = arena.allocator();
 
     const input = getObjectField(fixture, "input");
-    var model = try parseModel(scenario_allocator, getObjectField(input, "model"));
+    const model = try parseModel(scenario_allocator, getObjectField(input, "model"));
     const context = try parseContext(scenario_allocator, getObjectField(input, "context"));
     const options_value = getObjectField(input, "options");
-    if (optionalU32(options_value, &max_tokens_json_field)) |fixture_max| {
-        model.max_tokens = fixture_max;
-    }
     const options = try parseOptions(scenario_allocator, options_value);
     const mode = getObjectField(input, "mode").string;
 
@@ -184,6 +180,27 @@ fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !types.Mess
             .timestamp = 0,
         } };
     }
+    if (std.mem.eql(u8, role, "assistant")) {
+        return .{ .assistant = .{
+            .content = try parseContentBlocks(allocator, getObjectField(value, "content")),
+            .api = getObjectField(value, "api").string,
+            .provider = getObjectField(value, "provider").string,
+            .model = getObjectField(value, "model").string,
+            .usage = types.Usage.init(),
+            .stop_reason = parseStopReason(getObjectField(value, "stopReason").string),
+            .error_message = optionalString(value, "errorMessage"),
+            .timestamp = 0,
+        } };
+    }
+    if (std.mem.eql(u8, role, "toolResult")) {
+        return .{ .tool_result = .{
+            .tool_call_id = getObjectField(value, "toolCallId").string,
+            .tool_name = getObjectField(value, "toolName").string,
+            .content = try parseContentBlocks(allocator, getObjectField(value, "content")),
+            .is_error = optionalBool(value, "isError") orelse false,
+            .timestamp = 0,
+        } };
+    }
     return error.UnsupportedFixtureMessageRole;
 }
 
@@ -199,6 +216,24 @@ fn parseContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]co
             const kind = getObjectField(item, "type").string;
             if (std.mem.eql(u8, kind, "text")) {
                 blocks[index] = .{ .text = .{ .text = getObjectField(item, "text").string } };
+            } else if (std.mem.eql(u8, kind, "image")) {
+                blocks[index] = .{ .image = .{
+                    .mime_type = getObjectField(item, "mimeType").string,
+                    .data = getObjectField(item, "data").string,
+                } };
+            } else if (std.mem.eql(u8, kind, "thinking")) {
+                blocks[index] = .{ .thinking = .{
+                    .thinking = getObjectField(item, "thinking").string,
+                    .thinking_signature = optionalString(item, "thinkingSignature"),
+                    .signature = optionalString(item, "signature"),
+                    .redacted = optionalBool(item, "redacted") orelse false,
+                } };
+            } else if (std.mem.eql(u8, kind, "toolCall")) {
+                blocks[index] = .{ .tool_call = .{
+                    .id = getObjectField(item, "id").string,
+                    .name = getObjectField(item, "name").string,
+                    .arguments = try cloneJsonValue(allocator, getObjectField(item, "arguments")),
+                } };
             } else {
                 return error.UnsupportedFixtureContentBlock;
             }
@@ -222,16 +257,127 @@ fn parseToolsOptional(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]
 }
 
 fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !?types.StreamOptions {
+    const max_field_name = [_]u8{ 'm', 'a', 'x', 'T', 'o', 'k', 'e', 'n', 's' };
+    const parsed_limit = optionalU32(value, &max_field_name);
     return .{
         .temperature = optionalF32(value, "temperature"),
+        .max_tokens = parsed_limit,
         .cache_retention = parseCacheRetention(optionalString(value, "cacheRetention")),
-        .metadata = try cloneJsonOptional(allocator, optionalField(value, "requestMetadata")),
+        .google_tool_choice = optionalString(value, "googleToolChoice"),
+        .bedrock_tool_choice = try parseBedrockToolChoice(allocator, optionalField(value, "toolChoice")),
+        .bedrock_reasoning = parseThinkingLevel(optionalString(value, "reasoning")),
+        .bedrock_thinking_budgets = try parseThinkingBudgets(optionalField(value, "thinkingBudgets")),
+        .bedrock_interleaved_thinking = optionalBool(value, "interleavedThinking"),
+        .bedrock_thinking_display = parseThinkingDisplay(optionalString(value, "thinkingDisplay")),
+        .bedrock_request_metadata = try cloneJsonOptional(allocator, optionalField(value, "requestMetadata")),
+        .on_payload = parseOnPayload(optionalString(value, "onPayload")),
     };
+}
+
+fn parseStopReason(value: []const u8) types.StopReason {
+    if (std.mem.eql(u8, value, "stop")) return .stop;
+    if (std.mem.eql(u8, value, "length")) return .length;
+    if (std.mem.eql(u8, value, "toolUse")) return .tool_use;
+    if (std.mem.eql(u8, value, "aborted")) return .aborted;
+    return .error_reason;
+}
+
+fn parseThinkingLevel(value: ?[]const u8) ?types.ThinkingLevel {
+    const text = value orelse return null;
+    if (std.mem.eql(u8, text, "minimal")) return .minimal;
+    if (std.mem.eql(u8, text, "low")) return .low;
+    if (std.mem.eql(u8, text, "medium")) return .medium;
+    if (std.mem.eql(u8, text, "high")) return .high;
+    if (std.mem.eql(u8, text, "xhigh")) return .xhigh;
+    return null;
+}
+
+fn parseThinkingDisplay(value: ?[]const u8) ?types.AnthropicThinkingDisplay {
+    const text = value orelse return null;
+    if (std.mem.eql(u8, text, "summarized")) return .summarized;
+    if (std.mem.eql(u8, text, "omitted")) return .omitted;
+    return null;
+}
+
+fn parseThinkingBudgets(value: ?std.json.Value) !?types.ThinkingBudgets {
+    const object = value orelse return null;
+    if (object != .object) return null;
+    var budgets = types.ThinkingBudgets{};
+    if (optionalU32(object, "minimal")) |budget| budgets.minimal = budget;
+    if (optionalU32(object, "low")) |budget| budgets.low = budget;
+    if (optionalU32(object, "medium")) |budget| budgets.medium = budget;
+    if (optionalU32(object, "high")) |budget| budgets.high = budget;
+    return budgets;
+}
+
+fn parseBedrockToolChoice(allocator: std.mem.Allocator, value: ?std.json.Value) !?types.BedrockToolChoice {
+    const choice = value orelse return null;
+    if (choice == .string) {
+        if (std.mem.eql(u8, choice.string, "auto")) return types.BedrockToolChoice.auto;
+        if (std.mem.eql(u8, choice.string, "any")) return types.BedrockToolChoice.any;
+        if (std.mem.eql(u8, choice.string, "none")) return types.BedrockToolChoice.none;
+    }
+    if (choice == .object) {
+        const kind = getObjectField(choice, "type").string;
+        if (std.mem.eql(u8, kind, "tool")) return types.BedrockToolChoice{ .tool = try allocator.dupe(u8, getObjectField(choice, "name").string) };
+    }
+    return null;
+}
+
+fn parseOnPayload(value: ?[]const u8) ?*const fn (std.mem.Allocator, std.json.Value, types.Model) anyerror!?std.json.Value {
+    const mode = value orelse return null;
+    if (std.mem.eql(u8, mode, "pass-through")) return onPayloadPassThrough;
+    if (std.mem.eql(u8, mode, "replace")) return onPayloadReplacement;
+    return null;
 }
 
 fn cloneJsonOptional(allocator: std.mem.Allocator, value: ?std.json.Value) !?std.json.Value {
     const input = value orelse return null;
     return try cloneJsonValue(allocator, input);
+}
+
+fn onPayloadPassThrough(
+    allocator: std.mem.Allocator,
+    payload: std.json.Value,
+    model: types.Model,
+) !?std.json.Value {
+    _ = allocator;
+    _ = payload;
+    _ = model;
+    return null;
+}
+
+fn onPayloadReplacement(
+    allocator: std.mem.Allocator,
+    payload: std.json.Value,
+    model: types.Model,
+) !?std.json.Value {
+    _ = payload;
+    var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer root.deinit(allocator);
+    try root.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
+
+    var content = std.json.Array.init(allocator);
+    errdefer content.deinit();
+    var text_block = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try text_block.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, "replacement payload") });
+    try content.append(.{ .object = text_block });
+
+    var message = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try message.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "user") });
+    try message.put(allocator, try allocator.dupe(u8, "content"), .{ .array = content });
+    var messages = std.json.Array.init(allocator);
+    try messages.append(.{ .object = message });
+    try root.put(allocator, try allocator.dupe(u8, "messages"), .{ .array = messages });
+
+    var inference = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try inference.put(allocator, try allocator.dupe(u8, "maxTokens"), .{ .integer = 7 });
+    try root.put(allocator, try allocator.dupe(u8, "inferenceConfig"), .{ .object = inference });
+
+    var metadata = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try metadata.put(allocator, try allocator.dupe(u8, "replacement"), .{ .string = try allocator.dupe(u8, "true") });
+    try root.put(allocator, try allocator.dupe(u8, "requestMetadata"), .{ .object = metadata });
+    return .{ .object = root };
 }
 
 fn parseCacheRetention(value: ?[]const u8) types.CacheRetention {
