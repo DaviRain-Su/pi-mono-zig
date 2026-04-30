@@ -23,12 +23,14 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     try runBoundedDiffSelfTest(allocator);
+    try runIgnoredAllowlistSelfTest(allocator);
 
     const manifest = try readJsonFile(allocator, io, fixture_dir ++ "/manifest.json");
     defer manifest.deinit();
 
     const scenario_ids = getObjectField(manifest.value, "scenarioIds").array.items;
     var failures: usize = 0;
+    var ignored_paths = IgnoredPathTracker{};
 
     for (scenario_ids) |scenario_id_value| {
         const scenario_id = scenario_id_value.string;
@@ -38,19 +40,13 @@ pub fn main(init: std.process.Init) !void {
         const fixture = try readJsonFile(allocator, io, path);
         defer fixture.deinit();
 
-        const actual_request = try buildActualRequestFromFixture(allocator, fixture.value);
-        defer openai.freeOwnedJsonValue(allocator, actual_request);
-        const actual_compat = try buildActualCompatFromFixture(allocator, fixture.value);
-        defer openai.freeOwnedJsonValue(allocator, actual_compat);
+        const actual_fixture = try buildActualFixtureComparisonRoot(allocator, fixture.value);
+        defer openai.freeOwnedJsonValue(allocator, actual_fixture);
 
-        const expected_root = getObjectField(fixture.value, "expected");
-        const expected_request = getObjectField(expected_root, "typeScriptRequest");
-        const expected_compat = getObjectField(expected_root, "resolvedCompat");
         var diffs = DiffCollector.init(allocator);
         defer diffs.deinit();
 
-        try compareJson(&diffs, scenario_id, "resolvedCompat", expected_compat, actual_compat);
-        try compareJson(&diffs, scenario_id, "request", expected_request, actual_request);
+        try compareJson(&diffs, &ignored_paths, scenario_id, "", fixture.value, actual_fixture);
         if (diffs.count == 0) {
             std.debug.print("  matched {s}\n", .{scenario_id});
         } else {
@@ -67,14 +63,25 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
+    const ignored_summary = try ignored_paths.summary(allocator);
+    defer allocator.free(ignored_summary);
+    const allowlist_summary = try ignoredAllowlistSummary(allocator);
+    defer allocator.free(allowlist_summary);
+
     std.debug.print(
-        "OpenAI Chat parity matched {d} scenarios; ignored allowlist: {s}\n",
-        .{ scenario_ids.len, ignoredAllowlistSummary() },
+        "OpenAI Chat parity matched {d} scenarios; ignored paths: {s}; ignored allowlist: {s}\n",
+        .{ scenario_ids.len, ignored_summary, allowlist_summary },
     );
 }
 
-fn ignoredAllowlistSummary() []const u8 {
-    return "id, title, input, metadata, schemaVersion, expected.onPayload";
+fn ignoredAllowlistSummary(allocator: std.mem.Allocator) ![]const u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    for (ignored_field_allowlist, 0..) |path, index| {
+        if (index > 0) try buffer.appendSlice(allocator, ", ");
+        try buffer.appendSlice(allocator, path);
+    }
+    return try buffer.toOwnedSlice(allocator);
 }
 
 fn readJsonFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(std.json.Value) {
@@ -108,6 +115,32 @@ fn buildActualCompatFromFixture(allocator: std.mem.Allocator, fixture: std.json.
     const input = getObjectField(fixture, "input");
     const model = try parseModel(scenario_allocator, getObjectField(input, "model"));
     return try openai.buildResolvedCompatSnapshotValue(allocator, model);
+}
+
+fn buildActualFixtureComparisonRoot(allocator: std.mem.Allocator, fixture: std.json.Value) !std.json.Value {
+    const actual_request = try buildActualRequestFromFixture(allocator, fixture);
+    errdefer openai.freeOwnedJsonValue(allocator, actual_request);
+    const actual_compat = try buildActualCompatFromFixture(allocator, fixture);
+    errdefer openai.freeOwnedJsonValue(allocator, actual_compat);
+
+    var expected = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer expected.deinit(allocator);
+    try expected.put(
+        allocator,
+        try allocator.dupe(u8, "resolvedCompat"),
+        actual_compat,
+    );
+    try expected.put(
+        allocator,
+        try allocator.dupe(u8, "typeScriptRequest"),
+        actual_request,
+    );
+
+    var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer root.deinit(allocator);
+    try root.put(allocator, try allocator.dupe(u8, "expected"), .{ .object = expected });
+
+    return .{ .object = root };
 }
 
 fn parseModel(allocator: std.mem.Allocator, value: std.json.Value) !types.Model {
@@ -405,13 +438,51 @@ const DiffCollector = struct {
     }
 };
 
+const IgnoredPathTracker = struct {
+    paths: [ignored_field_allowlist.len]bool = [_]bool{false} ** ignored_field_allowlist.len,
+
+    fn shouldIgnore(self: *IgnoredPathTracker, path: []const u8) bool {
+        for (ignored_field_allowlist, 0..) |ignored_path, index| {
+            if (std.mem.eql(u8, path, ignored_path)) {
+                self.paths[index] = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn wasIgnored(self: *const IgnoredPathTracker, path: []const u8) bool {
+        for (ignored_field_allowlist, 0..) |ignored_path, index| {
+            if (std.mem.eql(u8, path, ignored_path)) return self.paths[index];
+        }
+        return false;
+    }
+
+    fn summary(self: *const IgnoredPathTracker, allocator: std.mem.Allocator) ![]const u8 {
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(allocator);
+        var first = true;
+        for (ignored_field_allowlist, 0..) |path, index| {
+            if (!self.paths[index]) continue;
+            if (!first) try buffer.appendSlice(allocator, ", ");
+            try buffer.appendSlice(allocator, path);
+            first = false;
+        }
+        if (first) try buffer.appendSlice(allocator, "(none)");
+        return try buffer.toOwnedSlice(allocator);
+    }
+};
+
 fn compareJson(
     diffs: *DiffCollector,
+    ignored_paths: *IgnoredPathTracker,
     scenario_id: []const u8,
     path: []const u8,
     expected: std.json.Value,
     actual: std.json.Value,
 ) !void {
+    if (ignored_paths.shouldIgnore(path)) return;
+
     if (expected == .integer and actual == .float) {
         if (@as(f64, @floatFromInt(expected.integer)) == actual.float) return;
     }
@@ -437,33 +508,45 @@ fn compareJson(
                 return;
             }
             for (expected_array.items, actual.array.items, 0..) |expected_item, actual_item, index| {
-                const child_path = try std.fmt.allocPrint(diffs.allocator, "{s}[{d}]", .{ path, index });
+                const child_path = try arrayChildPath(diffs.allocator, path, index);
                 defer diffs.allocator.free(child_path);
-                try compareJson(diffs, scenario_id, child_path, expected_item, actual_item);
+                try compareJson(diffs, ignored_paths, scenario_id, child_path, expected_item, actual_item);
             }
         },
         .object => |expected_object| {
             var expected_iterator = expected_object.iterator();
             while (expected_iterator.next()) |entry| {
-                const child_path = try std.fmt.allocPrint(diffs.allocator, "{s}.{s}", .{ path, entry.key_ptr.* });
+                const child_path = try objectChildPath(diffs.allocator, path, entry.key_ptr.*);
                 defer diffs.allocator.free(child_path);
+                if (ignored_paths.shouldIgnore(child_path)) continue;
                 const actual_child = actual.object.get(entry.key_ptr.*) orelse {
                     try diffs.add(scenario_id, child_path, entry.value_ptr.*, .null);
                     continue;
                 };
-                try compareJson(diffs, scenario_id, child_path, entry.value_ptr.*, actual_child);
+                try compareJson(diffs, ignored_paths, scenario_id, child_path, entry.value_ptr.*, actual_child);
             }
 
             var actual_iterator = actual.object.iterator();
             while (actual_iterator.next()) |entry| {
                 if (expected_object.get(entry.key_ptr.*) == null) {
-                    const child_path = try std.fmt.allocPrint(diffs.allocator, "{s}.{s}", .{ path, entry.key_ptr.* });
+                    const child_path = try objectChildPath(diffs.allocator, path, entry.key_ptr.*);
                     defer diffs.allocator.free(child_path);
+                    if (ignored_paths.shouldIgnore(child_path)) continue;
                     try diffs.add(scenario_id, child_path, .null, entry.value_ptr.*);
                 }
             }
         },
     }
+}
+
+fn objectChildPath(allocator: std.mem.Allocator, path: []const u8, child: []const u8) ![]const u8 {
+    if (path.len == 0) return try allocator.dupe(u8, child);
+    return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, child });
+}
+
+fn arrayChildPath(allocator: std.mem.Allocator, path: []const u8, index: usize) ![]const u8 {
+    if (path.len == 0) return try std.fmt.allocPrint(allocator, "[{d}]", .{index});
+    return try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, index });
 }
 
 fn renderBoundedJson(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
@@ -489,4 +572,49 @@ fn runBoundedDiffSelfTest(allocator: std.mem.Allocator) !void {
     defer diffs.deinit();
     try diffs.add("bounded-diff-self-test", "request.jsonPayload.long", .{ .string = long_expected }, .{ .string = long_actual });
     if (diffs.buffer.items.len > max_diff_output_bytes) return error.UnboundedDiffOutput;
+}
+
+fn runIgnoredAllowlistSelfTest(allocator: std.mem.Allocator) !void {
+    const expected_json =
+        \\{
+        \\  "id": "allowlisted-id",
+        \\  "expected": {
+        \\    "resolvedCompat": {},
+        \\    "typeScriptRequest": {},
+        \\    "futureExpectedField": true
+        \\  },
+        \\  "futureRootField": true
+        \\}
+    ;
+    const actual_json =
+        \\{
+        \\  "expected": {
+        \\    "resolvedCompat": {},
+        \\    "typeScriptRequest": {}
+        \\  },
+        \\  "actualOnlyField": true
+        \\}
+    ;
+
+    const expected = try std.json.parseFromSlice(std.json.Value, allocator, expected_json, .{});
+    defer expected.deinit();
+    const actual = try std.json.parseFromSlice(std.json.Value, allocator, actual_json, .{});
+    defer actual.deinit();
+
+    var ignored_paths = IgnoredPathTracker{};
+    var diffs = DiffCollector.init(allocator);
+    defer diffs.deinit();
+
+    try compareJson(&diffs, &ignored_paths, "ignored-allowlist-self-test", "", expected.value, actual.value);
+    if (diffs.count != 3) return error.UnallowlistedFixtureFieldWasNotRejected;
+    if (!ignored_paths.wasIgnored("id")) return error.AllowlistedFixtureFieldWasNotIgnored;
+    if (std.mem.indexOf(u8, diffs.buffer.items, "expected.futureExpectedField") == null) {
+        return error.UnallowlistedFixtureFieldPathNotReported;
+    }
+    if (std.mem.indexOf(u8, diffs.buffer.items, "futureRootField") == null) {
+        return error.UnallowlistedFixtureFieldPathNotReported;
+    }
+    if (std.mem.indexOf(u8, diffs.buffer.items, "actualOnlyField") == null) {
+        return error.UnallowlistedFixtureFieldPathNotReported;
+    }
 }
