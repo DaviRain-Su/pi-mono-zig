@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    openai_responses_parity_exe_mod.addImport("ai", ai_mod);
     const openai_responses_parity_exe = b.addExecutable(.{
         .name = "openai-responses-parity",
         .root_module = openai_responses_parity_exe_mod,

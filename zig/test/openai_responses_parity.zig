@@ -1,4 +1,10 @@
 const std = @import("std");
+const ai = @import("ai");
+
+const types = ai.types;
+const openai_responses = ai.providers.openai_responses;
+const azure_openai_responses = ai.providers.azure_openai_responses;
+const openai_codex_responses = ai.providers.openai_codex_responses;
 
 const fixture_dir = "test/golden/openai-responses";
 const default_codex_base_url = "https://chatgpt.com/backend-api";
@@ -21,7 +27,9 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     try runBoundedDiffSelfTest(allocator);
+    try runPathSpecificComparatorSelfTests(allocator);
     try runIgnoredAllowlistSelfTest(allocator);
+    try runProductionRequestBuilderProofSelfTest(allocator);
 
     const manifest = try readJsonFile(allocator, io, fixture_dir ++ "/manifest.json");
     defer manifest.deinit();
@@ -68,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(allowlist_summary);
 
     std.debug.print(
-        "OpenAI Responses parity matched {d} scenarios; ignored paths: {s}; ignored allowlist: {s}\n",
+        "OpenAI Responses parity matched {d} scenarios; comparator negative self-tests and production payload proof passed; ignored paths: {s}; ignored allowlist: {s}\n",
         .{ scenario_ids.len, ignored_summary, allowlist_summary },
     );
 }
@@ -305,6 +313,205 @@ fn buildCodexWebSocketMessage(allocator: std.mem.Allocator, payload: std.json.Va
         }
     }
     return .{ .object = message };
+}
+
+fn buildProductionBackedPayload(
+    allocator: std.mem.Allocator,
+    model_json: std.json.Value,
+    context_json: std.json.Value,
+    options_json: std.json.Value,
+    env: ?std.json.Value,
+    provider_family: []const u8,
+) !std.json.Value {
+    var model = try modelFromFixtureInput(allocator, model_json);
+    const context = try contextFromFixtureInput(allocator, context_json, model);
+    const options = try streamOptionsFromFixtureInput(allocator, model_json, options_json);
+
+    if (std.mem.eql(u8, provider_family, "azure-openai")) {
+        model.id = azureDeploymentName(model_json, options_json, env);
+        return try azure_openai_responses.buildAzureRequestPayload(allocator, model, context, options);
+    }
+    if (std.mem.eql(u8, provider_family, "openai-codex")) {
+        return try openai_codex_responses.buildRequestPayload(allocator, model, context, options);
+    }
+    return try openai_responses.buildRequestPayload(allocator, model, context, options);
+}
+
+fn modelFromFixtureInput(allocator: std.mem.Allocator, model: std.json.Value) !types.Model {
+    const input_json = getObjectField(model, "input");
+    const input_types = try allocator.alloc([]const u8, input_json.array.items.len);
+    for (input_json.array.items, 0..) |item, index| input_types[index] = item.string;
+    return .{
+        .id = getObjectField(model, "id").string,
+        .name = getObjectField(model, "name").string,
+        .api = getObjectField(model, "api").string,
+        .provider = getObjectField(model, "provider").string,
+        .base_url = getObjectField(model, "baseUrl").string,
+        .reasoning = optionalBool(model, "reasoning") orelse false,
+        .input_types = input_types,
+        .context_window = 0,
+        .max_tokens = 0,
+        .headers = try headersMapFromObject(allocator, optionalField(model, "headers")),
+        .compat = optionalField(model, "compat"),
+    };
+}
+
+fn contextFromFixtureInput(allocator: std.mem.Allocator, context: std.json.Value, model: types.Model) !types.Context {
+    const messages_json = getObjectField(context, "messages");
+    const messages = try allocator.alloc(types.Message, messages_json.array.items.len);
+    for (messages_json.array.items, 0..) |message, index| messages[index] = try messageFromFixtureInput(allocator, message, model);
+    return .{
+        .system_prompt = optionalString(context, "systemPrompt"),
+        .messages = messages,
+        .tools = try toolsFromFixtureInput(allocator, optionalField(context, "tools")),
+    };
+}
+
+fn messageFromFixtureInput(allocator: std.mem.Allocator, message: std.json.Value, model: types.Model) !types.Message {
+    const role = getObjectField(message, "role").string;
+    if (std.mem.eql(u8, role, "user")) {
+        return .{ .user = .{
+            .content = try contentBlocksFromFixtureInput(allocator, getObjectField(message, "content")),
+            .timestamp = 0,
+        } };
+    }
+    if (std.mem.eql(u8, role, "assistant")) {
+        return .{ .assistant = .{
+            .content = try contentBlocksFromFixtureInput(allocator, getObjectField(message, "content")),
+            .api = optionalString(message, "api") orelse model.api,
+            .provider = optionalString(message, "provider") orelse model.provider,
+            .model = optionalString(message, "model") orelse model.id,
+            .response_id = optionalString(message, "responseId"),
+            .usage = types.Usage.init(),
+            .stop_reason = stopReasonFromFixture(optionalString(message, "stopReason")),
+            .timestamp = 0,
+        } };
+    }
+    if (std.mem.eql(u8, role, "toolResult")) {
+        return .{ .tool_result = .{
+            .tool_call_id = getObjectField(message, "toolCallId").string,
+            .tool_name = getObjectField(message, "toolName").string,
+            .content = try contentBlocksFromFixtureInput(allocator, getObjectField(message, "content")),
+            .is_error = optionalBool(message, "isError") orelse false,
+            .timestamp = 0,
+        } };
+    }
+    return error.UnsupportedFixtureMessageRole;
+}
+
+fn contentBlocksFromFixtureInput(allocator: std.mem.Allocator, content: std.json.Value) ![]const types.ContentBlock {
+    if (content == .string) {
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = .{ .text = content.string } };
+        return blocks;
+    }
+
+    var blocks = std.ArrayList(types.ContentBlock).empty;
+    for (content.array.items) |part| {
+        const part_type = getObjectField(part, "type").string;
+        if (std.mem.eql(u8, part_type, "text")) {
+            try blocks.append(allocator, .{ .text = .{
+                .text = getObjectField(part, "text").string,
+                .text_signature = optionalString(part, "textSignature"),
+            } });
+        } else if (std.mem.eql(u8, part_type, "image")) {
+            try blocks.append(allocator, .{ .image = .{
+                .data = getObjectField(part, "data").string,
+                .mime_type = getObjectField(part, "mimeType").string,
+            } });
+        } else if (std.mem.eql(u8, part_type, "thinking")) {
+            try blocks.append(allocator, .{ .thinking = .{
+                .thinking = getObjectField(part, "thinking").string,
+                .thinking_signature = optionalString(part, "thinkingSignature"),
+            } });
+        } else if (std.mem.eql(u8, part_type, "toolCall")) {
+            try blocks.append(allocator, .{ .tool_call = .{
+                .id = getObjectField(part, "id").string,
+                .name = getObjectField(part, "name").string,
+                .arguments = getObjectField(part, "arguments"),
+            } });
+        }
+    }
+    return try blocks.toOwnedSlice(allocator);
+}
+
+fn toolsFromFixtureInput(allocator: std.mem.Allocator, maybe_tools: ?std.json.Value) !?[]const types.Tool {
+    const tools_json = maybe_tools orelse return null;
+    if (tools_json != .array) return null;
+    const tools = try allocator.alloc(types.Tool, tools_json.array.items.len);
+    for (tools_json.array.items, 0..) |tool, index| {
+        tools[index] = .{
+            .name = getObjectField(tool, "name").string,
+            .description = getObjectField(tool, "description").string,
+            .parameters = getObjectField(tool, "parameters"),
+        };
+    }
+    return tools;
+}
+
+fn streamOptionsFromFixtureInput(allocator: std.mem.Allocator, model: std.json.Value, options: std.json.Value) !?types.StreamOptions {
+    var stream_options = types.StreamOptions{
+        .api_key = "fixture-api-key-redacted",
+        .headers = try headersMapFromObject(allocator, optionalField(options, "headers")),
+        .cache_retention = cacheRetentionFromFixture(optionalString(options, "cacheRetention")),
+        .session_id = optionalString(options, "sessionId"),
+        .timeout_ms = optionalU32(options, "timeoutMs"),
+        .max_retries = optionalU32(options, "maxRetries"),
+        .max_tokens = optionalU32(options, "maxTokens"),
+        .responses_reasoning_summary = optionalString(options, "reasoningSummary"),
+        .responses_service_tier = optionalString(options, "serviceTier"),
+        .responses_text_verbosity = optionalString(options, "textVerbosity"),
+        .azure_api_version = optionalString(options, "azureApiVersion"),
+        .azure_resource_name = optionalString(options, "azureResourceName"),
+        .azure_base_url = optionalString(options, "azureBaseUrl"),
+        .azure_deployment_name = optionalString(options, "azureDeploymentName"),
+    };
+
+    if (optionalNumber(options, "temperature")) |temperature| stream_options.temperature = @floatCast(temperature);
+    if (optionalString(options, "reasoningEffort")) |effort| stream_options.responses_reasoning_effort = try thinkingLevelFromString(effort);
+    if (optionalString(options, "simpleReasoning")) |effort| {
+        const clamped = try clampSimpleReasoning(allocator, getObjectField(model, "id").string, effort);
+        stream_options.responses_reasoning_effort = try thinkingLevelFromString(clamped);
+        if (stream_options.max_tokens == null) stream_options.max_tokens = 4096;
+    }
+    return stream_options;
+}
+
+fn headersMapFromObject(allocator: std.mem.Allocator, maybe_headers: ?std.json.Value) !?std.StringHashMap([]const u8) {
+    const headers_json = maybe_headers orelse return null;
+    if (headers_json != .object) return null;
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    var iterator = headers_json.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* == .string) try headers.put(entry.key_ptr.*, entry.value_ptr.string);
+    }
+    return headers;
+}
+
+fn cacheRetentionFromFixture(value: ?[]const u8) types.CacheRetention {
+    const retention = value orelse return .unset;
+    if (std.mem.eql(u8, retention, "none")) return .none;
+    if (std.mem.eql(u8, retention, "long") or std.mem.eql(u8, retention, "env-long")) return .long;
+    if (std.mem.eql(u8, retention, "short")) return .short;
+    return .unset;
+}
+
+fn thinkingLevelFromString(value: []const u8) !types.ThinkingLevel {
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return error.UnsupportedFixtureThinkingLevel;
+}
+
+fn stopReasonFromFixture(value: ?[]const u8) types.StopReason {
+    const reason = value orelse return .stop;
+    if (std.mem.eql(u8, reason, "length")) return .length;
+    if (std.mem.eql(u8, reason, "toolUse")) return .tool_use;
+    if (std.mem.eql(u8, reason, "error")) return .error_reason;
+    if (std.mem.eql(u8, reason, "aborted")) return .aborted;
+    return .stop;
 }
 
 fn buildOpenAIResponsesPayload(allocator: std.mem.Allocator, model: std.json.Value, context: std.json.Value, options: std.json.Value, provider_family: []const u8) !std.json.Value {
@@ -1184,6 +1391,95 @@ fn runBoundedDiffSelfTest(allocator: std.mem.Allocator) !void {
     if (diffs.buffer.items.len > max_diff_output_bytes) return error.UnboundedDiffOutput;
 }
 
+const ComparatorNegativeCase = struct {
+    name: []const u8,
+    scenario_id: []const u8,
+    path: []const u8,
+    expected_json: []const u8,
+    actual_json: []const u8,
+};
+
+fn runPathSpecificComparatorSelfTests(allocator: std.mem.Allocator) !void {
+    const cases = [_]ComparatorNegativeCase{
+        .{
+            .name = "header diff",
+            .scenario_id = "negative-header-diff-self-test",
+            .path = "expected.typeScriptRequest.headers.openai-intent",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"headers\":{\"openai-intent\":\"conversation-edits\"}}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{\"headers\":{\"openai-intent\":\"fixture-override\"}}}}",
+        },
+        .{
+            .name = "payload diff",
+            .scenario_id = "negative-payload-diff-self-test",
+            .path = "expected.typeScriptRequest.jsonPayload.input[0].role",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"jsonPayload\":{\"input\":[{\"role\":\"developer\"}]}}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{\"jsonPayload\":{\"input\":[{\"role\":\"system\"}]}}}}",
+        },
+        .{
+            .name = "url diff",
+            .scenario_id = "negative-url-diff-self-test",
+            .path = "expected.typeScriptRequest.url",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"url\":\"https://api.openai.com/v1/responses\"}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{\"url\":\"https://api.openai.com/v1/wrong\"}}}",
+        },
+        .{
+            .name = "path/query diff",
+            .scenario_id = "negative-query-diff-self-test",
+            .path = "expected.typeScriptRequest.query.api-version",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"path\":\"/openai/v1/responses\",\"query\":{\"api-version\":\"2025-04-01-preview\"}}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{\"path\":\"/openai/v1/responses\",\"query\":{\"api-version\":\"v1\"}}}}",
+        },
+        .{
+            .name = "request options diff",
+            .scenario_id = "negative-request-options-diff-self-test",
+            .path = "expected.typeScriptRequest.requestOptions.timeoutMs",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"requestOptions\":{\"signal\":\"not-provided\",\"timeoutMs\":1234}}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{\"requestOptions\":{\"signal\":\"not-provided\",\"timeoutMs\":5678}}}}",
+        },
+        .{
+            .name = "transport metadata diff",
+            .scenario_id = "negative-metadata-diff-self-test",
+            .path = "expected.typeScriptRequest.transportMetadata.mode",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"transportMetadata\":{\"mode\":\"sse\"}}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{\"transportMetadata\":{\"mode\":\"deferred-websocket\"}}}}",
+        },
+        .{
+            .name = "unallowlisted extra diff",
+            .scenario_id = "negative-unallowlisted-extra-self-test",
+            .path = "expected.typeScriptRequest.unallowlistedExtra",
+            .expected_json = "{\"expected\":{\"typeScriptRequest\":{\"unallowlistedExtra\":true}}}",
+            .actual_json = "{\"expected\":{\"typeScriptRequest\":{}}}",
+        },
+    };
+
+    for (cases) |case| try runComparatorNegativeCase(allocator, case);
+}
+
+fn runComparatorNegativeCase(allocator: std.mem.Allocator, case: ComparatorNegativeCase) !void {
+    const expected = try std.json.parseFromSlice(std.json.Value, allocator, case.expected_json, .{});
+    defer expected.deinit();
+    const actual = try std.json.parseFromSlice(std.json.Value, allocator, case.actual_json, .{});
+    defer actual.deinit();
+
+    var ignored_paths = IgnoredPathTracker{};
+    var diffs = DiffCollector.init(allocator);
+    defer diffs.deinit();
+    try compareJson(&diffs, &ignored_paths, case.scenario_id, "", expected.value, actual.value);
+    if (diffs.count == 0) return error.ComparatorNegativeSelfTestDidNotFail;
+    if (diffs.buffer.items.len > max_diff_output_bytes) return error.UnboundedDiffOutput;
+    if (std.mem.indexOf(u8, diffs.buffer.items, case.scenario_id) == null) return error.ComparatorNegativeScenarioIdNotReported;
+    const path_text = try std.fmt.allocPrint(allocator, "path {s}", .{case.path});
+    defer allocator.free(path_text);
+    if (std.mem.indexOf(u8, diffs.buffer.items, path_text) == null) {
+        std.debug.print("Comparator negative self-test {s} did not report exact path {s}; output:\n{s}", .{ case.name, case.path, diffs.buffer.items });
+        return error.ComparatorNegativePathNotReported;
+    }
+    const forbidden = [_][]const u8{ "Bearer ", "sk-", "/Users/", "file://" };
+    for (forbidden) |marker| {
+        if (std.mem.indexOf(u8, diffs.buffer.items, marker) != null) return error.ComparatorNegativeOutputLeakedSecretLikeValue;
+    }
+}
+
 fn runIgnoredAllowlistSelfTest(allocator: std.mem.Allocator) !void {
     const expected_json =
         \\{
@@ -1211,4 +1507,65 @@ fn runIgnoredAllowlistSelfTest(allocator: std.mem.Allocator) !void {
     if (std.mem.indexOf(u8, diffs.buffer.items, "expected.futureExpectedField") == null) return error.UnallowlistedFixtureFieldPathNotReported;
     if (std.mem.indexOf(u8, diffs.buffer.items, "futureRootField") == null) return error.UnallowlistedFixtureFieldPathNotReported;
     if (std.mem.indexOf(u8, diffs.buffer.items, "actualOnlyField") == null) return error.UnallowlistedFixtureFieldPathNotReported;
+}
+
+fn runProductionRequestBuilderProofSelfTest(allocator: std.mem.Allocator) !void {
+    try runProductionPayloadProofCase(
+        allocator,
+        "production-openai-responses-payload-proof",
+        "openai",
+        "{\"id\":\"gpt-5-mini-proof\",\"name\":\"proof\",\"api\":\"openai-responses\",\"provider\":\"openai\",\"baseUrl\":\"https://api.openai.com/v1\",\"reasoning\":true,\"input\":[\"text\"]}",
+        "{\"systemPrompt\":\"Proof prompt.\",\"messages\":[{\"role\":\"user\",\"content\":\"Proof user.\"}],\"tools\":[{\"name\":\"lookup_fixture\",\"description\":\"Lookup.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\",\"cacheRetention\":\"long\",\"sessionId\":\"proof-session\",\"reasoningEffort\":\"high\",\"reasoningSummary\":\"concise\",\"maxTokens\":64,\"temperature\":0}",
+    );
+    try runProductionPayloadProofCase(
+        allocator,
+        "production-azure-responses-payload-proof",
+        "azure-openai",
+        "{\"id\":\"gpt-4.1-azure-proof\",\"name\":\"proof\",\"api\":\"azure-openai-responses\",\"provider\":\"azure-openai-responses\",\"baseUrl\":\"https://fixture-resource.openai.azure.com\",\"reasoning\":false,\"input\":[\"text\"]}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Proof Azure.\"}]}",
+        "{\"apiKeyMode\":\"fixture-placeholder\",\"azureDeploymentName\":\"proof-deployment\",\"sessionId\":\"azure-proof-session\",\"maxTokens\":32}",
+    );
+    try runProductionPayloadProofCase(
+        allocator,
+        "production-codex-responses-payload-proof",
+        "openai-codex",
+        "{\"id\":\"gpt-5.1-codex\",\"name\":\"proof\",\"api\":\"openai-codex-responses\",\"provider\":\"openai-codex\",\"baseUrl\":\"https://chatgpt.com/backend-api\",\"reasoning\":true,\"input\":[\"text\"]}",
+        "{\"systemPrompt\":\"Codex proof instructions.\",\"messages\":[{\"role\":\"user\",\"content\":\"Proof Codex.\"}]}",
+        "{\"apiKeyMode\":\"fixture-codex-jwt\",\"sessionId\":\"codex-proof-session\",\"textVerbosity\":\"low\",\"reasoningEffort\":\"minimal\",\"serviceTier\":\"flex\"}",
+    );
+}
+
+fn runProductionPayloadProofCase(
+    allocator: std.mem.Allocator,
+    scenario_id: []const u8,
+    provider_family: []const u8,
+    model_json_text: []const u8,
+    context_json_text: []const u8,
+    options_json_text: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const proof_allocator = arena.allocator();
+
+    const model = try std.json.parseFromSlice(std.json.Value, proof_allocator, model_json_text, .{});
+    const context = try std.json.parseFromSlice(std.json.Value, proof_allocator, context_json_text, .{});
+    const options = try std.json.parseFromSlice(std.json.Value, proof_allocator, options_json_text, .{});
+
+    const production_payload = try buildProductionBackedPayload(proof_allocator, model.value, context.value, options.value, null, provider_family);
+    const fixture_helper_payload = if (std.mem.eql(u8, provider_family, "azure-openai"))
+        try buildAzurePayload(proof_allocator, model.value, context.value, options.value, null)
+    else if (std.mem.eql(u8, provider_family, "openai-codex"))
+        try buildCodexPayload(proof_allocator, model.value, context.value, options.value)
+    else
+        try buildOpenAIResponsesPayload(proof_allocator, model.value, context.value, options.value, provider_family);
+
+    var ignored_paths = IgnoredPathTracker{};
+    var diffs = DiffCollector.init(proof_allocator);
+    defer diffs.deinit();
+    try compareJson(&diffs, &ignored_paths, scenario_id, "expected.typeScriptRequest.jsonPayload", fixture_helper_payload, production_payload);
+    if (diffs.count != 0) {
+        std.debug.print("Production request-builder proof failed:\n{s}", .{diffs.buffer.items});
+        return error.ProductionRequestBuilderProofFailed;
+    }
 }

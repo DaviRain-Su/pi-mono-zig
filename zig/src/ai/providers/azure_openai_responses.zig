@@ -162,7 +162,7 @@ pub const AzureOpenAIResponsesProvider = struct {
     }
 };
 
-fn buildAzureRequestPayload(
+pub fn buildAzureRequestPayload(
     allocator: std.mem.Allocator,
     request_model: types.Model,
     context: types.Context,
