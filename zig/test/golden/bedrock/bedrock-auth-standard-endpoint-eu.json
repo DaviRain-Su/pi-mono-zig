@@ -25,7 +25,7 @@
           "mode": "skip-auth",
           "secrets": "redacted"
         },
-        "boundary": "production-request-boundary",
+        "boundary": "aws-sdk-client-config-boundary",
         "clientConfig": {
           "endpoint": "https://bedrock-runtime.eu-central-1.amazonaws.com",
           "region": "eu-central-1"
@@ -271,9 +271,9 @@
         "bedrock-auth-missing-credentials"
       ]
     },
-    "captureBoundary": "streamBedrock, streamSimpleBedrock, and streamSimple after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
-    "captureMethod": "BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
-    "network": "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
+    "captureBoundary": "streamBedrock through TypeScript Converse command construction plus AWS SDK finalized local request capture for request-surface fixtures",
+    "captureMethod": "Request-surface fixtures use AWS SDK local request capture when bearer/SigV4 signing can finalize locally, and SDK client config capture for profile/missing-credential surfaces",
+    "network": "AWS SDK requestHandler fixture throws before network when local HTTP boundary capture runs; no live AWS calls are allowed",
     "sourceCitations": [
       "packages/ai/src/providers/amazon-bedrock.ts:73-260",
       "packages/ai/src/providers/amazon-bedrock.ts:311-348",
