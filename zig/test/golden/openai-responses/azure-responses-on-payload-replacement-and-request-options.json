@@ -62,8 +62,7 @@
         "api-version": "2025-04-01-preview"
       },
       "requestOptions": {
-        "maxRetries": 3,
-        "signal": "not-provided",
+        "signal": "provided",
         "timeoutMs": 3456
       },
       "transportMetadata": {
@@ -105,7 +104,6 @@
       "azureApiVersion": "2025-04-01-preview",
       "azureBaseUrl": "https://replacement-resource.openai.azure.com/openai/v1/",
       "azureDeploymentName": "azure-replacement-deployment",
-      "maxRetries": 3,
       "onPayload": "replace-with-fixture-payload",
       "payloadReplacement": {
         "fixture_marker": "azure-on-payload-replacement",
@@ -123,6 +121,7 @@
         "model": "azure-replacement-deployment",
         "stream": true
       },
+      "signal": "provided",
       "timeoutMs": 3456
     }
   },

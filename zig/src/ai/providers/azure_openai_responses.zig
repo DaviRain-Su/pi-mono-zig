@@ -124,6 +124,7 @@ pub const AzureOpenAIResponsesProvider = struct {
             .url = url,
             .headers = headers,
             .body = json_body,
+            .timeout_ms = if (options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
             .aborted = if (options) |stream_options| stream_options.signal else null,
         });
         defer response.deinit();
@@ -1252,6 +1253,59 @@ fn freeEventOwned(allocator: std.mem.Allocator, event: types.AssistantMessageEve
     if (event.tool_call) |tool_call| freeToolCallOwned(allocator, tool_call);
 }
 
+const DelayedBodyServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    body: []const u8,
+    body_delay_ms: u64,
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, body: []const u8, body_delay_ms: u64) !DelayedBodyServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .body = body,
+            .body_delay_ms = body_delay_ms,
+        };
+    }
+
+    fn start(self: *DelayedBodyServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *DelayedBodyServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn url(self: *const DelayedBodyServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn run(self: *DelayedBodyServer) void {
+        const stream = self.server.accept(self.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => return,
+        };
+        defer stream.close(self.io);
+
+        writeResponse(self, stream) catch {};
+    }
+
+    fn writeResponse(self: *DelayedBodyServer, stream: std.Io.net.Stream) !void {
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{self.body.len},
+        );
+        try writer.interface.flush();
+        std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.body_delay_ms)), .awake) catch {};
+        try writer.interface.writeAll(self.body);
+        try writer.interface.flush();
+    }
+};
+
 test "buildRequestUrl normalizes Azure resource endpoints" {
     const allocator = std.testing.allocator;
     const url = try buildRequestUrl(allocator, "https://example.openai.azure.com/", "v1");
@@ -1458,6 +1512,54 @@ test "parseSseStreamLines emits Azure reasoning events without leaks" {
     try std.testing.expectEqualStrings("first\n\nsecond", event7.message.?.content[0].thinking.thinking);
 
     freeAssistantMessageOwned(allocator, event7.message.?);
+}
+
+test "stream forwards timeout_ms to HTTP streaming request" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure_timeout\",\"status\":\"completed\"}}\n";
+    var server = try DelayedBodyServer.init(io, body, 250);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try AzureOpenAIResponsesProvider.stream(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .timeout_ms = 50,
+    });
+    defer stream.deinit();
+
+    var saw_timeout = false;
+    while (stream.next()) |event| {
+        if (event.event_type == .error_event) {
+            saw_timeout = true;
+            try std.testing.expectEqualStrings("Timeout", event.error_message.?);
+            break;
+        }
+    }
+    try std.testing.expect(saw_timeout);
 }
 
 test "stream HTTP status error is terminal sanitized event" {
