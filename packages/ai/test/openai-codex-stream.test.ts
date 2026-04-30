@@ -199,6 +199,25 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).toBe("payload callback failed");
 	});
 
+	it("validates account id before invoking onPayload", async () => {
+		const fetchMock = vi.fn(async () => new Response("unexpected fetch", { status: 500 }));
+		global.fetch = fetchMock as typeof fetch;
+		let observedPayload = false;
+
+		const result = await streamOpenAICodexResponses(buildCodexModel(), buildCodexContext(), {
+			apiKey: "not-a-jwt-before-onPayload",
+			onPayload: () => {
+				observedPayload = true;
+				return undefined;
+			},
+		}).result();
+
+		expect(observedPayload).toBe(false);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Failed to extract accountId from token");
+	});
+
 	it("passes deterministic response metadata to onResponse before stream processing", async () => {
 		const token = mockToken();
 		let responseMetadata: { status: number; headers: Record<string, string> } | undefined;
