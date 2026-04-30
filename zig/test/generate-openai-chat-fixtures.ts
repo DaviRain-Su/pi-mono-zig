@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { streamOpenAICompletions, type OpenAICompletionsOptions } from "../../packages/ai/src/providers/openai-completions.js";
+import {
+	getOpenAICompletionsCompatForTesting,
+	streamOpenAICompletions,
+	type OpenAICompletionsOptions,
+} from "../../packages/ai/src/providers/openai-completions.js";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -94,6 +98,7 @@ interface FixtureRecord {
 	title: string;
 	input: ScenarioInput;
 	expected: {
+		resolvedCompat: unknown;
 		typeScriptRequest: CapturedRequest;
 		onPayload?: {
 			observedPayload: unknown;
@@ -272,6 +277,342 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "openrouter-anthropic-compat",
+		title: "OpenRouter provider auto-detection captures OpenRouter thinking and Anthropic cache compat",
+		input: {
+			model: buildModel({
+				id: "anthropic/claude-3.7-sonnet",
+				name: "OpenRouter Anthropic Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				reasoningEffort: "medium",
+				sessionId: "fixture-openrouter-session",
+			},
+		},
+	},
+	{
+		id: "deepseek-reasoning-replay",
+		title: "DeepSeek auto-detection captures replay reasoning_content and effort map compatibility",
+		input: {
+			model: buildModel({
+				id: "deepseek-reasoner",
+				name: "DeepSeek Reasoner Fixture",
+				provider: "deepseek",
+				baseUrl: "https://api.deepseek.com/v1",
+				reasoning: true,
+			}),
+			context: {
+				systemPrompt: "Preserve DeepSeek assistant replay fields.",
+				messages: [
+					{ role: "user", content: "Replay the reasoning transcript." },
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "Prior answer without stored reasoning." }],
+						api: "openai-completions",
+						provider: "deepseek",
+						model: "deepseek-reasoner",
+						usage,
+						stopReason: "stop",
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "xhigh",
+			},
+		},
+	},
+	{
+		id: "groq-qwen3-effort-map",
+		title: "Groq Qwen3 auto-detection captures provider/model-specific reasoning effort map",
+		input: {
+			model: buildModel({
+				id: "qwen/qwen3-32b",
+				name: "Groq Qwen3 Fixture",
+				provider: "groq",
+				baseUrl: "https://api.groq.com/openai/v1",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "low",
+			},
+		},
+	},
+	{
+		id: "zai-nonstandard-compat",
+		title: "Z.AI auto-detection captures non-standard provider defaults and zai thinking format",
+		input: {
+			model: buildModel({
+				id: "glm-4.5",
+				name: "Z.AI Fixture",
+				provider: "zai",
+				baseUrl: "https://api.z.ai/api/paas/v4",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "xai-grok-compat",
+		title: "XAI/Grok auto-detection disables OpenAI-only reasoning effort support",
+		input: {
+			model: buildModel({
+				id: "grok-4",
+				name: "Grok Fixture",
+				provider: "xai",
+				baseUrl: "https://api.x.ai/v1",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "high",
+			},
+		},
+	},
+	{
+		id: "cerebras-nonstandard-compat",
+		title: "Cerebras auto-detection omits OpenAI-only request fields by default",
+		input: {
+			model: buildModel({
+				id: "llama-4-scout",
+				name: "Cerebras Fixture",
+				provider: "cerebras",
+				baseUrl: "https://api.cerebras.ai/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				maxTokens: 48,
+			},
+		},
+	},
+	{
+		id: "cloudflare-workers-ai-compat",
+		title: "Cloudflare Workers AI auto-detection captures non-standard provider defaults",
+		input: {
+			model: buildModel({
+				id: "@cf/meta/llama-3.1-8b-instruct",
+				name: "Cloudflare Workers AI Fixture",
+				provider: "cloudflare-workers-ai",
+				baseUrl: "https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "opencode-nonstandard-compat",
+		title: "opencode auto-detection captures non-standard provider defaults",
+		input: {
+			model: buildModel({
+				id: "opencode/gpt-oss",
+				name: "opencode Fixture",
+				provider: "opencode",
+				baseUrl: "https://api.opencode.ai/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "generic-proxy-compat",
+		title: "Generic OpenAI-compatible proxy preserves OpenAI defaults when no known provider/url matches",
+		input: {
+			model: buildModel({
+				id: "proxy-gpt",
+				name: "Generic Proxy Fixture",
+				provider: "custom-openai-proxy",
+				baseUrl: "https://llm-proxy.example.test/openai/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				maxTokens: 24,
+			},
+		},
+	},
+	{
+		id: "mixed-openrouter-deepseek-url",
+		title: "Mixed provider/base URL conflict follows TypeScript provider and URL precedence exactly",
+		input: {
+			model: buildModel({
+				id: "anthropic/mixed-deepseek",
+				name: "Mixed OpenRouter DeepSeek Fixture",
+				provider: "openrouter",
+				baseUrl: "https://api.deepseek.com/v1",
+				reasoning: true,
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				reasoningEffort: "minimal",
+			},
+		},
+	},
+	{
+		id: "explicit-partial-compat-override",
+		title: "Partial explicit compat override replaces only named fields and preserves detected defaults",
+		input: {
+			model: buildModel({
+				id: "partial-compat-fixture",
+				name: "Partial Compat Fixture",
+				provider: "deepseek",
+				baseUrl: "https://api.deepseek.com/v1",
+				reasoning: true,
+				compat: {
+					requiresToolResultName: true,
+					thinkingFormat: "openai",
+					supportsReasoningEffort: false,
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				reasoningEffort: "high",
+			},
+		},
+	},
+	{
+		id: "explicit-false-compat-override",
+		title: "Explicit false compat overrides are preserved and not replaced by detected defaults",
+		input: {
+			model: buildModel({
+				id: "explicit-false-fixture",
+				name: "Explicit False Fixture",
+				provider: "openai",
+				baseUrl: "https://api.openai.com/v1",
+				reasoning: true,
+				compat: {
+					supportsStore: false,
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: false,
+					supportsUsageInStreaming: false,
+					requiresToolResultName: false,
+					requiresAssistantAfterToolResult: false,
+					requiresThinkingAsText: false,
+					requiresReasoningContentOnAssistantMessages: false,
+					zaiToolStream: false,
+					supportsStrictMode: false,
+					sendSessionAffinityHeaders: false,
+					supportsLongCacheRetention: false,
+				},
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "long",
+				maxTokens: 42,
+				reasoningEffort: "low",
+				sessionId: "fixture-explicit-false-session",
+			},
+		},
+	},
+	{
+		id: "explicit-full-compat-all-fields",
+		title: "Full explicit compat override records every OpenAICompletionsCompat field",
+		input: {
+			model: buildModel({
+				id: "explicit-full-fixture",
+				name: "Explicit Full Compat Fixture",
+				provider: "openai",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+				compat: {
+					supportsStore: false,
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: false,
+					reasoningEffortMap: {
+						minimal: "tiny",
+						low: "small",
+						medium: "normal",
+						high: "large",
+						xhigh: "huge",
+					},
+					supportsUsageInStreaming: false,
+					maxTokensField: "max_tokens",
+					requiresToolResultName: true,
+					requiresAssistantAfterToolResult: true,
+					requiresThinkingAsText: true,
+					requiresReasoningContentOnAssistantMessages: true,
+					thinkingFormat: "qwen-chat-template",
+					openRouterRouting: {
+						allow_fallbacks: false,
+						require_parameters: true,
+						data_collection: "deny",
+						zdr: true,
+						enforce_distillable_text: true,
+						order: ["OpenAI", "Anthropic"],
+						only: ["OpenAI"],
+						ignore: ["Other"],
+						quantizations: ["fp16", "int8"],
+						sort: "latency",
+						max_price: { prompt: 1, completion: "2" },
+						preferred_min_throughput: { p50: 10, p90: 20 },
+						preferred_max_latency: 3,
+					},
+					vercelGatewayRouting: {
+						only: ["openai"],
+						order: ["anthropic", "openai"],
+					},
+					zaiToolStream: true,
+					supportsStrictMode: false,
+					cacheControlFormat: "anthropic",
+					sendSessionAffinityHeaders: true,
+					supportsLongCacheRetention: false,
+				},
+			}),
+			context: {
+				systemPrompt: "Bridge tool results and replay thinking as text.",
+				messages: [
+					{
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "private fixture reasoning" },
+							{ type: "text", text: "public answer" },
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "explicit-full-fixture",
+						usage,
+						stopReason: "stop",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_fixture_weather",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Tool result needing a bridge." }],
+						isError: false,
+					},
+					{ role: "user", content: "Continue after the tool result." },
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				cacheRetention: "none",
+				maxTokens: 12,
+				sessionId: "fixture-full-compat-session",
+			},
+		},
+	},
+	{
 		id: "tool-choice-and-history-scaffold",
 		title: "Tool definition, tool choice, assistant tool call replay, and tool result replay scaffold",
 		input: {
@@ -397,6 +738,8 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	const allowedOrigin = new URL(scenario.input.model.baseUrl).origin;
 	let capturedFetch: CapturedFetch | undefined;
 	let observedPayload: unknown;
+	const runtimeModel = toRuntimeModel(scenario.input.model);
+	const resolvedCompat = stableValue(getOpenAICompletionsCompatForTesting(runtimeModel));
 
 	globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
 		const request = input instanceof Request ? input : new Request(input, init);
@@ -435,7 +778,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 		}
 
 		const stream = streamOpenAICompletions(
-			toRuntimeModel(scenario.input.model),
+			runtimeModel,
 			toRuntimeContext(scenario.input.context),
 			runtimeOptions,
 		);
@@ -457,6 +800,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 			title: scenario.title,
 			input: scenario.input,
 			expected: {
+				resolvedCompat,
 				typeScriptRequest: capturedFetch.request,
 				...(scenario.input.options.onPayload
 					? {

@@ -1,0 +1,366 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "cacheControlFormat": "anthropic",
+      "maxTokensField": "max_tokens",
+      "openRouterRouting": {
+        "allow_fallbacks": false,
+        "data_collection": "deny",
+        "enforce_distillable_text": true,
+        "ignore": [
+          "Other"
+        ],
+        "max_price": {
+          "completion": "2",
+          "prompt": 1
+        },
+        "only": [
+          "OpenAI"
+        ],
+        "order": [
+          "OpenAI",
+          "Anthropic"
+        ],
+        "preferred_max_latency": 3,
+        "preferred_min_throughput": {
+          "p50": 10,
+          "p90": 20
+        },
+        "quantizations": [
+          "fp16",
+          "int8"
+        ],
+        "require_parameters": true,
+        "sort": "latency",
+        "zdr": true
+      },
+      "reasoningEffortMap": {
+        "high": "large",
+        "low": "small",
+        "medium": "normal",
+        "minimal": "tiny",
+        "xhigh": "huge"
+      },
+      "requiresAssistantAfterToolResult": true,
+      "requiresReasoningContentOnAssistantMessages": true,
+      "requiresThinkingAsText": true,
+      "requiresToolResultName": true,
+      "sendSessionAffinityHeaders": true,
+      "supportsDeveloperRole": false,
+      "supportsLongCacheRetention": false,
+      "supportsReasoningEffort": false,
+      "supportsStore": false,
+      "supportsStrictMode": false,
+      "supportsUsageInStreaming": false,
+      "thinkingFormat": "qwen-chat-template",
+      "vercelGatewayRouting": {
+        "only": [
+          "openai"
+        ],
+        "order": [
+          "anthropic",
+          "openai"
+        ]
+      },
+      "zaiToolStream": true
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "chat_template_kwargs": {
+          "enable_thinking": false,
+          "preserve_thinking": true
+        },
+        "max_tokens": 12,
+        "messages": [
+          {
+            "content": "Bridge tool results and replay thinking as text.",
+            "role": "system"
+          },
+          {
+            "content": [
+              {
+                "text": "private fixture reasoning",
+                "type": "text"
+              },
+              {
+                "text": "public answer",
+                "type": "text"
+              }
+            ],
+            "reasoning_content": "",
+            "role": "assistant"
+          },
+          {
+            "content": "Tool result needing a bridge.",
+            "name": "get_weather",
+            "role": "tool",
+            "tool_call_id": "call_fixture_weather"
+          },
+          {
+            "content": "I have processed the tool results.",
+            "role": "assistant"
+          },
+          {
+            "content": "Continue after the tool result.",
+            "role": "user"
+          }
+        ],
+        "model": "explicit-full-fixture",
+        "provider": {
+          "allow_fallbacks": false,
+          "data_collection": "deny",
+          "enforce_distillable_text": true,
+          "ignore": [
+            "Other"
+          ],
+          "max_price": {
+            "completion": "2",
+            "prompt": 1
+          },
+          "only": [
+            "OpenAI"
+          ],
+          "order": [
+            "OpenAI",
+            "Anthropic"
+          ],
+          "preferred_max_latency": 3,
+          "preferred_min_throughput": {
+            "p50": 10,
+            "p90": 20
+          },
+          "quantizations": [
+            "fp16",
+            "int8"
+          ],
+          "require_parameters": true,
+          "sort": "latency",
+          "zdr": true
+        },
+        "stream": true,
+        "tool_stream": true,
+        "tools": [
+          {
+            "function": {
+              "description": "Return deterministic weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "anyOf": [
+                      {
+                        "const": "celsius",
+                        "type": "string"
+                      },
+                      {
+                        "const": "fahrenheit",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "city",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+  },
+  "id": "explicit-full-compat-all-fields",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "api": "openai-completions",
+          "content": [
+            {
+              "thinking": "private fixture reasoning",
+              "type": "thinking"
+            },
+            {
+              "text": "public answer",
+              "type": "text"
+            }
+          ],
+          "model": "explicit-full-fixture",
+          "provider": "openai",
+          "role": "assistant",
+          "stopReason": "stop",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 7,
+            "output": 5,
+            "totalTokens": 12
+          }
+        },
+        {
+          "content": [
+            {
+              "text": "Tool result needing a bridge.",
+              "type": "text"
+            }
+          ],
+          "isError": false,
+          "role": "toolResult",
+          "toolCallId": "call_fixture_weather",
+          "toolName": "get_weather"
+        },
+        {
+          "content": "Continue after the tool result.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "Bridge tool results and replay thinking as text.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "compat": {
+        "cacheControlFormat": "anthropic",
+        "maxTokensField": "max_tokens",
+        "openRouterRouting": {
+          "allow_fallbacks": false,
+          "data_collection": "deny",
+          "enforce_distillable_text": true,
+          "ignore": [
+            "Other"
+          ],
+          "max_price": {
+            "completion": "2",
+            "prompt": 1
+          },
+          "only": [
+            "OpenAI"
+          ],
+          "order": [
+            "OpenAI",
+            "Anthropic"
+          ],
+          "preferred_max_latency": 3,
+          "preferred_min_throughput": {
+            "p50": 10,
+            "p90": 20
+          },
+          "quantizations": [
+            "fp16",
+            "int8"
+          ],
+          "require_parameters": true,
+          "sort": "latency",
+          "zdr": true
+        },
+        "reasoningEffortMap": {
+          "high": "large",
+          "low": "small",
+          "medium": "normal",
+          "minimal": "tiny",
+          "xhigh": "huge"
+        },
+        "requiresAssistantAfterToolResult": true,
+        "requiresReasoningContentOnAssistantMessages": true,
+        "requiresThinkingAsText": true,
+        "requiresToolResultName": true,
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false,
+        "supportsLongCacheRetention": false,
+        "supportsReasoningEffort": false,
+        "supportsStore": false,
+        "supportsStrictMode": false,
+        "supportsUsageInStreaming": false,
+        "thinkingFormat": "qwen-chat-template",
+        "vercelGatewayRouting": {
+          "only": [
+            "openai"
+          ],
+          "order": [
+            "anthropic",
+            "openai"
+          ]
+        },
+        "zaiToolStream": true
+      },
+      "id": "explicit-full-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "Explicit Full Compat Fixture",
+      "provider": "openai",
+      "reasoning": true
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "none",
+      "maxTokens": 12,
+      "sessionId": "fixture-full-compat-session"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Full explicit compat override records every OpenAICompletionsCompat field"
+}

@@ -1,7 +1,7 @@
 {
   "expected": {
     "resolvedCompat": {
-      "maxTokensField": "max_tokens",
+      "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
       "reasoningEffortMap": {},
       "requiresAssistantAfterToolResult": false,
@@ -20,13 +20,12 @@
       "zaiToolStream": false
     },
     "typeScriptRequest": {
-      "baseUrl": "https://llm.chutes.ai/v1",
+      "baseUrl": "https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1",
       "headers": {
         "authorization": "<redacted-present>",
         "content-type": "application/json"
       },
       "jsonPayload": {
-        "max_tokens": 96,
         "messages": [
           {
             "content": "You are the deterministic OpenAI Chat fixture assistant.",
@@ -37,18 +36,18 @@
             "role": "user"
           }
         ],
-        "model": "qwen-fixture",
+        "model": "@cf/meta/llama-3.1-8b-instruct",
         "stream": true,
         "stream_options": {
           "include_usage": true
         }
       },
       "method": "POST",
-      "path": "/v1/chat/completions",
-      "url": "https://llm.chutes.ai/v1/chat/completions"
+      "path": "/client/v4/accounts/fixture/ai/v1/chat/completions",
+      "url": "https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1/chat/completions"
     }
   },
-  "id": "chutes-max-tokens-scaffold",
+  "id": "cloudflare-workers-ai-compat",
   "input": {
     "context": {
       "messages": [
@@ -61,19 +60,17 @@
     },
     "model": {
       "api": "openai-completions",
-      "baseUrl": "https://llm.chutes.ai/v1",
-      "id": "qwen-fixture",
+      "baseUrl": "https://api.cloudflare.com/client/v4/accounts/fixture/ai/v1",
+      "id": "@cf/meta/llama-3.1-8b-instruct",
       "input": [
         "text"
       ],
-      "name": "Qwen Fixture",
-      "provider": "chutes",
+      "name": "Cloudflare Workers AI Fixture",
+      "provider": "cloudflare-workers-ai",
       "reasoning": false
     },
     "options": {
-      "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "none",
-      "maxTokens": 96
+      "apiKeyMode": "fixture-placeholder"
     }
   },
   "metadata": {
@@ -89,5 +86,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Non-standard OpenAI-compatible base URL scaffold captures max_tokens compatibility"
+  "title": "Cloudflare Workers AI auto-detection captures non-standard provider defaults"
 }

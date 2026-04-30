@@ -1,7 +1,7 @@
 {
   "expected": {
     "resolvedCompat": {
-      "maxTokensField": "max_tokens",
+      "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
       "reasoningEffortMap": {},
       "requiresAssistantAfterToolResult": false,
@@ -20,13 +20,13 @@
       "zaiToolStream": false
     },
     "typeScriptRequest": {
-      "baseUrl": "https://llm.chutes.ai/v1",
+      "baseUrl": "https://api.cerebras.ai/v1",
       "headers": {
         "authorization": "<redacted-present>",
         "content-type": "application/json"
       },
       "jsonPayload": {
-        "max_tokens": 96,
+        "max_completion_tokens": 48,
         "messages": [
           {
             "content": "You are the deterministic OpenAI Chat fixture assistant.",
@@ -37,7 +37,7 @@
             "role": "user"
           }
         ],
-        "model": "qwen-fixture",
+        "model": "llama-4-scout",
         "stream": true,
         "stream_options": {
           "include_usage": true
@@ -45,10 +45,10 @@
       },
       "method": "POST",
       "path": "/v1/chat/completions",
-      "url": "https://llm.chutes.ai/v1/chat/completions"
+      "url": "https://api.cerebras.ai/v1/chat/completions"
     }
   },
-  "id": "chutes-max-tokens-scaffold",
+  "id": "cerebras-nonstandard-compat",
   "input": {
     "context": {
       "messages": [
@@ -61,19 +61,18 @@
     },
     "model": {
       "api": "openai-completions",
-      "baseUrl": "https://llm.chutes.ai/v1",
-      "id": "qwen-fixture",
+      "baseUrl": "https://api.cerebras.ai/v1",
+      "id": "llama-4-scout",
       "input": [
         "text"
       ],
-      "name": "Qwen Fixture",
-      "provider": "chutes",
+      "name": "Cerebras Fixture",
+      "provider": "cerebras",
       "reasoning": false
     },
     "options": {
       "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "none",
-      "maxTokens": 96
+      "maxTokens": 48
     }
   },
   "metadata": {
@@ -89,5 +88,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Non-standard OpenAI-compatible base URL scaffold captures max_tokens compatibility"
+  "title": "Cerebras auto-detection omits OpenAI-only request fields by default"
 }

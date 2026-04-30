@@ -38,14 +38,19 @@ pub fn main(init: std.process.Init) !void {
         const fixture = try readJsonFile(allocator, io, path);
         defer fixture.deinit();
 
-        const actual = try buildActualRequestFromFixture(allocator, fixture.value);
-        defer openai.freeOwnedJsonValue(allocator, actual);
+        const actual_request = try buildActualRequestFromFixture(allocator, fixture.value);
+        defer openai.freeOwnedJsonValue(allocator, actual_request);
+        const actual_compat = try buildActualCompatFromFixture(allocator, fixture.value);
+        defer openai.freeOwnedJsonValue(allocator, actual_compat);
 
-        const expected = getObjectField(getObjectField(fixture.value, "expected"), "typeScriptRequest");
+        const expected_root = getObjectField(fixture.value, "expected");
+        const expected_request = getObjectField(expected_root, "typeScriptRequest");
+        const expected_compat = getObjectField(expected_root, "resolvedCompat");
         var diffs = DiffCollector.init(allocator);
         defer diffs.deinit();
 
-        try compareJson(&diffs, scenario_id, "request", expected, actual);
+        try compareJson(&diffs, scenario_id, "resolvedCompat", expected_compat, actual_compat);
+        try compareJson(&diffs, scenario_id, "request", expected_request, actual_request);
         if (diffs.count == 0) {
             std.debug.print("  matched {s}\n", .{scenario_id});
         } else {
@@ -91,6 +96,18 @@ fn buildActualRequestFromFixture(allocator: std.mem.Allocator, fixture: std.json
     const options = try parseOptions(scenario_allocator, getObjectField(input, "options"));
 
     return try openai.buildRequestSnapshotValue(allocator, model, context, options);
+}
+
+fn buildActualCompatFromFixture(allocator: std.mem.Allocator, fixture: std.json.Value) !std.json.Value {
+    if (getObjectField(fixture, "schemaVersion").integer != 1) return error.UnsupportedFixtureSchemaVersion;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scenario_allocator = arena.allocator();
+
+    const input = getObjectField(fixture, "input");
+    const model = try parseModel(scenario_allocator, getObjectField(input, "model"));
+    return try openai.buildResolvedCompatSnapshotValue(allocator, model);
 }
 
 fn parseModel(allocator: std.mem.Allocator, value: std.json.Value) !types.Model {
@@ -183,6 +200,11 @@ fn parseContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]co
                 .id = getObjectField(item, "id").string,
                 .name = getObjectField(item, "name").string,
                 .arguments = getObjectField(item, "arguments"),
+            } };
+        } else if (std.mem.eql(u8, item_type, "thinking")) {
+            blocks[index] = .{ .thinking = .{
+                .thinking = getObjectField(item, "thinking").string,
+                .thinking_signature = optionalString(item, "thinkingSignature"),
             } };
         } else {
             return error.UnsupportedFixtureContentBlock;
