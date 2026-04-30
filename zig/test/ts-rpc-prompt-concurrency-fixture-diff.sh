@@ -5,7 +5,16 @@ cd "$(dirname "$0")/.."
 
 actual="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency.XXXXXX")"
 expected="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency-ts.XXXXXX")"
-trap 'rm -f "$actual" "$expected"' EXIT
+clean_home="$(mktemp -d "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency-home.XXXXXX")"
+trap 'rm -f "$actual" "$expected"; rm -rf "$clean_home"' EXIT
+
+for name in "${!PI_@}"; do
+	unset "$name"
+done
+export HOME="$clean_home"
+export USERPROFILE="$clean_home"
+export PI_CODING_AGENT_DIR="$clean_home/.pi/agent"
+export npm_config_update_notifier=false
 
 npx tsx test/generate-ts-rpc-fixtures.ts --emit-fixture=prompt-concurrency-queue-order.jsonl > "$expected"
 

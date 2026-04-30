@@ -118,7 +118,7 @@
 		{
 			"path": "m5-simple-prompt.jsonl",
 			"description": "live runRpcMode stdout bytes for the M5 simple prompt and streaming text production parity scenario.",
-			"byteLength": 4618,
+			"byteLength": 4606,
 			"lineCount": 13
 		},
 		{
@@ -130,7 +130,7 @@
 		{
 			"path": "m5-thinking.jsonl",
 			"description": "live runRpcMode stdout bytes for the M5 thinking-delta production parity scenario.",
-			"byteLength": 7377,
+			"byteLength": 7359,
 			"lineCount": 16
 		},
 		{
@@ -142,7 +142,7 @@
 		{
 			"path": "m5-tool.jsonl",
 			"description": "live runRpcMode stdout bytes for the M5 tool call/result production parity scenario.",
-			"byteLength": 9254,
+			"byteLength": 9222,
 			"lineCount": 24
 		},
 		{
@@ -166,7 +166,7 @@
 		{
 			"path": "m5-retry.jsonl",
 			"description": "live runRpcMode stdout bytes for the M5 retry production parity scenario.",
-			"byteLength": 6745,
+			"byteLength": 6729,
 			"lineCount": 21
 		}
 	]
