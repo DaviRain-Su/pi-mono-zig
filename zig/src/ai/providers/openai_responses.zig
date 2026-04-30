@@ -1360,6 +1360,223 @@ pub fn buildRequestUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]co
     return try std.fmt.allocPrint(allocator, "{s}/responses", .{trimmed});
 }
 
+pub const RequestSnapshotTransportMode = enum {
+    sse,
+    deferred_websocket,
+};
+
+pub const RequestSnapshotOptions = struct {
+    scenario_id: []const u8,
+    provider_family: []const u8,
+    payload_override: ?std.json.Value = null,
+    transport_mode: RequestSnapshotTransportMode = .sse,
+    mocked_status: u16 = 200,
+    method: []const u8 = "POST",
+};
+
+pub fn buildRequestSnapshotValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    snapshot_options: RequestSnapshotOptions,
+) !std.json.Value {
+    var payload = if (snapshot_options.payload_override) |override|
+        try cloneJsonValue(allocator, override)
+    else
+        try buildRequestPayload(allocator, model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+
+    var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
+    if (resolved_options.api_key == null) resolved_options.api_key = "fixture-api-key-redacted";
+
+    var headers = try buildRequestHeaders(allocator, model, context, resolved_options);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    const url = try buildRequestUrl(allocator, model.base_url);
+    defer allocator.free(url);
+
+    var snapshot = try initObject(allocator);
+    errdefer snapshot.deinit(allocator);
+
+    try snapshot.put(allocator, try allocator.dupe(u8, "baseUrl"), .{ .string = try inferResponsesBaseUrlFromUrl(allocator, url, snapshot_options.provider_family) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "headers"), .{ .object = try normalizeSemanticHeaders(allocator, headers) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "jsonPayload"), payload);
+    payload = .null;
+    try snapshot.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, snapshot_options.method) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try buildResponsesRequestPathFromUrl(allocator, url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "query"), .{ .object = try buildResponsesRequestQueryObjectFromUrl(allocator, url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "requestOptions"), .{ .object = try buildRequestOptionsSnapshotObject(allocator, options, true) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "transportMetadata"), .{ .object = try buildTransportMetadataSnapshotObject(
+        allocator,
+        snapshot_options.scenario_id,
+        snapshot_options.provider_family,
+        snapshot_options.transport_mode,
+        snapshot_options.mocked_status,
+    ) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "url"), .{ .string = try allocator.dupe(u8, url) });
+
+    return .{ .object = snapshot };
+}
+
+pub fn buildRequestOptionsSnapshotObject(
+    allocator: std.mem.Allocator,
+    options: ?types.StreamOptions,
+    include_timeout_retries: bool,
+) !std.json.ObjectMap {
+    var object = try initObject(allocator);
+    errdefer object.deinit(allocator);
+
+    const signal = if (options) |stream_options|
+        if (stream_options.signal != null) "provided" else "not-provided"
+    else
+        "not-provided";
+    try object.put(allocator, try allocator.dupe(u8, "signal"), .{ .string = try allocator.dupe(u8, signal) });
+
+    if (include_timeout_retries) {
+        if (options) |stream_options| {
+            if (stream_options.max_retries) |max_retries| {
+                try object.put(allocator, try allocator.dupe(u8, "maxRetries"), .{ .integer = @intCast(max_retries) });
+            }
+            if (stream_options.timeout_ms) |timeout_ms| {
+                try object.put(allocator, try allocator.dupe(u8, "timeoutMs"), .{ .integer = @intCast(timeout_ms) });
+            }
+        }
+    }
+
+    return object;
+}
+
+pub fn buildTransportMetadataSnapshotObject(
+    allocator: std.mem.Allocator,
+    scenario_id: []const u8,
+    provider_family: []const u8,
+    mode: RequestSnapshotTransportMode,
+    mocked_status: u16,
+) !std.json.ObjectMap {
+    var object = try initObject(allocator);
+    errdefer object.deinit(allocator);
+
+    var response_headers = try initObject(allocator);
+    errdefer response_headers.deinit(allocator);
+    if (mode == .sse) {
+        try response_headers.put(allocator, try allocator.dupe(u8, "content-type"), .{ .string = try allocator.dupe(u8, "text/event-stream") });
+    }
+    try response_headers.put(allocator, try allocator.dupe(u8, "x-fixture-response"), .{ .string = try allocator.dupe(u8, scenario_id) });
+
+    try object.put(allocator, try allocator.dupe(u8, "mockedResponseHeaders"), .{ .object = response_headers });
+    try object.put(allocator, try allocator.dupe(u8, "mockedStatus"), .{ .integer = @intCast(mocked_status) });
+    try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, switch (mode) {
+        .sse => "sse",
+        .deferred_websocket => "deferred-websocket",
+    }) });
+    try object.put(allocator, try allocator.dupe(u8, "providerFamily"), .{ .string = try allocator.dupe(u8, provider_family) });
+    try object.put(allocator, try allocator.dupe(u8, "requestBoundary"), .{ .string = try allocator.dupe(u8, switch (mode) {
+        .sse => "before local mocked SSE response body is consumed",
+        .deferred_websocket => "before local mocked WebSocket message stream is consumed; no live socket opened",
+    }) });
+
+    return object;
+}
+
+pub fn buildResponsesRequestPathFromUrl(allocator: std.mem.Allocator, request_url: []const u8) ![]const u8 {
+    const scheme = std.mem.indexOf(u8, request_url, "://") orelse return error.InvalidUrl;
+    const after_host = request_url[scheme + 3 ..];
+    const slash = std.mem.indexOfScalar(u8, after_host, '/') orelse return try allocator.dupe(u8, "/");
+    const path_query = after_host[slash..];
+    const query = std.mem.indexOfScalar(u8, path_query, '?') orelse return try allocator.dupe(u8, path_query);
+    return try allocator.dupe(u8, path_query[0..query]);
+}
+
+pub fn buildResponsesRequestQueryObjectFromUrl(allocator: std.mem.Allocator, request_url: []const u8) !std.json.ObjectMap {
+    var object = try initObject(allocator);
+    errdefer object.deinit(allocator);
+
+    const query_index = std.mem.indexOfScalar(u8, request_url, '?') orelse return object;
+    var entries = std.mem.splitScalar(u8, request_url[query_index + 1 ..], '&');
+    while (entries.next()) |entry| {
+        if (entry.len == 0) continue;
+        const separator = std.mem.indexOfScalar(u8, entry, '=') orelse entry.len;
+        const key = entry[0..separator];
+        const value = if (separator < entry.len) entry[separator + 1 ..] else "";
+        try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+    }
+    return object;
+}
+
+pub fn inferResponsesBaseUrlFromUrl(allocator: std.mem.Allocator, request_url: []const u8, provider_family: []const u8) ![]const u8 {
+    const scheme = std.mem.indexOf(u8, request_url, "://") orelse return error.InvalidUrl;
+    const after_host = request_url[scheme + 3 ..];
+    const slash = std.mem.indexOfScalar(u8, after_host, '/') orelse return try allocator.dupe(u8, request_url);
+    const origin_end = scheme + 3 + slash;
+    const query_index = std.mem.indexOfScalar(u8, request_url[origin_end..], '?');
+    const path_end = if (query_index) |offset| origin_end + offset else request_url.len;
+    const suffix = if (std.mem.eql(u8, provider_family, "openai-codex")) "/codex/responses" else "/responses";
+    if (std.mem.endsWith(u8, request_url[origin_end..path_end], suffix)) {
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{
+            request_url[0..origin_end],
+            request_url[origin_end .. path_end - suffix.len],
+        });
+    }
+    return try allocator.dupe(u8, request_url[0..path_end]);
+}
+
+pub fn normalizeSemanticHeaders(
+    allocator: std.mem.Allocator,
+    headers: std.StringHashMap([]const u8),
+) !std.json.ObjectMap {
+    var semantic = try initObject(allocator);
+    errdefer semantic.deinit(allocator);
+
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        const lower = try asciiLowerAlloc(allocator, entry.key_ptr.*);
+        defer allocator.free(lower);
+
+        const include = std.mem.eql(u8, lower, "accept") or
+            std.mem.eql(u8, lower, "api-key") or
+            std.mem.eql(u8, lower, "authorization") or
+            std.mem.eql(u8, lower, "chatgpt-account-id") or
+            std.mem.eql(u8, lower, "content-type") or
+            std.mem.eql(u8, lower, "copilot-integration-id") or
+            std.mem.eql(u8, lower, "copilot-vision-request") or
+            std.mem.eql(u8, lower, "editor-plugin-version") or
+            std.mem.eql(u8, lower, "editor-version") or
+            std.mem.eql(u8, lower, "openai-beta") or
+            std.mem.eql(u8, lower, "openai-intent") or
+            std.mem.eql(u8, lower, "originator") or
+            std.mem.eql(u8, lower, "session_id") or
+            (std.mem.eql(u8, lower, "user-agent") and std.mem.startsWith(u8, entry.value_ptr.*, "GitHubCopilotChat/")) or
+            std.mem.eql(u8, lower, "x-client-request-id") or
+            std.mem.eql(u8, lower, "x-initiator") or
+            std.mem.startsWith(u8, lower, "x-fixture-");
+        if (!include) continue;
+
+        const value = if (std.mem.eql(u8, lower, "authorization") or std.mem.eql(u8, lower, "api-key"))
+            if (entry.value_ptr.*.len > 0) "<redacted-present>" else "<redacted-empty>"
+        else
+            entry.value_ptr.*;
+
+        const next_value = std.json.Value{ .string = try allocator.dupe(u8, value) };
+        if (semantic.getPtr(lower)) |existing| {
+            freeJsonValue(allocator, existing.*);
+            existing.* = next_value;
+        } else {
+            try semantic.put(allocator, try allocator.dupe(u8, lower), next_value);
+        }
+    }
+
+    return semantic;
+}
+
+fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const output = try allocator.alloc(u8, input.len);
+    for (input, 0..) |byte, index| {
+        output[index] = std.ascii.toLower(byte);
+    }
+    return output;
+}
+
 fn parseTextSignature(allocator: std.mem.Allocator, signature: ?[]const u8, message_index: usize) !ParsedTextSignature {
     const value = signature orelse return .{ .id = try std.fmt.allocPrint(allocator, "msg_{d}", .{message_index}), .phase = null };
     if (std.mem.startsWith(u8, value, "{")) {

@@ -101,20 +101,10 @@ pub const AzureOpenAIResponsesProvider = struct {
         };
         defer allocator.free(url);
 
-        var headers = std.StringHashMap([]const u8).init(allocator);
-        defer deinitOwnedHeaders(allocator, &headers);
-        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try putOwnedHeader(allocator, &headers, "Accept", "application/json");
-        try mergeHeaders(allocator, &headers, model.headers);
-        if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
-        }
-
-        const auth = resolveAzureAuthHeader(allocator, options) catch |err| {
+        var headers = buildRequestHeaders(allocator, model, options) catch |err| {
             return emitProviderError(allocator, &stream_instance, model, err);
         };
-        defer auth.deinit(allocator);
-        try putOwnedHeader(allocator, &headers, auth.name, auth.value);
+        defer deinitOwnedHeaders(allocator, &headers);
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -198,6 +188,68 @@ const ResolvedApiVersion = struct {
     owned: bool,
 };
 
+pub const SnapshotEnv = struct {
+    azure_api_version: ?[]const u8 = null,
+    azure_base_url: ?[]const u8 = null,
+    azure_resource_name: ?[]const u8 = null,
+    azure_deployment_name_map: ?[]const u8 = null,
+};
+
+pub fn buildRequestSnapshotValueWithEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    env: SnapshotEnv,
+    snapshot_options: openai_responses.RequestSnapshotOptions,
+) !std.json.Value {
+    const deployment_name = try resolveDeploymentNameWithEnv(allocator, model.id, options, env.azure_deployment_name_map);
+    defer allocator.free(deployment_name);
+
+    var request_model = model;
+    request_model.id = deployment_name;
+
+    var payload = if (snapshot_options.payload_override) |override|
+        try cloneJsonValue(allocator, override)
+    else
+        try buildAzureRequestPayload(allocator, request_model, context, options);
+    errdefer freeJsonValue(allocator, payload);
+
+    const base_url = try resolveAzureBaseUrlWithEnv(allocator, model, options, env.azure_base_url, env.azure_resource_name);
+    defer allocator.free(base_url);
+
+    const api_version = try resolveAzureApiVersionWithEnv(allocator, options, env.azure_api_version);
+    defer if (api_version.owned) allocator.free(api_version.value);
+
+    const url = try buildRequestUrl(allocator, base_url, api_version.value);
+    defer allocator.free(url);
+
+    var headers = try buildRequestHeaders(allocator, model, options);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    var snapshot = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer snapshot.deinit(allocator);
+
+    try snapshot.put(allocator, try allocator.dupe(u8, "baseUrl"), .{ .string = try openai_responses.inferResponsesBaseUrlFromUrl(allocator, url, snapshot_options.provider_family) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "headers"), .{ .object = try openai_responses.normalizeSemanticHeaders(allocator, headers) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "jsonPayload"), payload);
+    payload = .null;
+    try snapshot.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, snapshot_options.method) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try openai_responses.buildResponsesRequestPathFromUrl(allocator, url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "query"), .{ .object = try openai_responses.buildResponsesRequestQueryObjectFromUrl(allocator, url) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "requestOptions"), .{ .object = try openai_responses.buildRequestOptionsSnapshotObject(allocator, options, true) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "transportMetadata"), .{ .object = try openai_responses.buildTransportMetadataSnapshotObject(
+        allocator,
+        snapshot_options.scenario_id,
+        snapshot_options.provider_family,
+        snapshot_options.transport_mode,
+        snapshot_options.mocked_status,
+    ) });
+    try snapshot.put(allocator, try allocator.dupe(u8, "url"), .{ .string = try allocator.dupe(u8, url) });
+
+    return .{ .object = snapshot };
+}
+
 fn emitProviderError(
     allocator: std.mem.Allocator,
     stream_instance: *event_stream.AssistantMessageEventStream,
@@ -235,16 +287,25 @@ fn emitErrorMessage(
 }
 
 fn resolveDeploymentName(allocator: std.mem.Allocator, model_id: []const u8, options: ?types.StreamOptions) ![]const u8 {
+    const env_value = try loadEnvOptional(allocator, AZURE_DEPLOYMENT_MAP_ENV);
+    defer if (env_value) |value| allocator.free(value);
+
+    return resolveDeploymentNameWithEnv(allocator, model_id, options, env_value);
+}
+
+fn resolveDeploymentNameWithEnv(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    options: ?types.StreamOptions,
+    env_deployment_map: ?[]const u8,
+) ![]const u8 {
     if (options) |stream_options| {
         if (stream_options.azure_deployment_name) |deployment_name| {
             if (deployment_name.len > 0) return try allocator.dupe(u8, deployment_name);
         }
     }
 
-    const env_value = try loadEnvOptional(allocator, AZURE_DEPLOYMENT_MAP_ENV);
-    defer if (env_value) |value| allocator.free(value);
-
-    if (env_value) |value| {
+    if (env_deployment_map) |value| {
         var entries = std.mem.splitScalar(u8, value, ',');
         while (entries.next()) |entry| {
             const trimmed = std.mem.trim(u8, entry, " \t\r\n");
@@ -262,6 +323,21 @@ fn resolveDeploymentName(allocator: std.mem.Allocator, model_id: []const u8, opt
 }
 
 fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model, options: ?types.StreamOptions) ![]const u8 {
+    const env_base_url = try loadEnvOptional(allocator, AZURE_BASE_URL_ENV);
+    defer if (env_base_url) |value| allocator.free(value);
+    const env_resource_name = try loadEnvOptional(allocator, AZURE_RESOURCE_NAME_ENV);
+    defer if (env_resource_name) |value| allocator.free(value);
+
+    return resolveAzureBaseUrlWithEnv(allocator, model, options, env_base_url, env_resource_name);
+}
+
+fn resolveAzureBaseUrlWithEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    env_base_url: ?[]const u8,
+    env_resource_name: ?[]const u8,
+) ![]const u8 {
     if (options) |stream_options| {
         if (stream_options.azure_base_url) |value| {
             if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
@@ -270,8 +346,6 @@ fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model, options
         }
     }
 
-    const env_base_url = try loadEnvOptional(allocator, AZURE_BASE_URL_ENV);
-    defer if (env_base_url) |value| allocator.free(value);
     if (env_base_url) |value| {
         if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
             return try normalizeAzureBaseUrl(allocator, value);
@@ -287,8 +361,6 @@ fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model, options
         }
     }
 
-    const env_resource_name = try loadEnvOptional(allocator, AZURE_RESOURCE_NAME_ENV);
-    defer if (env_resource_name) |value| allocator.free(value);
     if (env_resource_name) |value| {
         const resource_name = std.mem.trim(u8, value, " \t\r\n");
         if (resource_name.len > 0) {
@@ -304,6 +376,17 @@ fn resolveAzureBaseUrl(allocator: std.mem.Allocator, model: types.Model, options
 }
 
 fn resolveAzureApiVersion(allocator: std.mem.Allocator, options: ?types.StreamOptions) !ResolvedApiVersion {
+    const env_api_version = try loadEnvOptional(allocator, AZURE_API_VERSION_ENV);
+    defer if (env_api_version) |value| allocator.free(value);
+
+    return resolveAzureApiVersionWithEnv(allocator, options, env_api_version);
+}
+
+fn resolveAzureApiVersionWithEnv(
+    allocator: std.mem.Allocator,
+    options: ?types.StreamOptions,
+    env_api_version: ?[]const u8,
+) !ResolvedApiVersion {
     if (options) |stream_options| {
         if (stream_options.azure_api_version) |value| {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -311,18 +394,9 @@ fn resolveAzureApiVersion(allocator: std.mem.Allocator, options: ?types.StreamOp
         }
     }
 
-    const env_api_version = try loadEnvOptional(allocator, AZURE_API_VERSION_ENV);
     if (env_api_version) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len == 0) {
-            allocator.free(value);
-        } else if (trimmed.ptr == value.ptr and trimmed.len == value.len) {
-            return .{ .value = value, .owned = true };
-        } else {
-            const owned = try allocator.dupe(u8, trimmed);
-            allocator.free(value);
-            return .{ .value = owned, .owned = true };
-        }
+        if (trimmed.len > 0) return .{ .value = try allocator.dupe(u8, trimmed), .owned = true };
     }
     return .{ .value = DEFAULT_AZURE_API_VERSION, .owned = false };
 }
@@ -357,6 +431,28 @@ fn buildRequestUrl(allocator: std.mem.Allocator, raw_base_url: []const u8, api_v
         );
     }
     return try std.fmt.allocPrint(allocator, "{s}/responses?api-version={s}", .{ base_url, api_version });
+}
+
+fn buildRequestHeaders(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+) !std.StringHashMap([]const u8) {
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitOwnedHeaders(allocator, &headers);
+
+    try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+    try putOwnedHeader(allocator, &headers, "Accept", "application/json");
+    try mergeHeaders(allocator, &headers, model.headers);
+    if (options) |stream_options| {
+        try mergeHeaders(allocator, &headers, stream_options.headers);
+    }
+
+    const auth = try resolveAzureAuthHeader(allocator, options);
+    defer auth.deinit(allocator);
+    try putOwnedHeader(allocator, &headers, auth.name, auth.value);
+
+    return headers;
 }
 
 fn resolveAzureAuthHeader(allocator: std.mem.Allocator, options: ?types.StreamOptions) !OwnedHeader {
