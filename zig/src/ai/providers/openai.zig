@@ -867,25 +867,33 @@ pub fn buildRequestPayload(
 
     // Add conversation messages
     var last_role: ?[]const u8 = null;
-    for (transformed_messages) |msg| {
+    var message_index: usize = 0;
+    while (message_index < transformed_messages.len) : (message_index += 1) {
+        const msg = transformed_messages[message_index];
         if (compat.requires_assistant_after_tool_result and last_role != null and std.mem.eql(u8, last_role.?, "toolResult") and msg == .user) {
             try messages.append(.{ .object = try buildMessageObject(allocator, "assistant", "I have processed the tool results.") });
         }
         switch (msg) {
             .user => |user_msg| {
+                if (user_msg.content.len == 0) continue;
                 try messages.append(try buildUserMessage(allocator, model, user_msg));
                 last_role = "user";
             },
             .assistant => |assistant_msg| {
-                try messages.append(try buildAssistantMessage(allocator, model, assistant_msg));
-                last_role = "assistant";
+                if (try buildAssistantMessage(allocator, model, assistant_msg)) |assistant_message| {
+                    try messages.append(assistant_message);
+                    last_role = "assistant";
+                }
             },
-            .tool_result => |tool_result| {
-                const appended_image_user = try appendToolResultMessages(allocator, &messages, model, tool_result);
-                last_role = if (appended_image_user) "user" else "toolResult";
+            .tool_result => {
+                const append_result = try appendToolResultMessages(allocator, &messages, model, transformed_messages, message_index);
+                message_index = append_result.next_index - 1;
+                last_role = if (append_result.appended_image_user) "user" else "toolResult";
             },
         }
     }
+
+    const has_tool_history = hasToolHistory(context.messages);
 
     var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer payload.deinit(allocator);
@@ -940,7 +948,11 @@ pub fn buildRequestPayload(
             if (compat.zai_tool_stream) {
                 try payload.put(allocator, try allocator.dupe(u8, "tool_stream"), .{ .bool = true });
             }
+        } else if (has_tool_history) {
+            try payload.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = std.json.Array.init(allocator) });
         }
+    } else if (has_tool_history) {
+        try payload.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = std.json.Array.init(allocator) });
     }
 
     if (model.reasoning) {
@@ -1000,6 +1012,22 @@ pub fn buildRequestPayload(
     }
 
     return std.json.Value{ .object = payload };
+}
+
+fn hasToolHistory(messages: []const types.Message) bool {
+    for (messages) |message| {
+        switch (message) {
+            .tool_result => return true,
+            .assistant => |assistant| {
+                if (types.hasInlineToolCalls(assistant)) return true;
+                if (assistant.tool_calls) |tool_calls| {
+                    if (tool_calls.len > 0) return true;
+                }
+            },
+            .user => {},
+        }
+    }
+    return false;
 }
 
 const ReasoningEffortMap = union(enum) {
@@ -1540,7 +1568,7 @@ fn buildUserMessage(allocator: std.mem.Allocator, model: types.Model, user_msg: 
     }
 }
 
-fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assistant_msg: types.AssistantMessage) !std.json.Value {
+fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assistant_msg: types.AssistantMessage) !?std.json.Value {
     const compat = getCompat(model);
     const tool_calls_source = if (types.hasInlineToolCalls(assistant_msg))
         try types.collectAssistantToolCalls(allocator, assistant_msg)
@@ -1563,9 +1591,6 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
     for (assistant_msg.content) |block| {
         switch (block) {
             .text => |text| {
-                if (text_parts.items.len > 0) {
-                    try text_parts.appendSlice(allocator, "\n");
-                }
                 try text_parts.appendSlice(allocator, text.text);
             },
             .thinking => |thinking| {
@@ -1626,8 +1651,12 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
             } else {
                 try obj.put(allocator, try allocator.dupe(u8, "content"), .null);
             }
-        } else {
+        } else if (content.len > 0) {
             try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
+        } else if (compat.requires_assistant_after_tool_result) {
+            try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, "") });
+        } else {
+            try obj.put(allocator, try allocator.dupe(u8, "content"), .null);
         }
     }
 
@@ -1667,25 +1696,51 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
         try obj.put(allocator, try allocator.dupe(u8, "tool_calls"), std.json.Value{ .array = tc_array });
     }
 
+    const content_value = obj.get("content") orelse .null;
+    const has_content = switch (content_value) {
+        .string => |content| content.len > 0,
+        .array => |content| content.items.len > 0,
+        else => false,
+    };
+    if (!has_content and !has_tool_calls) {
+        freeJsonValue(allocator, .{ .object = obj });
+        return null;
+    }
+
     return std.json.Value{ .object = obj };
 }
+
+const ToolResultAppendResult = struct {
+    next_index: usize,
+    appended_image_user: bool,
+};
 
 fn appendToolResultMessages(
     allocator: std.mem.Allocator,
     messages: *std.json.Array,
     model: types.Model,
-    tool_result: types.ToolResultMessage,
-) !bool {
+    transformed_messages: []const types.Message,
+    start_index: usize,
+) !ToolResultAppendResult {
     const compat = getCompat(model);
-    try messages.append(try buildToolResultMessage(allocator, model, tool_result));
-    if (try buildToolResultImageUserMessage(allocator, model, tool_result)) |image_message| {
+    var image_parts = std.json.Array.init(allocator);
+    defer image_parts.deinit();
+
+    var index = start_index;
+    while (index < transformed_messages.len and transformed_messages[index] == .tool_result) : (index += 1) {
+        const tool_result = transformed_messages[index].tool_result;
+        try messages.append(try buildToolResultMessage(allocator, model, tool_result));
+        try appendToolResultImageParts(allocator, model, tool_result, &image_parts);
+    }
+
+    if (image_parts.items.len > 0) {
         if (compat.requires_assistant_after_tool_result) {
             try messages.append(.{ .object = try buildMessageObject(allocator, "assistant", "I have processed the tool results.") });
         }
-        try messages.append(image_message);
-        return true;
+        try messages.append(try buildToolResultImageUserMessage(allocator, image_parts));
+        return .{ .next_index = index, .appended_image_user = true };
     }
-    return false;
+    return .{ .next_index = index, .appended_image_user = false };
 }
 
 fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool_result: types.ToolResultMessage) !std.json.Value {
@@ -1709,7 +1764,7 @@ fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool
     const content = if (text_parts.items.len > 0)
         try sanitizeSurrogates(allocator, text_parts.items)
     else
-        try allocator.dupe(u8, "");
+        try allocator.dupe(u8, "(see attached image)");
     defer allocator.free(content);
 
     var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -1726,11 +1781,12 @@ fn buildToolResultMessage(allocator: std.mem.Allocator, model: types.Model, tool
     return std.json.Value{ .object = obj };
 }
 
-fn buildToolResultImageUserMessage(
+fn appendToolResultImageParts(
     allocator: std.mem.Allocator,
     model: types.Model,
     tool_result: types.ToolResultMessage,
-) !?std.json.Value {
+    image_parts: *std.json.Array,
+) !void {
     var model_supports_images = false;
     for (model.input_types) |input_type| {
         if (std.mem.eql(u8, input_type, "image")) {
@@ -1738,25 +1794,7 @@ fn buildToolResultImageUserMessage(
             break;
         }
     }
-    if (!model_supports_images) return null;
-
-    var has_images = false;
-    for (tool_result.content) |block| {
-        if (block == .image) {
-            has_images = true;
-            break;
-        }
-    }
-    if (!has_images) return null;
-
-    var content_parts = std.json.Array.init(allocator);
-    errdefer content_parts.deinit();
-
-    var text_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer text_part.deinit(allocator);
-    try text_part.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "text") });
-    try text_part.put(allocator, try allocator.dupe(u8, "text"), std.json.Value{ .string = try allocator.dupe(u8, "Attached image(s) from tool result:") });
-    try content_parts.append(.{ .object = text_part });
+    if (!model_supports_images) return;
 
     for (tool_result.content) |block| {
         if (block != .image) continue;
@@ -1771,7 +1809,25 @@ fn buildToolResultImageUserMessage(
         errdefer image_url.deinit(allocator);
         try image_url.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, url) });
         try part.put(allocator, try allocator.dupe(u8, "image_url"), .{ .object = image_url });
-        try content_parts.append(.{ .object = part });
+        try image_parts.append(.{ .object = part });
+    }
+}
+
+fn buildToolResultImageUserMessage(
+    allocator: std.mem.Allocator,
+    image_parts: std.json.Array,
+) !std.json.Value {
+    var content_parts = std.json.Array.init(allocator);
+    errdefer content_parts.deinit();
+
+    var text_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer text_part.deinit(allocator);
+    try text_part.put(allocator, try allocator.dupe(u8, "type"), std.json.Value{ .string = try allocator.dupe(u8, "text") });
+    try text_part.put(allocator, try allocator.dupe(u8, "text"), std.json.Value{ .string = try allocator.dupe(u8, "Attached image(s) from tool result:") });
+    try content_parts.append(.{ .object = text_part });
+
+    for (image_parts.items) |part| {
+        try content_parts.append(part);
     }
 
     var obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -2230,7 +2286,7 @@ test "buildAssistantMessage separates thinking from text" {
         .timestamp = 1,
     };
 
-    const message = try buildAssistantMessage(allocator, model, assistant);
+    const message = (try buildAssistantMessage(allocator, model, assistant)).?;
     defer freeJsonValue(allocator, message);
 
     try std.testing.expectEqualStrings("final answer", message.object.get("content").?.string);
