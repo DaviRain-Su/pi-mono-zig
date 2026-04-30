@@ -1,0 +1,401 @@
+{
+  "expected": {
+    "typeScriptRequest": {
+      "mode": "streamBedrock",
+      "payload": {
+        "inferenceConfig": {
+          "maxTokens": 80
+        },
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "Return a concise Bedrock fixture response."
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "system": [
+          {
+            "text": "You are the deterministic Bedrock fixture assistant."
+          }
+        ],
+        "toolConfig": {
+          "tools": [
+            {
+              "toolSpec": {
+                "description": "Return deterministic weather for a city.",
+                "inputSchema": {
+                  "json": {
+                    "properties": {
+                      "city": {
+                        "type": "string"
+                      },
+                      "unit": {
+                        "anyOf": [
+                          {
+                            "const": "celsius",
+                            "type": "string"
+                          },
+                          {
+                            "const": "fahrenheit",
+                            "type": "string"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "city",
+                      "unit"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "name": "get_weather"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "typeScriptStream": [
+      {
+        "type": "start"
+      },
+      {
+        "contentIndex": 0,
+        "type": "thinking_start"
+      },
+      {
+        "contentIndex": 0,
+        "delta": "Need weather.",
+        "type": "thinking_delta"
+      },
+      {
+        "content": "Need weather.",
+        "contentIndex": 0,
+        "type": "thinking_end"
+      },
+      {
+        "contentIndex": 1,
+        "type": "toolcall_start"
+      },
+      {
+        "contentIndex": 1,
+        "delta": "{\"city\":\"Ber",
+        "type": "toolcall_delta"
+      },
+      {
+        "contentIndex": 1,
+        "delta": "lin\",\"unit\":\"celsius\"}",
+        "type": "toolcall_delta"
+      },
+      {
+        "contentIndex": 1,
+        "toolCall": {
+          "arguments": {
+            "city": "Berlin",
+            "unit": "celsius"
+          },
+          "id": "tool-1",
+          "name": "get_weather"
+        },
+        "type": "toolcall_end"
+      },
+      {
+        "message": {
+          "api": "bedrock-converse-stream",
+          "content": [
+            {
+              "thinking": "Need weather.",
+              "thinkingSignature": "sig-1",
+              "type": "thinking"
+            },
+            {
+              "arguments": {
+                "city": "Berlin",
+                "unit": "celsius"
+              },
+              "id": "tool-1",
+              "name": "get_weather",
+              "type": "toolCall"
+            }
+          ],
+          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "provider": "amazon-bedrock",
+          "role": "assistant",
+          "stopReason": "toolUse",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 21,
+            "output": 9,
+            "totalTokens": 30
+          }
+        },
+        "type": "done"
+      }
+    ]
+  },
+  "id": "bedrock-stream-tool-fragmented-json",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise Bedrock fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic Bedrock fixture assistant.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "localStream": {
+      "events": [
+        {
+          "messageStart": {
+            "role": "assistant"
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 0,
+            "delta": {
+              "reasoningContent": {
+                "signature": "sig-1",
+                "text": "Need weather."
+              }
+            }
+          }
+        },
+        {
+          "contentBlockStop": {
+            "contentBlockIndex": 0
+          }
+        },
+        {
+          "contentBlockStart": {
+            "contentBlockIndex": 1,
+            "start": {
+              "toolUse": {
+                "name": "get_weather",
+                "toolUseId": "tool-1"
+              }
+            }
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 1,
+            "delta": {
+              "toolUse": {
+                "input": "{\"city\":\"Ber"
+              }
+            }
+          }
+        },
+        {
+          "contentBlockDelta": {
+            "contentBlockIndex": 1,
+            "delta": {
+              "toolUse": {
+                "input": "lin\",\"unit\":\"celsius\"}"
+              }
+            }
+          }
+        },
+        {
+          "contentBlockStop": {
+            "contentBlockIndex": 1
+          }
+        },
+        {
+          "messageStop": {
+            "stopReason": "tool_use"
+          }
+        },
+        {
+          "metadata": {
+            "usage": {
+              "inputTokens": 21,
+              "outputTokens": 9,
+              "totalTokens": 30
+            }
+          }
+        }
+      ],
+      "format": "json-lines"
+    },
+    "mode": "streamBedrock",
+    "model": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "input": [
+        "text"
+      ],
+      "name": "Claude 3.7 Sonnet Bedrock Fixture",
+      "provider": "amazon-bedrock",
+      "reasoning": true
+    },
+    "options": {
+      "cacheRetention": "none",
+      "maxTokens": 80
+    }
+  },
+  "metadata": {
+    "allowlists": {
+      "ignoredPaths": [
+        "id",
+        "title",
+        "input",
+        "metadata",
+        "schemaVersion",
+        "expected.onResponse",
+        "expected.binaryEventStream"
+      ],
+      "localStreamFormats": [
+        "json-lines",
+        "aws-eventstream"
+      ],
+      "modelIds": [
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "amazon.nova-pro-v1:0",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "global.anthropic.claude-opus-4-6-v1",
+        "global.anthropic.claude-opus-4-7-v1",
+        "global.anthropic.claude-sonnet-4-6-v1",
+        "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/global.anthropic.claude-opus-4-7-v1",
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/fixture-profile"
+      ],
+      "scenarioIds": [
+        "bedrock-stream-no-explicit-inference",
+        "bedrock-stream-basic-text",
+        "bedrock-stream-metadata-response",
+        "bedrock-stream-thinking-signature",
+        "bedrock-stream-tool-fragmented-json",
+        "bedrock-stream-interleaved-block-indexes",
+        "bedrock-stream-usage-cache-total-fallback",
+        "bedrock-stream-stop-sequence",
+        "bedrock-stream-max-tokens",
+        "bedrock-stream-context-window-exceeded",
+        "bedrock-stream-unknown-stop-reason",
+        "bedrock-stream-non-assistant-message-start",
+        "bedrock-stream-validation-exception",
+        "bedrock-stream-throttling-exception",
+        "bedrock-stream-send-service-unavailable-exception",
+        "bedrock-stream-partial-model-exception",
+        "bedrock-stream-pre-abort",
+        "bedrock-stream-mid-abort",
+        "bedrock-binary-eventstream-exception",
+        "bedrock-tools-choice-none",
+        "bedrock-tools-choice-auto",
+        "bedrock-tools-choice-any",
+        "bedrock-tools-choice-specific",
+        "bedrock-unrelated-provider-options-ignored",
+        "bedrock-message-history-tool-results",
+        "bedrock-vision-image-block",
+        "bedrock-nonvision-image-downgrade",
+        "bedrock-cache-points-long",
+        "bedrock-onpayload-pass-through",
+        "bedrock-onpayload-replacement",
+        "bedrock-reasoning-fields",
+        "bedrock-reasoning-fixed-default-minimal",
+        "bedrock-reasoning-fixed-default-low",
+        "bedrock-reasoning-fixed-default-medium",
+        "bedrock-reasoning-fixed-default-high",
+        "bedrock-reasoning-fixed-default-xhigh",
+        "bedrock-reasoning-fixed-custom-low",
+        "bedrock-reasoning-fixed-custom-high",
+        "bedrock-reasoning-fixed-custom-xhigh",
+        "bedrock-reasoning-adaptive-opus46-xhigh",
+        "bedrock-reasoning-adaptive-opus47-xhigh",
+        "bedrock-reasoning-adaptive-sonnet46-xhigh",
+        "bedrock-reasoning-adaptive-minimal-effort",
+        "bedrock-reasoning-adaptive-display-omitted",
+        "bedrock-reasoning-govcloud-fixed-model",
+        "bedrock-reasoning-govcloud-adaptive-region",
+        "bedrock-reasoning-govcloud-adaptive-arn",
+        "bedrock-reasoning-interleaved-default",
+        "bedrock-reasoning-interleaved-true",
+        "bedrock-app-profile-adaptive-by-name",
+        "bedrock-app-profile-fixed-by-name",
+        "bedrock-app-profile-nonclaude-by-name",
+        "bedrock-simple-fixed-reasoning-adjust",
+        "bedrock-simple-fixed-reasoning-custom-cap",
+        "bedrock-simple-no-reasoning-no-adjust",
+        "bedrock-simple-adaptive-no-adjust",
+        "bedrock-simple-nonclaude-no-adjust",
+        "bedrock-transform-replay-edge-cases",
+        "bedrock-simple-explicit-tokens",
+        "bedrock-binary-eventstream-tool-use",
+        "bedrock-auth-path-encoding",
+        "bedrock-auth-standard-endpoint-eu",
+        "bedrock-auth-standard-endpoint-fips",
+        "bedrock-auth-standard-endpoint-china",
+        "bedrock-auth-region-precedence-options",
+        "bedrock-auth-region-precedence-env",
+        "bedrock-auth-region-precedence-default-env",
+        "bedrock-auth-aws-profile-env",
+        "bedrock-auth-options-profile",
+        "bedrock-auth-custom-endpoint-region",
+        "bedrock-auth-bearer-option",
+        "bedrock-auth-bearer-env",
+        "bedrock-auth-skip-auth-proxy",
+        "bedrock-auth-sigv4-session",
+        "bedrock-auth-missing-credentials"
+      ]
+    },
+    "captureBoundary": "streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+    "captureMethod": "BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
+    "network": "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
+    "sourceCitations": [
+      "packages/ai/src/providers/amazon-bedrock.ts:73-260",
+      "packages/ai/src/providers/amazon-bedrock.ts:311-348",
+      "packages/ai/src/providers/amazon-bedrock.ts:598-957",
+      "zig/src/ai/providers/bedrock.zig:169-754",
+      "zig/src/ai/providers/bedrock.zig:781-1427"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Bedrock streamBedrock finalizes fragmented tool JSON"
+}

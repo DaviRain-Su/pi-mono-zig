@@ -16,7 +16,10 @@ const BedrockError = error{
     MissingAwsSecretAccessKey,
     InvalidBedrockChunk,
     InvalidBedrockEventStream,
+    DuplicateBedrockMessageStart,
+    MissingBedrockMessageStart,
     UnsupportedEventStreamHeaderType,
+    UnexpectedBedrockMessageRole,
     UnknownStopReason,
 };
 
@@ -93,6 +96,26 @@ const BlockEntry = struct {
     event_index: usize,
     block: CurrentBlock,
 };
+
+const StreamParseState = struct {
+    saw_message_start: bool = false,
+    closed_indexes: [64]usize = [_]usize{0} ** 64,
+    closed_count: usize = 0,
+};
+
+fn isClosedContentBlock(state: *const StreamParseState, bedrock_index: usize) bool {
+    for (state.closed_indexes[0..state.closed_count]) |closed_index| {
+        if (closed_index == bedrock_index) return true;
+    }
+    return false;
+}
+
+fn markClosedContentBlock(state: *StreamParseState, bedrock_index: usize) !void {
+    if (isClosedContentBlock(state, bedrock_index)) return BedrockError.InvalidBedrockChunk;
+    if (state.closed_count >= state.closed_indexes.len) return BedrockError.InvalidBedrockChunk;
+    state.closed_indexes[state.closed_count] = bedrock_index;
+    state.closed_count += 1;
+}
 
 pub const BedrockProvider = struct {
     pub const api = "bedrock-converse-stream";
@@ -393,6 +416,27 @@ pub fn buildStreamSnapshotValueFromLocalEvents(
     model: types.Model,
     events: []const std.json.Value,
 ) !std.json.Value {
+    return buildStreamSnapshotValueFromLocalEventsWithTerminalFailure(allocator, io, model, events, null);
+}
+
+pub const FixtureTerminalFailureTiming = enum {
+    before_events,
+    after_events,
+};
+
+pub const FixtureTerminalFailure = struct {
+    timing: FixtureTerminalFailureTiming,
+    stop_reason: types.StopReason,
+    message: []const u8,
+};
+
+pub fn buildStreamSnapshotValueFromLocalEventsWithTerminalFailure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    events: []const std.json.Value,
+    terminal_failure: ?FixtureTerminalFailure,
+) !std.json.Value {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const parse_allocator = arena.allocator();
@@ -410,11 +454,18 @@ pub fn buildStreamSnapshotValueFromLocalEvents(
         for (active_blocks.items) |*entry| deinitCurrentBlock(parse_allocator, &entry.block);
         active_blocks.deinit(parse_allocator);
     }
+    var state = StreamParseState{};
 
-    stream_instance.push(.{ .event_type = .start });
+    if (terminal_failure) |failure| {
+        if (failure.timing == .before_events) {
+            try emitStreamFailureMessage(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, failure.stop_reason, failure.message);
+            return try snapshotStreamEvents(allocator, parse_allocator, &stream_instance);
+        }
+    }
+
     for (events) |event_value| {
         var failed = false;
-        handleEventValue(parse_allocator, &stream_instance, event_value, &output, &content_blocks, &tool_calls, &active_blocks, model) catch |err| switch (err) {
+        handleEventValue(parse_allocator, &stream_instance, event_value, &output, &content_blocks, &tool_calls, &active_blocks, &state, model) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
                 try emitRuntimeFailure(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
@@ -425,7 +476,15 @@ pub fn buildStreamSnapshotValueFromLocalEvents(
         if (stream_instance.result() != null) break;
     }
     if (stream_instance.result() == null) {
-        try finalizeOutput(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, model);
+        if (terminal_failure) |failure| {
+            if (failure.timing == .after_events) {
+                try emitStreamFailureMessage(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, failure.stop_reason, failure.message);
+            } else {
+                try finalizeOutput(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
+            }
+        } else {
+            try finalizeOutput(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
+        }
     }
 
     return try snapshotStreamEvents(allocator, parse_allocator, &stream_instance);
@@ -1328,8 +1387,7 @@ fn parseEventStreamFrames(
         for (active_blocks.items) |*entry| deinitCurrentBlock(allocator, &entry.block);
         active_blocks.deinit(allocator);
     }
-
-    stream_ptr.push(.{ .event_type = .start });
+    var state = StreamParseState{};
 
     var cursor: usize = 0;
     while (cursor < body.len) {
@@ -1364,7 +1422,7 @@ fn parseEventStreamFrames(
         cursor += total_length;
 
         if (payload.len == 0) continue;
-        parseWrappedEventPayload(allocator, stream_ptr, payload, parsed_headers.event_type, parsed_headers.exception_type, &output, &content_blocks, &tool_calls, &active_blocks, model) catch |err| switch (err) {
+        parseWrappedEventPayload(allocator, stream_ptr, payload, parsed_headers.event_type, parsed_headers.exception_type, &output, &content_blocks, &tool_calls, &active_blocks, &state, model) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
                 try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
@@ -1374,7 +1432,7 @@ fn parseEventStreamFrames(
         if (output.stop_reason == .error_reason and output.error_message != null and stream_ptr.result() != null) return;
     }
 
-    try finalizeOutput(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model);
+    try finalizeOutput(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
 }
 
 const EventStreamHeaders = struct {
@@ -1436,6 +1494,7 @@ fn parseWrappedEventPayload(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
     model: types.Model,
 ) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -1444,10 +1503,10 @@ fn parseWrappedEventPayload(
     if (parsed.value != .object or !containsKnownEventField(parsed.value)) {
         const wrapped = try wrapEventValue(allocator, parsed.value, event_type, exception_type);
         defer freeJsonValue(allocator, wrapped);
-        try handleEventValue(allocator, stream_ptr, wrapped, output, content_blocks, tool_calls, active_blocks, model);
+        try handleEventValue(allocator, stream_ptr, wrapped, output, content_blocks, tool_calls, active_blocks, state, model);
         return;
     }
-    try handleEventValue(allocator, stream_ptr, parsed.value, output, content_blocks, tool_calls, active_blocks, model);
+    try handleEventValue(allocator, stream_ptr, parsed.value, output, content_blocks, tool_calls, active_blocks, state, model);
 }
 
 fn containsKnownEventField(value: std.json.Value) bool {
@@ -1485,10 +1544,28 @@ fn wrapEventValue(
         return .{ .object = object };
     }
     if (exception_type) |name| {
-        try object.put(allocator, try allocator.dupe(u8, name), try cloneJsonValue(allocator, value));
+        const field_name = try normalizeEventStreamExceptionName(allocator, name);
+        defer allocator.free(field_name);
+        try object.put(allocator, try allocator.dupe(u8, field_name), try cloneJsonValue(allocator, value));
         return .{ .object = object };
     }
     return BedrockError.InvalidBedrockChunk;
+}
+
+fn normalizeEventStreamExceptionName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const mappings = [_]struct { raw: []const u8, field: []const u8 }{
+        .{ .raw = "InternalServerException", .field = "internalServerException" },
+        .{ .raw = "ModelStreamErrorException", .field = "modelStreamErrorException" },
+        .{ .raw = "ValidationException", .field = "validationException" },
+        .{ .raw = "ThrottlingException", .field = "throttlingException" },
+        .{ .raw = "ServiceUnavailableException", .field = "serviceUnavailableException" },
+    };
+    for (mappings) |mapping| {
+        if (std.mem.eql(u8, name, mapping.raw) or std.mem.eql(u8, name, mapping.field)) {
+            return allocator.dupe(u8, mapping.field);
+        }
+    }
+    return allocator.dupe(u8, name);
 }
 
 fn initOutput(model: types.Model) types.AssistantMessage {
@@ -1520,8 +1597,7 @@ fn parseTextStreamLines(
         for (active_blocks.items) |*entry| deinitCurrentBlock(allocator, &entry.block);
         active_blocks.deinit(allocator);
     }
-
-    stream_ptr.push(.{ .event_type = .start });
+    var state = StreamParseState{};
 
     while (true) {
         const maybe_line = streaming.readLine() catch |err| switch (err) {
@@ -1550,7 +1626,7 @@ fn parseTextStreamLines(
             },
         };
         defer parsed.deinit();
-        handleEventValue(allocator, stream_ptr, parsed.value, &output, &content_blocks, &tool_calls, &active_blocks, model) catch |err| switch (err) {
+        handleEventValue(allocator, stream_ptr, parsed.value, &output, &content_blocks, &tool_calls, &active_blocks, &state, model) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
                 try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
@@ -1560,7 +1636,7 @@ fn parseTextStreamLines(
         if (stream_ptr.result() != null) return;
     }
 
-    try finalizeOutput(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model);
+    try finalizeOutput(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
 }
 
 fn handleEventValue(
@@ -1571,6 +1647,7 @@ fn handleEventValue(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
     model: types.Model,
 ) !void {
     if (value != .object) return BedrockError.InvalidBedrockChunk;
@@ -1584,7 +1661,7 @@ fn handleEventValue(
     };
     inline for (exception_fields) |field| {
         if (value.object.get(field)) |exception_value| {
-            try finalizeOutputFromPartials(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model);
+            try collectOutputFromPartials(allocator, output, content_blocks, tool_calls, active_blocks);
             output.stop_reason = .error_reason;
             output.error_message = try buildExceptionMessage(allocator, field, exception_value);
             stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output.* });
@@ -1593,19 +1670,29 @@ fn handleEventValue(
         }
     }
 
-    if (value.object.get("messageStart")) |_| {
+    if (value.object.get("messageStart")) |start_value| {
+        if (state.saw_message_start) return BedrockError.DuplicateBedrockMessageStart;
+        state.saw_message_start = true;
+        if (start_value != .object) return BedrockError.InvalidBedrockChunk;
+        const role_value = start_value.object.get("role") orelse return BedrockError.InvalidBedrockChunk;
+        if (role_value != .string) return BedrockError.InvalidBedrockChunk;
+        if (!std.mem.eql(u8, role_value.string, "assistant")) {
+            try emitStreamFailureMessage(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, .error_reason, "Unexpected assistant message start but got user message start instead");
+            return;
+        }
+        stream_ptr.push(.{ .event_type = .start });
         return;
     }
     if (value.object.get("contentBlockStart")) |start_value| {
-        try handleContentBlockStart(allocator, active_blocks, stream_ptr, content_blocks.items.len, start_value);
+        try handleContentBlockStart(allocator, active_blocks, state, stream_ptr, content_blocks.items.len, start_value);
         return;
     }
     if (value.object.get("contentBlockDelta")) |delta_value| {
-        try handleContentBlockDelta(allocator, active_blocks, stream_ptr, content_blocks.items.len, delta_value);
+        try handleContentBlockDelta(allocator, active_blocks, state, stream_ptr, content_blocks.items.len, delta_value);
         return;
     }
     if (value.object.get("contentBlockStop")) |stop_value| {
-        try handleContentBlockStop(allocator, active_blocks, content_blocks, tool_calls, stream_ptr, stop_value);
+        try handleContentBlockStop(allocator, active_blocks, state, content_blocks, tool_calls, stream_ptr, stop_value);
         return;
     }
     if (value.object.get("messageStop")) |stop_value| {
@@ -1629,12 +1716,23 @@ fn buildExceptionMessage(allocator: std.mem.Allocator, field: []const u8, value:
         "Bedrock streaming request failed";
     const detail = try provider_error.sanitizeProviderErrorDetail(allocator, raw_detail);
     defer allocator.free(detail);
-    return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ field, detail });
+    const prefix = bedrockExceptionPrefix(field);
+    return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, detail });
+}
+
+fn bedrockExceptionPrefix(field: []const u8) []const u8 {
+    if (std.mem.eql(u8, field, "internalServerException")) return "Internal server error";
+    if (std.mem.eql(u8, field, "modelStreamErrorException")) return "Model stream error";
+    if (std.mem.eql(u8, field, "validationException")) return "Validation error";
+    if (std.mem.eql(u8, field, "throttlingException")) return "Throttling error";
+    if (std.mem.eql(u8, field, "serviceUnavailableException")) return "Service unavailable";
+    return field;
 }
 
 fn handleContentBlockStart(
     allocator: std.mem.Allocator,
     active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     completed_count: usize,
     value: std.json.Value,
@@ -1643,6 +1741,7 @@ fn handleContentBlockStart(
     const index_value = value.object.get("contentBlockIndex") orelse return BedrockError.InvalidBedrockChunk;
     if (index_value != .integer) return BedrockError.InvalidBedrockChunk;
     const bedrock_index: usize = @intCast(index_value.integer);
+    if (findActiveBlock(active_blocks, bedrock_index) != null or isClosedContentBlock(state, bedrock_index)) return BedrockError.InvalidBedrockChunk;
 
     const start_value = value.object.get("start") orelse return;
     if (start_value != .object) return BedrockError.InvalidBedrockChunk;
@@ -1670,6 +1769,7 @@ fn handleContentBlockStart(
 fn handleContentBlockDelta(
     allocator: std.mem.Allocator,
     active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     completed_count: usize,
     value: std.json.Value,
@@ -1678,6 +1778,7 @@ fn handleContentBlockDelta(
     const index_value = value.object.get("contentBlockIndex") orelse return BedrockError.InvalidBedrockChunk;
     if (index_value != .integer) return BedrockError.InvalidBedrockChunk;
     const bedrock_index: usize = @intCast(index_value.integer);
+    if (isClosedContentBlock(state, bedrock_index)) return BedrockError.InvalidBedrockChunk;
     const delta_value = value.object.get("delta") orelse return BedrockError.InvalidBedrockChunk;
     if (delta_value != .object) return BedrockError.InvalidBedrockChunk;
 
@@ -1714,11 +1815,26 @@ fn handleContentBlockDelta(
             }
         }
         if (extractReasoningSignature(reasoning_value)) |signature| {
-            if (entry.block.thinking.signature) |existing| allocator.free(existing);
-            entry.block.thinking.signature = try allocator.dupe(u8, signature);
+            if (entry.block.thinking.signature) |existing| {
+                const appended = try std.fmt.allocPrint(allocator, "{s}{s}", .{ existing, signature });
+                allocator.free(existing);
+                entry.block.thinking.signature = appended;
+            } else {
+                entry.block.thinking.signature = try allocator.dupe(u8, signature);
+            }
         }
         return;
     }
+}
+
+fn insertContentBlockAtEventIndex(
+    allocator: std.mem.Allocator,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    event_index: usize,
+    block: types.ContentBlock,
+) !void {
+    const insert_index = @min(event_index, content_blocks.items.len);
+    try content_blocks.insert(allocator, insert_index, block);
 }
 
 fn ensureActiveTextBlock(
@@ -1777,6 +1893,7 @@ fn extractReasoningSignature(value: std.json.Value) ?[]const u8 {
 fn handleContentBlockStop(
     allocator: std.mem.Allocator,
     active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -1790,17 +1907,18 @@ fn handleContentBlockStop(
     const remove_index = findActiveBlockIndex(active_blocks, bedrock_index) orelse return BedrockError.InvalidBedrockChunk;
     var entry = active_blocks.orderedRemove(remove_index);
     defer deinitCurrentBlock(allocator, &entry.block);
+    try markClosedContentBlock(state, bedrock_index);
 
     switch (entry.block) {
         .text => |text| {
             const owned = try allocator.dupe(u8, text.items);
-            try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+            try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .text = .{ .text = owned } });
             stream_ptr.push(.{ .event_type = .text_end, .content_index = @intCast(entry.event_index), .content = owned });
         },
         .thinking => |thinking| {
             const owned = try allocator.dupe(u8, thinking.text.items);
             const signature = if (thinking.signature) |value_bytes| try allocator.dupe(u8, value_bytes) else null;
-            try content_blocks.append(allocator, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
+            try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
             stream_ptr.push(.{ .event_type = .thinking_end, .content_index = @intCast(entry.event_index), .content = owned });
         },
         .tool_call => |tool| {
@@ -1813,7 +1931,7 @@ fn handleContentBlockStop(
                 .arguments = arguments,
             };
             try tool_calls.append(allocator, final_tool_call);
-            try content_blocks.append(allocator, .{ .tool_call = .{
+            try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .tool_call = .{
                 .id = try allocator.dupe(u8, final_tool_call.id),
                 .name = try allocator.dupe(u8, final_tool_call.name),
                 .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
@@ -1846,7 +1964,7 @@ fn updateUsage(output: *types.AssistantMessage, metadata_value: std.json.Value, 
     output.usage.cache_write = getJsonU32(usage_value.object.get("cacheWriteInputTokens"));
     output.usage.total_tokens = blk: {
         const total = getJsonU32(usage_value.object.get("totalTokens"));
-        break :blk if (total > 0) total else output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
+        break :blk if (total > 0) total else output.usage.input + output.usage.output;
     };
     calculateCost(model, &output.usage);
 }
@@ -1882,13 +2000,13 @@ fn finalizeOutputFromPartials(
         switch (entry.block) {
             .text => |text| {
                 const owned = try allocator.dupe(u8, text.items);
-                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .text = .{ .text = owned } });
                 stream_ptr.push(.{ .event_type = .text_end, .content_index = @intCast(entry.event_index), .content = owned });
             },
             .thinking => |thinking| {
                 const owned = try allocator.dupe(u8, thinking.text.items);
                 const signature = if (thinking.signature) |value_bytes| try allocator.dupe(u8, value_bytes) else null;
-                try content_blocks.append(allocator, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
+                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
                 stream_ptr.push(.{ .event_type = .thinking_end, .content_index = @intCast(entry.event_index), .content = owned });
             },
             .tool_call => |tool| {
@@ -1900,7 +2018,7 @@ fn finalizeOutputFromPartials(
                     .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
                 };
                 try tool_calls.append(allocator, final_tool_call);
-                try content_blocks.append(allocator, .{ .tool_call = .{
+                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .tool_call = .{
                     .id = try allocator.dupe(u8, final_tool_call.id),
                     .name = try allocator.dupe(u8, final_tool_call.name),
                     .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
@@ -1912,7 +2030,67 @@ fn finalizeOutputFromPartials(
 
     output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
     output.tool_calls = if (output.tool_calls == null and tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else output.tool_calls;
-    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
+    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
+}
+
+fn collectOutputFromPartials(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+) !void {
+    while (active_blocks.items.len > 0) {
+        var entry = active_blocks.orderedRemove(0);
+        defer deinitCurrentBlock(allocator, &entry.block);
+        switch (entry.block) {
+            .text => |text| {
+                const owned = try allocator.dupe(u8, text.items);
+                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .text = .{ .text = owned } });
+            },
+            .thinking => |thinking| {
+                const owned = try allocator.dupe(u8, thinking.text.items);
+                const signature = if (thinking.signature) |value_bytes| try allocator.dupe(u8, value_bytes) else null;
+                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
+            },
+            .tool_call => |tool| {
+                var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
+                defer parsed_arguments.deinit();
+                const final_tool_call = types.ToolCall{
+                    .id = try allocator.dupe(u8, tool.id),
+                    .name = try allocator.dupe(u8, tool.name),
+                    .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
+                };
+                try tool_calls.append(allocator, final_tool_call);
+                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .tool_call = .{
+                    .id = try allocator.dupe(u8, final_tool_call.id),
+                    .name = try allocator.dupe(u8, final_tool_call.name),
+                    .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+                } });
+            },
+        }
+    }
+
+    output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
+    output.tool_calls = if (output.tool_calls == null and tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else output.tool_calls;
+    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
+}
+
+fn emitStreamFailureMessage(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    stop_reason: types.StopReason,
+    message_text: []const u8,
+) !void {
+    try collectOutputFromPartials(allocator, output, content_blocks, tool_calls, active_blocks);
+    output.stop_reason = stop_reason;
+    output.error_message = try allocator.dupe(u8, message_text);
+    stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output.* });
+    stream_ptr.end(output.*);
 }
 
 fn emitRuntimeFailure(
@@ -1925,10 +2103,17 @@ fn emitRuntimeFailure(
     model: types.Model,
     err: anyerror,
 ) !void {
-    try finalizeOutputFromPartials(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model);
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    _ = model;
+    try emitStreamFailureMessage(
+        allocator,
+        stream_ptr,
+        output,
+        content_blocks,
+        tool_calls,
+        active_blocks,
+        provider_error.runtimeStopReason(err),
+        provider_error.runtimeErrorMessage(err),
+    );
 }
 
 fn finalizeOutput(
@@ -1938,13 +2123,22 @@ fn finalizeOutput(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
     model: types.Model,
 ) !void {
     _ = model;
+    if (!state.saw_message_start) {
+        try emitStreamFailureMessage(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, .error_reason, "An unknown error occurred");
+        return;
+    }
     if (active_blocks.items.len != 0) return BedrockError.InvalidBedrockChunk;
+    if (output.stop_reason == .error_reason or output.stop_reason == .aborted) {
+        try emitStreamFailureMessage(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, output.stop_reason, "An unknown error occurred");
+        return;
+    }
     output.content = try content_blocks.toOwnedSlice(allocator);
     output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
-    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
+    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 
     stream_ptr.push(.{ .event_type = .done, .message = output.* });
     stream_ptr.end(output.*);
@@ -2201,7 +2395,7 @@ fn eventTypeName(event_type: types.EventType) []const u8 {
         .toolcall_delta => "toolcall_delta",
         .toolcall_end => "toolcall_end",
         .done => "done",
-        .error_event => "error_event",
+        .error_event => "error",
     };
 }
 

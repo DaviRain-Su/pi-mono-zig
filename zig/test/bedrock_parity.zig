@@ -122,10 +122,11 @@ fn buildActualFixtureComparisonRoot(allocator: std.mem.Allocator, io: std.Io, fi
 
     const local_stream = getObjectField(input, "localStream");
     const stream_format = getObjectField(local_stream, "format").string;
+    const terminal_failure = parseTerminalFailure(options_value);
     const actual_stream = if (std.mem.eql(u8, stream_format, "aws-eventstream"))
         try buildBinaryStreamSnapshot(allocator, io, fixture, model)
     else
-        try bedrock.buildStreamSnapshotValueFromLocalEvents(allocator, io, model, getObjectField(local_stream, "events").array.items);
+        try bedrock.buildStreamSnapshotValueFromLocalEventsWithTerminalFailure(allocator, io, model, getObjectField(local_stream, "events").array.items, terminal_failure);
     errdefer bedrock.freeOwnedJsonValue(allocator, actual_stream);
 
     var expected = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -164,8 +165,20 @@ fn parseModel(allocator: std.mem.Allocator, value: std.json.Value) !types.Model 
         .base_url = getObjectField(value, "baseUrl").string,
         .reasoning = optionalBool(value, "reasoning") orelse false,
         .input_types = input_types,
+        .cost = parseModelCost(optionalField(value, "cost")),
         .context_window = 200_000,
         .max_tokens = parseOptionalModelMaxTokens(value) orelse 4096,
+    };
+}
+
+fn parseModelCost(value: ?std.json.Value) types.ModelCost {
+    const object = value orelse return .{};
+    if (object != .object) return .{};
+    return .{
+        .input = optionalF64(object, "input") orelse 0,
+        .output = optionalF64(object, "output") orelse 0,
+        .cache_read = optionalF64(object, "cacheRead") orelse 0,
+        .cache_write = optionalF64(object, "cacheWrite") orelse 0,
     };
 }
 
@@ -318,6 +331,35 @@ fn parseStopReason(value: []const u8) types.StopReason {
     return .error_reason;
 }
 
+fn parseTerminalFailure(value: std.json.Value) ?bedrock.FixtureTerminalFailure {
+    if (optionalString(value, "sendException")) |send_exception| {
+        if (std.mem.eql(u8, send_exception, "ServiceUnavailableException")) {
+            return .{
+                .timing = .before_events,
+                .stop_reason = .error_reason,
+                .message = "Service unavailable: service unavailable fixture",
+            };
+        }
+    }
+    if (optionalString(value, "abort")) |abort| {
+        if (std.mem.eql(u8, abort, "pre")) {
+            return .{
+                .timing = .before_events,
+                .stop_reason = .aborted,
+                .message = "Request was aborted",
+            };
+        }
+        if (std.mem.eql(u8, abort, "mid")) {
+            return .{
+                .timing = .after_events,
+                .stop_reason = .aborted,
+                .message = "Request was aborted",
+            };
+        }
+    }
+    return null;
+}
+
 fn parseThinkingLevel(value: ?[]const u8) ?types.ThinkingLevel {
     const text = value orelse return null;
     if (std.mem.eql(u8, text, "minimal")) return .minimal;
@@ -460,6 +502,15 @@ fn optionalF32(value: std.json.Value, key: []const u8) ?f32 {
     };
 }
 
+fn optionalF64(value: std.json.Value, key: []const u8) ?f64 {
+    const field = optionalField(value, key) orelse return null;
+    return switch (field) {
+        .integer => @floatFromInt(field.integer),
+        .float => field.float,
+        else => null,
+    };
+}
+
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     switch (value) {
         .null => return .null,
@@ -577,10 +628,10 @@ fn compareJson(
     if (ignored_paths.shouldIgnore(path)) return;
 
     if (expected == .integer and actual == .float) {
-        if (@as(f64, @floatFromInt(expected.integer)) == actual.float) return;
+        if (floatEquals(@floatFromInt(expected.integer), actual.float)) return;
     }
     if (expected == .float and actual == .integer) {
-        if (expected.float == @as(f64, @floatFromInt(actual.integer))) return;
+        if (floatEquals(expected.float, @floatFromInt(actual.integer))) return;
     }
 
     if (std.meta.activeTag(expected) != std.meta.activeTag(actual)) {
@@ -592,7 +643,7 @@ fn compareJson(
         .null => {},
         .bool => |expected_bool| if (expected_bool != actual.bool) try diffs.add(scenario_id, path, expected, actual),
         .integer => |expected_integer| if (expected_integer != actual.integer) try diffs.add(scenario_id, path, expected, actual),
-        .float => |expected_float| if (expected_float != actual.float) try diffs.add(scenario_id, path, expected, actual),
+        .float => |expected_float| if (!floatEquals(expected_float, actual.float)) try diffs.add(scenario_id, path, expected, actual),
         .number_string => |expected_number| if (!std.mem.eql(u8, expected_number, actual.number_string)) try diffs.add(scenario_id, path, expected, actual),
         .string => |expected_string| if (!std.mem.eql(u8, expected_string, actual.string)) try diffs.add(scenario_id, path, expected, actual),
         .array => |expected_array| {
@@ -630,6 +681,10 @@ fn compareJson(
             }
         },
     }
+}
+
+fn floatEquals(a: f64, b: f64) bool {
+    return @abs(a - b) <= 0.000000000001;
 }
 
 fn objectChildPath(allocator: std.mem.Allocator, path: []const u8, child: []const u8) ![]const u8 {
@@ -734,7 +789,7 @@ fn runNegativeSuite(allocator: std.mem.Allocator) !void {
     const stream = try bedrock.buildStreamSnapshotValueFromLocalEvents(allocator, std.Io.failing, model, invalid_tool_events.value.array.items);
     defer bedrock.freeOwnedJsonValue(allocator, stream);
     const last = stream.array.items[stream.array.items.len - 1];
-    if (!std.mem.eql(u8, getObjectField(last, "type").string, "error_event")) {
+    if (!std.mem.eql(u8, getObjectField(last, "type").string, "error")) {
         return error.NegativeInvalidToolFramingUnexpectedlyPassed;
     }
 
@@ -742,7 +797,7 @@ fn runNegativeSuite(allocator: std.mem.Allocator) !void {
     const binary_stream = try bedrock.buildStreamSnapshotValueFromBinaryBody(allocator, std.Io.failing, model, &bad_binary);
     defer bedrock.freeOwnedJsonValue(allocator, binary_stream);
     const binary_last = binary_stream.array.items[binary_stream.array.items.len - 1];
-    if (!std.mem.eql(u8, getObjectField(binary_last, "type").string, "error_event")) {
+    if (!std.mem.eql(u8, getObjectField(binary_last, "type").string, "error")) {
         return error.NegativeMalformedBinaryUnexpectedlyPassed;
     }
 }

@@ -1,6 +1,11 @@
 import {
 	BedrockRuntimeClient,
 	type ConverseStreamOutput,
+	InternalServerException,
+	ModelStreamErrorException,
+	ServiceUnavailableException,
+	ThrottlingException,
+	ValidationException,
 } from "@aws-sdk/client-bedrock-runtime";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -42,6 +47,22 @@ const allowedScenarioIds = [
 	"bedrock-stream-no-explicit-inference",
 	"bedrock-stream-basic-text",
 	"bedrock-stream-metadata-response",
+	"bedrock-stream-thinking-signature",
+	"bedrock-stream-tool-fragmented-json",
+	"bedrock-stream-interleaved-block-indexes",
+	"bedrock-stream-usage-cache-total-fallback",
+	"bedrock-stream-stop-sequence",
+	"bedrock-stream-max-tokens",
+	"bedrock-stream-context-window-exceeded",
+	"bedrock-stream-unknown-stop-reason",
+	"bedrock-stream-non-assistant-message-start",
+	"bedrock-stream-validation-exception",
+	"bedrock-stream-throttling-exception",
+	"bedrock-stream-send-service-unavailable-exception",
+	"bedrock-stream-partial-model-exception",
+	"bedrock-stream-pre-abort",
+	"bedrock-stream-mid-abort",
+	"bedrock-binary-eventstream-exception",
 	"bedrock-tools-choice-none",
 	"bedrock-tools-choice-auto",
 	"bedrock-tools-choice-any",
@@ -143,6 +164,7 @@ interface FixtureModelInput {
 	reasoning: boolean;
 	input: ("text" | "image")[];
 	maxTokens?: number;
+	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
 interface SerializableOptions {
@@ -162,6 +184,8 @@ interface SerializableOptions {
 	onPayload?: "pass-through" | "replace";
 	onResponse?: "capture";
 	requestSurface?: "capture";
+	sendException?: "ServiceUnavailableException";
+	abort?: "pre" | "mid";
 }
 
 type FixtureEnvKey =
@@ -206,8 +230,22 @@ type ConverseStreamFixtureEvent =
 	| { contentBlockDelta: { contentBlockIndex: number; delta: Record<string, unknown> } }
 	| { contentBlockStop: { contentBlockIndex: number } }
 	| { messageStop: { stopReason: string } }
-	| { metadata: { usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } } }
-	| { validationException: { message: string } };
+	| {
+			metadata: {
+				usage: {
+					inputTokens?: number;
+					outputTokens?: number;
+					totalTokens?: number;
+					cacheReadInputTokens?: number;
+					cacheWriteInputTokens?: number;
+				};
+			};
+	  }
+	| { internalServerException: { message: string } }
+	| { modelStreamErrorException: { message: string } }
+	| { validationException: { message: string } }
+	| { throttlingException: { message: string } }
+	| { serviceUnavailableException: { message: string } };
 
 interface SemanticToolCall {
 	id: string;
@@ -484,6 +522,62 @@ const toolUseEvents: ConverseStreamFixtureEvent[] = [
 	{ metadata: { usage: { inputTokens: 21, outputTokens: 9, totalTokens: 30 } } },
 ];
 
+const thinkingEvents: ConverseStreamFixtureEvent[] = [
+	{ messageStart: { role: "assistant" } },
+	{ contentBlockDelta: { contentBlockIndex: 0, delta: { reasoningContent: { text: "First thought. ", signature: "sig-a" } } } },
+	{ contentBlockDelta: { contentBlockIndex: 0, delta: { reasoningContent: { text: "Second thought.", signature: "sig-b" } } } },
+	{ contentBlockStop: { contentBlockIndex: 0 } },
+	{ messageStop: { stopReason: "end_turn" } },
+	{ metadata: { usage: { inputTokens: 9, outputTokens: 4, totalTokens: 13 } } },
+];
+
+const interleavedEvents: ConverseStreamFixtureEvent[] = [
+	{ messageStart: { role: "assistant" } },
+	{ contentBlockDelta: { contentBlockIndex: 2, delta: { text: "Later text." } } },
+	{ contentBlockDelta: { contentBlockIndex: 0, delta: { reasoningContent: { text: "Earlier thought.", signature: "sig-interleaved" } } } },
+	{
+		contentBlockStart: {
+			contentBlockIndex: 1,
+			start: { toolUse: { toolUseId: "tool-interleaved", name: "get_weather" } },
+		},
+	},
+	{ contentBlockDelta: { contentBlockIndex: 1, delta: { toolUse: { input: "{\"city\":\"Rome\"}" } } } },
+	{ contentBlockStop: { contentBlockIndex: 0 } },
+	{ contentBlockStop: { contentBlockIndex: 2 } },
+	{ contentBlockStop: { contentBlockIndex: 1 } },
+	{ messageStop: { stopReason: "tool_use" } },
+	{ metadata: { usage: { inputTokens: 17, outputTokens: 8, totalTokens: 25 } } },
+];
+
+const usageCacheFallbackEvents: ConverseStreamFixtureEvent[] = [
+	{ messageStart: { role: "assistant" } },
+	{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "Usage fallback." } } },
+	{ contentBlockStop: { contentBlockIndex: 0 } },
+	{ messageStop: { stopReason: "end_turn" } },
+	{ metadata: { usage: { inputTokens: 11, outputTokens: 6, cacheReadInputTokens: 3, cacheWriteInputTokens: 2 } } },
+];
+
+function stopReasonEvents(stopReason: string): ConverseStreamFixtureEvent[] {
+	return [
+		{ messageStart: { role: "assistant" } },
+		{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: `Stop reason ${stopReason}.` } } },
+		{ contentBlockStop: { contentBlockIndex: 0 } },
+		{ messageStop: { stopReason } },
+		{ metadata: { usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } } },
+	];
+}
+
+const partialModelExceptionEvents: ConverseStreamFixtureEvent[] = [
+	{ messageStart: { role: "assistant" } },
+	{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "Partial before model error." } } },
+	{ modelStreamErrorException: { message: "stream failed deterministically" } },
+];
+
+const midAbortEvents: ConverseStreamFixtureEvent[] = [
+	{ messageStart: { role: "assistant" } },
+	{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "Partial before abort." } } },
+];
+
 function reasoningScenario(
 	id: ScenarioId,
 	title: string,
@@ -565,6 +659,189 @@ const scenarios: Scenario[] = [
 				onResponse: "capture",
 			},
 			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-thinking-signature",
+		title: "Bedrock streamBedrock preserves thinking deltas and signatures",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: thinkingEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-tool-fragmented-json",
+		title: "Bedrock streamBedrock finalizes fragmented tool JSON",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 80 },
+			localStream: { format: "json-lines", events: toolUseEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-interleaved-block-indexes",
+		title: "Bedrock streamBedrock preserves interleaved Bedrock content block order",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: { ...baseContext, tools: [fixtureTool] },
+			options: { cacheRetention: "none", maxTokens: 80 },
+			localStream: { format: "json-lines", events: interleavedEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-usage-cache-total-fallback",
+		title: "Bedrock streamBedrock maps cache usage and falls back totalTokens to input plus output",
+		input: {
+			mode: "streamBedrock",
+			model: { ...baseModel, cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: usageCacheFallbackEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-stop-sequence",
+		title: "Bedrock streamBedrock maps stop_sequence to stop",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: stopReasonEvents("stop_sequence") },
+		},
+	},
+	{
+		id: "bedrock-stream-max-tokens",
+		title: "Bedrock streamBedrock maps max_tokens to length",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: stopReasonEvents("max_tokens") },
+		},
+	},
+	{
+		id: "bedrock-stream-context-window-exceeded",
+		title: "Bedrock streamBedrock maps model_context_window_exceeded to length",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: stopReasonEvents("model_context_window_exceeded") },
+		},
+	},
+	{
+		id: "bedrock-stream-unknown-stop-reason",
+		title: "Bedrock streamBedrock terminates unknown stop reasons through the error contract",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: stopReasonEvents("unexpected_fixture_reason") },
+		},
+	},
+	{
+		id: "bedrock-stream-non-assistant-message-start",
+		title: "Bedrock streamBedrock returns a stream error for non-assistant messageStart",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: [{ messageStart: { role: "user" } }] },
+		},
+	},
+	{
+		id: "bedrock-stream-validation-exception",
+		title: "Bedrock streamBedrock formats validation stream exceptions",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: [{ validationException: { message: "invalid fixture stream" } }] },
+		},
+	},
+	{
+		id: "bedrock-stream-throttling-exception",
+		title: "Bedrock streamBedrock formats throttling stream exceptions",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: [{ throttlingException: { message: "slow down fixture" } }] },
+		},
+	},
+	{
+		id: "bedrock-stream-send-service-unavailable-exception",
+		title: "Bedrock streamBedrock formats service unavailable send exceptions",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64, sendException: "ServiceUnavailableException" },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-partial-model-exception",
+		title: "Bedrock streamBedrock preserves partial content when model stream exceptions occur",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: { format: "json-lines", events: partialModelExceptionEvents },
+		},
+	},
+	{
+		id: "bedrock-stream-pre-abort",
+		title: "Bedrock streamBedrock finalizes pre-aborted requests through the aborted error contract",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64, abort: "pre" },
+			localStream: { format: "json-lines", events: [] },
+		},
+	},
+	{
+		id: "bedrock-stream-mid-abort",
+		title: "Bedrock streamBedrock preserves partial content for mid-stream aborts",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64, abort: "mid" },
+			localStream: { format: "json-lines", events: midAbortEvents },
+		},
+	},
+	{
+		id: "bedrock-binary-eventstream-exception",
+		title: "Bedrock binary AWS EventStream fixture covers exception frames",
+		input: {
+			mode: "streamBedrock",
+			model: baseModel,
+			context: baseContext,
+			options: { cacheRetention: "none", maxTokens: 64 },
+			localStream: {
+				format: "aws-eventstream",
+				events: [
+					{ messageStart: { role: "assistant" } },
+					{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "Binary partial." } } },
+					{ internalServerException: { message: "binary internal failure" } },
+				],
+			},
 		},
 	},
 	{
@@ -1046,7 +1323,7 @@ const scenarios: Scenario[] = [
 function toRuntimeModel(model: FixtureModelInput): Model<"bedrock-converse-stream"> {
 	return {
 		...model,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200_000,
 		maxTokens: model.maxTokens ?? 4096,
 	};
@@ -1283,15 +1560,45 @@ function eventPayload(event: ConverseStreamFixtureEvent): unknown {
 	return (event as unknown as Record<string, unknown>)[key];
 }
 
+function bedrockExceptionEvent(key: string, payload: { message: string }): Record<string, unknown> | undefined {
+	switch (key) {
+		case "internalServerException":
+			return { [key]: new InternalServerException({ message: payload.message, $metadata: {} }) };
+		case "modelStreamErrorException":
+			return { [key]: new ModelStreamErrorException({ message: payload.message, $metadata: {} }) };
+		case "validationException":
+			return { [key]: new ValidationException({ message: payload.message, $metadata: {} }) };
+		case "throttlingException":
+			return { [key]: new ThrottlingException({ message: payload.message, $metadata: {} }) };
+		case "serviceUnavailableException":
+			return { [key]: new ServiceUnavailableException({ message: payload.message, $metadata: {} }) };
+		default:
+			return undefined;
+	}
+}
+
 function toSdkEvent(event: ConverseStreamFixtureEvent): Record<string, unknown> {
+	const key = eventType(event);
+	const payload = eventPayload(event);
+	if (payload && typeof payload === "object" && "message" in payload) {
+		const exception = bedrockExceptionEvent(key, payload as { message: string });
+		if (exception) return exception;
+	}
 	return event as unknown as Record<string, unknown>;
 }
 
-function buildMockAsyncStream(events: ConverseStreamFixtureEvent[]): AsyncIterable<Record<string, unknown>> {
+function buildAbortableMockAsyncStream(
+	events: ConverseStreamFixtureEvent[],
+	controller: AbortController | undefined,
+	abortMode: SerializableOptions["abort"],
+): AsyncIterable<Record<string, unknown>> {
 	return {
 		async *[Symbol.asyncIterator]() {
 			for (const event of events) {
 				yield toSdkEvent(event);
+			}
+			if (abortMode === "mid") {
+				controller?.abort();
 			}
 		},
 	};
@@ -1320,7 +1627,9 @@ function buildEventStreamBase64(events: ConverseStreamFixtureEvent[]): string {
 	const encoder = new TextEncoder();
 	const frames: number[] = [];
 	for (const event of events) {
-		const headers = eventStreamHeader(":event-type", eventType(event));
+		const type = eventType(event);
+		const isException = type.endsWith("Exception");
+		const headers = eventStreamHeader(isException ? ":exception-type" : ":event-type", type);
 		const payload = [...encoder.encode(JSON.stringify(eventPayload(event)))];
 		const totalLength = 16 + headers.length + payload.length;
 		appendBigEndianU32(frames, totalLength);
@@ -1386,14 +1695,15 @@ function semanticToolCall(toolCall: ToolCall): SemanticToolCall {
 }
 
 function semanticEvent(event: AssistantMessageEvent): SemanticEvent {
+	const terminalMessage = event.type === "error" ? event.error : event.type === "done" ? event.message : undefined;
 	return {
 		type: event.type,
 		...(event.contentIndex !== undefined ? { contentIndex: event.contentIndex } : {}),
 		...(event.delta !== undefined ? { delta: event.delta } : {}),
 		...(event.content !== undefined ? { content: event.content } : {}),
 		...(event.toolCall !== undefined ? { toolCall: semanticToolCall(event.toolCall) } : {}),
-		...(event.message !== undefined ? { message: semanticMessage(event.message) } : {}),
-		...(event.errorMessage !== undefined ? { errorMessage: event.errorMessage } : {}),
+		...(terminalMessage !== undefined ? { message: semanticMessage(terminalMessage) } : {}),
+		...(event.type === "error" && event.error.errorMessage !== undefined ? { errorMessage: event.error.errorMessage } : {}),
 	};
 }
 
@@ -1404,16 +1714,24 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	const originalSend = prototype.send;
 	let capturedPayload: unknown;
 	let capturedResponse: FixtureRecord["expected"]["onResponse"];
+	let activeAbortController: AbortController | undefined;
 
 	prototype.send = async function (command: unknown): Promise<ConverseStreamOutput> {
 		const commandWithInput = command as { input?: unknown };
 		capturedPayload = stableValue(commandWithInput.input);
+		if (scenario.input.options.sendException === "ServiceUnavailableException") {
+			throw new ServiceUnavailableException({ message: "service unavailable fixture", $metadata: {} });
+		}
 		return {
 			$metadata: {
 				httpStatusCode: 200,
 				requestId: `fixture-request-${scenario.id}`,
 			},
-			stream: buildMockAsyncStream(scenario.input.localStream.events) as ConverseStreamOutput["stream"],
+			stream: buildAbortableMockAsyncStream(
+				scenario.input.localStream.events,
+				activeAbortController,
+				scenario.input.options.abort,
+			) as ConverseStreamOutput["stream"],
 		};
 	};
 
@@ -1422,6 +1740,15 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 			const runtimeModel = toRuntimeModel(scenario.input.model);
 			const runtimeContext = toRuntimeContext(scenario.input.context);
 			const runtimeOptions = toRuntimeOptions(scenario.input.options);
+			const abortController =
+				scenario.input.options.abort === "pre" || scenario.input.options.abort === "mid" ? new AbortController() : undefined;
+			activeAbortController = abortController;
+			if (scenario.input.options.abort === "pre") {
+				abortController?.abort();
+			}
+			if (abortController) {
+				runtimeOptions.signal = abortController.signal;
+			}
 			if (scenario.input.options.onPayload === "pass-through") {
 				runtimeOptions.onPayload = () => undefined;
 			} else if (scenario.input.options.onPayload === "replace") {
@@ -1450,8 +1777,8 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 				events.push(semanticEvent(event));
 			}
 			const terminalEvent = events.at(-1);
-			if (terminalEvent?.type !== "done") {
-				throw new Error(`Scenario ${scenario.id} did not complete with a done event`);
+			if (terminalEvent?.type !== "done" && terminalEvent?.type !== "error") {
+				throw new Error(`Scenario ${scenario.id} did not complete with a terminal event`);
 			}
 			if (capturedPayload === undefined) {
 				throw new Error(`Scenario ${scenario.id} did not capture a Bedrock Converse command input`);
@@ -1549,7 +1876,7 @@ function validateStreamEvents(record: FixtureRecord): void {
 	const activeToolBlocks = new Set<number>();
 	for (const [index, event] of record.expected.typeScriptStream.entries()) {
 		if (event.type === "start") sawStart = true;
-		if (!sawStart && event.type !== "start") {
+		if (!sawStart && event.type !== "start" && event.type !== "error") {
 			throw new Error(`HARNESS_STREAM_ORDER: ${record.id} event ${index} appears before start`);
 		}
 		if (event.type === "toolcall_start") {
@@ -1564,7 +1891,7 @@ function validateStreamEvents(record: FixtureRecord): void {
 			}
 			if (event.type === "toolcall_end") activeToolBlocks.delete(event.contentIndex);
 		}
-		if (event.type === "done" || event.type === "error_event") {
+		if (event.type === "done" || event.type === "error") {
 			terminalCount++;
 			if (!event.message) {
 				throw new Error(`HARNESS_STREAM_TERMINAL: ${record.id} terminal event missing message`);
