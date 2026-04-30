@@ -1,0 +1,219 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {
+        "allow_fallbacks": false,
+        "data_collection": "deny",
+        "enforce_distillable_text": true,
+        "ignore": [
+          "Other"
+        ],
+        "max_price": {
+          "audio": "0.02",
+          "completion": "1.25",
+          "image": 0.01,
+          "prompt": 0.5,
+          "request": 0
+        },
+        "only": [
+          "Anthropic",
+          "OpenAI"
+        ],
+        "order": [
+          "Anthropic",
+          "OpenAI",
+          "Google"
+        ],
+        "preferred_max_latency": {
+          "p50": 1,
+          "p75": 2,
+          "p90": 3,
+          "p99": 4
+        },
+        "preferred_min_throughput": 12,
+        "quantizations": [
+          "fp16",
+          "bf16",
+          "int8"
+        ],
+        "require_parameters": true,
+        "sort": {
+          "by": "latency",
+          "partition": null
+        },
+        "zdr": true
+      },
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openrouter",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": "You are the deterministic OpenAI Chat fixture assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Return a concise fixture response.",
+            "role": "user"
+          }
+        ],
+        "model": "openrouter-routing-fixture",
+        "provider": {
+          "allow_fallbacks": false,
+          "data_collection": "deny",
+          "enforce_distillable_text": true,
+          "ignore": [
+            "Other"
+          ],
+          "max_price": {
+            "audio": "0.02",
+            "completion": "1.25",
+            "image": 0.01,
+            "prompt": 0.5,
+            "request": 0
+          },
+          "only": [
+            "Anthropic",
+            "OpenAI"
+          ],
+          "order": [
+            "Anthropic",
+            "OpenAI",
+            "Google"
+          ],
+          "preferred_max_latency": {
+            "p50": 1,
+            "p75": 2,
+            "p90": 3,
+            "p99": 4
+          },
+          "preferred_min_throughput": 12,
+          "quantizations": [
+            "fp16",
+            "bf16",
+            "int8"
+          ],
+          "require_parameters": true,
+          "sort": {
+            "by": "latency",
+            "partition": null
+          },
+          "zdr": true
+        },
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+  },
+  "id": "openrouter-routing-full-object",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic OpenAI Chat fixture assistant."
+    },
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "compat": {
+        "openRouterRouting": {
+          "allow_fallbacks": false,
+          "data_collection": "deny",
+          "enforce_distillable_text": true,
+          "ignore": [
+            "Other"
+          ],
+          "max_price": {
+            "audio": "0.02",
+            "completion": "1.25",
+            "image": 0.01,
+            "prompt": 0.5,
+            "request": 0
+          },
+          "only": [
+            "Anthropic",
+            "OpenAI"
+          ],
+          "order": [
+            "Anthropic",
+            "OpenAI",
+            "Google"
+          ],
+          "preferred_max_latency": {
+            "p50": 1,
+            "p75": 2,
+            "p90": 3,
+            "p99": 4
+          },
+          "preferred_min_throughput": 12,
+          "quantizations": [
+            "fp16",
+            "bf16",
+            "int8"
+          ],
+          "require_parameters": true,
+          "sort": {
+            "by": "latency",
+            "partition": null
+          },
+          "zdr": true
+        }
+      },
+      "id": "openrouter-routing-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "OpenRouter Routing Fixture",
+      "provider": "openrouter",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "cacheRetention": "none"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "OpenRouter URL serializes the full explicit provider routing object"
+}

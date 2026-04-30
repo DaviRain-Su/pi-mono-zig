@@ -307,6 +307,7 @@ fn parseCacheRetention(value: ?[]const u8) types.CacheRetention {
     const retention = value orelse return .short;
     if (std.mem.eql(u8, retention, "none")) return .none;
     if (std.mem.eql(u8, retention, "long")) return .long;
+    if (std.mem.eql(u8, retention, "env-long")) return .long;
     return .short;
 }
 

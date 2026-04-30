@@ -1025,6 +1025,11 @@ pub fn buildRequestPayload(
         try payload.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = std.json.Array.init(allocator) });
     }
 
+    if (try buildCompatCacheControl(allocator, compat, if (options) |opts| opts.cache_retention else .short)) |cache_control| {
+        defer freeJsonValue(allocator, cache_control);
+        try applyAnthropicCacheControl(allocator, &payload, cache_control);
+    }
+
     if (model.reasoning) {
         const effort = if (options) |opts| opts.openai_reasoning_effort else null;
         if (std.mem.eql(u8, compat.thinking_format, "zai") or std.mem.eql(u8, compat.thinking_format, "qwen")) {
@@ -1082,6 +1087,138 @@ pub fn buildRequestPayload(
     }
 
     return std.json.Value{ .object = payload };
+}
+
+fn buildCompatCacheControl(
+    allocator: std.mem.Allocator,
+    compat: OpenAICompat,
+    cache_retention: types.CacheRetention,
+) !?std.json.Value {
+    const format = compat.cache_control_format orelse return null;
+    if (!std.mem.eql(u8, format, "anthropic") or cache_retention == .none) return null;
+
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "ephemeral") });
+    if (cache_retention == .long and compat.supports_long_cache_retention) {
+        try object.put(allocator, try allocator.dupe(u8, "ttl"), .{ .string = try allocator.dupe(u8, "1h") });
+    }
+    return .{ .object = object };
+}
+
+fn applyAnthropicCacheControl(
+    allocator: std.mem.Allocator,
+    payload: *std.json.ObjectMap,
+    cache_control: std.json.Value,
+) !void {
+    if (payload.getPtr("messages")) |messages_value| {
+        if (messages_value.* == .array) {
+            try addCacheControlToInstructionMessage(allocator, &messages_value.array, cache_control);
+            try addCacheControlToLastConversationMessage(allocator, &messages_value.array, cache_control);
+        }
+    }
+
+    if (payload.getPtr("tools")) |tools_value| {
+        if (tools_value.* == .array and tools_value.array.items.len > 0) {
+            const last_tool = &tools_value.array.items[tools_value.array.items.len - 1];
+            if (last_tool.* == .object) {
+                try putJsonObjectFieldReplacing(allocator, &last_tool.object, "cache_control", try cloneJsonValue(allocator, cache_control));
+            }
+        }
+    }
+}
+
+fn addCacheControlToInstructionMessage(
+    allocator: std.mem.Allocator,
+    messages: *std.json.Array,
+    cache_control: std.json.Value,
+) !void {
+    for (messages.items) |*message| {
+        if (message.* != .object) continue;
+        const role = objectStringField(message.object, "role") orelse continue;
+        if (std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "developer")) {
+            _ = try addCacheControlToTextContent(allocator, &message.object, cache_control);
+            return;
+        }
+    }
+}
+
+fn addCacheControlToLastConversationMessage(
+    allocator: std.mem.Allocator,
+    messages: *std.json.Array,
+    cache_control: std.json.Value,
+) !void {
+    var index = messages.items.len;
+    while (index > 0) {
+        index -= 1;
+        const message = &messages.items[index];
+        if (message.* != .object) continue;
+        const role = objectStringField(message.object, "role") orelse continue;
+        if (std.mem.eql(u8, role, "user") or std.mem.eql(u8, role, "assistant")) {
+            if (try addCacheControlToTextContent(allocator, &message.object, cache_control)) return;
+        }
+    }
+}
+
+fn addCacheControlToTextContent(
+    allocator: std.mem.Allocator,
+    message: *std.json.ObjectMap,
+    cache_control: std.json.Value,
+) !bool {
+    const content = message.getPtr("content") orelse return false;
+    switch (content.*) {
+        .string => |text| {
+            if (text.len == 0) return false;
+            var parts = std.json.Array.init(allocator);
+            errdefer parts.deinit();
+
+            var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer part.deinit(allocator);
+            try part.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
+            try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+            try part.put(allocator, try allocator.dupe(u8, "cache_control"), try cloneJsonValue(allocator, cache_control));
+            try parts.append(.{ .object = part });
+
+            freeJsonValue(allocator, content.*);
+            content.* = .{ .array = parts };
+            return true;
+        },
+        .array => |*parts| {
+            var index = parts.items.len;
+            while (index > 0) {
+                index -= 1;
+                const part = &parts.items[index];
+                if (part.* != .object) continue;
+                const part_type = objectStringField(part.object, "type") orelse continue;
+                if (std.mem.eql(u8, part_type, "text")) {
+                    try putJsonObjectFieldReplacing(allocator, &part.object, "cache_control", try cloneJsonValue(allocator, cache_control));
+                    return true;
+                }
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn objectStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+fn putJsonObjectFieldReplacing(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: std.json.Value,
+) !void {
+    if (object.getPtr(key)) |existing| {
+        freeJsonValue(allocator, existing.*);
+        existing.* = value;
+    } else {
+        try object.put(allocator, try allocator.dupe(u8, key), value);
+    }
 }
 
 fn hasToolHistory(messages: []const types.Message) bool {

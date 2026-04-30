@@ -1,6 +1,6 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 41,
+  "fixtureCount": 61,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
@@ -44,7 +44,27 @@
     "nonstandard-explicit-store-usage-override",
     "max-tokens-explicit-compat-field",
     "tool-compat-name-and-no-strict",
-    "tool-compat-name-required-but-missing"
+    "tool-compat-name-required-but-missing",
+    "openrouter-routing-full-object",
+    "openrouter-routing-empty-object",
+    "openrouter-routing-non-openrouter-omitted",
+    "vercel-gateway-routing-only",
+    "vercel-gateway-routing-order",
+    "vercel-gateway-routing-combined",
+    "vercel-gateway-routing-empty",
+    "vercel-gateway-routing-non-gateway-omitted",
+    "prompt-cache-direct-openai-long",
+    "prompt-cache-direct-openai-none",
+    "prompt-cache-proxy-long-supported",
+    "prompt-cache-proxy-long-unsupported",
+    "prompt-cache-long-missing-session",
+    "prompt-cache-env-long-retention",
+    "session-affinity-option-overrides",
+    "anthropic-cache-control-short-markers",
+    "anthropic-cache-control-long-ttl",
+    "anthropic-cache-control-long-unsupported",
+    "anthropic-cache-control-no-text-breakpoints",
+    "anthropic-cache-control-cache-none"
   ],
   "schemaVersion": 1,
   "sourceCitations": [
