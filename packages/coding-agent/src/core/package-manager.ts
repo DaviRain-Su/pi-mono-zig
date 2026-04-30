@@ -27,7 +27,7 @@ import type { Readable } from "node:stream";
 import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
-import { CONFIG_DIR_NAME, isBunRuntime } from "../config.js";
+import { CONFIG_DIR_NAME } from "../config.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import { isStdoutTakenOver } from "./output-guard.js";
@@ -1840,8 +1840,9 @@ export class DefaultPackageManager implements PackageManager {
 		if (this.globalNpmRoot && this.globalNpmRootCommandKey === commandKey) {
 			return this.globalNpmRoot;
 		}
-		if (isBunRuntime) {
-			const binDir = this.runCommandSync("bun", ["pm", "bin", "-g"]).trim();
+		const isBunPackageManager = npmCommand.command === "bun";
+		if (isBunPackageManager) {
+			const binDir = this.runNpmCommandSync(["pm", "bin", "-g"]).trim();
 			this.globalNpmRoot = join(dirname(binDir), "install", "global", "node_modules");
 		} else {
 			this.globalNpmRoot = this.runNpmCommandSync(["root", "-g"]).trim();

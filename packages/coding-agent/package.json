@@ -67,7 +67,7 @@
 		}
 	},
 	"optionalDependencies": {
-		"@mariozechner/clipboard": "^0.3.3"
+		"@mariozechner/clipboard": "^0.3.5"
 	},
 	"devDependencies": {
 		"@types/diff": "^7.0.2",
