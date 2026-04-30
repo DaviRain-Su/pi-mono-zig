@@ -7,35 +7,15 @@
         "authorization": "<redacted-present>",
         "content-type": "application/json",
         "copilot-integration-id": "vscode-chat",
-        "copilot-vision-request": "true",
         "editor-plugin-version": "copilot-chat/0.35.0",
         "editor-version": "vscode/1.107.0",
         "openai-intent": "conversation-edits",
-        "session_id": "fixture-copilot-session",
         "user-agent": "GitHubCopilotChat/0.35.0",
-        "x-client-request-id": "fixture-copilot-session",
-        "x-fixture-option-header": "option-copilot",
         "x-initiator": "user"
       },
       "jsonPayload": {
-        "input": [
-          {
-            "content": [
-              {
-                "text": "Describe this fixture image.",
-                "type": "input_text"
-              },
-              {
-                "detail": "auto",
-                "image_url": "data:image/png;base64,iVBORw0KGgo=",
-                "type": "input_image"
-              }
-            ],
-            "role": "user"
-          }
-        ],
-        "model": "gpt-4.1-copilot-fixture",
-        "prompt_cache_key": "fixture-copilot-session",
+        "input": [],
+        "model": "gpt-4.1-copilot-empty-fixture",
         "store": false,
         "stream": true
       },
@@ -48,7 +28,7 @@
       "transportMetadata": {
         "mockedResponseHeaders": {
           "content-type": "text/event-stream",
-          "x-fixture-response": "copilot-responses-dynamic-headers"
+          "x-fixture-response": "copilot-responses-empty-initiator-user"
         },
         "mockedStatus": 200,
         "mode": "sse",
@@ -58,25 +38,10 @@
       "url": "https://api.individual.githubcopilot.com/responses"
     }
   },
-  "id": "copilot-responses-dynamic-headers",
+  "id": "copilot-responses-empty-initiator-user",
   "input": {
     "context": {
-      "messages": [
-        {
-          "content": [
-            {
-              "text": "Describe this fixture image.",
-              "type": "text"
-            },
-            {
-              "data": "iVBORw0KGgo=",
-              "mimeType": "image/png",
-              "type": "image"
-            }
-          ],
-          "role": "user"
-        }
-      ]
+      "messages": []
     },
     "model": {
       "api": "openai-responses",
@@ -87,7 +52,7 @@
         "Editor-Version": "vscode/1.107.0",
         "User-Agent": "GitHubCopilotChat/0.35.0"
       },
-      "id": "gpt-4.1-copilot-fixture",
+      "id": "gpt-4.1-copilot-empty-fixture",
       "input": [
         "text",
         "image"
@@ -97,12 +62,7 @@
       "reasoning": true
     },
     "options": {
-      "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "short",
-      "headers": {
-        "x-fixture-option-header": "option-copilot"
-      },
-      "sessionId": "fixture-copilot-session"
+      "apiKeyMode": "fixture-placeholder"
     }
   },
   "metadata": {
@@ -120,5 +80,5 @@
   },
   "providerFamily": "github-copilot",
   "schemaVersion": 1,
-  "title": "GitHub Copilot Responses captures static model headers, dynamic headers, and option override precedence"
+  "title": "GitHub Copilot Responses infers user initiator for empty conversations and omits vision and default reasoning"
 }
