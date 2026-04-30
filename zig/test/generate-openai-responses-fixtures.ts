@@ -1547,9 +1547,50 @@ function validateFixture(record: FixtureRecord): void {
 	if (!request.headers || !request.jsonPayload || !request.requestOptions || !request.transportMetadata) {
 		throw new Error(`Fixture ${record.id} must capture headers, JSON payload, request options, and transport metadata`);
 	}
+	assertAllowedKeys(`Fixture ${record.id}.expected`, record.expected, ["onPayload", "typeScriptRequest"]);
+	assertAllowedKeys(`Fixture ${record.id}.expected.typeScriptRequest`, request, [
+		"baseUrl",
+		"headers",
+		"jsonPayload",
+		"method",
+		"path",
+		"query",
+		"requestOptions",
+		"transportMetadata",
+		"url",
+	]);
+	assertAllowedKeys(`Fixture ${record.id}.expected.typeScriptRequest.requestOptions`, request.requestOptions, [
+		"maxRetries",
+		"signal",
+		"timeoutMs",
+	]);
+	assertAllowedKeys(`Fixture ${record.id}.expected.typeScriptRequest.transportMetadata`, request.transportMetadata, [
+		"mockedResponseHeaders",
+		"mockedStatus",
+		"mode",
+		"providerFamily",
+		"requestBoundary",
+	]);
+	if (record.expected.onPayload) {
+		assertAllowedKeys(`Fixture ${record.id}.expected.onPayload`, record.expected.onPayload, ["observedPayload", "replacementPayload"]);
+	}
+	assertAllowedKeys(`Fixture ${record.id}.metadata`, record.metadata, [
+		"captureBoundary",
+		"captureMethod",
+		"diffOutputBoundBytes",
+		"network",
+		"sourceCitations",
+	]);
 	const serialized = stableStringify(record);
 	if (Buffer.byteLength(serialized) > maxFixtureBytes) throw new Error(`Fixture ${record.id} exceeds ${maxFixtureBytes} bytes`);
 	validateNoVolatileStrings(record, record.id);
+}
+
+function assertAllowedKeys(path: string, value: object, allowedKeys: readonly string[]): void {
+	const allowed = new Set(allowedKeys);
+	for (const key of Object.keys(value)) {
+		if (!allowed.has(key)) throw new Error(`${path} contains unknown schema key ${key}`);
+	}
 }
 
 function validateRecords(records: FixtureRecord[]): void {
@@ -1572,6 +1613,20 @@ function runSchemaNegativeSelfTests(records: FixtureRecord[]): void {
 		["missing/unknown schema version", [{ ...first, schemaVersion: 999 as typeof schemaVersion }]],
 		["duplicate scenario id", [first, { ...records[1], id: first.id }]],
 		["missing input section", [{ ...first, input: undefined as unknown as ScenarioInput }]],
+		["missing expected section", [{ ...first, expected: undefined as unknown as FixtureRecord["expected"] }]],
+		["unknown top-level field", [{ ...first, unexpectedRootField: true } as unknown as FixtureRecord]],
+		[
+			"unknown request field",
+			[
+				{
+					...first,
+					expected: {
+						...first.expected,
+						typeScriptRequest: { ...first.expected.typeScriptRequest, sdkDump: "not allowed" } as unknown as CapturedRequest,
+					},
+				},
+			],
+		],
 		["volatile field", [{ ...first, metadata: { ...first.metadata, pid: 123 } as unknown as FixtureRecord["metadata"] }]],
 		["secret-like value", [{ ...first, title: "contains sk-secret-for-negative-test" }]],
 		["oversized value", [{ ...first, title: "x".repeat(maxStringLength + 1) }]],
