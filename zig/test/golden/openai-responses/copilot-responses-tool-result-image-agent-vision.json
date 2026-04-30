@@ -11,18 +11,16 @@
         "editor-plugin-version": "copilot-chat/0.35.0",
         "editor-version": "vscode/1.107.0",
         "openai-intent": "conversation-edits",
-        "session_id": "fixture-copilot-session",
         "user-agent": "GitHubCopilotChat/0.35.0",
-        "x-client-request-id": "fixture-copilot-session",
-        "x-fixture-option-header": "option-copilot",
-        "x-initiator": "user"
+        "x-initiator": "agent"
       },
       "jsonPayload": {
         "input": [
           {
-            "content": [
+            "call_id": "call_copilot_fixture",
+            "output": [
               {
-                "text": "Describe this fixture image.",
+                "text": "Tool result with image.",
                 "type": "input_text"
               },
               {
@@ -31,11 +29,10 @@
                 "type": "input_image"
               }
             ],
-            "role": "user"
+            "type": "function_call_output"
           }
         ],
-        "model": "gpt-4.1-copilot-fixture",
-        "prompt_cache_key": "fixture-copilot-session",
+        "model": "gpt-4.1-copilot-tool-image-fixture",
         "store": false,
         "stream": true
       },
@@ -48,7 +45,7 @@
       "transportMetadata": {
         "mockedResponseHeaders": {
           "content-type": "text/event-stream",
-          "x-fixture-response": "copilot-responses-dynamic-headers"
+          "x-fixture-response": "copilot-responses-tool-result-image-agent-vision"
         },
         "mockedStatus": 200,
         "mode": "sse",
@@ -58,14 +55,14 @@
       "url": "https://api.individual.githubcopilot.com/responses"
     }
   },
-  "id": "copilot-responses-dynamic-headers",
+  "id": "copilot-responses-tool-result-image-agent-vision",
   "input": {
     "context": {
       "messages": [
         {
           "content": [
             {
-              "text": "Describe this fixture image.",
+              "text": "Tool result with image.",
               "type": "text"
             },
             {
@@ -74,7 +71,10 @@
               "type": "image"
             }
           ],
-          "role": "user"
+          "isError": false,
+          "role": "toolResult",
+          "toolCallId": "call_copilot_fixture",
+          "toolName": "fixture_tool"
         }
       ]
     },
@@ -87,7 +87,7 @@
         "Editor-Version": "vscode/1.107.0",
         "User-Agent": "GitHubCopilotChat/0.35.0"
       },
-      "id": "gpt-4.1-copilot-fixture",
+      "id": "gpt-4.1-copilot-tool-image-fixture",
       "input": [
         "text",
         "image"
@@ -97,12 +97,7 @@
       "reasoning": true
     },
     "options": {
-      "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "short",
-      "headers": {
-        "x-fixture-option-header": "option-copilot"
-      },
-      "sessionId": "fixture-copilot-session"
+      "apiKeyMode": "fixture-placeholder"
     }
   },
   "metadata": {
@@ -120,5 +115,5 @@
   },
   "providerFamily": "github-copilot",
   "schemaVersion": 1,
-  "title": "GitHub Copilot Responses captures static model headers, dynamic headers, and option override precedence"
+  "title": "GitHub Copilot Responses infers agent initiator and vision header from final tool-result image"
 }

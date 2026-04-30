@@ -196,6 +196,24 @@ function buildCodexModel(overrides: Partial<FixtureModelInput> = {}): FixtureMod
 	};
 }
 
+function buildCopilotModel(overrides: Partial<FixtureModelInput> = {}): FixtureModelInput {
+	return buildOpenAIModel({
+		id: "gpt-4.1-copilot-fixture",
+		name: "GitHub Copilot Responses Fixture",
+		provider: "github-copilot",
+		baseUrl: "https://api.individual.githubcopilot.com",
+		reasoning: true,
+		input: ["text", "image"],
+		headers: {
+			"User-Agent": "GitHubCopilotChat/0.35.0",
+			"Editor-Version": "vscode/1.107.0",
+			"Editor-Plugin-Version": "copilot-chat/0.35.0",
+			"Copilot-Integration-Id": "vscode-chat",
+		},
+		...overrides,
+	});
+}
+
 const scenarios: Scenario[] = [
 	{
 		id: "openai-responses-basic-request",
@@ -221,19 +239,7 @@ const scenarios: Scenario[] = [
 		title: "GitHub Copilot Responses captures static model headers, dynamic headers, and option override precedence",
 		providerFamily: "github-copilot",
 		input: {
-			model: buildOpenAIModel({
-				id: "gpt-4.1-copilot-fixture",
-				name: "GitHub Copilot Responses Fixture",
-				provider: "github-copilot",
-				reasoning: true,
-				input: ["text", "image"],
-				headers: {
-					"User-Agent": "GitHubCopilotChat/0.35.0",
-					"Editor-Version": "vscode/1.107.0",
-					"Editor-Plugin-Version": "copilot-chat/0.35.0",
-					"Copilot-Integration-Id": "vscode-chat",
-				},
-			}),
+			model: buildCopilotModel(),
 			context: {
 				messages: [
 					{
@@ -251,6 +257,100 @@ const scenarios: Scenario[] = [
 				headers: { "x-fixture-option-header": "option-copilot" },
 				sessionId: "fixture-copilot-session",
 			},
+		},
+	},
+	{
+		id: "copilot-responses-empty-initiator-user",
+		title: "GitHub Copilot Responses infers user initiator for empty conversations and omits vision and default reasoning",
+		providerFamily: "github-copilot",
+		input: {
+			model: buildCopilotModel({ id: "gpt-4.1-copilot-empty-fixture" }),
+			context: { messages: [] },
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "copilot-responses-assistant-final-agent-initiator",
+		title: "GitHub Copilot Responses infers agent initiator from final assistant message without vision input",
+		providerFamily: "github-copilot",
+		input: {
+			model: buildCopilotModel({ id: "gpt-4.1-copilot-agent-final-fixture" }),
+			context: {
+				messages: [
+					{ role: "user", content: "Start a Copilot fixture turn." },
+					{
+						role: "assistant",
+						api: "openai-responses",
+						provider: "github-copilot",
+						model: "gpt-4.1-copilot-agent-final-fixture",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "stop",
+						content: [{ type: "text", text: "Assistant final fixture text." }],
+					},
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "copilot-responses-tool-result-image-agent-vision",
+		title: "GitHub Copilot Responses infers agent initiator and vision header from final tool-result image",
+		providerFamily: "github-copilot",
+		input: {
+			model: buildCopilotModel({ id: "gpt-4.1-copilot-tool-image-fixture" }),
+			context: {
+				messages: [
+					{
+						role: "toolResult",
+						toolCallId: "call_copilot_fixture",
+						toolName: "fixture_tool",
+						content: [{ type: "text", text: "Tool result with image." }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+						isError: false,
+					},
+				],
+			},
+			options: { apiKeyMode: "fixture-placeholder" },
+		},
+	},
+	{
+		id: "copilot-responses-option-header-overrides",
+		title: "GitHub Copilot Responses explicit headers override static, dynamic, vision, and generated session headers",
+		providerFamily: "github-copilot",
+		input: {
+			model: buildCopilotModel({ id: "gpt-4.1-copilot-header-override-fixture" }),
+			context: {
+				messages: [
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: "Trigger all generated Copilot headers." },
+							{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+						],
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+				headers: {
+					"User-Agent": "GitHubCopilotChat/override",
+					"X-Initiator": "option-initiator",
+					"Openai-Intent": "option-intent",
+					"Copilot-Vision-Request": "false",
+					"x-client-request-id": "option-request",
+					session_id: "option-session",
+				},
+				sessionId: "fixture-copilot-session",
+			},
+		},
+	},
+	{
+		id: "copilot-responses-explicit-reasoning-options",
+		title: "GitHub Copilot Responses emits reasoning only when explicit effort or summary options are requested",
+		providerFamily: "github-copilot",
+		input: {
+			model: buildCopilotModel({ id: "gpt-4.1-copilot-explicit-reasoning-fixture" }),
+			context: { messages: [{ role: "user", content: "Use explicit reasoning options." }] },
+			options: { apiKeyMode: "fixture-placeholder", reasoningSummary: "concise" },
 		},
 	},
 	{

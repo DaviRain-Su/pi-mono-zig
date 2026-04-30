@@ -127,7 +127,7 @@ pub const OpenAIResponsesProvider = struct {
         var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
         resolved_options.api_key = api_key.?;
 
-        var headers = try buildRequestHeaders(allocator, model, resolved_options);
+        var headers = try buildRequestHeaders(allocator, model, context, resolved_options);
         defer deinitOwnedHeaders(allocator, &headers);
 
         var client = try http_client.HttpClient.init(allocator, io);
@@ -271,6 +271,7 @@ pub fn buildRequestPayload(
 fn buildRequestHeaders(
     allocator: std.mem.Allocator,
     model: types.Model,
+    context: types.Context,
     options: types.StreamOptions,
 ) !std.StringHashMap([]const u8) {
     const api_key = options.api_key orelse return error.MissingApiKey;
@@ -287,6 +288,14 @@ fn buildRequestHeaders(
     try putOwnedHeader(allocator, &headers, "Authorization", authorization);
     try mergeHeaders(allocator, &headers, model.headers);
 
+    if (std.mem.eql(u8, model.provider, "github-copilot")) {
+        try putOwnedHeader(allocator, &headers, "X-Initiator", inferCopilotInitiator(context));
+        try putOwnedHeader(allocator, &headers, "Openai-Intent", "conversation-edits");
+        if (hasCopilotVisionInput(context)) {
+            try putOwnedHeader(allocator, &headers, "Copilot-Vision-Request", "true");
+        }
+    }
+
     if (options.session_id) |session_id| {
         if (cache_retention != .none) {
             try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
@@ -298,6 +307,31 @@ fn buildRequestHeaders(
     try mergeHeaders(allocator, &headers, options.headers);
 
     return headers;
+}
+
+fn inferCopilotInitiator(context: types.Context) []const u8 {
+    if (context.messages.len == 0) return "user";
+    return switch (context.messages[context.messages.len - 1]) {
+        .user => "user",
+        .assistant, .tool_result => "agent",
+    };
+}
+
+fn hasCopilotVisionInput(context: types.Context) bool {
+    for (context.messages) |message| {
+        const content = switch (message) {
+            .user => |user| user.content,
+            .tool_result => |tool_result| tool_result.content,
+            .assistant => continue,
+        };
+        for (content) |block| {
+            switch (block) {
+                .image => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 fn parseSseStreamLines(
@@ -1540,6 +1574,20 @@ fn putOwnedHeader(
     name: []const u8,
     value: []const u8,
 ) !void {
+    var existing_name: ?[]const u8 = null;
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
+            existing_name = entry.key_ptr.*;
+            break;
+        }
+    }
+    if (existing_name) |key| {
+        if (headers.fetchRemove(key)) |removed| {
+            allocator.free(removed.key);
+            allocator.free(removed.value);
+        }
+    }
     try headers.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
 }
 
@@ -2537,7 +2585,7 @@ test "buildRequestHeaders omits session_id when compat disables it" {
         .compat = compat_value,
     };
 
-    var headers = try buildRequestHeaders(allocator, model, .{
+    var headers = try buildRequestHeaders(allocator, model, .{ .messages = &[_]types.Message{} }, .{
         .api_key = "test-key",
         .session_id = "sess-1",
         .cache_retention = .short,
@@ -2547,6 +2595,106 @@ test "buildRequestHeaders omits session_id when compat disables it" {
     try std.testing.expectEqualStrings("Bearer test-key", headers.get("Authorization").?);
     try std.testing.expectEqualStrings("sess-1", headers.get("x-client-request-id").?);
     try std.testing.expect(headers.get("session_id") == null);
+}
+
+test "buildRequestHeaders applies Copilot dynamic headers before session and option headers" {
+    const allocator = std.testing.allocator;
+
+    var model_headers = std.StringHashMap([]const u8).init(allocator);
+    defer model_headers.deinit();
+    try model_headers.put("User-Agent", "GitHubCopilotChat/0.35.0");
+    try model_headers.put("Editor-Version", "vscode/1.107.0");
+    try model_headers.put("Editor-Plugin-Version", "copilot-chat/0.35.0");
+    try model_headers.put("Copilot-Integration-Id", "vscode-chat");
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "github-copilot",
+        .base_url = "https://api.individual.githubcopilot.com",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 400000,
+        .max_tokens = 128000,
+        .headers = model_headers,
+    };
+
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{
+                    .{ .text = .{ .text = "Describe this image." } },
+                    .{ .image = .{ .data = "iVBORw0KGgo=", .mime_type = "image/png" } },
+                },
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var option_headers = std.StringHashMap([]const u8).init(allocator);
+    defer option_headers.deinit();
+    try option_headers.put("user-agent", "GitHubCopilotChat/override");
+    try option_headers.put("x-initiator", "option-initiator");
+    try option_headers.put("Openai-Intent", "option-intent");
+    try option_headers.put("Copilot-Vision-Request", "false");
+    try option_headers.put("x-client-request-id", "option-request");
+
+    var headers = try buildRequestHeaders(allocator, model, context, .{
+        .api_key = "test-key",
+        .session_id = "sess-1",
+        .cache_retention = .short,
+        .headers = option_headers,
+    });
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    try std.testing.expectEqualStrings("GitHubCopilotChat/override", headers.get("user-agent").?);
+    try std.testing.expect(headers.get("User-Agent") == null);
+    try std.testing.expectEqualStrings("vscode/1.107.0", headers.get("Editor-Version").?);
+    try std.testing.expectEqualStrings("copilot-chat/0.35.0", headers.get("Editor-Plugin-Version").?);
+    try std.testing.expectEqualStrings("vscode-chat", headers.get("Copilot-Integration-Id").?);
+    try std.testing.expectEqualStrings("option-initiator", headers.get("x-initiator").?);
+    try std.testing.expect(headers.get("X-Initiator") == null);
+    try std.testing.expectEqualStrings("option-intent", headers.get("Openai-Intent").?);
+    try std.testing.expectEqualStrings("false", headers.get("Copilot-Vision-Request").?);
+    try std.testing.expectEqualStrings("option-request", headers.get("x-client-request-id").?);
+}
+
+test "Copilot header inference follows final role and user or tool-result images only" {
+    const user_final = types.Context{
+        .messages = &[_]types.Message{
+            .{ .assistant = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Earlier assistant." } }},
+                .api = "openai-responses",
+                .provider = "github-copilot",
+                .model = "gpt-5-mini",
+                .usage = types.Usage.init(),
+                .stop_reason = .stop,
+                .timestamp = 1,
+            } },
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Final user." } }},
+                .timestamp = 2,
+            } },
+        },
+    };
+    try std.testing.expectEqualStrings("user", inferCopilotInitiator(.{ .messages = &[_]types.Message{} }));
+    try std.testing.expectEqualStrings("user", inferCopilotInitiator(user_final));
+    try std.testing.expect(!hasCopilotVisionInput(user_final));
+
+    const tool_result_final = types.Context{
+        .messages = &[_]types.Message{
+            .{ .tool_result = .{
+                .tool_call_id = "call_fixture",
+                .tool_name = "fixture_tool",
+                .content = &[_]types.ContentBlock{.{ .image = .{ .data = "iVBORw0KGgo=", .mime_type = "image/png" } }},
+                .is_error = false,
+                .timestamp = 3,
+            } },
+        },
+    };
+    try std.testing.expectEqualStrings("agent", inferCopilotInitiator(tool_result_final));
+    try std.testing.expect(hasCopilotVisionInput(tool_result_final));
 }
 
 test "parseSseStreamLines finalizes partial text before response.failed terminal error" {

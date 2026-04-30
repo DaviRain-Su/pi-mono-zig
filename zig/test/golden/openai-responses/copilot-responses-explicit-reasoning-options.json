@@ -7,35 +7,32 @@
         "authorization": "<redacted-present>",
         "content-type": "application/json",
         "copilot-integration-id": "vscode-chat",
-        "copilot-vision-request": "true",
         "editor-plugin-version": "copilot-chat/0.35.0",
         "editor-version": "vscode/1.107.0",
         "openai-intent": "conversation-edits",
-        "session_id": "fixture-copilot-session",
         "user-agent": "GitHubCopilotChat/0.35.0",
-        "x-client-request-id": "fixture-copilot-session",
-        "x-fixture-option-header": "option-copilot",
         "x-initiator": "user"
       },
       "jsonPayload": {
+        "include": [
+          "reasoning.encrypted_content"
+        ],
         "input": [
           {
             "content": [
               {
-                "text": "Describe this fixture image.",
+                "text": "Use explicit reasoning options.",
                 "type": "input_text"
-              },
-              {
-                "detail": "auto",
-                "image_url": "data:image/png;base64,iVBORw0KGgo=",
-                "type": "input_image"
               }
             ],
             "role": "user"
           }
         ],
-        "model": "gpt-4.1-copilot-fixture",
-        "prompt_cache_key": "fixture-copilot-session",
+        "model": "gpt-4.1-copilot-explicit-reasoning-fixture",
+        "reasoning": {
+          "effort": "medium",
+          "summary": "concise"
+        },
         "store": false,
         "stream": true
       },
@@ -48,7 +45,7 @@
       "transportMetadata": {
         "mockedResponseHeaders": {
           "content-type": "text/event-stream",
-          "x-fixture-response": "copilot-responses-dynamic-headers"
+          "x-fixture-response": "copilot-responses-explicit-reasoning-options"
         },
         "mockedStatus": 200,
         "mode": "sse",
@@ -58,22 +55,12 @@
       "url": "https://api.individual.githubcopilot.com/responses"
     }
   },
-  "id": "copilot-responses-dynamic-headers",
+  "id": "copilot-responses-explicit-reasoning-options",
   "input": {
     "context": {
       "messages": [
         {
-          "content": [
-            {
-              "text": "Describe this fixture image.",
-              "type": "text"
-            },
-            {
-              "data": "iVBORw0KGgo=",
-              "mimeType": "image/png",
-              "type": "image"
-            }
-          ],
+          "content": "Use explicit reasoning options.",
           "role": "user"
         }
       ]
@@ -87,7 +74,7 @@
         "Editor-Version": "vscode/1.107.0",
         "User-Agent": "GitHubCopilotChat/0.35.0"
       },
-      "id": "gpt-4.1-copilot-fixture",
+      "id": "gpt-4.1-copilot-explicit-reasoning-fixture",
       "input": [
         "text",
         "image"
@@ -98,11 +85,7 @@
     },
     "options": {
       "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "short",
-      "headers": {
-        "x-fixture-option-header": "option-copilot"
-      },
-      "sessionId": "fixture-copilot-session"
+      "reasoningSummary": "concise"
     }
   },
   "metadata": {
@@ -120,5 +103,5 @@
   },
   "providerFamily": "github-copilot",
   "schemaVersion": 1,
-  "title": "GitHub Copilot Responses captures static model headers, dynamic headers, and option override precedence"
+  "title": "GitHub Copilot Responses emits reasoning only when explicit effort or summary options are requested"
 }

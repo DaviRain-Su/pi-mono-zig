@@ -7,35 +7,38 @@
         "authorization": "<redacted-present>",
         "content-type": "application/json",
         "copilot-integration-id": "vscode-chat",
-        "copilot-vision-request": "true",
         "editor-plugin-version": "copilot-chat/0.35.0",
         "editor-version": "vscode/1.107.0",
         "openai-intent": "conversation-edits",
-        "session_id": "fixture-copilot-session",
         "user-agent": "GitHubCopilotChat/0.35.0",
-        "x-client-request-id": "fixture-copilot-session",
-        "x-fixture-option-header": "option-copilot",
-        "x-initiator": "user"
+        "x-initiator": "agent"
       },
       "jsonPayload": {
         "input": [
           {
             "content": [
               {
-                "text": "Describe this fixture image.",
+                "text": "Start a Copilot fixture turn.",
                 "type": "input_text"
-              },
-              {
-                "detail": "auto",
-                "image_url": "data:image/png;base64,iVBORw0KGgo=",
-                "type": "input_image"
               }
             ],
             "role": "user"
+          },
+          {
+            "content": [
+              {
+                "annotations": [],
+                "text": "Assistant final fixture text.",
+                "type": "output_text"
+              }
+            ],
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
           }
         ],
-        "model": "gpt-4.1-copilot-fixture",
-        "prompt_cache_key": "fixture-copilot-session",
+        "model": "gpt-4.1-copilot-agent-final-fixture",
         "store": false,
         "stream": true
       },
@@ -48,7 +51,7 @@
       "transportMetadata": {
         "mockedResponseHeaders": {
           "content-type": "text/event-stream",
-          "x-fixture-response": "copilot-responses-dynamic-headers"
+          "x-fixture-response": "copilot-responses-assistant-final-agent-initiator"
         },
         "mockedStatus": 200,
         "mode": "sse",
@@ -58,23 +61,40 @@
       "url": "https://api.individual.githubcopilot.com/responses"
     }
   },
-  "id": "copilot-responses-dynamic-headers",
+  "id": "copilot-responses-assistant-final-agent-initiator",
   "input": {
     "context": {
       "messages": [
         {
+          "content": "Start a Copilot fixture turn.",
+          "role": "user"
+        },
+        {
+          "api": "openai-responses",
           "content": [
             {
-              "text": "Describe this fixture image.",
+              "text": "Assistant final fixture text.",
               "type": "text"
-            },
-            {
-              "data": "iVBORw0KGgo=",
-              "mimeType": "image/png",
-              "type": "image"
             }
           ],
-          "role": "user"
+          "model": "gpt-4.1-copilot-agent-final-fixture",
+          "provider": "github-copilot",
+          "role": "assistant",
+          "stopReason": "stop",
+          "usage": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "input": 0,
+              "output": 0,
+              "total": 0
+            },
+            "input": 0,
+            "output": 0,
+            "totalTokens": 0
+          }
         }
       ]
     },
@@ -87,7 +107,7 @@
         "Editor-Version": "vscode/1.107.0",
         "User-Agent": "GitHubCopilotChat/0.35.0"
       },
-      "id": "gpt-4.1-copilot-fixture",
+      "id": "gpt-4.1-copilot-agent-final-fixture",
       "input": [
         "text",
         "image"
@@ -97,12 +117,7 @@
       "reasoning": true
     },
     "options": {
-      "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "short",
-      "headers": {
-        "x-fixture-option-header": "option-copilot"
-      },
-      "sessionId": "fixture-copilot-session"
+      "apiKeyMode": "fixture-placeholder"
     }
   },
   "metadata": {
@@ -120,5 +135,5 @@
   },
   "providerFamily": "github-copilot",
   "schemaVersion": 1,
-  "title": "GitHub Copilot Responses captures static model headers, dynamic headers, and option override precedence"
+  "title": "GitHub Copilot Responses infers agent initiator from final assistant message without vision input"
 }

@@ -7,22 +7,21 @@
         "authorization": "<redacted-present>",
         "content-type": "application/json",
         "copilot-integration-id": "vscode-chat",
-        "copilot-vision-request": "true",
+        "copilot-vision-request": "false",
         "editor-plugin-version": "copilot-chat/0.35.0",
         "editor-version": "vscode/1.107.0",
-        "openai-intent": "conversation-edits",
-        "session_id": "fixture-copilot-session",
-        "user-agent": "GitHubCopilotChat/0.35.0",
-        "x-client-request-id": "fixture-copilot-session",
-        "x-fixture-option-header": "option-copilot",
-        "x-initiator": "user"
+        "openai-intent": "option-intent",
+        "session_id": "option-session",
+        "user-agent": "GitHubCopilotChat/override",
+        "x-client-request-id": "option-request",
+        "x-initiator": "option-initiator"
       },
       "jsonPayload": {
         "input": [
           {
             "content": [
               {
-                "text": "Describe this fixture image.",
+                "text": "Trigger all generated Copilot headers.",
                 "type": "input_text"
               },
               {
@@ -34,7 +33,7 @@
             "role": "user"
           }
         ],
-        "model": "gpt-4.1-copilot-fixture",
+        "model": "gpt-4.1-copilot-header-override-fixture",
         "prompt_cache_key": "fixture-copilot-session",
         "store": false,
         "stream": true
@@ -48,7 +47,7 @@
       "transportMetadata": {
         "mockedResponseHeaders": {
           "content-type": "text/event-stream",
-          "x-fixture-response": "copilot-responses-dynamic-headers"
+          "x-fixture-response": "copilot-responses-option-header-overrides"
         },
         "mockedStatus": 200,
         "mode": "sse",
@@ -58,14 +57,14 @@
       "url": "https://api.individual.githubcopilot.com/responses"
     }
   },
-  "id": "copilot-responses-dynamic-headers",
+  "id": "copilot-responses-option-header-overrides",
   "input": {
     "context": {
       "messages": [
         {
           "content": [
             {
-              "text": "Describe this fixture image.",
+              "text": "Trigger all generated Copilot headers.",
               "type": "text"
             },
             {
@@ -87,7 +86,7 @@
         "Editor-Version": "vscode/1.107.0",
         "User-Agent": "GitHubCopilotChat/0.35.0"
       },
-      "id": "gpt-4.1-copilot-fixture",
+      "id": "gpt-4.1-copilot-header-override-fixture",
       "input": [
         "text",
         "image"
@@ -98,9 +97,13 @@
     },
     "options": {
       "apiKeyMode": "fixture-placeholder",
-      "cacheRetention": "short",
       "headers": {
-        "x-fixture-option-header": "option-copilot"
+        "Copilot-Vision-Request": "false",
+        "Openai-Intent": "option-intent",
+        "User-Agent": "GitHubCopilotChat/override",
+        "X-Initiator": "option-initiator",
+        "session_id": "option-session",
+        "x-client-request-id": "option-request"
       },
       "sessionId": "fixture-copilot-session"
     }
@@ -120,5 +123,5 @@
   },
   "providerFamily": "github-copilot",
   "schemaVersion": 1,
-  "title": "GitHub Copilot Responses captures static model headers, dynamic headers, and option override precedence"
+  "title": "GitHub Copilot Responses explicit headers override static, dynamic, vision, and generated session headers"
 }
