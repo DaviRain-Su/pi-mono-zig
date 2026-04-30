@@ -65,6 +65,7 @@ interface SerializableOptions {
 	payloadReplacement?: unknown;
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
 	reasoningSummary?: "auto" | "detailed" | "concise" | "off" | "on" | null;
+	signal?: "provided";
 	simpleReasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
 	serviceTier?: "auto" | "default" | "flex" | "priority";
 	sessionId?: string;
@@ -374,7 +375,6 @@ const scenarios: Scenario[] = [
 				azureDeploymentName: "fixture-deployment",
 				azureResourceName: "fixture-resource-override",
 				headers: { "x-fixture-option-header": "option-azure" },
-				maxRetries: 1,
 				maxTokens: 32,
 				sessionId: "fixture-azure-session",
 				timeoutMs: 2345,
@@ -524,7 +524,6 @@ const scenarios: Scenario[] = [
 				azureApiVersion: "2025-04-01-preview",
 				azureBaseUrl: "https://replacement-resource.openai.azure.com/openai/v1/",
 				azureDeploymentName: "azure-replacement-deployment",
-				maxRetries: 3,
 				onPayload: "replace-with-fixture-payload",
 				payloadReplacement: {
 					model: "azure-replacement-deployment",
@@ -532,6 +531,7 @@ const scenarios: Scenario[] = [
 					stream: true,
 					fixture_marker: "azure-on-payload-replacement",
 				},
+				signal: "provided",
 				timeoutMs: 3456,
 			},
 		},
@@ -1105,6 +1105,7 @@ function commonRuntimeOptions(options: SerializableOptions): OpenAIResponsesOpti
 			: {}),
 		...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
 		...(options.sessionId ? { sessionId: options.sessionId } : {}),
+		...(options.signal === "provided" ? { signal: new AbortController().signal } : {}),
 		...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
 		...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
 		apiKey: options.apiKeyMode === "fixture-codex-jwt" ? fakeCodexJwt : fixtureApiKey,
@@ -1363,7 +1364,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 					requestOptions: {
 						...(scenario.input.options.timeoutMs !== undefined ? { timeoutMs: scenario.input.options.timeoutMs } : {}),
 						...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
-						signal: "not-provided",
+						signal: scenario.input.options.signal ?? "not-provided",
 					},
 					transportMetadata: buildTransportMetadata(scenario, "deferred-websocket", 101),
 				},
@@ -1389,7 +1390,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 				requestOptions: {
 					...(scenario.input.options.timeoutMs !== undefined ? { timeoutMs: scenario.input.options.timeoutMs } : {}),
 					...(scenario.input.options.maxRetries !== undefined ? { maxRetries: scenario.input.options.maxRetries } : {}),
-					signal: "not-provided",
+					signal: scenario.input.options.signal ?? "not-provided",
 				},
 				transportMetadata: buildTransportMetadata(
 					scenario,

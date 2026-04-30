@@ -11,6 +11,7 @@ const default_codex_base_url = "https://chatgpt.com/backend-api";
 const max_diff_output_bytes: usize = 12_000;
 const max_value_bytes: usize = 512;
 const max_diffs: usize = 20;
+var provided_signal = std.atomic.Value(bool).init(false);
 
 const ignored_field_allowlist = [_][]const u8{
     "id",
@@ -468,6 +469,12 @@ fn streamOptionsFromFixtureInput(allocator: std.mem.Allocator, model: std.json.V
     };
 
     if (optionalNumber(options, "temperature")) |temperature| stream_options.temperature = @floatCast(temperature);
+    if (optionalString(options, "signal")) |signal| {
+        if (std.mem.eql(u8, signal, "provided")) {
+            provided_signal.store(false, .seq_cst);
+            stream_options.signal = &provided_signal;
+        }
+    }
     if (optionalString(options, "reasoningEffort")) |effort| stream_options.responses_reasoning_effort = try thinkingLevelFromString(effort);
     if (optionalString(options, "simpleReasoning")) |effort| {
         const clamped = try clampSimpleReasoning(allocator, getObjectField(model, "id").string, effort);
@@ -1056,7 +1063,7 @@ fn hasCopilotVisionInput(context: std.json.Value) bool {
 fn buildRequestOptions(allocator: std.mem.Allocator, options: std.json.Value) !std.json.ObjectMap {
     var object = try initObject(allocator);
     if (optionalU32(options, "maxRetries")) |value| try putInteger(allocator, &object, "maxRetries", value);
-    try putString(allocator, &object, "signal", "not-provided");
+    try putString(allocator, &object, "signal", optionalString(options, "signal") orelse "not-provided");
     if (optionalU32(options, "timeoutMs")) |value| try putInteger(allocator, &object, "timeoutMs", value);
     return object;
 }

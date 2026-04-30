@@ -36,7 +36,6 @@
         "api-version": "2025-03-01-preview"
       },
       "requestOptions": {
-        "maxRetries": 1,
         "signal": "not-provided",
         "timeoutMs": 2345
       },
@@ -86,7 +85,6 @@
       "headers": {
         "x-fixture-option-header": "option-azure"
       },
-      "maxRetries": 1,
       "maxTokens": 32,
       "sessionId": "fixture-azure-session",
       "timeoutMs": 2345
