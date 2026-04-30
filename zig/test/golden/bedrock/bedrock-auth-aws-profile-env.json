@@ -3,35 +3,40 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 16384,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 20000
+          "maxTokens": 32
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Auth surface fixture bedrock-auth-aws-profile-env."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0"
+      },
+      "requestSurface": {
+        "auth": {
+          "credentialDiscovery": "sdk-profile-resolution",
+          "envProfile": "fixture-env-profile",
+          "mode": "profile"
+        },
+        "clientConfig": {
+          "envProfile": "fixture-env-profile"
+        },
+        "endpoint": {
+          "mode": "sdk-profile-resolution"
+        },
+        "method": "POST",
+        "path": "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream",
+        "redaction": "secrets-redacted",
+        "region": {
+          "source": "sdk-profile-resolution"
+        },
+        "url": "sdk-profile-resolution"
       }
     },
     "typeScriptStream": [
@@ -84,16 +89,18 @@
       }
     ]
   },
-  "id": "bedrock-reasoning-fixed-default-xhigh",
+  "id": "bedrock-auth-aws-profile-env",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Auth surface fixture bedrock-auth-aws-profile-env.",
           "role": "user"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
+    },
+    "env": {
+      "AWS_PROFILE": "fixture-env-profile"
     },
     "localStream": {
       "events": [
@@ -135,7 +142,7 @@
     "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "baseUrl": "https://bedrock-runtime.eu-central-1.amazonaws.com",
       "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
       "input": [
         "text"
@@ -146,8 +153,8 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 20000,
-      "reasoning": "xhigh"
+      "maxTokens": 32,
+      "requestSurface": "capture"
     }
   },
   "metadata": {
@@ -251,5 +258,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock fixed Claude xhigh reasoning clamps to the high default token budget"
+  "title": "Bedrock AWS_PROFILE suppresses endpoint-derived/default region in SDK config snapshots"
 }

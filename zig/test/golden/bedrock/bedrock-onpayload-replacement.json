@@ -209,7 +209,22 @@
         "bedrock-simple-nonclaude-no-adjust",
         "bedrock-transform-replay-edge-cases",
         "bedrock-simple-explicit-tokens",
-        "bedrock-binary-eventstream-tool-use"
+        "bedrock-binary-eventstream-tool-use",
+        "bedrock-auth-path-encoding",
+        "bedrock-auth-standard-endpoint-eu",
+        "bedrock-auth-standard-endpoint-fips",
+        "bedrock-auth-standard-endpoint-china",
+        "bedrock-auth-region-precedence-options",
+        "bedrock-auth-region-precedence-env",
+        "bedrock-auth-region-precedence-default-env",
+        "bedrock-auth-aws-profile-env",
+        "bedrock-auth-options-profile",
+        "bedrock-auth-custom-endpoint-region",
+        "bedrock-auth-bearer-option",
+        "bedrock-auth-bearer-env",
+        "bedrock-auth-skip-auth-proxy",
+        "bedrock-auth-sigv4-session",
+        "bedrock-auth-missing-credentials"
       ]
     },
     "captureBoundary": "streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",

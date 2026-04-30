@@ -3,35 +3,44 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 16384,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 20000
+          "maxTokens": 32
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Auth surface fixture bedrock-auth-path-encoding."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/global.anthropic.claude-opus-4-7-v1"
+      },
+      "requestSurface": {
+        "auth": {
+          "bearerSuppressed": false,
+          "credentialSource": "proxy-dummy",
+          "mode": "skip-auth",
+          "secrets": "redacted"
+        },
+        "clientConfig": {
+          "endpoint": "https://bedrock-runtime.us-east-1.amazonaws.com",
+          "region": "us-east-1"
+        },
+        "endpoint": {
+          "mode": "explicit",
+          "value": "https://bedrock-runtime.us-east-1.amazonaws.com"
+        },
+        "method": "POST",
+        "path": "/model/arn%3Aaws-us-gov%3Abedrock%3Aus-gov-west-1%3A123456789012%3Ainference-profile%2Fglobal.anthropic.claude-opus-4-7-v1/converse-stream",
+        "redaction": "secrets-redacted",
+        "region": {
+          "source": "endpoint",
+          "value": "us-east-1"
+        },
+        "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/arn%3Aaws-us-gov%3Abedrock%3Aus-gov-west-1%3A123456789012%3Ainference-profile%2Fglobal.anthropic.claude-opus-4-7-v1/converse-stream"
       }
     },
     "typeScriptStream": [
@@ -61,7 +70,7 @@
               "type": "text"
             }
           ],
-          "model": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "model": "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/global.anthropic.claude-opus-4-7-v1",
           "provider": "amazon-bedrock",
           "role": "assistant",
           "stopReason": "stop",
@@ -84,16 +93,18 @@
       }
     ]
   },
-  "id": "bedrock-reasoning-fixed-default-xhigh",
+  "id": "bedrock-auth-path-encoding",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Auth surface fixture bedrock-auth-path-encoding.",
           "role": "user"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
+    },
+    "env": {
+      "AWS_BEDROCK_SKIP_AUTH": "1"
     },
     "localStream": {
       "events": [
@@ -136,18 +147,18 @@
     "model": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
-      "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+      "id": "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/global.anthropic.claude-opus-4-7-v1",
       "input": [
         "text"
       ],
-      "name": "Claude 3.7 Sonnet Bedrock Fixture",
+      "name": "Claude Opus 4.7 GovCloud ARN Fixture",
       "provider": "amazon-bedrock",
       "reasoning": true
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 20000,
-      "reasoning": "xhigh"
+      "maxTokens": 32,
+      "requestSurface": "capture"
     }
   },
   "metadata": {
@@ -251,5 +262,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock fixed Claude xhigh reasoning clamps to the high default token budget"
+  "title": "Bedrock request URL percent-encodes ARN model ids as a single path segment"
 }

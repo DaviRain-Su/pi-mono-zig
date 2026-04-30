@@ -3,35 +3,44 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 16384,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 20000
+          "maxTokens": 32
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Auth surface fixture bedrock-auth-standard-endpoint-fips."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0"
+      },
+      "requestSurface": {
+        "auth": {
+          "bearerSuppressed": false,
+          "credentialSource": "proxy-dummy",
+          "mode": "skip-auth",
+          "secrets": "redacted"
+        },
+        "clientConfig": {
+          "endpoint": "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
+          "region": "us-gov-west-1"
+        },
+        "endpoint": {
+          "mode": "explicit",
+          "value": "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com"
+        },
+        "method": "POST",
+        "path": "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream",
+        "redaction": "secrets-redacted",
+        "region": {
+          "source": "endpoint",
+          "value": "us-gov-west-1"
+        },
+        "url": "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream"
       }
     },
     "typeScriptStream": [
@@ -84,16 +93,18 @@
       }
     ]
   },
-  "id": "bedrock-reasoning-fixed-default-xhigh",
+  "id": "bedrock-auth-standard-endpoint-fips",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Auth surface fixture bedrock-auth-standard-endpoint-fips.",
           "role": "user"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
+    },
+    "env": {
+      "AWS_BEDROCK_SKIP_AUTH": "1"
     },
     "localStream": {
       "events": [
@@ -135,7 +146,7 @@
     "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "baseUrl": "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
       "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
       "input": [
         "text"
@@ -146,8 +157,8 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 20000,
-      "reasoning": "xhigh"
+      "maxTokens": 32,
+      "requestSurface": "capture"
     }
   },
   "metadata": {
@@ -251,5 +262,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock fixed Claude xhigh reasoning clamps to the high default token budget"
+  "title": "Bedrock FIPS runtime endpoint derives its signing region"
 }

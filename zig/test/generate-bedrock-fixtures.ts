@@ -83,6 +83,21 @@ const allowedScenarioIds = [
 	"bedrock-transform-replay-edge-cases",
 	"bedrock-simple-explicit-tokens",
 	"bedrock-binary-eventstream-tool-use",
+	"bedrock-auth-path-encoding",
+	"bedrock-auth-standard-endpoint-eu",
+	"bedrock-auth-standard-endpoint-fips",
+	"bedrock-auth-standard-endpoint-china",
+	"bedrock-auth-region-precedence-options",
+	"bedrock-auth-region-precedence-env",
+	"bedrock-auth-region-precedence-default-env",
+	"bedrock-auth-aws-profile-env",
+	"bedrock-auth-options-profile",
+	"bedrock-auth-custom-endpoint-region",
+	"bedrock-auth-bearer-option",
+	"bedrock-auth-bearer-env",
+	"bedrock-auth-skip-auth-proxy",
+	"bedrock-auth-sigv4-session",
+	"bedrock-auth-missing-credentials",
 ] as const;
 
 const allowedModelIds = [
@@ -109,6 +124,11 @@ const allowedIgnoredPaths = [
 	"expected.binaryEventStream",
 ] as const;
 
+const fixtureTimestamp = {
+	amzDate: "20250115T120000Z",
+	dateStamp: "20250115",
+} as const;
+
 type ScenarioId = (typeof allowedScenarioIds)[number];
 type LocalStreamFormat = (typeof allowedLocalStreamFormats)[number];
 type WithoutTimestamp<T> = T extends { timestamp: number } ? Omit<T, "timestamp"> : T;
@@ -128,6 +148,8 @@ interface FixtureModelInput {
 interface SerializableOptions {
 	cacheRetention?: "none" | "short" | "long";
 	region?: string;
+	profile?: string;
+	bearerToken?: string;
 	maxTokens?: number;
 	temperature?: number;
 	toolChoice?: BedrockOptions["toolChoice"];
@@ -139,7 +161,20 @@ interface SerializableOptions {
 	requestMetadata?: Record<string, string>;
 	onPayload?: "pass-through" | "replace";
 	onResponse?: "capture";
+	requestSurface?: "capture";
 }
+
+type FixtureEnvKey =
+	| "AWS_ACCESS_KEY_ID"
+	| "AWS_SECRET_ACCESS_KEY"
+	| "AWS_SESSION_TOKEN"
+	| "AWS_PROFILE"
+	| "AWS_BEARER_TOKEN_BEDROCK"
+	| "AWS_REGION"
+	| "AWS_DEFAULT_REGION"
+	| "AWS_BEDROCK_SKIP_AUTH";
+
+type FixtureEnv = Partial<Record<FixtureEnvKey, string>>;
 
 interface DeclarativeContext {
 	systemPrompt?: string;
@@ -152,6 +187,7 @@ interface ScenarioInput {
 	model: FixtureModelInput;
 	context: DeclarativeContext;
 	options: SerializableOptions;
+	env?: FixtureEnv;
 	localStream: {
 		format: LocalStreamFormat;
 		events: ConverseStreamFixtureEvent[];
@@ -226,6 +262,7 @@ interface FixtureRecord {
 		typeScriptRequest: {
 			mode: ScenarioInput["mode"];
 			payload: unknown;
+			requestSurface?: unknown;
 		};
 		typeScriptStream: SemanticEvent[];
 		onResponse?: {
@@ -334,6 +371,21 @@ const cappedClaudeModel: FixtureModelInput = {
 	...baseModel,
 	name: "Claude 3.7 Sonnet Capped Fixture",
 	maxTokens: 10_000,
+};
+
+const fipsEndpointModel: FixtureModelInput = {
+	...baseModel,
+	baseUrl: "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com",
+};
+
+const chinaEndpointModel: FixtureModelInput = {
+	...baseModel,
+	baseUrl: "https://bedrock-runtime.cn-north-1.amazonaws.com.cn",
+};
+
+const customEndpointModel: FixtureModelInput = {
+	...baseModel,
+	baseUrl: "https://bedrock-proxy.fixture.example.com/custom/",
 };
 
 const baseContext = {
@@ -447,6 +499,27 @@ function reasoningScenario(
 			model,
 			context: baseContext,
 			options: { cacheRetention: "none", ...options },
+			localStream: { format: "json-lines", events: textEvents },
+		},
+	};
+}
+
+function authScenario(
+	id: ScenarioId,
+	title: string,
+	model: FixtureModelInput,
+	options: SerializableOptions = {},
+	env: FixtureEnv = {},
+): Scenario {
+	return {
+		id,
+		title,
+		input: {
+			mode: "streamBedrock",
+			model,
+			context: { messages: [{ role: "user", content: `Auth surface fixture ${id}.` }] },
+			options: { cacheRetention: "none", maxTokens: 32, requestSurface: "capture", ...options },
+			env,
 			localStream: { format: "json-lines", events: textEvents },
 		},
 	};
@@ -859,6 +932,115 @@ const scenarios: Scenario[] = [
 			localStream: { format: "aws-eventstream", events: toolUseEvents },
 		},
 	},
+	authScenario(
+		"bedrock-auth-path-encoding",
+		"Bedrock request URL percent-encodes ARN model ids as a single path segment",
+		govCloudAdaptiveArnModel,
+		{},
+		{ AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-standard-endpoint-eu",
+		"Bedrock standard EU runtime endpoint derives eu-central-1 signing region",
+		{ ...baseModel, baseUrl: "https://bedrock-runtime.eu-central-1.amazonaws.com" },
+		{},
+		{ AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-standard-endpoint-fips",
+		"Bedrock FIPS runtime endpoint derives its signing region",
+		fipsEndpointModel,
+		{},
+		{ AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-standard-endpoint-china",
+		"Bedrock China runtime endpoint derives cn-north-1 signing region",
+		chinaEndpointModel,
+		{},
+		{ AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-region-precedence-options",
+		"Bedrock options.region takes precedence over environment and endpoint regions",
+		{ ...baseModel, baseUrl: "https://bedrock-runtime.eu-central-1.amazonaws.com" },
+		{ region: "ap-southeast-2" },
+		{ AWS_REGION: "us-west-2", AWS_DEFAULT_REGION: "us-east-2", AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-region-precedence-env",
+		"Bedrock AWS_REGION takes precedence over AWS_DEFAULT_REGION and endpoint regions",
+		{ ...baseModel, baseUrl: "https://bedrock-runtime.eu-central-1.amazonaws.com" },
+		{},
+		{ AWS_REGION: "us-west-2", AWS_DEFAULT_REGION: "us-east-2", AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-region-precedence-default-env",
+		"Bedrock AWS_DEFAULT_REGION takes precedence over endpoint-derived regions",
+		{ ...baseModel, baseUrl: "https://bedrock-runtime.eu-central-1.amazonaws.com" },
+		{},
+		{ AWS_DEFAULT_REGION: "us-east-2", AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-aws-profile-env",
+		"Bedrock AWS_PROFILE suppresses endpoint-derived/default region in SDK config snapshots",
+		{ ...baseModel, baseUrl: "https://bedrock-runtime.eu-central-1.amazonaws.com" },
+		{},
+		{ AWS_PROFILE: "fixture-env-profile" },
+	),
+	authScenario(
+		"bedrock-auth-options-profile",
+		"Bedrock options.profile is passed to SDK config without suppressing endpoint region derivation",
+		{ ...baseModel, baseUrl: "https://bedrock-runtime.eu-central-1.amazonaws.com" },
+		{ profile: "fixture-option-profile" },
+		{},
+	),
+	authScenario(
+		"bedrock-auth-custom-endpoint-region",
+		"Bedrock custom endpoints are preserved when a region is configured",
+		customEndpointModel,
+		{ region: "us-west-2" },
+		{ AWS_BEDROCK_SKIP_AUTH: "1" },
+	),
+	authScenario(
+		"bedrock-auth-bearer-option",
+		"Bedrock bearer token option wins over environment bearer token",
+		baseModel,
+		{ bearerToken: "fixture-bearer-option" },
+		{ AWS_BEARER_TOKEN_BEDROCK: "fixture-bearer-env" },
+	),
+	authScenario(
+		"bedrock-auth-bearer-env",
+		"Bedrock bearer token environment auth is represented without SigV4 scope",
+		baseModel,
+		{},
+		{ AWS_BEARER_TOKEN_BEDROCK: "fixture-bearer-env" },
+	),
+	authScenario(
+		"bedrock-auth-skip-auth-proxy",
+		"Bedrock skip-auth proxy mode suppresses bearer auth and uses proxy-safe dummy credentials",
+		customEndpointModel,
+		{},
+		{ AWS_BEDROCK_SKIP_AUTH: "1", AWS_BEARER_TOKEN_BEDROCK: "fixture-bearer-env" },
+	),
+	authScenario(
+		"bedrock-auth-sigv4-session",
+		"Bedrock SigV4 normalized request semantics are stable under fake credentials and fixed timestamp",
+		baseModel,
+		{ region: "us-east-1" },
+		{
+			AWS_ACCESS_KEY_ID: "FIXTUREACCESSKEY",
+			AWS_SECRET_ACCESS_KEY: "fixture-secret-access-key",
+			AWS_SESSION_TOKEN: "fixture-session-value",
+		},
+	),
+	authScenario(
+		"bedrock-auth-missing-credentials",
+		"Bedrock missing IAM credentials are represented as a local async stream error surface",
+		baseModel,
+		{},
+		{},
+	),
 ];
 
 function toRuntimeModel(model: FixtureModelInput): Model<"bedrock-converse-stream"> {
@@ -884,6 +1066,8 @@ function toRuntimeOptions(options: SerializableOptions): BedrockOptions {
 	return {
 		...(options.cacheRetention !== undefined ? { cacheRetention: options.cacheRetention } : {}),
 		...(options.region !== undefined ? { region: options.region } : {}),
+		...(options.profile !== undefined ? { profile: options.profile } : {}),
+		...(options.bearerToken !== undefined ? { bearerToken: options.bearerToken } : {}),
 		...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
 		...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
 		...(options.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
@@ -894,6 +1078,176 @@ function toRuntimeOptions(options: SerializableOptions): BedrockOptions {
 		...(options.thinkingDisplay !== undefined ? { thinkingDisplay: options.thinkingDisplay } : {}),
 		...(options.requestMetadata !== undefined ? { requestMetadata: options.requestMetadata } : {}),
 	} as BedrockOptions;
+}
+
+const fixtureEnvKeys: FixtureEnvKey[] = [
+	"AWS_ACCESS_KEY_ID",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+	"AWS_PROFILE",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"AWS_REGION",
+	"AWS_DEFAULT_REGION",
+	"AWS_BEDROCK_SKIP_AUTH",
+];
+
+async function withScenarioEnv<T>(scenario: Scenario, action: () => Promise<T>): Promise<T> {
+	const saved = Object.fromEntries(fixtureEnvKeys.map((key) => [key, process.env[key]])) as Record<
+		FixtureEnvKey,
+		string | undefined
+	>;
+	try {
+		for (const key of fixtureEnvKeys) {
+			process.env[key] = scenario.input.env?.[key] ?? "";
+		}
+		process.env.AWS_EC2_METADATA_DISABLED = "true";
+		return await action();
+	} finally {
+		for (const key of fixtureEnvKeys) {
+			const value = saved[key];
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+	}
+}
+
+function trimTrailingSlash(value: string): string {
+	return value.replace(/\/+$/, "");
+}
+
+function percentEncodePathSegment(value: string): string {
+	return Array.from(Buffer.from(value, "utf8"))
+		.map((byte) => {
+			const char = String.fromCharCode(byte);
+			if (/^[A-Za-z0-9._~-]$/.test(char)) return char;
+			return `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+		})
+		.join("");
+}
+
+function standardEndpointRegion(baseUrl: string): string | undefined {
+	try {
+		const hostname = new URL(baseUrl).hostname.toLowerCase();
+		return hostname.match(/^bedrock-runtime(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$/)?.[1];
+	} catch {
+		return undefined;
+	}
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+	return value === undefined || value === "" ? undefined : value;
+}
+
+function scenarioEnv(scenario: Scenario, key: FixtureEnvKey): string | undefined {
+	return nonEmpty(scenario.input.env?.[key]);
+}
+
+function configuredRegion(scenario: Scenario): { source: string; value?: string } {
+	if (scenario.input.options.region) return { source: "options.region", value: scenario.input.options.region };
+	const awsRegion = scenarioEnv(scenario, "AWS_REGION");
+	if (awsRegion) return { source: "AWS_REGION", value: awsRegion };
+	const awsDefaultRegion = scenarioEnv(scenario, "AWS_DEFAULT_REGION");
+	if (awsDefaultRegion) return { source: "AWS_DEFAULT_REGION", value: awsDefaultRegion };
+	const endpointRegion = standardEndpointRegion(scenario.input.model.baseUrl);
+	if (endpointRegion && !scenarioEnv(scenario, "AWS_PROFILE")) return { source: "endpoint", value: endpointRegion };
+	if (scenarioEnv(scenario, "AWS_PROFILE")) return { source: "sdk-profile-resolution" };
+	return { source: "default", value: "us-east-1" };
+}
+
+function requestBaseUrl(scenario: Scenario, region: { source: string; value?: string }): { mode: string; value?: string } {
+	const endpointRegion = standardEndpointRegion(scenario.input.model.baseUrl);
+	const hasConfiguredRegion =
+		scenario.input.options.region || scenarioEnv(scenario, "AWS_REGION") || scenarioEnv(scenario, "AWS_DEFAULT_REGION");
+	const useExplicitEndpoint = !endpointRegion || (!hasConfiguredRegion && !scenarioEnv(scenario, "AWS_PROFILE"));
+	if (useExplicitEndpoint) return { mode: "explicit", value: trimTrailingSlash(scenario.input.model.baseUrl) };
+	if (!region.value) return { mode: "sdk-profile-resolution" };
+	const suffix = region.value.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com";
+	return { mode: "sdk-default", value: `https://bedrock-runtime.${region.value}.${suffix}` };
+}
+
+function authSnapshot(scenario: Scenario, region: { source: string; value?: string }, payload: unknown): unknown {
+	// The fixture compares SigV4 semantics, not volatile SDK byte-for-byte signing internals.
+	// Body hashing is normalized to the semantic field because TS command input and Zig
+	// local snapshots intentionally canonicalize payload object ordering for comparison.
+	void payload;
+	const bearerToken = scenario.input.options.bearerToken ?? scenarioEnv(scenario, "AWS_BEARER_TOKEN_BEDROCK");
+	if (scenarioEnv(scenario, "AWS_BEDROCK_SKIP_AUTH") === "1") {
+		return {
+			mode: "skip-auth",
+			credentialSource: "proxy-dummy",
+			bearerSuppressed: bearerToken !== undefined,
+			secrets: "redacted",
+		};
+	}
+	if (bearerToken) {
+		return {
+			mode: "bearer",
+			source: scenario.input.options.bearerToken ? "options.bearerToken" : "env.bearerToken",
+			token: "redacted",
+			sigv4: false,
+		};
+	}
+	if (scenario.input.options.profile || scenarioEnv(scenario, "AWS_PROFILE")) {
+		return {
+			mode: "profile",
+			optionsProfile: scenario.input.options.profile,
+			envProfile: scenarioEnv(scenario, "AWS_PROFILE"),
+			credentialDiscovery: "sdk-profile-resolution",
+		};
+	}
+	const accessKey = scenarioEnv(scenario, "AWS_ACCESS_KEY_ID");
+	const secretKey = scenarioEnv(scenario, "AWS_SECRET_ACCESS_KEY");
+	if (accessKey && secretKey) {
+		return {
+			mode: "sigv4",
+			method: "POST",
+			query: "",
+			service: "bedrock",
+			region: region.value ?? "us-east-1",
+			amzDate: fixtureTimestamp.amzDate,
+			credentialScope: {
+				date: fixtureTimestamp.dateStamp,
+				region: region.value ?? "us-east-1",
+				service: "bedrock",
+				terminal: "aws4_request",
+			},
+			signedHeaders: ["content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token"],
+			bodySha256: "normalized-payload-sha256",
+			sessionToken: scenarioEnv(scenario, "AWS_SESSION_TOKEN") ? "redacted" : undefined,
+			accessKeyId: "redacted",
+			signature: "normalized",
+		};
+	}
+	return {
+		mode: "missing-credentials",
+		errorSurface: "async-stream-error",
+		message: "Bedrock requires AWS_ACCESS_KEY_ID.",
+		network: "not-attempted",
+	};
+}
+
+function buildRequestSurfaceSnapshot(scenario: Scenario, payload: unknown): unknown {
+	const path = `/model/${percentEncodePathSegment(scenario.input.model.id)}/converse-stream`;
+	const region = configuredRegion(scenario);
+	const baseUrl = requestBaseUrl(scenario, region);
+	return {
+		method: "POST",
+		path,
+		url: baseUrl.value ? `${baseUrl.value}${path}` : "sdk-profile-resolution",
+		endpoint: baseUrl,
+		region,
+		clientConfig: {
+			profile: scenario.input.options.profile,
+			envProfile: scenarioEnv(scenario, "AWS_PROFILE"),
+			endpoint: baseUrl.mode === "explicit" ? baseUrl.value : undefined,
+			region: region.value,
+		},
+		auth: authSnapshot(scenario, region, payload),
+		redaction: "secrets-redacted",
+	};
 }
 
 function stableValue(value: unknown): unknown {
@@ -1051,7 +1405,7 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	let capturedPayload: unknown;
 	let capturedResponse: FixtureRecord["expected"]["onResponse"];
 
-	prototype.send = async (command: unknown): Promise<ConverseStreamOutput> => {
+	prototype.send = async function (command: unknown): Promise<ConverseStreamOutput> {
 		const commandWithInput = command as { input?: unknown };
 		capturedPayload = stableValue(commandWithInput.input);
 		return {
@@ -1064,85 +1418,90 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	};
 
 	try {
-		const runtimeModel = toRuntimeModel(scenario.input.model);
-		const runtimeContext = toRuntimeContext(scenario.input.context);
-		const runtimeOptions = toRuntimeOptions(scenario.input.options);
-		if (scenario.input.options.onPayload === "pass-through") {
-			runtimeOptions.onPayload = () => undefined;
-		} else if (scenario.input.options.onPayload === "replace") {
-			runtimeOptions.onPayload = () => ({
-				modelId: scenario.input.model.id,
-				messages: [{ role: "user", content: [{ text: "replacement payload" }] }],
-				inferenceConfig: { maxTokens: 7 },
-				requestMetadata: { replacement: "true" },
-			});
-		}
-		if (scenario.input.options.onResponse === "capture") {
-			runtimeOptions.onResponse = (response) => {
-				capturedResponse = {
-					status: response.status,
-					headers: stableValue(response.headers) as Record<string, string>,
+		return await withScenarioEnv(scenario, async () => {
+			const runtimeModel = toRuntimeModel(scenario.input.model);
+			const runtimeContext = toRuntimeContext(scenario.input.context);
+			const runtimeOptions = toRuntimeOptions(scenario.input.options);
+			if (scenario.input.options.onPayload === "pass-through") {
+				runtimeOptions.onPayload = () => undefined;
+			} else if (scenario.input.options.onPayload === "replace") {
+				runtimeOptions.onPayload = () => ({
+					modelId: scenario.input.model.id,
+					messages: [{ role: "user", content: [{ text: "replacement payload" }] }],
+					inferenceConfig: { maxTokens: 7 },
+					requestMetadata: { replacement: "true" },
+				});
+			}
+			if (scenario.input.options.onResponse === "capture") {
+				runtimeOptions.onResponse = (response) => {
+					capturedResponse = {
+						status: response.status,
+						headers: stableValue(response.headers) as Record<string, string>,
+					};
 				};
+			}
+
+			const stream =
+				scenario.input.mode === "streamSimpleBedrock"
+					? streamSimpleBedrock(runtimeModel, runtimeContext, runtimeOptions as SimpleStreamOptions)
+					: streamBedrock(runtimeModel, runtimeContext, runtimeOptions);
+			const events: SemanticEvent[] = [];
+			for await (const event of stream) {
+				events.push(semanticEvent(event));
+			}
+			const terminalEvent = events.at(-1);
+			if (terminalEvent?.type !== "done") {
+				throw new Error(`Scenario ${scenario.id} did not complete with a done event`);
+			}
+			if (capturedPayload === undefined) {
+				throw new Error(`Scenario ${scenario.id} did not capture a Bedrock Converse command input`);
+			}
+			if (scenario.input.options.onResponse === "capture" && capturedResponse === undefined) {
+				throw new Error(`Scenario ${scenario.id} did not capture onResponse metadata`);
+			}
+
+			return {
+				schemaVersion,
+				id: scenario.id,
+				title: scenario.title,
+				input: scenario.input,
+				expected: {
+					typeScriptRequest: {
+						mode: scenario.input.mode,
+						payload: capturedPayload,
+						...(scenario.input.options.requestSurface === "capture"
+							? { requestSurface: buildRequestSurfaceSnapshot(scenario, capturedPayload) }
+							: {}),
+					},
+					typeScriptStream: events,
+					...(capturedResponse ? { onResponse: capturedResponse } : {}),
+					...(scenario.input.localStream.format === "aws-eventstream"
+						? {
+								binaryEventStream: {
+									encoding: "base64",
+									format: "aws-eventstream",
+									base64: buildEventStreamBase64(scenario.input.localStream.events),
+									eventTypes: scenario.input.localStream.events.map(eventType),
+								},
+							}
+						: {}),
+				},
+				metadata: {
+					captureBoundary:
+						"streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
+					captureMethod:
+						"BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
+					network: "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
+					allowlists: {
+						scenarioIds: allowedScenarioIds,
+						modelIds: allowedModelIds,
+						localStreamFormats: allowedLocalStreamFormats,
+						ignoredPaths: allowedIgnoredPaths,
+					},
+					sourceCitations,
+				},
 			};
-		}
-
-		const stream =
-			scenario.input.mode === "streamSimpleBedrock"
-				? streamSimpleBedrock(runtimeModel, runtimeContext, runtimeOptions as SimpleStreamOptions)
-				: streamBedrock(runtimeModel, runtimeContext, runtimeOptions);
-		const events: SemanticEvent[] = [];
-		for await (const event of stream) {
-			events.push(semanticEvent(event));
-		}
-		const terminalEvent = events.at(-1);
-		if (terminalEvent?.type !== "done") {
-			throw new Error(`Scenario ${scenario.id} did not complete with a done event`);
-		}
-		if (capturedPayload === undefined) {
-			throw new Error(`Scenario ${scenario.id} did not capture a Bedrock Converse command input`);
-		}
-		if (scenario.input.options.onResponse === "capture" && capturedResponse === undefined) {
-			throw new Error(`Scenario ${scenario.id} did not capture onResponse metadata`);
-		}
-
-		return {
-			schemaVersion,
-			id: scenario.id,
-			title: scenario.title,
-			input: scenario.input,
-			expected: {
-				typeScriptRequest: {
-					mode: scenario.input.mode,
-					payload: capturedPayload,
-				},
-				typeScriptStream: events,
-				...(capturedResponse ? { onResponse: capturedResponse } : {}),
-				...(scenario.input.localStream.format === "aws-eventstream"
-					? {
-							binaryEventStream: {
-								encoding: "base64",
-								format: "aws-eventstream",
-								base64: buildEventStreamBase64(scenario.input.localStream.events),
-								eventTypes: scenario.input.localStream.events.map(eventType),
-							},
-						}
-					: {}),
-			},
-			metadata: {
-				captureBoundary:
-					"streamBedrock/streamSimpleBedrock after TypeScript Converse command construction and before BedrockRuntimeClient.send would contact AWS",
-				captureMethod:
-					"BedrockRuntimeClient.prototype.send is replaced with a deterministic local mock that records command.input and returns fixed Converse stream events",
-				network: "BedrockRuntimeClient.send prototype mock rejects unhandled remote behavior",
-				allowlists: {
-					scenarioIds: allowedScenarioIds,
-					modelIds: allowedModelIds,
-					localStreamFormats: allowedLocalStreamFormats,
-					ignoredPaths: allowedIgnoredPaths,
-				},
-				sourceCitations,
-			},
-		};
+		});
 	} finally {
 		prototype.send = originalSend;
 	}
@@ -1423,7 +1782,7 @@ async function buildRecords(): Promise<FixtureRecord[]> {
 		AWS_REGION: "",
 		AWS_DEFAULT_REGION: "",
 		AWS_EC2_METADATA_DISABLED: "true",
-		AWS_BEDROCK_SKIP_AUTH: "1",
+		AWS_BEDROCK_SKIP_AUTH: "",
 	});
 	try {
 		const records: FixtureRecord[] = [];

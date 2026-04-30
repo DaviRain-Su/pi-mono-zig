@@ -32,6 +32,29 @@ const AwsCredentials = struct {
     }
 };
 
+const BedrockAuth = union(enum) {
+    sigv4: AwsCredentials,
+    bearer: []const u8,
+
+    fn deinit(self: BedrockAuth, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .sigv4 => |credentials| credentials.deinit(allocator),
+            .bearer => |token| allocator.free(token),
+        }
+    }
+};
+
+pub const FixtureEnv = struct {
+    aws_access_key_id: ?[]const u8 = null,
+    aws_secret_access_key: ?[]const u8 = null,
+    aws_session_token: ?[]const u8 = null,
+    aws_profile: ?[]const u8 = null,
+    aws_bearer_token_bedrock: ?[]const u8 = null,
+    aws_region: ?[]const u8 = null,
+    aws_default_region: ?[]const u8 = null,
+    aws_bedrock_skip_auth: ?[]const u8 = null,
+};
+
 const RequestTimestamp = struct {
     amz_date: []const u8,
     date_stamp: []const u8,
@@ -84,11 +107,11 @@ pub const BedrockProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        const credentials = resolveAwsCredentials(allocator) catch |err| {
+        const auth = resolveBedrockAuth(allocator, options) catch |err| {
             try emitAuthError(allocator, &stream_instance, model, authErrorMessage(err));
             return stream_instance;
         };
-        defer credentials.deinit(allocator);
+        defer auth.deinit(allocator);
 
         const timestamp = try currentTimestamp(allocator);
         defer timestamp.deinit(allocator);
@@ -121,7 +144,14 @@ pub const BedrockProvider = struct {
         if (options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
         }
-        try signRequestHeaders(allocator, &headers, model, request_path, json_body, credentials, timestamp);
+        switch (auth) {
+            .sigv4 => |credentials| try signRequestHeaders(allocator, &headers, model, request_path, json_body, credentials, timestamp, options),
+            .bearer => |token| {
+                const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+                defer allocator.free(authorization);
+                try putOwnedHeader(allocator, &headers, "Authorization", authorization);
+            },
+        }
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -187,6 +217,13 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
         .signal = stream_options.signal,
         .max_retry_delay_ms = stream_options.max_retry_delay_ms,
         .metadata = stream_options.metadata,
+        .bedrock_region = stream_options.bedrock_region,
+        .bedrock_profile = stream_options.bedrock_profile,
+        .bedrock_bearer_token = stream_options.bedrock_bearer_token,
+        .bedrock_tool_choice = stream_options.bedrock_tool_choice,
+        .bedrock_interleaved_thinking = stream_options.bedrock_interleaved_thinking,
+        .bedrock_thinking_display = stream_options.bedrock_thinking_display,
+        .bedrock_request_metadata = stream_options.bedrock_request_metadata,
     };
 
     const reasoning = stream_options.bedrock_reasoning orelse return base;
@@ -296,6 +333,58 @@ pub fn buildRequestSnapshotValue(
     }
     try request.put(allocator, try allocator.dupe(u8, "payload"), payload);
     return .{ .object = request };
+}
+
+pub fn buildRequestSurfaceSnapshotValue(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    payload: std.json.Value,
+    fixture_env: FixtureEnv,
+) !std.json.Value {
+    _ = payload;
+    const request_path = try buildRequestPath(allocator, model.id);
+    defer allocator.free(request_path);
+    const region = resolveFixtureRegion(model.base_url, options, fixture_env);
+    const endpoint = try resolveFixtureEndpoint(allocator, model.base_url, region, fixture_env, options);
+    defer if (endpoint.value) |value| allocator.free(value);
+
+    var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer root.deinit(allocator);
+    try root.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
+    try root.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, request_path) });
+    if (endpoint.value) |base_url| {
+        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, request_path });
+        try root.put(allocator, try allocator.dupe(u8, "url"), .{ .string = url });
+    } else {
+        try root.put(allocator, try allocator.dupe(u8, "url"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
+    }
+
+    var endpoint_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try endpoint_object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, endpoint.mode) });
+    if (endpoint.value) |value| try endpoint_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
+    try root.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .object = endpoint_object });
+
+    var region_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try region_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, region.source) });
+    if (region.value) |value| try region_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
+    try root.put(allocator, try allocator.dupe(u8, "region"), .{ .object = region_object });
+
+    var client_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    if (options) |stream_options| {
+        if (stream_options.bedrock_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
+    }
+    if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
+    if (std.mem.eql(u8, endpoint.mode, "explicit")) {
+        if (endpoint.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .string = try allocator.dupe(u8, value) });
+    }
+    if (region.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, value) });
+    try root.put(allocator, try allocator.dupe(u8, "clientConfig"), .{ .object = client_config });
+
+    const auth = try buildFixtureAuthSnapshot(allocator, options, fixture_env, region);
+    try root.put(allocator, try allocator.dupe(u8, "auth"), auth);
+    try root.put(allocator, try allocator.dupe(u8, "redaction"), .{ .string = try allocator.dupe(u8, "secrets-redacted") });
+    return .{ .object = root };
 }
 
 pub fn buildStreamSnapshotValueFromLocalEvents(
@@ -892,6 +981,31 @@ fn resolveAwsCredentials(allocator: std.mem.Allocator) !AwsCredentials {
     };
 }
 
+fn resolveBedrockAuth(allocator: std.mem.Allocator, options: ?types.StreamOptions) !BedrockAuth {
+    const skip_auth = if (try loadEnvOptional(allocator, "AWS_BEDROCK_SKIP_AUTH")) |value| blk: {
+        defer allocator.free(value);
+        break :blk std.mem.eql(u8, value, "1");
+    } else false;
+
+    if (skip_auth) {
+        return .{ .sigv4 = .{
+            .access_key_id = try allocator.dupe(u8, "dummy-access-key"),
+            .secret_access_key = try allocator.dupe(u8, "dummy-secret-key"),
+        } };
+    }
+
+    if (options) |stream_options| {
+        if (stream_options.bedrock_bearer_token) |token| {
+            return .{ .bearer = try allocator.dupe(u8, token) };
+        }
+    }
+    if (try loadEnvOptional(allocator, "AWS_BEARER_TOKEN_BEDROCK")) |token| {
+        return .{ .bearer = token };
+    }
+
+    return .{ .sigv4 = try resolveAwsCredentials(allocator) };
+}
+
 fn loadEnvRequired(allocator: std.mem.Allocator, name: []const u8, comptime err: anytype) ![]u8 {
     return try loadEnvOptional(allocator, name) orelse err;
 }
@@ -949,7 +1063,10 @@ fn percentEncodePathSegment(allocator: std.mem.Allocator, value: []const u8) ![]
     return try list.toOwnedSlice(allocator);
 }
 
-fn resolveBedrockRegion(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+fn resolveBedrockRegion(allocator: std.mem.Allocator, base_url: []const u8, options: ?types.StreamOptions) ![]u8 {
+    if (options) |stream_options| {
+        if (stream_options.bedrock_region) |region| return try allocator.dupe(u8, region);
+    }
     if (try loadEnvOptional(allocator, "AWS_REGION")) |region| return region;
     if (try loadEnvOptional(allocator, "AWS_DEFAULT_REGION")) |region| return region;
 
@@ -992,10 +1109,11 @@ fn signRequestHeaders(
     body: []const u8,
     credentials: AwsCredentials,
     timestamp: RequestTimestamp,
+    options: ?types.StreamOptions,
 ) !void {
     const host = try extractHostFromUrl(allocator, model.base_url);
     defer allocator.free(host);
-    const region = try resolveBedrockRegion(allocator, model.base_url);
+    const region = try resolveBedrockRegion(allocator, model.base_url, options);
     defer allocator.free(region);
 
     try putOwnedHeader(allocator, headers, "host", host);
@@ -1876,6 +1994,146 @@ fn trimTrailingSlash(value: []const u8) []const u8 {
     return value[0..end];
 }
 
+const FixtureRegion = struct {
+    source: []const u8,
+    value: ?[]const u8 = null,
+};
+
+const FixtureEndpoint = struct {
+    mode: []const u8,
+    value: ?[]const u8 = null,
+};
+
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    const text = value orelse return null;
+    if (text.len == 0) return null;
+    return text;
+}
+
+fn standardEndpointRegion(base_url: []const u8) ?[]const u8 {
+    const prefix = "https://";
+    const rest = if (std.mem.startsWith(u8, base_url, prefix)) base_url[prefix.len..] else base_url;
+    const host_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const host = rest[0..host_end];
+    const prefixes = [_][]const u8{ "bedrock-runtime.", "bedrock-runtime-fips." };
+    for (prefixes) |pattern| {
+        if (std.mem.startsWith(u8, host, pattern)) {
+            const after = host[pattern.len..];
+            if (std.mem.indexOf(u8, after, ".amazonaws.com.cn")) |end| return after[0..end];
+            if (std.mem.indexOf(u8, after, ".amazonaws.com")) |end| return after[0..end];
+        }
+    }
+    return null;
+}
+
+fn resolveFixtureRegion(base_url: []const u8, options: ?types.StreamOptions, env: FixtureEnv) FixtureRegion {
+    if (options) |stream_options| {
+        if (nonEmpty(stream_options.bedrock_region)) |region| return .{ .source = "options.region", .value = region };
+    }
+    if (nonEmpty(env.aws_region)) |region| return .{ .source = "AWS_REGION", .value = region };
+    if (nonEmpty(env.aws_default_region)) |region| return .{ .source = "AWS_DEFAULT_REGION", .value = region };
+    if (standardEndpointRegion(base_url)) |region| {
+        if (nonEmpty(env.aws_profile) == null) return .{ .source = "endpoint", .value = region };
+    }
+    if (nonEmpty(env.aws_profile) != null) return .{ .source = "sdk-profile-resolution" };
+    return .{ .source = "default", .value = "us-east-1" };
+}
+
+fn hasConfiguredFixtureRegion(options: ?types.StreamOptions, env: FixtureEnv) bool {
+    if (options) |stream_options| {
+        if (nonEmpty(stream_options.bedrock_region) != null) return true;
+    }
+    return nonEmpty(env.aws_region) != null or nonEmpty(env.aws_default_region) != null;
+}
+
+fn resolveFixtureEndpoint(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    region: FixtureRegion,
+    env: FixtureEnv,
+    options: ?types.StreamOptions,
+) !FixtureEndpoint {
+    const endpoint_region = standardEndpointRegion(base_url);
+    const use_explicit_endpoint = endpoint_region == null or (!hasConfiguredFixtureRegion(options, env) and nonEmpty(env.aws_profile) == null);
+    if (use_explicit_endpoint) {
+        return .{ .mode = "explicit", .value = try allocator.dupe(u8, trimTrailingSlash(base_url)) };
+    }
+    const region_value = region.value orelse return .{ .mode = "sdk-profile-resolution" };
+    const suffix = if (std.mem.startsWith(u8, region_value, "cn-")) "amazonaws.com.cn" else "amazonaws.com";
+    return .{ .mode = "sdk-default", .value = try std.fmt.allocPrint(allocator, "https://bedrock-runtime.{s}.{s}", .{ region_value, suffix }) };
+}
+
+fn buildFixtureAuthSnapshot(
+    allocator: std.mem.Allocator,
+    options: ?types.StreamOptions,
+    env: FixtureEnv,
+    region: FixtureRegion,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+
+    const option_bearer = if (options) |stream_options| nonEmpty(stream_options.bedrock_bearer_token) else null;
+    const env_bearer = nonEmpty(env.aws_bearer_token_bedrock);
+
+    if (std.mem.eql(u8, nonEmpty(env.aws_bedrock_skip_auth) orelse "", "1")) {
+        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "skip-auth") });
+        try object.put(allocator, try allocator.dupe(u8, "credentialSource"), .{ .string = try allocator.dupe(u8, "proxy-dummy") });
+        try object.put(allocator, try allocator.dupe(u8, "bearerSuppressed"), .{ .bool = option_bearer != null or env_bearer != null });
+        try object.put(allocator, try allocator.dupe(u8, "secrets"), .{ .string = try allocator.dupe(u8, "redacted") });
+        return .{ .object = object };
+    }
+
+    if (option_bearer != null or env_bearer != null) {
+        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "bearer") });
+        try object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, if (option_bearer != null) "options.bearerToken" else "env.bearerToken") });
+        try object.put(allocator, try allocator.dupe(u8, "token"), .{ .string = try allocator.dupe(u8, "redacted") });
+        try object.put(allocator, try allocator.dupe(u8, "sigv4"), .{ .bool = false });
+        return .{ .object = object };
+    }
+
+    if ((options != null and nonEmpty(options.?.bedrock_profile) != null) or nonEmpty(env.aws_profile) != null) {
+        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "profile") });
+        if (options) |stream_options| {
+            if (nonEmpty(stream_options.bedrock_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
+        }
+        if (nonEmpty(env.aws_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
+        try object.put(allocator, try allocator.dupe(u8, "credentialDiscovery"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
+        return .{ .object = object };
+    }
+
+    if (nonEmpty(env.aws_access_key_id) != null and nonEmpty(env.aws_secret_access_key) != null) {
+        const signing_region = region.value orelse "us-east-1";
+        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "sigv4") });
+        try object.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
+        try object.put(allocator, try allocator.dupe(u8, "query"), .{ .string = try allocator.dupe(u8, "") });
+        try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
+        try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, signing_region) });
+        try object.put(allocator, try allocator.dupe(u8, "amzDate"), .{ .string = try allocator.dupe(u8, "20250115T120000Z") });
+        var credential_scope = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        try credential_scope.put(allocator, try allocator.dupe(u8, "date"), .{ .string = try allocator.dupe(u8, "20250115") });
+        try credential_scope.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, signing_region) });
+        try credential_scope.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
+        try credential_scope.put(allocator, try allocator.dupe(u8, "terminal"), .{ .string = try allocator.dupe(u8, "aws4_request") });
+        try object.put(allocator, try allocator.dupe(u8, "credentialScope"), .{ .object = credential_scope });
+        var signed_headers = std.json.Array.init(allocator);
+        inline for (&[_][]const u8{ "content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token" }) |header| {
+            try signed_headers.append(.{ .string = try allocator.dupe(u8, header) });
+        }
+        try object.put(allocator, try allocator.dupe(u8, "signedHeaders"), .{ .array = signed_headers });
+        try object.put(allocator, try allocator.dupe(u8, "bodySha256"), .{ .string = try allocator.dupe(u8, "normalized-payload-sha256") });
+        if (nonEmpty(env.aws_session_token) != null) try object.put(allocator, try allocator.dupe(u8, "sessionToken"), .{ .string = try allocator.dupe(u8, "redacted") });
+        try object.put(allocator, try allocator.dupe(u8, "accessKeyId"), .{ .string = try allocator.dupe(u8, "redacted") });
+        try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, "normalized") });
+        return .{ .object = object };
+    }
+
+    try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "missing-credentials") });
+    try object.put(allocator, try allocator.dupe(u8, "errorSurface"), .{ .string = try allocator.dupe(u8, "async-stream-error") });
+    try object.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, "Bedrock requires AWS_ACCESS_KEY_ID.") });
+    try object.put(allocator, try allocator.dupe(u8, "network"), .{ .string = try allocator.dupe(u8, "not-attempted") });
+    return .{ .object = object };
+}
+
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     if (options) |stream_options| {
         if (stream_options.signal) |signal| return signal.load(.seq_cst);
@@ -2230,6 +2488,7 @@ test "signRequestHeaders creates sigv4 authorization and security token" {
             .amz_date = "20250115T120000Z",
             .date_stamp = "20250115",
         },
+        null,
     );
 
     try std.testing.expectEqualStrings("bedrock-runtime.us-east-1.amazonaws.com", headers.get("host").?);

@@ -3,35 +3,43 @@
     "typeScriptRequest": {
       "mode": "streamBedrock",
       "payload": {
-        "additionalModelRequestFields": {
-          "anthropic_beta": [
-            "interleaved-thinking-2025-05-14"
-          ],
-          "thinking": {
-            "budget_tokens": 16384,
-            "display": "summarized",
-            "type": "enabled"
-          }
-        },
         "inferenceConfig": {
-          "maxTokens": 20000
+          "maxTokens": 32
         },
         "messages": [
           {
             "content": [
               {
-                "text": "Return a concise Bedrock fixture response."
+                "text": "Auth surface fixture bedrock-auth-region-precedence-options."
               }
             ],
             "role": "user"
           }
         ],
-        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "system": [
-          {
-            "text": "You are the deterministic Bedrock fixture assistant."
-          }
-        ]
+        "modelId": "anthropic.claude-3-7-sonnet-20250219-v1:0"
+      },
+      "requestSurface": {
+        "auth": {
+          "bearerSuppressed": false,
+          "credentialSource": "proxy-dummy",
+          "mode": "skip-auth",
+          "secrets": "redacted"
+        },
+        "clientConfig": {
+          "region": "ap-southeast-2"
+        },
+        "endpoint": {
+          "mode": "sdk-default",
+          "value": "https://bedrock-runtime.ap-southeast-2.amazonaws.com"
+        },
+        "method": "POST",
+        "path": "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream",
+        "redaction": "secrets-redacted",
+        "region": {
+          "source": "options.region",
+          "value": "ap-southeast-2"
+        },
+        "url": "https://bedrock-runtime.ap-southeast-2.amazonaws.com/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse-stream"
       }
     },
     "typeScriptStream": [
@@ -84,16 +92,20 @@
       }
     ]
   },
-  "id": "bedrock-reasoning-fixed-default-xhigh",
+  "id": "bedrock-auth-region-precedence-options",
   "input": {
     "context": {
       "messages": [
         {
-          "content": "Return a concise Bedrock fixture response.",
+          "content": "Auth surface fixture bedrock-auth-region-precedence-options.",
           "role": "user"
         }
-      ],
-      "systemPrompt": "You are the deterministic Bedrock fixture assistant."
+      ]
+    },
+    "env": {
+      "AWS_BEDROCK_SKIP_AUTH": "1",
+      "AWS_DEFAULT_REGION": "us-east-2",
+      "AWS_REGION": "us-west-2"
     },
     "localStream": {
       "events": [
@@ -135,7 +147,7 @@
     "mode": "streamBedrock",
     "model": {
       "api": "bedrock-converse-stream",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "baseUrl": "https://bedrock-runtime.eu-central-1.amazonaws.com",
       "id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
       "input": [
         "text"
@@ -146,8 +158,9 @@
     },
     "options": {
       "cacheRetention": "none",
-      "maxTokens": 20000,
-      "reasoning": "xhigh"
+      "maxTokens": 32,
+      "region": "ap-southeast-2",
+      "requestSurface": "capture"
     }
   },
   "metadata": {
@@ -251,5 +264,5 @@
     ]
   },
   "schemaVersion": 1,
-  "title": "Bedrock fixed Claude xhigh reasoning clamps to the high default token budget"
+  "title": "Bedrock options.region takes precedence over environment and endpoint regions"
 }
