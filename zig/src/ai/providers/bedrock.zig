@@ -142,9 +142,24 @@ pub const BedrockProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => try emitSetupRuntimeFailure(allocator, &stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
         const auth = resolveBedrockAuth(allocator, options) catch |err| {
-            try emitAuthError(allocator, &stream_instance, model, authErrorMessage(err));
-            return stream_instance;
+            try emitAuthError(allocator, stream_instance, model, authErrorMessage(err));
+            return;
         };
         defer auth.deinit(allocator);
 
@@ -219,12 +234,11 @@ pub const BedrockProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseStreamBody(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseStreamBody(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -518,10 +532,10 @@ pub fn buildStreamSnapshotValueFromLocalEventsWithTerminalFailure(
             if (failure.timing == .after_events) {
                 try emitStreamFailureMessage(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, failure.stop_reason, failure.message);
             } else {
-                try finalizeOutput(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
+                try finalizeOutputSafely(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
             }
         } else {
-            try finalizeOutput(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
+            try finalizeOutputSafely(parse_allocator, &stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
         }
     }
 
@@ -1542,7 +1556,7 @@ fn parseEventStreamFrames(
         if (output.stop_reason == .error_reason and output.error_message != null and stream_ptr.result() != null) return;
     }
 
-    try finalizeOutput(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
+    try finalizeOutputSafely(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
 }
 
 const EventStreamHeaders = struct {
@@ -1746,7 +1760,7 @@ fn parseTextStreamLines(
         if (stream_ptr.result() != null) return;
     }
 
-    try finalizeOutput(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
+    try finalizeOutputSafely(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
 }
 
 fn handleEventValue(
@@ -1774,6 +1788,17 @@ fn handleEventValue(
             try collectOutputFromPartials(allocator, output, content_blocks, tool_calls, active_blocks);
             output.stop_reason = .error_reason;
             output.error_message = try buildExceptionMessage(allocator, field, exception_value);
+            stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output.* });
+            stream_ptr.end(output.*);
+            return;
+        }
+    }
+    var exception_iterator = value.object.iterator();
+    while (exception_iterator.next()) |entry| {
+        if (std.mem.endsWith(u8, entry.key_ptr.*, "Exception")) {
+            try collectOutputFromPartials(allocator, output, content_blocks, tool_calls, active_blocks);
+            output.stop_reason = .error_reason;
+            output.error_message = try buildExceptionMessage(allocator, entry.key_ptr.*, entry.value_ptr.*);
             stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output.* });
             stream_ptr.end(output.*);
             return;
@@ -1826,17 +1851,30 @@ fn buildExceptionMessage(allocator: std.mem.Allocator, field: []const u8, value:
         "Bedrock streaming request failed";
     const detail = try provider_error.sanitizeProviderErrorDetail(allocator, raw_detail);
     defer allocator.free(detail);
-    const prefix = bedrockExceptionPrefix(field);
+    const prefix = try bedrockExceptionPrefix(allocator, field);
+    defer allocator.free(prefix);
     return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ prefix, detail });
 }
 
-fn bedrockExceptionPrefix(field: []const u8) []const u8 {
-    if (std.mem.eql(u8, field, "internalServerException")) return "Internal server error";
-    if (std.mem.eql(u8, field, "modelStreamErrorException")) return "Model stream error";
-    if (std.mem.eql(u8, field, "validationException")) return "Validation error";
-    if (std.mem.eql(u8, field, "throttlingException")) return "Throttling error";
-    if (std.mem.eql(u8, field, "serviceUnavailableException")) return "Service unavailable";
-    return field;
+fn bedrockExceptionPrefix(allocator: std.mem.Allocator, field: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, field, "internalServerException")) return allocator.dupe(u8, "Internal server error");
+    if (std.mem.eql(u8, field, "modelStreamErrorException")) return allocator.dupe(u8, "Model stream error");
+    if (std.mem.eql(u8, field, "validationException")) return allocator.dupe(u8, "Validation error");
+    if (std.mem.eql(u8, field, "throttlingException")) return allocator.dupe(u8, "Throttling error");
+    if (std.mem.eql(u8, field, "serviceUnavailableException")) return allocator.dupe(u8, "Service unavailable");
+    return sanitizeExceptionName(allocator, field);
+}
+
+fn sanitizeExceptionName(allocator: std.mem.Allocator, field: []const u8) ![]const u8 {
+    const limit = @min(field.len, 96);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    for (field[0..limit]) |byte| {
+        try out.append(allocator, if (byte >= 0x20 and byte < 0x7f and byte != '\n' and byte != '\r' and byte != '\t') byte else '_');
+    }
+    if (out.items.len == 0) return allocator.dupe(u8, "Bedrock exception");
+    if (field.len > limit) try out.appendSlice(allocator, "...");
+    return out.toOwnedSlice(allocator);
 }
 
 fn handleContentBlockStart(
@@ -2120,7 +2158,10 @@ fn finalizeOutputFromPartials(
                 stream_ptr.push(.{ .event_type = .thinking_end, .content_index = @intCast(entry.event_index), .content = owned });
             },
             .tool_call => |tool| {
-                var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
+                var parsed_arguments = json_parse.parseStreamingJson(allocator, tool.partial_json.items) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
                 defer parsed_arguments.deinit();
                 const final_tool_call = types.ToolCall{
                     .id = try allocator.dupe(u8, tool.id),
@@ -2164,7 +2205,10 @@ fn collectOutputFromPartials(
                 try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .thinking = .{ .thinking = owned, .signature = signature, .redacted = false } });
             },
             .tool_call => |tool| {
-                var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
+                var parsed_arguments = json_parse.parseStreamingJson(allocator, tool.partial_json.items) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => continue,
+                };
                 defer parsed_arguments.deinit();
                 const final_tool_call = types.ToolCall{
                     .id = try allocator.dupe(u8, tool.id),
@@ -2224,6 +2268,41 @@ fn emitRuntimeFailure(
         provider_error.runtimeStopReason(err),
         provider_error.runtimeErrorMessage(err),
     );
+}
+
+fn emitSetupRuntimeFailure(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) !void {
+    var output = initOutput(model);
+    var content_blocks = std.ArrayList(types.ContentBlock).empty;
+    defer content_blocks.deinit(allocator);
+    var tool_calls = std.ArrayList(types.ToolCall).empty;
+    defer tool_calls.deinit(allocator);
+    var active_blocks = std.ArrayList(BlockEntry).empty;
+    defer active_blocks.deinit(allocator);
+
+    const effective_err = if (isAbortRequested(options)) error.RequestAborted else err;
+    try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, effective_err);
+}
+
+fn finalizeOutputSafely(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
+    model: types.Model,
+) !void {
+    finalizeOutput(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, state, model) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => try emitRuntimeFailure(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, err),
+    };
 }
 
 fn finalizeOutput(
@@ -2762,6 +2841,29 @@ test "Bedrock stream on_response observes non-200 metadata before sanitized erro
     try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 503:"));
 }
 
+test "Bedrock stream converts pre-aborted requestStreaming failure into terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    var stream = try BedrockProvider.stream(
+        allocator,
+        io,
+        bedrockTestModel("https://bedrock-runtime.us-east-1.amazonaws.com"),
+        bedrockTestContext(),
+        .{ .bedrock_bearer_token = "fixture-token", .signal = &aborted },
+    );
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", event.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "VAL-MSG-010 Bedrock skips failed assistants" {
     const allocator = std.testing.allocator;
     const model = types.Model{
@@ -2952,6 +3054,25 @@ fn appendEventStreamFrame(
     var headers = std.ArrayList(u8).empty;
     defer headers.deinit(allocator);
     try appendEventStreamHeader(allocator, &headers, ":event-type", event_type);
+
+    const total_length = 16 + headers.items.len + payload.len;
+    try appendBigEndianU32(frames, allocator, total_length);
+    try appendBigEndianU32(frames, allocator, headers.items.len);
+    try appendBigEndianU32(frames, allocator, 0);
+    try frames.appendSlice(allocator, headers.items);
+    try frames.appendSlice(allocator, payload);
+    try appendBigEndianU32(frames, allocator, 0);
+}
+
+fn appendEventStreamExceptionFrame(
+    allocator: std.mem.Allocator,
+    frames: *std.ArrayList(u8),
+    exception_type: []const u8,
+    payload: []const u8,
+) !void {
+    var headers = std.ArrayList(u8).empty;
+    defer headers.deinit(allocator);
+    try appendEventStreamHeader(allocator, &headers, ":exception-type", exception_type);
 
     const total_length = 16 + headers.items.len + payload.len;
     try appendBigEndianU32(frames, allocator, total_length);
@@ -3224,6 +3345,89 @@ test "parseEventStreamFrames finalizes partial Bedrock blocks before provider ex
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "sk-bedrock-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "parseEventStreamFrames surfaces unknown binary exception raw name" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock");
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+    try appendEventStreamExceptionFrame(allocator, &body, "UnmodeledBedrockException", "{\"message\":\"raw unknown failure\"}");
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseEventStreamFrames(allocator, &stream, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(std.mem.startsWith(u8, terminal.error_message.?, "UnmodeledBedrockException: raw unknown failure"));
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "parseEventStreamFrames converts invalid terminal state into partial-preserving error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock");
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial terminal text\"}}");
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseEventStreamFrames(allocator, &stream, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_delta, stream.next().?.event_type);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("partial terminal text", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("InvalidBedrockChunk", terminal.error_message.?);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "parseEventStreamFrames drops unsafe active tool scratch on terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock");
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"safe text\"}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":0}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStart", "{\"contentBlockIndex\":1,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-1\",\"name\":\"get_weather\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":1,\"delta\":{\"toolUse\":{\"input\":\"{\\\"city\\\":\"}}}");
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseEventStreamFrames(allocator, &stream, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_delta, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_end, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, stream.next().?.event_type);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("safe text", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), terminal.message.?.content.len);
+    try std.testing.expect(terminal.message.?.tool_calls == null);
+    try std.testing.expectEqualStrings("InvalidBedrockChunk", terminal.error_message.?);
     try std.testing.expect(stream.next() == null);
 }
 
