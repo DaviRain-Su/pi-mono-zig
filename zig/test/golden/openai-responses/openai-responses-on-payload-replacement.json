@@ -1,0 +1,137 @@
+{
+  "expected": {
+    "onPayload": {
+      "observedPayload": {
+        "input": [
+          {
+            "content": [
+              {
+                "text": "This original prompt is replaced.",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-responses-replacement-fixture",
+        "store": false,
+        "stream": true
+      },
+      "replacementPayload": {
+        "fixture_marker": "responses-on-payload-replacement",
+        "input": [
+          {
+            "content": [
+              {
+                "text": "payload replaced by deterministic fixture callback",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "fixture-replacement-model",
+        "stream": true
+      }
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "accept": "application/json",
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "fixture_marker": "responses-on-payload-replacement",
+        "input": [
+          {
+            "content": [
+              {
+                "text": "payload replaced by deterministic fixture callback",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "fixture-replacement-model",
+        "stream": true
+      },
+      "method": "POST",
+      "path": "/v1/responses",
+      "query": {},
+      "requestOptions": {
+        "signal": "not-provided"
+      },
+      "transportMetadata": {
+        "mockedResponseHeaders": {
+          "content-type": "text/event-stream",
+          "x-fixture-response": "openai-responses-on-payload-replacement"
+        },
+        "mockedStatus": 200,
+        "mode": "sse",
+        "providerFamily": "openai",
+        "requestBoundary": "before local mocked SSE response body is consumed"
+      },
+      "url": "https://api.openai.com/v1/responses"
+    }
+  },
+  "id": "openai-responses-on-payload-replacement",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "This original prompt is replaced.",
+          "role": "user"
+        }
+      ]
+    },
+    "model": {
+      "api": "openai-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "id": "gpt-4.1-responses-replacement-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 4.1 Responses Fixture",
+      "provider": "openai",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder",
+      "onPayload": "replace-with-fixture-payload",
+      "payloadReplacement": {
+        "fixture_marker": "responses-on-payload-replacement",
+        "input": [
+          {
+            "content": [
+              {
+                "text": "payload replaced by deterministic fixture callback",
+                "type": "input_text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "fixture-replacement-model",
+        "stream": true
+      }
+    }
+  },
+  "metadata": {
+    "captureBoundary": "Responses-family request after model/options resolution, payload conversion, header merge, callbacks, and before live HTTP/WebSocket transport",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records final request semantics and rejects unhandled hosts",
+    "diffOutputBoundBytes": 12000,
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-responses.ts",
+      "packages/ai/src/providers/openai-responses-shared.ts",
+      "packages/ai/src/providers/github-copilot-headers.ts",
+      "packages/ai/src/providers/azure-openai-responses.ts",
+      "packages/ai/src/providers/openai-codex-responses.ts"
+    ]
+  },
+  "providerFamily": "openai",
+  "schemaVersion": 1,
+  "title": "OpenAI Responses onPayload replacement is captured at the final request boundary"
+}

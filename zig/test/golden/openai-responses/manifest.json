@@ -1,0 +1,28 @@
+{
+  "captureBoundary": "TypeScript Responses-family request after final payload/header/options resolution and before live transport",
+  "diffOutputBoundBytes": 12000,
+  "fixtureCount": 5,
+  "generatedBy": "zig/test/generate-openai-responses-fixtures.ts",
+  "network": "local mocked global fetch only; unhandled requests throw",
+  "providerFamilies": [
+    "openai",
+    "github-copilot",
+    "azure-openai",
+    "openai-codex"
+  ],
+  "scenarioIds": [
+    "openai-responses-basic-request",
+    "copilot-responses-dynamic-headers",
+    "azure-responses-basic-override-request",
+    "codex-responses-sse-basic-request",
+    "openai-responses-on-payload-replacement"
+  ],
+  "schemaVersion": 1,
+  "sourceCitations": [
+    "packages/ai/src/providers/openai-responses.ts",
+    "packages/ai/src/providers/openai-responses-shared.ts",
+    "packages/ai/src/providers/github-copilot-headers.ts",
+    "packages/ai/src/providers/azure-openai-responses.ts",
+    "packages/ai/src/providers/openai-codex-responses.ts"
+  ]
+}
