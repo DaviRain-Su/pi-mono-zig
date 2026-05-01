@@ -44,6 +44,7 @@ pub fn transformMessages(
                     .tool_call_id = try cloneNormalizedToolCallId(allocator, tool_result.tool_call_id, &normalized_tool_call_ids),
                     .tool_name = try allocator.dupe(u8, tool_result.tool_name),
                     .content = try cloneUserLikeContent(allocator, tool_result.content, modelSupportsImages(model), NON_VISION_TOOL_IMAGE_PLACEHOLDER),
+                    .details = if (tool_result.details) |details| try cloneJsonValue(allocator, details) else null,
                     .is_error = tool_result.is_error,
                     .timestamp = tool_result.timestamp,
                 },
@@ -472,6 +473,7 @@ fn freeMessage(allocator: std.mem.Allocator, message: types.Message) void {
             allocator.free(tool_result.tool_call_id);
             allocator.free(tool_result.tool_name);
             freeContentBlocks(allocator, tool_result.content);
+            if (tool_result.details) |details| freeJsonValue(allocator, details);
         },
         .assistant => |assistant| {
             allocator.free(assistant.api);
@@ -848,4 +850,243 @@ test "transformMessages strips cross model signatures and normalizes inline tool
     try std.testing.expectEqualStrings("lookup", transformed[0].assistant.tool_calls.?[0].name);
     try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[0].assistant.tool_calls.?[0].id);
     try std.testing.expectEqualStrings("normalized-tool-call-1", transformed[1].tool_result.tool_call_id);
+}
+
+// ---------------------------------------------------------------------------
+// VAL-M8D-POLISH-001 / 002 / 003 / 004: ToolResultMessage.details preservation
+// ---------------------------------------------------------------------------
+
+// Deferred provider surfaces: Cloudflare AI Gateway and Moonshot/Moonshot CN
+// provider-specific OpenAI-compatible surface outside M8D core transform parity.
+// The OpenAI-compat compat-detection fixture (cloudflare-workers-ai-compat)
+// exercises generic request-surface behavior only, not Cloudflare-specific
+// provider implementation. Full Cloudflare/Moonshot parity is out of scope for
+// this feature and the M8D milestone.
+
+test "transformMessages preserves details on real tool result for same-provider replay" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5",
+        .name = "GPT-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var details_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iter = details_obj.iterator();
+        while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = details_obj;
+        owned.deinit(allocator);
+    }
+    try details_obj.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = 0 });
+    try details_obj.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = false });
+    try details_obj.put(allocator, try allocator.dupe(u8, "output_path"), .{ .string = "/tmp/result.txt" });
+
+    const tool_result = types.ToolResultMessage{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "ok" } }},
+        .details = .{ .object = details_obj },
+        .is_error = false,
+        .timestamp = 100,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .tool_result = tool_result },
+    }, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 1), transformed.len);
+    const result = transformed[0].tool_result;
+    try std.testing.expect(result.details != null);
+    const details = result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 0), details.get("exit_code").?.integer);
+    try std.testing.expectEqual(false, details.get("timed_out").?.bool);
+    try std.testing.expectEqualStrings("/tmp/result.txt", details.get("output_path").?.string);
+}
+
+test "transformMessages preserves details on real tool result for cross-provider toolCallId normalization" {
+    const allocator = std.testing.allocator;
+    const target_model = types.Model{
+        .id = "claude-sonnet",
+        .name = "Claude Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+
+    var details_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iter = details_obj.iterator();
+        while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = details_obj;
+        owned.deinit(allocator);
+    }
+    try details_obj.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = 0 });
+    try details_obj.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = false });
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iterator = arguments.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = arguments;
+        owned.deinit(allocator);
+    }
+    try arguments.put(allocator, try allocator.dupe(u8, "cmd"), .{ .string = "echo hi" });
+
+    const assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .tool_calls = &[_]types.ToolCall{.{
+            .id = "openai-call-1",
+            .name = "bash",
+            .arguments = .{ .object = arguments },
+        }},
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 50,
+    };
+
+    const tool_result = types.ToolResultMessage{
+        .tool_call_id = "openai-call-1",
+        .tool_name = "bash",
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hi" } }},
+        .details = .{ .object = details_obj },
+        .is_error = false,
+        .timestamp = 100,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .assistant = assistant },
+        .{ .tool_result = tool_result },
+    }, target_model, normalizeToolCallIdForTest);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 2), transformed.len);
+    // Tool call ID was normalized
+    try std.testing.expectEqualStrings("normalized-openai-call-1", transformed[0].assistant.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("normalized-openai-call-1", transformed[1].tool_result.tool_call_id);
+    // Details survived normalization
+    try std.testing.expect(transformed[1].tool_result.details != null);
+    const details = transformed[1].tool_result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 0), details.get("exit_code").?.integer);
+    try std.testing.expectEqual(false, details.get("timed_out").?.bool);
+}
+
+test "transformMessages preserves details on real tool result during non-vision image downgrade" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "text-only",
+        .name = "Text Only",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 32000,
+        .max_tokens = 4000,
+    };
+
+    var details_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iter = details_obj.iterator();
+        while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = details_obj;
+        owned.deinit(allocator);
+    }
+    try details_obj.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = 1 });
+    try details_obj.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = true });
+
+    const tool_content = [_]types.ContentBlock{
+        .{ .image = .{ .data = "base64png", .mime_type = "image/png" } },
+        .{ .text = .{ .text = "screenshot captured" } },
+    };
+
+    const tool_result = types.ToolResultMessage{
+        .tool_call_id = "tool-img-1",
+        .tool_name = "capture",
+        .content = &tool_content,
+        .details = .{ .object = details_obj },
+        .is_error = false,
+        .timestamp = 200,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .tool_result = tool_result },
+    }, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 1), transformed.len);
+    const result = transformed[0].tool_result;
+    // Image was downgraded to placeholder
+    try std.testing.expectEqualStrings(NON_VISION_TOOL_IMAGE_PLACEHOLDER, result.content[0].text.text);
+    try std.testing.expectEqualStrings("screenshot captured", result.content[1].text.text);
+    // Details survived image downgrade
+    try std.testing.expect(result.details != null);
+    const details = result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 1), details.get("exit_code").?.integer);
+    try std.testing.expectEqual(true, details.get("timed_out").?.bool);
+}
+
+test "transformMessages synthetic orphan tool results have null details" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5",
+        .name = "GPT-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iter = arguments.iterator();
+        while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = arguments;
+        owned.deinit(allocator);
+    }
+    try arguments.put(allocator, try allocator.dupe(u8, "cmd"), .{ .string = "echo hi" });
+
+    const orphan_assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Calling tool" } }},
+        .tool_calls = &[_]types.ToolCall{.{
+            .id = "orphan-call-1",
+            .name = "bash",
+            .arguments = .{ .object = arguments },
+        }},
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 50,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .assistant = orphan_assistant },
+        .{ .user = .{ .content = &[_]types.ContentBlock{.{ .text = .{ .text = "continue" } }}, .timestamp = 60 } },
+    }, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 3), transformed.len);
+    // Synthetic tool result was inserted
+    try std.testing.expect(transformed[1] == .tool_result);
+    try std.testing.expectEqualStrings("orphan-call-1", transformed[1].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("bash", transformed[1].tool_result.tool_name);
+    try std.testing.expect(transformed[1].tool_result.is_error);
+    try std.testing.expectEqualStrings(SYNTHETIC_TOOL_RESULT_TEXT, transformed[1].tool_result.content[0].text.text);
+    // Synthetic result must NOT invent details
+    try std.testing.expect(transformed[1].tool_result.details == null);
 }
