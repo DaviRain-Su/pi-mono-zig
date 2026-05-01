@@ -10,7 +10,7 @@
       "requiresToolResultName": false,
       "sendSessionAffinityHeaders": false,
       "supportsDeveloperRole": false,
-      "supportsLongCacheRetention": true,
+      "supportsLongCacheRetention": false,
       "supportsReasoningEffort": true,
       "supportsStore": false,
       "supportsStrictMode": true,
