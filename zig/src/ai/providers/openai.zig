@@ -295,10 +295,15 @@ fn parseSseStreamLines(
 
         const value = chunk.?.value;
 
-        // Extract usage from chunk (may be present even without choices)
+        // Extract usage from chunk (may be present even without choices).
+        // Track whether this chunk had top-level usage so that choice.usage
+        // is only used as a fallback when chunk.usage is absent (matching
+        // TypeScript: if (!chunk.usage && choice.usage) { ... }).
+        var chunk_has_top_level_usage = false;
         if (value.object.get("usage")) |usage_val| {
             if (usage_val == .object) {
                 output.usage = parseChunkUsage(allocator, usage_val, model);
+                chunk_has_top_level_usage = true;
             }
         }
 
@@ -327,10 +332,14 @@ fn parseSseStreamLines(
         const choice = choices.array.items[0];
         if (choice != .object) continue;
 
-        // Handle usage in choice (some providers like Moonshot)
-        if (choice.object.get("usage")) |choice_usage| {
-            if (choice_usage == .object) {
-                output.usage = parseChunkUsage(allocator, choice_usage, model);
+        // Fallback: choice.usage only when top-level chunk.usage is absent.
+        // Some providers (e.g., Moonshot) return usage in choice.usage instead
+        // of the standard top-level chunk.usage.
+        if (!chunk_has_top_level_usage) {
+            if (choice.object.get("usage")) |choice_usage| {
+                if (choice_usage == .object) {
+                    output.usage = parseChunkUsage(allocator, choice_usage, model);
+                }
             }
         }
 
@@ -769,17 +778,34 @@ fn parseChunkUsage(
     else
         @as(u32, 0);
 
-    var cache_read_tokens: u32 = 0;
+    // Resolve cached token source matching TypeScript precedence:
+    // prompt_tokens_details.cached_tokens ?? prompt_cache_hit_tokens ?? 0
+    // A boolean flag is needed because cached_tokens=0 is a valid explicit value
+    // that must not trigger the fallback (matching TS nullish coalescing semantics).
+    var reported_cached_tokens: u32 = 0;
+    var found_cached_tokens = false;
     var cache_write_tokens: u32 = 0;
 
     if (usage_val.object.get("prompt_tokens_details")) |details| {
         if (details == .object) {
             if (details.object.get("cached_tokens")) |ct| {
-                if (ct == .integer) cache_read_tokens = @as(u32, @intCast(ct.integer));
+                if (ct == .integer) {
+                    reported_cached_tokens = @as(u32, @intCast(ct.integer));
+                    found_cached_tokens = true;
+                }
             }
             if (details.object.get("cache_write_tokens")) |cwt| {
                 if (cwt == .integer) cache_write_tokens = @as(u32, @intCast(cwt.integer));
             }
+        }
+    }
+
+    // Fallback: prompt_cache_hit_tokens when prompt_tokens_details.cached_tokens
+    // is absent. This matches TypeScript:
+    // rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0
+    if (!found_cached_tokens) {
+        if (usage_val.object.get("prompt_cache_hit_tokens")) |pcht| {
+            if (pcht == .integer) reported_cached_tokens = @as(u32, @intCast(pcht.integer));
         }
     }
 
@@ -790,10 +816,13 @@ fn parseChunkUsage(
     }
 
     // Normalize cache read: subtract cache writes if present
-    const normalized_cache_read = if (cache_write_tokens > 0)
-        @max(@as(u32, 0), cache_read_tokens - cache_write_tokens)
+    // Some OpenAI-compatible providers (observed on OpenRouter) report cached_tokens
+    // as (previous hits + current writes). In that case, remove cacheWrite from cacheRead.
+    // Clamp at zero: u32 subtraction would underflow, so guard with a comparison.
+    const normalized_cache_read = if (reported_cached_tokens >= cache_write_tokens)
+        reported_cached_tokens - cache_write_tokens
     else
-        cache_read_tokens;
+        @as(u32, 0);
 
     const input = @max(@as(u32, 0), prompt_tokens - normalized_cache_read - cache_write_tokens);
     const output = completion_tokens;

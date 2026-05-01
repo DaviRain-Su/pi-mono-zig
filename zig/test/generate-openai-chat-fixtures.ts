@@ -1805,6 +1805,317 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	// Usage parity scenarios (VAL-M8D-USAGE-001 through VAL-M8D-USAGE-012)
+	{
+		id: "usage-only-final-chunk",
+		title: "Final usage-only SSE chunk without choices updates assistant message usage",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-usage-only",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "hello" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-usage-only",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+				},
+			],
+		},
+	},
+	{
+		id: "usage-top-level-precedence",
+		title: "Top-level chunk.usage takes precedence over choice.usage in the same chunk",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-precedence",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-precedence",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {},
+							finish_reason: "stop",
+							usage: { prompt_tokens: 999, completion_tokens: 999, total_tokens: 1998 },
+						},
+					],
+					usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+				},
+			],
+		},
+	},
+	{
+		id: "usage-choice-fallback",
+		title: "choice.usage is used as fallback when top-level chunk.usage is absent",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-choice-fallback",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-choice-fallback",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {},
+							finish_reason: "stop",
+							usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+						},
+					],
+				},
+			],
+		},
+	},
+	{
+		id: "usage-cached-tokens-cache-read",
+		title: "prompt_tokens_details.cached_tokens maps to cacheRead",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-cached",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-cached",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 100,
+						completion_tokens: 7,
+						total_tokens: 107,
+						prompt_tokens_details: { cached_tokens: 30 },
+					},
+				},
+			],
+		},
+	},
+	{
+		id: "usage-cache-hit-tokens-fallback",
+		title: "prompt_cache_hit_tokens maps to cacheRead when prompt_tokens_details.cached_tokens is absent",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-cache-hit",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-cache-hit",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 100,
+						completion_tokens: 7,
+						total_tokens: 107,
+						prompt_cache_hit_tokens: 30,
+					},
+				},
+			],
+		},
+	},
+	{
+		id: "usage-cached-tokens-precedence",
+		title: "prompt_tokens_details.cached_tokens wins over prompt_cache_hit_tokens",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-both-cache",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-both-cache",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 100,
+						completion_tokens: 7,
+						total_tokens: 107,
+						prompt_cache_hit_tokens: 40,
+						prompt_tokens_details: { cached_tokens: 25 },
+					},
+				},
+			],
+		},
+	},
+	{
+		id: "usage-cache-write-normalization",
+		title: "cache_write_tokens is preserved and subtracted from cached_tokens for cacheRead",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-cache-write",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-cache-write",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 120,
+						completion_tokens: 9,
+						total_tokens: 129,
+						prompt_tokens_details: { cached_tokens: 50, cache_write_tokens: 20 },
+					},
+				},
+			],
+		},
+	},
+	{
+		id: "usage-cache-read-clamp-zero",
+		title: "Cache read normalization clamps at zero when cache_write_tokens exceeds cached_tokens",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-clamp",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-clamp",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 40,
+						completion_tokens: 3,
+						total_tokens: 43,
+						prompt_tokens_details: { cached_tokens: 10, cache_write_tokens: 20 },
+					},
+				},
+			],
+		},
+	},
+	{
+		id: "usage-reasoning-tokens-included",
+		title: "completion_tokens already includes reasoning tokens; output is not reduced",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-reasoning",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-reasoning",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 50,
+						completion_tokens: 100,
+						total_tokens: 150,
+						completion_tokens_details: { reasoning_tokens: 30 },
+					},
+				},
+			],
+		},
+	},
+	{
+		id: "usage-latest-snapshot-wins",
+		title: "Latest provider usage snapshot replaces earlier usage rather than summing",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-latest",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "first" }, finish_reason: null }],
+					usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+				},
+				{
+					id: "chatcmpl-latest",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { content: " second" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-latest",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 },
+				},
+			],
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {

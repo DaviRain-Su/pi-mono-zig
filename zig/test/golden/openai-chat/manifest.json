@@ -1,6 +1,6 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 68,
+  "fixtureCount": 78,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
@@ -71,7 +71,17 @@
     "response-model-echoed",
     "response-model-missing-empty",
     "response-model-sticky",
-    "composed-tool-history-reasoning-routing-cache-compat"
+    "composed-tool-history-reasoning-routing-cache-compat",
+    "usage-only-final-chunk",
+    "usage-top-level-precedence",
+    "usage-choice-fallback",
+    "usage-cached-tokens-cache-read",
+    "usage-cache-hit-tokens-fallback",
+    "usage-cached-tokens-precedence",
+    "usage-cache-write-normalization",
+    "usage-cache-read-clamp-zero",
+    "usage-reasoning-tokens-included",
+    "usage-latest-snapshot-wins"
   ],
   "schemaVersion": 1,
   "sourceCitations": [
