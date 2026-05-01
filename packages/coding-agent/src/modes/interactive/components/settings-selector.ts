@@ -235,7 +235,7 @@ export class SettingsSelectorComponent extends Container {
 				label: "Transport",
 				description: "Preferred transport for providers that support multiple transports",
 				currentValue: config.transport,
-				values: ["sse", "websocket", "auto"],
+				values: ["sse", "websocket", "websocket-cached", "auto"],
 			},
 			{
 				id: "hide-thinking",

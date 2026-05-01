@@ -12,7 +12,15 @@ export type { GoogleOptions } from "./providers/google.js";
 export type { GoogleThinkingLevel } from "./providers/google-shared.js";
 export type { GoogleVertexOptions } from "./providers/google-vertex.js";
 export type { MistralOptions } from "./providers/mistral.js";
-export type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses.js";
+export type {
+	OpenAICodexResponsesOptions,
+	OpenAICodexWebSocketDebugStats,
+} from "./providers/openai-codex-responses.js";
+export {
+	closeOpenAICodexWebSocketSessions,
+	getOpenAICodexWebSocketDebugStats,
+	resetOpenAICodexWebSocketDebugStats,
+} from "./providers/openai-codex-responses.js";
 export type { OpenAICompletionsOptions } from "./providers/openai-completions.js";
 export type { OpenAIResponsesOptions } from "./providers/openai-responses.js";
 export * from "./providers/register-builtins.js";

@@ -74,6 +74,7 @@ interface RequestBody {
 	store?: boolean;
 	stream?: boolean;
 	instructions?: string;
+	previous_response_id?: string;
 	input?: ResponseInput;
 	tools?: OpenAITool[];
 	tool_choice?: "auto";
@@ -193,7 +194,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					stream.end();
 					return;
 				} catch (error) {
-					if (transport === "websocket" || websocketStarted) {
+					if (transport === "websocket" || transport === "websocket-cached" || websocketStarted) {
 						throw error;
 					}
 				}
@@ -534,13 +535,82 @@ interface WebSocketLike {
 	removeEventListener(type: WebSocketEventType, listener: WebSocketListener): void;
 }
 
+interface CachedWebSocketContinuationState {
+	lastRequestBody: RequestBody;
+	lastResponseId: string;
+	lastResponseItems: ResponseInput;
+}
+
 interface CachedWebSocketConnection {
 	socket: WebSocketLike;
 	busy: boolean;
 	idleTimer?: ReturnType<typeof setTimeout>;
+	continuation?: CachedWebSocketContinuationState;
+}
+
+export interface OpenAICodexWebSocketDebugStats {
+	requests: number;
+	connectionsCreated: number;
+	connectionsReused: number;
+	cachedContextRequests: number;
+	storeTrueRequests: number;
+	fullContextRequests: number;
+	deltaRequests: number;
+	lastInputItems: number;
+	lastDeltaInputItems?: number;
+	lastPreviousResponseId?: string;
 }
 
 const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
+const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
+
+function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
+	let stats = websocketDebugStats.get(sessionId);
+	if (!stats) {
+		stats = {
+			requests: 0,
+			connectionsCreated: 0,
+			connectionsReused: 0,
+			cachedContextRequests: 0,
+			storeTrueRequests: 0,
+			fullContextRequests: 0,
+			deltaRequests: 0,
+			lastInputItems: 0,
+		};
+		websocketDebugStats.set(sessionId, stats);
+	}
+	return stats;
+}
+
+export function getOpenAICodexWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats | undefined {
+	const stats = websocketDebugStats.get(sessionId);
+	return stats ? { ...stats } : undefined;
+}
+
+export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
+	if (sessionId) {
+		websocketDebugStats.delete(sessionId);
+		return;
+	}
+	websocketDebugStats.clear();
+}
+
+export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
+	const closeEntry = (entry: CachedWebSocketConnection) => {
+		if (entry.idleTimer) clearTimeout(entry.idleTimer);
+		closeWebSocketSilently(entry.socket, 1000, "debug_close");
+	};
+	if (sessionId) {
+		const entry = websocketSessionCache.get(sessionId);
+		if (entry) closeEntry(entry);
+		websocketSessionCache.delete(sessionId);
+		return;
+	}
+	for (const entry of websocketSessionCache.values()) {
+		closeEntry(entry);
+	}
+	websocketSessionCache.clear();
+}
 
 type WebSocketConstructor = new (
 	url: string,
@@ -648,11 +718,17 @@ async function acquireWebSocket(
 	headers: Headers,
 	sessionId: string | undefined,
 	signal?: AbortSignal,
-): Promise<{ socket: WebSocketLike; release: (options?: { keep?: boolean }) => void }> {
+): Promise<{
+	socket: WebSocketLike;
+	entry?: CachedWebSocketConnection;
+	reused: boolean;
+	release: (options?: { keep?: boolean }) => void;
+}> {
 	if (!sessionId) {
 		const socket = await connectWebSocket(url, headers, signal);
 		return {
 			socket,
+			reused: false,
 			release: ({ keep } = {}) => {
 				if (keep === false) {
 					closeWebSocketSilently(socket);
@@ -673,6 +749,8 @@ async function acquireWebSocket(
 			cached.busy = true;
 			return {
 				socket: cached.socket,
+				entry: cached,
+				reused: true,
 				release: ({ keep } = {}) => {
 					if (!keep || !isWebSocketReusable(cached.socket)) {
 						closeWebSocketSilently(cached.socket);
@@ -688,6 +766,7 @@ async function acquireWebSocket(
 			const socket = await connectWebSocket(url, headers, signal);
 			return {
 				socket,
+				reused: false,
 				release: () => {
 					closeWebSocketSilently(socket);
 				},
@@ -704,6 +783,8 @@ async function acquireWebSocket(
 	websocketSessionCache.set(sessionId, entry);
 	return {
 		socket,
+		entry,
+		reused: false,
 		release: ({ keep } = {}) => {
 			if (!keep || !isWebSocketReusable(entry.socket)) {
 				closeWebSocketSilently(entry.socket);
@@ -848,6 +929,60 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 	}
 }
 
+function requestBodyWithoutInput(body: RequestBody): RequestBody {
+	const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
+	return rest;
+}
+
+function responseInputsEqual(a: ResponseInput | undefined, b: ResponseInput | undefined): boolean {
+	return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+}
+
+function requestBodiesMatchExceptInput(a: RequestBody, b: RequestBody): boolean {
+	return JSON.stringify(requestBodyWithoutInput(a)) === JSON.stringify(requestBodyWithoutInput(b));
+}
+
+function getCachedWebSocketInputDelta(
+	body: RequestBody,
+	continuation: CachedWebSocketContinuationState,
+): ResponseInput | undefined {
+	if (!requestBodiesMatchExceptInput(body, continuation.lastRequestBody)) {
+		return undefined;
+	}
+
+	const currentInput = body.input ?? [];
+	const baseline = [...(continuation.lastRequestBody.input ?? []), ...continuation.lastResponseItems];
+	if (currentInput.length < baseline.length) {
+		return undefined;
+	}
+
+	const prefix = currentInput.slice(0, baseline.length);
+	if (!responseInputsEqual(prefix, baseline)) {
+		return undefined;
+	}
+
+	return currentInput.slice(baseline.length);
+}
+
+function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body: RequestBody): RequestBody {
+	const continuation = entry.continuation;
+	if (!continuation) {
+		return body;
+	}
+
+	const delta = getCachedWebSocketInputDelta(body, continuation);
+	if (!delta || !continuation.lastResponseId) {
+		entry.continuation = undefined;
+		return body;
+	}
+
+	return {
+		...body,
+		previous_response_id: continuation.lastResponseId,
+		input: delta,
+	};
+}
+
 async function processWebSocketStream(
 	url: string,
 	body: RequestBody,
@@ -858,10 +993,33 @@ async function processWebSocketStream(
 	onStart: () => void,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	const { socket, release } = await acquireWebSocket(url, headers, options?.sessionId, options?.signal);
+	const { socket, entry, reused, release } = await acquireWebSocket(url, headers, options?.sessionId, options?.signal);
 	let keepConnection = true;
+	const useCachedContext = options?.transport === "websocket-cached";
+	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
+	// WebSocket continuation still works via connection-scoped previous_response_id state.
+	const fullBody = body;
+	const requestBody = useCachedContext && entry ? buildCachedWebSocketRequestBody(entry, fullBody) : fullBody;
+	const stats = options?.sessionId ? getOrCreateWebSocketDebugStats(options.sessionId) : undefined;
+	if (stats) {
+		stats.requests++;
+		if (reused) stats.connectionsReused++;
+		else stats.connectionsCreated++;
+		if (useCachedContext) stats.cachedContextRequests++;
+		if (requestBody.store === true) stats.storeTrueRequests++;
+		stats.lastInputItems = requestBody.input?.length ?? 0;
+		if (requestBody.previous_response_id) {
+			stats.deltaRequests++;
+			stats.lastDeltaInputItems = requestBody.input?.length ?? 0;
+			stats.lastPreviousResponseId = requestBody.previous_response_id;
+		} else {
+			stats.fullContextRequests++;
+			stats.lastDeltaInputItems = undefined;
+			stats.lastPreviousResponseId = undefined;
+		}
+	}
 	try {
-		socket.send(JSON.stringify({ type: "response.create", ...body }));
+		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		onStart();
 		stream.push({ type: "start", partial: output });
 		await processResponsesStream(mapCodexEvents(parseWebSocket(socket, options?.signal)), output, stream, model, {
@@ -871,8 +1029,20 @@ async function processWebSocketStream(
 		});
 		if (options?.signal?.aborted) {
 			keepConnection = false;
+		} else if (useCachedContext && entry && output.responseId) {
+			const responseItems = convertResponsesMessages(model, { messages: [output] }, CODEX_TOOL_CALL_PROVIDERS, {
+				includeSystemPrompt: false,
+			}).filter((item) => item.type !== "function_call_output");
+			entry.continuation = {
+				lastRequestBody: fullBody,
+				lastResponseId: output.responseId,
+				lastResponseItems: responseItems,
+			};
 		}
 	} catch (error) {
+		if (entry) {
+			entry.continuation = undefined;
+		}
 		keepConnection = false;
 		throw error;
 	} finally {
