@@ -1313,6 +1313,8 @@ fn getCompat(model: types.Model) OpenAICompat {
     const is_groq = std.mem.eql(u8, model.provider, "groq") or std.mem.indexOf(u8, model.base_url, "groq.com") != null;
     const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
     const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
+    const is_cloudflare_workers_ai = std.mem.eql(u8, model.provider, "cloudflare-workers-ai") or std.mem.indexOf(u8, model.base_url, "api.cloudflare.com") != null;
+    const is_cloudflare_ai_gateway = std.mem.eql(u8, model.provider, "cloudflare-ai-gateway") or std.mem.indexOf(u8, model.base_url, "gateway.ai.cloudflare.com") != null;
     const detected_reasoning_effort_map: ReasoningEffortMap = if (is_deepseek)
         .deepseek
     else if (is_groq and std.mem.eql(u8, model.id, "qwen/qwen3-32b"))
@@ -1335,10 +1337,10 @@ fn getCompat(model: types.Model) OpenAICompat {
     return .{
         .supports_store = compatBoolField(model.compat, "supportsStore") orelse !is_non_standard,
         .supports_developer_role = compatBoolField(model.compat, "supportsDeveloperRole") orelse !is_non_standard,
-        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai),
+        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai and !is_cloudflare_ai_gateway),
         .reasoning_effort_map = compatObjectField(model.compat, "reasoningEffortMap") orelse detected_reasoning_effort_map,
         .supports_usage_in_streaming = compatBoolField(model.compat, "supportsUsageInStreaming") orelse true,
-        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes) "max_tokens" else "max_completion_tokens",
+        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes or is_cloudflare_ai_gateway) "max_tokens" else "max_completion_tokens",
         .requires_tool_result_name = compatBoolField(model.compat, "requiresToolResultName") orelse false,
         .requires_assistant_after_tool_result = compatBoolField(model.compat, "requiresAssistantAfterToolResult") orelse false,
         .requires_thinking_as_text = compatBoolField(model.compat, "requiresThinkingAsText") orelse false,
@@ -1347,10 +1349,10 @@ fn getCompat(model: types.Model) OpenAICompat {
         .open_router_routing = compatObjectValueField(model.compat, "openRouterRouting") orelse null,
         .vercel_gateway_routing = compatObjectValueField(model.compat, "vercelGatewayRouting") orelse null,
         .zai_tool_stream = compatBoolField(model.compat, "zaiToolStream") orelse false,
-        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse true,
+        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse !is_cloudflare_ai_gateway,
         .cache_control_format = compatStringField(model.compat, "cacheControlFormat") orelse detected_cache_control_format,
         .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse false,
-        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse true,
+        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse !(is_cloudflare_workers_ai or is_cloudflare_ai_gateway),
     };
 }
 
@@ -1394,7 +1396,8 @@ fn isNonStandardProvider(model: types.Model) bool {
         std.mem.eql(u8, provider, "xai") or
         std.mem.eql(u8, provider, "zai") or
         std.mem.eql(u8, provider, "opencode") or
-        std.mem.eql(u8, provider, "cloudflare-workers-ai"))
+        std.mem.eql(u8, provider, "cloudflare-workers-ai") or
+        std.mem.eql(u8, provider, "cloudflare-ai-gateway"))
     {
         return true;
     }
@@ -1405,7 +1408,8 @@ fn isNonStandardProvider(model: types.Model) bool {
         std.mem.indexOf(u8, base_url, "deepseek.com") != null or
         std.mem.indexOf(u8, base_url, "api.z.ai") != null or
         std.mem.indexOf(u8, base_url, "opencode.ai") != null or
-        std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null)
+        std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null or
+        std.mem.indexOf(u8, base_url, "gateway.ai.cloudflare.com") != null)
     {
         return true;
     }
