@@ -582,6 +582,9 @@ fn buildCompletionResultValue(allocator: std.mem.Allocator, assistant_message: a
     if (assistant_message.response_id) |response_id| {
         try putStringField(&result, allocator, "responseId", response_id);
     }
+    if (assistant_message.response_model) |response_model| {
+        try putStringField(&result, allocator, "responseModel", response_model);
+    }
     if (assistant_message.error_message) |error_message| {
         try putStringField(&result, allocator, "error", error_message);
     }
@@ -606,6 +609,9 @@ fn buildAssistantSummaryValue(allocator: std.mem.Allocator, assistant_message: a
     try putStringField(&result, allocator, "model", assistant_message.model);
     if (assistant_message.response_id) |response_id| {
         try putStringField(&result, allocator, "responseId", response_id);
+    }
+    if (assistant_message.response_model) |response_model| {
+        try putStringField(&result, allocator, "responseModel", response_model);
     }
     if (assistant_message.error_message) |error_message| {
         try putStringField(&result, allocator, "error", error_message);

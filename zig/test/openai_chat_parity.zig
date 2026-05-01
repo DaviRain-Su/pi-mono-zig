@@ -138,11 +138,170 @@ fn buildActualFixtureComparisonRoot(allocator: std.mem.Allocator, fixture: std.j
         actual_request,
     );
 
+    // If the fixture has input.mockChunks, parse the SSE and compare streamOutput
+    const input = getObjectField(fixture, "input");
+    if (input.object.get("mockChunks")) |mock_chunks| {
+        if (mock_chunks == .array and mock_chunks.array.items.len > 0) {
+            const sse_bytes = try mockChunksToSse(allocator, mock_chunks);
+            defer allocator.free(sse_bytes);
+
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const scenario_allocator = arena.allocator();
+
+            const model = try parseModel(scenario_allocator, getObjectField(input, "model"));
+
+            const message = openai.parseSseAssistantMessageFromSlice(scenario_allocator, std.Io.failing, sse_bytes, model) catch |err| {
+                std.debug.print("stream parse error: {s}\n", .{@errorName(err)});
+                return err;
+            };
+
+            const stream_output = try assistantMessageToStreamOutputValue(allocator, message);
+            try expected.put(
+                allocator,
+                try allocator.dupe(u8, "streamOutput"),
+                stream_output,
+            );
+        }
+    }
+
     var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer root.deinit(allocator);
     try root.put(allocator, try allocator.dupe(u8, "expected"), .{ .object = expected });
 
     return .{ .object = root };
+}
+
+fn stopReasonToString(reason: types.StopReason) []const u8 {
+    return switch (reason) {
+        .stop => "stop",
+        .length => "length",
+        .tool_use => "toolUse",
+        .error_reason => "error",
+        .aborted => "aborted",
+    };
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |b| .{ .bool = b },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+        .number_string => |ns| .{ .number_string = try allocator.dupe(u8, ns) },
+        .array => |arr| {
+            var new_arr = std.json.Array.init(allocator);
+            errdefer new_arr.deinit();
+            for (arr.items) |item| {
+                try new_arr.append(try cloneJsonValue(allocator, item));
+            }
+            return .{ .array = new_arr };
+        },
+        .object => |obj| {
+            var new_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer new_obj.deinit(allocator);
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key_copy);
+                try new_obj.put(allocator, key_copy, try cloneJsonValue(allocator, entry.value_ptr.*));
+            }
+            return .{ .object = new_obj };
+        },
+    };
+}
+
+fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |s| allocator.free(s),
+        .number_string => |ns| allocator.free(ns),
+        .array => |arr| {
+            for (arr.items) |item| deinitJsonValue(allocator, item);
+            var arr_mut = arr;
+            arr_mut.deinit();
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                deinitJsonValue(allocator, entry.value_ptr.*);
+            }
+            var obj_mut = obj;
+            obj_mut.deinit(allocator);
+        },
+        else => {},
+    }
+}
+
+fn mockChunksToSse(allocator: std.mem.Allocator, chunks: std.json.Value) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+
+    for (chunks.array.items) |chunk| {
+        try buffer.appendSlice(allocator, "data: ");
+        const chunk_str = try std.json.Stringify.valueAlloc(allocator, chunk, .{});
+        defer allocator.free(chunk_str);
+        try buffer.appendSlice(allocator, chunk_str);
+        try buffer.appendSlice(allocator, "\n\n");
+    }
+    try buffer.appendSlice(allocator, "data: [DONE]\n\n");
+
+    return try buffer.toOwnedSlice(allocator);
+}
+
+fn assistantMessageToStreamOutputValue(allocator: std.mem.Allocator, message: types.AssistantMessage) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer object.deinit(allocator);
+
+    try object.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, message.model) });
+    if (message.response_model) |response_model| {
+        try object.put(allocator, try allocator.dupe(u8, "responseModel"), .{ .string = try allocator.dupe(u8, response_model) });
+    }
+    try object.put(allocator, try allocator.dupe(u8, "stopReason"), .{ .string = try allocator.dupe(u8, stopReasonToString(message.stop_reason)) });
+    try object.put(allocator, try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, message.api) });
+    try object.put(allocator, try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, message.provider) });
+
+    // Usage
+    var usage_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try usage_object.put(allocator, try allocator.dupe(u8, "input"), .{ .integer = @intCast(message.usage.input) });
+    try usage_object.put(allocator, try allocator.dupe(u8, "output"), .{ .integer = @intCast(message.usage.output) });
+    try usage_object.put(allocator, try allocator.dupe(u8, "cacheRead"), .{ .integer = @intCast(message.usage.cache_read) });
+    try usage_object.put(allocator, try allocator.dupe(u8, "cacheWrite"), .{ .integer = @intCast(message.usage.cache_write) });
+    try usage_object.put(allocator, try allocator.dupe(u8, "totalTokens"), .{ .integer = @intCast(message.usage.total_tokens) });
+    try object.put(allocator, try allocator.dupe(u8, "usage"), .{ .object = usage_object });
+
+    // Content
+    var content_array = std.json.Array.init(allocator);
+    for (message.content) |block| {
+        var block_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+        switch (block) {
+            .text => |text| {
+                try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
+                try block_object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text.text) });
+            },
+            .thinking => |thinking| {
+                try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "thinking") });
+                try block_object.put(allocator, try allocator.dupe(u8, "thinking"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
+                try block_object.put(allocator, try allocator.dupe(u8, "redacted"), .{ .bool = thinking.redacted });
+            },
+            .tool_call => |tool_call| {
+                try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "toolCall") });
+                try block_object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
+                try block_object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
+                try block_object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, tool_call.arguments));
+            },
+            .image => |image| {
+                try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "image") });
+                try block_object.put(allocator, try allocator.dupe(u8, "data"), .{ .string = try allocator.dupe(u8, image.data) });
+                try block_object.put(allocator, try allocator.dupe(u8, "mimeType"), .{ .string = try allocator.dupe(u8, image.mime_type) });
+            },
+        }
+        try content_array.append(.{ .object = block_object });
+    }
+    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .array = content_array });
+
+    return .{ .object = object };
 }
 
 fn parseModel(allocator: std.mem.Allocator, value: std.json.Value) !types.Model {

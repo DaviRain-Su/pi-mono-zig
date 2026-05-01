@@ -1747,6 +1747,7 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !
             .provider = try allocator.dupe(u8, assistant.provider),
             .model = try allocator.dupe(u8, assistant.model),
             .response_id = if (assistant.response_id) |response_id| try allocator.dupe(u8, response_id) else null,
+            .response_model = if (assistant.response_model) |response_model| try allocator.dupe(u8, response_model) else null,
             .usage = assistant.usage,
             .stop_reason = assistant.stop_reason,
             .error_message = if (assistant.error_message) |error_message| try allocator.dupe(u8, error_message) else null,
@@ -1778,6 +1779,7 @@ pub fn deinitMessage(allocator: std.mem.Allocator, message: *agent.AgentMessage)
             allocator.free(assistant.provider);
             allocator.free(assistant.model);
             if (assistant.response_id) |response_id| allocator.free(response_id);
+            if (assistant.response_model) |response_model| allocator.free(response_model);
             if (assistant.error_message) |error_message| allocator.free(error_message);
         },
         .tool_result => |*tool_result| {
@@ -2217,6 +2219,9 @@ fn messageToJsonValue(allocator: std.mem.Allocator, message: agent.AgentMessage)
             if (assistant.response_id) |response_id| {
                 try object.put(allocator, try allocator.dupe(u8, "responseId"), .{ .string = try allocator.dupe(u8, response_id) });
             }
+            if (assistant.response_model) |response_model| {
+                try object.put(allocator, try allocator.dupe(u8, "responseModel"), .{ .string = try allocator.dupe(u8, response_model) });
+            }
             try object.put(allocator, try allocator.dupe(u8, "usage"), try usageToJsonValue(allocator, assistant.usage));
             try object.put(allocator, try allocator.dupe(u8, "stopReason"), .{ .string = try allocator.dupe(u8, stopReasonToString(assistant.stop_reason)) });
             if (assistant.error_message) |error_message| {
@@ -2608,6 +2613,7 @@ fn parseMessageValue(allocator: std.mem.Allocator, value: std.json.Value) !agent
             .provider = try allocator.dupe(u8, try getRequiredString(object, "provider")),
             .model = try allocator.dupe(u8, try getRequiredString(object, "model")),
             .response_id = if (getOptionalString(object, "responseId")) |response_id| try allocator.dupe(u8, response_id) else null,
+            .response_model = if (getOptionalString(object, "responseModel")) |response_model| try allocator.dupe(u8, response_model) else null,
             .usage = try parseUsageValue(object.get("usage") orelse return error.InvalidSessionMessage),
             .stop_reason = try parseStopReason(try getRequiredString(object, "stopReason")),
             .error_message = if (getOptionalString(object, "errorMessage")) |error_message| try allocator.dupe(u8, error_message) else null,

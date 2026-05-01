@@ -74,6 +74,8 @@ interface ScenarioInput {
 	model: FixtureModelInput;
 	context: DeclarativeContext;
 	options: SerializableOptions;
+	/** Optional SSE chunks to return from the mock instead of the default stream. */
+	mockChunks?: Record<string, unknown>[];
 }
 
 interface Scenario {
@@ -92,6 +94,22 @@ interface CapturedRequest {
 	jsonPayload: unknown;
 }
 
+interface NormalizedAssistantMessage {
+	model: string;
+	responseModel?: string;
+	stopReason: string;
+	api: string;
+	provider: string;
+	usage: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		totalTokens: number;
+	};
+	content: unknown[];
+}
+
 interface FixtureRecord {
 	schemaVersion: typeof schemaVersion;
 	id: string;
@@ -104,6 +122,7 @@ interface FixtureRecord {
 			observedPayload: unknown;
 			replacementPayload?: unknown;
 		};
+		streamOutput?: NormalizedAssistantMessage;
 	};
 	metadata: {
 		captureBoundary: string;
@@ -1584,6 +1603,140 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "response-model-routed",
+		title: "Routed chunk.model sets responseModel while requested model remains unchanged",
+		input: {
+			model: buildModel({
+				id: "openrouter/auto",
+				name: "OpenRouter Auto Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-routed",
+					object: "chat.completion.chunk",
+					model: "anthropic/claude-opus-4.7",
+					choices: [{ index: 0, delta: { role: "assistant", content: "routed" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-routed",
+					object: "chat.completion.chunk",
+					model: "anthropic/claude-opus-4.7",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+				},
+			],
+		},
+	},
+	{
+		id: "response-model-echoed",
+		title: "Echoed chunk.model matching requested id omits responseModel",
+		input: {
+			model: buildModel({
+				id: "openrouter/auto",
+				name: "OpenRouter Auto Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-echoed",
+					object: "chat.completion.chunk",
+					model: "openrouter/auto",
+					choices: [{ index: 0, delta: { role: "assistant", content: "echoed" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-echoed",
+					object: "chat.completion.chunk",
+					model: "openrouter/auto",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+				},
+			],
+		},
+	},
+	{
+		id: "response-model-missing-empty",
+		title: "Missing and empty chunk.model does not set responseModel",
+		input: {
+			model: buildModel({
+				id: "openrouter/auto",
+				name: "OpenRouter Auto Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-missing",
+					object: "chat.completion.chunk",
+					choices: [{ index: 0, delta: { role: "assistant", content: "no-model" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-missing",
+					object: "chat.completion.chunk",
+					model: "",
+					choices: [{ index: 0, delta: { content: "!" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-missing",
+					object: "chat.completion.chunk",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+				},
+			],
+		},
+	},
+	{
+		id: "response-model-sticky",
+		title: "First concrete routed model is sticky even when later chunks differ",
+		input: {
+			model: buildModel({
+				id: "openrouter/auto",
+				name: "OpenRouter Auto Fixture",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+			}),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-sticky",
+					object: "chat.completion.chunk",
+					model: "anthropic/claude-opus-4.7",
+					choices: [{ index: 0, delta: { role: "assistant", content: "first" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-sticky",
+					object: "chat.completion.chunk",
+					model: "google/gemini-2.5-pro",
+					choices: [{ index: 0, delta: { content: " then second" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-sticky",
+					object: "chat.completion.chunk",
+					model: "google/gemini-2.5-pro",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+				},
+			],
+		},
+	},
+	{
 		id: "composed-tool-history-reasoning-routing-cache-compat",
 		title: "Composed tool history, OpenRouter reasoning, routing, cache, and explicit compat overrides",
 		input: {
@@ -1735,6 +1888,54 @@ function buildMockStream(): ReadableStream<Uint8Array> {
 	});
 }
 
+function buildCustomMockStream(chunks: Record<string, unknown>[]): ReadableStream<Uint8Array> {
+	const encoder = new TextEncoder();
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			for (const chunk of chunks) {
+				controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+			}
+			controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+			controller.close();
+		},
+	});
+}
+
+function normalizeAssistantMessage(message: AssistantMessage): NormalizedAssistantMessage {
+	const result: NormalizedAssistantMessage = {
+		model: message.model,
+		stopReason: message.stopReason,
+		api: message.api,
+		provider: message.provider,
+		usage: {
+			input: message.usage.input,
+			output: message.usage.output,
+			cacheRead: message.usage.cacheRead,
+			cacheWrite: message.usage.cacheWrite,
+			totalTokens: message.usage.totalTokens,
+		},
+		content: message.content.map((block) => {
+			if (block.type === "text") {
+				return { type: "text", text: block.text };
+			}
+			if (block.type === "thinking") {
+				return { type: "thinking", thinking: block.thinking, redacted: block.redacted ?? false };
+			}
+			if (block.type === "toolCall") {
+				return { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments };
+			}
+			if (block.type === "image") {
+				return { type: "image", data: block.data, mimeType: block.mimeType };
+			}
+			return block;
+		}),
+	};
+	if (message.responseModel !== undefined) {
+		result.responseModel = message.responseModel;
+	}
+	return result;
+}
+
 async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 	const originalFetch = globalThis.fetch;
 	const originalCacheRetention = process.env.PI_CACHE_RETENTION;
@@ -1765,13 +1966,16 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 				jsonPayload: rawBody.length > 0 ? (JSON.parse(rawBody) as unknown) : null,
 			},
 		};
-		return new Response(buildMockStream(), {
-			status: 200,
-			headers: {
-				"content-type": "text/event-stream",
-				"x-fixture-response": scenario.id,
+		return new Response(
+			scenario.input.mockChunks ? buildCustomMockStream(scenario.input.mockChunks) : buildMockStream(),
+			{
+				status: 200,
+				headers: {
+					"content-type": "text/event-stream",
+					"x-fixture-response": scenario.id,
+				},
 			},
-		});
+		);
 	};
 
 	try {
@@ -1819,6 +2023,13 @@ async function captureScenario(scenario: Scenario): Promise<FixtureRecord> {
 									? {}
 									: { replacementPayload: scenario.onPayloadReplacement }),
 							},
+						}
+					: {}),
+				...(scenario.input.mockChunks
+					? {
+							streamOutput: normalizeAssistantMessage(
+								terminalEvent.message as AssistantMessage,
+							),
 						}
 					: {}),
 			},

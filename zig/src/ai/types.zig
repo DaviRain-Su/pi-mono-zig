@@ -197,6 +197,10 @@ pub const AssistantMessage = struct {
     provider: Provider,
     model: []const u8,
     response_id: ?[]const u8 = null,
+    /// Concrete `chunk.model` when different from the requested `model`
+    /// (e.g. OpenRouter `auto` -> `anthropic/...`). Equivalent to
+    /// TypeScript `AssistantMessage.responseModel`.
+    response_model: ?[]const u8 = null,
     usage: Usage,
     stop_reason: StopReason,
     error_message: ?[]const u8 = null,

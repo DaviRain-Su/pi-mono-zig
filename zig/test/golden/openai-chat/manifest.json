@@ -1,6 +1,6 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 64,
+  "fixtureCount": 68,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
@@ -67,6 +67,10 @@
     "anthropic-cache-control-long-unsupported",
     "anthropic-cache-control-no-text-breakpoints",
     "anthropic-cache-control-cache-none",
+    "response-model-routed",
+    "response-model-echoed",
+    "response-model-missing-empty",
+    "response-model-sticky",
     "composed-tool-history-reasoning-routing-cache-compat"
   ],
   "schemaVersion": 1,
