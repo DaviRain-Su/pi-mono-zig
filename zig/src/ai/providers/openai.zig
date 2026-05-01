@@ -2109,6 +2109,9 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
             if (tc.thought_signature) |sig| {
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, sig, .{}) catch continue;
                 defer parsed.deinit();
+                // Match TypeScript .filter(Boolean): skip null/unsupported parsed values.
+                // JSON.parse("null") produces null which TypeScript's filter(Boolean) removes.
+                if (parsed.value == .null) continue;
                 reasoning_details.append(try cloneJsonValue(allocator, parsed.value)) catch continue;
             }
         }

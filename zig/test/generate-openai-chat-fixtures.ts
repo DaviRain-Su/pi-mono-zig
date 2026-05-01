@@ -2517,6 +2517,46 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	{
+		id: "signature-null-not-replayed",
+		title: "JSON null thoughtSignature is not replayed as reasoning_details",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [
+					{ role: "user", content: "Check the weather." },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "call_null_sig_1",
+								name: "get_weather",
+								arguments: { city: "Berlin", unit: "celsius" },
+								thoughtSignature: "null",
+							},
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_null_sig_1",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Sunny, 22°C" }],
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {
