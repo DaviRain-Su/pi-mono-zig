@@ -870,7 +870,11 @@ fn parseChunkUsage(
     else
         @as(u32, 0);
 
-    const input = @max(@as(u32, 0), prompt_tokens - normalized_cache_read - cache_write_tokens);
+    // Saturating subtraction: when cache tokens exceed prompt_tokens, clamp input to zero.
+    // Using a comparison guard because u32 subtraction would wrap on underflow,
+    // and @max(0, wrapped_u32) cannot recover from the wrap.
+    const cache_total = normalized_cache_read + cache_write_tokens;
+    const input = if (cache_total >= prompt_tokens) @as(u32, 0) else prompt_tokens - cache_total;
     const output = completion_tokens;
 
     usage.input = input;
@@ -3885,4 +3889,31 @@ test "parseChunkUsage" {
     try std.testing.expectEqual(@as(u32, 10), usage.cache_read);
     try std.testing.expectEqual(@as(u32, 10), usage.cache_write);
     try std.testing.expectEqual(@as(u32, 150), usage.total_tokens);
+}
+
+// Regression: cache_write_tokens alone exceeding prompt_tokens must not trap.
+// prompt_tokens=15, cache_write_tokens=20, no cached_tokens.
+// normalized_cache_read=0, cache_total=20 >= 15 => input clamps to 0.
+test "parseChunkUsage cache write exceeds prompt saturates to zero" {
+    const allocator = std.testing.allocator;
+    const usage_json = "{\"prompt_tokens\":15,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cache_write_tokens\":20}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, usage_json, .{});
+    defer parsed.deinit();
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+    const usage = parseChunkUsage(allocator, parsed.value, model);
+    // input clamps to zero because cache_write_tokens(20) > prompt_tokens(15)
+    try std.testing.expectEqual(@as(u32, 0), usage.input);
+    try std.testing.expectEqual(@as(u32, 4), usage.output);
+    try std.testing.expectEqual(@as(u32, 0), usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 20), usage.cache_write);
+    try std.testing.expectEqual(@as(u32, 24), usage.total_tokens);
 }

@@ -2053,6 +2053,37 @@ const scenarios: Scenario[] = [
 		},
 	},
 	{
+		id: "usage-cache-write-exceeds-prompt",
+		title: "cache_write_tokens alone exceeding prompt_tokens clamps input to zero without unsigned underflow",
+		input: {
+			model: buildModel(),
+			context: baseContext,
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-write-over",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "text" }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-write-over",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 15,
+						completion_tokens: 4,
+						total_tokens: 19,
+						prompt_tokens_details: { cache_write_tokens: 20 },
+					},
+				},
+			],
+		},
+	},
+	{
 		id: "usage-reasoning-tokens-included",
 		title: "completion_tokens already includes reasoning tokens; output is not reduced",
 		input: {
