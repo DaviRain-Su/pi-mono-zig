@@ -290,6 +290,9 @@ fn assistantMessageToStreamOutputValue(allocator: std.mem.Allocator, message: ty
                 try block_object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
                 try block_object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
                 try block_object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, tool_call.arguments));
+                if (tool_call.thought_signature) |sig| {
+                    try block_object.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, sig) });
+                }
             },
             .image => |image| {
                 try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "image") });
@@ -394,6 +397,7 @@ fn parseContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]co
                 .id = getObjectField(item, "id").string,
                 .name = getObjectField(item, "name").string,
                 .arguments = getObjectField(item, "arguments"),
+                .thought_signature = optionalString(item, "thoughtSignature"),
             } };
         } else if (std.mem.eql(u8, item_type, "thinking")) {
             blocks[index] = .{ .thinking = .{
