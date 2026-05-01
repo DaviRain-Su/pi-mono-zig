@@ -22,7 +22,12 @@
         "auth": {
           "credentialDiscovery": "sdk-profile-resolution",
           "mode": "profile",
-          "optionsProfile": "fixture-option-profile"
+          "optionsProfile": "fixture-option-profile",
+          "profileBoundary": {
+            "configuredProfile": "fixture-option-profile",
+            "selectedProfile": "fixture-option-profile",
+            "source": "aws-sdk-shared-ini-profile-resolution"
+          }
         },
         "boundary": "aws-sdk-client-config-boundary",
         "clientConfig": {

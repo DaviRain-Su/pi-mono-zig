@@ -2592,11 +2592,24 @@ fn buildProductionAuthSnapshot(
         },
         .profile => {
             try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "profile") });
+            var profile_boundary = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer profile_boundary.deinit(allocator);
+            try profile_boundary.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, "aws-sdk-shared-ini-profile-resolution") });
+            const configured_profile = if (options) |stream_options| nonEmpty(stream_options.bedrock_profile) else null;
+            const env_profile = nonEmpty(env.aws_profile);
+            try profile_boundary.put(allocator, try allocator.dupe(u8, "selectedProfile"), .{ .string = try allocator.dupe(u8, configured_profile orelse env_profile orelse "default") });
             if (options) |stream_options| {
-                if (nonEmpty(stream_options.bedrock_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
+                if (nonEmpty(stream_options.bedrock_profile)) |profile| {
+                    try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
+                    try profile_boundary.put(allocator, try allocator.dupe(u8, "configuredProfile"), .{ .string = try allocator.dupe(u8, profile) });
+                }
             }
-            if (nonEmpty(env.aws_profile)) |profile| try object.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
+            if (nonEmpty(env.aws_profile)) |profile| {
+                try object.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
+                try profile_boundary.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
+            }
             try object.put(allocator, try allocator.dupe(u8, "credentialDiscovery"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
+            try object.put(allocator, try allocator.dupe(u8, "profileBoundary"), .{ .object = profile_boundary });
         },
         .sigv4 => {
             const authorization = headerValueIgnoreCase(headers, "authorization");

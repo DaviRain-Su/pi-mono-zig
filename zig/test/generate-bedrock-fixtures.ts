@@ -7,6 +7,7 @@ import {
 	ThrottlingException,
 	ValidationException,
 } from "@aws-sdk/client-bedrock-runtime";
+import { getProfileName } from "@smithy/shared-ini-file-loader";
 import type { HttpHandlerOptions, HttpRequest, HttpResponse, RequestHandler } from "@smithy/types";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -208,6 +209,13 @@ type FixtureEnvKey =
 	| "AWS_BEDROCK_SKIP_AUTH";
 
 type FixtureEnv = Partial<Record<FixtureEnvKey, string>>;
+
+interface SdkProfileBoundarySnapshot {
+	source: "aws-sdk-shared-ini-profile-resolution";
+	selectedProfile: string;
+	configuredProfile?: string;
+	envProfile?: string;
+}
 
 interface DeclarativeContext {
 	systemPrompt?: string;
@@ -1488,6 +1496,25 @@ async function resolveProviderValue(value: unknown): Promise<unknown> {
 	return value;
 }
 
+function stringValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function sdkProfileBoundarySnapshot(
+	config: Record<string, unknown>,
+	scenario: Scenario,
+): SdkProfileBoundarySnapshot | undefined {
+	const configuredProfile = stringValue(config.profile);
+	const envProfile = scenarioEnv(scenario, "AWS_PROFILE");
+	if (configuredProfile === undefined && envProfile === undefined) return undefined;
+	return {
+		source: "aws-sdk-shared-ini-profile-resolution",
+		selectedProfile: getProfileName({ profile: configuredProfile }),
+		...(configuredProfile !== undefined ? { configuredProfile } : {}),
+		...(envProfile !== undefined ? { envProfile } : {}),
+	};
+}
+
 function endpointBaseUrlFromParts(value: unknown): string | undefined {
 	if (value instanceof URL) return trimTrailingSlash(value.href);
 	if (!isRecord(value)) return undefined;
@@ -1614,12 +1641,22 @@ function normalizeCapturedAuthSnapshot(
 	request: HttpRequest | undefined,
 ): unknown {
 	const bearerToken = scenario.input.options.bearerToken ?? scenarioEnv(scenario, "AWS_BEARER_TOKEN_BEDROCK");
+	const profileBoundary = sdkProfileBoundarySnapshot(config, scenario);
 	if (scenarioEnv(scenario, "AWS_BEDROCK_SKIP_AUTH") === "1") {
 		return {
 			mode: "skip-auth",
 			credentialSource: "proxy-dummy",
 			bearerSuppressed: bearerToken !== undefined,
 			secrets: "redacted",
+		};
+	}
+	if (profileBoundary) {
+		return {
+			mode: "profile",
+			...(profileBoundary.configuredProfile !== undefined ? { optionsProfile: profileBoundary.configuredProfile } : {}),
+			...(profileBoundary.envProfile !== undefined ? { envProfile: profileBoundary.envProfile } : {}),
+			credentialDiscovery: "sdk-profile-resolution",
+			profileBoundary,
 		};
 	}
 	if (request) {
@@ -1650,14 +1687,6 @@ function normalizeCapturedAuthSnapshot(
 				signature: "normalized",
 			};
 		}
-	}
-	if (scenario.input.options.profile || scenarioEnv(scenario, "AWS_PROFILE")) {
-		return {
-			mode: "profile",
-			optionsProfile: scenario.input.options.profile,
-			envProfile: scenarioEnv(scenario, "AWS_PROFILE"),
-			credentialDiscovery: "sdk-profile-resolution",
-		};
 	}
 	return {
 		mode: "missing-credentials",
@@ -1709,6 +1738,7 @@ async function buildRequestSurfaceSnapshot(
 ): Promise<unknown> {
 	void payload;
 	const config = isRecord(sdkClient) && isRecord(sdkClient.config) ? sdkClient.config : {};
+	const profileBoundary = sdkProfileBoundarySnapshot(config, scenario);
 	const path = `/model/${percentEncodePathSegment(scenario.input.model.id)}/converse-stream`;
 	const region = await sdkRegionSnapshot(config, scenario);
 	const baseUrl = request ? { mode: "sdk-http-request", value: requestBaseUrl(request) } : await sdkRequestBaseUrl(config, region);
@@ -1720,8 +1750,8 @@ async function buildRequestSurfaceSnapshot(
 		endpoint: baseUrl,
 		region,
 		clientConfig: {
-			profile: scenario.input.options.profile,
-			envProfile: scenarioEnv(scenario, "AWS_PROFILE"),
+			profile: profileBoundary?.configuredProfile,
+			envProfile: profileBoundary?.envProfile,
 			endpoint: baseUrl.mode === "explicit" ? baseUrl.value : undefined,
 			region: region.value,
 		},
@@ -2178,6 +2208,31 @@ function validateStreamEvents(record: FixtureRecord): void {
 	}
 }
 
+function validateProfileBoundary(record: FixtureRecord): void {
+	const requestSurface = record.expected.typeScriptRequest.requestSurface;
+	if (!isRecord(requestSurface) || !isRecord(requestSurface.auth) || requestSurface.auth.mode !== "profile") return;
+	const profileBoundary = requestSurface.auth.profileBoundary;
+	if (!isRecord(profileBoundary)) {
+		throw new Error(`HARNESS_PROFILE_BOUNDARY: ${record.id} missing SDK profile boundary proof`);
+	}
+	if (profileBoundary.source !== "aws-sdk-shared-ini-profile-resolution") {
+		throw new Error(`HARNESS_PROFILE_BOUNDARY: ${record.id} does not use SDK shared-ini profile resolution`);
+	}
+	const expectedProfile = record.input.options.profile ?? record.input.env?.AWS_PROFILE;
+	if (typeof expectedProfile !== "string" || expectedProfile.length === 0) {
+		throw new Error(`HARNESS_PROFILE_BOUNDARY: ${record.id} has profile auth without profile input`);
+	}
+	if (profileBoundary.selectedProfile !== expectedProfile) {
+		throw new Error(`HARNESS_PROFILE_BOUNDARY: ${record.id} selected profile diverged from SDK boundary`);
+	}
+	if (record.input.options.profile !== undefined && profileBoundary.configuredProfile !== record.input.options.profile) {
+		throw new Error(`HARNESS_PROFILE_BOUNDARY: ${record.id} options.profile was not captured from SDK client config`);
+	}
+	if (record.input.env?.AWS_PROFILE !== undefined && profileBoundary.envProfile !== record.input.env.AWS_PROFILE) {
+		throw new Error(`HARNESS_PROFILE_BOUNDARY: ${record.id} AWS_PROFILE was not captured from SDK profile boundary`);
+	}
+}
+
 function validateFixture(record: FixtureRecord): void {
 	const allowedTopLevelKeys = ["expected", "id", "input", "metadata", "schemaVersion", "title"];
 	for (const key of Object.keys(record)) {
@@ -2217,6 +2272,7 @@ function validateFixture(record: FixtureRecord): void {
 		throw new Error(`HARNESS_SCHEMA: Fixture ${record.id} exceeds ${maxFixtureBytes} bytes`);
 	}
 	validateStreamEvents(record);
+	validateProfileBoundary(record);
 	validateSecretFree(record, record.id);
 }
 
@@ -2337,6 +2393,17 @@ function runNegativeSuite(records: FixtureRecord[]): string[] {
 		expectNegative("secret-scan", "HARNESS_SECRET", () => {
 			const record = cloneRecord(first);
 			record.title = "AKIAABCDEFGHIJKLMNOP";
+			validateFixture(record);
+		}),
+	);
+	output.push(
+		expectNegative("profile-boundary-proof", "HARNESS_PROFILE_BOUNDARY", () => {
+			const record = cloneRecord(records.find((candidate) => candidate.id === "bedrock-auth-options-profile") ?? first);
+			const requestSurface = record.expected.typeScriptRequest.requestSurface;
+			if (!isRecord(requestSurface) || !isRecord(requestSurface.auth)) {
+				throw new Error("profile request surface missing");
+			}
+			delete requestSurface.auth.profileBoundary;
 			validateFixture(record);
 		}),
 	);
