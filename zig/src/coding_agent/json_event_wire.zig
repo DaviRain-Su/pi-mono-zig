@@ -287,6 +287,13 @@ fn validateAssistantMessageObject(allocator: std.mem.Allocator, object: std.json
             try invalidType(allocator, response_id_path, "string", response_id);
         }
     }
+    if (object.get("responseModel")) |response_model| {
+        if (response_model != .string) {
+            const response_model_path = try fieldPath(allocator, path, "responseModel");
+            defer allocator.free(response_model_path);
+            try invalidType(allocator, response_model_path, "string", response_model);
+        }
+    }
     try validateUsageField(allocator, object, path, "usage");
     _ = try requireAllowedStringField(allocator, object, path, "stopReason", &[_][]const u8{ "stop", "length", "toolUse", "error", "aborted" }, "an allowed stop reason");
     if (object.get("errorMessage")) |error_message| {
@@ -737,6 +744,9 @@ fn assistantMessageToJsonValue(allocator: std.mem.Allocator, assistant: ai.Assis
     try putStringField(&object, allocator, "model", assistant.model);
     if (assistant.response_id) |response_id| {
         try putStringField(&object, allocator, "responseId", response_id);
+    }
+    if (assistant.response_model) |response_model| {
+        try putStringField(&object, allocator, "responseModel", response_model);
     }
     try putField(&object, allocator, "usage", try usageToJsonValue(allocator, assistant.usage));
     try putStringField(&object, allocator, "stopReason", stopReasonToString(assistant.stop_reason));

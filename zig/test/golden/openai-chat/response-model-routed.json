@@ -1,0 +1,145 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openrouter",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "streamOutput": {
+      "api": "openai-completions",
+      "content": [
+        {
+          "text": "routed",
+          "type": "text"
+        }
+      ],
+      "model": "openrouter/auto",
+      "provider": "openrouter",
+      "responseModel": "anthropic/claude-opus-4.7",
+      "stopReason": "stop",
+      "usage": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 10,
+        "output": 5,
+        "totalTokens": 15
+      }
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": "You are the deterministic OpenAI Chat fixture assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Return a concise fixture response.",
+            "role": "user"
+          }
+        ],
+        "model": "openrouter/auto",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+  },
+  "id": "response-model-routed",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Return a concise fixture response.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are the deterministic OpenAI Chat fixture assistant."
+    },
+    "mockChunks": [
+      {
+        "choices": [
+          {
+            "delta": {
+              "content": "routed",
+              "role": "assistant"
+            },
+            "finish_reason": null,
+            "index": 0
+          }
+        ],
+        "id": "chatcmpl-routed",
+        "model": "anthropic/claude-opus-4.7",
+        "object": "chat.completion.chunk"
+      },
+      {
+        "choices": [
+          {
+            "delta": {},
+            "finish_reason": "stop",
+            "index": 0
+          }
+        ],
+        "id": "chatcmpl-routed",
+        "model": "anthropic/claude-opus-4.7",
+        "object": "chat.completion.chunk",
+        "usage": {
+          "completion_tokens": 5,
+          "prompt_tokens": 10,
+          "total_tokens": 15
+        }
+      }
+    ],
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "id": "openrouter/auto",
+      "input": [
+        "text"
+      ],
+      "name": "OpenRouter Auto Fixture",
+      "provider": "openrouter",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Routed chunk.model sets responseModel while requested model remains unchanged"
+}

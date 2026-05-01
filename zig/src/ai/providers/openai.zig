@@ -309,6 +309,17 @@ fn parseSseStreamLines(
             }
         }
 
+        // Extract response_model from chunk.model when it differs from the
+        // requested model id (sticky first-match semantics matching TS
+        // `output.responseModel ||= chunk.model`).
+        if (value.object.get("model")) |model_val| {
+            if (model_val == .string and model_val.string.len > 0 and output.response_model == null) {
+                if (!std.mem.eql(u8, model_val.string, model.id)) {
+                    output.response_model = try allocator.dupe(u8, model_val.string);
+                }
+            }
+        }
+
         // Extract choices from chunk
         const choices = value.object.get("choices") orelse continue;
         if (choices != .array or choices.array.items.len == 0) continue;
@@ -1511,6 +1522,32 @@ fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap(
         allocator.free(entry.value_ptr.*);
     }
     headers.deinit();
+}
+
+/// Parse an OpenAI Chat SSE byte slice and return the final AssistantMessage.
+/// This is a test/parity helper that wraps the existing SSE stream parser.
+/// The caller owns the returned message; free with the same allocator used for parsing.
+pub fn parseSseAssistantMessageFromSlice(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sse_data: []const u8,
+    model: types.Model,
+) !types.AssistantMessage {
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    // The StreamingResponse takes ownership of `body`; duplicate so caller keeps theirs.
+    const body_copy = try allocator.dupe(u8, sse_data);
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body_copy,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    return stream.result() orelse return error.MissingAssistantMessage;
 }
 
 pub fn buildResolvedCompatSnapshotValue(allocator: std.mem.Allocator, model: types.Model) !std.json.Value {
