@@ -1,0 +1,244 @@
+{
+  "expected": {
+    "resolvedCompat": {
+      "maxTokensField": "max_completion_tokens",
+      "openRouterRouting": {},
+      "reasoningEffortMap": {},
+      "requiresAssistantAfterToolResult": false,
+      "requiresReasoningContentOnAssistantMessages": false,
+      "requiresThinkingAsText": false,
+      "requiresToolResultName": false,
+      "sendSessionAffinityHeaders": false,
+      "supportsDeveloperRole": true,
+      "supportsLongCacheRetention": true,
+      "supportsReasoningEffort": true,
+      "supportsStore": true,
+      "supportsStrictMode": true,
+      "supportsUsageInStreaming": true,
+      "thinkingFormat": "openai",
+      "vercelGatewayRouting": {},
+      "zaiToolStream": false
+    },
+    "streamOutput": {
+      "api": "openai-completions",
+      "content": [
+        {
+          "arguments": {
+            "city": "Berlin",
+            "unit": "celsius"
+          },
+          "id": "call_sig_single",
+          "name": "get_weather",
+          "thoughtSignature": "{\"data\":\"opaque-encrypted-payload-single\",\"id\":\"call_sig_single\",\"type\":\"reasoning.encrypted\"}",
+          "type": "toolCall"
+        }
+      ],
+      "model": "gpt-4.1-fixture",
+      "provider": "openai",
+      "stopReason": "toolUse",
+      "usage": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 10,
+        "output": 5,
+        "totalTokens": 15
+      }
+    },
+    "typeScriptRequest": {
+      "baseUrl": "https://api.openai.com/v1",
+      "headers": {
+        "authorization": "<redacted-present>",
+        "content-type": "application/json"
+      },
+      "jsonPayload": {
+        "messages": [
+          {
+            "content": "You are a helpful assistant.",
+            "role": "system"
+          },
+          {
+            "content": "Check the weather in Berlin.",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-fixture",
+        "store": false,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "tools": [
+          {
+            "function": {
+              "description": "Return deterministic weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "anyOf": [
+                      {
+                        "const": "celsius",
+                        "type": "string"
+                      },
+                      {
+                        "const": "fahrenheit",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "city",
+                  "unit"
+                ],
+                "type": "object"
+              },
+              "strict": false
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "url": "https://api.openai.com/v1/chat/completions"
+    }
+  },
+  "id": "signature-stream-single-tool",
+  "input": {
+    "context": {
+      "messages": [
+        {
+          "content": "Check the weather in Berlin.",
+          "role": "user"
+        }
+      ],
+      "systemPrompt": "You are a helpful assistant.",
+      "tools": [
+        {
+          "description": "Return deterministic weather for a city.",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "anyOf": [
+                  {
+                    "const": "celsius",
+                    "type": "string"
+                  },
+                  {
+                    "const": "fahrenheit",
+                    "type": "string"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "city",
+              "unit"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    "mockChunks": [
+      {
+        "choices": [
+          {
+            "delta": {
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\":\"Berlin\",\"unit\":\"celsius\"}",
+                    "name": "get_weather"
+                  },
+                  "id": "call_sig_single",
+                  "index": 0,
+                  "type": "function"
+                }
+              ]
+            },
+            "finish_reason": null,
+            "index": 0
+          }
+        ],
+        "id": "chatcmpl-sig-single",
+        "model": "gpt-4.1-fixture",
+        "object": "chat.completion.chunk"
+      },
+      {
+        "choices": [
+          {
+            "delta": {
+              "reasoning_details": [
+                {
+                  "data": "opaque-encrypted-payload-single",
+                  "id": "call_sig_single",
+                  "type": "reasoning.encrypted"
+                }
+              ]
+            },
+            "finish_reason": null,
+            "index": 0
+          }
+        ],
+        "id": "chatcmpl-sig-single",
+        "model": "gpt-4.1-fixture",
+        "object": "chat.completion.chunk"
+      },
+      {
+        "choices": [
+          {
+            "delta": {},
+            "finish_reason": "tool_calls",
+            "index": 0
+          }
+        ],
+        "id": "chatcmpl-sig-single",
+        "model": "gpt-4.1-fixture",
+        "object": "chat.completion.chunk",
+        "usage": {
+          "completion_tokens": 5,
+          "prompt_tokens": 10,
+          "total_tokens": 15
+        }
+      }
+    ],
+    "model": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.openai.com/v1",
+      "id": "gpt-4.1-fixture",
+      "input": [
+        "text"
+      ],
+      "name": "GPT 4.1 Fixture",
+      "provider": "openai",
+      "reasoning": false
+    },
+    "options": {
+      "apiKeyMode": "fixture-placeholder"
+    }
+  },
+  "metadata": {
+    "captureBoundary": "streamOpenAICompletions after compat resolution, message/tool conversion, header merge, and onPayload mutation; before any live HTTP request",
+    "captureMethod": "global fetch is replaced with a deterministic local mock that records the SDK request and returns fixed SSE chunks",
+    "network": "global fetch mock rejects unhandled requests",
+    "sourceCitations": [
+      "packages/ai/src/providers/openai-completions.ts:111-153",
+      "packages/ai/src/providers/openai-completions.ts:426-579",
+      "packages/ai/src/providers/openai-completions.ts:582-778",
+      "packages/ai/src/providers/openai-completions.ts:941-1122",
+      "packages/ai/src/types.ts:278-347"
+    ]
+  },
+  "schemaVersion": 1,
+  "title": "Encrypted reasoning_details for a single tool call attaches thoughtSignature"
+}

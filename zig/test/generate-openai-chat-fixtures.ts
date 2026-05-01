@@ -2116,6 +2116,376 @@ const scenarios: Scenario[] = [
 			],
 		},
 	},
+	// Signature parity scenarios (VAL-M8D-SIGNATURE-001 through VAL-M8D-SIGNATURE-012)
+	{
+		id: "signature-stream-single-tool",
+		title: "Encrypted reasoning_details for a single tool call attaches thoughtSignature",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [{ role: "user", content: "Check the weather in Berlin." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-sig-single",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								role: "assistant",
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_sig_single",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"Berlin","unit":"celsius"}' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-single",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								reasoning_details: [
+									{
+										type: "reasoning.encrypted",
+										id: "call_sig_single",
+										data: "opaque-encrypted-payload-single",
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-single",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+				},
+			],
+		},
+	},
+	{
+		id: "signature-stream-multi-tool",
+		title: "Multiple tool calls with multiple encrypted reasoning_details matched by id",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [{ role: "user", content: "Check weather and time." }],
+				tools: [
+					fixtureTool,
+					{
+						name: "get_time",
+						description: "Return the current time for a timezone.",
+						parameters: Type.Object({ timezone: Type.String() }),
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-sig-multi",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								role: "assistant",
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_sig_a",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"Berlin","unit":"celsius"}' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-multi",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 1,
+										id: "call_sig_b",
+										type: "function",
+										function: { name: "get_time", arguments: '{"timezone":"UTC"}' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-multi",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								reasoning_details: [
+									{
+										type: "reasoning.encrypted",
+										id: "call_sig_a",
+										data: "encrypted-payload-a",
+									},
+									{
+										type: "reasoning.encrypted",
+										id: "call_sig_b",
+										data: "encrypted-payload-b",
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-multi",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
+				},
+			],
+		},
+	},
+	{
+		id: "signature-unmatched-ignored",
+		title: "Unmatched reasoning_details id does not create synthetic tool calls or wrong associations",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [{ role: "user", content: "Check the weather." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-sig-unmatched",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								role: "assistant",
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_real",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"Berlin","unit":"celsius"}' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-unmatched",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								reasoning_details: [
+									{
+										type: "reasoning.encrypted",
+										id: "call_nonexistent_999",
+										data: "orphan-encrypted-payload",
+									},
+									{
+										type: "reasoning.other",
+										id: "call_real",
+										data: "wrong-type-payload",
+									},
+									{
+										type: "reasoning.encrypted",
+										id: "call_real",
+									},
+									{
+										type: "reasoning.encrypted",
+										data: "missing-id-payload",
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-sig-unmatched",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+				},
+			],
+		},
+	},
+	{
+		id: "signature-same-model-replay",
+		title: "Same provider/api/model replay emits reasoning_details alongside tool_calls",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [
+					{ role: "user", content: "Check the weather." },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "call_replay_1",
+								name: "get_weather",
+								arguments: { city: "Berlin", unit: "celsius" },
+								thoughtSignature: '{"type":"reasoning.encrypted","id":"call_replay_1","data":"replay-encrypted-payload"}',
+							},
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_replay_1",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Sunny, 22°C" }],
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "signature-cross-model-stripped",
+		title: "Cross model/provider replay strips tool-call thoughtSignature and omits reasoning_details",
+		input: {
+			model: buildModel({
+				id: "claude-sonnet",
+				name: "Claude Sonnet",
+				provider: "anthropic",
+				baseUrl: "https://api.anthropic.com/v1",
+			}),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [
+					{ role: "user", content: "Check the weather." },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "call_cross_1",
+								name: "get_weather",
+								arguments: { city: "Berlin", unit: "celsius" },
+								thoughtSignature: '{"type":"reasoning.encrypted","id":"call_cross_1","data":"cross-encrypted-payload"}',
+							},
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_cross_1",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Sunny, 22°C" }],
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
+	{
+		id: "signature-malformed-not-replayed",
+		title: "Malformed stored thoughtSignature is not replayed as reasoning_details",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [
+					{ role: "user", content: "Check the weather." },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "call_malformed_1",
+								name: "get_weather",
+								arguments: { city: "Berlin", unit: "celsius" },
+								thoughtSignature: "not-valid-json{{{",
+							},
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_malformed_1",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Sunny, 22°C" }],
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {
@@ -2233,7 +2603,17 @@ function normalizeAssistantMessage(message: AssistantMessage): NormalizedAssista
 				return { type: "thinking", thinking: block.thinking, redacted: block.redacted ?? false };
 			}
 			if (block.type === "toolCall") {
-				return { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments };
+				const tc: Record<string, unknown> = { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments };
+				if (block.thoughtSignature) {
+					// Normalize the JSON key order to match Zig's alphabetically-sorted
+					// JSON stringify, ensuring deterministic string comparison in parity.
+					try {
+						tc.thoughtSignature = JSON.stringify(stableValue(JSON.parse(block.thoughtSignature)));
+					} catch {
+						tc.thoughtSignature = block.thoughtSignature;
+					}
+				}
+				return tc;
 			}
 			if (block.type === "image") {
 				return { type: "image", data: block.data, mimeType: block.mimeType };

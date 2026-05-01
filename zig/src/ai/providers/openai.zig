@@ -126,6 +126,7 @@ const ActiveToolCallBlock = struct {
     id: std.ArrayList(u8),
     name: std.ArrayList(u8),
     partial_args: std.ArrayList(u8),
+    thought_signature: ?[]const u8 = null,
 };
 
 fn deinitCurrentBlock(block: *CurrentBlock, allocator: std.mem.Allocator) void {
@@ -147,6 +148,7 @@ fn deinitActiveToolCallBlock(allocator: std.mem.Allocator, block: *ActiveToolCal
     block.id.deinit(allocator);
     block.name.deinit(allocator);
     block.partial_args.deinit(allocator);
+    if (block.thought_signature) |sig| allocator.free(sig);
 }
 
 /// Free allocated fields within an AssistantMessageEvent.
@@ -242,6 +244,7 @@ fn parseSseStreamLines(
                 allocator.free(tool_call.id);
                 allocator.free(tool_call.name);
                 freeJsonValue(allocator, tool_call.arguments);
+                if (tool_call.thought_signature) |sig| allocator.free(sig);
             }
             tool_calls.deinit(allocator);
         }
@@ -487,6 +490,42 @@ fn parseSseStreamLines(
                 }
             }
         }
+
+        // Handle reasoning_details: attach encrypted reasoning details to
+        // matching tool-call thought_signature by id. This mirrors TypeScript
+        // openai-completions.ts which sets
+        // matchingToolCall.thoughtSignature = JSON.stringify(detail).
+        if (delta.object.get("reasoning_details")) |reasoning_details_val| {
+            if (reasoning_details_val == .array) {
+                for (reasoning_details_val.array.items) |detail| {
+                    if (detail != .object) continue;
+                    const detail_type = if (detail.object.get("type")) |t|
+                        if (t == .string) t.string else null
+                    else
+                        null;
+                    if (detail_type == null or !std.mem.eql(u8, detail_type.?, "reasoning.encrypted")) continue;
+                    const detail_id = if (detail.object.get("id")) |id_v|
+                        if (id_v == .string and id_v.string.len > 0) id_v.string else null
+                    else
+                        null;
+                    if (detail_id == null) continue;
+                    const detail_data = if (detail.object.get("data")) |d_v|
+                        if (d_v == .string and d_v.string.len > 0) d_v.string else null
+                    else
+                        null;
+                    if (detail_data == null) continue;
+
+                    // Find matching active tool call by id
+                    for (active_tool_calls.items) |*tool_call| {
+                        if (std.mem.eql(u8, tool_call.id.items, detail_id.?)) {
+                            if (tool_call.thought_signature) |old| allocator.free(old);
+                            tool_call.thought_signature = try std.json.Stringify.valueAlloc(allocator, detail, .{});
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Finish any remaining block
@@ -631,16 +670,23 @@ fn finishActiveToolCalls(
         const args_str = std.mem.trim(u8, tool_call.partial_args.items, " ");
         const args = try parseStreamingJsonToValue(allocator, args_str);
         errdefer freeJsonValue(allocator, args);
+        // Transfer thought_signature ownership from the active block to the
+        // final tool call; null out the active block field so
+        // deinitActiveToolCallBlock does not double-free.
+        const thought_sig = tool_call.thought_signature;
+        tool_call.thought_signature = null;
         const final_tool_call = types.ToolCall{
             .id = id,
             .name = name,
             .arguments = args,
+            .thought_signature = thought_sig,
         };
         try tool_calls.append(allocator, final_tool_call);
         try content_blocks.append(allocator, types.ContentBlock{ .tool_call = .{
             .id = try allocator.dupe(u8, final_tool_call.id),
             .name = try allocator.dupe(u8, final_tool_call.name),
             .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+            .thought_signature = if (thought_sig) |sig| try allocator.dupe(u8, sig) else null,
         } });
         stream_ptr.push(.{
             .event_type = .toolcall_end,
@@ -2047,6 +2093,26 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
             try tc_array.append(std.json.Value{ .object = tc_obj });
         }
         try obj.put(allocator, try allocator.dupe(u8, "tool_calls"), std.json.Value{ .array = tc_array });
+
+        // Emit reasoning_details from tool-call thought signatures for
+        // same-model replay. transform_messages already strips signatures
+        // for cross-model/provider, so any remaining thought_signature is
+        // safe to replay. This mirrors TypeScript convertMessages:
+        //   reasoningDetails = toolCalls.filter(tc => tc.thoughtSignature)
+        //     .map(tc => JSON.parse(tc.thoughtSignature)).filter(Boolean)
+        var reasoning_details = std.json.Array.init(allocator);
+        for (tool_calls) |tc| {
+            if (tc.thought_signature) |sig| {
+                const parsed = std.json.parseFromSlice(std.json.Value, allocator, sig, .{}) catch continue;
+                defer parsed.deinit();
+                reasoning_details.append(try cloneJsonValue(allocator, parsed.value)) catch continue;
+            }
+        }
+        if (reasoning_details.items.len > 0) {
+            try obj.put(allocator, try allocator.dupe(u8, "reasoning_details"), std.json.Value{ .array = reasoning_details });
+        } else {
+            reasoning_details.deinit();
+        }
     }
 
     const content_value = obj.get("content") orelse .null;
