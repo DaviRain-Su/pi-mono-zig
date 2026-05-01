@@ -130,6 +130,7 @@ fn cloneAssistantMessage(
         .provider = try allocator.dupe(u8, assistant.provider),
         .model = try allocator.dupe(u8, assistant.model),
         .response_id = if (assistant.response_id) |response_id| try allocator.dupe(u8, response_id) else null,
+        .response_model = if (assistant.response_model) |response_model| try allocator.dupe(u8, response_model) else null,
         .usage = assistant.usage,
         .stop_reason = assistant.stop_reason,
         .error_message = if (assistant.error_message) |error_message| try allocator.dupe(u8, error_message) else null,
@@ -480,6 +481,7 @@ fn freeMessage(allocator: std.mem.Allocator, message: types.Message) void {
             allocator.free(assistant.provider);
             allocator.free(assistant.model);
             if (assistant.response_id) |response_id| allocator.free(response_id);
+            if (assistant.response_model) |response_model| allocator.free(response_model);
             if (assistant.error_message) |error_message| allocator.free(error_message);
             freeContentBlocks(allocator, assistant.content);
             if (assistant.tool_calls) |tool_calls| {
@@ -1089,4 +1091,159 @@ test "transformMessages synthetic orphan tool results have null details" {
     try std.testing.expectEqualStrings(SYNTHETIC_TOOL_RESULT_TEXT, transformed[1].tool_result.content[0].text.text);
     // Synthetic result must NOT invent details
     try std.testing.expect(transformed[1].tool_result.details == null);
+}
+
+// ---------------------------------------------------------------------------
+// response_model clone/transform preservation
+// ---------------------------------------------------------------------------
+
+test "transformMessages preserves response_model for same-provider replay" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "openrouter/auto",
+        .name = "OpenRouter Auto",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello from routed model." } }},
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .model = "openrouter/auto",
+        .response_model = "anthropic/claude-opus-4.7",
+        .usage = types.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 100,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{.{ .assistant = assistant }}, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 1), transformed.len);
+    try std.testing.expectEqualStrings("openrouter/auto", transformed[0].assistant.model);
+    try std.testing.expect(transformed[0].assistant.response_model != null);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", transformed[0].assistant.response_model.?);
+}
+
+test "transformMessages leaves response_model null when source has none" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gpt-5",
+        .name = "GPT-5",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "No routed model." } }},
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = types.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 200,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{.{ .assistant = assistant }}, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 1), transformed.len);
+    try std.testing.expect(transformed[0].assistant.response_model == null);
+}
+
+test "transformMessages preserves response_model through cross-provider replay" {
+    const allocator = std.testing.allocator;
+    const target_model = types.Model{
+        .id = "claude-sonnet",
+        .name = "Claude Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+
+    const assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Cross provider with routed model." } }},
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .model = "openrouter/auto",
+        .response_model = "anthropic/claude-opus-4.7",
+        .usage = types.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 300,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{.{ .assistant = assistant }}, target_model, normalizeToolCallIdForTest);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 1), transformed.len);
+    // model remains the original requested model, not the routed one
+    try std.testing.expectEqualStrings("openrouter/auto", transformed[0].assistant.model);
+    // response_model is preserved through cross-provider clone
+    try std.testing.expect(transformed[0].assistant.response_model != null);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", transformed[0].assistant.response_model.?);
+}
+
+test "transformMessages preserves response_model with tool calls and synthetic results" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "openrouter/auto",
+        .name = "OpenRouter Auto",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    defer {
+        var iter = arguments.iterator();
+        while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
+        var owned = arguments;
+        owned.deinit(allocator);
+    }
+    try arguments.put(allocator, try allocator.dupe(u8, "query"), .{ .string = "test" });
+
+    const assistant = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Using tool." } }},
+        .tool_calls = &[_]types.ToolCall{.{
+            .id = "call-routed-1",
+            .name = "search",
+            .arguments = .{ .object = arguments },
+        }},
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .model = "openrouter/auto",
+        .response_model = "anthropic/claude-opus-4.7",
+        .usage = types.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 400,
+    };
+
+    const transformed = try transformMessages(allocator, &[_]types.Message{
+        .{ .assistant = assistant },
+        .{ .user = .{ .content = &[_]types.ContentBlock{.{ .text = .{ .text = "continue" } }}, .timestamp = 500 } },
+    }, model, null);
+    defer freeMessages(allocator, transformed);
+
+    try std.testing.expectEqual(@as(usize, 3), transformed.len);
+    // assistant response_model preserved despite synthetic tool result insertion
+    try std.testing.expectEqualStrings("openrouter/auto", transformed[0].assistant.model);
+    try std.testing.expect(transformed[0].assistant.response_model != null);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", transformed[0].assistant.response_model.?);
+    // synthetic tool result has no response_model (not applicable)
+    try std.testing.expect(transformed[1] == .tool_result);
 }
