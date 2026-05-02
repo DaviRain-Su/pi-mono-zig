@@ -25,6 +25,22 @@ pub const ParseError = error{
 
 pub const ParseArgsError = ParseError || std.mem.Allocator.Error;
 
+/// Mirrors the TypeScript `Args.unknownFlags` map entry shape. Long
+/// (`--*`) flags that are not part of the built-in CLI option set are
+/// accepted at parse time so that extension-registered flags can be
+/// surfaced after extension discovery completes. Boolean flags appear
+/// when the next argv token starts with `-` or `@` or is absent;
+/// string flags consume the following token (or use `--foo=bar`).
+pub const UnknownFlagValue = union(enum) {
+    boolean: bool,
+    string: []const u8,
+};
+
+pub const UnknownFlag = struct {
+    name: []const u8,
+    value: UnknownFlagValue,
+};
+
 pub const Args = struct {
     model: ?[]const u8 = null,
     provider: ?[]const u8 = null,
@@ -63,6 +79,7 @@ pub const Args = struct {
     prompt: ?[]const u8 = null,
     prompt_owned: bool = false,
     file_args: ?[]const []const u8 = null,
+    unknown_flags: ?[]const UnknownFlag = null,
 
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         if (self.extensions) |extensions| allocator.free(extensions);
@@ -72,6 +89,7 @@ pub const Args = struct {
         if (self.tools) |tools| allocator.free(tools);
         if (self.models) |models| allocator.free(models);
         if (self.file_args) |file_args| allocator.free(file_args);
+        if (self.unknown_flags) |flags| allocator.free(flags);
         if (self.prompt_owned and self.prompt != null) allocator.free(self.prompt.?);
         self.* = undefined;
     }
@@ -98,6 +116,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
     var themes_builder = std.ArrayList([]const u8).empty;
     var themes_transferred = false;
     defer if (!themes_transferred) themes_builder.deinit(allocator);
+    var unknown_flags_builder = std.ArrayList(UnknownFlag).empty;
+    var unknown_flags_transferred = false;
+    defer if (!unknown_flags_transferred) unknown_flags_builder.deinit(allocator);
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -217,7 +238,43 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             result.@"export" = argv[i];
         } else if (std.mem.startsWith(u8, arg, "@")) {
             try file_args_builder.append(allocator, arg[1..]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            // Long flag we do not recognize. Mirror TypeScript
+            // `parseArgs` behavior in `packages/coding-agent/src/cli/args.ts`
+            // by collecting the flag (and optional next-token value) into
+            // `unknown_flags` so extensions registered later can either
+            // claim the flag or produce an `Unknown option:` diagnostic.
+            const eq_index_opt = std.mem.indexOfScalar(u8, arg, '=');
+            if (eq_index_opt) |eq_index| {
+                const flag_name = arg[2..eq_index];
+                const flag_value = arg[eq_index + 1 ..];
+                try unknown_flags_builder.append(allocator, .{
+                    .name = flag_name,
+                    .value = .{ .string = flag_value },
+                });
+            } else {
+                const flag_name = arg[2..];
+                if (i + 1 < argv.len) {
+                    const next = argv[i + 1];
+                    if (next.len > 0 and !std.mem.startsWith(u8, next, "-") and !std.mem.startsWith(u8, next, "@")) {
+                        try unknown_flags_builder.append(allocator, .{
+                            .name = flag_name,
+                            .value = .{ .string = next },
+                        });
+                        i += 1;
+                        continue;
+                    }
+                }
+                try unknown_flags_builder.append(allocator, .{
+                    .name = flag_name,
+                    .value = .{ .boolean = true },
+                });
+            }
         } else if (std.mem.startsWith(u8, arg, "-")) {
+            // Single-dash short options not in the built-in set remain a
+            // hard error. TypeScript surfaces these as a parse-time
+            // diagnostic; Zig keeps the existing fail-fast behavior so
+            // the caller can render `Error: Unknown option`.
             return error.UnknownOption;
         } else {
             if (prompt_builder.items.len > 0) {
@@ -253,11 +310,71 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
         result.themes = try themes_builder.toOwnedSlice(allocator);
         themes_transferred = true;
     }
+    if (unknown_flags_builder.items.len > 0) {
+        result.unknown_flags = try unknown_flags_builder.toOwnedSlice(allocator);
+        unknown_flags_transferred = true;
+    }
 
     return result;
 }
 
+/// Minimal description of an extension-registered CLI flag used for
+/// help-text rendering. Mirrors the subset of the TypeScript
+/// `ExtensionFlag` shape that the help formatter needs.
+pub const ExtensionFlagInfo = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    type_kind: enum { boolean, string } = .boolean,
+    extension_path: []const u8 = "",
+};
+
 pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
+    return helpTextWithExtensions(allocator, version, &.{});
+}
+
+pub fn helpTextWithExtensions(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    extension_flags: []const ExtensionFlagInfo,
+) ![]u8 {
+    const base = try renderBaseHelp(allocator, version);
+    if (extension_flags.len == 0) return base;
+    defer allocator.free(base);
+
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    try buffer.appendSlice(allocator, base);
+
+    // Insert the extension flags section directly after the existing
+    // top-level options listing. Match the TypeScript ordering by
+    // appending after the trailing newline written by `renderBaseHelp`.
+    try buffer.appendSlice(allocator, "Extension CLI Flags:\n");
+    for (extension_flags) |flag| {
+        const value_label: []const u8 = if (flag.type_kind == .string) " <value>" else "";
+        const description = if (flag.description) |desc| desc else flag.extension_path;
+        // Mirror TS padEnd(30) on `--<name><value>` with a 2-space prefix.
+        var label_buffer: [64]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buffer, "  --{s}{s}", .{ flag.name, value_label }) catch
+            return error.OutOfMemory;
+        try buffer.appendSlice(allocator, label);
+        const padded_target: usize = 30;
+        if (label.len < padded_target) {
+            var pad_remaining = padded_target - label.len;
+            const spaces = "                                ";
+            while (pad_remaining > 0) {
+                const chunk = @min(pad_remaining, spaces.len);
+                try buffer.appendSlice(allocator, spaces[0..chunk]);
+                pad_remaining -= chunk;
+            }
+        }
+        try buffer.appendSlice(allocator, description);
+        try buffer.append(allocator, '\n');
+    }
+
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn renderBaseHelp(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         \\pi - AI assistant (Zig rewrite) v{s}
@@ -461,6 +578,74 @@ test "parse args accepts TS RPC mode" {
     defer args.deinit(allocator);
 
     try std.testing.expectEqual(Mode.ts_rpc, args.mode);
+}
+
+test "parse args collects unknown long flags as boolean by default" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{ "--plan", "--verbose" });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.unknown_flags != null);
+    try std.testing.expectEqual(@as(usize, 1), args.unknown_flags.?.len);
+    try std.testing.expectEqualStrings("plan", args.unknown_flags.?[0].name);
+    try std.testing.expect(args.unknown_flags.?[0].value == .boolean);
+    try std.testing.expect(args.unknown_flags.?[0].value.boolean);
+    try std.testing.expect(args.verbose);
+}
+
+test "parse args collects unknown long flag with following string value" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{ "--model-alias", "claude-haiku" });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.unknown_flags != null);
+    try std.testing.expectEqual(@as(usize, 1), args.unknown_flags.?.len);
+    try std.testing.expectEqualStrings("model-alias", args.unknown_flags.?[0].name);
+    try std.testing.expect(args.unknown_flags.?[0].value == .string);
+    try std.testing.expectEqualStrings("claude-haiku", args.unknown_flags.?[0].value.string);
+}
+
+test "parse args collects unknown long flag with equals form" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{"--plan-mode=ready"});
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.unknown_flags != null);
+    try std.testing.expectEqual(@as(usize, 1), args.unknown_flags.?.len);
+    try std.testing.expectEqualStrings("plan-mode", args.unknown_flags.?[0].name);
+    try std.testing.expect(args.unknown_flags.?[0].value == .string);
+    try std.testing.expectEqualStrings("ready", args.unknown_flags.?[0].value.string);
+}
+
+test "parse args still rejects unknown short options" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UnknownOption, parseArgs(allocator, &.{"-x"}));
+}
+
+test "helpTextWithExtensions includes registered extension flags" {
+    const allocator = std.testing.allocator;
+    const flags = [_]ExtensionFlagInfo{
+        .{
+            .name = "plan",
+            .description = "Enable plan mode",
+            .type_kind = .boolean,
+            .extension_path = "/tmp/plan.ts",
+        },
+        .{
+            .name = "model-alias",
+            .description = null,
+            .type_kind = .string,
+            .extension_path = "/tmp/alias.ts",
+        },
+    };
+    const help = try helpTextWithExtensions(allocator, "0.1.0", &flags);
+    defer allocator.free(help);
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "Extension CLI Flags:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Enable plan mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--model-alias <value>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "/tmp/alias.ts") != null);
 }
 
 test "parse args supports help and version" {
