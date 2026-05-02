@@ -136,6 +136,7 @@ const ClipboardPasteResult = union(enum) {
     none,
     success: ai.ImageContent,
     empty,
+    unsupported,
     failure,
 };
 
@@ -197,20 +198,24 @@ const ClipboardPasteTask = struct {
             return;
         };
 
-        var image = clipboard_image.readClipboardImage(allocator, self.io, env_map) catch {
+        const read_result = clipboard_image.readClipboardImage(allocator, self.io, env_map) catch {
             self.storeResult(.failure);
             return;
-        } orelse {
-            self.storeResult(.empty);
-            return;
         };
-        defer image.deinit(allocator);
+        switch (read_result) {
+            .image => |raw_image| {
+                var image = raw_image;
+                defer image.deinit(allocator);
 
-        const encoded = clipboard_image.encodeImageContent(allocator, image) catch {
-            self.storeResult(.failure);
-            return;
-        };
-        self.storeResult(.{ .success = encoded });
+                const encoded = clipboard_image.encodeImageContent(allocator, image) catch {
+                    self.storeResult(.failure);
+                    return;
+                };
+                self.storeResult(.{ .success = encoded });
+            },
+            .unsupported => self.storeResult(.unsupported),
+            .none => self.storeResult(.empty),
+        }
     }
 
     fn storeResult(self: *ClipboardPasteTask, result: ClipboardPasteResult) void {
@@ -355,6 +360,7 @@ pub const AppState = struct {
                 try self.setStatus("clipboard image pasted");
             },
             .empty => try self.setStatus("clipboard does not contain an image"),
+            .unsupported => try self.setStatus("clipboard image format is not supported (use PNG, JPEG, WebP, or GIF)"),
             .failure => try self.setStatus("clipboard image paste failed"),
             .none => {},
         }
