@@ -4755,47 +4755,432 @@ test "handleCopySlashCommand copies the last assistant message to the clipboard"
     try std.testing.expectEqualStrings("copied reply", capture.text.?);
 }
 
-test "handleShareSlashCommand copies markdown transcript to the clipboard" {
-    const allocator = std.testing.allocator;
+fn expectShareTmpRemoved(path: []const u8) !void {
+    if (std.Io.Dir.openFileAbsolute(std.testing.io, path, .{})) |file| {
+        var owned = file;
+        owned.close(std.testing.io);
+        return error.TestUnexpectedShareTmpFileExists;
+    } else |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    }
+}
 
-    var capture = ClipboardCapture{ .allocator = allocator };
-    defer capture.deinit();
-    const previous_context = slash_commands.clipboard_copy_context;
-    const previous_fn = slash_commands.clipboard_copy_fn;
-    slash_commands.clipboard_copy_context = &capture;
-    slash_commands.clipboard_copy_fn = captureClipboardText;
-    defer {
-        slash_commands.clipboard_copy_context = previous_context;
-        slash_commands.clipboard_copy_fn = previous_fn;
+fn lastItemKindContains(state: *const AppState, kind: rendering.ChatKind, needle: []const u8) bool {
+    var index = state.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = state.items.items[index];
+        if (item.kind != kind) continue;
+        if (std.mem.indexOf(u8, item.text, needle) != null) return true;
+        return false;
+    }
+    return false;
+}
+
+fn hasItemKind(state: *const AppState, kind: rendering.ChatKind) bool {
+    for (state.items.items) |item| {
+        if (item.kind == kind) return true;
+    }
+    return false;
+}
+
+const ShareGhStubInvocation = struct {
+    argv: [][]u8,
+
+    fn deinit(self: *ShareGhStubInvocation, allocator: std.mem.Allocator) void {
+        for (self.argv) |arg| allocator.free(arg);
+        allocator.free(self.argv);
+    }
+};
+
+const ShareGhStubScript = struct {
+    not_found: bool = false,
+    exit_code: u8 = 0,
+    stdout: []const u8 = "",
+    stderr: []const u8 = "",
+    return_error: ?anyerror = null,
+};
+
+const ShareGhStub = struct {
+    allocator: std.mem.Allocator,
+    auth: ShareGhStubScript = .{},
+    gist: ShareGhStubScript = .{},
+    invocations: std.ArrayList(ShareGhStubInvocation) = .empty,
+
+    fn deinit(self: *ShareGhStub) void {
+        for (self.invocations.items) |*invocation| invocation.deinit(self.allocator);
+        self.invocations.deinit(self.allocator);
     }
 
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
+    fn run(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        argv: []const []const u8,
+    ) anyerror!slash_commands.ShareGhResult {
+        const self: *ShareGhStub = @ptrCast(@alignCast(context.?));
+        var stored_argv = try self.allocator.alloc([]u8, argv.len);
+        errdefer self.allocator.free(stored_argv);
+        for (argv, 0..) |arg, index| {
+            stored_argv[index] = try self.allocator.dupe(u8, arg);
+        }
+        try self.invocations.append(self.allocator, .{ .argv = stored_argv });
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
-    defer current_provider.deinit(allocator);
+        const script = if (argv.len >= 2 and std.mem.eql(u8, argv[1], "gist"))
+            self.gist
+        else
+            self.auth;
 
+        if (script.return_error) |err| return err;
+
+        return slash_commands.ShareGhResult{
+            .exit_code = script.exit_code,
+            .stdout = try allocator.dupe(u8, script.stdout),
+            .stderr = try allocator.dupe(u8, script.stderr),
+            .not_found = script.not_found,
+        };
+    }
+};
+
+fn shareTestTmpFile(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
+    const relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "session.html",
+    });
+    defer allocator.free(relative);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative });
+}
+
+fn installShareTestStub(stub: *ShareGhStub, tmp_path: []const u8) struct {
+    prev_run_fn: slash_commands.ShareGhRunFn,
+    prev_run_ctx: ?*anyopaque,
+    prev_tmp: ?[]const u8,
+} {
+    const prev_run_fn = slash_commands.share_gh_run_fn;
+    const prev_run_ctx = slash_commands.share_gh_run_context;
+    const prev_tmp = slash_commands.share_tmp_file_override;
+    slash_commands.share_gh_run_fn = ShareGhStub.run;
+    slash_commands.share_gh_run_context = stub;
+    slash_commands.share_tmp_file_override = tmp_path;
+    return .{ .prev_run_fn = prev_run_fn, .prev_run_ctx = prev_run_ctx, .prev_tmp = prev_tmp };
+}
+
+fn restoreShareTestStub(prev: anytype) void {
+    slash_commands.share_gh_run_fn = prev.prev_run_fn;
+    slash_commands.share_gh_run_context = prev.prev_run_ctx;
+    slash_commands.share_tmp_file_override = prev.prev_tmp;
+}
+
+fn buildShareTestSession(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+) !struct {
+    provider: provider_config.ResolvedProviderConfig,
+    session: session_mod.AgentSession,
+    user: agent.AgentMessage,
+    assistant: agent.AgentMessage,
+} {
+    var current_provider = try provider_config.resolveProviderConfig(allocator, env_map, "faux", null, null, null);
+    errdefer current_provider.deinit(allocator);
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp/project",
         .system_prompt = "sys",
         .model = current_provider.model,
         .api_key = current_provider.api_key,
     });
-    defer session.deinit();
-
+    errdefer session.deinit();
     var user = try makeInteractiveTestUserMessage("share prompt", 1);
-    defer session_manager_mod.deinitMessage(allocator, &user);
+    errdefer session_manager_mod.deinitMessage(allocator, &user);
     var assistant = try makeInteractiveTestAssistantMessage("share reply", current_provider.model, ai.Usage.init(), 2);
-    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    errdefer session_manager_mod.deinitMessage(allocator, &assistant);
     try session.agent.setMessages(&.{ user, assistant });
+    return .{ .provider = current_provider, .session = session, .user = user, .assistant = assistant };
+}
+
+test "handleShareSlashCommand reports missing gh CLI without writing tmp file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var stub = ShareGhStub{ .allocator = allocator, .auth = .{ .not_found = true } };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
 
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    try handleShareSlashCommand(allocator, std.testing.io, &session, &state);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "# Session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "share prompt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "share reply") != null);
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expectEqual(@as(usize, 1), stub.invocations.items.len);
+    try std.testing.expect(lastItemKindContains(&state, .@"error", "GitHub CLI (gh) is not installed"));
+    try std.testing.expect(std.mem.indexOf(u8, state.status, "share failed") != null);
+    // tmp file must not exist
+    try expectShareTmpRemoved(tmp_file);
+}
+
+test "handleShareSlashCommand reports unauthenticated gh and cleans up" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var stub = ShareGhStub{
+        .allocator = allocator,
+        .auth = .{ .exit_code = 1, .stderr = "You are not logged into any GitHub hosts.\n" },
+    };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expectEqual(@as(usize, 1), stub.invocations.items.len);
+    try std.testing.expect(lastItemKindContains(&state, .@"error", "gh auth login"));
+    try expectShareTmpRemoved(tmp_file);
+}
+
+test "handleShareSlashCommand creates secret gist and uses default viewer URL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var stub = ShareGhStub{
+        .allocator = allocator,
+        .auth = .{ .exit_code = 0, .stdout = "Logged in to github.com\n" },
+        .gist = .{ .exit_code = 0, .stdout = "https://gist.github.com/octocat/abc123def456\n" },
+    };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expectEqual(@as(usize, 2), stub.invocations.items.len);
+    const gist_invocation = stub.invocations.items[1];
+    try std.testing.expectEqualStrings("gh", gist_invocation.argv[0]);
+    try std.testing.expectEqualStrings("gist", gist_invocation.argv[1]);
+    try std.testing.expectEqualStrings("create", gist_invocation.argv[2]);
+    try std.testing.expectEqualStrings("--public=false", gist_invocation.argv[3]);
+    try std.testing.expectEqualStrings(tmp_file, gist_invocation.argv[4]);
+
+    try std.testing.expect(lastItemKindContains(&state, .info, "https://pi.dev/session/#abc123def456"));
+    try std.testing.expect(lastItemKindContains(&state, .info, "https://gist.github.com/octocat/abc123def456"));
+    try std.testing.expectEqualStrings("shared", state.status);
+    try expectShareTmpRemoved(tmp_file);
+}
+
+test "handleShareSlashCommand honors PI_SHARE_VIEWER_URL override" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var stub = ShareGhStub{
+        .allocator = allocator,
+        .auth = .{ .exit_code = 0 },
+        .gist = .{ .exit_code = 0, .stdout = "https://gist.github.com/user/zzz999\n" },
+    };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_SHARE_VIEWER_URL", "https://share.example.com/v/");
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expect(lastItemKindContains(&state, .info, "https://share.example.com/v/#zzz999"));
+    try expectShareTmpRemoved(tmp_file);
+}
+
+test "handleShareSlashCommand surfaces gist creation failure and cleans up" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var stub = ShareGhStub{
+        .allocator = allocator,
+        .auth = .{ .exit_code = 0 },
+        .gist = .{ .exit_code = 1, .stderr = "rate limit exceeded\n" },
+    };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expect(lastItemKindContains(&state, .@"error", "Failed to create gist"));
+    try std.testing.expect(lastItemKindContains(&state, .@"error", "rate limit exceeded"));
+    try std.testing.expect(!hasItemKind(&state, .info));
+    try expectShareTmpRemoved(tmp_file);
+}
+
+test "handleShareSlashCommand rejects gh stdout without a parseable gist id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var stub = ShareGhStub{
+        .allocator = allocator,
+        .auth = .{ .exit_code = 0 },
+        .gist = .{ .exit_code = 0, .stdout = "no usable url here\n" },
+    };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expect(lastItemKindContains(&state, .@"error", "Failed to parse gist ID"));
+    try std.testing.expect(!hasItemKind(&state, .info));
+    try expectShareTmpRemoved(tmp_file);
+}
+
+test "handleShareSlashCommand never falls back to clipboard markdown" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_file = try shareTestTmpFile(allocator, tmp);
+    defer allocator.free(tmp_file);
+
+    var capture = ClipboardCapture{ .allocator = allocator };
+    defer capture.deinit();
+    const previous_clipboard_context = slash_commands.clipboard_copy_context;
+    const previous_clipboard_fn = slash_commands.clipboard_copy_fn;
+    slash_commands.clipboard_copy_context = &capture;
+    slash_commands.clipboard_copy_fn = captureClipboardText;
+    defer {
+        slash_commands.clipboard_copy_context = previous_clipboard_context;
+        slash_commands.clipboard_copy_fn = previous_clipboard_fn;
+    }
+
+    var stub = ShareGhStub{
+        .allocator = allocator,
+        .auth = .{ .not_found = true },
+    };
+    defer stub.deinit();
+    const prev = installShareTestStub(&stub, tmp_file);
+    defer restoreShareTestStub(prev);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var built = try buildShareTestSession(allocator, &env_map);
+    defer {
+        session_manager_mod.deinitMessage(allocator, &built.assistant);
+        session_manager_mod.deinitMessage(allocator, &built.user);
+        built.session.deinit();
+        built.provider.deinit(allocator);
+    }
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
+
+    try std.testing.expect(capture.text == null);
 }
 
 test "handleLogoutSlashCommand opens selector for stored auth providers" {
