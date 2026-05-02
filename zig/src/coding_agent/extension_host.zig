@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("tools/common.zig");
+const extension_registry = @import("extension_registry.zig");
 
 pub const HOST_MARKER_ENV = "PI_M6_EXTENSION_HOST_MARKER";
 
@@ -87,23 +88,61 @@ pub const ExtensionUiRequest = struct {
     }
 };
 
+/// Live Bun JSONL `register_*`/`unregister_*` registration frame. The
+/// host parser owns a deep-cloned copy of the JSON object payload so
+/// the protocol state can apply it to the runtime registry on the
+/// host's mutex-guarded thread without holding a reference to the
+/// short-lived parser arena.
+pub const RegistryFrame = struct {
+    payload: std.json.Value,
+
+    pub fn deinit(self: *RegistryFrame, allocator: std.mem.Allocator) void {
+        common.deinitJsonValue(allocator, self.payload);
+        self.* = undefined;
+    }
+};
+
 pub const HostMessage = union(enum) {
     ready,
     diagnostic: Diagnostic,
     extension_ui_request: ExtensionUiRequest,
     shutdown_complete,
     error_message: Diagnostic,
+    /// Live Bun-hosted register_tool / register_command /
+    /// register_shortcut / register_flag / register_provider /
+    /// unregister_provider frame. Routed through `ProtocolState` to
+    /// `extension_registry.applyHostFrame` so the runtime registry
+    /// reflects extension contributions in CLI / TS-RPC output.
+    registry_frame: RegistryFrame,
 
     pub fn deinit(self: *HostMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .diagnostic => |*diagnostic| diagnostic.deinit(allocator),
             .extension_ui_request => |*request| request.deinit(allocator),
             .error_message => |*diagnostic| diagnostic.deinit(allocator),
+            .registry_frame => |*frame| frame.deinit(allocator),
             else => {},
         }
         self.* = undefined;
     }
 };
+
+/// Names of JSONL message types that carry registration data.
+const REGISTRY_FRAME_TYPES = [_][]const u8{
+    "register_tool",
+    "register_command",
+    "register_shortcut",
+    "register_flag",
+    "register_provider",
+    "unregister_provider",
+};
+
+fn isRegistryFrameType(type_name: []const u8) bool {
+    inline for (REGISTRY_FRAME_TYPES) |candidate| {
+        if (std.mem.eql(u8, type_name, candidate)) return true;
+    }
+    return false;
+}
 
 pub const JsonlFrameParser = struct {
     buffer: std.ArrayList(u8) = .empty,
@@ -195,11 +234,22 @@ pub const ProtocolState = struct {
     pending_request_ids: std.StringHashMap(void),
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     ui_requests: std.ArrayList(ExtensionUiRequest) = .empty,
+    /// Live runtime registry populated as register_* JSONL frames
+    /// arrive over the host stdout protocol. Mirrors the TypeScript
+    /// `runtime.extensionState.registry` shape so CLI / TS-RPC consumers
+    /// can observe registered tools, commands, shortcuts, flags, and
+    /// providers without depending on local sidecar manifests.
+    registry: extension_registry.Registry,
+    /// Total number of registry frames successfully applied. Useful for
+    /// fixture tests that need to wait for the host to drain its
+    /// register_* frames before snapshotting.
+    registry_frames_applied: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) ProtocolState {
         return .{
             .allocator = allocator,
             .pending_request_ids = std.StringHashMap(void).init(allocator),
+            .registry = extension_registry.Registry.init(allocator),
         };
     }
 
@@ -214,6 +264,7 @@ pub const ProtocolState = struct {
         self.diagnostics.deinit(self.allocator);
         for (self.ui_requests.items) |*request| request.deinit(self.allocator);
         self.ui_requests.deinit(self.allocator);
+        self.registry.deinit();
         self.* = undefined;
     }
 
@@ -244,6 +295,17 @@ pub const ProtocolState = struct {
                 try self.ui_requests.append(self.allocator, try ExtensionUiRequest.clone(self.allocator, request));
             },
             .shutdown_complete => self.shutdown_complete_seen = true,
+            .registry_frame => |frame| {
+                const outcome = extension_registry.applyHostFrame(&self.registry, frame.payload) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                };
+                switch (outcome) {
+                    .registered_tool, .registered_command, .registered_shortcut,
+                    .registered_flag, .registered_provider, .unregistered_provider => self.registry_frames_applied += 1,
+                    .none, .ignored_unsupported => {},
+                    .ignored_malformed => try self.addDiagnostic(.malformed_json, .@"error", "host emitted malformed register_* frame"),
+                }
+            },
         }
     }
 
@@ -456,6 +518,42 @@ pub const HostProcess = struct {
         return self.state.shutdown_complete_seen;
     }
 
+    /// Number of register_* JSONL frames the host has successfully
+    /// applied to the runtime registry. Useful for fixture tests that
+    /// need to wait for live Bun extensions to drain before
+    /// snapshotting.
+    pub fn registryFramesApplied(self: *HostProcess) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.state.registry_frames_applied;
+    }
+
+    /// Render a deterministic JSON snapshot of the runtime registry
+    /// the host has accumulated. Caller owns the returned bytes.
+    pub fn snapshotRegistryJson(self: *HostProcess, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try extension_registry.writeRegistrySnapshotJson(allocator, &self.state.registry, &out.writer);
+        return try allocator.dupe(u8, out.written());
+    }
+
+    /// Apply parsed CLI flag values into the live host registry so
+    /// extension code can observe `--<flag>` values via `getFlag()`.
+    /// Mirrors the TS runtime step that writes parsed CLI flag values
+    /// into `extensionState.flags` after extension load.
+    pub fn applyCliFlagValues(
+        self: *HostProcess,
+        entries: []const extension_registry.ParsedCliFlag,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (entries) |entry| {
+            _ = try self.state.registry.setFlagValue(entry.name, entry.value);
+        }
+    }
+
     pub fn takeUiRequests(self: *HostProcess, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -591,6 +689,10 @@ fn parseObjectMessage(allocator: std.mem.Allocator, object: std.json.ObjectMap) 
             .response_required = optionalBool(object, "responseRequired") orelse false,
             .payload_json = payload_json,
         } };
+    }
+    if (isRegistryFrameType(type_name)) {
+        const cloned = try common.cloneJsonValue(allocator, .{ .object = object });
+        return .{ .registry_frame = .{ .payload = cloned } };
     }
     return error.UnsupportedHostMessageType;
 }
@@ -885,4 +987,99 @@ test "M6 host lifecycle cleans up after shutdown write failure" {
     try std.testing.expect(host.stdin_file == null);
     try std.testing.expect(host.stdout_file == null);
     try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
+}
+
+test "M11 host protocol applies live register_* JSONL frames into runtime registry" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"say-hello\",\"label\":\"Say Hello\",\"description\":\"Greets the world\",\"extensionPath\":\"fixture/extension.ts\"}\n" ++
+        "{\"type\":\"register_command\",\"name\":\"say-hello\",\"description\":\"Slash command\",\"extensionPath\":\"fixture/extension.ts\"}\n" ++
+        "{\"type\":\"register_shortcut\",\"shortcut\":\"ctrl+h\",\"command\":\"say-hello\",\"extensionPath\":\"fixture/extension.ts\"}\n" ++
+        "{\"type\":\"register_flag\",\"name\":\"plan\",\"valueType\":\"boolean\",\"default\":true,\"extensionPath\":\"fixture/extension.ts\"}\n" ++
+        "{\"type\":\"register_flag\",\"name\":\"model-alias\",\"valueType\":\"string\",\"default\":\"claude-haiku\",\"extensionPath\":\"fixture/extension.ts\"}\n" ++
+        "{\"type\":\"register_provider\",\"name\":\"fake-provider\",\"displayName\":\"Fake\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"fake-1\",\"name\":\"Fake 1\"}],\"extensionPath\":\"fixture/extension.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 6), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.tools.items.len);
+    try std.testing.expectEqualStrings("say-hello", state.registry.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.shortcuts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), state.registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.providers.items.len);
+
+    // Default values resolve through getFlag when no CLI value is set.
+    const plan_value = state.registry.getFlag("plan");
+    try std.testing.expect(plan_value == .boolean and plan_value.boolean);
+    const alias_value = state.registry.getFlag("model-alias");
+    try std.testing.expect(alias_value == .string);
+    try std.testing.expectEqualStrings("claude-haiku", alias_value.string);
+
+    // Apply parsed CLI values; getFlag now reflects them over defaults.
+    _ = try state.registry.setFlagValue("plan", .{ .boolean = true });
+    _ = try state.registry.setFlagValue("model-alias", .{ .string = "claude-opus" });
+    const alias_after = state.registry.getFlag("model-alias");
+    try std.testing.expectEqualStrings("claude-opus", alias_after.string);
+}
+
+test "M11 host process drains live register_* frames into observable runtime registry" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_tool\",\"name\":\"say-hello\",\"label\":\"Say Hello\",\"description\":\"Greets the world\",\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_command\",\"name\":\"say-hello\",\"description\":\"Slash\",\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_shortcut\",\"shortcut\":\"ctrl+h\",\"command\":\"say-hello\",\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_flag\",\"name\":\"plan\",\"valueType\":\"boolean\",\"default\":true,\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_flag\",\"name\":\"model-alias\",\"valueType\":\"string\",\"default\":\"claude-haiku\",\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_provider\",\"name\":\"fake-provider\",\"displayName\":\"Fake\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"fake-1\",\"name\":\"Fake 1\"}],\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m11-extension-fixture" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-m11-extension-fixture",
+            .cwd = "/tmp",
+            .fixture = "registration-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+
+    // Wait for all 6 registration frames to drain.
+    var elapsed: u64 = 0;
+    while (host.registryFramesApplied() < 6 and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 6), host.registryFramesApplied());
+
+    // Apply CLI flag values into the live registry, mirroring the
+    // runtime step that hands parsed --<flag> values back to the host
+    // after extension load.
+    try host.applyCliFlagValues(&.{
+        .{ .name = "plan", .value = .{ .boolean = true } },
+        .{ .name = "model-alias", .value = .{ .string = "claude-opus" } },
+    });
+
+    const snapshot = try host.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"say-hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"fake-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"shortcut\":\"ctrl+h\"") != null);
+    // Resolved CLI value must appear in the snapshot value field.
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"value\":\"claude-opus\"") != null);
+    // The default must still be visible alongside the resolved value.
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"default\":\"claude-haiku\"") != null);
+
+    try host.shutdown();
+    try std.testing.expect(host.hasShutdownComplete());
 }
