@@ -974,6 +974,15 @@ pub const SessionManager = struct {
         try self.persistToDisk();
     }
 
+    /// Forces a full rewrite of the session JSONL file from the in-memory
+    /// header and entries. Used by lifecycle paths that need the on-disk
+    /// header to reflect a recent in-memory mutation (for example, the
+    /// missing-cwd Continue flow that overrides the stored cwd only after
+    /// user confirmation).
+    pub fn persistToDiskNow(self: *SessionManager) !void {
+        try self.persistToDisk();
+    }
+
     fn persistToDisk(self: *SessionManager) !void {
         if (!self.persist) return;
         const path = self.session_file orelse return;
@@ -1030,6 +1039,34 @@ pub fn findMostRecentSession(
     }
 
     return null;
+}
+
+/// Reads only the first JSONL line of `session_file` and parses it as a
+/// `SessionHeader`. Used by lifecycle preflight code that needs the stored
+/// cwd before constructing a full session/runtime/provider stack. Caller
+/// must call `freeSessionHeader` to release the returned strings.
+pub fn readSessionHeader(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_file: []const u8,
+) !SessionHeader {
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, session_file, allocator, .unlimited);
+    defer allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    const header_line = lines.next() orelse return error.InvalidSessionFile;
+    return try parseHeaderLine(allocator, header_line);
+}
+
+/// Releases ownership of strings allocated by `readSessionHeader`.
+pub fn freeSessionHeader(allocator: std.mem.Allocator, header: *SessionHeader) void {
+    deinitHeader(allocator, header);
+    header.* = .{
+        .id = "",
+        .timestamp = "",
+        .cwd = "",
+        .parent_session = null,
+    };
 }
 
 pub fn listAllSessionsUnder(
@@ -2968,6 +3005,39 @@ fn parseJsonTestValue(allocator: std.mem.Allocator, json: []const u8) !std.json.
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
     return try common.cloneJsonValue(allocator, parsed.value);
+}
+
+test "readSessionHeader reads only the JSONL header without loading entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/preflight", session_dir);
+    const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+    const expected_id = try std.testing.allocator.dupe(u8, manager.getSessionId());
+    defer std.testing.allocator.free(expected_id);
+    manager.deinit();
+
+    var header = try readSessionHeader(std.testing.allocator, std.testing.io, session_file);
+    defer freeSessionHeader(std.testing.allocator, &header);
+    try std.testing.expectEqualStrings("/tmp/preflight", header.cwd);
+    try std.testing.expectEqualStrings(expected_id, header.id);
+    try std.testing.expect(header.parent_session == null);
+}
+
+test "readSessionHeader returns error.FileNotFound for missing files" {
+    const result = readSessionHeader(std.testing.allocator, std.testing.io, "/tmp/this/does/not/exist.jsonl");
+    try std.testing.expectError(error.FileNotFound, result);
 }
 
 test "session manager creates empty session with metadata" {

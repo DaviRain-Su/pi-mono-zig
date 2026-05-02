@@ -169,6 +169,36 @@ fn runCliWithInput(
         }
     }
 
+    if (app_mode != .interactive) {
+        // Preflight stored-session cwd BEFORE provider/auth resolution and
+        // tool construction so missing-cwd diagnostics always preempt
+        // unrelated bootstrap failures. Matches TypeScript main.ts ordering.
+        const preflight_options: coding_agent.RunInteractiveModeOptions = .{
+            .cwd = cwd,
+            .system_prompt = prepared.system_prompt,
+            .session_dir = prepared.session_dir,
+            .provider = prepared.provider_name,
+            .session = options.session,
+            .@"continue" = options.@"continue",
+            .@"resume" = options.@"resume",
+            .fork = options.fork,
+            .no_session = options.no_session,
+        };
+        if (try coding_agent.interactive_mode.preflightInteractiveMissingCwd(
+            allocator,
+            io,
+            preflight_options,
+        )) |captured_preflight| {
+            var captured_preflight_mut = captured_preflight;
+            defer captured_preflight_mut.deinit(allocator);
+            const message = try coding_agent.formatMissingSessionCwdError(allocator, captured_preflight_mut.issue());
+            defer allocator.free(message);
+            try stderr.print("Error: {s}\n", .{message});
+            try stderr.flush();
+            return 1;
+        }
+    }
+
     var provider_runtime = coding_agent.resolveProviderConfig(
         allocator,
         &effective_env_map,

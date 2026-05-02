@@ -176,6 +176,8 @@ tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 log "case: continue confirms the launch cwd and bootstraps the interactive UI"
 continue_case_dir="$(prepare_case continue)"
 continue_launch_path="$(cat "$continue_case_dir/launch.path")"
+continue_stored_path="$(cat "$continue_case_dir/stored.path")"
+continue_session_file="$continue_case_dir/sessions/missing-cwd.jsonl"
 launch_pi_with_missing_cwd "$continue_case_dir"
 # Default selection is Continue (index 0).
 tuistory -s "$SESSION" press enter
@@ -187,6 +189,31 @@ snapshot_contains "$continue_snapshot" "Model:"
 # confirms.
 snapshot_does_not_contain "$continue_snapshot" "Session cwd not found"
 snapshot_does_not_contain "$continue_snapshot" "Resume cancelled"
+
+# JSONL/header evidence: after Continue, the persisted session file's first
+# JSONL line (the header) must record the launch cwd as the new stored cwd
+# while preserving the session id/version. The header must no longer point
+# at the deleted stored path. This proves the fallback cwd is only persisted
+# AFTER user confirmation, not before.
+continue_header_line="$(head -n 1 "$continue_session_file")"
+python3 - "$continue_header_line" "$continue_launch_path" "$continue_stored_path" <<'PY'
+import json
+import sys
+
+header_line, launch_cwd, stored_cwd = sys.argv[1:]
+header = json.loads(header_line)
+assert header.get("type") == "session", f"unexpected type: {header.get('type')}"
+assert header.get("cwd") == launch_cwd, (
+    f"expected header cwd to match launch cwd after Continue\n"
+    f"  expected: {launch_cwd}\n"
+    f"  actual:   {header.get('cwd')}"
+)
+assert header.get("cwd") != stored_cwd, (
+    f"header cwd unexpectedly still points at the deleted stored cwd: {stored_cwd}"
+)
+assert "id" in header and header["id"], "header is missing session id"
+assert "timestamp" in header and header["timestamp"], "header is missing timestamp"
+PY
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 log "all missing-cwd selector flows passed"

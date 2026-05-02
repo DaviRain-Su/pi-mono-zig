@@ -37,29 +37,49 @@ pub fn formatBody(
 /// Build the two `SelectItem`s for the Continue/Cancel selector. Caller owns
 /// the returned slice and is responsible for freeing each item's `value` and
 /// `label` and the slice itself.
+///
+/// On any partial-allocation failure all previously-allocated bytes are
+/// freed exactly once. Tracked via the `made` counter so error cleanup never
+/// double-frees an item that was already adopted into `items`.
 pub fn buildSelectItems(allocator: std.mem.Allocator) ![]tui.SelectItem {
     var items = try allocator.alloc(tui.SelectItem, 2);
     errdefer allocator.free(items);
 
     var made: usize = 0;
-    errdefer for (items[0..made]) |item| {
-        allocator.free(@constCast(item.value));
-        allocator.free(@constCast(item.label));
-    };
+    errdefer freePartialSelectItems(allocator, items[0..made]);
 
-    const continue_value = try allocator.dupe(u8, MissingCwdItems.continue_label);
-    errdefer allocator.free(continue_value);
-    const continue_label = try allocator.dupe(u8, MissingCwdItems.continue_label);
-    items[0] = .{ .value = continue_value, .label = continue_label };
-    made = 1;
-
-    const cancel_value = try allocator.dupe(u8, MissingCwdItems.cancel_label);
-    errdefer allocator.free(cancel_value);
-    const cancel_label = try allocator.dupe(u8, MissingCwdItems.cancel_label);
-    items[1] = .{ .value = cancel_value, .label = cancel_label };
-    made = 2;
+    try appendSelectItem(allocator, items, &made, MissingCwdItems.continue_label);
+    try appendSelectItem(allocator, items, &made, MissingCwdItems.cancel_label);
 
     return items;
+}
+
+/// Allocates a paired value/label for a single `SelectItem` and writes it
+/// into `items[*made]`, advancing `made` only after both allocations succeed
+/// and the item is fully owned by the slice. Any allocation failure inside
+/// this helper is unwound locally so the caller's `errdefer
+/// freePartialSelectItems` only frees fully-adopted items.
+fn appendSelectItem(
+    allocator: std.mem.Allocator,
+    items: []tui.SelectItem,
+    made: *usize,
+    label: []const u8,
+) !void {
+    const value_buf = try allocator.dupe(u8, label);
+    errdefer allocator.free(value_buf);
+    const label_buf = try allocator.dupe(u8, label);
+    items[made.*] = .{ .value = value_buf, .label = label_buf };
+    made.* += 1;
+}
+
+/// Frees `items[0..made]` when partial-allocation cleanup runs. Mirrors the
+/// `freeSelectItems` shape but only walks the prefix that was successfully
+/// adopted into the slice.
+fn freePartialSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
+    for (items) |item| {
+        allocator.free(@constCast(item.value));
+        allocator.free(@constCast(item.label));
+    }
 }
 
 /// Frees an array previously produced by `buildSelectItems`.
@@ -250,6 +270,27 @@ test "buildSelectItems exposes Continue and Cancel options" {
     try std.testing.expectEqualStrings("Continue", items[0].value);
     try std.testing.expectEqualStrings("Cancel", items[1].label);
     try std.testing.expectEqualStrings("Cancel", items[1].value);
+}
+
+test "buildSelectItems releases partial allocations on OOM at every allocation index" {
+    // Walk the allocation index across the full buildSelectItems call so any
+    // single failure point still unwinds cleanly. Each iteration uses
+    // FailingAllocator on top of std.testing.allocator so the testing
+    // allocator's leak detector catches a missed free.
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing_state = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_state.allocator();
+        if (buildSelectItems(failing_allocator)) |items| {
+            // The call succeeded before the configured failure index, so the
+            // test simply observes a clean run and frees the result.
+            freeSelectItems(failing_allocator, items);
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                // Success path: errdefer chain ran without leaking.
+            },
+        }
+    }
 }
 
 test "choiceFromIndex maps zero to continue and non-zero to cancel" {
