@@ -85,7 +85,7 @@ pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "scoped-models", .description = "Select from the scoped model cycling list" },
     .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl/.json/.md)", .argument_hint = "<path.html|path.jsonl>" },
     .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
-    .{ .name = "share", .description = "Copy a shareable markdown transcript" },
+    .{ .name = "share", .description = "Upload session as a private GitHub gist with a shareable HTML link" },
     .{ .name = "copy", .description = "Copy last assistant message" },
     .{ .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
     .{ .name = "session", .description = "Show session info and stats" },
@@ -252,7 +252,7 @@ pub fn handleSlashCommand(
                 subscriber,
             );
         },
-        .share => try handleShareSlashCommand(allocator, io, session, app_state),
+        .share => try handleShareSlashCommand(allocator, io, env_map, session, app_state),
         .copy => try handleCopySlashCommand(allocator, io, session, app_state),
         .name => try handleNameSlashCommand(allocator, session, command.argument, app_state),
         .hotkeys => overlay.* = try loadHotkeysOverlay(allocator, live_resources.keybindings),
@@ -1440,10 +1440,96 @@ pub fn handleCopySlashCommand(
     try app_state.setStatus("copied");
 }
 
+pub const DEFAULT_SHARE_VIEWER_URL: []const u8 = "https://pi.dev/session/";
+pub const DEFAULT_SHARE_TMP_FILE: []const u8 = "/tmp/session.html";
+
+pub const ShareGhResult = struct {
+    exit_code: u8,
+    stdout: []u8,
+    stderr: []u8,
+    /// True only when the binary was missing on PATH (gh not installed).
+    not_found: bool = false,
+
+    pub fn deinit(self: *ShareGhResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.stdout = &.{};
+        self.stderr = &.{};
+    }
+};
+
+pub const ShareGhRunFn = *const fn (
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) anyerror!ShareGhResult;
+
+pub var share_gh_run_context: ?*anyopaque = null;
+pub var share_gh_run_fn: ShareGhRunFn = defaultShareGhRun;
+pub var share_tmp_file_override: ?[]const u8 = null;
+
+pub fn defaultShareGhRun(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) anyerror!ShareGhResult {
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch |err| switch (err) {
+        error.FileNotFound => return ShareGhResult{
+            .exit_code = 127,
+            .stdout = try allocator.alloc(u8, 0),
+            .stderr = try allocator.alloc(u8, 0),
+            .not_found = true,
+        },
+        else => return err,
+    };
+    return ShareGhResult{
+        .exit_code = exitCodeFromChildTerm(result.term),
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .not_found = false,
+    };
+}
+
+fn shareTmpFilePath() []const u8 {
+    return share_tmp_file_override orelse DEFAULT_SHARE_TMP_FILE;
+}
+
+fn parseGistIdFromOutput(stdout: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| {
+        const id = trimmed[slash + 1 ..];
+        if (id.len == 0) return null;
+        // Reject empty/whitespace and anything that does not look like an id.
+        for (id) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_') return null;
+        }
+        return id;
+    }
+    return null;
+}
+
+fn shareViewerUrl(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    gist_id: []const u8,
+) ![]u8 {
+    const base_raw = env_map.get("PI_SHARE_VIEWER_URL");
+    const base = if (base_raw) |value|
+        std.mem.trim(u8, value, " \t\r\n")
+    else
+        "";
+    const effective = if (base.len > 0) base else DEFAULT_SHARE_VIEWER_URL;
+    return std.fmt.allocPrint(allocator, "{s}#{s}", .{ effective, gist_id });
+}
+
 pub fn handleShareSlashCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
-    session: *const session_mod.AgentSession,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
     app_state: *AppState,
 ) !void {
     if (session.agent.getMessages().len == 0) {
@@ -1451,18 +1537,98 @@ pub fn handleShareSlashCommand(
         return;
     }
 
-    const text = try buildShareText(allocator, session);
-    defer allocator.free(text);
-
-    copyTextToClipboard(io, text) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "Failed to copy share text: {s}", .{@errorName(err)});
+    // 1) Check that gh is installed and authenticated.
+    var auth_result = share_gh_run_fn(
+        share_gh_run_context,
+        allocator,
+        io,
+        &[_][]const u8{ "gh", "auth", "status" },
+    ) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Failed to invoke gh: {s}", .{@errorName(err)});
         defer allocator.free(message);
         try app_state.appendError(message);
+        try app_state.setStatus("share failed");
+        return;
+    };
+    defer auth_result.deinit(allocator);
+
+    if (auth_result.not_found) {
+        try app_state.appendError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
+        try app_state.setStatus("share failed");
+        return;
+    }
+    if (auth_result.exit_code != 0) {
+        try app_state.appendError("GitHub CLI is not logged in. Run 'gh auth login' first.");
+        try app_state.setStatus("share failed");
+        return;
+    }
+
+    // 2) Export the session to a temporary HTML file.
+    const tmp_file = shareTmpFilePath();
+    const exported_path = session_advanced.exportToHtml(allocator, io, session, tmp_file) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Failed to export session: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        try app_state.setStatus("share failed");
+        return;
+    };
+    defer allocator.free(exported_path);
+
+    var cleanup_done = false;
+    defer if (!cleanup_done) {
+        std.Io.Dir.deleteFileAbsolute(io, exported_path) catch {};
+    };
+
+    // 3) Create a secret gist.
+    var gist_result = share_gh_run_fn(
+        share_gh_run_context,
+        allocator,
+        io,
+        &[_][]const u8{ "gh", "gist", "create", "--public=false", exported_path },
+    ) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(io, exported_path) catch {};
+        cleanup_done = true;
+        const message = try std.fmt.allocPrint(allocator, "Failed to create gist: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        try app_state.setStatus("share failed");
+        return;
+    };
+    defer gist_result.deinit(allocator);
+
+    // Always clean the temp file once gh has run.
+    std.Io.Dir.deleteFileAbsolute(io, exported_path) catch {};
+    cleanup_done = true;
+
+    if (gist_result.not_found) {
+        try app_state.appendError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
+        try app_state.setStatus("share failed");
+        return;
+    }
+    if (gist_result.exit_code != 0) {
+        const stderr_trimmed = std.mem.trim(u8, gist_result.stderr, " \t\r\n");
+        const detail = if (stderr_trimmed.len > 0) stderr_trimmed else "Unknown error";
+        const message = try std.fmt.allocPrint(allocator, "Failed to create gist: {s}", .{detail});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        try app_state.setStatus("share failed");
+        return;
+    }
+
+    const gist_url = std.mem.trim(u8, gist_result.stdout, " \t\r\n");
+    const gist_id = parseGistIdFromOutput(gist_url) orelse {
+        try app_state.appendError("Failed to parse gist ID from gh output");
+        try app_state.setStatus("share failed");
         return;
     };
 
-    try app_state.appendInfo("Copied shareable markdown transcript to clipboard");
-    try app_state.setStatus("share text copied");
+    const preview_url = try shareViewerUrl(allocator, env_map, gist_id);
+    defer allocator.free(preview_url);
+
+    const message = try std.fmt.allocPrint(allocator, "Share URL: {s}\nGist: {s}", .{ preview_url, gist_url });
+    defer allocator.free(message);
+    try app_state.appendInfo(message);
+    try app_state.setStatus("shared");
 }
 
 pub fn handleLogoutSlashCommand(
