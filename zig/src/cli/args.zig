@@ -382,6 +382,18 @@ fn renderBaseHelp(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\Usage:
         \\  pi [options] [@files...] [prompt]
         \\
+        \\Commands:
+        \\  pi install <source> [-l]       Install extension source and add to settings
+        \\  pi remove <source> [-l]        Remove extension source from settings
+        \\  pi uninstall <source> [-l]     Alias for remove
+        \\  pi update [source]             Update installed extensions (offline no-op for local fixtures)
+        \\  pi list                        List installed extensions from settings
+        \\  pi config                      Manage package resource toggles in settings
+        \\  pi <command> --help            Show help for install/remove/uninstall/update/list/config
+        \\
+        \\Note: release/binary packaging (self-update, packaged installers) is not
+        \\implemented in this build; package commands operate on local fixtures only.
+        \\
         \\Options:
         \\  --model <model>                Model ID (default depends on provider)
         \\  --provider <provider>          Provider name (default: openai)
@@ -773,6 +785,23 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--help, -h") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "[@files...] [prompt]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") != null);
+}
+
+test "VAL-M12-PKG-013 top-level help lists package and config commands" {
+    const allocator = std.testing.allocator;
+    const help = try helpText(allocator, "0.1.0");
+    defer allocator.free(help);
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "Commands:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "pi install <source>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "pi remove <source>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "pi uninstall <source>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "pi update [source]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "pi list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "pi config") != null);
+    // Existing core options must still appear after the new Commands block.
+    try std.testing.expect(std.mem.indexOf(u8, help, "--model <model>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "release/binary packaging") != null);
 }
 
 test "version text prints version" {
