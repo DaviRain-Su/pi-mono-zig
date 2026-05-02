@@ -7,6 +7,7 @@ const config_mod = @import("config.zig");
 const keybindings_mod = @import("keybindings.zig");
 const resources_mod = @import("resources.zig");
 const session_advanced = @import("session_advanced.zig");
+const session_cwd_mod = @import("session_cwd.zig");
 const session_manager_mod = @import("session_manager.zig");
 const provider_config = @import("provider_config.zig");
 const session_mod = @import("session.zig");
@@ -123,7 +124,10 @@ pub const BuiltTools = tool_adapters.BuiltTools;
 pub const buildAgentTools = tool_adapters.buildAgentTools;
 pub const InteractiveBootstrap = session_bootstrap.InteractiveBootstrap;
 pub const bootstrapInteractiveState = session_bootstrap.bootstrapInteractiveState;
+pub const bootstrapInteractiveStateWithMissingCwd = session_bootstrap.bootstrapInteractiveStateWithMissingCwd;
 pub const openInitialSession = session_bootstrap.openInitialSession;
+pub const openInitialSessionWithMissingCwd = session_bootstrap.openInitialSessionWithMissingCwd;
+pub const OwnedMissingSessionCwdIssue = session_bootstrap.OwnedMissingSessionCwdIssue;
 pub const SlashCommandKind = slash_commands.SlashCommandKind;
 pub const SlashCommand = slash_commands.SlashCommand;
 pub const BuiltinSlashCommand = slash_commands.BuiltinSlashCommand;
@@ -212,25 +216,20 @@ pub fn runInteractiveMode(
 
     var app_context = AppContext.init(options.cwd, io);
 
-    var bootstrap = session_bootstrap.bootstrapInteractiveState(
+    var missing_cwd_issue: ?session_bootstrap.OwnedMissingSessionCwdIssue = null;
+    defer if (missing_cwd_issue) |*captured| captured.deinit(allocator);
+    const bootstrap_or_exit = try bootstrapInteractiveStateOrPromptMissingCwd(
         allocator,
         io,
         env_map,
         options,
         &app_context,
-    ) catch |err| switch (err) {
-        error.MissingApiKey,
-        error.UnknownProvider,
-        error.InvalidFauxStopReason,
-        error.InvalidFauxTokensPerSecond,
-        error.InvalidFauxContextWindow,
-        error.InvalidFauxToolArguments,
-        => {
-            try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(err, options.provider)});
-            try stderr_writer.flush();
-            return 1;
-        },
-        else => return err,
+        &missing_cwd_issue,
+        stderr_writer,
+    );
+    var bootstrap = switch (bootstrap_or_exit) {
+        .bootstrap => |state| state,
+        .exit_code => |code| return code,
     };
     defer bootstrap.deinit();
 
@@ -411,6 +410,140 @@ pub fn runInteractiveMode(
     }
 
     return 0;
+}
+
+/// Result of bootstrap that may want to short-circuit interactive mode (for
+/// example, after a cancelled missing-cwd prompt).
+const BootstrapOrExit = union(enum) {
+    bootstrap: session_bootstrap.InteractiveBootstrap,
+    exit_code: u8,
+};
+
+/// Attempts to bootstrap the interactive session. If the stored session cwd
+/// no longer exists, prompts the user to continue in the launch cwd or
+/// cancel; on cancel, returns an exit code; on continue, retries the
+/// bootstrap with `missing_cwd_mode = .use_fallback`.
+fn bootstrapInteractiveStateOrPromptMissingCwd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    options: RunInteractiveModeOptions,
+    app_context: *AppContext,
+    out_issue: *?session_bootstrap.OwnedMissingSessionCwdIssue,
+    stderr_writer: *std.Io.Writer,
+) !BootstrapOrExit {
+    const initial = session_bootstrap.bootstrapInteractiveStateWithMissingCwd(
+        allocator,
+        io,
+        env_map,
+        options,
+        app_context,
+        out_issue,
+    );
+    if (initial) |state| {
+        return .{ .bootstrap = state };
+    } else |err| switch (err) {
+        error.MissingApiKey,
+        error.UnknownProvider,
+        error.InvalidFauxStopReason,
+        error.InvalidFauxTokensPerSecond,
+        error.InvalidFauxContextWindow,
+        error.InvalidFauxToolArguments,
+        => {
+            try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(err, options.provider)});
+            try stderr_writer.flush();
+            return .{ .exit_code = 1 };
+        },
+        error.MissingSessionCwd => {
+            const captured = out_issue.* orelse {
+                try stderr_writer.writeAll("Error: stored session working directory does not exist\n");
+                try stderr_writer.flush();
+                return .{ .exit_code = 1 };
+            };
+            const continue_in_fallback = try promptInteractiveMissingSessionCwd(
+                allocator,
+                io,
+                captured.issue(),
+                stderr_writer,
+            );
+            if (!continue_in_fallback) {
+                try stderr_writer.writeAll("Resume cancelled\n");
+                try stderr_writer.flush();
+                return .{ .exit_code = 0 };
+            }
+            var fallback_options = options;
+            fallback_options.missing_cwd_mode = .use_fallback;
+            const retry = session_bootstrap.bootstrapInteractiveState(
+                allocator,
+                io,
+                env_map,
+                fallback_options,
+                app_context,
+            );
+            if (retry) |state| return .{ .bootstrap = state } else |retry_err| switch (retry_err) {
+                error.MissingApiKey,
+                error.UnknownProvider,
+                error.InvalidFauxStopReason,
+                error.InvalidFauxTokensPerSecond,
+                error.InvalidFauxContextWindow,
+                error.InvalidFauxToolArguments,
+                => {
+                    try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(retry_err, options.provider)});
+                    try stderr_writer.flush();
+                    return .{ .exit_code = 1 };
+                },
+                else => return retry_err,
+            }
+        },
+        else => return err,
+    }
+}
+
+/// Prompts the user (via stderr/stdin) to continue resuming the session in
+/// the launch cwd or cancel. Returns true when the user agrees to continue,
+/// false when the user cancels.
+fn promptInteractiveMissingSessionCwd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    issue: session_cwd_mod.MissingSessionCwdIssue,
+    stderr_writer: *std.Io.Writer,
+) !bool {
+    const prompt_body = try session_cwd_mod.formatMissingSessionCwdPrompt(allocator, issue);
+    defer allocator.free(prompt_body);
+    try stderr_writer.print("Session cwd not found\n{s}\n[Continue]/Cancel? [Y/n] ", .{prompt_body});
+    try stderr_writer.flush();
+
+    var stdin_buffer: [1]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    while (true) {
+        const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return false,
+            else => return err,
+        };
+        switch (byte) {
+            '\n' => return true,
+            'y', 'Y' => {
+                _ = consumeRestOfLine(&stdin_reader.interface);
+                return true;
+            },
+            'n', 'N' => {
+                _ = consumeRestOfLine(&stdin_reader.interface);
+                return false;
+            },
+            ' ', '\r', '\t' => continue,
+            else => {
+                _ = consumeRestOfLine(&stdin_reader.interface);
+                return false;
+            },
+        }
+    }
+}
+
+fn consumeRestOfLine(reader: anytype) void {
+    while (true) {
+        const byte = reader.takeByte() catch return;
+        if (byte == '\n') return;
+    }
 }
 
 fn appendConfigErrorStartupWarning(

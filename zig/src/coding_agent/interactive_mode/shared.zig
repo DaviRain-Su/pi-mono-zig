@@ -26,6 +26,19 @@ pub const AppContext = struct {
     }
 };
 
+/// Controls how a stored session cwd that no longer exists is handled when
+/// resuming/forking/opening a persisted session.
+///
+/// `.fail` matches the non-interactive TypeScript path: fail before mutating
+/// any runtime state and let the caller surface the diagnostic.
+///
+/// `.use_fallback` matches the post-prompt interactive path where the user
+/// has agreed to continue in the launch cwd.
+pub const MissingCwdMode = enum {
+    fail,
+    use_fallback,
+};
+
 pub const RunInteractiveModeOptions = struct {
     cwd: []const u8,
     system_prompt: []const u8,
@@ -50,6 +63,10 @@ pub const RunInteractiveModeOptions = struct {
     runtime_config: ?*const config_mod.RuntimeConfig = null,
     offline: bool = false,
     verbose: bool = false,
+    /// How to handle a stored session cwd that no longer exists when resuming
+    /// or opening a persisted session. Defaults to `.fail` so non-interactive
+    /// callers never silently fall back to the launch cwd.
+    missing_cwd_mode: MissingCwdMode = .fail,
 };
 
 pub const LiveResources = struct {
