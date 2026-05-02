@@ -140,13 +140,9 @@ pub const AnthropicProvider = struct {
 
         if (resolved_options.options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                if (response.response_headers) |response_headers| {
-                    try callback(response.status, response_headers, model);
-                } else {
-                    var response_headers = std.StringHashMap([]const u8).init(allocator);
-                    defer response_headers.deinit();
-                    try callback(response.status, response_headers, model);
-                }
+                var response_headers = try normalizedResponseHeaders(allocator, response.response_headers);
+                defer deinitOwnedHeaders(allocator, &response_headers);
+                try callback(response.status, response_headers, model);
             }
         }
 
@@ -2328,6 +2324,37 @@ fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap(
     headers.deinit();
 }
 
+fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const output = try allocator.alloc(u8, input.len);
+    for (input, 0..) |byte, index| {
+        output[index] = std.ascii.toLower(byte);
+    }
+    return output;
+}
+
+/// Normalize response header names to TypeScript-compatible lowercase keys
+/// before invoking `on_response` callbacks. Mirrors the OpenAI Chat path so
+/// callbacks can rely on consistent lookup semantics regardless of the
+/// on-the-wire casing emitted by the upstream server.
+fn normalizedResponseHeaders(
+    allocator: std.mem.Allocator,
+    maybe_headers: ?std.StringHashMap([]const u8),
+) !std.StringHashMap([]const u8) {
+    var normalized = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitOwnedHeaders(allocator, &normalized);
+
+    if (maybe_headers) |headers| {
+        var iterator = headers.iterator();
+        while (iterator.next()) |entry| {
+            const lower = try asciiLowerAlloc(allocator, entry.key_ptr.*);
+            defer allocator.free(lower);
+            try putOwnedHeader(allocator, &normalized, lower, entry.value_ptr.*);
+        }
+    }
+
+    return normalized;
+}
+
 fn isOAuthToken(api_key: []const u8) bool {
     return std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
 }
@@ -2521,10 +2548,11 @@ const OnResponseCapture = struct {
     fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
         called = true;
         status = callback_status;
-        std.testing.expectEqualStrings("anthropic-messages", model.api) catch unreachable;
-        std.testing.expectEqualStrings("text/event-stream", headers.get("Content-Type").?) catch unreachable;
-        std.testing.expectEqualStrings("req_123", headers.get("x-request-id").?) catch unreachable;
-        std.testing.expectEqualStrings("17", headers.get("anthropic-processing-ms").?) catch unreachable;
+        try std.testing.expectEqualStrings("anthropic-messages", model.api);
+        try std.testing.expectEqualStrings("text/event-stream", headers.get("content-type").?);
+        try std.testing.expectEqualStrings("req_123", headers.get("x-request-id").?);
+        try std.testing.expectEqualStrings("17", headers.get("anthropic-processing-ms").?);
+        try std.testing.expect(headers.get("Content-Type") == null);
     }
 };
 
