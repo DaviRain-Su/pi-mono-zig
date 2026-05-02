@@ -32,7 +32,47 @@ const resources_mod = @import("resources.zig");
 /// settings paths for tests so deterministic fixture runs can compare
 /// stdout/stderr and JSON state without leaking machine paths.
 
-pub const PackageCommand = enum { install, remove, update, list };
+pub const PackageCommand = enum { install, remove, update, list, config };
+
+pub const ConfigKind = enum {
+    extensions,
+    skills,
+    prompts,
+    themes,
+
+    pub fn fromString(value: []const u8) ?ConfigKind {
+        if (std.mem.eql(u8, value, "extensions")) return .extensions;
+        if (std.mem.eql(u8, value, "skills")) return .skills;
+        if (std.mem.eql(u8, value, "prompts")) return .prompts;
+        if (std.mem.eql(u8, value, "themes")) return .themes;
+        return null;
+    }
+
+    pub fn settingsKey(self: ConfigKind) []const u8 {
+        return switch (self) {
+            .extensions => "extensions",
+            .skills => "skills",
+            .prompts => "prompts",
+            .themes => "themes",
+        };
+    }
+};
+
+pub const ConfigToggleAction = enum { enable, disable };
+
+pub const ConfigOptions = struct {
+    /// When set, the config command performs a deterministic
+    /// non-interactive toggle (used by tests and CLI parity); when
+    /// absent, the command prints a deterministic listing and usage.
+    toggle_kind: ?ConfigKind = null,
+    toggle_pattern: ?[]u8 = null,
+    toggle_action: ConfigToggleAction = .enable,
+
+    fn deinit(self: *ConfigOptions, allocator: std.mem.Allocator) void {
+        if (self.toggle_pattern) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
 
 pub const UpdateTarget = union(enum) {
     all,
@@ -46,6 +86,7 @@ pub const ParsedCommand = struct {
     /// command parser; freed with `deinit`.
     source: ?[]u8 = null,
     update_target: ?UpdateTarget = null,
+    config_options: ConfigOptions = .{},
     local: bool = false,
     help: bool = false,
     /// First parse-time diagnostic, if any. Mirrors TS where parse
@@ -55,6 +96,7 @@ pub const ParsedCommand = struct {
     pub fn deinit(self: *ParsedCommand, allocator: std.mem.Allocator) void {
         if (self.source) |value| allocator.free(value);
         if (self.parse_error) |value| allocator.free(value);
+        self.config_options.deinit(allocator);
         self.* = .{ .command = .install };
     }
 };
@@ -74,7 +116,8 @@ pub fn isPackageCommand(args: []const []const u8) bool {
         std.mem.eql(u8, first, "remove") or
         std.mem.eql(u8, first, "uninstall") or
         std.mem.eql(u8, first, "update") or
-        std.mem.eql(u8, first, "list");
+        std.mem.eql(u8, first, "list") or
+        std.mem.eql(u8, first, "config");
 }
 
 /// Parse a `pi <subcommand> [args...]` invocation. Returns
@@ -95,6 +138,8 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
         command = .update;
     } else if (std.mem.eql(u8, raw, "list")) {
         command = .list;
+    } else if (std.mem.eql(u8, raw, "config")) {
+        command = .config;
     } else {
         return error.NotPackageCommand;
     }
@@ -105,6 +150,14 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
     var positional_owned: ?[]u8 = null;
     errdefer if (positional_owned) |value| allocator.free(value);
 
+    // Tracks --toggle <kind> <pattern> for `pi config`. Both args must be
+    // present and the kind must resolve before the positional pattern is
+    // accepted.
+    var saw_toggle_flag = false;
+    var pending_toggle_kind: ?ConfigKind = null;
+    var pending_toggle_pattern_owned: ?[]u8 = null;
+    errdefer if (pending_toggle_pattern_owned) |value| allocator.free(value);
+
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -113,7 +166,7 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
             continue;
         }
         if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--local")) {
-            if (command == .install or command == .remove) {
+            if (command == .install or command == .remove or command == .config) {
                 result.local = true;
             } else {
                 if (result.parse_error == null) {
@@ -124,6 +177,46 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
                     );
                 }
             }
+            continue;
+        }
+        if (command == .config and std.mem.eql(u8, arg, "--toggle")) {
+            saw_toggle_flag = true;
+            const kind_arg_index = index + 1;
+            const pattern_arg_index = index + 2;
+            if (pattern_arg_index >= args.len) {
+                if (result.parse_error == null) {
+                    result.parse_error = try allocator.dupe(
+                        u8,
+                        "--toggle requires <kind> and <pattern> arguments.",
+                    );
+                }
+                index = args.len; // stop scanning further
+                continue;
+            }
+            const kind_arg = args[kind_arg_index];
+            const pattern_arg = args[pattern_arg_index];
+            const kind = ConfigKind.fromString(kind_arg) orelse {
+                if (result.parse_error == null) {
+                    result.parse_error = try std.fmt.allocPrint(
+                        allocator,
+                        "Unknown --toggle kind {s}. Expected extensions, skills, prompts, or themes.",
+                        .{kind_arg},
+                    );
+                }
+                index = pattern_arg_index;
+                continue;
+            };
+            pending_toggle_kind = kind;
+            if (pending_toggle_pattern_owned) |value| allocator.free(value);
+            pending_toggle_pattern_owned = try allocator.dupe(u8, pattern_arg);
+            index = pattern_arg_index;
+            continue;
+        }
+        if (command == .config and (std.mem.eql(u8, arg, "--enable") or std.mem.eql(u8, arg, "--disable"))) {
+            result.config_options.toggle_action = if (std.mem.eql(u8, arg, "--enable"))
+                .enable
+            else
+                .disable;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "-")) {
@@ -147,6 +240,21 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
             continue;
         }
         positional_owned = try allocator.dupe(u8, arg);
+    }
+
+    if (command == .config and saw_toggle_flag and result.parse_error == null) {
+        if (pending_toggle_kind == null or pending_toggle_pattern_owned == null) {
+            if (result.parse_error == null) {
+                result.parse_error = try allocator.dupe(
+                    u8,
+                    "--toggle requires <kind> and <pattern> arguments.",
+                );
+            }
+        } else {
+            result.config_options.toggle_kind = pending_toggle_kind;
+            result.config_options.toggle_pattern = pending_toggle_pattern_owned;
+            pending_toggle_pattern_owned = null;
+        }
     }
 
     if (positional_owned) |value| {
@@ -180,6 +288,7 @@ pub fn packageCommandName(command: PackageCommand) []const u8 {
         .remove => "remove",
         .update => "update",
         .list => "list",
+        .config => "config",
     };
 }
 
@@ -189,6 +298,7 @@ pub fn packageCommandUsage(command: PackageCommand) []const u8 {
         .remove => "pi remove <source> [-l]",
         .update => "pi update [source]",
         .list => "pi list",
+        .config => "pi config [--toggle <kind> <pattern> --enable|--disable] [-l]",
     };
 }
 
@@ -229,7 +339,107 @@ pub fn executePackageCommand(
         .remove => executeRemove(allocator, io, command, options, stdout, stderr),
         .update => executeUpdate(allocator, io, command, options, stdout, stderr),
         .list => executeList(allocator, io, options, stdout),
+        .config => executeConfig(allocator, io, command, options, stdout, stderr),
     };
+}
+
+fn executeConfig(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command: ParsedCommand,
+    options: ExecuteOptions,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !ExecuteResult {
+    _ = stderr;
+
+    // Bare `pi config`: print a deterministic listing of toggle kinds
+    // plus an explicit note that interactive TUI release/binary
+    // packaging is intentionally out of scope for this build.
+    if (command.config_options.toggle_kind == null or command.config_options.toggle_pattern == null) {
+        try stdout.writeAll(
+            \\Configurable resource kinds: extensions, skills, prompts, themes.
+            \\
+            \\Use --toggle <kind> <pattern> --enable|--disable [-l] to persist
+            \\an enable/disable pattern to the matching settings.json array.
+            \\
+            \\Note: release/binary packaging (self-update, packaged installers,
+            \\bundled first-run UX) is not implemented in this build; only
+            \\local-fixture-friendly toggles are supported here.
+            \\
+        );
+        return .{ .exit_code = 0 };
+    }
+
+    const kind = command.config_options.toggle_kind.?;
+    const pattern = command.config_options.toggle_pattern.?;
+    const action = command.config_options.toggle_action;
+
+    const settings_path = try settingsPathForScope(allocator, options, command.local);
+    defer allocator.free(settings_path);
+
+    var settings_object = try loadSettingsObject(allocator, io, settings_path);
+    defer {
+        const owner: std.json.Value = .{ .object = settings_object };
+        common.deinitJsonValue(allocator, owner);
+    }
+
+    const prefix: u8 = if (action == .enable) '+' else '-';
+    const new_entry = try std.fmt.allocPrint(allocator, "{c}{s}", .{ prefix, pattern });
+    errdefer allocator.free(new_entry);
+
+    const array_ptr = try ensureKindArray(allocator, &settings_object, kind);
+
+    // Filter out any previous +pattern/-pattern/!pattern/pattern entries
+    // matching this exact pattern string. Mirrors the TS config selector
+    // semantics where toggling replaces the previous decision.
+    var idx: usize = 0;
+    while (idx < array_ptr.items.len) {
+        const item = array_ptr.items[idx];
+        const matches = blk: {
+            if (item != .string) break :blk false;
+            const value = item.string;
+            const stripped = if (value.len > 0 and (value[0] == '+' or value[0] == '-' or value[0] == '!'))
+                value[1..]
+            else
+                value;
+            break :blk std.mem.eql(u8, stripped, pattern);
+        };
+        if (matches) {
+            const removed = array_ptr.orderedRemove(idx);
+            common.deinitJsonValue(allocator, removed);
+            continue;
+        }
+        idx += 1;
+    }
+
+    try array_ptr.append(.{ .string = new_entry });
+    try writeSettingsObject(allocator, io, settings_path, settings_object);
+
+    const action_label: []const u8 = if (action == .enable) "Enabled" else "Disabled";
+    try stdout.print("{s} {s}: {s}\n", .{ action_label, kind.settingsKey(), pattern });
+    return .{ .exit_code = 0 };
+}
+
+fn ensureKindArray(
+    allocator: std.mem.Allocator,
+    settings_object: *std.json.ObjectMap,
+    kind: ConfigKind,
+) !*std.json.Array {
+    const key_str = kind.settingsKey();
+    if (settings_object.getPtr(key_str)) |existing| {
+        if (existing.* == .array) {
+            return &existing.array;
+        }
+        const cleanup = existing.*;
+        common.deinitJsonValue(allocator, cleanup);
+        existing.* = .{ .array = std.json.Array.init(allocator) };
+        return &existing.array;
+    }
+    const owned_key = try allocator.dupe(u8, key_str);
+    errdefer allocator.free(owned_key);
+    try settings_object.put(allocator, owned_key, .{ .array = std.json.Array.init(allocator) });
+    return &settings_object.getPtr(key_str).?.array;
 }
 
 fn executeInstall(
@@ -427,12 +637,36 @@ fn writePackageCommandHelp(stdout: *std.Io.Writer, command: PackageCommand) !voi
             \\With a positional <source>, only that package is targeted; if
             \\the source is not installed, an error is reported instead.
             \\
+            \\Note: self-update (e.g. `pi update self` or `pi update pi`) and
+            \\release/binary packaging are intentionally not implemented in
+            \\this build and will report a deterministic diagnostic.
+            \\
         ),
         .list => try stdout.writeAll(
             \\Usage:
             \\  pi list
             \\
             \\List installed packages from user and project settings.
+            \\
+        ),
+        .config => try stdout.writeAll(
+            \\Usage:
+            \\  pi config [--toggle <kind> <pattern> --enable|--disable] [-l]
+            \\
+            \\Manage package resource toggles in settings.json.
+            \\
+            \\Kinds:
+            \\  extensions, skills, prompts, themes
+            \\
+            \\Options:
+            \\  --toggle <kind> <pattern>    Persist an enable/disable pattern
+            \\  --enable                     Persist a +pattern entry (default)
+            \\  --disable                    Persist a -pattern entry
+            \\  -l, --local                  Operate on project settings (.pi/settings.json)
+            \\
+            \\Note: release/binary packaging (self-update, packaged installers,
+            \\bundled first-run UX) is not implemented in this build; only
+            \\local-fixture-friendly toggles are supported here.
             \\
         ),
     }
@@ -1059,4 +1293,362 @@ test "parsePackageCommand reports unknown options" {
     defer parsed.deinit(allocator);
     try std.testing.expect(parsed.parse_error != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.parse_error.?, "--bogus") != null);
+}
+
+test "VAL-M12-PKG-010 convention resource discovery follows package conventions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/convention-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/convention-pkg/skills/example");
+    // No `pi` block in package.json: resource discovery must fall back to
+    // convention-named directories under the package root.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/convention-pkg/package.json",
+        .data =
+        \\{ "name": "convention-pkg", "version": "0.0.0" }
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/convention-pkg/extensions/main.ts",
+        .data = "export default {};\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/convention-pkg/skills/example/SKILL.md",
+        .data =
+        \\---
+        \\description: convention skill
+        \\---
+        \\Body.
+        ,
+    });
+    // A file outside any supported convention directory must NOT be
+    // discovered as an extension. This proves convention-based discovery
+    // does not blanket-scan unrelated package files.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/convention-pkg/stray.ts",
+        .data = "export default {};\n",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    const fixture_root = try makeAbsoluteTmpPath(allocator, tmp, "repo/fixtures/convention-pkg");
+    defer allocator.free(fixture_root);
+
+    const package_source = try allocator.dupe(u8, fixture_root);
+    var package_config = resources_mod.PackageSourceConfig{ .source = package_source };
+    defer package_config.deinit(allocator);
+
+    var resolved = try resources_mod.resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .project = .{ .packages = &.{package_config} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    var saw_extension = false;
+    for (resolved.extensions) |entry| {
+        if (std.mem.endsWith(u8, entry.path, "extensions/main.ts")) saw_extension = true;
+        try std.testing.expect(!std.mem.endsWith(u8, entry.path, "stray.ts"));
+    }
+    try std.testing.expect(saw_extension);
+
+    var saw_skill = false;
+    for (resolved.skills) |entry| {
+        if (std.mem.endsWith(u8, entry.path, "example/SKILL.md")) saw_skill = true;
+    }
+    try std.testing.expect(saw_skill);
+}
+
+test "VAL-M12-PKG-011 package resource filtering keeps only matching entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/filter-pkg/extensions");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/filter-pkg/package.json",
+        .data =
+        \\{ "name": "filter-pkg", "version": "0.0.0" }
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/filter-pkg/extensions/keep.ts",
+        .data = "export default {};\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/filter-pkg/extensions/skip.ts",
+        .data = "export default {};\n",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    const fixture_root = try makeAbsoluteTmpPath(allocator, tmp, "repo/fixtures/filter-pkg");
+    defer allocator.free(fixture_root);
+
+    const package_source = try allocator.dupe(u8, fixture_root);
+    const filter_extensions = try allocator.alloc([]u8, 1);
+    filter_extensions[0] = try allocator.dupe(u8, "extensions/keep.ts");
+    var package_config = resources_mod.PackageSourceConfig{
+        .source = package_source,
+        .extensions = filter_extensions,
+    };
+    defer package_config.deinit(allocator);
+
+    var resolved = try resources_mod.resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .project = .{ .packages = &.{package_config} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    var saw_keep = false;
+    for (resolved.extensions) |entry| {
+        if (std.mem.endsWith(u8, entry.path, "extensions/keep.ts")) saw_keep = true;
+        try std.testing.expect(!std.mem.endsWith(u8, entry.path, "extensions/skip.ts"));
+    }
+    try std.testing.expect(saw_keep);
+}
+
+test "VAL-M12-PKG-012 package command --help text covers each subcommand" {
+    const allocator = std.testing.allocator;
+
+    const subcommands = [_]struct { args: []const []const u8, must_contain: []const []const u8 }{
+        .{
+            .args = &.{ "install", "--help" },
+            .must_contain = &.{ "pi install <source>", "-l, --local" },
+        },
+        .{
+            .args = &.{ "remove", "--help" },
+            .must_contain = &.{ "pi remove <source>", "Alias: pi uninstall" },
+        },
+        .{
+            .args = &.{ "uninstall", "--help" },
+            .must_contain = &.{ "pi remove <source>", "Alias: pi uninstall" },
+        },
+        .{
+            .args = &.{ "update", "--help" },
+            .must_contain = &.{ "pi update [source]", "self-update", "release/binary packaging" },
+        },
+        .{
+            .args = &.{ "list", "--help" },
+            .must_contain = &.{ "pi list", "List installed packages" },
+        },
+        .{
+            .args = &.{ "config", "--help" },
+            .must_contain = &.{ "pi config", "--toggle <kind> <pattern>", "release/binary packaging" },
+        },
+    };
+
+    for (subcommands) |spec| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+        const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+        defer allocator.free(cwd);
+        const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+        defer allocator.free(agent_dir);
+
+        var stdout_buf: std.ArrayList(u8) = .empty;
+        defer stdout_buf.deinit(allocator);
+        var stderr_buf: std.ArrayList(u8) = .empty;
+        defer stderr_buf.deinit(allocator);
+
+        const result = try runCommand(
+            allocator,
+            spec.args,
+            .{ .cwd = cwd, .agent_dir = agent_dir },
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        for (spec.must_contain) |needle| {
+            if (std.mem.indexOf(u8, stdout_buf.items, needle) == null) {
+                std.debug.print("missing '{s}' in {s} help: {s}\n", .{ needle, spec.args[0], stdout_buf.items });
+                return error.TestExpectedHelpEntry;
+            }
+        }
+    }
+}
+
+test "VAL-M12-PKG-014 config --toggle persists pattern in scoped settings.json" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    // Pre-populate user settings with an unrelated key to assert we
+    // never wipe other settings while writing the toggle.
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "defaultProvider": "openai"
+        \\}
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result_disable = try runCommand(
+        allocator,
+        &.{ "config", "--toggle", "extensions", "extras/main.ts", "--disable" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result_disable.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Disabled extensions: extras/main.ts") != null);
+
+    const after_disable = try readSettings(allocator, settings_path);
+    defer allocator.free(after_disable);
+    try std.testing.expect(std.mem.indexOf(u8, after_disable, "\"-extras/main.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_disable, "\"defaultProvider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_disable, "\"openai\"") != null);
+
+    // Toggling enable for the same pattern must replace the disable
+    // entry rather than accumulate stale entries.
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const result_enable = try runCommand(
+        allocator,
+        &.{ "config", "--toggle", "extensions", "extras/main.ts", "--enable" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result_enable.exit_code);
+
+    const after_enable = try readSettings(allocator, settings_path);
+    defer allocator.free(after_enable);
+    try std.testing.expect(std.mem.indexOf(u8, after_enable, "\"+extras/main.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_enable, "\"-extras/main.ts\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_enable, "\"defaultProvider\"") != null);
+}
+
+test "VAL-M12-PKG-014 config --toggle -l writes project-scope settings only" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "config", "--toggle", "skills", "example", "--disable", "-l" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const project = try readSettings(allocator, project_settings_path);
+    defer allocator.free(project);
+    try std.testing.expect(std.mem.indexOf(u8, project, "\"skills\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project, "\"-example\"") != null);
+
+    // User-scope settings.json must not exist after a project-scope toggle.
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    const user_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, user_settings_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(!user_exists);
+}
+
+test "VAL-M12-PKG-015 release and binary packaging surfaces stay excluded" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    // `pi update self` is the user-visible self-update target. It must
+    // surface a deterministic excluded-surface diagnostic, not silently
+    // succeed or attempt any release/binary packaging operation.
+    const result_self = try runCommand(
+        allocator,
+        &.{ "update", "self" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), result_self.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "Self-update is not supported") != null);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+
+    // Bare `pi config` and `pi config --help` must both document that
+    // release/binary packaging is intentionally not implemented in this
+    // build so users do not assume the surface exists.
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const result_config_bare = try runCommand(
+        allocator,
+        &.{"config"},
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result_config_bare.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "release/binary packaging") != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const result_config_help = try runCommand(
+        allocator,
+        &.{ "config", "--help" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result_config_help.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "release/binary packaging") != null);
 }
