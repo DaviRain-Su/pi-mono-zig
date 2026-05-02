@@ -772,6 +772,27 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
     return cloneJsonValue(allocator, parsed.value);
 }
 
+/// Mirror TypeScript Array.prototype.filter(Boolean) semantics for parsed
+/// JSON values produced by JSON.parse. Returns true if the value would be
+/// filtered out by `filter(Boolean)`.
+///
+/// JSON.parse can yield: null, true/false, number, string, array, object.
+/// Of these, the falsey ones are: null, false, 0 (integer or float), and
+/// empty string. NaN cannot appear from JSON.parse (it is not valid JSON),
+/// but we conservatively treat number_string-encoded NaN-like values the
+/// same as the underlying numeric semantics.
+fn isFalseyJsonValue(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .bool => |b| !b,
+        .integer => |i| i == 0,
+        .float => |f| f == 0.0 or std.math.isNan(f),
+        .number_string => |ns| ns.len == 0 or std.mem.eql(u8, ns, "0") or std.mem.eql(u8, ns, "-0") or std.mem.eql(u8, ns, "NaN"),
+        .string => |s| s.len == 0,
+        .array, .object => false,
+    };
+}
+
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
     switch (value) {
         .null => return .null,
@@ -2109,9 +2130,10 @@ fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, assis
             if (tc.thought_signature) |sig| {
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, sig, .{}) catch continue;
                 defer parsed.deinit();
-                // Match TypeScript .filter(Boolean): skip null/unsupported parsed values.
-                // JSON.parse("null") produces null which TypeScript's filter(Boolean) removes.
-                if (parsed.value == .null) continue;
+                // Match TypeScript .filter(Boolean): skip ALL falsey parsed values
+                // (null, false, 0, NaN, empty string). JSON.parse can produce any of
+                // these; TypeScript's filter(Boolean) removes them all.
+                if (isFalseyJsonValue(parsed.value)) continue;
                 reasoning_details.append(try cloneJsonValue(allocator, parsed.value)) catch continue;
             }
         }

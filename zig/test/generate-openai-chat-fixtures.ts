@@ -2557,6 +2557,72 @@ const scenarios: Scenario[] = [
 			},
 		},
 	},
+	{
+		id: "signature-falsey-not-replayed",
+		title: "Falsey thoughtSignature values (false, 0, empty string) are not replayed as reasoning_details",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [
+					{ role: "user", content: "Check the weather." },
+					{
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "call_falsey_false",
+								name: "get_weather",
+								arguments: { city: "Berlin", unit: "celsius" },
+								thoughtSignature: "false",
+							},
+							{
+								type: "toolCall",
+								id: "call_falsey_zero",
+								name: "get_weather",
+								arguments: { city: "Paris", unit: "celsius" },
+								thoughtSignature: "0",
+							},
+							{
+								type: "toolCall",
+								id: "call_falsey_empty_string",
+								name: "get_weather",
+								arguments: { city: "Madrid", unit: "celsius" },
+								thoughtSignature: '""',
+							},
+						],
+						api: "openai-completions",
+						provider: "openai",
+						model: "gpt-4.1-fixture",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+						stopReason: "toolUse",
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_falsey_false",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Sunny, 22°C" }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_falsey_zero",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Cloudy, 18°C" }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_falsey_empty_string",
+						toolName: "get_weather",
+						content: [{ type: "text", text: "Rainy, 14°C" }],
+					},
+				],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+		},
+	},
 ];
 
 function stableValue(value: unknown): unknown {
