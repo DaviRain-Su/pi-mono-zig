@@ -69,6 +69,42 @@ fn runCliWithInput(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
+    // Dispatch package-management subcommands (`pi install`, `pi remove`,
+    // `pi uninstall`, `pi update`, `pi list`) before the standard CLI
+    // parser runs. The package commands have their own positional and
+    // option grammar that the regular `parseArgs` would misclassify
+    // (positional sources would be consumed as prompt text). Mirrors
+    // TypeScript `main.ts` which runs `handlePackageCommand` before the
+    // standard prompt/agent path. Only the `local-fixtures-first` slice
+    // is implemented here for M12 m12-package-cli-local-fixtures; npm/git
+    // sources and self-update return deterministic out-of-scope errors.
+    if (coding_agent.package_manager.isPackageCommand(argv)) {
+        var package_command = coding_agent.package_manager.parsePackageCommand(allocator, argv) catch |err| switch (err) {
+            error.NotPackageCommand => unreachable,
+            else => return err,
+        };
+        defer package_command.deinit(allocator);
+        const cwd = if (cwd_override) |override| blk: {
+            break :blk try allocator.dupe(u8, override);
+        } else blk: {
+            const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+            defer allocator.free(real_cwd);
+            break :blk try allocator.dupe(u8, real_cwd);
+        };
+        defer allocator.free(cwd);
+        const agent_dir = try config_mod.resolveAgentDir(allocator, env_map);
+        defer allocator.free(agent_dir);
+        const result = try coding_agent.package_manager.executePackageCommand(
+            allocator,
+            io,
+            package_command,
+            .{ .cwd = cwd, .agent_dir = agent_dir },
+            stdout,
+            stderr,
+        );
+        return result.exit_code;
+    }
+
     var options = bootstrap.parseArgs(allocator, argv) catch |err| {
         try stderr.print("Error: {s}\n\n", .{bootstrap.parseErrorMessage(err)});
         try output.printUsage(allocator, VERSION, stdout);
