@@ -67,6 +67,11 @@ pub const RunInteractiveModeOptions = struct {
     /// or opening a persisted session. Defaults to `.fail` so non-interactive
     /// callers never silently fall back to the launch cwd.
     missing_cwd_mode: MissingCwdMode = .fail,
+    /// True when the caller already prompted the user (via the early
+    /// pre-`prepareCliRuntime` lifecycle preflight) and the user agreed to
+    /// continue in the launch cwd. The interactive bootstrap then skips its
+    /// own missing-cwd selector to avoid prompting twice.
+    missing_cwd_already_confirmed: bool = false,
 };
 
 pub const LiveResources = struct {

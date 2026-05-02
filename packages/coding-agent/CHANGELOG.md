@@ -9,6 +9,7 @@
 ### Fixed
 
 - Fixed `pi -p` treating prompts that start with YAML frontmatter as extension flags instead of user messages ([#4163](https://github.com/badlogic/pi-mono/issues/4163)).
+- The Zig missing stored-cwd preflight now runs BEFORE `runtime_prep.prepareCliRuntime` in non-interactive and interactive resume/open flows. Runtime config, resource bundle, context file, system prompt, provider auth, and tool construction failures can no longer preempt the missing-cwd diagnostic (non-interactive) or the Continue/Cancel TUI selector (interactive). The early Continue path is recorded so the deeper interactive bootstrap does not prompt twice. The existing post-bootstrap guard remains as a race-condition fallback. `readSessionHeader` now uses a bounded streaming first-line read (cap 64 KiB) instead of loading the entire session file.
 
 ## [0.73.0] - 2026-05-04
 

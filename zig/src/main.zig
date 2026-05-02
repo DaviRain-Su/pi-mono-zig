@@ -142,6 +142,80 @@ fn runCliWithInput(
     };
     defer allocator.free(cwd);
 
+    // M10 lifecycle ordering: surface a missing stored-cwd diagnostic BEFORE
+    // `prepareCliRuntime` runs. `prepareCliRuntime` loads runtime config,
+    // resource bundles, context files, the system prompt, and may select an
+    // initial provider/model. Any of those steps can fail (invalid settings,
+    // bad context files, unknown provider, etc.) and would otherwise
+    // preempt the missing-cwd diagnostic that the user actually needs to
+    // see. Mirrors TS `main.ts` ordering, which checks
+    // `getMissingSessionCwdIssue` before constructing the runtime.
+    //
+    // The interactive path additionally prompts the user via the same
+    // Continue/Cancel selector that the post-bootstrap guard uses; on
+    // Continue we set `missing_cwd_already_confirmed` so the deeper
+    // bootstrap path does not prompt twice.
+    var preflight_continue_confirmed = false;
+    {
+        const preflight_session_dir = try runtime_prep.resolvePreflightSessionDir(
+            allocator,
+            io,
+            &effective_env_map,
+            cwd,
+            &options,
+        );
+        defer allocator.free(preflight_session_dir);
+
+        const preflight_options: coding_agent.RunInteractiveModeOptions = .{
+            .cwd = cwd,
+            // The preflight only inspects session files / stored cwd. The
+            // system_prompt and provider strings below are placeholders that
+            // are never used during preflight resolution.
+            .system_prompt = "",
+            .session_dir = preflight_session_dir,
+            .provider = "faux",
+            .session = options.session,
+            .@"continue" = options.@"continue",
+            .@"resume" = options.@"resume",
+            .fork = options.fork,
+            .no_session = options.no_session,
+        };
+
+        if (try coding_agent.interactive_mode.preflightInteractiveMissingCwd(
+            allocator,
+            io,
+            preflight_options,
+        )) |captured_preflight| {
+            var captured_preflight_mut = captured_preflight;
+            defer captured_preflight_mut.deinit(allocator);
+
+            if (app_mode != .interactive) {
+                const message = try coding_agent.formatMissingSessionCwdError(allocator, captured_preflight_mut.issue());
+                defer allocator.free(message);
+                try stderr.print("Error: {s}\n", .{message});
+                try stderr.flush();
+                return 1;
+            }
+
+            const choice = try coding_agent.runMissingCwdSelector(
+                allocator,
+                io,
+                &effective_env_map,
+                captured_preflight_mut.issue(),
+            );
+            switch (choice) {
+                .cancel => {
+                    try stderr.writeAll("Resume cancelled\n");
+                    try stderr.flush();
+                    return 0;
+                },
+                .continue_in_fallback => {
+                    preflight_continue_confirmed = true;
+                },
+            }
+        }
+    }
+
     var prepared = try runtime_prep.prepareCliRuntime(allocator, io, &effective_env_map, cwd, &options, selected_tools);
     defer prepared.deinit(allocator);
     try output.writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
@@ -246,7 +320,11 @@ fn runCliWithInput(
                 .runtime_config = &prepared.runtime_config,
                 // Non-interactive flows must never silently fall back to the
                 // launch cwd when the stored session cwd no longer exists.
+                // The early preflight already failed/exited before this
+                // point if the stored cwd was missing, so a missing-cwd
+                // issue here is purely a race fallback.
                 .missing_cwd_mode = .fail,
+                .missing_cwd_already_confirmed = preflight_continue_confirmed,
             },
             provider_runtime.model,
             provider_runtime.api_key,
@@ -355,6 +433,13 @@ fn runCliWithInput(
             .runtime_config = &prepared.runtime_config,
             .offline = options.offline,
             .verbose = options.verbose,
+            // Continue path of the early pre-`prepareCliRuntime` preflight
+            // already showed the Continue/Cancel selector and the user
+            // chose Continue. Skip the duplicate prompt inside the
+            // interactive bootstrap and let it apply the launch cwd
+            // fallback directly.
+            .missing_cwd_mode = if (preflight_continue_confirmed) .use_fallback else .fail,
+            .missing_cwd_already_confirmed = preflight_continue_confirmed,
         },
         stderr,
     );
@@ -1899,4 +1984,200 @@ test "prepareCliRuntime selects kimi-coding from KIMI_API_KEY" {
 
     try std.testing.expectEqualStrings("kimi-coding", prepared.provider_name);
     try std.testing.expectEqualStrings("kimi-for-coding", prepared.model_name.?);
+}
+
+test "runCli missing-cwd preflight wins over runtime_prep failures (M10 ordering)" {
+    // Regression for M10 scrutiny round 2: the missing stored-cwd diagnostic
+    // must win over `prepareCliRuntime` / `resolveProviderConfig` failures.
+    // Without the early preflight ordering fix, a non-interactive `--continue`
+    // with an unknown provider would surface the unrelated provider error
+    // instead of the missing-cwd diagnostic the user actually needs to see.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "stored");
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const stored_cwd = try makeTmpPath(allocator, tmp, "stored");
+    defer allocator.free(stored_cwd);
+    const launch_cwd = try makeTmpPath(allocator, tmp, "launch");
+    defer allocator.free(launch_cwd);
+    const session_dir = try makeTmpPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    // Seed a session whose stored cwd will be removed below.
+    {
+        var seed_env = std.process.Environ.Map.init(allocator);
+        defer seed_env.deinit();
+        try seed_env.put("HOME", home_dir);
+        try seed_env.put("PI_FAUX_RESPONSE", "seed reply");
+
+        var seed_stdout: std.Io.Writer.Allocating = .init(allocator);
+        defer seed_stdout.deinit();
+        var seed_stderr: std.Io.Writer.Allocating = .init(allocator);
+        defer seed_stderr.deinit();
+        const seed_exit = try runCli(
+            allocator,
+            std.testing.io,
+            &seed_env,
+            &.{
+                "--provider",
+                "faux",
+                "--print",
+                "--session-dir",
+                session_dir,
+                "seed prompt",
+            },
+            stored_cwd,
+            &seed_stdout.writer,
+            &seed_stderr.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), seed_exit);
+    }
+
+    // Capture session bytes, then delete the stored cwd so the next resume
+    // attempt sees a missing-cwd issue.
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+    const before_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(before_bytes);
+    try tmp.dir.deleteTree(std.testing.io, "stored");
+
+    var run_env = std.process.Environ.Map.init(allocator);
+    defer run_env.deinit();
+    try run_env.put("HOME", home_dir);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &run_env,
+        &.{
+            "--provider",
+            "definitely-not-a-real-provider",
+            "--print",
+            "--continue",
+            "--session-dir",
+            session_dir,
+            "second prompt",
+        },
+        launch_cwd,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    const stderr_text = stderr_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "Stored session working directory does not exist:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, stored_cwd) != null);
+    // Confirm the unknown provider error did NOT preempt the missing-cwd
+    // diagnostic.
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "definitely-not-a-real-provider") == null);
+
+    // The session file must remain byte-identical: a rejected non-interactive
+    // resume must never mutate the persisted session.
+    const after_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(after_bytes);
+    try std.testing.expectEqualSlices(u8, before_bytes, after_bytes);
+}
+
+test "resolvePreflightSessionDir prefers --session-dir over env and settings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "explicit");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{ "sessionDir": "/tmp/should-be-ignored-by-cli-flag" }
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+    const explicit_dir = try makeTmpPath(allocator, tmp, "explicit");
+    defer allocator.free(explicit_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_SESSION_DIR", "/tmp/should-be-ignored-by-cli-flag-too");
+
+    var args = try cli.parseArgs(allocator, &.{ "--session-dir", explicit_dir });
+    defer args.deinit(allocator);
+
+    const resolved = try runtime_prep.resolvePreflightSessionDir(allocator, std.testing.io, &env_map, repo_dir, &args);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(explicit_dir, resolved);
+}
+
+test "resolvePreflightSessionDir uses PI_CODING_AGENT_SESSION_DIR when no flag" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "envvar-sessions");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+    const env_dir = try makeTmpPath(allocator, tmp, "envvar-sessions");
+    defer allocator.free(env_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_SESSION_DIR", env_dir);
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    const resolved = try runtime_prep.resolvePreflightSessionDir(allocator, std.testing.io, &env_map, repo_dir, &args);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(env_dir, resolved);
+}
+
+test "resolvePreflightSessionDir falls back to default cwd/.pi/sessions" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    const resolved = try runtime_prep.resolvePreflightSessionDir(allocator, std.testing.io, &env_map, repo_dir, &args);
+    defer allocator.free(resolved);
+    const expected = try std.fs.path.join(allocator, &[_][]const u8{ repo_dir, ".pi", "sessions" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
 }

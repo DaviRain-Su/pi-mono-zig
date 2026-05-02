@@ -122,6 +122,31 @@ launch_pi_with_missing_cwd() {
   tuistory -s "$SESSION" wait-idle --timeout 8000
 }
 
+# Variant that launches the binary with an explicitly invalid provider so the
+# downstream `runtime_prep.prepareCliRuntime` / `resolveProviderConfig` paths
+# would fail without the M10 ordering fix. Used to prove that the missing-cwd
+# selector still wins.
+launch_pi_with_missing_cwd_unknown_provider() {
+  local case_dir="$1"
+  shift
+  local launch_dir="$case_dir/launch"
+  local home_dir="$case_dir/home"
+  local agent_dir="$case_dir/agent"
+  local sessions_dir="$case_dir/sessions"
+
+  tuistory -s "$SESSION" close >/dev/null 2>&1 || true
+  tuistory launch "$BIN_PATH --provider definitely-not-a-real-provider --continue --session-dir $sessions_dir" \
+    -s "$SESSION" \
+    --cwd "$launch_dir" \
+    --cols 100 \
+    --rows 24 \
+    --env "HOME=$home_dir" \
+    --env "PI_CODING_AGENT_DIR=$agent_dir" \
+    --env "PI_FAUX_RESPONSE=ok" \
+    "$@"
+  tuistory -s "$SESSION" wait-idle --timeout 8000
+}
+
 verify_session_unchanged() {
   local case_dir="$1"
   local session_file="$case_dir/sessions/missing-cwd.jsonl"
@@ -214,6 +239,33 @@ assert header.get("cwd") != stored_cwd, (
 assert "id" in header and header["id"], "header is missing session id"
 assert "timestamp" in header and header["timestamp"], "header is missing timestamp"
 PY
+tuistory -s "$SESSION" close >/dev/null 2>&1 || true
+
+log "case: selector wins over runtime_prep failures (M10 preflight ordering)"
+ordering_case_dir="$(prepare_case ordering)"
+ordering_launch_path="$(cat "$ordering_case_dir/launch.path")"
+ordering_stored_path="$(cat "$ordering_case_dir/stored.path")"
+launch_pi_with_missing_cwd_unknown_provider "$ordering_case_dir"
+ordering_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+# The Continue/Cancel selector and stored/launch paths must render even
+# though the requested provider does not exist; without the early
+# pre-`prepareCliRuntime` preflight, the unknown-provider error would have
+# preempted this selector.
+snapshot_contains "$ordering_snapshot" "Session cwd not found"
+snapshot_contains "$ordering_snapshot" "cwd from session file does not exist"
+snapshot_contains "$ordering_snapshot" "$ordering_stored_path"
+snapshot_contains "$ordering_snapshot" "continue in current cwd"
+snapshot_contains "$ordering_snapshot" "$ordering_launch_path"
+snapshot_contains "$ordering_snapshot" "Continue"
+snapshot_contains "$ordering_snapshot" "Cancel"
+snapshot_does_not_contain "$ordering_snapshot" "definitely-not-a-real-provider"
+verify_session_unchanged "$ordering_case_dir"
+# Cancel exits without mutation even when the would-be runtime is invalid.
+tuistory -s "$SESSION" press down
+tuistory -s "$SESSION" wait-idle --timeout 3000
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "Resume cancelled" --timeout 5000
+verify_session_unchanged "$ordering_case_dir"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 log "all missing-cwd selector flows passed"

@@ -204,6 +204,26 @@ fn loadMergedSettings(allocator: std.mem.Allocator, io: std.Io, global_path: []c
     return mergeSettings(allocator, global, project);
 }
 
+/// Loads the merged global+project settings only; used by the M10
+/// missing-cwd lifecycle preflight to resolve the effective session
+/// directory before `prepareCliRuntime` performs heavier work that could
+/// fail and preempt the diagnostic. Caller owns the returned `Settings` and
+/// must call `Settings.deinit`.
+pub fn loadMergedSettingsForPreflight(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+) !Settings {
+    const agent_dir = try resolveAgentDir(allocator, env_map);
+    defer allocator.free(agent_dir);
+    const global_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(global_settings_path);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    return loadMergedSettings(allocator, io, global_settings_path, project_settings_path);
+}
+
 fn loadSettingsFile(
     allocator: std.mem.Allocator,
     io: std.Io,

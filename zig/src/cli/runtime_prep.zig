@@ -125,6 +125,50 @@ pub fn runtimeConfigLoadOptions(
     };
 }
 
+/// Resolves the effective session directory using the same precedence as
+/// `prepareCliRuntime`, but without loading provider auth, model registries,
+/// resource bundles, context files, or the system prompt. Used by the M10
+/// missing-cwd preflight so the diagnostic always wins over downstream
+/// runtime/provider/tool failures.
+///
+/// Precedence (matches TypeScript `main.ts`):
+///   1. `--session-dir` CLI override
+///   2. `$PI_CODING_AGENT_SESSION_DIR` env var (TS `ENV_SESSION_DIR`)
+///   3. `settings.json` `sessionDir` from merged global/project settings
+///   4. Default `<cwd>/.pi/sessions`
+///
+/// Settings load failures fall through to the default; the preflight is
+/// best-effort and never blocks the heavier `prepareCliRuntime` failure
+/// path.
+pub fn resolvePreflightSessionDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    options: *const cli.Args,
+) ![]u8 {
+    if (options.session_dir) |value| {
+        return try config_mod.expandPath(allocator, env_map, value, cwd);
+    }
+    if (env_map.get("PI_CODING_AGENT_SESSION_DIR")) |value| {
+        if (value.len > 0) {
+            return try config_mod.expandPath(allocator, env_map, value, cwd);
+        }
+    }
+    if (config_mod.loadMergedSettingsForPreflight(allocator, io, env_map, cwd)) |maybe_settings| {
+        var settings_value = maybe_settings;
+        defer settings_value.deinit(allocator);
+        if (settings_value.session_dir) |value| {
+            return try config_mod.expandPath(allocator, env_map, value, cwd);
+        }
+    } else |_| {
+        // Settings parse failure: fall through to the default. The heavier
+        // prepareCliRuntime path will surface the same diagnostic later when
+        // the user actually proceeds past the missing-cwd preflight.
+    }
+    return try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+}
+
 const InitialModelSelection = struct {
     provider_name: []const u8,
     model_name: ?[]const u8,
