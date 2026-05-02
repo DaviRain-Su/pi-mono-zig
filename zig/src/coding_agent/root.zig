@@ -15,6 +15,7 @@ pub const extension_registry = @import("extension_registry.zig");
 pub const package_manager = @import("package_manager.zig");
 pub const provider_config = @import("provider_config.zig");
 pub const interactive_mode = @import("interactive_mode.zig");
+pub const file_image = @import("file_image.zig");
 
 pub const SessionManager = session_manager.SessionManager;
 pub const SessionContext = session_manager.SessionContext;
@@ -77,5 +78,6 @@ test {
     _ = @import("ts_rpc_fixture_tests.zig");
     _ = @import("provider_config.zig");
     _ = @import("interactive_mode.zig");
+    _ = @import("file_image.zig");
     _ = @import("migrations.zig");
 }
