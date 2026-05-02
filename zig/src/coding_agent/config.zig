@@ -101,7 +101,25 @@ pub const RuntimeConfig = struct {
         return null;
     }
 
+    /// Resolves the runtime session directory using the same precedence as
+    /// the M10 missing-cwd preflight (`runtime_prep.resolvePreflightSessionDir`)
+    /// and TypeScript `main.ts`:
+    ///
+    ///   1. `$PI_CODING_AGENT_SESSION_DIR` env var (TS `ENV_SESSION_DIR`)
+    ///   2. `settings.json` `sessionDir` from merged global/project settings
+    ///   3. Default `<cwd>/.pi/sessions`
+    ///
+    /// `--session-dir` overrides this entirely and is applied by the caller
+    /// before `effectiveSessionDir` runs, so it is not re-checked here.
+    /// Aligning the env-var precedence with the preflight ensures the
+    /// missing-cwd diagnostic always refers to the same session directory
+    /// the runtime will later open.
     pub fn effectiveSessionDir(self: *const RuntimeConfig, allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, cwd: []const u8) ![]u8 {
+        if (env_map.get("PI_CODING_AGENT_SESSION_DIR")) |value| {
+            if (value.len > 0) {
+                return expandPath(allocator, env_map, value, cwd);
+            }
+        }
         if (self.settings.session_dir) |value| {
             return expandPath(allocator, env_map, value, cwd);
         }
@@ -1458,4 +1476,107 @@ test "runtime config collects model discovery failures" {
         if (config_error.source == .discovery) saw_discovery = true;
     }
     try std.testing.expect(saw_discovery);
+}
+
+test "RuntimeConfig.effectiveSessionDir honors PI_CODING_AGENT_SESSION_DIR before settings sessionDir" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+    try tmp.dir.createDirPath(std.testing.io, "envvar-sessions");
+    // Settings explicitly point at a different directory so we can prove the
+    // env var wins.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{ "sessionDir": "/tmp/should-be-ignored-by-env-var" }
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const env_dir = try makeTmpPath(allocator, tmp, "envvar-sessions");
+    defer allocator.free(env_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_SESSION_DIR", env_dir);
+
+    var runtime = try loadRuntimeConfig(allocator, std.testing.io, &env_map, project_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    const session_dir = try runtime.effectiveSessionDir(allocator, &env_map, project_dir);
+    defer allocator.free(session_dir);
+    try std.testing.expectEqualStrings(env_dir, session_dir);
+}
+
+test "RuntimeConfig.effectiveSessionDir falls back to settings sessionDir when env is empty" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{ "sessionDir": "~/sessions-from-settings" }
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    // Empty env value must not preempt settings sessionDir; mirrors TS
+    // `process.env[ENV_SESSION_DIR]` truthiness check.
+    try env_map.put("PI_CODING_AGENT_SESSION_DIR", "");
+
+    var runtime = try loadRuntimeConfig(allocator, std.testing.io, &env_map, project_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    const session_dir = try runtime.effectiveSessionDir(allocator, &env_map, project_dir);
+    defer allocator.free(session_dir);
+    const expected = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, "sessions-from-settings" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, session_dir);
+}
+
+test "RuntimeConfig.effectiveSessionDir falls back to default when env and settings are absent" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfig(allocator, std.testing.io, &env_map, project_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    const session_dir = try runtime.effectiveSessionDir(allocator, &env_map, project_dir);
+    defer allocator.free(session_dir);
+    const expected = try std.fs.path.join(allocator, &[_][]const u8{ project_dir, ".pi", "sessions" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, session_dir);
 }
