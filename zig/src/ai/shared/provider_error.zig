@@ -50,6 +50,15 @@ pub fn runtimeStopReason(err: anyerror) types.StopReason {
     };
 }
 
+/// Returns true when the caller's abort signal is currently set. Mirrors the
+/// TypeScript `options?.signal?.aborted` check that providers use to classify
+/// in-flight failures as aborted rather than generic errors.
+pub fn isAbortRequested(options: ?types.StreamOptions) bool {
+    const stream_options = options orelse return false;
+    const signal = stream_options.signal orelse return false;
+    return signal.load(.seq_cst);
+}
+
 pub fn runtimeErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.RequestAborted => "Request was aborted",
