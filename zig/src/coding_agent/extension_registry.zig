@@ -154,6 +154,65 @@ pub const ExtensionProvider = struct {
     }
 };
 
+/// Header / footer hook captured from the live Bun host. Mirrors the
+/// TS `ExtensionUIContext.setHeader` / `setFooter` factories: at the
+/// JSONL protocol layer the host serializes a deterministic content
+/// preview (line array) plus the owning extension path so cleanup on
+/// reload / session replacement can target hooks by extension.
+pub const InjectionHook = struct {
+    lines: [][]u8,
+    extension_path: []u8,
+
+    pub fn deinit(self: *InjectionHook, allocator: std.mem.Allocator) void {
+        for (self.lines) |line| allocator.free(line);
+        allocator.free(self.lines);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
+/// Terminal input subscription. The host serializes the consume +
+/// transform behavior so cleanup/unsubscribe can be observed without a
+/// real TUI: `consume = true` mirrors `{ consume: true }` returned from
+/// the TS handler; `transform_to` mirrors `{ data: <new> }`. A pure
+/// observer subscription has both `consume = false` and
+/// `transform_to == null`.
+pub const TerminalInputSubscription = struct {
+    id: []u8,
+    consume: bool = false,
+    transform_to: ?[]u8 = null,
+    extension_path: []u8,
+
+    pub fn deinit(self: *TerminalInputSubscription, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.transform_to) |t| allocator.free(t);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
+/// Custom editor component hook. The host serializes a deterministic
+/// label (the registered editor name) so reload/cleanup can confirm
+/// the previous custom editor did not survive.
+pub const EditorComponentHook = struct {
+    label: []u8,
+    extension_path: []u8,
+
+    pub fn deinit(self: *EditorComponentHook, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
+/// Result of feeding terminal input bytes through the registered
+/// subscriptions. `consumed` blocks the default editor; `data` is the
+/// final transformed bytes (caller borrows).
+pub const TerminalInputResult = struct {
+    consumed: bool,
+    data: []const u8,
+};
+
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     flags: std.ArrayList(ExtensionFlag) = .empty,
@@ -165,6 +224,20 @@ pub const Registry = struct {
     /// host-side bridge log so UI bridge correlation can be asserted by
     /// fixture tests (VAL-M11-EXT-013).
     ui_request_ids: std.ArrayList([]u8) = .empty,
+    /// Currently-installed extension header hook (TS `setHeader`).
+    /// Single-slot to mirror the TS interactive runtime contract:
+    /// later setHeader frames replace the previous one. `null` means
+    /// the built-in header is in use.
+    header_hook: ?InjectionHook = null,
+    /// Currently-installed extension footer hook (TS `setFooter`).
+    footer_hook: ?InjectionHook = null,
+    /// Terminal input subscriptions in registration order. Each
+    /// subscription has a stable id so unsubscribe frames can target
+    /// the exact handler.
+    terminal_input_subs: std.ArrayList(TerminalInputSubscription) = .empty,
+    /// Custom editor component hook (TS `setEditorComponent`).
+    /// Single-slot; `null` means the default editor is in use.
+    editor_component_hook: ?EditorComponentHook = null,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -183,6 +256,11 @@ pub const Registry = struct {
         self.providers.deinit(self.allocator);
         for (self.ui_request_ids.items) |id| self.allocator.free(id);
         self.ui_request_ids.deinit(self.allocator);
+        if (self.header_hook) |*h| h.deinit(self.allocator);
+        if (self.footer_hook) |*h| h.deinit(self.allocator);
+        for (self.terminal_input_subs.items) |*sub| sub.deinit(self.allocator);
+        self.terminal_input_subs.deinit(self.allocator);
+        if (self.editor_component_hook) |*h| h.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -395,7 +473,210 @@ pub const Registry = struct {
         errdefer self.allocator.free(owned);
         try self.ui_request_ids.append(self.allocator, owned);
     }
+
+    /// Install the extension header hook. Replaces any previous header
+    /// hook (TS `setHeader` is single-slot per runtime).
+    pub fn setHeaderHook(
+        self: *Registry,
+        lines: []const []const u8,
+        extension_path: []const u8,
+    ) !void {
+        var owned_lines = try self.allocator.alloc([]u8, lines.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_lines[0..initialized]) |line| self.allocator.free(line);
+            self.allocator.free(owned_lines);
+        }
+        for (lines, 0..) |line, idx| {
+            owned_lines[idx] = try self.allocator.dupe(u8, line);
+            initialized = idx + 1;
+        }
+        const path_dup = try self.allocator.dupe(u8, extension_path);
+        if (self.header_hook) |*existing| existing.deinit(self.allocator);
+        self.header_hook = .{ .lines = owned_lines, .extension_path = path_dup };
+    }
+
+    /// Remove the extension header hook (TS `setHeader(undefined)` /
+    /// session replacement clears the hook).
+    pub fn clearHeaderHook(self: *Registry) bool {
+        if (self.header_hook) |*existing| {
+            existing.deinit(self.allocator);
+            self.header_hook = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// Install the extension footer hook. Replaces any previous footer
+    /// hook (TS `setFooter` is single-slot per runtime).
+    pub fn setFooterHook(
+        self: *Registry,
+        lines: []const []const u8,
+        extension_path: []const u8,
+    ) !void {
+        var owned_lines = try self.allocator.alloc([]u8, lines.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_lines[0..initialized]) |line| self.allocator.free(line);
+            self.allocator.free(owned_lines);
+        }
+        for (lines, 0..) |line, idx| {
+            owned_lines[idx] = try self.allocator.dupe(u8, line);
+            initialized = idx + 1;
+        }
+        const path_dup = try self.allocator.dupe(u8, extension_path);
+        if (self.footer_hook) |*existing| existing.deinit(self.allocator);
+        self.footer_hook = .{ .lines = owned_lines, .extension_path = path_dup };
+    }
+
+    pub fn clearFooterHook(self: *Registry) bool {
+        if (self.footer_hook) |*existing| {
+            existing.deinit(self.allocator);
+            self.footer_hook = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// Register a terminal input subscription with a stable id. Later
+    /// frames with the same id replace the previous behavior so
+    /// extensions can change consume/transform behavior at runtime.
+    pub fn registerTerminalInput(
+        self: *Registry,
+        id: []const u8,
+        consume: bool,
+        transform_to: ?[]const u8,
+        extension_path: []const u8,
+    ) !void {
+        // Replace existing subscription with the same id (TS unsubscribe
+        // is by closure identity, but the JSONL protocol surfaces the
+        // id explicitly so the runtime can route updates).
+        for (self.terminal_input_subs.items, 0..) |*sub, idx| {
+            if (std.mem.eql(u8, sub.id, id)) {
+                sub.deinit(self.allocator);
+                self.terminal_input_subs.items[idx] = try makeTerminalInputSubscription(self.allocator, id, consume, transform_to, extension_path);
+                return;
+            }
+        }
+        const sub = try makeTerminalInputSubscription(self.allocator, id, consume, transform_to, extension_path);
+        try self.terminal_input_subs.append(self.allocator, sub);
+    }
+
+    /// Remove a terminal input subscription by id. Mirrors calling the
+    /// TS unsubscribe closure returned from `onTerminalInput`. Returns
+    /// `true` when an entry was removed.
+    pub fn unregisterTerminalInput(self: *Registry, id: []const u8) bool {
+        for (self.terminal_input_subs.items, 0..) |*sub, idx| {
+            if (std.mem.eql(u8, sub.id, id)) {
+                var removed = self.terminal_input_subs.orderedRemove(idx);
+                removed.deinit(self.allocator);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Apply terminal input bytes through the registered subscriptions
+    /// in registration order. Mirrors TS behavior:
+    ///   * If a subscription returns `{ consume: true }`, propagation
+    ///     stops and the default editor does not see the bytes.
+    ///   * If a subscription returns `{ data: <new> }` without consume,
+    ///     the bytes are rewritten and propagation continues to later
+    ///     subscriptions and finally the default editor.
+    ///   * If a subscription returns nothing, propagation continues
+    ///     unchanged.
+    /// `scratch` is filled with owned bytes when a transform happens
+    /// across multiple subscriptions; the returned `data` slice
+    /// borrows from `scratch.items` or the original `bytes` slice.
+    pub fn applyTerminalInput(
+        self: *Registry,
+        bytes: []const u8,
+        scratch: *std.ArrayList(u8),
+    ) !TerminalInputResult {
+        scratch.clearRetainingCapacity();
+        try scratch.appendSlice(self.allocator, bytes);
+        var consumed = false;
+        for (self.terminal_input_subs.items) |sub| {
+            if (sub.consume) {
+                consumed = true;
+                break;
+            }
+            if (sub.transform_to) |new_data| {
+                scratch.clearRetainingCapacity();
+                try scratch.appendSlice(self.allocator, new_data);
+            }
+        }
+        return .{ .consumed = consumed, .data = scratch.items };
+    }
+
+    /// Install the custom editor component hook. Replaces any previous
+    /// editor hook (TS `setEditorComponent` is single-slot per runtime).
+    pub fn setEditorComponentHook(
+        self: *Registry,
+        label: []const u8,
+        extension_path: []const u8,
+    ) !void {
+        const label_dup = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(label_dup);
+        const path_dup = try self.allocator.dupe(u8, extension_path);
+        if (self.editor_component_hook) |*existing| existing.deinit(self.allocator);
+        self.editor_component_hook = .{ .label = label_dup, .extension_path = path_dup };
+    }
+
+    pub fn clearEditorComponentHook(self: *Registry) bool {
+        if (self.editor_component_hook) |*existing| {
+            existing.deinit(self.allocator);
+            self.editor_component_hook = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// Drop every UI hook that should not survive an extension reload
+    /// or session replacement. This mirrors the TS interactive runtime
+    /// teardown that clears extension header/footer factories,
+    /// extension terminal input listeners, and the custom editor
+    /// component before re-binding extensions on the new session.
+    /// Static registrations (tools, commands, shortcuts, flags,
+    /// providers) are left intact and re-asserted by the next round of
+    /// register_* frames; UI hooks are NOT, by design.
+    pub fn clearUiHooksForReload(self: *Registry) void {
+        if (self.header_hook) |*existing| {
+            existing.deinit(self.allocator);
+            self.header_hook = null;
+        }
+        if (self.footer_hook) |*existing| {
+            existing.deinit(self.allocator);
+            self.footer_hook = null;
+        }
+        for (self.terminal_input_subs.items) |*sub| sub.deinit(self.allocator);
+        self.terminal_input_subs.clearRetainingCapacity();
+        if (self.editor_component_hook) |*existing| {
+            existing.deinit(self.allocator);
+            self.editor_component_hook = null;
+        }
+    }
 };
+
+fn makeTerminalInputSubscription(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    consume: bool,
+    transform_to: ?[]const u8,
+    extension_path: []const u8,
+) !TerminalInputSubscription {
+    const id_dup = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_dup);
+    const transform_dup = if (transform_to) |t| try allocator.dupe(u8, t) else null;
+    errdefer if (transform_dup) |t| allocator.free(t);
+    const path_dup = try allocator.dupe(u8, extension_path);
+    return .{
+        .id = id_dup,
+        .consume = consume,
+        .transform_to = transform_dup,
+        .extension_path = path_dup,
+    };
+}
 
 /// Lightweight provider/model descriptor used as input to
 /// `Registry.registerProvider`. Strings are borrowed; the registry
@@ -610,7 +891,42 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
     }
     try root.put(allocator, try allocator.dupe(u8, "uiRequestIds"), .{ .array = ids_array });
 
+    try root.put(allocator, try allocator.dupe(u8, "headerHook"), try injectionHookJson(allocator, registry.header_hook));
+    try root.put(allocator, try allocator.dupe(u8, "footerHook"), try injectionHookJson(allocator, registry.footer_hook));
+
+    var subs_array = std.json.Array.init(allocator);
+    for (registry.terminal_input_subs.items) |sub| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, sub.id) });
+        try entry.put(allocator, try allocator.dupe(u8, "consume"), .{ .bool = sub.consume });
+        try entry.put(allocator, try allocator.dupe(u8, "transformTo"), try optionalStringJson(allocator, sub.transform_to));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, sub.extension_path) });
+        try subs_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "terminalInputSubscriptions"), .{ .array = subs_array });
+
+    if (registry.editor_component_hook) |hook| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "label"), .{ .string = try allocator.dupe(u8, hook.label) });
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, hook.extension_path) });
+        try root.put(allocator, try allocator.dupe(u8, "editorComponentHook"), .{ .object = entry });
+    } else {
+        try root.put(allocator, try allocator.dupe(u8, "editorComponentHook"), .null);
+    }
+
     return .{ .object = root };
+}
+
+fn injectionHookJson(allocator: std.mem.Allocator, hook: ?InjectionHook) !std.json.Value {
+    const value = hook orelse return .null;
+    var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    var lines_array = std.json.Array.init(allocator);
+    for (value.lines) |line| {
+        try lines_array.append(.{ .string = try allocator.dupe(u8, line) });
+    }
+    try entry.put(allocator, try allocator.dupe(u8, "lines"), .{ .array = lines_array });
+    try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, value.extension_path) });
+    return .{ .object = entry };
 }
 
 fn optionalStringJson(allocator: std.mem.Allocator, value: ?[]const u8) !std.json.Value {
@@ -668,6 +984,15 @@ pub const FrameOutcome = enum {
     registered_flag,
     registered_provider,
     unregistered_provider,
+    set_header_hook,
+    cleared_header_hook,
+    set_footer_hook,
+    cleared_footer_hook,
+    registered_terminal_input,
+    unregistered_terminal_input,
+    set_editor_component_hook,
+    cleared_editor_component_hook,
+    cleared_ui_hooks_for_reload,
     ignored_unsupported,
     ignored_malformed,
 };
@@ -762,7 +1087,73 @@ pub fn applyHostFrame(
         return .none;
     }
 
+    if (std.mem.eql(u8, type_name, "set_header")) {
+        const lines = try optionalLinesArray(registry.allocator, object, "lines");
+        defer registry.allocator.free(lines);
+        try registry.setHeaderHook(lines, extension_path);
+        return .set_header_hook;
+    }
+    if (std.mem.eql(u8, type_name, "clear_header")) {
+        _ = registry.clearHeaderHook();
+        return .cleared_header_hook;
+    }
+    if (std.mem.eql(u8, type_name, "set_footer")) {
+        const lines = try optionalLinesArray(registry.allocator, object, "lines");
+        defer registry.allocator.free(lines);
+        try registry.setFooterHook(lines, extension_path);
+        return .set_footer_hook;
+    }
+    if (std.mem.eql(u8, type_name, "clear_footer")) {
+        _ = registry.clearFooterHook();
+        return .cleared_footer_hook;
+    }
+    if (std.mem.eql(u8, type_name, "register_terminal_input")) {
+        const id = optionalString(object, "id") orelse return .ignored_malformed;
+        const consume = optionalBool(object, "consume") orelse false;
+        const transform_to = optionalString(object, "transformTo");
+        try registry.registerTerminalInput(id, consume, transform_to, extension_path);
+        return .registered_terminal_input;
+    }
+    if (std.mem.eql(u8, type_name, "unregister_terminal_input")) {
+        const id = optionalString(object, "id") orelse return .ignored_malformed;
+        _ = registry.unregisterTerminalInput(id);
+        return .unregistered_terminal_input;
+    }
+    if (std.mem.eql(u8, type_name, "set_editor_component")) {
+        const label = optionalString(object, "label") orelse return .ignored_malformed;
+        try registry.setEditorComponentHook(label, extension_path);
+        return .set_editor_component_hook;
+    }
+    if (std.mem.eql(u8, type_name, "clear_editor_component")) {
+        _ = registry.clearEditorComponentHook();
+        return .cleared_editor_component_hook;
+    }
+    if (std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload")) {
+        registry.clearUiHooksForReload();
+        return .cleared_ui_hooks_for_reload;
+    }
+
     return .ignored_unsupported;
+}
+
+fn optionalBool(object: std.json.ObjectMap, field: []const u8) ?bool {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
+fn optionalLinesArray(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![][]const u8 {
+    const value = object.get(field) orelse return try allocator.alloc([]const u8, 0);
+    if (value != .array) return try allocator.alloc([]const u8, 0);
+    var collected = std.ArrayList([]const u8).empty;
+    defer collected.deinit(allocator);
+    for (value.array.items) |item| {
+        if (item != .string) continue;
+        try collected.append(allocator, item.string);
+    }
+    return try collected.toOwnedSlice(allocator);
 }
 
 /// Load and apply registration frames from a deterministic local
@@ -1091,4 +1482,222 @@ test "applyHostFrame records ui request ids for bridge correlation" {
     try std.testing.expectEqual(@as(usize, 2), registry.ui_request_ids.items.len);
     try std.testing.expectEqualStrings("ui-1", registry.ui_request_ids.items[0]);
     try std.testing.expectEqualStrings("ui-2", registry.ui_request_ids.items[1]);
+}
+
+// --------------------------------------------------------------------------
+// M11 extension UI hooks tests
+// --------------------------------------------------------------------------
+
+test "M11 setHeaderHook and setFooterHook are single-slot and replaceable" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const v1 = [_][]const u8{ "Header v1 line 1", "Header v1 line 2" };
+    try registry.setHeaderHook(&v1, "fixture/extension.ts");
+    try std.testing.expect(registry.header_hook != null);
+    try std.testing.expectEqual(@as(usize, 2), registry.header_hook.?.lines.len);
+    try std.testing.expectEqualStrings("Header v1 line 1", registry.header_hook.?.lines[0]);
+
+    // Replace; previous hook bytes are freed and the new content wins.
+    const v2 = [_][]const u8{"Header v2 only line"};
+    try registry.setHeaderHook(&v2, "fixture/extension.ts");
+    try std.testing.expectEqual(@as(usize, 1), registry.header_hook.?.lines.len);
+    try std.testing.expectEqualStrings("Header v2 only line", registry.header_hook.?.lines[0]);
+
+    // Footer mirrors the header API.
+    const f1 = [_][]const u8{ "Footer A", "Footer B" };
+    try registry.setFooterHook(&f1, "fixture/extension.ts");
+    try std.testing.expect(registry.footer_hook != null);
+    try std.testing.expectEqualStrings("Footer A", registry.footer_hook.?.lines[0]);
+
+    // Clearing returns true the first time and false the second.
+    try std.testing.expect(registry.clearHeaderHook());
+    try std.testing.expect(!registry.clearHeaderHook());
+    try std.testing.expect(registry.clearFooterHook());
+    try std.testing.expect(!registry.clearFooterHook());
+}
+
+test "M11 terminal input subscriptions support consume / transform / unsubscribe" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    // Pure observer (no consume, no transform) leaves bytes intact.
+    try registry.registerTerminalInput("observer", false, null, "fixture/extension.ts");
+
+    var scratch = std.ArrayList(u8).empty;
+    defer scratch.deinit(allocator);
+    var result = try registry.applyTerminalInput("hello", &scratch);
+    try std.testing.expect(!result.consumed);
+    try std.testing.expectEqualStrings("hello", result.data);
+
+    // Transform handler rewrites bytes.
+    try registry.registerTerminalInput("transform", false, "world", "fixture/extension.ts");
+    result = try registry.applyTerminalInput("hello", &scratch);
+    try std.testing.expect(!result.consumed);
+    try std.testing.expectEqualStrings("world", result.data);
+
+    // Consume handler stops propagation.
+    try registry.registerTerminalInput("consumer", true, null, "fixture/extension.ts");
+    result = try registry.applyTerminalInput("hello", &scratch);
+    try std.testing.expect(result.consumed);
+
+    // Unsubscribing the consumer restores propagation through the
+    // remaining transform handler.
+    try std.testing.expect(registry.unregisterTerminalInput("consumer"));
+    result = try registry.applyTerminalInput("hello", &scratch);
+    try std.testing.expect(!result.consumed);
+    try std.testing.expectEqualStrings("world", result.data);
+
+    // Unsubscribing the transform handler returns to the original
+    // observer-only behavior.
+    try std.testing.expect(registry.unregisterTerminalInput("transform"));
+    result = try registry.applyTerminalInput("hello", &scratch);
+    try std.testing.expect(!result.consumed);
+    try std.testing.expectEqualStrings("hello", result.data);
+
+    // Unsubscribe returns false for an unknown id and the registry is
+    // left intact.
+    try std.testing.expect(!registry.unregisterTerminalInput("does-not-exist"));
+    try std.testing.expectEqual(@as(usize, 1), registry.terminal_input_subs.items.len);
+}
+
+test "M11 setEditorComponentHook is single-slot and clearable" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.setEditorComponentHook("VimEditor", "fixture/extension.ts");
+    try std.testing.expect(registry.editor_component_hook != null);
+    try std.testing.expectEqualStrings("VimEditor", registry.editor_component_hook.?.label);
+
+    try registry.setEditorComponentHook("EmacsEditor", "fixture/extension.ts");
+    try std.testing.expectEqualStrings("EmacsEditor", registry.editor_component_hook.?.label);
+
+    try std.testing.expect(registry.clearEditorComponentHook());
+    try std.testing.expect(!registry.clearEditorComponentHook());
+    try std.testing.expect(registry.editor_component_hook == null);
+}
+
+test "M11 clearUiHooksForReload drops UI hooks but keeps static registrations" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    // Static surfaces.
+    try registry.registerTool("greet", "Greet", "Greets", "fixture/extension.ts");
+    try registry.registerCommand("greet", "Slash command", "fixture/extension.ts");
+    try registry.registerFlag("plan", .boolean, null, .{ .boolean = true }, "fixture/extension.ts");
+
+    // UI hooks.
+    const lines = [_][]const u8{"Header"};
+    try registry.setHeaderHook(&lines, "fixture/extension.ts");
+    try registry.setFooterHook(&lines, "fixture/extension.ts");
+    try registry.registerTerminalInput("sub-1", true, null, "fixture/extension.ts");
+    try registry.setEditorComponentHook("VimEditor", "fixture/extension.ts");
+
+    registry.clearUiHooksForReload();
+
+    // Hooks gone.
+    try std.testing.expect(registry.header_hook == null);
+    try std.testing.expect(registry.footer_hook == null);
+    try std.testing.expectEqual(@as(usize, 0), registry.terminal_input_subs.items.len);
+    try std.testing.expect(registry.editor_component_hook == null);
+
+    // Static registrations preserved.
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.flags.items.len);
+}
+
+test "M11 applyHostFrameStream covers UI hook frame types end-to-end" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "set_header", "lines": ["Header line A", "Header line B"], "extensionPath": "fixture/extension.ts" }
+        \\{ "type": "set_footer", "lines": ["Footer line"], "extensionPath": "fixture/extension.ts" }
+        \\{ "type": "register_terminal_input", "id": "consumer", "consume": true, "extensionPath": "fixture/extension.ts" }
+        \\{ "type": "register_terminal_input", "id": "transform", "consume": false, "transformTo": "rewritten", "extensionPath": "fixture/extension.ts" }
+        \\{ "type": "set_editor_component", "label": "VimEditor", "extensionPath": "fixture/extension.ts" }
+        \\
+    ;
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 5), applied);
+
+    try std.testing.expect(registry.header_hook != null);
+    try std.testing.expectEqualStrings("Header line A", registry.header_hook.?.lines[0]);
+    try std.testing.expect(registry.footer_hook != null);
+    try std.testing.expectEqual(@as(usize, 2), registry.terminal_input_subs.items.len);
+    try std.testing.expect(registry.editor_component_hook != null);
+    try std.testing.expectEqualStrings("VimEditor", registry.editor_component_hook.?.label);
+
+    // Removing one terminal input subscription via JSONL.
+    const remove_frame =
+        \\{ "type": "unregister_terminal_input", "id": "consumer" }
+        \\
+    ;
+    _ = try applyHostFrameStream(&registry, remove_frame);
+    try std.testing.expectEqual(@as(usize, 1), registry.terminal_input_subs.items.len);
+    try std.testing.expectEqualStrings("transform", registry.terminal_input_subs.items[0].id);
+
+    // clear_header / clear_footer / clear_editor_component frames.
+    const clear_frames =
+        \\{ "type": "clear_header" }
+        \\{ "type": "clear_footer" }
+        \\{ "type": "clear_editor_component" }
+        \\
+    ;
+    _ = try applyHostFrameStream(&registry, clear_frames);
+    try std.testing.expect(registry.header_hook == null);
+    try std.testing.expect(registry.footer_hook == null);
+    try std.testing.expect(registry.editor_component_hook == null);
+    // Static surfaces and the surviving subscription remain.
+    try std.testing.expectEqual(@as(usize, 1), registry.terminal_input_subs.items.len);
+
+    // clear_ui_hooks_for_reload drops the surviving subscription too.
+    const reload_frame =
+        \\{ "type": "clear_ui_hooks_for_reload" }
+        \\
+    ;
+    _ = try applyHostFrameStream(&registry, reload_frame);
+    try std.testing.expectEqual(@as(usize, 0), registry.terminal_input_subs.items.len);
+}
+
+test "M11 snapshot JSON includes UI hook state" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const lines = [_][]const u8{ "Header A", "Header B" };
+    const single_line = [_][]const u8{"Header A"};
+    try registry.setHeaderHook(&lines, "fixture/extension.ts");
+    try registry.setFooterHook(&single_line, "fixture/extension.ts");
+    try registry.registerTerminalInput("consumer", true, null, "fixture/extension.ts");
+    try registry.registerTerminalInput("transform", false, "rewritten", "fixture/extension.ts");
+    try registry.setEditorComponentHook("VimEditor", "fixture/extension.ts");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+
+    const snapshot = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"headerHook\":{\"lines\":[\"Header A\",\"Header B\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"footerHook\":{\"lines\":[\"Header A\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"terminalInputSubscriptions\":[{\"id\":\"consumer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"transformTo\":\"rewritten\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"editorComponentHook\":{\"label\":\"VimEditor\"") != null);
+
+    // After clearUiHooksForReload, the snapshot reflects empty hooks.
+    registry.clearUiHooksForReload();
+    var out2: std.Io.Writer.Allocating = .init(allocator);
+    defer out2.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out2.writer);
+    const snapshot2 = out2.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"headerHook\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"footerHook\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"terminalInputSubscriptions\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"editorComponentHook\":null") != null);
 }
