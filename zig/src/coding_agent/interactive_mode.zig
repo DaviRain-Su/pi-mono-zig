@@ -129,6 +129,8 @@ pub const bootstrapInteractiveStateWithMissingCwd = session_bootstrap.bootstrapI
 pub const openInitialSession = session_bootstrap.openInitialSession;
 pub const openInitialSessionWithMissingCwd = session_bootstrap.openInitialSessionWithMissingCwd;
 pub const OwnedMissingSessionCwdIssue = session_bootstrap.OwnedMissingSessionCwdIssue;
+pub const resolveResumeSessionPath = session_bootstrap.resolveResumeSessionPath;
+pub const preflightInteractiveMissingCwd = session_bootstrap.preflightInteractiveMissingCwd;
 pub const SlashCommandKind = slash_commands.SlashCommandKind;
 pub const SlashCommand = slash_commands.SlashCommand;
 pub const BuiltinSlashCommand = slash_commands.BuiltinSlashCommand;
@@ -434,6 +436,50 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
     out_issue: *?session_bootstrap.OwnedMissingSessionCwdIssue,
     stderr_writer: *std.Io.Writer,
 ) !BootstrapOrExit {
+    // Lifecycle ordering: run the missing-cwd preflight BEFORE provider auth /
+    // tool construction. This guarantees the Continue/Cancel TUI selector
+    // appears even when provider auth or model configuration would otherwise
+    // fail later in bootstrap. Matches TypeScript main.ts which checks the
+    // missing-cwd issue before constructing the runtime.
+    if (try session_bootstrap.preflightInteractiveMissingCwd(allocator, io, options)) |captured_preflight| {
+        var captured_preflight_mut = captured_preflight;
+        defer captured_preflight_mut.deinit(allocator);
+        const choice = try promptInteractiveMissingSessionCwd(
+            allocator,
+            io,
+            env_map,
+            captured_preflight_mut.issue(),
+        );
+        if (choice == .cancel) {
+            try stderr_writer.writeAll("Resume cancelled\n");
+            try stderr_writer.flush();
+            return .{ .exit_code = 0 };
+        }
+        var fallback_options = options;
+        fallback_options.missing_cwd_mode = .use_fallback;
+        const retry = session_bootstrap.bootstrapInteractiveState(
+            allocator,
+            io,
+            env_map,
+            fallback_options,
+            app_context,
+        );
+        if (retry) |state| return .{ .bootstrap = state } else |retry_err| switch (retry_err) {
+            error.MissingApiKey,
+            error.UnknownProvider,
+            error.InvalidFauxStopReason,
+            error.InvalidFauxTokensPerSecond,
+            error.InvalidFauxContextWindow,
+            error.InvalidFauxToolArguments,
+            => {
+                try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(retry_err, options.provider)});
+                try stderr_writer.flush();
+                return .{ .exit_code = 1 };
+            },
+            else => return retry_err,
+        }
+    }
+
     const initial = session_bootstrap.bootstrapInteractiveStateWithMissingCwd(
         allocator,
         io,
@@ -457,6 +503,9 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
             return .{ .exit_code = 1 };
         },
         error.MissingSessionCwd => {
+            // Defensive fallback: if the preflight missed (for example a
+            // session whose stored cwd disappeared between preflight and
+            // open), reuse the same TUI selector flow.
             const captured = out_issue.* orelse {
                 try stderr_writer.writeAll("Error: stored session working directory does not exist\n");
                 try stderr_writer.flush();

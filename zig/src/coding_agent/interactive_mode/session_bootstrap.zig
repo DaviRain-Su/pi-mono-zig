@@ -18,6 +18,60 @@ const configuredRetrySettings = shared.configuredRetrySettings;
 const createSeededSession = slash_commands.createSeededSession;
 const resolveSessionPath = slash_commands.resolveSessionPath;
 
+/// Computes the session file path that `openInitialSessionWithMissingCwd`
+/// would open for `options`, without resolving providers, models, or tools.
+///
+/// Returns the session file path on success (caller owns the returned slice
+/// and must `allocator.free` it). Returns null when bootstrapping would
+/// create a brand new session instead of opening one (no `--session`,
+/// `--continue`, `--resume`, or `--fork` and `--no-session` not set; or
+/// `--continue` / `--resume` requested but no recent session exists).
+///
+/// Used by lifecycle preflight callers so missing-cwd diagnostics can be
+/// surfaced BEFORE provider auth / runtime / tool construction can fail.
+pub fn resolveResumeSessionPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: RunInteractiveModeOptions,
+) !?[]const u8 {
+    if (options.no_session) return null;
+
+    if (options.fork) |session_ref| {
+        return try resolveSessionPath(allocator, io, options.session_dir, options.cwd, session_ref);
+    }
+    if (options.session) |session_ref| {
+        return try resolveSessionPath(allocator, io, options.session_dir, options.cwd, session_ref);
+    }
+    if (options.@"continue" or options.@"resume") {
+        if (try session_manager_mod.findMostRecentSession(allocator, io, options.session_dir)) |recent| {
+            // findMostRecentSession returns an allocator-owned slice; the
+            // caller of resolveResumeSessionPath assumes ownership of the
+            // returned slice via allocator.free.
+            return recent;
+        }
+    }
+    return null;
+}
+
+/// Returns an owned missing-cwd diagnostic when the session that
+/// `options` would open has a stored cwd that no longer exists. Returns
+/// null otherwise (including when no resume target is selected).
+///
+/// This is the canonical bootstrap-ordering preflight: the caller MUST
+/// invoke it before resolving the provider config or building tools so
+/// missing-cwd diagnostics always preempt provider/auth/tool failures
+/// (matches TypeScript main.ts which checks the missing-cwd issue before
+/// constructing the runtime).
+pub fn preflightInteractiveMissingCwd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: RunInteractiveModeOptions,
+) !?session_cwd.OwnedMissingSessionCwdIssue {
+    const session_path = (try resolveResumeSessionPath(allocator, io, options)) orelse return null;
+    defer allocator.free(session_path);
+    return try session_cwd.preflightMissingSessionCwd(allocator, io, session_path, options.cwd);
+}
+
 pub const InteractiveBootstrap = struct {
     allocator: std.mem.Allocator,
     current_provider: provider_config.ResolvedProviderConfig,
@@ -94,47 +148,13 @@ pub fn bootstrapInteractiveStateWithMissingCwd(
     };
 }
 
-/// Owned snapshot of a `MissingSessionCwdIssue` that survives after the
-/// session that produced it has been torn down.
-pub const OwnedMissingSessionCwdIssue = struct {
-    session_file: ?[]u8,
-    session_cwd: []u8,
-    fallback_cwd: []u8,
+/// Re-exported owned snapshot of a `MissingSessionCwdIssue`. The canonical
+/// type lives in `session_cwd.zig` so non-interactive callers (CLI, TS-RPC)
+/// can produce/consume the diagnostic without depending on interactive_mode
+/// internals.
+pub const OwnedMissingSessionCwdIssue = session_cwd.OwnedMissingSessionCwdIssue;
 
-    pub fn deinit(self: *OwnedMissingSessionCwdIssue, allocator: std.mem.Allocator) void {
-        if (self.session_file) |path| allocator.free(path);
-        allocator.free(self.session_cwd);
-        allocator.free(self.fallback_cwd);
-        self.* = undefined;
-    }
-
-    pub fn issue(self: *const OwnedMissingSessionCwdIssue) session_cwd.MissingSessionCwdIssue {
-        return .{
-            .session_file = self.session_file,
-            .session_cwd = self.session_cwd,
-            .fallback_cwd = self.fallback_cwd,
-        };
-    }
-};
-
-fn captureMissingSessionCwdIssue(
-    allocator: std.mem.Allocator,
-    issue: session_cwd.MissingSessionCwdIssue,
-) !OwnedMissingSessionCwdIssue {
-    const session_file_copy: ?[]u8 = if (issue.session_file) |path|
-        try allocator.dupe(u8, path)
-    else
-        null;
-    errdefer if (session_file_copy) |path| allocator.free(path);
-    const session_cwd_copy = try allocator.dupe(u8, issue.session_cwd);
-    errdefer allocator.free(session_cwd_copy);
-    const fallback_cwd_copy = try allocator.dupe(u8, issue.fallback_cwd);
-    return .{
-        .session_file = session_file_copy,
-        .session_cwd = session_cwd_copy,
-        .fallback_cwd = fallback_cwd_copy,
-    };
-}
+const captureMissingSessionCwdIssue = session_cwd.captureOwnedMissingSessionCwdIssue;
 
 pub fn openInitialSession(
     allocator: std.mem.Allocator,
@@ -325,10 +345,12 @@ fn openSessionAtPathCapturing(
                 // The caller (interactive mode) has already prompted the user
                 // and confirmed the fallback. Reopen with the launch cwd as an
                 // explicit override so the in-memory cwd reflects the user
-                // choice while the on-disk session header is also rewritten,
-                // matching TS `SessionManager.open(file, sessionDir, cwd)`.
+                // choice, then persist the rewritten header back to disk.
+                // This guarantees the fallback cwd is recorded ONLY after
+                // confirmation, matching TS `SessionManager.open(file,
+                // sessionDir, cwd)` behavior.
                 session.deinit();
-                return try session_mod.AgentSession.open(allocator, io, .{
+                var resumed = try session_mod.AgentSession.open(allocator, io, .{
                     .session_file = session_path,
                     .cwd_override = options.cwd,
                     .system_prompt = options.system_prompt,
@@ -339,6 +361,9 @@ fn openSessionAtPathCapturing(
                     .compaction = configuredCompactionSettings(options.runtime_config),
                     .retry = configuredRetrySettings(options.runtime_config),
                 });
+                errdefer resumed.deinit();
+                try resumed.session_manager.persistToDiskNow();
+                return resumed;
             },
         }
     }
@@ -655,6 +680,204 @@ test "openInitialSessionWithMissingCwd applies fallback cwd when the user agreed
     try std.testing.expect(captured == null);
     try std.testing.expectEqualStrings(launch_cwd, resumed.session_manager.getCwd());
     try std.testing.expectEqualStrings(launch_cwd, resumed.cwd);
+
+    // The on-disk session header must reflect the new launch cwd because the
+    // fallback cwd is persisted ONLY after user confirmation.
+    const session_file_after = resumed.session_manager.getSessionFile().?;
+    var on_disk_header = try session_manager_mod.readSessionHeader(allocator, std.testing.io, session_file_after);
+    defer session_manager_mod.freeSessionHeader(allocator, &on_disk_header);
+    try std.testing.expectEqualStrings(launch_cwd, on_disk_header.cwd);
+}
+
+test "preflightInteractiveMissingCwd reports missing stored cwd for --continue without provider/auth resolution" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "stored");
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const stored_cwd = try makeSessionBootstrapTestPath(allocator, tmp, "stored");
+    defer allocator.free(stored_cwd);
+    const launch_cwd = try makeSessionBootstrapTestPath(allocator, tmp, "launch");
+    defer allocator.free(launch_cwd);
+    const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var seed_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer seed_provider.deinit(allocator);
+    var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = stored_cwd,
+        .system_prompt = "sys",
+        .model = seed_provider.model,
+        .api_key = seed_provider.api_key,
+        .session_dir = session_dir,
+    });
+    const session_file = try allocator.dupe(u8, seed_session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    seed_session.deinit();
+    try tmp.dir.deleteTree(std.testing.io, "stored");
+
+    // Crucially the preflight options name an unsupported provider so the
+    // ordering bug would manifest as an UnknownProvider error from
+    // resolveProviderConfig if the missing-cwd guard did not preempt it.
+    const options = RunInteractiveModeOptions{
+        .cwd = launch_cwd,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "definitely-not-a-real-provider",
+        .@"continue" = true,
+    };
+
+    var captured = try preflightInteractiveMissingCwd(allocator, std.testing.io, options);
+    defer if (captured) |*value| value.deinit(allocator);
+
+    const issue = captured orelse return error.TestUnexpectedNullIssue;
+    try std.testing.expectEqualStrings(stored_cwd, issue.session_cwd);
+    try std.testing.expectEqualStrings(launch_cwd, issue.fallback_cwd);
+    try std.testing.expect(issue.session_file != null);
+    try std.testing.expectEqualStrings(session_file, issue.session_file.?);
+}
+
+test "preflightInteractiveMissingCwd returns null when stored cwd still exists" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "stored");
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const stored_cwd = try makeSessionBootstrapTestPath(allocator, tmp, "stored");
+    defer allocator.free(stored_cwd);
+    const launch_cwd = try makeSessionBootstrapTestPath(allocator, tmp, "launch");
+    defer allocator.free(launch_cwd);
+    const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var seed_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer seed_provider.deinit(allocator);
+    var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = stored_cwd,
+        .system_prompt = "sys",
+        .model = seed_provider.model,
+        .api_key = seed_provider.api_key,
+        .session_dir = session_dir,
+    });
+    seed_session.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = launch_cwd,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .@"continue" = true,
+    };
+    const captured = try preflightInteractiveMissingCwd(allocator, std.testing.io, options);
+    try std.testing.expect(captured == null);
+}
+
+test "preflightInteractiveMissingCwd returns null when no resume target is requested" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const launch_cwd = try makeSessionBootstrapTestPath(allocator, tmp, "launch");
+    defer allocator.free(launch_cwd);
+    const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    const options = RunInteractiveModeOptions{
+        .cwd = launch_cwd,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+    };
+    const captured = try preflightInteractiveMissingCwd(allocator, std.testing.io, options);
+    try std.testing.expect(captured == null);
+}
+
+test "resolveResumeSessionPath returns the most recent session for --continue" {
+    const allocator = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/sessions");
+
+    const root_dir = try makeSessionBootstrapTestPath(allocator, tmp, "workspace");
+    defer allocator.free(root_dir);
+    const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "workspace/sessions");
+    defer allocator.free(session_dir);
+
+    var seed_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    defer seed_provider.deinit(allocator);
+    var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = seed_provider.model,
+        .api_key = seed_provider.api_key,
+        .session_dir = session_dir,
+    });
+    const expected_session_file = try allocator.dupe(u8, seed_session.session_manager.getSessionFile().?);
+    defer allocator.free(expected_session_file);
+    seed_session.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .@"continue" = true,
+    };
+    const resolved = try resolveResumeSessionPath(allocator, std.testing.io, options);
+    defer if (resolved) |path| allocator.free(path);
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings(expected_session_file, resolved.?);
+}
+
+test "resolveResumeSessionPath returns null for new sessions and --no-session" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const launch_cwd = try makeSessionBootstrapTestPath(allocator, tmp, "launch");
+    defer allocator.free(launch_cwd);
+    const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    const fresh_options = RunInteractiveModeOptions{
+        .cwd = launch_cwd,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+    };
+    const fresh = try resolveResumeSessionPath(allocator, std.testing.io, fresh_options);
+    try std.testing.expect(fresh == null);
+
+    const no_session_options = RunInteractiveModeOptions{
+        .cwd = launch_cwd,
+        .system_prompt = "sys",
+        .session_dir = session_dir,
+        .provider = "faux",
+        .no_session = true,
+        .@"continue" = true,
+    };
+    const no_session = try resolveResumeSessionPath(allocator, std.testing.io, no_session_options);
+    try std.testing.expect(no_session == null);
 }
 
 fn makeSessionBootstrapTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {

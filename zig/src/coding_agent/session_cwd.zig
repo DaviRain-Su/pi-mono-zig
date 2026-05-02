@@ -14,6 +14,85 @@ pub const MissingSessionCwdIssue = struct {
     fallback_cwd: []const u8,
 };
 
+/// Owned snapshot of a `MissingSessionCwdIssue` that survives independently
+/// of any session manager / session manager bytes. Used by lifecycle
+/// preflight callers and the interactive bootstrap so the diagnostic can be
+/// surfaced after the producing context has been torn down.
+pub const OwnedMissingSessionCwdIssue = struct {
+    session_file: ?[]u8,
+    session_cwd: []u8,
+    fallback_cwd: []u8,
+
+    pub fn deinit(self: *OwnedMissingSessionCwdIssue, allocator: std.mem.Allocator) void {
+        if (self.session_file) |path| allocator.free(path);
+        allocator.free(self.session_cwd);
+        allocator.free(self.fallback_cwd);
+        self.* = undefined;
+    }
+
+    pub fn issue(self: *const OwnedMissingSessionCwdIssue) MissingSessionCwdIssue {
+        return .{
+            .session_file = self.session_file,
+            .session_cwd = self.session_cwd,
+            .fallback_cwd = self.fallback_cwd,
+        };
+    }
+};
+
+/// Captures `issue` into an owned snapshot. Caller must call
+/// `OwnedMissingSessionCwdIssue.deinit`.
+pub fn captureOwnedMissingSessionCwdIssue(
+    allocator: std.mem.Allocator,
+    issue: MissingSessionCwdIssue,
+) !OwnedMissingSessionCwdIssue {
+    const session_file_copy: ?[]u8 = if (issue.session_file) |path|
+        try allocator.dupe(u8, path)
+    else
+        null;
+    errdefer if (session_file_copy) |path| allocator.free(path);
+    const session_cwd_copy = try allocator.dupe(u8, issue.session_cwd);
+    errdefer allocator.free(session_cwd_copy);
+    const fallback_cwd_copy = try allocator.dupe(u8, issue.fallback_cwd);
+    return .{
+        .session_file = session_file_copy,
+        .session_cwd = session_cwd_copy,
+        .fallback_cwd = fallback_cwd_copy,
+    };
+}
+
+/// Reads only the JSONL header of `session_file` and returns an owned
+/// missing-cwd issue when the stored cwd does not exist on disk. Returns
+/// null if the stored cwd is empty, the stored cwd still exists, or the
+/// header cannot be parsed (callers fall through to the heavier session
+/// manager path which produces the standard error in that case).
+///
+/// Designed to run BEFORE provider/auth resolution and tool construction so
+/// missing-cwd diagnostics always preempt unrelated bootstrap failures.
+pub fn preflightMissingSessionCwd(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_file: []const u8,
+    fallback_cwd: []const u8,
+) !?OwnedMissingSessionCwdIssue {
+    var header = session_manager_mod.readSessionHeader(allocator, io, session_file) catch |err| switch (err) {
+        // Defer to the heavier session manager path for missing/corrupt files;
+        // those failures already produce deterministic diagnostics later.
+        error.FileNotFound, error.InvalidSessionFile => return null,
+        else => return err,
+    };
+    defer session_manager_mod.freeSessionHeader(allocator, &header);
+
+    if (header.cwd.len == 0) return null;
+    if (pathExists(io, header.cwd)) return null;
+
+    const issue = MissingSessionCwdIssue{
+        .session_file = session_file,
+        .session_cwd = header.cwd,
+        .fallback_cwd = fallback_cwd,
+    };
+    return try captureOwnedMissingSessionCwdIssue(allocator, issue);
+}
+
 /// Returns a `MissingSessionCwdIssue` if the session manager has a persisted
 /// session file with a stored cwd that does not exist. In every other case the
 /// caller can proceed normally.
@@ -189,6 +268,62 @@ test "formatMissingSessionCwdError omits session file when absent" {
         "Stored session working directory does not exist: /tmp/missing\nCurrent working directory: /tmp/current",
         message,
     );
+}
+
+test "preflightMissingSessionCwd returns owned issue when stored cwd is missing" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "stored");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const stored = try makeMissingCwdTestPath(allocator, tmp, "stored");
+    defer allocator.free(stored);
+    const sessions = try makeMissingCwdTestPath(allocator, tmp, "sessions");
+    defer allocator.free(sessions);
+
+    var manager = try session_manager_mod.SessionManager.create(allocator, std.testing.io, stored, sessions);
+    const session_file = try allocator.dupe(u8, manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    manager.deinit();
+
+    try tmp.dir.deleteTree(std.testing.io, "stored");
+
+    var captured = try preflightMissingSessionCwd(allocator, std.testing.io, session_file, "/private/tmp");
+    defer if (captured) |*value| value.deinit(allocator);
+    const issue = captured orelse return error.TestUnexpectedNullIssue;
+    try std.testing.expectEqualStrings(stored, issue.session_cwd);
+    try std.testing.expectEqualStrings("/private/tmp", issue.fallback_cwd);
+    try std.testing.expectEqualStrings(session_file, issue.session_file.?);
+}
+
+test "preflightMissingSessionCwd returns null when stored cwd still exists" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "stored");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const stored = try makeMissingCwdTestPath(allocator, tmp, "stored");
+    defer allocator.free(stored);
+    const sessions = try makeMissingCwdTestPath(allocator, tmp, "sessions");
+    defer allocator.free(sessions);
+
+    var manager = try session_manager_mod.SessionManager.create(allocator, std.testing.io, stored, sessions);
+    const session_file = try allocator.dupe(u8, manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    manager.deinit();
+
+    const captured = try preflightMissingSessionCwd(allocator, std.testing.io, session_file, "/private/tmp");
+    try std.testing.expect(captured == null);
+}
+
+test "preflightMissingSessionCwd returns null when session file does not exist" {
+    const allocator = std.testing.allocator;
+    const captured = try preflightMissingSessionCwd(allocator, std.testing.io, "/tmp/missing-session-file.jsonl", "/private/tmp");
+    try std.testing.expect(captured == null);
 }
 
 test "formatMissingSessionCwdPrompt mirrors the TypeScript continue/cancel prompt body" {
