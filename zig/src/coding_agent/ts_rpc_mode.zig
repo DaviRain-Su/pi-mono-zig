@@ -6,6 +6,7 @@ const common = @import("tools/common.zig");
 const truncate = @import("tools/truncate.zig");
 const session_mod = @import("session.zig");
 const session_advanced = @import("session_advanced.zig");
+const session_cwd_mod = @import("session_cwd.zig");
 const session_manager_mod = @import("session_manager.zig");
 const extension_host_mod = @import("extension_host.zig");
 
@@ -352,8 +353,15 @@ const TsRpcSessionHost = struct {
         );
         errdefer manager.deinit();
 
+        // Atomically reject the switch when the stored cwd no longer exists
+        // before tearing down the current runtime. This matches TS
+        // `RuntimeHost.switchSession` which throws `MissingSessionCwdError`
+        // before mutating active session state.
+        if (session_cwd_mod.getMissingSessionCwdIssue(self.server.io, manager, old.cwd) != null) {
+            return error.MissingSessionCwd;
+        }
+
         try self.replaceWithManager(manager, manager.getCwd());
-        _ = old;
         return .{ .cancelled = false };
     }
 
@@ -4504,6 +4512,7 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "project-cwd");
 
     const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
         ".zig-cache",
@@ -4512,14 +4521,23 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
         "ts-rpc-session-host",
     });
     defer allocator.free(relative_dir);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "project-cwd",
+    });
+    defer allocator.free(project_relative);
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(cwd);
     const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, relative_dir });
     defer allocator.free(session_dir);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ cwd, project_relative });
+    defer allocator.free(project_cwd);
 
     const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
-        .cwd = "/tmp/ts-rpc-host",
+        .cwd = project_cwd,
         .system_prompt = "system",
         .model = model,
         .session_dir = session_dir,
@@ -4645,6 +4663,91 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
     defer allocator.free(expected_clone_state);
     try expectNewOutput(&stdout_capture.writer, &cursor, expected_clone_state);
     try expectContains(clone_state, "\"sessionName\":\"rebound name\"");
+}
+
+test "TS RPC switch_session rejects target with missing stored cwd before tearing down current runtime" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "live-cwd");
+    try tmp.dir.createDirPath(std.testing.io, "soon-deleted-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const live_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "live-cwd",
+    });
+    defer allocator.free(live_relative);
+    const live_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, live_relative });
+    defer allocator.free(live_cwd);
+    const stale_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "soon-deleted-cwd",
+    });
+    defer allocator.free(stale_relative);
+    const stale_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, stale_relative });
+    defer allocator.free(stale_cwd);
+
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+
+    // The "stale" session file is created against an existing cwd which is
+    // then deleted, so its stored cwd will fail the missing-cwd guard.
+    var stale_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = stale_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    const stale_session_file = try allocator.dupe(u8, stale_session.session_manager.getSessionFile().?);
+    defer allocator.free(stale_session_file);
+    stale_session.deinit();
+    try tmp.dir.deleteTree(std.testing.io, "soon-deleted-cwd");
+
+    // The "active" session has a valid cwd and remains the current session.
+    var active_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = live_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer active_session.deinit();
+    const active_session_id = try allocator.dupe(u8, active_session.session_manager.getSessionId());
+    defer allocator.free(active_session_id);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &active_session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"switch_stale\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{stale_session_file},
+    );
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"switch_stale\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":false,\"error\":\"MissingSessionCwd\"}\n",
+    );
+
+    // The active session must remain the current session and its cwd must be
+    // unchanged after the rejected switch.
+    try std.testing.expectEqualStrings(active_session_id, active_session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(live_cwd, active_session.cwd);
+    try std.testing.expectEqualStrings(live_cwd, active_session.session_manager.getCwd());
 }
 
 test "TS RPC M2 queue_update is emitted before response and prompt.streamingBehavior queues while streaming" {

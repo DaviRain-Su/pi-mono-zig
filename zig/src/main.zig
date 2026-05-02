@@ -187,7 +187,9 @@ fn runCliWithInput(
         var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, &app_context, selected_tools);
         defer built_tools.deinit();
 
-        var session = try coding_agent.interactive_mode.openInitialSession(
+        var missing_cwd_issue: ?coding_agent.interactive_mode.OwnedMissingSessionCwdIssue = null;
+        defer if (missing_cwd_issue) |*captured| captured.deinit(allocator);
+        var session = coding_agent.interactive_mode.openInitialSessionWithMissingCwd(
             allocator,
             io,
             prepared.session_dir,
@@ -212,11 +214,28 @@ fn runCliWithInput(
                 .keybindings = &prepared.runtime_config.keybindings,
                 .theme = prepared.resource_bundle.selectedTheme(),
                 .runtime_config = &prepared.runtime_config,
+                // Non-interactive flows must never silently fall back to the
+                // launch cwd when the stored session cwd no longer exists.
+                .missing_cwd_mode = .fail,
             },
             provider_runtime.model,
             provider_runtime.api_key,
             built_tools.items,
-        );
+            &missing_cwd_issue,
+        ) catch |err| switch (err) {
+            error.MissingSessionCwd => {
+                if (missing_cwd_issue) |captured| {
+                    const message = try coding_agent.formatMissingSessionCwdError(allocator, captured.issue());
+                    defer allocator.free(message);
+                    try stderr.print("Error: {s}\n", .{message});
+                } else {
+                    try stderr.writeAll("Error: stored session working directory does not exist\n");
+                }
+                try stderr.flush();
+                return 1;
+            },
+            else => return err,
+        };
         defer session.deinit();
 
         if (app_mode == .rpc) {
