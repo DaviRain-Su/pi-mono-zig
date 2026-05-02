@@ -4750,6 +4750,595 @@ test "TS RPC switch_session rejects target with missing stored cwd before tearin
     try std.testing.expectEqualStrings(live_cwd, active_session.session_manager.getCwd());
 }
 
+// VAL-M10-SESSION-003: Resuming an existing session uses the stored session
+// cwd rather than the process launch cwd whenever the stored cwd is valid.
+test "VAL-M10-SESSION-003 switch_session adopts stored session cwd over launch cwd" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "stored-cwd");
+    try tmp.dir.createDirPath(std.testing.io, "launch-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const stored_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "stored-cwd",
+    });
+    defer allocator.free(stored_relative);
+    const stored_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, stored_relative });
+    defer allocator.free(stored_cwd);
+    const launch_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "launch-cwd",
+    });
+    defer allocator.free(launch_relative);
+    const launch_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, launch_relative });
+    defer allocator.free(launch_cwd);
+
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+
+    // Stored session is created with stored_cwd; this becomes the persisted
+    // header cwd and must win over launch_cwd when we switch back to it.
+    var stored_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = stored_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    const stored_session_file = try allocator.dupe(u8, stored_session.session_manager.getSessionFile().?);
+    defer allocator.free(stored_session_file);
+    const stored_session_id = try allocator.dupe(u8, stored_session.session_manager.getSessionId());
+    defer allocator.free(stored_session_id);
+    stored_session.deinit();
+
+    // The "active" session simulates the running process whose launch cwd is
+    // a different existing directory.
+    var active_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = launch_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer active_session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &active_session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"switch\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{stored_session_file},
+    );
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"switch\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n",
+    );
+
+    // Stored cwd wins over the prior launch cwd, and the resumed session
+    // identity is preserved on disk through the switch.
+    try std.testing.expectEqualStrings(stored_session_id, active_session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(stored_cwd, active_session.cwd);
+    try std.testing.expectEqualStrings(stored_cwd, active_session.session_manager.getCwd());
+    try std.testing.expect(!std.mem.eql(u8, launch_cwd, active_session.cwd));
+}
+
+// VAL-M10-SESSION-004 / VAL-M10-SESSION-007: Forking a session preserves the
+// parent session metadata, branch ancestry, and cwd identity without
+// mutating the parent session file.
+test "VAL-M10-SESSION-004 fork preserves parent metadata and parent file is unchanged" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "fork-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "fork-cwd",
+    });
+    defer allocator.free(project_relative);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, project_relative });
+    defer allocator.free(project_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_a = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_a[0] = .{ .text = .{ .text = "root prompt" } };
+    const assistant_a = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_a[0] = .{ .text = .{ .text = "root answer" } };
+    const user_b = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_b[0] = .{ .text = .{ .text = "fork target prompt" } };
+
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = user_a, .timestamp = 21 } });
+    _ = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_a,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 22,
+    } });
+    const fork_target_id = try session.session_manager.appendMessage(.{ .user = .{ .content = user_b, .timestamp = 23 } });
+    const fork_target_id_owned = try allocator.dupe(u8, fork_target_id);
+    defer allocator.free(fork_target_id_owned);
+    try session.navigateTo(fork_target_id);
+
+    const parent_session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(parent_session_file);
+    const parent_session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(parent_session_id);
+    const parent_bytes_before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, parent_session_file, allocator, .unlimited);
+    defer allocator.free(parent_bytes_before);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    const fork_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"fork\",\"type\":\"fork\",\"entryId\":\"{s}\"}}",
+        .{fork_target_id_owned},
+    );
+    defer allocator.free(fork_command);
+    try server.handleLine(fork_command);
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"fork\",\"type\":\"response\",\"command\":\"fork\",\"success\":true,\"data\":{\"text\":\"fork target prompt\",\"cancelled\":false}}\n",
+    );
+
+    // The forked session is a new, distinct session that retains the parent
+    // cwd and records the parent session file in its persisted header.
+    const fork_session_file = session.session_manager.getSessionFile().?;
+    try std.testing.expect(!std.mem.eql(u8, parent_session_file, fork_session_file));
+    try std.testing.expect(!std.mem.eql(u8, parent_session_id, session.session_manager.getSessionId()));
+    try std.testing.expectEqualStrings(project_cwd, session.cwd);
+    try std.testing.expectEqualStrings(project_cwd, session.session_manager.getCwd());
+
+    const fork_parent = session.session_manager.getHeader().parent_session orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings(parent_session_file, fork_parent);
+
+    // Parent session file on disk is preserved byte-for-byte.
+    const parent_bytes_after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, parent_session_file, allocator, .unlimited);
+    defer allocator.free(parent_bytes_after);
+    try std.testing.expectEqualStrings(parent_bytes_before, parent_bytes_after);
+}
+
+// VAL-M10-SESSION-006: Creating a new session clears prior transient session
+// state, message history, and exposes a fresh session id; old session file is
+// preserved and can be switched back to.
+test "VAL-M10-SESSION-006 new_session clears prior transient state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "new-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "new-cwd",
+    });
+    defer allocator.free(project_relative);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, project_relative });
+    defer allocator.free(project_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = "old prompt" } };
+    const assistant_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_content[0] = .{ .text = .{ .text = "old answer" } };
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = user_content, .timestamp = 31 } });
+    const old_assistant_id = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_content,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 32,
+    } });
+    try session.navigateTo(old_assistant_id);
+    try std.testing.expect(session.agent.getMessages().len > 0);
+
+    const old_session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(old_session_id);
+    const old_session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(old_session_file);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    try server.handleLine("{\"id\":\"new\",\"type\":\"new_session\",\"parentSession\":\"prior.jsonl\"}");
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"new\",\"type\":\"response\",\"command\":\"new_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n",
+    );
+
+    // New session is fresh: distinct id, no messages, distinct file path,
+    // cwd stays anchored to the active runtime cwd.
+    try std.testing.expect(!std.mem.eql(u8, old_session_id, session.session_manager.getSessionId()));
+    try std.testing.expect(!std.mem.eql(u8, old_session_file, session.session_manager.getSessionFile().?));
+    try std.testing.expectEqual(@as(usize, 0), session.agent.getMessages().len);
+    try std.testing.expectEqual(@as(usize, 0), session.session_manager.getEntries().len);
+    try std.testing.expectEqualStrings(project_cwd, session.cwd);
+    try std.testing.expectEqualStrings(project_cwd, session.session_manager.getCwd());
+    try std.testing.expectEqual(@as(?[]const u8, null), session.session_manager.getLeafId());
+
+    // Persisted parentSession is recorded in the new session header.
+    const parent = session.session_manager.getHeader().parent_session orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings("prior.jsonl", parent);
+
+    // The prior session file is preserved on disk (we can switch back to it
+    // and observe the original messages).
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"back\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{old_session_file},
+    );
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"back\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n",
+    );
+    try std.testing.expectEqualStrings(old_session_id, session.session_manager.getSessionId());
+    try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
+}
+
+// VAL-M10-SESSION-008: Reloading an active session preserves the selected
+// session id, branch identity, stored cwd, and visible message list when the
+// underlying files are unchanged.
+test "VAL-M10-SESSION-008 reload preserves session identity and messages" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "reload-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "reload-cwd",
+    });
+    defer allocator.free(project_relative);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, project_relative });
+    defer allocator.free(project_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = "reload prompt" } };
+    const assistant_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_content[0] = .{ .text = .{ .text = "reload answer" } };
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = user_content, .timestamp = 41 } });
+    const reload_assistant_id = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_content,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 42,
+    } });
+    try session.navigateTo(reload_assistant_id);
+
+    const session_file_before = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file_before);
+    const session_id_before = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(session_id_before);
+    const leaf_before = try allocator.dupe(u8, session.session_manager.getLeafId().?);
+    defer allocator.free(leaf_before);
+    const message_count_before = session.agent.getMessages().len;
+    const session_bytes_before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file_before, allocator, .unlimited);
+    defer allocator.free(session_bytes_before);
+
+    // Reload from disk via navigateTo (which delegates to reloadFromSession):
+    // identity, cwd, leaf, and messages are preserved when underlying files
+    // are unchanged.
+    try session.navigateTo(leaf_before);
+
+    try std.testing.expectEqualStrings(session_id_before, session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(session_file_before, session.session_manager.getSessionFile().?);
+    try std.testing.expectEqualStrings(leaf_before, session.session_manager.getLeafId().?);
+    try std.testing.expectEqualStrings(project_cwd, session.cwd);
+    try std.testing.expectEqualStrings(project_cwd, session.session_manager.getCwd());
+    try std.testing.expectEqual(message_count_before, session.agent.getMessages().len);
+
+    const session_bytes_after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file_before, allocator, .unlimited);
+    defer allocator.free(session_bytes_after);
+    try std.testing.expectEqualStrings(session_bytes_before, session_bytes_after);
+}
+
+// VAL-M10-SESSION-009: Disconnecting and reconnecting the client to an
+// existing TS-RPC runtime preserves active session identity, cwd, and
+// messages rather than implicitly creating a new session.
+test "VAL-M10-SESSION-009 reconnect to existing runtime preserves session state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "reconnect-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "reconnect-cwd",
+    });
+    defer allocator.free(project_relative);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, project_relative });
+    defer allocator.free(project_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = "reconnect prompt" } };
+    const assistant_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_content[0] = .{ .text = .{ .text = "reconnect answer" } };
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = user_content, .timestamp = 51 } });
+    const assistant_id = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_content,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 52,
+    } });
+    try session.navigateTo(assistant_id);
+
+    const session_id_before = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(session_id_before);
+    const session_file_before = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file_before);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    // First client "connects" to the runtime, queries state, then finishes.
+    {
+        var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+        try server.start();
+        try server.handleLine("{\"id\":\"first\",\"type\":\"get_state\"}");
+        const first_state = try server.buildStateJson(&session);
+        defer allocator.free(first_state);
+        try expectContains(stdout_capture.writer.buffered(), session_id_before);
+        try expectContains(stdout_capture.writer.buffered(), first_state);
+        try server.finish();
+    }
+
+    // The runtime/session stays alive across client disconnects: identity,
+    // cwd, and messages are not reset by a finished server connection.
+    try std.testing.expectEqualStrings(session_id_before, session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(session_file_before, session.session_manager.getSessionFile().?);
+    try std.testing.expectEqualStrings(project_cwd, session.cwd);
+    try std.testing.expectEqualStrings(project_cwd, session.session_manager.getCwd());
+    try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
+
+    // Second client "reconnects", retrieves state again, and observes the
+    // exact same identity and message count.
+    var stdout_capture_two: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture_two.deinit();
+    var stderr_capture_two: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture_two.deinit();
+    var server2 = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture_two.writer, &stderr_capture_two.writer);
+    try server2.start();
+    defer server2.finish() catch {};
+    try server2.handleLine("{\"id\":\"second\",\"type\":\"get_state\"}");
+    try server2.handleLine("{\"id\":\"msgs\",\"type\":\"get_messages\"}");
+    try expectContains(stdout_capture_two.writer.buffered(), session_id_before);
+    try expectContains(stdout_capture_two.writer.buffered(), "\"messageCount\":2");
+    try expectContains(stdout_capture_two.writer.buffered(), "\"command\":\"get_messages\",\"success\":true");
+
+    try std.testing.expectEqualStrings(session_id_before, session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(project_cwd, session.cwd);
+}
+
+// VAL-M10-SESSION-010 / subscription isolation: A failed switch_session
+// (rejected by the missing-cwd guard) leaves the active session file
+// byte-identical, leaves the active subscriber attached for new events, and
+// leaves the prior session file undisturbed.
+test "VAL-M10-SESSION-010 failed switch leaves session files byte-identical and subscriber intact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "live-cwd");
+    try tmp.dir.createDirPath(std.testing.io, "soon-deleted-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const live_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "live-cwd",
+    });
+    defer allocator.free(live_relative);
+    const live_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, live_relative });
+    defer allocator.free(live_cwd);
+    const stale_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "soon-deleted-cwd",
+    });
+    defer allocator.free(stale_relative);
+    const stale_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, stale_relative });
+    defer allocator.free(stale_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+
+    var stale_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = stale_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    const stale_session_file = try allocator.dupe(u8, stale_session.session_manager.getSessionFile().?);
+    defer allocator.free(stale_session_file);
+    stale_session.deinit();
+    const stale_bytes_before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, stale_session_file, allocator, .unlimited);
+    defer allocator.free(stale_bytes_before);
+    try tmp.dir.deleteTree(std.testing.io, "soon-deleted-cwd");
+
+    var active_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = live_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer active_session.deinit();
+    const active_session_file = try allocator.dupe(u8, active_session.session_manager.getSessionFile().?);
+    defer allocator.free(active_session_file);
+    const active_session_id = try allocator.dupe(u8, active_session.session_manager.getSessionId());
+    defer allocator.free(active_session_id);
+    const active_bytes_before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, active_session_file, allocator, .unlimited);
+    defer allocator.free(active_bytes_before);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &active_session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"switch_stale\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{stale_session_file},
+    );
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"switch_stale\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":false,\"error\":\"MissingSessionCwd\"}\n",
+    );
+
+    // Active session identity, cwd, and on-disk bytes are unchanged.
+    try std.testing.expectEqualStrings(active_session_id, active_session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(live_cwd, active_session.cwd);
+    const active_bytes_after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, active_session_file, allocator, .unlimited);
+    defer allocator.free(active_bytes_after);
+    try std.testing.expectEqualStrings(active_bytes_before, active_bytes_after);
+
+    // The would-be target session file is also untouched on disk.
+    const stale_bytes_after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, stale_session_file, allocator, .unlimited);
+    defer allocator.free(stale_bytes_after);
+    try std.testing.expectEqualStrings(stale_bytes_before, stale_bytes_after);
+
+    // Subscription isolation: the active session subscriber is still attached
+    // and routes new events to the existing client. Setting the session name
+    // emits a `session_info_changed` event followed by a successful response.
+    try server.handleLine("{\"id\":\"name\",\"type\":\"set_session_name\",\"name\":\"after-failed-switch\"}");
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"type\":\"session_info_changed\",\"name\":\"after-failed-switch\"}\n{\"id\":\"name\",\"type\":\"response\",\"command\":\"set_session_name\",\"success\":true}\n",
+    );
+}
+
 test "TS RPC M2 queue_update is emitted before response and prompt.streamingBehavior queues while streaming" {
     const allocator = std.testing.allocator;
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
