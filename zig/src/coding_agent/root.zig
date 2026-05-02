@@ -10,6 +10,7 @@ pub const print_mode = @import("print_mode.zig");
 pub const rpc_mode = @import("rpc_mode.zig");
 pub const ts_rpc_mode = @import("ts_rpc_mode.zig");
 pub const extension_host = @import("extension_host.zig");
+pub const extension_flags = @import("extension_flags.zig");
 pub const provider_config = @import("provider_config.zig");
 pub const interactive_mode = @import("interactive_mode.zig");
 
@@ -68,6 +69,7 @@ test {
     _ = @import("rpc_mode.zig");
     _ = @import("ts_rpc_mode.zig");
     _ = @import("extension_host.zig");
+    _ = @import("extension_flags.zig");
     _ = @import("ts_rpc_fixture_tests.zig");
     _ = @import("provider_config.zig");
     _ = @import("interactive_mode.zig");

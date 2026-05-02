@@ -10,6 +10,7 @@ const coding_agent = @import("coding_agent/root.zig");
 const config_mod = @import("coding_agent/config.zig");
 const json_event_wire = @import("coding_agent/json_event_wire.zig");
 const extension_host_mod = @import("coding_agent/extension_host.zig");
+const extension_flags_mod = @import("coding_agent/extension_flags.zig");
 
 const VERSION = "0.1.0";
 
@@ -74,14 +75,75 @@ fn runCliWithInput(
     };
     defer options.deinit(allocator);
 
+    // Build the extension flag registry from local Bun-fixture manifest
+    // sidecars next to each `--extension <path>` entry. This is the
+    // deterministic compatibility hook for M11 extension CLI flag
+    // passthrough; live Bun JSONL flag registration is handled by the
+    // sibling registration-surfaces feature.
+    var extension_flag_registry = extension_flags_mod.Registry.init(allocator);
+    defer extension_flag_registry.deinit();
+    if (options.extensions) |paths| {
+        try extension_flags_mod.loadFromExtensionPaths(&extension_flag_registry, io, paths);
+    }
+
     if (options.help) {
-        try output.printUsage(allocator, VERSION, stdout);
+        const ext_flags_snapshot = try extension_flag_registry.snapshotForHelp(allocator);
+        defer allocator.free(ext_flags_snapshot);
+        const help_flags = try allocator.alloc(cli.ExtensionFlagInfo, ext_flags_snapshot.len);
+        defer allocator.free(help_flags);
+        for (ext_flags_snapshot, 0..) |flag, idx| {
+            help_flags[idx] = .{
+                .name = flag.name,
+                .description = flag.description,
+                .type_kind = switch (flag.type_kind) {
+                    .boolean => .boolean,
+                    .string => .string,
+                },
+                .extension_path = flag.extension_path,
+            };
+        }
+        try output.printUsageWithExtensions(allocator, VERSION, help_flags, stdout);
         return 0;
     }
 
     if (options.version) {
         try output.printVersion(allocator, VERSION, stdout);
         return 0;
+    }
+
+    // Validate any unknown long flags against the extension flag
+    // registry. Unregistered flags are surfaced as TS-compatible
+    // `Unknown option(s):` diagnostics; registered flags are accepted
+    // (and currently observable through the registry by the sibling
+    // M11 registration-surfaces feature).
+    if (options.unknown_flags) |unknown_flags| {
+        const parsed = try allocator.alloc(extension_flags_mod.ParsedUnknownFlag, unknown_flags.len);
+        defer allocator.free(parsed);
+        for (unknown_flags, 0..) |raw, idx| {
+            parsed[idx] = .{
+                .name = raw.name,
+                .value = switch (raw.value) {
+                    .boolean => |b| .{ .boolean = b },
+                    .string => |s| .{ .string = s },
+                },
+            };
+        }
+
+        var apply_result = try extension_flags_mod.applyUnknownFlags(
+            allocator,
+            &extension_flag_registry,
+            parsed,
+        );
+        defer apply_result.deinit(allocator);
+
+        if (apply_result.diagnostics.len > 0) {
+            var saw_error = false;
+            for (apply_result.diagnostics) |diagnostic| {
+                if (diagnostic.severity == .@"error") saw_error = true;
+                try stderr.print("Error: {s}\n", .{diagnostic.message});
+            }
+            if (saw_error) return 1;
+        }
     }
 
     var effective_env_map = try prepareEffectiveEnvMap(allocator, env_map, &options);
@@ -1379,6 +1441,98 @@ test "runCli rejects conflicting fork flags" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
     try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "--fork cannot be combined") != null);
+}
+
+test "runCli rejects unregistered unknown long flag with sanitized diagnostic" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--bogus-flag", "--print", "hello" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "Unknown option: --bogus-flag") != null);
+}
+
+test "runCli accepts registered extension boolean and string flags from local Bun fixture" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "ext-flags ok");
+
+    const fixture_path = try makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
+    defer allocator.free(fixture_path);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{
+            "--extension",  fixture_path,
+            "--no-session", "--provider",
+            "faux",         "--print",
+            "--plan",       "--model-alias",
+            "claude-haiku", "hello",
+        },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("ext-flags ok\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli help with --extension lists fixture extension flags" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const fixture_path = try makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
+    defer allocator.free(fixture_path);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--extension", fixture_path, "--help" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    const help_text = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "Extension CLI Flags:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "Enable plan mode (fixture flag)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--model-alias <value>") != null);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
 test "cli executable continue resumes the latest session while preserving older sessions" {
