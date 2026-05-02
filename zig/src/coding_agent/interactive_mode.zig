@@ -3411,13 +3411,13 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
     const allocator = std.testing.allocator;
 
     const ReaderStub = struct {
-        fn read(_: ?*anyopaque, alloc: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map) !?clipboard_image.ClipboardImage {
+        fn read(_: ?*anyopaque, alloc: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map) !clipboard_image.ClipboardImageResult {
             _ = io;
             _ = env_map;
-            return .{
+            return .{ .image = .{
                 .bytes = try alloc.dupe(u8, &[_]u8{ 0x01, 0x02, 0x03 }),
                 .mime_type = try alloc.dupe(u8, "image/png"),
-            };
+            } };
         }
     };
 
