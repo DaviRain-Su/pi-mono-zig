@@ -7,7 +7,7 @@ import {
 	type ThinkingConfig,
 	ThinkingLevel,
 } from "@google/genai";
-import { calculateCost } from "../models.js";
+import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	Api,
 	AssistantMessage,
@@ -33,7 +33,7 @@ import {
 	mapToolChoice,
 	retainThoughtSignature,
 } from "./google-shared.js";
-import { buildBaseOptions, clampReasoning } from "./simple-options.js";
+import { buildBaseOptions } from "./simple-options.js";
 
 export interface GoogleVertexOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "any";
@@ -305,7 +305,8 @@ export const streamSimpleGoogleVertex: StreamFunction<"google-vertex", SimpleStr
 		} satisfies GoogleVertexOptions);
 	}
 
-	const effort = clampReasoning(options.reasoning)!;
+	const clampedReasoning = clampThinkingLevel(model, options.reasoning);
+	const effort = (clampedReasoning === "off" ? "high" : clampedReasoning) as ClampedThinkingLevel;
 	const geminiModel = model as unknown as Model<"google-generative-ai">;
 
 	if (isGemini3ProModel(geminiModel) || isGemini3FlashModel(geminiModel)) {

@@ -524,11 +524,12 @@ function supportsAdaptiveThinking(modelId: string, modelName?: string): boolean 
 }
 
 function mapThinkingLevelToEffort(
+	model: Model<"bedrock-converse-stream">,
 	level: SimpleStreamOptions["reasoning"],
-	modelId: string,
-	modelName?: string,
 ): "low" | "medium" | "high" | "xhigh" | "max" {
-	const candidates = getModelMatchCandidates(modelId, modelName);
+	const mapped = level ? model.thinkingLevelMap?.[level] : undefined;
+	if (typeof mapped === "string") return mapped as "low" | "medium" | "high" | "xhigh" | "max";
+
 	switch (level) {
 		case "minimal":
 		case "low":
@@ -536,14 +537,6 @@ function mapThinkingLevelToEffort(
 		case "medium":
 			return "medium";
 		case "high":
-			return "high";
-		case "xhigh":
-			if (candidates.some((s) => s.includes("opus-4-6"))) {
-				return "max";
-			}
-			if (candidates.some((s) => s.includes("opus-4-7"))) {
-				return "xhigh";
-			}
 			return "high";
 		default:
 			return "high";
@@ -921,7 +914,7 @@ function buildAdditionalModelRequestFields(
 		const result: Record<string, any> = supportsAdaptiveThinking(model.id, model.name)
 			? {
 					thinking: { type: "adaptive", ...(display !== undefined ? { display } : {}) },
-					output_config: { effort: mapThinkingLevelToEffort(options.reasoning, model.id, model.name) },
+					output_config: { effort: mapThinkingLevelToEffort(model, options.reasoning) },
 				}
 			: (() => {
 					const defaultBudgets: Record<ThinkingLevel, number> = {

@@ -201,28 +201,29 @@ The `api` field determines which streaming implementation is used:
 | `google-vertex` | Google Vertex AI API |
 | `bedrock-converse-stream` | Amazon Bedrock Converse API |
 
-Most OpenAI-compatible providers work with `openai-completions`. Use `compat` for quirks:
+Most OpenAI-compatible providers work with `openai-completions`. Use model-level `thinkingLevelMap` for model-specific thinking levels, and `compat` for provider quirks:
 
 ```typescript
 models: [{
   id: "custom-model",
   // ...
+  reasoning: true,
+  thinkingLevelMap: {              // map pi levels to provider values; null hides unsupported levels
+    minimal: null,
+    low: null,
+    medium: null,
+    high: "default",
+    xhigh: "max"
+  },
   compat: {
-    supportsDeveloperRole: false,      // use "system" instead of "developer"
+    supportsDeveloperRole: false,   // use "system" instead of "developer"
     supportsReasoningEffort: true,
-    reasoningEffortMap: {              // map pi-ai levels to provider values
-      minimal: "default",
-      low: "default",
-      medium: "default",
-      high: "default",
-      xhigh: "default"
-    },
-      maxTokensField: "max_tokens",      // instead of "max_completion_tokens"
-      requiresToolResultName: true,      // tool results need name field
-      thinkingFormat: "qwen",           // top-level enable_thinking: true
-      cacheControlFormat: "anthropic"   // Anthropic-style cache_control markers
-    }
-  }]
+    maxTokensField: "max_tokens",   // instead of "max_completion_tokens"
+    requiresToolResultName: true,   // tool results need name field
+    thinkingFormat: "qwen",        // top-level enable_thinking: true
+    cacheControlFormat: "anthropic" // Anthropic-style cache_control markers
+  }
+}]
 ```
 
 Use `qwen-chat-template` instead for local Qwen-compatible servers that read `chat_template_kwargs.enable_thinking`.
@@ -595,8 +596,14 @@ interface ProviderModelConfig {
   /** API type override for this specific model. */
   api?: Api;
 
+  /** API endpoint URL override for this specific model. */
+  baseUrl?: string;
+
   /** Whether the model supports extended thinking. */
   reasoning: boolean;
+
+  /** Maps pi thinking levels to provider/model-specific values; null marks a level unsupported. */
+  thinkingLevelMap?: Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>>;
 
   /** Supported input types. */
   input: ("text" | "image")[];
@@ -623,7 +630,6 @@ interface ProviderModelConfig {
     supportsStore?: boolean;
     supportsDeveloperRole?: boolean;
     supportsReasoningEffort?: boolean;
-    reasoningEffortMap?: Partial<Record<"minimal" | "low" | "medium" | "high" | "xhigh", string>>;
     supportsUsageInStreaming?: boolean;
     maxTokensField?: "max_completion_tokens" | "max_tokens";
     requiresToolResultName?: boolean;

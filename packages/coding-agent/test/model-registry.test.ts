@@ -396,7 +396,7 @@ describe("ModelRegistry", () => {
 			}
 		});
 
-		test("compat schema accepts reasoningEffortMap, supportsStrictMode, and cacheControlFormat", () => {
+		test("model schema accepts thinkingLevelMap and compat schema accepts supportsStrictMode and cacheControlFormat", () => {
 			writeRawModelsJson({
 				demo: {
 					baseUrl: "https://example.com/v1",
@@ -410,11 +410,11 @@ describe("ModelRegistry", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 							contextWindow: 1000,
 							maxTokens: 100,
+							thinkingLevelMap: {
+								minimal: null,
+								high: "max",
+							},
 							compat: {
-								reasoningEffortMap: {
-									minimal: "default",
-									high: "max",
-								},
 								supportsStrictMode: false,
 								cacheControlFormat: "anthropic",
 							},
@@ -424,10 +424,11 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-			const compat = registry.find("demo", "demo-model")?.compat as OpenAICompletionsCompat | undefined;
+			const model = registry.find("demo", "demo-model");
+			const compat = model?.compat as OpenAICompletionsCompat | undefined;
 
 			expect(registry.getError()).toBeUndefined();
-			expect(compat?.reasoningEffortMap).toEqual({ minimal: "default", high: "max" });
+			expect(model?.thinkingLevelMap).toEqual({ minimal: null, high: "max" });
 			expect(compat?.supportsStrictMode).toBe(false);
 			expect(compat?.cacheControlFormat).toBe("anthropic");
 		});

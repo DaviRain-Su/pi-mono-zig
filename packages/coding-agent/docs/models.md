@@ -192,6 +192,7 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 | `name` | No | `id` | Human-readable model label. Used for matching (`--model` patterns) and shown in model details/status text. |
 | `api` | No | provider's `api` | Override provider's API for this model |
 | `reasoning` | No | `false` | Supports extended thinking |
+| `thinkingLevelMap` | No | omitted | Maps pi thinking levels to provider values and marks unsupported levels (see below) |
 | `input` | No | `["text"]` | Input types: `["text"]` or `["text", "image"]` |
 | `contextWindow` | No | `128000` | Context window size in tokens |
 | `maxTokens` | No | `16384` | Maximum output tokens |
@@ -201,6 +202,48 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 Current behavior:
 - `/model` and `--list-models` list entries by model `id`.
 - The configured `name` is used for model matching and detail/status text.
+
+### Thinking Level Map
+
+Use `thinkingLevelMap` on a model to describe model-specific thinking controls. Keys are pi thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+
+Values are tristate:
+
+| Value | Meaning |
+|-------|---------|
+| omitted | Level is supported and uses the provider's default mapping |
+| string | Level is supported and this value is sent to the provider |
+| `null` | Level is unsupported and hidden/skipped/clamped away |
+
+Example for a model that only supports off, high, and max reasoning:
+
+```json
+{
+  "id": "deepseek-v4-pro",
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "minimal": null,
+    "low": null,
+    "medium": null,
+    "high": "high",
+    "xhigh": "max"
+  }
+}
+```
+
+Example for a model where thinking cannot be disabled:
+
+```json
+{
+  "id": "always-thinking-model",
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "off": null
+  }
+}
+```
+
+Migration: older configs that used `compat.reasoningEffortMap` should move that mapping to model-level `thinkingLevelMap`. Use `null` for levels that should not appear in the UI.
 
 ## Overriding Built-in Providers
 
@@ -332,7 +375,6 @@ For providers with partial OpenAI compatibility, use the `compat` field.
 | `supportsStore` | Provider supports `store` field |
 | `supportsDeveloperRole` | Use `developer` vs `system` role |
 | `supportsReasoningEffort` | Support for `reasoning_effort` parameter |
-| `reasoningEffortMap` | Map pi thinking levels to provider-specific `reasoning_effort` values |
 | `supportsUsageInStreaming` | Supports `stream_options: { include_usage: true }` (default: `true`) |
 | `maxTokensField` | Use `max_completion_tokens` or `max_tokens` |
 | `requiresToolResultName` | Include `name` on tool result messages |
