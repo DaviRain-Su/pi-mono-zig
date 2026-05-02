@@ -122,6 +122,32 @@ launch_pi_with_missing_cwd() {
   tuistory -s "$SESSION" wait-idle --timeout 8000
 }
 
+# Variant that resolves the session directory from PI_CODING_AGENT_SESSION_DIR
+# instead of `--session-dir`. Used to prove the missing-cwd preflight selects
+# the same session directory the runtime would later open via
+# `RuntimeConfig.effectiveSessionDir`.
+launch_pi_with_missing_cwd_env_session_dir() {
+  local case_dir="$1"
+  shift
+  local launch_dir="$case_dir/launch"
+  local home_dir="$case_dir/home"
+  local agent_dir="$case_dir/agent"
+  local sessions_dir="$case_dir/sessions"
+
+  tuistory -s "$SESSION" close >/dev/null 2>&1 || true
+  tuistory launch "$BIN_PATH --provider faux --continue" \
+    -s "$SESSION" \
+    --cwd "$launch_dir" \
+    --cols 100 \
+    --rows 24 \
+    --env "HOME=$home_dir" \
+    --env "PI_CODING_AGENT_DIR=$agent_dir" \
+    --env "PI_CODING_AGENT_SESSION_DIR=$sessions_dir" \
+    --env "PI_FAUX_RESPONSE=ok" \
+    "$@"
+  tuistory -s "$SESSION" wait-idle --timeout 8000
+}
+
 # Variant that launches the binary with an explicitly invalid provider so the
 # downstream `runtime_prep.prepareCliRuntime` / `resolveProviderConfig` paths
 # would fail without the M10 ordering fix. Used to prove that the missing-cwd
@@ -266,6 +292,32 @@ tuistory -s "$SESSION" wait-idle --timeout 3000
 tuistory -s "$SESSION" press enter
 tuistory -s "$SESSION" wait "Resume cancelled" --timeout 5000
 verify_session_unchanged "$ordering_case_dir"
+tuistory -s "$SESSION" close >/dev/null 2>&1 || true
+
+log "case: PI_CODING_AGENT_SESSION_DIR drives preflight session-dir resolution"
+env_case_dir="$(prepare_case envvar)"
+env_launch_path="$(cat "$env_case_dir/launch.path")"
+env_stored_path="$(cat "$env_case_dir/stored.path")"
+launch_pi_with_missing_cwd_env_session_dir "$env_case_dir"
+env_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+# The preflight must surface the missing stored cwd from the session file
+# located in $PI_CODING_AGENT_SESSION_DIR (no --session-dir passed). If the
+# preflight resolver and the runtime resolver disagreed, the preflight would
+# read a different/empty directory and the prompt would never render.
+snapshot_contains "$env_snapshot" "Session cwd not found"
+snapshot_contains "$env_snapshot" "cwd from session file does not exist"
+snapshot_contains "$env_snapshot" "$env_stored_path"
+snapshot_contains "$env_snapshot" "continue in current cwd"
+snapshot_contains "$env_snapshot" "$env_launch_path"
+snapshot_contains "$env_snapshot" "Continue"
+snapshot_contains "$env_snapshot" "Cancel"
+verify_session_unchanged "$env_case_dir"
+# Cancel exits without mutation when env-resolved sessions are used.
+tuistory -s "$SESSION" press down
+tuistory -s "$SESSION" wait-idle --timeout 3000
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "Resume cancelled" --timeout 5000
+verify_session_unchanged "$env_case_dir"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 log "all missing-cwd selector flows passed"

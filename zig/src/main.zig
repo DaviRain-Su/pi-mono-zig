@@ -7,6 +7,7 @@ const input_prep = @import("cli/input_prep.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
+const config_mod = @import("coding_agent/config.zig");
 const json_event_wire = @import("coding_agent/json_event_wire.zig");
 const extension_host_mod = @import("coding_agent/extension_host.zig");
 
@@ -2180,4 +2181,57 @@ test "resolvePreflightSessionDir falls back to default cwd/.pi/sessions" {
     const expected = try std.fs.path.join(allocator, &[_][]const u8{ repo_dir, ".pi", "sessions" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "resolvePreflightSessionDir and effectiveSessionDir agree when env and settings both present" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "envvar-sessions");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    // Settings sessionDir must NOT win when env is also present; both
+    // resolvers must pick the env-derived directory.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{ "sessionDir": "/tmp/should-be-ignored-by-env-var" }
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+    const env_dir = try makeTmpPath(allocator, tmp, "envvar-sessions");
+    defer allocator.free(env_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_SESSION_DIR", env_dir);
+
+    var args = try cli.parseArgs(allocator, &.{});
+    defer args.deinit(allocator);
+
+    const preflight_resolved = try runtime_prep.resolvePreflightSessionDir(
+        allocator,
+        std.testing.io,
+        &env_map,
+        repo_dir,
+        &args,
+    );
+    defer allocator.free(preflight_resolved);
+
+    var runtime = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, repo_dir);
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    const runtime_resolved = try runtime.effectiveSessionDir(allocator, &env_map, repo_dir);
+    defer allocator.free(runtime_resolved);
+
+    try std.testing.expectEqualStrings(env_dir, preflight_resolved);
+    try std.testing.expectEqualStrings(env_dir, runtime_resolved);
+    try std.testing.expectEqualStrings(preflight_resolved, runtime_resolved);
 }
