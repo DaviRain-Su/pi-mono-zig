@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("ai");
 const cli = @import("args.zig");
 const config_mod = @import("../coding_agent/config.zig");
+const file_image = @import("../coding_agent/file_image.zig");
 
 pub const CliStdin = struct {
     is_tty: bool = true,
@@ -65,6 +66,15 @@ fn readPipedStdin(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
     return try allocator.dupe(u8, trimmed);
 }
 
+pub const PrepareInitialInputOptions = struct {
+    /// When true (the TS default) file image attachments are routed through
+    /// the deterministic file_image processor, which can omit them with a
+    /// dimension note or omission message. When false, supported images are
+    /// inserted with their original bytes (matches TS `autoResizeImages =
+    /// false`).
+    auto_resize_images: bool = true,
+};
+
 pub fn prepareInitialInput(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -74,6 +84,7 @@ pub fn prepareInitialInput(
     prompt: ?[]const u8,
     stdin_content: ?[]const u8,
     stderr: *std.Io.Writer,
+    options: PrepareInitialInputOptions,
 ) !PreparedInitialInput {
     var file_text = std.ArrayList(u8).empty;
     defer file_text.deinit(allocator);
@@ -102,18 +113,16 @@ pub fn prepareInitialInput(
 
             if (bytes.len == 0) continue;
 
-            if (detectImageMime(bytes)) |mime_type| {
-                const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-                _ = std.base64.standard.Encoder.encode(encoded, bytes);
-
-                try images.append(allocator, .{
-                    .data = encoded,
-                    .mime_type = try allocator.dupe(u8, mime_type),
-                });
-
-                const note = try std.fmt.allocPrint(allocator, "<file name=\"{s}\"></file>\n", .{absolute_path});
-                defer allocator.free(note);
-                try file_text.appendSlice(allocator, note);
+            if (file_image.detectImageMime(bytes)) |mime_type| {
+                try appendFileImage(
+                    allocator,
+                    &file_text,
+                    &images,
+                    absolute_path,
+                    bytes,
+                    mime_type,
+                    options.auto_resize_images,
+                );
             } else {
                 const header = try std.fmt.allocPrint(allocator, "<file name=\"{s}\">\n", .{absolute_path});
                 defer allocator.free(header);
@@ -139,14 +148,76 @@ pub fn prepareInitialInput(
     };
 }
 
-fn detectImageMime(bytes: []const u8) ?[]const u8 {
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
-    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) {
-        return "image/gif";
+/// Append a single file image attachment + its `<file>` text reference,
+/// honoring the auto-resize gate, the deterministic file_image processor,
+/// the dimension-note emission, and the omission message. Mirrors the TS
+/// `processFileArguments` image branch byte-for-byte.
+fn appendFileImage(
+    allocator: std.mem.Allocator,
+    file_text: *std.ArrayList(u8),
+    images: *std.ArrayList(ai.ImageContent),
+    absolute_path: []const u8,
+    bytes: []const u8,
+    mime_type: []const u8,
+    auto_resize_images: bool,
+) !void {
+    if (!auto_resize_images) {
+        // TS path with autoResizeImages=false: insert original bytes verbatim
+        // and emit an empty `<file>` reference.
+        const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+        errdefer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        try images.append(allocator, .{
+            .data = encoded,
+            .mime_type = try allocator.dupe(u8, mime_type),
+        });
+        const note = try std.fmt.allocPrint(allocator, "<file name=\"{s}\"></file>\n", .{absolute_path});
+        defer allocator.free(note);
+        try file_text.appendSlice(allocator, note);
+        return;
     }
-    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) {
-        return "image/webp";
+
+    const result = try file_image.processImage(allocator, .{
+        .bytes = bytes,
+        .mime_type = mime_type,
+        .options = .{},
+    });
+    if (result == null) {
+        // TS: `text += `<file name="${absolutePath}">[Image omitted: could not be resized below the inline image size limit.]</file>\n`;`
+        const omission = try std.fmt.allocPrint(
+            allocator,
+            "<file name=\"{s}\">{s}</file>\n",
+            .{ absolute_path, file_image.OMISSION_MESSAGE },
+        );
+        defer allocator.free(omission);
+        try file_text.appendSlice(allocator, omission);
+        return;
     }
-    return null;
+
+    var processed = result.?;
+    // Take ownership of the processor-allocated buffers and hand them to the
+    // images list directly to avoid an extra copy.
+    const data_b64 = processed.data_b64;
+    const processed_mime = processed.mime_type;
+    processed.data_b64 = &.{};
+    processed.mime_type = &.{};
+    try images.append(allocator, .{
+        .data = data_b64,
+        .mime_type = processed_mime,
+    });
+
+    if (try file_image.formatDimensionNote(allocator, processed)) |dim_note| {
+        defer allocator.free(dim_note);
+        const wrapped = try std.fmt.allocPrint(
+            allocator,
+            "<file name=\"{s}\">{s}</file>\n",
+            .{ absolute_path, dim_note },
+        );
+        defer allocator.free(wrapped);
+        try file_text.appendSlice(allocator, wrapped);
+    } else {
+        const note = try std.fmt.allocPrint(allocator, "<file name=\"{s}\"></file>\n", .{absolute_path});
+        defer allocator.free(note);
+        try file_text.appendSlice(allocator, note);
+    }
 }

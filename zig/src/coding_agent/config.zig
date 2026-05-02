@@ -27,6 +27,10 @@ pub const Settings = struct {
     session_dir: ?[]u8 = null,
     editor_padding_x: ?usize = null,
     autocomplete_max_visible: ?usize = null,
+    /// Mirrors TypeScript `settings.images.autoResize`. When null the
+    /// runtime defaults to `true` (TS default) via
+    /// `RuntimeConfig.imageAutoResize`.
+    image_auto_resize: ?bool = null,
     compaction: ?session_mod.CompactionSettings = null,
     retry: ?session_mod.RetrySettings = null,
     packages: ?[]const resources_mod.PackageSourceConfig = null,
@@ -57,6 +61,7 @@ pub const Settings = struct {
             .session_dir = if (self.session_dir) |value| try allocator.dupe(u8, value) else null,
             .editor_padding_x = self.editor_padding_x,
             .autocomplete_max_visible = self.autocomplete_max_visible,
+            .image_auto_resize = self.image_auto_resize,
             .compaction = self.compaction,
             .retry = self.retry,
             .packages = try clonePackageSources(allocator, self.packages),
@@ -89,6 +94,12 @@ pub const RuntimeConfig = struct {
         self.keybindings.deinit();
         config_errors.deinitSlice(self.allocator, self.errors);
         self.* = undefined;
+    }
+
+    /// Mirrors TS `settingsManager.getImageAutoResize()`: defaults to `true`
+    /// when the merged `images.autoResize` is unset.
+    pub fn imageAutoResize(self: *const RuntimeConfig) bool {
+        return self.settings.image_auto_resize orelse true;
     }
 
     pub fn lookupApiKey(self: *const RuntimeConfig, provider: []const u8) ?[]const u8 {
@@ -296,6 +307,13 @@ fn parseSettingsContent(
     if (parsed.value.object.get("autocompleteMaxVisible")) |value| {
         result.autocomplete_max_visible = parsePositiveUsize(value);
     }
+    if (parsed.value.object.get("images")) |images_value| {
+        if (images_value == .object) {
+            if (images_value.object.get("autoResize")) |inner| {
+                if (inner == .bool) result.image_auto_resize = inner.bool;
+            }
+        }
+    }
     if (parsed.value.object.get("compaction")) |value| {
         result.compaction = parseCompactionSettings(value);
     }
@@ -335,6 +353,7 @@ fn mergeSettings(allocator: std.mem.Allocator, base: Settings, overrides: Settin
     }
     if (overrides.editor_padding_x) |value| merged.editor_padding_x = value;
     if (overrides.autocomplete_max_visible) |value| merged.autocomplete_max_visible = value;
+    if (overrides.image_auto_resize) |value| merged.image_auto_resize = value;
     merged.compaction = mergeCompaction(base.compaction, overrides.compaction);
     merged.retry = mergeRetry(base.retry, overrides.retry);
     if (overrides.packages != null) {

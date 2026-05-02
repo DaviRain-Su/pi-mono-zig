@@ -389,6 +389,7 @@ fn runCliWithInput(
         prepared.expanded_prompt,
         detected_stdin.content,
         stderr,
+        .{ .auto_resize_images = prepared.runtime_config.imageAutoResize() },
     ) catch |err| switch (err) {
         error.CliInputFailed => return 1,
         else => return err,
@@ -1195,9 +1196,20 @@ test "runCli injects image file arguments into the initial prompt" {
     try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
     const image_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "screenshot.png" });
     defer allocator.free(image_path);
+    // Minimal valid PNG (8-byte signature + IHDR for a 2x2 image). The M14
+    // file_image processor reads dimensions from IHDR before attaching the
+    // image; an unparseable header would trigger the deterministic omission
+    // path instead.
+    const minimal_png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d,
+        0x24,
+    };
     try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
         .sub_path = image_path,
-        .data = "\x89PNG\r\n\x1a\nfakepng",
+        .data = &minimal_png,
     });
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -1244,6 +1256,146 @@ test "runCli injects image file arguments into the initial prompt" {
     try std.testing.expectEqualStrings("image/png", context.messages[0].user.content[1].image.mime_type);
     try std.testing.expect(context.messages[0].user.content[1].image.data.len > 0);
     try std.testing.expectEqualStrings("image file injected", context.messages[1].assistant.content[0].text.text);
+}
+
+// VAL-M14-IMAGE-008: when the file_image processor cannot resize an image
+// below the inline byte limit, the CLI must omit the attachment and inject
+// the deterministic omission text into the user message instead. Regression
+// for the M14 file image normalization parity surface.
+test "runCli omits oversized image with deterministic message when processor returns null" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try makeTmpPath(allocator, tmp, "cli-file-image-omit");
+    defer allocator.free(cwd);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
+    const image_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "huge.png" });
+    defer allocator.free(image_path);
+    // Valid PNG header reporting 8000x8000 dimensions; well above the
+    // default 2000x2000 max so the default processor returns null.
+    const huge_png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x1f, 0x40, 0x00, 0x00, 0x1f, 0x40,
+        0x08, 0x06, 0x00, 0x00, 0x00,
+    };
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = image_path,
+        .data = &huge_png,
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "ack");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var stdin_input = CliStdin{};
+
+    const exit_code = try runCliWithInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "@huge.png", "what is this" },
+        cwd,
+        &stdin_input,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqual(@as(usize, 1), context.messages[0].user.content.len);
+    const user_text = context.messages[0].user.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, user_text, "[Image omitted: could not be resized below the inline image size limit.]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, user_text, "what is this"));
+}
+
+// VAL-M14-IMAGE-010: when `images.autoResize` is set to `false` in
+// settings.json the file image is attached without dimension/byte gating,
+// even when the default processor would otherwise omit it. Mirrors TS
+// `processFileArguments({ autoResizeImages: false })`.
+test "runCli respects images.autoResize=false and attaches oversized image bytes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try makeTmpPath(allocator, tmp, "cli-file-image-no-resize");
+    defer allocator.free(cwd);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
+    const project_pi = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" });
+    defer allocator.free(project_pi);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, project_pi, .default_dir);
+    const project_settings = try std.fs.path.join(allocator, &[_][]const u8{ project_pi, "settings.json" });
+    defer allocator.free(project_settings);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = project_settings,
+        .data = "{\"images\":{\"autoResize\":false}}",
+    });
+
+    const image_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "huge.png" });
+    defer allocator.free(image_path);
+    const huge_png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x1f, 0x40, 0x00, 0x00, 0x1f, 0x40,
+        0x08, 0x06, 0x00, 0x00, 0x00,
+    };
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = image_path,
+        .data = &huge_png,
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "noresize");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var stdin_input = CliStdin{};
+
+    const exit_code = try runCliWithInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "@huge.png", "describe" },
+        cwd,
+        &stdin_input,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
+    defer allocator.free(session_dir);
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+
+    var manager = try coding_agent.SessionManager.open(allocator, std.testing.io, session_file, cwd);
+    defer manager.deinit();
+    var context = try manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), context.messages[0].user.content.len);
+    try std.testing.expectEqualStrings("image/png", context.messages[0].user.content[1].image.mime_type);
+    const user_text = context.messages[0].user.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, user_text, "[Image omitted") == null);
+    try std.testing.expect(std.mem.endsWith(u8, user_text, "describe"));
 }
 
 test "cli executable print mode writes assistant text to stdout without interactive escape codes" {
