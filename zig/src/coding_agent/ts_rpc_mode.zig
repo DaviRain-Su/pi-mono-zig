@@ -4945,6 +4945,172 @@ test "VAL-M10-SESSION-004 fork preserves parent metadata and parent file is unch
     try std.testing.expectEqualStrings(parent_bytes_before, parent_bytes_after);
 }
 
+// VAL-M10-SESSION-007: Cloning a session creates a distinct child branch that
+// retains the full ancestry up to and including the current leaf entry,
+// records the parent session file in its persisted header, preserves the
+// parent cwd, leaves the parent session file byte-identical on disk, and
+// exposes parent and clone branch views via get_messages that reflect the
+// correct cutoff/target ancestry.
+test "VAL-M10-SESSION-007 clone preserves branch ancestry and parent file is unchanged" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "clone-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "clone-cwd",
+    });
+    defer allocator.free(project_relative);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, project_relative });
+    defer allocator.free(project_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_a = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_a[0] = .{ .text = .{ .text = "root prompt" } };
+    const assistant_a = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_a[0] = .{ .text = .{ .text = "root answer" } };
+    const user_b = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_b[0] = .{ .text = .{ .text = "second prompt" } };
+    const assistant_b = try arena.allocator().alloc(ai.ContentBlock, 1);
+    assistant_b[0] = .{ .text = .{ .text = "second answer" } };
+
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = user_a, .timestamp = 51 } });
+    _ = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_a,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 52,
+    } });
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = user_b, .timestamp = 53 } });
+    const leaf_assistant_id = try session.session_manager.appendMessage(.{ .assistant = .{
+        .content = assistant_b,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = .{ .input = 1, .output = 2, .total_tokens = 3 },
+        .stop_reason = .stop,
+        .timestamp = 54,
+    } });
+    const leaf_assistant_id_owned = try allocator.dupe(u8, leaf_assistant_id);
+    defer allocator.free(leaf_assistant_id_owned);
+    try session.navigateTo(leaf_assistant_id);
+
+    // Snapshot parent identity and persisted bytes before clone runs.
+    const parent_session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(parent_session_file);
+    const parent_session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(parent_session_id);
+    const parent_leaf_id = try allocator.dupe(u8, session.session_manager.getLeafId().?);
+    defer allocator.free(parent_leaf_id);
+    const parent_message_count = session.agent.getMessages().len;
+    try std.testing.expectEqual(@as(usize, 4), parent_message_count);
+    const parent_bytes_before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, parent_session_file, allocator, .unlimited);
+    defer allocator.free(parent_bytes_before);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    var cursor: usize = 0;
+
+    // Capture parent get_messages branch view before clone (the cutoff/target
+    // ancestry currently visible on the parent session).
+    const parent_branch_messages_before = try server.buildMessagesJson(session.agent.getMessages());
+    defer allocator.free(parent_branch_messages_before);
+
+    try server.handleLine("{\"id\":\"clone\",\"type\":\"clone\"}");
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"clone\",\"type\":\"response\",\"command\":\"clone\",\"success\":true,\"data\":{\"cancelled\":false}}\n",
+    );
+
+    // Cloned session is a new, distinct session. The session id and on-disk
+    // file path are different from the parent.
+    const clone_session_file = session.session_manager.getSessionFile().?;
+    try std.testing.expect(!std.mem.eql(u8, parent_session_file, clone_session_file));
+    try std.testing.expect(!std.mem.eql(u8, parent_session_id, session.session_manager.getSessionId()));
+
+    // Clone preserves the parent cwd in its metadata.
+    try std.testing.expectEqualStrings(project_cwd, session.cwd);
+    try std.testing.expectEqualStrings(project_cwd, session.session_manager.getCwd());
+
+    // Clone records the parent session file in its persisted header.
+    const clone_parent = session.session_manager.getHeader().parent_session orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings(parent_session_file, clone_parent);
+
+    // Clone retains the full branch ancestry: the leaf entry and message count
+    // match the parent at clone time (cutoff/target == leaf assistant id).
+    const clone_leaf_id = session.session_manager.getLeafId() orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expectEqualStrings(parent_leaf_id, clone_leaf_id);
+    try std.testing.expectEqual(parent_message_count, session.agent.getMessages().len);
+
+    // Clone get_messages branch view matches the parent's branch view at the
+    // cloned cutoff/target. Both must reflect the same root and second
+    // user/assistant pairs in order.
+    const clone_branch_messages = try server.buildMessagesJson(session.agent.getMessages());
+    defer allocator.free(clone_branch_messages);
+    try std.testing.expectEqualStrings(parent_branch_messages_before, clone_branch_messages);
+
+    // Parent session file on disk is preserved byte-for-byte after clone.
+    const parent_bytes_after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, parent_session_file, allocator, .unlimited);
+    defer allocator.free(parent_bytes_after);
+    try std.testing.expectEqualStrings(parent_bytes_before, parent_bytes_after);
+
+    // Switch back to the parent session and confirm its branch view is
+    // unchanged: the same leaf and the same get_messages output as before
+    // the clone occurred.
+    const switch_command = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"back\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}",
+        .{parent_session_file},
+    );
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    try expectNewOutput(
+        &stdout_capture.writer,
+        &cursor,
+        "{\"id\":\"back\",\"type\":\"response\",\"command\":\"switch_session\",\"success\":true,\"data\":{\"cancelled\":false}}\n",
+    );
+    try std.testing.expectEqualStrings(parent_session_id, session.session_manager.getSessionId());
+    try std.testing.expectEqualStrings(parent_leaf_id, session.session_manager.getLeafId().?);
+    try std.testing.expectEqual(parent_message_count, session.agent.getMessages().len);
+    const parent_branch_messages_after_switch = try server.buildMessagesJson(session.agent.getMessages());
+    defer allocator.free(parent_branch_messages_after_switch);
+    try std.testing.expectEqualStrings(parent_branch_messages_before, parent_branch_messages_after_switch);
+}
+
 // VAL-M10-SESSION-006: Creating a new session clears prior transient session
 // state, message history, and exposes a fresh session id; old session file is
 // preserved and can be switched back to.
