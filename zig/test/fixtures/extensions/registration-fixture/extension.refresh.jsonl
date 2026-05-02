@@ -1,0 +1,3 @@
+{"type":"register_tool","name":"say-hello","label":"Say Hello v2","description":"Greets the world (refreshed)","extensionPath":"registration-fixture/extension.ts"}
+{"type":"register_tool","name":"new-tool","label":"New Tool","description":"Added on refresh","extensionPath":"registration-fixture/extension.ts"}
+{"type":"unregister_provider","name":"fake-provider"}
