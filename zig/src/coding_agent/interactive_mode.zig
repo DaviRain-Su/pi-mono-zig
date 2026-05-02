@@ -441,7 +441,11 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
     // appears even when provider auth or model configuration would otherwise
     // fail later in bootstrap. Matches TypeScript main.ts which checks the
     // missing-cwd issue before constructing the runtime.
-    if (try session_bootstrap.preflightInteractiveMissingCwd(allocator, io, options)) |captured_preflight| {
+    //
+    // When the caller already prompted the user via the earlier
+    // pre-`prepareCliRuntime` lifecycle preflight, skip prompting again.
+    if (!options.missing_cwd_already_confirmed) {
+        if (try session_bootstrap.preflightInteractiveMissingCwd(allocator, io, options)) |captured_preflight| {
         var captured_preflight_mut = captured_preflight;
         defer captured_preflight_mut.deinit(allocator);
         const choice = try promptInteractiveMissingSessionCwd(
@@ -477,6 +481,7 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
                 return .{ .exit_code = 1 };
             },
             else => return retry_err,
+        }
         }
     }
 

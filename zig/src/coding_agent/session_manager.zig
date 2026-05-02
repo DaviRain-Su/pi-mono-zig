@@ -1041,21 +1041,48 @@ pub fn findMostRecentSession(
     return null;
 }
 
+/// Hard cap on the bytes consumed by `readSessionHeader`. The JSONL header is
+/// a single short JSON object describing the session metadata; capping the
+/// preflight read keeps the lifecycle preflight bounded even when the session
+/// file is multi-megabyte. Mirrors the cap used by the migration first-line
+/// reader.
+pub const MAX_SESSION_HEADER_BYTES: usize = 64 * 1024;
+
 /// Reads only the first JSONL line of `session_file` and parses it as a
 /// `SessionHeader`. Used by lifecycle preflight code that needs the stored
-/// cwd before constructing a full session/runtime/provider stack. Caller
-/// must call `freeSessionHeader` to release the returned strings.
+/// cwd before constructing a full session/runtime/provider stack. The read
+/// is bounded by `MAX_SESSION_HEADER_BYTES`; if the first line exceeds that
+/// cap the function returns `error.InvalidSessionFile` so callers can fall
+/// through to the heavier session-manager path. Caller must call
+/// `freeSessionHeader` to release the returned strings.
 pub fn readSessionHeader(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_file: []const u8,
 ) !SessionHeader {
-    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, session_file, allocator, .unlimited);
-    defer allocator.free(bytes);
+    const file = try std.Io.Dir.openFile(.cwd(), io, session_file, .{});
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    defer reader.file.close(io);
 
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    const header_line = lines.next() orelse return error.InvalidSessionFile;
-    return try parseHeaderLine(allocator, header_line);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+
+    while (line.items.len < MAX_SESSION_HEADER_BYTES) {
+        const byte = reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return reader.err.?,
+        };
+        if (byte == '\n') break;
+        try line.append(allocator, byte);
+    }
+
+    if (line.items.len >= MAX_SESSION_HEADER_BYTES) {
+        return error.InvalidSessionFile;
+    }
+    if (line.items.len == 0) return error.InvalidSessionFile;
+
+    return try parseHeaderLine(allocator, line.items);
 }
 
 /// Releases ownership of strings allocated by `readSessionHeader`.
@@ -3038,6 +3065,85 @@ test "readSessionHeader reads only the JSONL header without loading entries" {
 test "readSessionHeader returns error.FileNotFound for missing files" {
     const result = readSessionHeader(std.testing.allocator, std.testing.io, "/tmp/this/does/not/exist.jsonl");
     try std.testing.expectError(error.FileNotFound, result);
+}
+
+test "readSessionHeader is bounded and ignores oversized session bodies" {
+    // Builds a JSONL file whose header line is small but whose body is
+    // significantly larger than `MAX_SESSION_HEADER_BYTES`. The bounded
+    // preflight read must successfully parse the header without loading the
+    // entire body, regardless of trailing content size.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(allocator, relative_dir);
+    defer allocator.free(session_dir);
+
+    var manager = try SessionManager.create(allocator, std.testing.io, "/tmp/preflight-bounded", session_dir);
+    const session_file = try allocator.dupe(u8, manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    manager.deinit();
+
+    // Append an enormous body line (>= MAX_SESSION_HEADER_BYTES) to confirm
+    // that the bounded read does not allocate the whole file.
+    const original_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(original_bytes);
+
+    const oversize_payload_len = MAX_SESSION_HEADER_BYTES * 8;
+    var rebuilt: std.ArrayList(u8) = .empty;
+    defer rebuilt.deinit(allocator);
+    try rebuilt.appendSlice(allocator, original_bytes);
+    if (rebuilt.items.len == 0 or rebuilt.items[rebuilt.items.len - 1] != '\n') {
+        try rebuilt.append(allocator, '\n');
+    }
+    // A single huge non-header line. The preflight must stop at the header
+    // newline that precedes it.
+    try rebuilt.appendNTimes(allocator, 'X', oversize_payload_len);
+    try rebuilt.append(allocator, '\n');
+    try common.writeFileAbsolute(std.testing.io, session_file, rebuilt.items, true);
+
+    var header = try readSessionHeader(allocator, std.testing.io, session_file);
+    defer freeSessionHeader(allocator, &header);
+    try std.testing.expectEqualStrings("/tmp/preflight-bounded", header.cwd);
+}
+
+test "readSessionHeader returns InvalidSessionFile when first line exceeds the byte cap" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer allocator.free(relative_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, relative_dir);
+    const session_file = try std.fs.path.join(allocator, &[_][]const u8{ relative_dir, "oversized.jsonl" });
+    defer allocator.free(session_file);
+
+    // Build a synthetic >cap first line with no newline before the cap.
+    var oversize: std.ArrayList(u8) = .empty;
+    defer oversize.deinit(allocator);
+    try oversize.appendNTimes(allocator, 'A', MAX_SESSION_HEADER_BYTES + 16);
+
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = session_file,
+        .data = oversize.items,
+    });
+
+    const result = readSessionHeader(allocator, std.testing.io, session_file);
+    try std.testing.expectError(error.InvalidSessionFile, result);
 }
 
 test "session manager creates empty session with metadata" {

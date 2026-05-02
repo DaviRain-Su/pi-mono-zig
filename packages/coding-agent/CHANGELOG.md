@@ -6,6 +6,10 @@
 
 - Replaced the Zig interactive missing stored-cwd stderr/stdin prompt with a full TUI Continue/Cancel selector that mirrors the TypeScript `ExtensionSelectorComponent` flow used by `promptForMissingSessionCwd`, with tuistory coverage for prompt rendering, cancel, escape, and continue paths. Cancel exits without mutating the session file; continue persists the launch cwd only after explicit confirmation.
 
+### Fixed
+
+- The Zig missing stored-cwd preflight now runs BEFORE `runtime_prep.prepareCliRuntime` in non-interactive and interactive resume/open flows. Runtime config, resource bundle, context file, system prompt, provider auth, and tool construction failures can no longer preempt the missing-cwd diagnostic (non-interactive) or the Continue/Cancel TUI selector (interactive). The early Continue path is recorded so the deeper interactive bootstrap does not prompt twice. The existing post-bootstrap guard remains as a race-condition fallback. `readSessionHeader` now uses a bounded streaming first-line read (cap 64 KiB) instead of loading the entire session file.
+
 ## [0.72.0] - 2026-05-01
 
 ### New Features
