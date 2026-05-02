@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the Zig interactive missing stored-cwd stderr/stdin prompt with a full TUI Continue/Cancel selector that mirrors the TypeScript `ExtensionSelectorComponent` flow used by `promptForMissingSessionCwd`, with tuistory coverage for prompt rendering, cancel, escape, and continue paths. Cancel exits without mutating the session file; continue persists the launch cwd only after explicit confirmation.
+
 ## [0.72.0] - 2026-05-01
 
 ### New Features
