@@ -19,14 +19,26 @@ pub const OpenAIProvider = struct {
         var event_stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer event_stream_instance.deinit();
 
-        // Build request payload
-        const payload = buildFinalRequestPayload(allocator, model, context, options) catch |err| switch (err) {
+        streamProduction(allocator, io, model, context, options, &event_stream_instance) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
-                pushEarlyTerminalError(&event_stream_instance, model, err);
+                pushEarlyTerminalError(&event_stream_instance, model, options, err);
                 return event_stream_instance;
             },
         };
+        return event_stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        event_stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
+        // Build request payload
+        const payload = try buildFinalRequestPayload(allocator, model, context, options);
         defer freeJsonValue(allocator, payload);
 
         // Serialize payload to JSON
@@ -34,10 +46,7 @@ pub const OpenAIProvider = struct {
         const json_writer = &json_out.writer;
         defer json_out.deinit();
 
-        std.json.Stringify.value(payload, .{}, json_writer) catch |err| {
-            pushEarlyTerminalError(&event_stream_instance, model, err);
-            return event_stream_instance;
-        };
+        try std.json.Stringify.value(payload, .{}, json_writer);
 
         // Build HTTP request
         var headers = try buildRequestHeaders(allocator, model, options);
@@ -59,40 +68,26 @@ pub const OpenAIProvider = struct {
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
 
-        var streaming = client.requestStreaming(req) catch |err| switch (err) {
-            error.InvalidUrl => {
-                pushEarlyTerminalError(&event_stream_instance, model, err);
-                return event_stream_instance;
-            },
-            else => return err,
-        };
+        var streaming = try client.requestStreaming(req);
         defer streaming.deinit();
 
         if (options) |opts| {
             if (opts.on_response) |on_response| {
                 var response_headers = try normalizedResponseHeaders(allocator, streaming.response_headers);
                 defer deinitOwnedHeaders(allocator, &response_headers);
-                on_response(streaming.status, response_headers, model) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
-                        pushEarlyTerminalError(&event_stream_instance, model, err);
-                        return event_stream_instance;
-                    },
-                };
+                try on_response(streaming.status, response_headers, model);
             }
         }
 
         if (streaming.status != 200) {
             const response_body = try streaming.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &event_stream_instance, model, streaming.status, response_body);
-            return event_stream_instance;
+            try provider_error.pushHttpStatusError(allocator, event_stream_instance, model, streaming.status, response_body);
+            return;
         }
 
         // Parse SSE stream incrementally from lines
-        try parseSseStreamLines(allocator, &event_stream_instance, &streaming, model);
-
-        return event_stream_instance;
+        try parseSseStreamLines(allocator, event_stream_instance, &streaming, model);
     }
 
     pub fn streamSimple(
@@ -165,9 +160,11 @@ fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) v
 fn pushEarlyTerminalError(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     model: types.Model,
+    options: ?types.StreamOptions,
     err: anyerror,
 ) void {
-    const error_message = provider_error.runtimeErrorMessage(err);
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
     const message = types.AssistantMessage{
         .role = "assistant",
         .content = &[_]types.ContentBlock{},
@@ -175,7 +172,7 @@ fn pushEarlyTerminalError(
         .provider = model.provider,
         .model = model.id,
         .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(err),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
         .error_message = error_message,
         .timestamp = 0,
     };
@@ -2929,13 +2926,65 @@ test "stream respects pre-aborted signal" {
         },
     };
 
-    try std.testing.expectError(
-        error.RequestAborted,
-        OpenAIProvider.stream(allocator, io, model, context, .{
-            .api_key = "test-key",
-            .signal = &aborted,
-        }),
-    );
+    var stream = try OpenAIProvider.stream(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .signal = &aborted,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("Request was aborted", event.error_message.?);
+    try std.testing.expectEqual(types.StopReason.aborted, event.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
+}
+
+test "VAL-M9-STREAM-010 streamSimple matches stream pre-aborted terminal cancellation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    const model = types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var simple_stream = try OpenAIProvider.streamSimple(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .signal = &aborted,
+    });
+    defer simple_stream.deinit();
+
+    const event = simple_stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("Request was aborted", event.error_message.?);
+    try std.testing.expectEqual(types.StopReason.aborted, event.message.?.stop_reason);
+    try std.testing.expect(simple_stream.next() == null);
+
+    const result = simple_stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
 }
 
 test "stream emits single terminal sanitized error for HTTP status" {

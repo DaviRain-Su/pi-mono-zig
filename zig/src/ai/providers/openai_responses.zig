@@ -75,6 +75,21 @@ pub const OpenAIResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
         var payload = try buildRequestPayload(allocator, model, context, options);
         defer freeJsonValue(allocator, payload);
 
@@ -118,7 +133,7 @@ pub const OpenAIResponsesProvider = struct {
                 .message = message,
             });
             stream_instance.end(message);
-            return stream_instance;
+            return;
         }
 
         const url = try buildRequestUrl(allocator, model.base_url);
@@ -158,12 +173,11 @@ pub const OpenAIResponsesProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -176,6 +190,27 @@ pub const OpenAIResponsesProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
@@ -3231,6 +3266,201 @@ test "parseSseStreamLines finalizes partial text before response.failed terminal
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }
 
+fn streamErrorContractTestModel(base_url: []const u8) types.Model {
+    return .{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+}
+
+fn streamErrorContractTestContext() types.Context {
+    return .{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+}
+
+fn expectOnlyTerminalErrorResponses(
+    stream: *event_stream.AssistantMessageEventStream,
+    expected_error: []const u8,
+    expected_stop: types.StopReason,
+) !void {
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expectEqualStrings(expected_error, event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(expected_stop, event.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+    try std.testing.expectEqual(expected_stop, result.stop_reason);
+}
+
+fn failingResponsesOnPayload(allocator: std.mem.Allocator, payload: std.json.Value, model: types.Model) !?std.json.Value {
+    _ = allocator;
+    _ = payload;
+    _ = model;
+    return error.FixtureResponsesPayloadFailure;
+}
+
+fn failingResponsesOnResponse(status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+    _ = status;
+    _ = headers;
+    _ = model;
+    return error.FixtureResponsesResponseFailure;
+}
+
+test "VAL-M9-STREAM-002 stream URL construction failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel("not-a-valid-url"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "InvalidUrl", .error_reason);
+}
+
+test "VAL-M9-STREAM-002 streamSimple URL construction failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractTestModel("not-a-valid-url"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "InvalidUrl", .error_reason);
+}
+
+test "VAL-M9-STREAM-004 stream on_payload failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .on_payload = failingResponsesOnPayload },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesPayloadFailure", .error_reason);
+}
+
+test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body =
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_unread\"}}\n" ++
+        "data: [DONE]\n";
+    var server = try provider_error.TestStatusServer.init(io, 200, "OK", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel(url),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .on_response = &failingResponsesOnResponse },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesResponseFailure", .error_reason);
+}
+
+test "VAL-M9-STREAM-006 stream missing api key returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "" },
+    );
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expectEqualStrings("No API key for provider: openai", event.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "test-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    allocator.free(result.error_message.?);
+}
+
+test "VAL-M9-STREAM-010 stream pre-aborted signal yields terminal aborted event without throwing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel("http://127.0.0.1:1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .signal = &aborted },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "Request was aborted", .aborted);
+}
+
+test "VAL-M9-STREAM-010 streamSimple pre-aborted signal matches stream terminal aborted semantics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    var simple_stream = try OpenAIResponsesProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractTestModel("http://127.0.0.1:1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .signal = &aborted },
+    );
+    defer simple_stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&simple_stream, "Request was aborted", .aborted);
+}
 test "parseSseStreamLines finalizes partial text before top-level error terminal error" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;

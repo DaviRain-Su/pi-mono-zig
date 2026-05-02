@@ -64,6 +64,21 @@ pub const AnthropicProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
         const resolved_options = try resolveStreamOptions(allocator, model, options);
         defer resolved_options.deinit(allocator);
 
@@ -125,12 +140,11 @@ pub const AnthropicProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, context, resolved_options.options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, context, resolved_options.options);
     }
 
     pub fn streamSimple(
@@ -143,6 +157,28 @@ pub const AnthropicProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
 
 fn buildMessagesUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, base_url, "/");
@@ -2693,4 +2729,172 @@ test "parseSseStreamLines finalizes partial Anthropic text before EOF terminal e
     try std.testing.expectEqualStrings("partial before eof", terminal.message.?.content[0].text.text);
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
+}
+
+fn streamErrorContractAnthropicModel(base_url: []const u8) types.Model {
+    return .{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+}
+
+fn streamErrorContractAnthropicContext() types.Context {
+    return .{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+}
+
+fn expectOnlyTerminalErrorAnthropic(
+    stream: *event_stream.AssistantMessageEventStream,
+    expected_error: []const u8,
+    expected_stop: types.StopReason,
+) !void {
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expectEqualStrings(expected_error, event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(expected_stop, event.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+    try std.testing.expectEqual(expected_stop, result.stop_reason);
+}
+
+fn failingAnthropicOnPayload(allocator: std.mem.Allocator, payload: std.json.Value, model: types.Model) !?std.json.Value {
+    _ = allocator;
+    _ = payload;
+    _ = model;
+    return error.FixtureAnthropicPayloadFailure;
+}
+
+fn failingAnthropicOnResponse(status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+    _ = status;
+    _ = headers;
+    _ = model;
+    return error.FixtureAnthropicResponseFailure;
+}
+
+test "VAL-M9-STREAM-003 stream URL construction failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("not-a-valid-url"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorAnthropic(&stream, "InvalidUrl", .error_reason);
+}
+
+test "VAL-M9-STREAM-003 streamSimple URL construction failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try AnthropicProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("not-a-valid-url"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorAnthropic(&stream, "InvalidUrl", .error_reason);
+}
+
+test "VAL-M9-STREAM-004 stream on_payload failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("https://api.anthropic.com/v1"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key", .on_payload = failingAnthropicOnPayload },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorAnthropic(&stream, "FixtureAnthropicPayloadFailure", .error_reason);
+}
+
+test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_unread\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+    var server = try provider_error.TestStatusServer.init(io, 200, "OK", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel(url),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key", .on_response = &failingAnthropicOnResponse },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorAnthropic(&stream, "FixtureAnthropicResponseFailure", .error_reason);
+}
+
+test "VAL-M9-STREAM-010 stream pre-aborted signal yields terminal aborted event without throwing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("http://127.0.0.1:1"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key", .signal = &aborted },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorAnthropic(&stream, "Request was aborted", .aborted);
+}
+
+test "VAL-M9-STREAM-010 streamSimple pre-aborted signal matches stream terminal aborted semantics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    var simple_stream = try AnthropicProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("http://127.0.0.1:1"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key", .signal = &aborted },
+    );
+    defer simple_stream.deinit();
+
+    try expectOnlyTerminalErrorAnthropic(&simple_stream, "Request was aborted", .aborted);
 }
