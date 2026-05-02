@@ -976,7 +976,7 @@ fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
-fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
+pub fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
     if (env_map.get("PI_CODING_AGENT_DIR")) |value| {
         return expandLeadingHome(allocator, env_map, value);
     }
