@@ -5,6 +5,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
+const env_api_keys = @import("../env_api_keys.zig");
 
 pub const OpenAIProvider = struct {
     pub const api = "openai-completions";
@@ -48,8 +49,30 @@ pub const OpenAIProvider = struct {
 
         try std.json.Stringify.value(payload, .{}, json_writer);
 
+        // Resolve provider authentication. Mirrors the TypeScript
+        // `apiKey || getEnvApiKey(model.provider)` precedence and emits a
+        // sanitized terminal stream error when both are missing instead of
+        // sending an unauthenticated request.
+        var env_api_key: ?[]u8 = null;
+        defer if (env_api_key) |key| allocator.free(key);
+
+        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
+        const has_provided_api_key = if (provided_api_key) |key| key.len > 0 else false;
+        if (!has_provided_api_key) {
+            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
+        }
+
+        const resolved_api_key: ?[]const u8 = if (has_provided_api_key) provided_api_key else env_api_key;
+        if (resolved_api_key == null or resolved_api_key.?.len == 0) {
+            try pushMissingApiKeyError(allocator, event_stream_instance, model);
+            return;
+        }
+
+        var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
+        resolved_options.api_key = resolved_api_key.?;
+
         // Build HTTP request
-        var headers = try buildRequestHeaders(allocator, model, options);
+        var headers = try buildRequestHeaders(allocator, model, resolved_options);
         defer deinitOwnedHeaders(allocator, &headers);
 
         const request_target = try buildOpenAIChatRequestTarget(allocator, model.base_url);
@@ -177,6 +200,39 @@ fn pushEarlyTerminalError(
         .timestamp = 0,
     };
     provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
+
+/// Emit a deterministic sanitized terminal stream error when no API key is
+/// available. Mirrors the TypeScript `No API key for provider:` diagnostic and
+/// must not leak environment values, credential-store paths, bearer tokens, or
+/// local auth paths.
+fn pushMissingApiKeyError(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+) !void {
+    const error_message = try std.fmt.allocPrint(
+        allocator,
+        "No API key for provider: {s}",
+        .{model.provider},
+    );
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = message,
+    });
+    stream_ptr.end(message);
 }
 
 fn normalizedResponseHeaders(
@@ -3433,6 +3489,93 @@ test "stream URL construction failure returns one terminal error event" {
     defer stream.deinit();
 
     try expectOnlyTerminalError(&stream, "InvalidUrl");
+}
+
+fn expectMissingApiKeyTerminalError(
+    stream: *event_stream.AssistantMessageEventStream,
+    expected_provider: []const u8,
+) !void {
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "No API key for provider: {s}",
+        .{expected_provider},
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+
+    // Diagnostic must not leak secrets, environment values, bearer tokens,
+    // credential-store paths, or local auth paths.
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "Bearer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "OPENAI_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "ANTHROPIC_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/home/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "auth.json") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    std.testing.allocator.free(result.error_message.?);
+}
+
+test "VAL-M9-STREAM-006 stream missing api key returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIProvider.stream(
+        allocator,
+        io,
+        openAiCallbackTestModel("https://api.openai.com/v1"),
+        openAiCallbackTestContext(),
+        .{ .api_key = "" },
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalError(&stream, "openai");
+}
+
+test "VAL-M9-STREAM-006 streamSimple missing api key returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIProvider.streamSimple(
+        allocator,
+        io,
+        openAiCallbackTestModel("https://api.openai.com/v1"),
+        openAiCallbackTestContext(),
+        .{ .api_key = "" },
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalError(&stream, "openai");
+}
+
+test "VAL-M9-STREAM-006 stream null api key options returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIProvider.stream(
+        allocator,
+        io,
+        openAiCallbackTestModel("https://api.openai.com/v1"),
+        openAiCallbackTestContext(),
+        null,
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalError(&stream, "openai");
 }
 
 test "parseSseStreamLines preserves partial text before malformed event JSON terminal error" {

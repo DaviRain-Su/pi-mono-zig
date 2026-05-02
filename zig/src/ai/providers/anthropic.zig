@@ -82,6 +82,19 @@ pub const AnthropicProvider = struct {
         const resolved_options = try resolveStreamOptions(allocator, model, options);
         defer resolved_options.deinit(allocator);
 
+        // After resolving env-based credentials, missing or blank auth must
+        // surface as a deterministic terminal stream error rather than a
+        // silent unauthenticated request. Mirrors the TypeScript
+        // `No API key for provider:` diagnostic.
+        const resolved_api_key = if (resolved_options.options) |stream_options|
+            stream_options.api_key orelse ""
+        else
+            "";
+        if (resolved_api_key.len == 0) {
+            try pushMissingApiKeyError(allocator, stream_instance, model);
+            return;
+        }
+
         var payload = try buildRequestPayload(allocator, model, context, resolved_options.options);
         defer freeJsonValue(allocator, payload);
 
@@ -178,6 +191,39 @@ fn emitSetupRuntimeFailure(
         .timestamp = 0,
     };
     provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
+
+/// Emit a deterministic sanitized terminal stream error when no API key is
+/// available. Mirrors the TypeScript `No API key for provider:` diagnostic and
+/// must not leak environment values, credential-store paths, bearer tokens, or
+/// local auth paths.
+fn pushMissingApiKeyError(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+) !void {
+    const error_message = try std.fmt.allocPrint(
+        allocator,
+        "No API key for provider: {s}",
+        .{model.provider},
+    );
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = message,
+    });
+    stream_ptr.end(message);
 }
 
 fn buildMessagesUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
@@ -2897,4 +2943,92 @@ test "VAL-M9-STREAM-010 streamSimple pre-aborted signal matches stream terminal 
     defer simple_stream.deinit();
 
     try expectOnlyTerminalErrorAnthropic(&simple_stream, "Request was aborted", .aborted);
+}
+
+fn expectMissingApiKeyTerminalErrorAnthropic(
+    stream: *event_stream.AssistantMessageEventStream,
+    expected_provider: []const u8,
+) !void {
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "No API key for provider: {s}",
+        .{expected_provider},
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+
+    // Diagnostic must not leak secrets, environment values, bearer tokens,
+    // credential-store paths, or local auth paths.
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "Bearer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-ant") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "ANTHROPIC_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "ANTHROPIC_OAUTH_TOKEN") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "x-api-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/home/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "auth.json") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    std.testing.allocator.free(result.error_message.?);
+}
+
+test "VAL-M9-STREAM-006 stream missing api key returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("https://api.anthropic.com/v1"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "" },
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalErrorAnthropic(&stream, "anthropic");
+}
+
+test "VAL-M9-STREAM-006 streamSimple missing api key returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try AnthropicProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("https://api.anthropic.com/v1"),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "" },
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalErrorAnthropic(&stream, "anthropic");
+}
+
+test "VAL-M9-STREAM-006 stream null api key options returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel("https://api.anthropic.com/v1"),
+        streamErrorContractAnthropicContext(),
+        null,
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalErrorAnthropic(&stream, "anthropic");
 }
