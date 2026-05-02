@@ -325,20 +325,24 @@ pub fn loadFromExtensionPaths(
 fn readManifestForPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     // Try `<path>.flags.json` first (file extension form), then
     // `<path>/flags.json` for directory-style extensions. Matches the
-    // local fixture layout used in tests.
+    // local fixture layout used in tests. Treat NotDir / IsDir as
+    // FileNotFound so callers can keep iterating extension paths.
     const sidecar = try std.fmt.allocPrint(allocator, "{s}.flags.json", .{path});
     defer allocator.free(sidecar);
 
     if (std.Io.Dir.readFileAlloc(.cwd(), io, sidecar, allocator, .limited(64 * 1024))) |bytes| {
         return bytes;
     } else |err| switch (err) {
-        error.FileNotFound => {},
+        error.FileNotFound, error.NotDir, error.IsDir => {},
         else => return err,
     }
 
     const dir_manifest = try std.fs.path.join(allocator, &[_][]const u8{ path, "flags.json" });
     defer allocator.free(dir_manifest);
-    return std.Io.Dir.readFileAlloc(.cwd(), io, dir_manifest, allocator, .limited(64 * 1024));
+    return std.Io.Dir.readFileAlloc(.cwd(), io, dir_manifest, allocator, .limited(64 * 1024)) catch |err| switch (err) {
+        error.NotDir, error.IsDir => return error.FileNotFound,
+        else => return err,
+    };
 }
 
 test "Registry registers and lists flags" {

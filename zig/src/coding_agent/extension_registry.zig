@@ -54,15 +54,30 @@ pub const ExtensionFlag = struct {
     description: ?[]u8,
     type_kind: FlagKind,
     default_value: FlagDefault,
+    /// Parsed CLI value for this flag, set by `setFlagValue` when the
+    /// CLI parser observes `--<name>` (and optional value) on the
+    /// command line. Mirrors TypeScript `extensionState.flags[name]`
+    /// so extensions can observe CLI flag values via `getFlag()`.
+    cli_value: FlagDefault = .none,
     extension_path: []u8,
 
     pub fn deinit(self: *ExtensionFlag, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.description) |desc| allocator.free(desc);
         self.default_value.deinit(allocator);
+        self.cli_value.deinit(allocator);
         allocator.free(self.extension_path);
         self.* = undefined;
     }
+};
+
+/// Resolved CLI/runtime flag value used by `Registry.getFlag`. Mirrors
+/// the TypeScript `extensionState.flags[name]` shape: explicit CLI
+/// value wins, else the registered default, else `.none`.
+pub const FlagValue = union(enum) {
+    none,
+    boolean: bool,
+    string: []const u8,
 };
 
 pub const ExtensionTool = struct {
@@ -339,6 +354,42 @@ pub const Registry = struct {
         return false;
     }
 
+    /// Set the parsed CLI value for a registered flag. Mirrors the TS
+    /// `extensionState.flags[name] = value` step the runtime performs
+    /// after parsing the CLI. Returns `true` when the flag is known
+    /// (the value is stored regardless of registration order, but
+    /// callers should register the flag first).
+    pub fn setFlagValue(self: *Registry, name: []const u8, value: FlagDefaultInput) !bool {
+        const idx = self.findFlagIndex(name) orelse return false;
+        var new_value: FlagDefault = switch (value) {
+            .none => .none,
+            .boolean => |b| .{ .boolean = b },
+            .string => |s| .{ .string = try self.allocator.dupe(u8, s) },
+        };
+        errdefer new_value.deinit(self.allocator);
+        self.flags.items[idx].cli_value.deinit(self.allocator);
+        self.flags.items[idx].cli_value = new_value;
+        return true;
+    }
+
+    /// Return the resolved flag value: explicit CLI value if set, else
+    /// the registered default, else `.none`. The returned `.string`
+    /// borrow is valid for the registry lifetime.
+    pub fn getFlag(self: *const Registry, name: []const u8) FlagValue {
+        const idx = self.findFlagIndex(name) orelse return .none;
+        const flag = self.flags.items[idx];
+        switch (flag.cli_value) {
+            .boolean => |b| return .{ .boolean = b },
+            .string => |s| return .{ .string = s },
+            .none => {},
+        }
+        return switch (flag.default_value) {
+            .none => .none,
+            .boolean => |b| .{ .boolean = b },
+            .string => |s| .{ .string = s },
+        };
+    }
+
     pub fn recordUiRequest(self: *Registry, id: []const u8) !void {
         const owned = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(owned);
@@ -361,6 +412,14 @@ pub const FlagDefaultInput = union(enum) {
     none,
     boolean: bool,
     string: []const u8,
+};
+
+/// CLI-parsed flag value the runtime layer hands back to the registry
+/// after parsing `--<name> [value]`. The string payload is borrowed;
+/// `Registry.setFlagValue` clones what it stores.
+pub const ParsedCliFlag = struct {
+    name: []const u8,
+    value: FlagDefaultInput,
 };
 
 fn makeTool(
@@ -454,6 +513,147 @@ fn makeFlag(
         .default_value = default_dup,
         .extension_path = path_dup,
     };
+}
+
+/// Render a deterministic JSON snapshot of the registry to `writer` for
+/// CLI/TS-RPC observability. The snapshot includes tools/labels/
+/// descriptions, commands/descriptions, shortcuts, flag definitions
+/// with parsed CLI values resolved through `getFlag()`, providers +
+/// models, and the captured UI request ids. Order is registration
+/// order to match the underlying ArrayList storage and the
+/// TypeScript listing order.
+pub fn writeRegistrySnapshotJson(
+    allocator: std.mem.Allocator,
+    registry: *const Registry,
+    writer: *std.Io.Writer,
+) !void {
+    const value = try buildRegistryJsonValue(allocator, registry);
+    defer deinitJsonValueLocal(allocator, value);
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registry) !std.json.Value {
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+
+    var tools_array = std.json.Array.init(allocator);
+    for (registry.tools.items) |tool| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
+        try entry.put(allocator, try allocator.dupe(u8, "label"), .{ .string = try allocator.dupe(u8, tool.label) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, tool.extension_path) });
+        try tools_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tools_array });
+
+    var commands_array = std.json.Array.init(allocator);
+    for (registry.commands.items) |cmd| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, cmd.name) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), try optionalStringJson(allocator, cmd.description));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, cmd.extension_path) });
+        try commands_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "commands"), .{ .array = commands_array });
+
+    var shortcuts_array = std.json.Array.init(allocator);
+    for (registry.shortcuts.items) |sc| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "shortcut"), .{ .string = try allocator.dupe(u8, sc.shortcut) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), try optionalStringJson(allocator, sc.description));
+        try entry.put(allocator, try allocator.dupe(u8, "command"), try optionalStringJson(allocator, sc.command));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, sc.extension_path) });
+        try shortcuts_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "shortcuts"), .{ .array = shortcuts_array });
+
+    var flags_array = std.json.Array.init(allocator);
+    for (registry.flags.items) |flag| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, flag.name) });
+        try entry.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, switch (flag.type_kind) {
+            .boolean => "boolean",
+            .string => "string",
+        }) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), try optionalStringJson(allocator, flag.description));
+        try entry.put(allocator, try allocator.dupe(u8, "default"), try flagDefaultToJson(allocator, flag.default_value));
+        const resolved = registry.getFlag(flag.name);
+        try entry.put(allocator, try allocator.dupe(u8, "value"), try flagValueToJson(allocator, resolved));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, flag.extension_path) });
+        try flags_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "flags"), .{ .array = flags_array });
+
+    var providers_array = std.json.Array.init(allocator);
+    for (registry.providers.items) |p| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, p.name) });
+        try entry.put(allocator, try allocator.dupe(u8, "displayName"), try optionalStringJson(allocator, p.display_name));
+        try entry.put(allocator, try allocator.dupe(u8, "baseUrl"), try optionalStringJson(allocator, p.base_url));
+        try entry.put(allocator, try allocator.dupe(u8, "api"), try optionalStringJson(allocator, p.api));
+        var models_array = std.json.Array.init(allocator);
+        for (p.models) |m| {
+            var m_entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+            try m_entry.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, m.id) });
+            try m_entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, m.name) });
+            try models_array.append(.{ .object = m_entry });
+        }
+        try entry.put(allocator, try allocator.dupe(u8, "models"), .{ .array = models_array });
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, p.extension_path) });
+        try providers_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "providers"), .{ .array = providers_array });
+
+    var ids_array = std.json.Array.init(allocator);
+    for (registry.ui_request_ids.items) |id| {
+        try ids_array.append(.{ .string = try allocator.dupe(u8, id) });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "uiRequestIds"), .{ .array = ids_array });
+
+    return .{ .object = root };
+}
+
+fn optionalStringJson(allocator: std.mem.Allocator, value: ?[]const u8) !std.json.Value {
+    if (value) |s| return .{ .string = try allocator.dupe(u8, s) };
+    return .null;
+}
+
+fn flagDefaultToJson(allocator: std.mem.Allocator, default: FlagDefault) !std.json.Value {
+    return switch (default) {
+        .none => .null,
+        .boolean => |b| .{ .bool = b },
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+    };
+}
+
+fn flagValueToJson(allocator: std.mem.Allocator, value: FlagValue) !std.json.Value {
+    return switch (value) {
+        .none => .null,
+        .boolean => |b| .{ .bool = b },
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+    };
+}
+
+fn deinitJsonValueLocal(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .null, .bool, .integer, .float => {},
+        .number_string => |v| allocator.free(v),
+        .string => |s| allocator.free(s),
+        .array => |arr| {
+            for (arr.items) |item| deinitJsonValueLocal(allocator, item);
+            var mut = arr;
+            mut.deinit();
+        },
+        .object => |obj| {
+            var mut = obj;
+            var iter = mut.iterator();
+            while (iter.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                deinitJsonValueLocal(allocator, entry.value_ptr.*);
+            }
+            mut.deinit(allocator);
+        },
+    }
 }
 
 /// Outcome of feeding a single JSONL frame into the registry. Used by
@@ -595,13 +795,16 @@ fn readManifestForPath(allocator: std.mem.Allocator, io: std.Io, path: []const u
     if (std.Io.Dir.readFileAlloc(.cwd(), io, sidecar, allocator, .limited(256 * 1024))) |bytes| {
         return bytes;
     } else |err| switch (err) {
-        error.FileNotFound => {},
+        error.FileNotFound, error.NotDir, error.IsDir => {},
         else => return err,
     }
 
     const dir_manifest = try std.fs.path.join(allocator, &[_][]const u8{ path, "registry.jsonl" });
     defer allocator.free(dir_manifest);
-    return std.Io.Dir.readFileAlloc(.cwd(), io, dir_manifest, allocator, .limited(256 * 1024));
+    return std.Io.Dir.readFileAlloc(.cwd(), io, dir_manifest, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.NotDir, error.IsDir => return error.FileNotFound,
+        else => return err,
+    };
 }
 
 /// Feed a buffer of JSONL frames (one JSON object per line) into the
