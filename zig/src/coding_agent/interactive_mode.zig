@@ -8,6 +8,7 @@ const keybindings_mod = @import("keybindings.zig");
 const resources_mod = @import("resources.zig");
 const session_advanced = @import("session_advanced.zig");
 const session_cwd_mod = @import("session_cwd.zig");
+const missing_cwd_selector_mod = @import("missing_cwd_selector.zig");
 const session_manager_mod = @import("session_manager.zig");
 const provider_config = @import("provider_config.zig");
 const session_mod = @import("session.zig");
@@ -420,9 +421,10 @@ const BootstrapOrExit = union(enum) {
 };
 
 /// Attempts to bootstrap the interactive session. If the stored session cwd
-/// no longer exists, prompts the user to continue in the launch cwd or
-/// cancel; on cancel, returns an exit code; on continue, retries the
-/// bootstrap with `missing_cwd_mode = .use_fallback`.
+/// no longer exists, prompts the user through a TUI Continue/Cancel selector
+/// matching the TypeScript ExtensionSelectorComponent behavior; on cancel,
+/// returns an exit code; on continue, retries the bootstrap with
+/// `missing_cwd_mode = .use_fallback`.
 fn bootstrapInteractiveStateOrPromptMissingCwd(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -460,13 +462,13 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
                 try stderr_writer.flush();
                 return .{ .exit_code = 1 };
             };
-            const continue_in_fallback = try promptInteractiveMissingSessionCwd(
+            const choice = try promptInteractiveMissingSessionCwd(
                 allocator,
                 io,
+                env_map,
                 captured.issue(),
-                stderr_writer,
             );
-            if (!continue_in_fallback) {
+            if (choice == .cancel) {
                 try stderr_writer.writeAll("Resume cancelled\n");
                 try stderr_writer.flush();
                 return .{ .exit_code = 0 };
@@ -499,51 +501,18 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
     }
 }
 
-/// Prompts the user (via stderr/stdin) to continue resuming the session in
-/// the launch cwd or cancel. Returns true when the user agrees to continue,
-/// false when the user cancels.
+/// Prompts the user via the full TUI Continue/Cancel selector to either
+/// continue resuming the session in the launch cwd or cancel. Returns the
+/// resolved `MissingCwdChoice`. Mirrors the TypeScript
+/// `promptForMissingSessionCwd` flow that uses an ExtensionSelectorComponent
+/// with options ["Continue", "Cancel"] before any session mutation.
 fn promptInteractiveMissingSessionCwd(
     allocator: std.mem.Allocator,
     io: std.Io,
+    env_map: *const std.process.Environ.Map,
     issue: session_cwd_mod.MissingSessionCwdIssue,
-    stderr_writer: *std.Io.Writer,
-) !bool {
-    const prompt_body = try session_cwd_mod.formatMissingSessionCwdPrompt(allocator, issue);
-    defer allocator.free(prompt_body);
-    try stderr_writer.print("Session cwd not found\n{s}\n[Continue]/Cancel? [Y/n] ", .{prompt_body});
-    try stderr_writer.flush();
-
-    var stdin_buffer: [1]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
-    while (true) {
-        const byte = stdin_reader.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return false,
-            else => return err,
-        };
-        switch (byte) {
-            '\n' => return true,
-            'y', 'Y' => {
-                _ = consumeRestOfLine(&stdin_reader.interface);
-                return true;
-            },
-            'n', 'N' => {
-                _ = consumeRestOfLine(&stdin_reader.interface);
-                return false;
-            },
-            ' ', '\r', '\t' => continue,
-            else => {
-                _ = consumeRestOfLine(&stdin_reader.interface);
-                return false;
-            },
-        }
-    }
-}
-
-fn consumeRestOfLine(reader: anytype) void {
-    while (true) {
-        const byte = reader.takeByte() catch return;
-        if (byte == '\n') return;
-    }
+) !missing_cwd_selector_mod.MissingCwdChoice {
+    return missing_cwd_selector_mod.runMissingCwdSelector(allocator, io, env_map, issue);
 }
 
 fn appendConfigErrorStartupWarning(
