@@ -135,6 +135,15 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "register_flag",
     "register_provider",
     "unregister_provider",
+    "set_header",
+    "clear_header",
+    "set_footer",
+    "clear_footer",
+    "register_terminal_input",
+    "unregister_terminal_input",
+    "set_editor_component",
+    "clear_editor_component",
+    "clear_ui_hooks_for_reload",
 };
 
 fn isRegistryFrameType(type_name: []const u8) bool {
@@ -300,8 +309,22 @@ pub const ProtocolState = struct {
                     error.OutOfMemory => return err,
                 };
                 switch (outcome) {
-                    .registered_tool, .registered_command, .registered_shortcut,
-                    .registered_flag, .registered_provider, .unregistered_provider => self.registry_frames_applied += 1,
+                    .registered_tool,
+                    .registered_command,
+                    .registered_shortcut,
+                    .registered_flag,
+                    .registered_provider,
+                    .unregistered_provider,
+                    .set_header_hook,
+                    .cleared_header_hook,
+                    .set_footer_hook,
+                    .cleared_footer_hook,
+                    .registered_terminal_input,
+                    .unregistered_terminal_input,
+                    .set_editor_component_hook,
+                    .cleared_editor_component_hook,
+                    .cleared_ui_hooks_for_reload,
+                    => self.registry_frames_applied += 1,
                     .none, .ignored_unsupported => {},
                     .ignored_malformed => try self.addDiagnostic(.malformed_json, .@"error", "host emitted malformed register_* frame"),
                 }
