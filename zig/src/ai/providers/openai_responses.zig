@@ -3400,6 +3400,44 @@ test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error ev
     try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesResponseFailure", .error_reason);
 }
 
+fn expectMissingApiKeyTerminalErrorResponses(
+    stream: *event_stream.AssistantMessageEventStream,
+    expected_provider: []const u8,
+) !void {
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expect(event.error_message != null);
+
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "No API key for provider: {s}",
+        .{expected_provider},
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+
+    // Diagnostic must not leak secrets, environment values, bearer tokens,
+    // credential-store paths, or local auth paths.
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "Bearer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "OPENAI_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/home/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "auth.json") == null);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqualStrings(event.message.?.api, result.api);
+    try std.testing.expectEqualStrings(event.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(event.message.?.model, result.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    std.testing.allocator.free(result.error_message.?);
+}
+
 test "VAL-M9-STREAM-006 stream missing api key returns sanitized terminal error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3413,19 +3451,39 @@ test "VAL-M9-STREAM-006 stream missing api key returns sanitized terminal error"
     );
     defer stream.deinit();
 
-    const event = stream.next().?;
-    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
-    try std.testing.expect(event.message != null);
-    try std.testing.expect(event.error_message != null);
-    try std.testing.expectEqualStrings("No API key for provider: openai", event.error_message.?);
-    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
-    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "test-key") == null);
-    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/") == null);
-    try std.testing.expect(stream.next() == null);
+    try expectMissingApiKeyTerminalErrorResponses(&stream, "openai");
+}
 
-    const result = stream.result().?;
-    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
-    allocator.free(result.error_message.?);
+test "VAL-M9-STREAM-006 streamSimple missing api key returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "" },
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalErrorResponses(&stream, "openai");
+}
+
+test "VAL-M9-STREAM-006 stream null api key options returns sanitized terminal error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        null,
+    );
+    defer stream.deinit();
+
+    try expectMissingApiKeyTerminalErrorResponses(&stream, "openai");
 }
 
 test "VAL-M9-STREAM-010 stream pre-aborted signal yields terminal aborted event without throwing" {
