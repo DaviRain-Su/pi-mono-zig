@@ -1,0 +1,6 @@
+{"type":"register_tool","name":"say-hello","label":"Say Hello","description":"Greets the world (fixture tool)","extensionPath":"registration-fixture/extension.ts"}
+{"type":"register_command","name":"say-hello","description":"Slash command for say-hello","extensionPath":"registration-fixture/extension.ts"}
+{"type":"register_shortcut","shortcut":"ctrl+h","description":"Trigger say-hello","command":"say-hello","extensionPath":"registration-fixture/extension.ts"}
+{"type":"register_flag","name":"plan","valueType":"boolean","default":true,"description":"Enable plan mode (fixture flag)","extensionPath":"registration-fixture/extension.ts"}
+{"type":"register_flag","name":"model-alias","valueType":"string","default":"claude-haiku","description":"Model alias override (fixture flag)","extensionPath":"registration-fixture/extension.ts"}
+{"type":"register_provider","name":"fake-provider","displayName":"Fake Provider","api":"openai-completions","baseUrl":"http://localhost:0","models":[{"id":"fake-model-1","name":"Fake Model 1"},{"id":"fake-model-2","name":"Fake Model 2"}],"extensionPath":"registration-fixture/extension.ts"}
