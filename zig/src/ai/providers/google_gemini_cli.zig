@@ -37,7 +37,24 @@ pub const GoogleGeminiCliProvider = struct {
             allocator.free(auth.project_id);
         }
 
-        var payload = try buildRequestPayload(allocator, model, context, auth.project_id, options);
+        streamProduction(allocator, io, model, context, options, &stream_instance, auth.token, auth.project_id) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+        auth_token: []const u8,
+        project_id: []const u8,
+    ) !void {
+        var payload = try buildRequestPayload(allocator, model, context, project_id, options);
         defer freeJsonValue(allocator, payload);
 
         if (options) |stream_options| {
@@ -57,7 +74,7 @@ pub const GoogleGeminiCliProvider = struct {
 
         var headers = std.StringHashMap([]const u8).init(allocator);
         defer headers.deinit();
-        try headers.put("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{auth.token}));
+        try headers.put("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{auth_token}));
         try headers.put("Content-Type", "application/json");
         try headers.put("Accept", "text/event-stream");
         try headers.put("User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
@@ -95,12 +112,11 @@ pub const GoogleGeminiCliProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -255,6 +271,28 @@ fn emitAuthError(
         .message = message,
     });
     stream_ptr.end(message);
+}
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 
 fn parseSseStreamLines(
@@ -1311,4 +1349,40 @@ test "parseSseStreamLines preserves partial Gemini CLI text before malformed ter
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "stream returns error_event on non-auth setup failure instead of throwing" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-gemini-cli",
+        .provider = "google-gemini-cli",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    var stream = try GoogleGeminiCliProvider.stream(allocator, io, model, context, .{
+        .api_key = "{\"token\":\"cli-token\",\"projectId\":\"test-project\"}",
+    });
+    defer stream.deinit();
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("google-gemini-cli", error_event.message.?.api);
+    try std.testing.expectEqualStrings("google-gemini-cli", error_event.message.?.provider);
+    try std.testing.expect(stream.next() == null);
 }
