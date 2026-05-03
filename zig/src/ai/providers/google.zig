@@ -1498,9 +1498,6 @@ test "stream returns error_event on setup failure instead of throwing" {
     var stream = try GoogleProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
     defer stream.deinit();
 
-    const start = stream.next().?;
-    try std.testing.expectEqual(types.EventType.start, start.event_type);
-
     const error_event = stream.next().?;
     try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
     try std.testing.expect(error_event.message != null);

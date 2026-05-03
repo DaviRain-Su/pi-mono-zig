@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const env_api_keys = @import("../env_api_keys.zig");
 const openai = @import("openai.zig");
 
 pub const KimiProvider = struct {
@@ -18,6 +19,36 @@ pub const KimiProvider = struct {
     ) !event_stream.AssistantMessageEventStream {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
+
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
+        var env_api_key: ?[]u8 = null;
+        defer if (env_api_key) |key| allocator.free(key);
+
+        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
+        const api_key = blk: {
+            if (provided_api_key) |key| break :blk key;
+            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
+            break :blk env_api_key;
+        };
+
+        if (api_key == null or api_key.?.len == 0) {
+            try pushMissingApiKeyError(allocator, stream_instance, model);
+            return;
+        }
 
         const payload = try buildRequestPayload(allocator, model, context, options);
         defer freeJsonValue(allocator, payload);
@@ -39,8 +70,7 @@ pub const KimiProvider = struct {
         try headers.put("Content-Type", "application/json");
         try headers.put("Accept", "text/event-stream");
 
-        const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
-        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?});
         defer allocator.free(auth_header);
         try headers.put("Authorization", auth_header);
 
@@ -73,12 +103,11 @@ pub const KimiProvider = struct {
         if (streaming.status != 200) {
             const response_body = try streaming.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, streaming.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, streaming.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &streaming, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &streaming, model, options);
     }
 
     pub fn streamSimple(
@@ -91,6 +120,57 @@ pub const KimiProvider = struct {
         return try stream(allocator, io, model, context, options);
     }
 };
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
+
+fn pushMissingApiKeyError(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+) !void {
+    const error_message = try std.fmt.allocPrint(
+        allocator,
+        "No API key for provider: {s}",
+        .{model.provider},
+    );
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = message,
+    });
+    stream_ptr.end(message);
+}
 
 const CurrentBlock = union(enum) {
     text: struct {
@@ -1324,4 +1404,47 @@ test "parseSseStreamLines preserves partial Kimi text before malformed terminal 
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "stream returns error_event when API key is empty" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try KimiProvider.stream(allocator, io, model, context, .{ .api_key = "" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "No API key for provider: kimi") != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("kimi-completions", event.message.?.api);
+    try std.testing.expectEqualStrings("kimi", event.message.?.provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    allocator.free(result.error_message.?);
 }
