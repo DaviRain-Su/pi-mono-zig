@@ -1448,3 +1448,48 @@ test "stream returns error_event when API key is empty" {
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     allocator.free(result.error_message.?);
 }
+
+test "stream returns error_event when options is null (no API key available)" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    // When options is null and no KIMI_API_KEY env var is set,
+    // stream() must return a stream with error_event (not throw).
+    var stream = try KimiProvider.stream(allocator, io, model, context, null);
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "No API key for provider: kimi") != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("kimi-completions", event.message.?.api);
+    try std.testing.expectEqualStrings("kimi", event.message.?.provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    allocator.free(result.error_message.?);
+}
