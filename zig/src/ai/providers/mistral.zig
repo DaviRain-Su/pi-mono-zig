@@ -98,21 +98,21 @@ pub const MistralProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
 
-        if (options) |stream_options| {
-            if (stream_options.on_payload) |callback| {
-                if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
-                    payload = replacement;
-                }
-            }
-        }
-
-        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        defer allocator.free(json_body);
-
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
         var env_api_key: ?[]u8 = null;
         defer if (env_api_key) |key| allocator.free(key);
 
@@ -141,8 +141,23 @@ pub const MistralProvider = struct {
                 .message = message,
             });
             stream_instance.end(message);
-            return stream_instance;
+            return;
         }
+
+        var payload = try buildRequestPayload(allocator, model, context, options);
+        defer freeJsonValue(allocator, payload);
+
+        if (options) |stream_options| {
+            if (stream_options.on_payload) |callback| {
+                if (try callback(allocator, payload, model)) |replacement| {
+                    freeJsonValue(allocator, payload);
+                    payload = replacement;
+                }
+            }
+        }
+
+        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        defer allocator.free(json_body);
 
         const url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url});
         defer allocator.free(url);
@@ -189,12 +204,11 @@ pub const MistralProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -1183,6 +1197,27 @@ fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
+
 test "VAL-MSG-010 Mistral skips failed assistants" {
     const allocator = std.testing.allocator;
     const model = types.Model{
@@ -1603,4 +1638,122 @@ test "parseSseStreamLines preserves partial Mistral text before malformed termin
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "stream returns error_event when API key is empty" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    const model = types.Model{
+        .id = "mistral-small-latest",
+        .name = "Mistral Small",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    var stream = try MistralProvider.stream(allocator, io, model, context, .{ .api_key = "" });
+    defer stream.deinit();
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "No API key for provider: mistral") != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("mistral-conversations", event.message.?.api);
+    try std.testing.expectEqualStrings("mistral", event.message.?.provider);
+    try std.testing.expectEqualStrings("mistral-small-latest", event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    allocator.free(result.error_message.?);
+}
+
+test "stream returns error_event when options is null (no API key available)" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    const model = types.Model{
+        .id = "mistral-small-latest",
+        .name = "Mistral Small",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    // When options is null and no MISTRAL_API_KEY env var is set,
+    // stream() must return a stream with error_event (not throw).
+    var stream = try MistralProvider.stream(allocator, io, model, context, null);
+    defer stream.deinit();
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "No API key for provider: mistral") != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("mistral-conversations", event.message.?.api);
+    try std.testing.expectEqualStrings("mistral", event.message.?.provider);
+    try std.testing.expectEqualStrings("mistral-small-latest", event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+    allocator.free(result.error_message.?);
+}
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const model = types.Model{
+        .id = "mistral-small-latest",
+        .name = "Mistral Small",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    var stream = try MistralProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("mistral-conversations", error_event.message.?.api);
+    try std.testing.expectEqualStrings("mistral", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("mistral-small-latest", error_event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
 }
