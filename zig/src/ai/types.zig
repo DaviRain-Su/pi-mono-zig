@@ -97,12 +97,12 @@ pub const CacheRetention = enum {
     long,
 };
 
- pub const Transport = enum {
-     sse,
-     websocket,
-     websocket_cached,
-     auto,
- };
+pub const Transport = enum {
+    sse,
+    websocket,
+    websocket_cached,
+    auto,
+};
 
 pub const StopReason = enum {
     stop,
