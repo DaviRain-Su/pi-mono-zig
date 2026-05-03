@@ -117,6 +117,49 @@ test "buildBaseOptions applies defaults and explicit api key override" {
     try std.testing.expectEqualStrings("auto", base.google_tool_choice.?);
 }
 
+test "buildBaseOptions supports websocket_cached transport flag" {
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const options = types.SimpleStreamOptions{
+        .transport = .websocket_cached,
+    };
+
+    const base = buildBaseOptions(model, options, null);
+    // Ensure the transport value is propagated through
+    try std.testing.expect(base.transport == .websocket_cached);
+}
+
+test "buildBaseOptions respects short cache retention and session_id usage" {
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    const options = types.SimpleStreamOptions{
+        .cache_retention = .short,
+        .session_id = "sess-1",
+    };
+
+    const base = buildBaseOptions(model, options, null);
+    try std.testing.expectEqual(types.CacheRetention.short, base.cache_retention);
+    try std.testing.expectEqualStrings("sess-1", base.session_id.?);
+}
+
 test "clampReasoning downgrades xhigh only" {
     try std.testing.expectEqual(@as(?types.ThinkingLevel, .high), clampReasoning(.xhigh));
     try std.testing.expectEqual(@as(?types.ThinkingLevel, .medium), clampReasoning(.medium));
