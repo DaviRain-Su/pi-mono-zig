@@ -1204,6 +1204,7 @@ test "built-in representative provider families convert setup failures into term
         .{ .api = "openai-responses", .provider = "openai" },
         .{ .api = "anthropic-messages", .provider = "anthropic" },
         .{ .api = "google-generative-ai", .provider = "google" },
+        .{ .api = "google-vertex", .provider = "google-vertex" },
     };
 
     for (cases) |case| {
