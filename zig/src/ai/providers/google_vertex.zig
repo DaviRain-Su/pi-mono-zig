@@ -2023,3 +2023,43 @@ test "stream returns error_event on non-auth setup failure instead of throwing" 
     try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
 }
+
+test "stream returns auth error when Google Vertex credentials are missing" {
+    // VAL-STREAM-010: auth error path in stream() returns a stream with error_event
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Vertex Gemini 2.5 Pro",
+        .api = "google-vertex",
+        .provider = "google-vertex",
+        .base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/test-project/locations/us-central1/publishers/google",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    // Pass options with empty api_key so env var lookup is skipped but no valid key is provided
+    var stream = try GoogleVertexProvider.stream(allocator, io, model, context, .{ .api_key = "" });
+    defer stream.deinit();
+
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("google-vertex", error_event.message.?.api);
+    try std.testing.expectEqualStrings("google-vertex", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", error_event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+}

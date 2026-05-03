@@ -1493,3 +1493,42 @@ test "stream returns error_event when options is null (no API key available)" {
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     allocator.free(result.error_message.?);
 }
+
+test "stream returns error_event on non-API-key setup failure instead of throwing" {
+    // VAL-STREAM-003: streamProduction wrapper catches connection failures when API key is present
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try KimiProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("kimi-completions", error_event.message.?.api);
+    try std.testing.expectEqualStrings("kimi", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", error_event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+}
