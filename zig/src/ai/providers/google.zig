@@ -18,6 +18,21 @@ pub const GoogleProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
         var payload = try buildRequestPayload(allocator, model, context, options);
         defer freeJsonValue(allocator, payload);
 
@@ -77,12 +92,11 @@ pub const GoogleProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -95,6 +109,28 @@ pub const GoogleProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
@@ -1434,4 +1470,96 @@ test "parseSseStreamLines preserves partial Google text before malformed termina
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try GoogleProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, start.event_type);
+
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("google-generative-ai", error_event.message.?.api);
+    try std.testing.expectEqualStrings("google", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("gemini-2.5-flash", error_event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+}
+
+test "stream happy path unchanged after streamProduction refactor" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("Hello", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 5), done.message.?.usage.output);
 }
