@@ -120,6 +120,22 @@ pub const GoogleVertexProvider = struct {
         };
         defer auth_header.deinit(allocator);
 
+        streamProduction(allocator, io, model, context, options, &stream_instance, auth_header) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+        auth_header: OwnedHeader,
+    ) !void {
         var payload = try buildRequestPayload(allocator, model, context, options);
         defer freeJsonValue(allocator, payload);
 
@@ -175,12 +191,11 @@ pub const GoogleVertexProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -1050,6 +1065,28 @@ fn authErrorMessage(err: anyerror) []const u8 {
         error.OAuthTokenRequestFailed, error.InvalidTokenResponse, error.MissingAccessToken => "Vertex AI OAuth token exchange failed.",
         else => "Vertex AI authentication failed.",
     };
+}
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 
 fn buildContentsValue(
