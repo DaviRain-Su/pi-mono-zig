@@ -271,7 +271,7 @@ pub fn handleInputKey(
     }
 
     if (resolveAppAction(live_resources.keybindings, key)) |action| {
-        if (action == .paste_image) {
+        if (action == .clipboard_pasteImage) {
             try handlePasteImageAction(allocator, io, env_map, app_state);
             return;
         }
@@ -735,7 +735,7 @@ pub fn dispatchInputEvent(
             if (overlay.* == null and auth_flow.* == null) {
                 if (resolveParsedAppAction(live_resources.keybindings, key, parsed.modifiers)) |action| {
                     switch (action) {
-                        .queue_follow_up => {
+                        .message_followUp => {
                             try handleFollowUpAction(
                                 allocator,
                                 io,
@@ -758,7 +758,7 @@ pub fn dispatchInputEvent(
                             consumeInputBytes(input_buffer, parsed.consumed);
                             return;
                         },
-                        .dequeue_messages => {
+                        .message_dequeue => {
                             try handleDequeueAction(allocator, session, app_state, editor);
                             consumeInputBytes(input_buffer, parsed.consumed);
                             return;
@@ -844,25 +844,35 @@ pub fn legacyParsedAppActionForKey(
 ) ?keybindings_mod.Action {
     if (modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super) {
         return switch (key) {
-            .enter => .queue_follow_up,
-            .up => .dequeue_messages,
+            .enter => .message_followUp,
+            .up => .message_dequeue,
+            else => null,
+        };
+    }
+
+    if (modifiers.shift and !modifiers.alt and !modifiers.ctrl and !modifiers.super) {
+        return switch (key) {
+            .shift_tab => .thinking_cycle,
             else => null,
         };
     }
 
     return switch (key) {
         .ctrl => |ctrl| switch (ctrl) {
-            'c' => .interrupt,
+            'c' => .clear,
             'd' => .exit,
-            'l' => .clear,
-            's' => .open_sessions,
-            'p' => .open_models,
-            'v' => .paste_image,
-            'g' => .chat_scroll_to_tail,
-            'r' => .toggle_expand_all,
+            'l' => .model_select,
+            'o' => .tools_expand,
+            't' => .thinking_toggle,
+            'n' => .session_toggleNamedFilter,
+            'g' => .editor_external,
+            'v' => .clipboard_pasteImage,
+            'z' => .app_suspend,
+            'p' => .model_cycleForward,
             else => null,
         },
-        .escape => .exit,
+        .escape => .interrupt,
+        .shift_tab => .thinking_cycle,
         else => null,
     };
 }
@@ -898,24 +908,23 @@ pub fn handleAppAction(
             if (prompt_worker_active.*) session.agent.abort();
         },
         .clear => app_state.clearDisplay(),
-        .open_sessions => {
+        .session_tree => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before switching sessions");
                 return;
             }
             overlay.* = try loadSessionOverlay(allocator, io, session_dir);
         },
-        .open_models => {
+        .model_select => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
             overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, model_patterns, runtime_config);
         },
-        .queue_follow_up, .dequeue_messages => {},
-        .paste_image => {},
-        .chat_scroll_to_tail => app_state.chatScrollToTail(),
-        .toggle_expand_all => app_state.toggleAllExpanded(),
+        .message_followUp, .message_dequeue => {},
+        .clipboard_pasteImage => {},
+        else => {},
     }
 }
 
@@ -929,7 +938,7 @@ test "protocol events update kitty state through app context" {
 }
 
 test "legacy app actions include clipboard image paste" {
-    try std.testing.expectEqual(keybindings_mod.Action.paste_image, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
-    try std.testing.expectEqual(keybindings_mod.Action.chat_scroll_to_tail, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
-    try std.testing.expectEqual(keybindings_mod.Action.toggle_expand_all, legacyAppActionForKey(.{ .ctrl = 'r' }).?);
+    try std.testing.expectEqual(keybindings_mod.Action.clipboard_pasteImage, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
+    try std.testing.expectEqual(keybindings_mod.Action.editor_external, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
+    try std.testing.expect(legacyAppActionForKey(.{ .ctrl = 'r' }) == null);
 }
