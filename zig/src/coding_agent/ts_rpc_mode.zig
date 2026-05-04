@@ -308,14 +308,16 @@ const PromptTask = struct {
         // pollute the TS-RPC output stream.
         if (self.id != null) {
             try self.server.writeSuccessResponseNoData(self.id, "prompt");
-            // TypeScript's RPC dispatcher accepts the prompt synchronously, then
-            // continues processing already-buffered JSONL input before later agent
-            // events can dominate the output stream. Yield briefly after the
-            // acceptance response so rapid controls can be handled in dispatcher
-            // order instead of racing the prompt worker.
+            // Signal the main thread that the response has been written before
+            // sleeping. This allows the dispatcher to process already-buffered
+            // JSONL input (abort, steer, follow_up, etc.) during the yield window
+            // so those commands are fully processed before agent events begin.
+            self.response_sent.store(true, .seq_cst);
+            // Yield briefly so rapid controls can be handled in dispatcher order
+            // instead of racing the prompt worker. The sleep must come after
+            // response_sent.store so the main thread unblocks first.
             std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch {};
         }
-        self.response_sent.store(true, .seq_cst);
     }
 };
 
