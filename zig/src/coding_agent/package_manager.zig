@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("tools/common.zig");
 const resources_mod = @import("resources.zig");
+const tui_mod = @import("tui");
 
 /// Package CLI subcommand parser/executor parity with the TypeScript
 /// `package-manager-cli.ts`. Scope for M12 m12-package-cli-local-fixtures:
@@ -455,6 +456,13 @@ pub const ExecuteOptions = struct {
     /// Slice of argv strings; the first element is the executable.
     /// Set to an empty slice to simulate "no package manager found".
     self_update_command_override: ?[]const []const u8 = null,
+    /// When true and no --toggle flag is given, bare `pi config` launches
+    /// the interactive TUI config selector instead of the non-interactive
+    /// listing. Defaults to false so tests always see the listing output.
+    stdout_is_tty: bool = false,
+    /// Required when stdout_is_tty is true; used to initialize the vaxis
+    /// terminal backend. When null, TUI is disabled even if stdout_is_tty.
+    env_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const ExecuteResult = struct {
@@ -503,10 +511,23 @@ fn executeConfig(
 ) !ExecuteResult {
     _ = stderr;
 
-    // Bare `pi config`: print a deterministic listing of toggle kinds
-    // plus an explicit note that interactive TUI release/binary
-    // packaging is intentionally out of scope for this build.
+    // Bare `pi config` (no --toggle flag): launch interactive TUI when
+    // stdout is a TTY, otherwise print the non-interactive listing.
     if (command.config_options.toggle_kind == null or command.config_options.toggle_pattern == null) {
+        if (options.stdout_is_tty) {
+            if (options.env_map) |env_map| {
+                const settings_path = try settingsPathForScope(allocator, options, command.local);
+                defer allocator.free(settings_path);
+                try runConfigSelector(.{
+                    .allocator = allocator,
+                    .io = io,
+                    .env_map = env_map,
+                    .settings_path = settings_path,
+                });
+                return .{ .exit_code = 0 };
+            }
+        }
+        // Non-TTY fallback: print deterministic listing.
         try stdout.writeAll(
             \\Configurable resource kinds: extensions, skills, prompts, themes.
             \\
@@ -1290,6 +1311,320 @@ fn findInstalledScope(
 fn freeOwnedStrings(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
     for (list.items) |entry| allocator.free(entry);
     list.deinit(allocator);
+}
+
+// ---------------------------------------------------------------------
+// Config Selector: interactive TUI for bare `pi config` on a TTY.
+// The state machine (ConfigSelectorState) is kept separate from the
+// vaxis draw/input loop so automated tests can exercise key handling
+// without spawning a real terminal.
+// ---------------------------------------------------------------------
+
+/// A single toggleable entry loaded from a settings.json kind array.
+pub const ConfigSelectorEntry = struct {
+    kind: ConfigKind,
+    /// Pattern without +/- prefix; owned by the allocator.
+    pattern: []u8,
+    /// Current enabled state: +pattern = true, -/! pattern = false.
+    enabled: bool,
+    /// Set to true when the user toggles this entry in the selector.
+    changed: bool = false,
+
+    fn deinit(self: *ConfigSelectorEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.pattern);
+        self.* = undefined;
+    }
+};
+
+/// Pure state machine for the interactive config selector. Contains no
+/// vaxis types so tests can drive it without starting a terminal.
+pub const ConfigSelectorState = struct {
+    entries: std.ArrayList(ConfigSelectorEntry),
+    selected: usize = 0,
+
+    pub fn deinit(self: *ConfigSelectorState, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| entry.deinit(allocator);
+        self.entries.deinit(allocator);
+        self.entries = .empty;
+        self.selected = 0;
+    }
+
+    /// Move cursor up (wraps around).
+    pub fn moveUp(self: *ConfigSelectorState) void {
+        if (self.entries.items.len == 0) return;
+        if (self.selected == 0) {
+            self.selected = self.entries.items.len - 1;
+        } else {
+            self.selected -= 1;
+        }
+    }
+
+    /// Move cursor down (wraps around).
+    pub fn moveDown(self: *ConfigSelectorState) void {
+        if (self.entries.items.len == 0) return;
+        self.selected = (self.selected + 1) % self.entries.items.len;
+    }
+
+    /// Toggle the enabled state of the currently selected entry.
+    pub fn toggleSelected(self: *ConfigSelectorState) void {
+        if (self.selected >= self.entries.items.len) return;
+        const entry = &self.entries.items[self.selected];
+        entry.enabled = !entry.enabled;
+        entry.changed = true;
+    }
+
+    /// Returns true if any entry was toggled since the state was loaded.
+    pub fn hasChanges(self: *const ConfigSelectorState) bool {
+        for (self.entries.items) |entry| {
+            if (entry.changed) return true;
+        }
+        return false;
+    }
+};
+
+/// Load all toggleable entries from settings.json for a single scope.
+/// Each array entry in extensions/skills/prompts/themes becomes a
+/// ConfigSelectorEntry with its current +/- enabled state.
+fn loadSelectorState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    settings_path: []const u8,
+) !ConfigSelectorState {
+    var state = ConfigSelectorState{ .entries = .empty };
+    errdefer state.deinit(allocator);
+
+    var settings_object = try loadSettingsObject(allocator, io, settings_path);
+    defer {
+        const owner: std.json.Value = .{ .object = settings_object };
+        common.deinitJsonValue(allocator, owner);
+    }
+
+    const kinds = [_]ConfigKind{ .extensions, .skills, .prompts, .themes };
+    for (kinds) |kind| {
+        const key = kind.settingsKey();
+        const value = settings_object.get(key) orelse continue;
+        if (value != .array) continue;
+        for (value.array.items) |item| {
+            if (item != .string) continue;
+            const raw = item.string;
+            if (raw.len == 0) continue;
+            const has_prefix = raw[0] == '+' or raw[0] == '-' or raw[0] == '!';
+            const enabled = !has_prefix or raw[0] == '+';
+            const pat = if (has_prefix) raw[1..] else raw;
+            if (pat.len == 0) continue;
+            const pattern_owned = try allocator.dupe(u8, pat);
+            errdefer allocator.free(pattern_owned);
+            try state.entries.append(allocator, .{
+                .kind = kind,
+                .pattern = pattern_owned,
+                .enabled = enabled,
+            });
+        }
+    }
+    return state;
+}
+
+/// Write all changed entries from the selector state back to settings.json.
+/// Mirrors the --toggle semantics: remove old +/-/! entry for the same
+/// pattern, then append the new +/- entry.
+/// Does nothing when no entries were changed (file is left untouched).
+fn saveSelectorState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    settings_path: []const u8,
+    state: *const ConfigSelectorState,
+) !void {
+    if (!state.hasChanges()) return;
+    var settings_object = try loadSettingsObject(allocator, io, settings_path);
+    defer {
+        const owner: std.json.Value = .{ .object = settings_object };
+        common.deinitJsonValue(allocator, owner);
+    }
+
+    for (state.entries.items) |entry| {
+        if (!entry.changed) continue;
+        const array_ptr = try ensureKindArray(allocator, &settings_object, entry.kind);
+
+        // Remove any previous +/-/! entry for this pattern.
+        var idx: usize = 0;
+        while (idx < array_ptr.items.len) {
+            const item = array_ptr.items[idx];
+            const matches = blk: {
+                if (item != .string) break :blk false;
+                const v = item.string;
+                const stripped = if (v.len > 0 and (v[0] == '+' or v[0] == '-' or v[0] == '!'))
+                    v[1..]
+                else
+                    v;
+                break :blk std.mem.eql(u8, stripped, entry.pattern);
+            };
+            if (matches) {
+                const removed = array_ptr.orderedRemove(idx);
+                common.deinitJsonValue(allocator, removed);
+                continue;
+            }
+            idx += 1;
+        }
+
+        const prefix: u8 = if (entry.enabled) '+' else '-';
+        const new_entry = try std.fmt.allocPrint(allocator, "{c}{s}", .{ prefix, entry.pattern });
+        errdefer allocator.free(new_entry);
+        try array_ptr.append(.{ .string = new_entry });
+    }
+
+    try writeSettingsObject(allocator, io, settings_path, settings_object);
+}
+
+/// Options for the interactive config selector TUI runner.
+pub const ConfigSelectorRunOptions = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    settings_path: []const u8,
+};
+
+/// Run the interactive config selector TUI. Initializes a vaxis terminal,
+/// renders the selector, processes keyboard input, and persists changes on
+/// Enter. Exits cleanly on Esc or q without writing changes.
+pub fn runConfigSelector(opts: ConfigSelectorRunOptions) !void {
+    var state = try loadSelectorState(opts.allocator, opts.io, opts.settings_path);
+    defer state.deinit(opts.allocator);
+
+    var terminal = tui_mod.Terminal.initNative(.{
+        .io = opts.io,
+        .env_map = opts.env_map,
+    });
+    try terminal.start();
+    defer terminal.stop();
+
+    var input_loop = try terminal.initInputLoop(opts.allocator, opts.io, opts.env_map);
+    defer input_loop.deinit();
+    input_loop.vaxis_state.queryTerminal(input_loop.loop.tty.writer(), .fromMilliseconds(250)) catch {};
+
+    var renderer = tui_mod.Renderer.init(opts.allocator, &terminal);
+    defer renderer.deinit();
+
+    var should_quit = false;
+    var should_save = false;
+
+    while (!should_quit) {
+        const screen = ConfigSelectorScreen{ .state = &state };
+        try renderer.renderToVaxis(
+            screen.drawComponent(),
+            input_loop.vaxis_state,
+            input_loop.loop.tty.writer(),
+        );
+
+        var got_input = false;
+        while (try input_loop.tryInputEvent()) |event| {
+            defer event.deinit(opts.allocator);
+            got_input = true;
+            switch (event.parsed.event) {
+                .key => |key| switch (key) {
+                    .up => state.moveUp(),
+                    .down => state.moveDown(),
+                    .enter => {
+                        should_save = true;
+                        should_quit = true;
+                    },
+                    .escape => should_quit = true,
+                    .ctrl => |c| if (c == 'c') {
+                        should_quit = true;
+                    },
+                    .printable => |pk| {
+                        const s = pk.slice();
+                        if (std.mem.eql(u8, s, " ")) {
+                            state.toggleSelected();
+                        } else if (std.mem.eql(u8, s, "q")) {
+                            should_quit = true;
+                        }
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+
+        if (!got_input) {
+            std.Io.sleep(opts.io, .fromMilliseconds(50), .awake) catch {};
+        }
+    }
+
+    if (should_save and state.hasChanges()) {
+        try saveSelectorState(opts.allocator, opts.io, opts.settings_path, &state);
+    }
+}
+
+/// Vaxis draw component for the config selector screen.
+const ConfigSelectorScreen = struct {
+    state: *const ConfigSelectorState,
+
+    pub fn drawComponent(self: *const ConfigSelectorScreen) tui_mod.DrawComponent {
+        return .{ .ptr = self, .drawFn = drawOpaque };
+    }
+
+    fn drawOpaque(
+        ptr: *const anyopaque,
+        window: tui_mod.vaxis.Window,
+        ctx: tui_mod.DrawContext,
+    ) std.mem.Allocator.Error!tui_mod.DrawSize {
+        _ = ctx;
+        const self: *const ConfigSelectorScreen = @ptrCast(@alignCast(ptr));
+        return self.draw(window);
+    }
+
+    pub fn draw(
+        self: *const ConfigSelectorScreen,
+        window: tui_mod.vaxis.Window,
+    ) std.mem.Allocator.Error!tui_mod.DrawSize {
+        window.clear();
+        var row: u16 = 0;
+
+        row = drawSelectorLine(window, row, "Config Selector");
+        row = drawSelectorLine(window, row, "Up/Down navigate  Space toggle  Enter save  Esc/q cancel");
+        if (row < window.height) row += 1; // blank line
+
+        const entries = self.state.entries.items;
+        if (entries.len == 0) {
+            row = drawSelectorLine(window, row, "  No entries in settings. Use --toggle to add entries.");
+        } else {
+            // Compute scroll offset to keep selected entry visible.
+            const header_rows: usize = row;
+            const visible: usize = if (window.height > header_rows) window.height - header_rows else 0;
+            const scroll: usize = blk: {
+                if (visible == 0) break :blk 0;
+                const sel = self.state.selected;
+                const half = visible / 2;
+                if (sel < half) break :blk 0;
+                const max_s = if (entries.len > visible) entries.len - visible else 0;
+                break :blk @min(sel - half, max_s);
+            };
+
+            for (entries, 0..) |entry, i| {
+                if (i < scroll) continue;
+                if (row >= window.height) break;
+                const cursor: []const u8 = if (i == self.state.selected) "> " else "  ";
+                const checkbox: []const u8 = if (entry.enabled) "[x]" else "[ ]";
+                const kind_label = entry.kind.settingsKey();
+                var item_buf: [256]u8 = undefined;
+                const item_line = std.fmt.bufPrint(
+                    &item_buf,
+                    "{s}{s} {s}: {s}",
+                    .{ cursor, checkbox, kind_label, entry.pattern },
+                ) catch entry.pattern;
+                row = drawSelectorLine(window, row, item_line);
+            }
+        }
+
+        return .{ .width = window.width, .height = row };
+    }
+};
+
+fn drawSelectorLine(window: tui_mod.vaxis.Window, row: u16, text: []const u8) u16 {
+    if (row >= window.height) return row;
+    const line_win = window.child(.{ .y_off = row, .height = 1 });
+    _ = line_win.printSegment(.{ .text = text }, .{ .wrap = .none });
+    return row + 1;
 }
 
 // ---------------------------------------------------------------------
@@ -3570,4 +3905,272 @@ test "VAL-PKG-172 unknown flag on any command reports error with usage" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "--bogus") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "pi install") != null);
     try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+// ---------------------------------------------------------------------------
+// Config selector state machine tests (VAL-PKG-140..143 programmatic driver).
+// These test the pure state machine without starting a real terminal.
+// ---------------------------------------------------------------------------
+
+test "ConfigSelectorState moveDown wraps from last to first" {
+    const allocator = std.testing.allocator;
+    var state = ConfigSelectorState{ .entries = .empty };
+    defer state.deinit(allocator);
+
+    const p0 = try allocator.dupe(u8, "foo");
+    errdefer allocator.free(p0);
+    const p1 = try allocator.dupe(u8, "bar");
+    errdefer allocator.free(p1);
+    try state.entries.append(allocator, .{ .kind = .extensions, .pattern = p0, .enabled = true });
+    try state.entries.append(allocator, .{ .kind = .extensions, .pattern = p1, .enabled = false });
+
+    state.selected = 1;
+    state.moveDown();
+    try std.testing.expectEqual(@as(usize, 0), state.selected);
+}
+
+test "ConfigSelectorState moveUp wraps from first to last" {
+    const allocator = std.testing.allocator;
+    var state = ConfigSelectorState{ .entries = .empty };
+    defer state.deinit(allocator);
+
+    const p0 = try allocator.dupe(u8, "foo");
+    errdefer allocator.free(p0);
+    const p1 = try allocator.dupe(u8, "bar");
+    errdefer allocator.free(p1);
+    try state.entries.append(allocator, .{ .kind = .extensions, .pattern = p0, .enabled = true });
+    try state.entries.append(allocator, .{ .kind = .extensions, .pattern = p1, .enabled = false });
+
+    state.selected = 0;
+    state.moveUp();
+    try std.testing.expectEqual(@as(usize, 1), state.selected);
+}
+
+test "ConfigSelectorState toggleSelected inverts enabled and marks changed" {
+    const allocator = std.testing.allocator;
+    var state = ConfigSelectorState{ .entries = .empty };
+    defer state.deinit(allocator);
+
+    const pat = try allocator.dupe(u8, "my-ext");
+    errdefer allocator.free(pat);
+    try state.entries.append(allocator, .{ .kind = .extensions, .pattern = pat, .enabled = true });
+
+    try std.testing.expect(!state.hasChanges());
+    state.toggleSelected();
+    try std.testing.expect(state.hasChanges());
+    try std.testing.expect(!state.entries.items[0].enabled);
+    try std.testing.expect(state.entries.items[0].changed);
+}
+
+test "ConfigSelectorState hasChanges false when no toggle applied" {
+    const allocator = std.testing.allocator;
+    var state = ConfigSelectorState{ .entries = .empty };
+    defer state.deinit(allocator);
+
+    const pat = try allocator.dupe(u8, "ext1");
+    errdefer allocator.free(pat);
+    try state.entries.append(allocator, .{ .kind = .extensions, .pattern = pat, .enabled = true });
+
+    try std.testing.expect(!state.hasChanges());
+}
+
+test "loadSelectorState parses enabled and disabled entries from settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "extensions": ["+foo", "-bar"],
+        \\  "skills": ["+my-skill"]
+        \\}
+    , true);
+
+    var state = try loadSelectorState(allocator, std.testing.io, settings_path);
+    defer state.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), state.entries.items.len);
+
+    // First entry: +foo → enabled
+    try std.testing.expectEqualStrings("foo", state.entries.items[0].pattern);
+    try std.testing.expect(state.entries.items[0].enabled);
+    try std.testing.expect(state.entries.items[0].kind == .extensions);
+
+    // Second entry: -bar → disabled
+    try std.testing.expectEqualStrings("bar", state.entries.items[1].pattern);
+    try std.testing.expect(!state.entries.items[1].enabled);
+
+    // Third entry: +my-skill → enabled
+    try std.testing.expectEqualStrings("my-skill", state.entries.items[2].pattern);
+    try std.testing.expect(state.entries.items[2].enabled);
+    try std.testing.expect(state.entries.items[2].kind == .skills);
+}
+
+test "loadSelectorState returns empty state for missing settings file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const missing_path = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent/nonexistent.json");
+    defer allocator.free(missing_path);
+
+    var state = try loadSelectorState(allocator, std.testing.io, missing_path);
+    defer state.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), state.entries.items.len);
+}
+
+test "saveSelectorState writes changed entries and replaces stale entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    // Start with +foo enabled in settings.
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "extensions": ["+foo"] }
+    , true);
+
+    // Build a state with foo toggled to disabled.
+    var state = ConfigSelectorState{ .entries = .empty };
+    defer state.deinit(allocator);
+    const pat = try allocator.dupe(u8, "foo");
+    errdefer allocator.free(pat);
+    try state.entries.append(allocator, .{
+        .kind = .extensions,
+        .pattern = pat,
+        .enabled = false,
+        .changed = true,
+    });
+
+    try saveSelectorState(allocator, std.testing.io, settings_path, &state);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+
+    // Must have exactly one entry: -foo.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, after, "foo"));
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"-foo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"+foo\"") == null);
+}
+
+test "saveSelectorState does not write unchanged entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "extensions": ["+foo"] }
+    , true);
+    const before = try readSettings(allocator, settings_path);
+    defer allocator.free(before);
+
+    // Build a state with foo NOT changed.
+    var state = ConfigSelectorState{ .entries = .empty };
+    defer state.deinit(allocator);
+    const pat = try allocator.dupe(u8, "foo");
+    errdefer allocator.free(pat);
+    try state.entries.append(allocator, .{
+        .kind = .extensions,
+        .pattern = pat,
+        .enabled = true,
+        .changed = false, // unchanged
+    });
+
+    try saveSelectorState(allocator, std.testing.io, settings_path, &state);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "config selector simulate navigate+toggle+save flow persists to settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "extensions": ["+ext-a", "-ext-b"] }
+    , true);
+
+    var state = try loadSelectorState(allocator, std.testing.io, settings_path);
+    defer state.deinit(allocator);
+
+    // Verify initial state: ext-a enabled, ext-b disabled.
+    try std.testing.expectEqual(@as(usize, 2), state.entries.items.len);
+    try std.testing.expect(state.entries.items[0].enabled);  // ext-a
+    try std.testing.expect(!state.entries.items[1].enabled); // ext-b
+
+    // Simulate: moveDown to select ext-b (index 1), toggle it enabled.
+    state.moveDown();
+    try std.testing.expectEqual(@as(usize, 1), state.selected);
+    state.toggleSelected();
+    try std.testing.expect(state.entries.items[1].enabled);
+    try std.testing.expect(state.hasChanges());
+
+    // Simulate Enter: save.
+    try saveSelectorState(allocator, std.testing.io, settings_path, &state);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+
+    // ext-b must now be +ext-b.
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"+ext-b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"-ext-b\"") == null);
+    // ext-a must remain +ext-a (unchanged).
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"+ext-a\"") != null);
+}
+
+test "config selector simulate esc flow does not persist changes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "extensions": ["+ext-a"] }
+    , true);
+    const before = try readSettings(allocator, settings_path);
+    defer allocator.free(before);
+
+    var state = try loadSelectorState(allocator, std.testing.io, settings_path);
+    defer state.deinit(allocator);
+
+    // Toggle (simulate space key).
+    state.toggleSelected();
+    try std.testing.expect(state.hasChanges());
+
+    // Simulate Esc: do NOT call saveSelectorState.
+    // Settings file must be unchanged.
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
