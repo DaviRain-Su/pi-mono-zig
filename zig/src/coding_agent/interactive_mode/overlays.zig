@@ -391,8 +391,8 @@ pub fn loadHotkeysOverlay(
     try appendHotkeyOverlayItem(allocator, &items, bindings, .interrupt, "Cancel autocomplete or abort streaming");
     try appendHotkeyOverlayItem(allocator, &items, bindings, .clear, "Clear the chat display");
     try appendHotkeyOverlayItem(allocator, &items, bindings, .exit, "Exit interactive mode");
-    try appendHotkeyOverlayItem(allocator, &items, bindings, .open_sessions, "Open the session selector");
-    try appendHotkeyOverlayItem(allocator, &items, bindings, .open_models, "Open the model selector");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .session_tree, "Open the session selector");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .model_select, "Open the model selector");
     try appendInfoOverlayItem(allocator, &items, "Enter", try allocator.dupe(u8, "Submit the current prompt"));
     try appendInfoOverlayItem(allocator, &items, "Tab", try allocator.dupe(u8, "Accept the selected autocomplete entry"));
     try appendInfoOverlayItem(allocator, &items, "/", try allocator.dupe(u8, "Start a slash command"));

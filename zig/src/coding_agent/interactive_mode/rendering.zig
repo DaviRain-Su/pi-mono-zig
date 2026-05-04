@@ -1952,7 +1952,7 @@ fn drawQueuedMessages(
         const line = try std.fmt.allocPrint(ctx.arena, "Follow-up: {s}", .{queued});
         row += drawWrappedText(window, row, line, status_style);
     }
-    const dequeue_label = try actionLabel(ctx.arena, keybindings, .dequeue_messages, "Alt+Up");
+    const dequeue_label = try actionLabel(ctx.arena, keybindings, .message_dequeue, "Alt+Up");
     const hint = try std.fmt.allocPrint(ctx.arena, "↳ {s} to edit queued messages", .{dequeue_label});
     row += drawWrappedText(window, row, hint, status_style);
     return .{
@@ -2174,7 +2174,7 @@ fn drawCollapseIndicator(
     hidden_rows: usize,
 ) !void {
     if (row >= window.height) return;
-    const label = try actionLabel(allocator, keybindings, .toggle_expand_all, "Ctrl+R");
+    const label = try actionLabel(allocator, keybindings, .tools_expand, "Ctrl+O");
     const text = try std.fmt.allocPrint(allocator, "… +{d} lines ({s} 展开)", .{ hidden_rows, label });
     _ = window.printSegment(.{
         .text = text,
@@ -3243,15 +3243,15 @@ pub fn formatHintsText(
 ) ![]u8 {
     if (hintsHeightForWidth(width) == 0) return allocator.dupe(u8, "");
 
-    const open_sessions = try actionLabel(allocator, keybindings, .open_sessions, "Ctrl+S");
+    const open_sessions = try actionLabel(allocator, keybindings, .session_tree, "Unbound");
     defer allocator.free(open_sessions);
-    const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
+    const open_models = try actionLabel(allocator, keybindings, .model_select, "Ctrl+L");
     defer allocator.free(open_models);
-    const queue_label = try actionLabel(allocator, keybindings, .queue_follow_up, "Alt+Enter");
+    const queue_label = try actionLabel(allocator, keybindings, .message_followUp, "Alt+Enter");
     defer allocator.free(queue_label);
     const queue_follow_up = try hintKeyLabel(allocator, queue_label);
     defer allocator.free(queue_follow_up);
-    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Ctrl+C");
+    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Esc");
     defer allocator.free(interrupt);
     const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
     defer allocator.free(exit);
@@ -3863,7 +3863,7 @@ test "prompt m2 renders hints above compact footer with distinct styles and term
     const rendered = try tui.test_helpers.screenToString(&screen);
     defer allocator.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ queue · Ctrl+S sessions · Ctrl+P models · Ctrl+C interrupt · Ctrl+D exit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ queue · Unbound sessions · Ctrl+L models · Esc interrupt · Ctrl+D exit") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "GHOSTTY") != null);
 
     const prompt_top = screen.readCell(0, 9) orelse return error.TestUnexpectedResult;
@@ -5057,7 +5057,7 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "> pending prompt"));
-    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send · Alt+⏎ queue · Ctrl+S sessions · Ctrl+P models · Ctrl+C interrupt · Ctrl+D exit"));
+    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send · Alt+⏎ queue · Unbound sessions · Ctrl+L models · Esc interrupt · Ctrl+D exit"));
     try std.testing.expect(renderedLinesContain(lines.items, "Faux"));
     try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
@@ -5142,6 +5142,6 @@ test "vaxis m8 visual parity snapshot covers overlay composition" {
     defer freeLinesSafe(allocator, &lines);
 
     try std.testing.expect(renderedLinesContain(lines.items, "Keyboard shortcuts"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+P"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+S"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+C"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+L"));
 }

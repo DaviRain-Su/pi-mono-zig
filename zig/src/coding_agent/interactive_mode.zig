@@ -640,11 +640,11 @@ fn buildVerboseStartupBanner(
     defer allocator.free(clear);
     const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
     defer allocator.free(exit);
-    const open_models = try actionLabel(allocator, keybindings, .open_models, "Ctrl+P");
+    const open_models = try actionLabel(allocator, keybindings, .model_select, "Ctrl+L");
     defer allocator.free(open_models);
-    const open_sessions = try actionLabel(allocator, keybindings, .open_sessions, "Ctrl+S");
+    const open_sessions = try actionLabel(allocator, keybindings, .session_tree, "Unbound");
     defer allocator.free(open_sessions);
-    const paste_image = try actionLabel(allocator, keybindings, .paste_image, "Ctrl+V");
+    const paste_image = try actionLabel(allocator, keybindings, .clipboard_pasteImage, "Ctrl+V");
     defer allocator.free(paste_image);
 
     return std.fmt.allocPrint(
@@ -1173,7 +1173,7 @@ test "screen renders themed output and custom keybinding hints" {
 
     var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
     defer keybindings.deinit();
-    try keybindings.setBinding(.open_sessions, &.{.{ .ctrl = 'x' }});
+    try keybindings.setBinding(.session_tree, &.{.{ .ctrl = 'x' }});
 
     var theme = try resources_mod.Theme.initDefault(allocator);
     defer theme.deinit(allocator);
@@ -1435,7 +1435,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         allocator,
         std.testing.io,
         &env_map,
-        .{ .ctrl = 'c' },
+        .escape,
         &session,
         &current_provider,
         options.session_dir,
@@ -1461,7 +1461,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         allocator,
         std.testing.io,
         &env_map,
-        .{ .ctrl = 'l' },
+        .{ .ctrl = 'c' },
         &session,
         &current_provider,
         options.session_dir,

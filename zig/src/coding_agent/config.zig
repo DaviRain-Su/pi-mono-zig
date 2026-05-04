@@ -1325,7 +1325,8 @@ test "runtime config honors PI_CODING_AGENT_DIR and loads keybindings" {
     try std.testing.expectEqualStrings("faux", runtime.settings.default_provider.?);
     try std.testing.expectEqualStrings("faux-1", runtime.settings.default_model.?);
     try std.testing.expectEqual(keybindings_mod.Action.clear, runtime.keybindings.actionForKey(.{ .ctrl = 'x' }).?);
-    try std.testing.expect(runtime.keybindings.actionForKey(.{ .ctrl = 'l' }) == null);
+    // ctrl+l is now model_select by default (was app.clear in old Zig defaults)
+    try std.testing.expectEqual(keybindings_mod.Action.model_select, runtime.keybindings.actionForKey(.{ .ctrl = 'l' }).?);
     try std.testing.expectEqual(keybindings_mod.Action.exit, runtime.keybindings.actionForKey(.{ .ctrl = 'q' }).?);
 }
 
