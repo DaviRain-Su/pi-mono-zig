@@ -1556,8 +1556,24 @@ pub fn handleShareSlashCommand(
     defer auth_result.deinit(allocator);
 
     if (auth_result.not_found) {
-        try app_state.appendError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
-        try app_state.setStatus("share failed");
+        // gh is not installed - fall back to copying session markdown to clipboard
+        const text = buildShareText(allocator, session) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to build share text: {s}", .{@errorName(err)});
+            defer allocator.free(msg);
+            try app_state.appendError(msg);
+            try app_state.setStatus("share failed");
+            return;
+        };
+        defer allocator.free(text);
+        copyTextToClipboard(io, text) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Session markdown copy failed: {s}. Install gh from https://cli.github.com/ for gist sharing.", .{@errorName(err)});
+            defer allocator.free(msg);
+            try app_state.appendError(msg);
+            try app_state.setStatus("share failed");
+            return;
+        };
+        try app_state.appendInfo("Session markdown copied to clipboard (install gh CLI from https://cli.github.com/ for gist sharing)");
+        try app_state.setStatus("copied");
         return;
     }
     if (auth_result.exit_code != 0) {
@@ -2396,4 +2412,14 @@ test "switchModel shows provider-specific setup guidance when auth is missing" {
     const error_text = app_state.items.items[app_state.items.items.len - 1].text;
     try std.testing.expect(std.mem.indexOf(u8, error_text, "OPENAI_API_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, error_text, "/login openai") != null);
+}
+
+test "parseGistIdFromOutput extracts gist ID from URL" {
+    try std.testing.expectEqualStrings("abc123", parseGistIdFromOutput("https://gist.github.com/user/abc123").?);
+    try std.testing.expectEqualStrings("abc123", parseGistIdFromOutput("https://gist.github.com/user/abc123\n").?);
+    try std.testing.expectEqualStrings("abc-def_123", parseGistIdFromOutput("https://gist.github.com/user/abc-def_123").?);
+    try std.testing.expect(parseGistIdFromOutput("") == null);
+    try std.testing.expect(parseGistIdFromOutput("   \n  ") == null);
+    // ID with invalid characters should be rejected
+    try std.testing.expect(parseGistIdFromOutput("https://gist.github.com/user/abc!def") == null);
 }

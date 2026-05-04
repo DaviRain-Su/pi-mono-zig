@@ -4902,13 +4902,24 @@ fn buildShareTestSession(
     return .{ .provider = current_provider, .session = session, .user = user, .assistant = assistant };
 }
 
-test "handleShareSlashCommand reports missing gh CLI without writing tmp file" {
+test "handleShareSlashCommand falls back to clipboard when gh not installed" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const tmp_file = try shareTestTmpFile(allocator, tmp);
     defer allocator.free(tmp_file);
+
+    var capture = ClipboardCapture{ .allocator = allocator };
+    defer capture.deinit();
+    const previous_clipboard_context = slash_commands.clipboard_copy_context;
+    const previous_clipboard_fn = slash_commands.clipboard_copy_fn;
+    slash_commands.clipboard_copy_context = &capture;
+    slash_commands.clipboard_copy_fn = captureClipboardText;
+    defer {
+        slash_commands.clipboard_copy_context = previous_clipboard_context;
+        slash_commands.clipboard_copy_fn = previous_clipboard_fn;
+    }
 
     var stub = ShareGhStub{ .allocator = allocator, .auth = .{ .not_found = true } };
     defer stub.deinit();
@@ -4931,10 +4942,15 @@ test "handleShareSlashCommand reports missing gh CLI without writing tmp file" {
 
     try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
 
+    // Only one gh invocation (auth status), no gist create
     try std.testing.expectEqual(@as(usize, 1), stub.invocations.items.len);
-    try std.testing.expect(lastItemKindContains(&state, .@"error", "GitHub CLI (gh) is not installed"));
-    try std.testing.expect(std.mem.indexOf(u8, state.status, "share failed") != null);
-    // tmp file must not exist
+    // Clipboard should have been called with session markdown
+    try std.testing.expect(capture.text != null);
+    // Status should be "copied", not "share failed"
+    try std.testing.expectEqualStrings("copied", state.status);
+    // An info item (not error) about clipboard should be present
+    try std.testing.expect(lastItemKindContains(&state, .info, "clipboard"));
+    // tmp file must not exist (no HTML export was attempted)
     try expectShareTmpRemoved(tmp_file);
 }
 
@@ -5137,7 +5153,7 @@ test "handleShareSlashCommand rejects gh stdout without a parseable gist id" {
     try expectShareTmpRemoved(tmp_file);
 }
 
-test "handleShareSlashCommand never falls back to clipboard markdown" {
+test "handleShareSlashCommand clipboard fallback does not call gist create" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5180,7 +5196,12 @@ test "handleShareSlashCommand never falls back to clipboard markdown" {
 
     try handleShareSlashCommand(allocator, std.testing.io, &env_map, &built.session, &state);
 
-    try std.testing.expect(capture.text == null);
+    // Clipboard fallback should have been called (gh not found)
+    try std.testing.expect(capture.text != null);
+    // Only auth status was invoked - no gist create
+    try std.testing.expectEqual(@as(usize, 1), stub.invocations.items.len);
+    // Should show copied status, not share failed
+    try std.testing.expectEqualStrings("copied", state.status);
 }
 
 test "handleLogoutSlashCommand opens selector for stored auth providers" {
