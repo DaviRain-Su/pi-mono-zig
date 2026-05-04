@@ -450,14 +450,8 @@ fn executeInstall(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !ExecuteResult {
+    _ = stderr;
     const source = command.source orelse unreachable;
-    if (!isLocalSource(source)) {
-        try stderr.print(
-            "Error: Only local package sources are supported in this build (got {s}).\n",
-            .{source},
-        );
-        return .{ .exit_code = 1 };
-    }
 
     const settings_path = try settingsPathForScope(allocator, options, command.local);
     defer allocator.free(settings_path);
@@ -577,28 +571,38 @@ fn executeList(
     options: ExecuteOptions,
     stdout: *std.Io.Writer,
 ) !ExecuteResult {
-    var user_sources = try collectScopePackages(allocator, io, options, false);
-    defer freeOwnedStrings(allocator, &user_sources);
-    var project_sources = try collectScopePackages(allocator, io, options, true);
-    defer freeOwnedStrings(allocator, &project_sources);
+    var user_entries = try collectScopePackageEntries(allocator, io, options, false);
+    defer freeListEntries(allocator, &user_entries);
+    var project_entries = try collectScopePackageEntries(allocator, io, options, true);
+    defer freeListEntries(allocator, &project_entries);
 
-    if (user_sources.items.len == 0 and project_sources.items.len == 0) {
+    if (user_entries.items.len == 0 and project_entries.items.len == 0) {
         try stdout.print("No packages installed.\n", .{});
         return .{ .exit_code = 0 };
     }
 
-    if (user_sources.items.len > 0) {
+    if (user_entries.items.len > 0) {
         try stdout.print("User packages:\n", .{});
-        for (user_sources.items) |entry| {
-            try stdout.print("  {s}\n", .{entry});
+        for (user_entries.items) |entry| {
+            if (entry.filtered) {
+                try stdout.print("  {s} (filtered)\n", .{entry.source});
+            } else {
+                try stdout.print("  {s}\n", .{entry.source});
+            }
+            try stdout.print("    {s}\n", .{entry.installed_path});
         }
     }
 
-    if (project_sources.items.len > 0) {
-        if (user_sources.items.len > 0) try stdout.print("\n", .{});
+    if (project_entries.items.len > 0) {
+        if (user_entries.items.len > 0) try stdout.print("\n", .{});
         try stdout.print("Project packages:\n", .{});
-        for (project_sources.items) |entry| {
-            try stdout.print("  {s}\n", .{entry});
+        for (project_entries.items) |entry| {
+            if (entry.filtered) {
+                try stdout.print("  {s} (filtered)\n", .{entry.source});
+            } else {
+                try stdout.print("  {s}\n", .{entry.source});
+            }
+            try stdout.print("    {s}\n", .{entry.installed_path});
         }
     }
 
@@ -615,6 +619,14 @@ fn writePackageCommandHelp(stdout: *std.Io.Writer, command: PackageCommand) !voi
             \\
             \\Options:
             \\  -l, --local    Install project-locally (.pi/settings.json)
+            \\
+            \\Examples:
+            \\  pi install npm:@foo/bar
+            \\  pi install git:github.com/user/repo
+            \\  pi install git@github.com:user/repo
+            \\  pi install https://github.com/user/repo
+            \\  pi install ssh://git@github.com/user/repo
+            \\  pi install ./local/path
             \\
         ),
         .remove => try stdout.writeAll(
@@ -680,6 +692,150 @@ fn isLocalSource(source: []const u8) bool {
     if (std.mem.startsWith(u8, source, "http://")) return false;
     if (std.mem.startsWith(u8, source, "ssh://")) return false;
     return true;
+}
+
+/// Strips the npm: prefix and version specifier to get the package name.
+/// e.g. "npm:@scope/pkg@1.0.0" → "@scope/pkg", "npm:my-pkg" → "my-pkg"
+fn npmPackageName(spec: []const u8) []const u8 {
+    if (spec.len == 0) return spec;
+    if (spec[0] == '@') {
+        const at_index = std.mem.lastIndexOfScalar(u8, spec, '@') orelse return spec;
+        if (std.mem.indexOfScalar(u8, spec, '/')) |slash_index| {
+            if (at_index > slash_index) return spec[0..at_index];
+        }
+        return spec;
+    }
+    const at_index = std.mem.lastIndexOfScalar(u8, spec, '@') orelse return spec;
+    return spec[0..at_index];
+}
+
+/// Returns the normalized form of a git source for hashing (used by gitInstallPath).
+fn normalizeGitSource(source: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, source, "git:")) return source["git:".len..];
+    return source;
+}
+
+/// Computes the expected on-disk install path for a package source.
+/// For local sources, resolves relative paths from cwd.
+/// For npm sources, returns the node_modules directory path.
+/// For git sources, returns a SHA256-derived directory path.
+/// Caller owns the returned slice.
+fn computeInstalledPath(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    is_project: bool,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    if (isLocalSource(source)) {
+        if (std.fs.path.isAbsolute(source)) {
+            return allocator.dupe(u8, source);
+        }
+        return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, source });
+    }
+    if (std.mem.startsWith(u8, source, "npm:")) {
+        const spec = std.mem.trim(u8, source["npm:".len..], " ");
+        const pkg_name = npmPackageName(spec);
+        const base = if (is_project)
+            try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "npm", "node_modules" })
+        else
+            try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "npm", "node_modules" });
+        defer allocator.free(base);
+        return std.fs.path.join(allocator, &[_][]const u8{ base, pkg_name });
+    }
+    // git and URL-based sources: hash the normalized form
+    const normalized = normalizeGitSource(source);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const hex_str = try std.fmt.allocPrint(allocator, "{s}", .{hex[0..]});
+    defer allocator.free(hex_str);
+    const base = if (is_project)
+        try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "git" })
+    else
+        try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "git" });
+    defer allocator.free(base);
+    return std.fs.path.join(allocator, &[_][]const u8{ base, hex_str });
+}
+
+/// Returns true when the settings JSON object for a package has any
+/// non-empty filter arrays (extensions, skills, prompts, themes).
+fn hasFilterFields(obj: std.json.ObjectMap) bool {
+    const filter_keys = [_][]const u8{ "extensions", "skills", "prompts", "themes" };
+    for (filter_keys) |key| {
+        if (obj.get(key)) |v| {
+            if (v == .array and v.array.items.len > 0) return true;
+        }
+    }
+    return false;
+}
+
+/// Rich per-package info for the list command.
+const ListEntry = struct {
+    source: []u8,
+    installed_path: []u8,
+    filtered: bool,
+
+    fn deinit(self: *ListEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.installed_path);
+        self.* = undefined;
+    }
+};
+
+fn freeListEntries(allocator: std.mem.Allocator, list: *std.ArrayList(ListEntry)) void {
+    for (list.items) |*entry| entry.deinit(allocator);
+    list.deinit(allocator);
+}
+
+fn collectScopePackageEntries(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    is_project: bool,
+) !std.ArrayList(ListEntry) {
+    var result: std.ArrayList(ListEntry) = .empty;
+    errdefer freeListEntries(allocator, &result);
+
+    const settings_path = try settingsPathForScope(allocator, options, is_project);
+    defer allocator.free(settings_path);
+
+    var settings_object = try loadSettingsObject(allocator, io, settings_path);
+    defer {
+        const cleanup: std.json.Value = .{ .object = settings_object };
+        common.deinitJsonValue(allocator, cleanup);
+    }
+
+    const packages_value = settings_object.get("packages") orelse return result;
+    if (packages_value != .array) return result;
+
+    for (packages_value.array.items) |item| {
+        const source_str: []const u8 = switch (item) {
+            .string => |s| s,
+            .object => |obj| blk: {
+                const sv = obj.get("source") orelse continue;
+                if (sv != .string) continue;
+                break :blk sv.string;
+            },
+            else => continue,
+        };
+        const filtered: bool = switch (item) {
+            .object => |obj| hasFilterFields(obj),
+            else => false,
+        };
+
+        const source_owned = try allocator.dupe(u8, source_str);
+        errdefer allocator.free(source_owned);
+        const installed_path = try computeInstalledPath(allocator, source_str, is_project, options.cwd, options.agent_dir);
+        errdefer allocator.free(installed_path);
+
+        try result.append(allocator, .{
+            .source = source_owned,
+            .installed_path = installed_path,
+            .filtered = filtered,
+        });
+    }
+    return result;
 }
 
 fn settingsPathForScope(
@@ -1592,6 +1748,478 @@ test "VAL-M12-PKG-014 config --toggle -l writes project-scope settings only" {
         break :blk true;
     };
     try std.testing.expect(!user_exists);
+}
+
+// ---------------------------------------------------------------------------
+// Remote source tests (VAL-PKG-101..115, VAL-PKG-150..153)
+// ---------------------------------------------------------------------------
+
+test "VAL-PKG-101 npm scoped package accepted and persisted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "npm:@scope/package" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed npm:@scope/package") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"npm:@scope/package\"") != null);
+}
+
+test "VAL-PKG-102 npm unscoped package accepted and persisted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "npm:my-package" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed npm:my-package") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"npm:my-package\"") != null);
+}
+
+test "VAL-PKG-103 npm source install/remove round-trips correctly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    // Pre-populate with unrelated key to verify preservation.
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "defaultProvider": "openai" }
+    , true);
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const r_install = try runCommand(allocator, &.{ "install", "npm:@foo/bar" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), r_install.exit_code);
+
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+    const r_remove = try runCommand(allocator, &.{ "remove", "npm:@foo/bar" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), r_remove.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Removed npm:@foo/bar") != null);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "npm:@foo/bar") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"defaultProvider\"") != null);
+}
+
+test "VAL-PKG-104 npm duplicate install is a no-op" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "npm:@scope/pkg" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const r2 = try runCommand(allocator, &.{ "install", "npm:@scope/pkg" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), r2.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Already installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "npm:@scope/pkg") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    // Only one entry should exist.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, settings, "npm:@scope/pkg"));
+}
+
+test "VAL-PKG-110 git:github.com prefix source accepted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "git:github.com/user/repo" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Installed git:github.com/user/repo") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"git:github.com/user/repo\"") != null);
+}
+
+test "VAL-PKG-111 git@ SSH source accepted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "git@github.com:user/repo.git" },
+        options,
+        &buf_a,
+        &buf_b,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Installed git@github.com:user/repo.git") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"git@github.com:user/repo.git\"") != null);
+}
+
+test "VAL-PKG-112 https:// git URL source accepted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "https://github.com/user/repo" },
+        options,
+        &buf_a,
+        &buf_b,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Installed https://github.com/user/repo") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"https://github.com/user/repo\"") != null);
+}
+
+test "VAL-PKG-113 ssh:// git URL source accepted" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "ssh://git@github.com/user/repo" },
+        options,
+        &buf_a,
+        &buf_b,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Installed ssh://git@github.com/user/repo") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"ssh://git@github.com/user/repo\"") != null);
+}
+
+test "VAL-PKG-114 git source install/remove round-trips correctly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "defaultProvider": "openai" }
+    , true);
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "git:github.com/user/mypkg" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const r_remove = try runCommand(allocator, &.{ "remove", "git:github.com/user/mypkg" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), r_remove.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Removed git:github.com/user/mypkg") != null);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "git:github.com/user/mypkg") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"defaultProvider\"") != null);
+}
+
+test "VAL-PKG-115 git source duplicate install is a no-op" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "git:github.com/user/repo" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const r2 = try runCommand(allocator, &.{ "install", "git:github.com/user/repo" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), r2.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Already installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "git:github.com/user/repo") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, settings, "git:github.com/user/repo"));
+}
+
+test "VAL-PKG-150 list shows installed path for each package" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/my-pkg");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    // Install using the absolute fixture path so the resolved path is deterministic.
+    const pkg_path = try makeAbsoluteTmpPath(allocator, tmp, "repo/fixtures/my-pkg");
+    defer allocator.free(pkg_path);
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", pkg_path }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const result = try runCommand(allocator, &.{"list"}, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // Source line must appear.
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, pkg_path) != null);
+    // Installed path line (indented, same as source for absolute local path) must appear.
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "    ") != null);
+}
+
+test "VAL-PKG-151 list shows (filtered) indicator for filtered packages" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    // Manually write settings with one filtered and one unfiltered package.
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "packages": [
+        \\    { "source": "npm:@foo/filtered-pkg", "extensions": ["ext/main.ts"] },
+        \\    { "source": "npm:@bar/plain-pkg" }
+        \\  ]
+        \\}
+    , true);
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{"list"}, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "npm:@foo/filtered-pkg (filtered)") != null);
+    // Plain package must NOT have the "(filtered)" tag.
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "npm:@bar/plain-pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "npm:@bar/plain-pkg (filtered)") == null);
+}
+
+test "VAL-PKG-152 list groups user and project packages with headers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "npm:@user/pkg" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+    _ = try runCommand(allocator, &.{ "install", "npm:@project/pkg", "-l" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const result = try runCommand(allocator, &.{"list"}, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "User packages:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "npm:@user/pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Project packages:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "npm:@project/pkg") != null);
+}
+
+test "VAL-PKG-153 list prints No packages installed. when empty" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{"list"}, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("No packages installed.\n", buf_a.items);
 }
 
 test "VAL-M12-PKG-015 release and binary packaging surfaces stay excluded" {
