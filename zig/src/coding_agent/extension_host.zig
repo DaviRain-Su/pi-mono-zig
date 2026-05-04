@@ -169,6 +169,8 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "clear_widget",
     "clear_ui_hooks_for_reload",
     "resources_discover",
+    "register_message_renderer",
+    "unregister_message_renderer",
 };
 
 fn isRegistryFrameType(type_name: []const u8) bool {
@@ -353,6 +355,8 @@ pub const ProtocolState = struct {
                     .cleared_widget_hook,
                     .cleared_ui_hooks_for_reload,
                     .resources_discovered,
+                    .registered_message_renderer,
+                    .unregistered_message_renderer,
                     => self.registry_frames_applied += 1,
                     .none, .ignored_unsupported, .ignored_malformed => {},
                 }

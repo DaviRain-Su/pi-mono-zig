@@ -4885,7 +4885,7 @@ fn buildShareTestSession(
     user: agent.AgentMessage,
     assistant: agent.AgentMessage,
 } {
-    var current_provider = try provider_config.resolveProviderConfig(allocator, env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, env_map, "faux", null, null, null);
     errdefer current_provider.deinit(allocator);
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp/project",
@@ -5307,6 +5307,7 @@ test "handleLogoutSlashCommand removes stored auth for the current provider" {
 
     var current_provider = try provider_config.resolveProviderConfig(
         allocator,
+        std.testing.io,
         &env_map,
         "openai",
         null,
