@@ -541,24 +541,6 @@ fn runCliWithInput(
             );
         }
 
-        if (initial_input.images.len > 0) {
-            return try coding_agent.runPrintMode(
-                allocator,
-                io,
-                &session,
-                .{
-                    .text = initial_input.prompt.?,
-                    .images = initial_input.images,
-                },
-                .{
-                    .mode = if (app_mode == .json) .json else .text,
-                    .config_errors = prepared.runtime_config.errors,
-                },
-                stdout,
-                stderr,
-            );
-        }
-
         return try coding_agent.runPrintMode(
             allocator,
             io,
@@ -567,6 +549,7 @@ fn runCliWithInput(
             .{
                 .mode = if (app_mode == .json) .json else .text,
                 .config_errors = prepared.runtime_config.errors,
+                .initial_images = initial_input.images,
             },
             stdout,
             stderr,
