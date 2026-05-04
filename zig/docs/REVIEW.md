@@ -150,16 +150,16 @@ This means the review should explicitly reject a rewrite-first strategy such as:
 
 Compared with the current TS extension surface, parity is still incomplete for:
 
-- `registerTool(...)`
-- `registerCommand(...)`
-- `registerShortcut(...)`
-- `registerFlag(...)`
-- `registerProvider(...)` and `unregisterProvider(...)`
-- extension CLI flag parsing and help integration
-- extension-driven tool registry refresh semantics
-- extension package install/update/remove/list/config flows
-- extension widgets, custom editor hooks, header/footer injection, and terminal
-  input hooks at the Bun compatibility layer
+- ✅ `registerTool(...)` — Implemented in `extension_registry.zig` with dynamic refresh support
+- ✅ `registerCommand(...)` — Implemented in `extension_registry.zig`
+- ✅ `registerShortcut(...)` — Implemented in `extension_registry.zig`
+- ✅ `registerFlag(...)` — Implemented in `extension_registry.zig` with CLI value resolution
+- ✅ `registerProvider(...)` and `unregisterProvider(...)` — Implemented with OAuth support
+- ✅ extension CLI flag parsing and help integration — Unknown flag passthrough works; extension flags appear in `--help`
+- extension-driven tool registry refresh semantics — Partial: re-registration replaces entries, but full refresh cycle needs verification
+- ✅ extension package install/update/remove/list/config flows — Implemented in `package_manager.zig`
+- ✅ extension widgets, custom editor hooks, header/footer injection, and terminal
+  input hooks at the Bun compatibility layer — All implemented in `extension_registry.zig`
 
 Relevant TS references:
 
@@ -176,31 +176,34 @@ Relevant Zig references:
 
 ### Concrete Current Gaps
 
-#### CLI flag parity
+#### ✅ CLI flag parity (RESOLVED)
 
-TS accepts unknown `--flags` so extension flags can be registered and consumed
-later. Zig currently treats unknown `--...` options as parse errors.
+Zig now accepts unknown `--flags` through the `UnknownFlag` passthrough mechanism
+in `zig/src/cli/args.zig` (lines 241-273). Extension flags are collected and can
+be resolved later by the extension flag registry. Extension flags appear in
+`--help` output via `helpTextWithExtensions`.
 
-That blocks extension flags such as plan-mode style switches and any Bun-hosted
-extension CLI integration.
+#### ✅ Package-management parity (RESOLVED)
 
-#### Package-management parity
+Zig implements all TS package-management commands in `package_manager.zig`:
 
-TS exposes:
+- `install` — Install local packages and update settings.json
+- `remove` / `uninstall` — Remove packages from settings
+- `update` — Offline no-op for local fixtures (network sources out of scope)
+- `list` — List installed packages grouped by scope
+- `config` — Enable/disable extensions, skills, prompts, themes
 
-- `install`
-- `remove`
-- `uninstall`
-- `update`
-- `list`
-- `config`
+#### Remaining gaps
 
-Zig currently has resource loading and package path awareness, but not the same
-user-facing command surface.
+- Extension-driven tool registry refresh semantics — Need end-to-end tests with
+  real Bun-hosted extensions to verify dynamic refresh behavior
+- Extension-aware help text — Extension flags appear in help, but full parity
+  with TS help formatting needs verification
 
 ### Priority
 
-Critical for full replacement.
+Medium — Core extension registration and package management are implemented.
+Remaining work is verification and edge-case handling.
 
 ---
 
@@ -516,9 +519,9 @@ not broad aspirational checklists.
 | Area | Current Status | Replacement Risk | Priority |
 |---|---|---:|---:|
 | Provider stream contract | Partial mismatch | High | Critical |
-| Bun-hosted TS extension parity | Incomplete | High | Critical |
+| Bun-hosted TS extension parity | Core surfaces implemented; needs e2e verification | Medium | Medium |
 | Session cwd safety | Missing guard | High | High |
-| Package/CLI extension surface | Incomplete | High | High |
+| Package/CLI extension surface | Implemented; needs e2e verification | Low | Medium |
 | `/share` behavior | Different behavior | Medium | Medium-high |
 | Clipboard image normalization | Incomplete | Medium | Medium-high |
 | Export HTML parity | Needs verification | Medium | Medium |
