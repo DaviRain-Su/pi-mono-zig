@@ -23,6 +23,7 @@
 - After code changes (not documentation changes): `npm run check` (get full output, no tail). Fix all errors, warnings, and infos before committing.
 - Note: `npm run check` does not run tests.
 - NEVER run: `npm run dev`, `npm run build`, `npm test`
+- **verificationSteps**: Run every step in `feature.verificationSteps` verbatim. If you substitute a step (e.g., a different test command), declare the substitution explicitly in your handoff `verification.commandsRun` with a note explaining why.
 - Only run specific tests if user instructs: `npx tsx ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`
 - Run tests from the package root, not the repo root.
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
@@ -241,6 +242,74 @@ git pull --rebase && git push
 - If conflict is in a file you didn't modify, abort and ask the user
 - NEVER force push
 
+### Restore-then-recheck Pattern for Revert Features
+
+When a feature's goal is to revert or undo a previous change:
+
+1. `git restore <specific-files>` to revert only those files
+2. `git diff HEAD` to confirm exactly what changed
+3. Re-run all relevant tests and checks to confirm the revert is clean
+4. Include a diff summary in the handoff so the orchestrator can verify no unrelated lines were reverted
+
+Perform this check at hand-off time, not just at the time of revert.
+
 ### User override
 
 If the user instructions conflict with rules set out here, ask for confirmation that they want to override the rules. Only then execute their instructions.
+
+---
+
+## Zig Implementation Notes
+
+### Provider Helper Integration Checklist
+
+When porting a helper module from `packages/ai/src/providers/` to Zig (e.g., `github-copilot-headers.ts`, `cloudflare.ts`), verify integration at every call site after implementation:
+
+- `zig/src/ai/providers/openai.zig` line 78 — `cloudflare` base-URL resolution call
+- `zig/src/ai/providers/openai.zig` line 1604 — `copilot` dynamic header construction call
+- `zig/src/ai/providers/anthropic.zig` line 1480 — `cloudflare` base-URL resolution call
+- `zig/src/ai/providers/anthropic.zig` line 2213 — `copilot` dynamic header construction call
+
+These are the canonical wire-up sites. Any new leaf helper must be wired into the provider `stream()` path at these sites AND accompanied by a stream-level smoke test (pass an invalid base_url/token and assert the stream contains an error event rather than throwing).
+
+### Stream Contract Pattern
+
+The reference implementation for Zig provider stream contracts is `zig/src/ai/providers/anthropic.zig`.
+
+All provider `stream()` functions must return an `AssistantMessageEventStream` and never throw (except `error.OutOfMemory`). The canonical pattern:
+
+1. Extract setup into `streamProduction()` returning `!void`
+2. In `stream()`: create stream, call `streamProduction(...)` with `catch |err| switch (err) { error.OutOfMemory => return err, else => emitSetupRuntimeFailure(...) }`, return stream
+
+**Canonical setup-failure regression test template:**
+
+```zig
+test "<provider> stream returns error_event on setup failure" {
+    const allocator = std.testing.allocator;
+    var stream = try <provider>.stream(allocator, .{
+        .base_url = "http://127.0.0.1:1",  // unreachable — forces connection error
+        .api_key = "placeholder",
+        .model = "<any-valid-model-id>",
+        .messages = &.{},
+    });
+    defer stream.deinit();
+
+    const event = (try stream.next()).?;
+    try std.testing.expectEqual(.error_event, event);
+    try std.testing.expect(event.error_event.message.len > 0);
+    try std.testing.expectEqual(.error_reason, event.error_event.stop_reason);
+    // api / provider / model fields must match what was passed in
+    const null_event = try stream.next();
+    try std.testing.expectEqual(null, null_event);
+}
+```
+
+### Keybinding Implementation Notes
+
+- Adding or removing `Action` enum variants in `keybindings.zig` requires corresponding call-site updates across: `input_dispatch.zig`, overlay files (tree/session/model overlays), `interactive_mode.zig`, and any rendering code that switch-dispatches on `Action`.
+- The contract shorthand `.{ .char = 'l' }` used in tests is a `KeySpec` literal, NOT a `tui.Key` union value. Real key matching goes through `Keybindings.actionForKey()` which converts `tui.Key` → `KeySpec` before comparing.
+- Keybinding declaration order in `DEFINITIONS` matters: the first matching definition wins when two bindings share a default key. Check for collisions before adding new defaults. Cross-reference the "Never hardcode key checks" rule above.
+
+### Environmental Dependencies for Standalone Parity Tests
+
+`zig build test-ts-rpc-parity` requires `libsimdjson` installed on the host (e.g., `brew install simdjson` on macOS). Without it the linker will fail. The same test scenarios are covered inside `zig build test` which links a bundled copy, so CI failures in `test-ts-rpc-parity` on clean machines are an environment issue, not a code bug.
