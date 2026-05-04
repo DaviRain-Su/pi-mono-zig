@@ -582,6 +582,7 @@ const TsRpcServer = struct {
         self.bash_tasks.deinit(self.allocator);
         self.bash_tasks = .empty;
         if (self.extension_host) |host| {
+            self.emitSessionShutdownEvent(host, "quit", null);
             host.deinit();
             self.extension_host = null;
         }
@@ -915,7 +916,9 @@ const TsRpcServer = struct {
             return;
         };
 
-        if (!isKnownCommandType(command)) {
+        // navigate_to is a Zig-only extension command not in the TypeScript protocol.
+        // Allow it through without the isKnownCommandType gate.
+        if (!std.mem.eql(u8, command, "navigate_to") and !isKnownCommandType(command)) {
             try self.writeUnknownCommand(command);
             return;
         }
@@ -1068,6 +1071,10 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |ext_host| {
+                self.emitSessionBeforeSwitchEvent(ext_host, "new", parent_session);
+                self.emitSessionShutdownEvent(ext_host, "new", parent_session);
+            }
             var host = TsRpcSessionHost.init(self);
             const result = host.newSession(parent_session) catch |err| {
                 try self.writeCommandError(id, command, err);
@@ -1180,6 +1187,7 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |ext_host| self.emitSessionBeforeCompactEvent(ext_host, custom_instructions);
             try self.writeCompactionStartEvent("manual");
             const result = session.compact(custom_instructions) catch |err| {
                 try self.writeCompactionEndEvent("manual", null, true, false);
@@ -1189,6 +1197,7 @@ const TsRpcServer = struct {
             const data = try self.buildCompactionResultJson(result);
             defer self.allocator.free(data);
             try self.writeCompactionEndEvent("manual", data, false, false);
+            if (self.extension_host) |ext_host| self.emitSessionCompactEvent(ext_host);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
         }
@@ -1291,6 +1300,10 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |ext_host| {
+                self.emitSessionBeforeSwitchEvent(ext_host, "resume", session_path);
+                self.emitSessionShutdownEvent(ext_host, "resume", session_path);
+            }
             var host = TsRpcSessionHost.init(self);
             var result = host.switchSession(session_path) catch |err| {
                 try self.writeCommandError(id, command, err);
@@ -1306,6 +1319,10 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |ext_host| {
+                self.emitSessionBeforeForkEvent(ext_host, entry_id, "before");
+                self.emitSessionShutdownEvent(ext_host, "fork", null);
+            }
             var host = TsRpcSessionHost.init(self);
             var result = host.fork(entry_id, .before) catch |err| {
                 try self.writeCommandError(id, command, err);
@@ -1383,6 +1400,25 @@ const TsRpcServer = struct {
 
         if (std.mem.eql(u8, command, "get_commands")) {
             try self.writeSuccessResponseRawData(id, command, "{\"commands\":[]}");
+            return;
+        }
+
+        if (std.mem.eql(u8, command, "navigate_to")) {
+            const entry_id = requiredString(object, "entryId") catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const old_leaf_id_raw = session.session_manager.getLeafId();
+            const old_leaf_id = if (old_leaf_id_raw) |lid| try self.allocator.dupe(u8, lid) else null;
+            defer if (old_leaf_id) |lid| self.allocator.free(lid);
+            if (self.extension_host) |ext_host| self.emitSessionBeforeTreeEvent(ext_host, entry_id);
+            session.navigateTo(entry_id) catch |err| {
+                try self.writeCommandError(id, command, err);
+                return;
+            };
+            const new_leaf_id = session.session_manager.getLeafId();
+            if (self.extension_host) |ext_host| self.emitSessionTreeEvent(ext_host, new_leaf_id, old_leaf_id);
+            try self.writeSuccessResponseNoData(id, command);
             return;
         }
 
@@ -1938,6 +1974,101 @@ const TsRpcServer = struct {
             ts_ms,
         }) catch return;
         out.writer.writeAll(base_frame[base_prefix.len..]) catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    // -------------------------------------------------------------------------
+    // Session lifecycle extension event helpers
+    // -------------------------------------------------------------------------
+
+    /// Emit session_before_switch to extension host.
+    /// reason: "new" | "resume"
+    fn emitSessionBeforeSwitchEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, reason: []const u8, target_file: ?[]const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_before_switch\",\"reason\":") catch return;
+        writeJsonString(self.allocator, &out.writer, reason) catch return;
+        if (target_file) |file| {
+            out.writer.writeAll(",\"targetSessionFile\":") catch return;
+            writeJsonString(self.allocator, &out.writer, file) catch return;
+        }
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit session_shutdown to extension host.
+    /// reason: "quit" | "reload" | "new" | "resume" | "fork"
+    fn emitSessionShutdownEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, reason: []const u8, target_file: ?[]const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_shutdown\",\"reason\":") catch return;
+        writeJsonString(self.allocator, &out.writer, reason) catch return;
+        if (target_file) |file| {
+            out.writer.writeAll(",\"targetSessionFile\":") catch return;
+            writeJsonString(self.allocator, &out.writer, file) catch return;
+        }
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit session_before_fork to extension host.
+    fn emitSessionBeforeForkEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, entry_id: []const u8, position: []const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_before_fork\",\"entryId\":") catch return;
+        writeJsonString(self.allocator, &out.writer, entry_id) catch return;
+        out.writer.writeAll(",\"position\":") catch return;
+        writeJsonString(self.allocator, &out.writer, position) catch return;
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit session_before_compact to extension host.
+    fn emitSessionBeforeCompactEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, custom_instructions: ?[]const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_before_compact\"") catch return;
+        if (custom_instructions) |instructions| {
+            out.writer.writeAll(",\"customInstructions\":") catch return;
+            writeJsonString(self.allocator, &out.writer, instructions) catch return;
+        }
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit session_compact to extension host after compaction completes.
+    fn emitSessionCompactEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess) void {
+        _ = self;
+        host.sendExtensionEventFrame("{\"type\":\"session_compact\",\"fromExtension\":false}");
+    }
+
+    /// Emit session_before_tree to extension host before navigating the session tree.
+    fn emitSessionBeforeTreeEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, target_id: []const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_before_tree\",\"preparation\":{\"targetId\":") catch return;
+        writeJsonString(self.allocator, &out.writer, target_id) catch return;
+        out.writer.writeAll("}}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit session_tree to extension host after tree navigation completes.
+    fn emitSessionTreeEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, new_leaf_id: ?[]const u8, old_leaf_id: ?[]const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_tree\",\"newLeafId\":") catch return;
+        if (new_leaf_id) |nid| {
+            writeJsonString(self.allocator, &out.writer, nid) catch return;
+        } else {
+            out.writer.writeAll("null") catch return;
+        }
+        out.writer.writeAll(",\"oldLeafId\":") catch return;
+        if (old_leaf_id) |oid| {
+            writeJsonString(self.allocator, &out.writer, oid) catch return;
+        } else {
+            out.writer.writeAll("null") catch return;
+        }
+        out.writer.writeAll(",\"fromExtension\":false}") catch return;
         host.sendExtensionEventFrame(out.written());
     }
 
@@ -6397,4 +6528,283 @@ test "event_emission: turn_start and turn_end frames contain turnIndex and times
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"turn_end\"") != null);
     // turn_start for turn 2 should carry turnIndex:2
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":2") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle extension event tests
+// All test names contain "session_lifecycle" to match the --test-filter flag.
+// ---------------------------------------------------------------------------
+
+/// Helper: returns a shell script that captures all stdin lines to capture_path
+/// and exits on `{"type":"shutdown"}`.
+fn sessionLifecycleCaptureScript(allocator: std.mem.Allocator, capture_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"type\":\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{capture_path},
+    );
+}
+
+test "session_lifecycle: new_session emits session_before_switch and session_shutdown" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-session-lifecycle-new.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-sl-new" };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-sl-new",
+        .fixture = "sl-new",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    try server.handleLine("{\"id\":\"n1\",\"type\":\"new_session\"}");
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // session_before_switch must appear with reason "new"
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_before_switch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"reason\":\"new\"") != null);
+    // session_shutdown must appear (from new_session and/or quit)
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_shutdown\"") != null);
+}
+
+test "session_lifecycle: fork emits session_before_fork and session_shutdown" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-session-lifecycle-fork.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-sl-fork" };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+    });
+    defer session.deinit();
+
+    // Add a user message so fork has an entryId to work with
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = "fork me" } };
+    const entry_id = try session.session_manager.appendMessage(.{ .user = .{ .content = user_content, .timestamp = 11 } });
+    const entry_id_owned = try allocator.dupe(u8, entry_id);
+    defer allocator.free(entry_id_owned);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-sl-fork",
+        .fixture = "sl-fork",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    const fork_cmd = try std.fmt.allocPrint(allocator, "{{\"id\":\"f1\",\"type\":\"fork\",\"entryId\":\"{s}\"}}", .{entry_id_owned});
+    defer allocator.free(fork_cmd);
+    try server.handleLine(fork_cmd);
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // session_before_fork must appear with entryId and position
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_before_fork\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"position\":\"before\"") != null);
+    // session_shutdown must appear (from fork and/or quit)
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_shutdown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"reason\":\"fork\"") != null);
+}
+
+test "session_lifecycle: compact emits session_before_compact and session_compact" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-session-lifecycle-compact.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-sl-compact" };
+
+    // Compact builds a text summary from session entries without calling the LLM.
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+    });
+    defer session.deinit();
+
+    // Add 2 message entries so prepareManualCompaction has enough to work with
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const msg1 = try arena.allocator().alloc(ai.ContentBlock, 1);
+    msg1[0] = .{ .text = .{ .text = "first message to compact" } };
+    const msg2 = try arena.allocator().alloc(ai.ContentBlock, 1);
+    msg2[0] = .{ .text = .{ .text = "second message to compact" } };
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = msg1, .timestamp = 11 } });
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = msg2, .timestamp = 12 } });
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-sl-compact",
+        .fixture = "sl-compact",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    try server.handleLine("{\"id\":\"c1\",\"type\":\"compact\"}");
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // Both before and after compact events must appear
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_before_compact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_compact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"fromExtension\":false") != null);
+}
+
+test "session_lifecycle: navigate_to emits session_before_tree and session_tree" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-session-lifecycle-tree.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-sl-tree" };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+    });
+    defer session.deinit();
+
+    // Add messages to create tree entries to navigate between
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const msg_a = try arena.allocator().alloc(ai.ContentBlock, 1);
+    msg_a[0] = .{ .text = .{ .text = "root message" } };
+    const msg_b = try arena.allocator().alloc(ai.ContentBlock, 1);
+    msg_b[0] = .{ .text = .{ .text = "leaf message" } };
+    const entry_a = try session.session_manager.appendMessage(.{ .user = .{ .content = msg_a, .timestamp = 11 } });
+    const entry_a_owned = try allocator.dupe(u8, entry_a);
+    defer allocator.free(entry_a_owned);
+    _ = try session.session_manager.appendMessage(.{ .user = .{ .content = msg_b, .timestamp = 12 } });
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-sl-tree",
+        .fixture = "sl-tree",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    const nav_cmd = try std.fmt.allocPrint(allocator, "{{\"id\":\"t1\",\"type\":\"navigate_to\",\"entryId\":\"{s}\"}}", .{entry_a_owned});
+    defer allocator.free(nav_cmd);
+    try server.handleLine(nav_cmd);
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // session_before_tree and session_tree must both appear
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_before_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"newLeafId\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"oldLeafId\"") != null);
+}
+
+test "session_lifecycle: finish emits session_shutdown with reason quit" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-session-lifecycle-quit.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-sl-quit" };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-sl-quit",
+        .fixture = "sl-quit",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    // Just finish without any commands - should emit session_shutdown with reason "quit"
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // session_shutdown with reason "quit" must appear before the shutdown frame
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_shutdown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"reason\":\"quit\"") != null);
 }
