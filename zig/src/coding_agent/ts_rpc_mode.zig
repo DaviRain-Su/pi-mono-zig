@@ -511,6 +511,8 @@ const TsRpcServer = struct {
     extension_host: ?*extension_host_mod.HostProcess = null,
     suppress_events: bool = false,
     finished: bool = false,
+    /// Incremented on each turn_start event so extension frames carry sequential turnIndex values.
+    turn_index: usize = 0,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -949,6 +951,9 @@ const TsRpcServer = struct {
                 return;
             };
 
+            // Emit input extension event before agent processes the message
+            if (self.extension_host) |host| self.emitExtensionInputEvent(host, message, "rpc");
+
             if (session.isStreaming() or self.hasInFlightPrompt()) {
                 const behavior = streaming_behavior orelse {
                     try self.writeErrorResponse(
@@ -1095,10 +1100,12 @@ const TsRpcServer = struct {
                 try self.writeErrorResponse(id, command, message);
                 return;
             };
+            const prev_model = session.agent.getModel();
             session.setModel(model) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |host| self.emitExtensionModelSelectEvent(host, model, prev_model, "set");
             const data = try self.buildModelJson(model);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
@@ -1122,10 +1129,12 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            const prev_level = session.agent.getThinkingLevel();
             session.setThinkingLevel(level) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, level, prev_level);
             try self.writeSuccessResponseNoData(id, command);
             return;
         }
@@ -1135,11 +1144,13 @@ const TsRpcServer = struct {
                 try self.writeSuccessResponseRawData(id, command, "null");
                 return;
             }
-            const next_level = nextThinkingLevel(session.agent.getThinkingLevel());
+            const prev_level = session.agent.getThinkingLevel();
+            const next_level = nextThinkingLevel(prev_level);
             session.setThinkingLevel(next_level) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
+            if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, next_level, prev_level);
             const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{thinkingLevelName(next_level)});
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
@@ -1765,10 +1776,169 @@ const TsRpcServer = struct {
         const line = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(line);
 
+        // Forward agent event to extension host stdin (non-blocking; drops if pipe full)
+        if (self.extension_host) |host| {
+            switch (event.event_type) {
+                .turn_start => {
+                    self.turn_index += 1;
+                    self.emitExtensionTurnStartFrame(host);
+                },
+                .turn_end => self.emitExtensionTurnEndFrame(host, line),
+                else => host.sendExtensionEventFrame(line),
+            }
+            // Emit the typed tool_call / tool_result companion frames that the
+            // extension event API exposes separately from the execution lifecycle events.
+            switch (event.event_type) {
+                .tool_execution_start => self.emitExtensionToolCallEvent(host, event),
+                .tool_execution_end => self.emitExtensionToolResultEvent(host, event),
+                else => {},
+            }
+        }
+
         self.output_mutex.lockUncancelable(self.io);
         defer self.output_mutex.unlock(self.io);
         try self.stdout_writer.print("{s}\n", .{line});
         try self.stdout_writer.flush();
+    }
+
+    /// Emit a `tool_call` extension event frame when a tool starts executing.
+    /// Mirrors the TS `ToolCallEvent` wire format: type, toolCallId, toolName, input.
+    fn emitExtensionToolCallEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, event: agent.AgentEvent) void {
+        const tool_call_id = event.tool_call_id orelse return;
+        const tool_name = event.tool_name orelse return;
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"tool_call\",\"toolCallId\":") catch return;
+        writeJsonString(self.allocator, &out.writer, tool_call_id) catch return;
+        out.writer.writeAll(",\"toolName\":") catch return;
+        writeJsonString(self.allocator, &out.writer, tool_name) catch return;
+        out.writer.writeAll(",\"input\":") catch return;
+        if (event.args) |args| {
+            const args_json = std.json.Stringify.valueAlloc(self.allocator, args, .{}) catch return;
+            defer self.allocator.free(args_json);
+            out.writer.writeAll(args_json) catch return;
+        } else {
+            out.writer.writeAll("{}") catch return;
+        }
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit a `tool_result` extension event frame when a tool finishes executing.
+    /// Mirrors the TS `ToolResultEvent` wire format: type, toolCallId, toolName,
+    /// input (empty since args not available at end), content, isError.
+    fn emitExtensionToolResultEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, event: agent.AgentEvent) void {
+        const tool_call_id = event.tool_call_id orelse return;
+        const tool_name = event.tool_name orelse return;
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"tool_result\",\"toolCallId\":") catch return;
+        writeJsonString(self.allocator, &out.writer, tool_call_id) catch return;
+        out.writer.writeAll(",\"toolName\":") catch return;
+        writeJsonString(self.allocator, &out.writer, tool_name) catch return;
+        out.writer.writeAll(",\"input\":{},\"content\":[") catch return;
+        if (event.result) |result| {
+            for (result.content, 0..) |block, idx| {
+                if (idx > 0) out.writer.writeAll(",") catch return;
+                switch (block) {
+                    .text => |text| {
+                        out.writer.writeAll("{\"type\":\"text\",\"text\":") catch return;
+                        writeJsonString(self.allocator, &out.writer, text.text) catch return;
+                        out.writer.writeAll("}") catch return;
+                    },
+                    .image => |image| {
+                        out.writer.writeAll("{\"type\":\"image\",\"mimeType\":") catch return;
+                        writeJsonString(self.allocator, &out.writer, image.mime_type) catch return;
+                        out.writer.writeAll(",\"data\":") catch return;
+                        writeJsonString(self.allocator, &out.writer, image.data) catch return;
+                        out.writer.writeAll("}") catch return;
+                    },
+                    else => {
+                        // Skip thinking/tool_call blocks in extension events
+                        out.writer.writeAll("{\"type\":\"text\",\"text\":\"\"}") catch return;
+                    },
+                }
+            }
+        }
+        out.writer.writeAll("],\"isError\":") catch return;
+        out.writer.writeAll(if (event.is_error orelse false) "true" else "false") catch return;
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit a `model_select` extension event frame when the active model changes.
+    /// Mirrors the TS `ModelSelectEvent` wire format.
+    fn emitExtensionModelSelectEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, model: ai.Model, prev_model: ai.Model, source: []const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"model_select\",\"model\":") catch return;
+        writeModelJson(self.allocator, &out.writer, model) catch return;
+        out.writer.writeAll(",\"previousModel\":") catch return;
+        writeModelJson(self.allocator, &out.writer, prev_model) catch return;
+        out.writer.writeAll(",\"source\":") catch return;
+        writeJsonString(self.allocator, &out.writer, source) catch return;
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit a `thinking_level_select` extension event frame when the thinking level changes.
+    /// Mirrors the TS `ThinkingLevelSelectEvent` wire format.
+    fn emitExtensionThinkingLevelSelectEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, level: agent.ThinkingLevel, prev_level: agent.ThinkingLevel) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"thinking_level_select\",\"level\":") catch return;
+        writeJsonString(self.allocator, &out.writer, thinkingLevelName(level)) catch return;
+        out.writer.writeAll(",\"previousLevel\":") catch return;
+        writeJsonString(self.allocator, &out.writer, thinkingLevelName(prev_level)) catch return;
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit an `input` extension event frame when user input is received.
+    /// Mirrors the TS `InputEvent` wire format: type, text, source.
+    fn emitExtensionInputEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, text: []const u8, source: []const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"input\",\"text\":") catch return;
+        writeJsonString(self.allocator, &out.writer, text) catch return;
+        out.writer.writeAll(",\"source\":") catch return;
+        writeJsonString(self.allocator, &out.writer, source) catch return;
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit a `turn_start` extension event frame with the current turnIndex and timestamp.
+    /// Mirrors the TS TurnStartEvent wire format: type, turnIndex, timestamp.
+    fn emitExtensionTurnStartFrame(self: *TsRpcServer, host: *extension_host_mod.HostProcess) void {
+        const ts_ms = @divFloor(std.Io.Clock.now(.awake, self.io).nanoseconds, std.time.ns_per_ms);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.print("{{\"type\":\"turn_start\",\"turnIndex\":{d},\"timestamp\":{d}}}", .{
+            self.turn_index,
+            ts_ms,
+        }) catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
+    /// Emit a `turn_end` extension event frame with turnIndex and timestamp injected
+    /// after the type field. The base_frame (from json_event_wire) carries message and
+    /// toolResults; this function prepends the parity fields before forwarding to the host.
+    fn emitExtensionTurnEndFrame(self: *TsRpcServer, host: *extension_host_mod.HostProcess, base_frame: []const u8) void {
+        const base_prefix = "{\"type\":\"turn_end\"";
+        if (!std.mem.startsWith(u8, base_frame, base_prefix)) {
+            host.sendExtensionEventFrame(base_frame);
+            return;
+        }
+        const ts_ms = @divFloor(std.Io.Clock.now(.awake, self.io).nanoseconds, std.time.ns_per_ms);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.print("{s},\"turnIndex\":{d},\"timestamp\":{d}", .{
+            base_prefix,
+            self.turn_index,
+            ts_ms,
+        }) catch return;
+        out.writer.writeAll(base_frame[base_prefix.len..]) catch return;
+        host.sendExtensionEventFrame(out.written());
     }
 
     fn writeQueueUpdate(self: *TsRpcServer) !void {
@@ -6148,4 +6318,83 @@ fn blockingUntilAbortStream(
     });
     _ = allocator;
     return stream;
+}
+
+test "event_emission: turn_start and turn_end frames contain turnIndex and timestamp" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-ts-rpc-event-emission-turn-index.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{
+            ai.providers.faux.fauxText("reply one"),
+        }, .{}) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{
+            ai.providers.faux.fauxText("reply two"),
+        }, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-event-emission-turn-index",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-ts-rpc-turn-index" };
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-ts-rpc-turn-index",
+        .fixture = "turn-index",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    // Run first prompt (turn 1)
+    try server.handleLine("{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"hello\"}");
+    try waitForNoInFlightPrompt(&server, 5000);
+
+    // Run second prompt (turn 2) to verify turnIndex increments
+    try server.handleLine("{\"id\":\"p2\",\"type\":\"prompt\",\"message\":\"hello again\"}");
+    try waitForNoInFlightPrompt(&server, 5000);
+
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // turn_start frames must include turnIndex and timestamp
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"turn_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"timestamp\":") != null);
+
+    // turn_end frames must include turnIndex and timestamp
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"turn_end\"") != null);
+    // turn_start for turn 2 should carry turnIndex:2
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":2") != null);
 }
