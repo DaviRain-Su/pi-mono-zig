@@ -375,7 +375,7 @@ test "buildAgentTools accepts bash timeout alias through the agent adapter" {
     try env_map.put("PI_FAUX_TOOL_ARGS_JSON", "{\"command\":\"sleep 5\",\"timeout\":1}");
     try env_map.put("PI_FAUX_TOOL_FINAL_RESPONSE", "The command timed out");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var app_context = AppContext.init(root_dir, std.testing.io);

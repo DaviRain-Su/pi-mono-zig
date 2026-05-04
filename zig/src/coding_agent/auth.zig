@@ -555,15 +555,83 @@ pub fn buildApiKeyFromStoredEntry(
     return null;
 }
 
+// Shell command execution for "!" prefix support.
+// Uses module-level cache for process lifetime (single-threaded at startup).
+var command_result_cache: ?std.StringHashMap(?[]u8) = null;
+
+fn getOrInitCommandCache(allocator: std.mem.Allocator) *std.StringHashMap(?[]u8) {
+    if (command_result_cache == null) {
+        command_result_cache = std.StringHashMap(?[]u8).init(allocator);
+    }
+    return &command_result_cache.?;
+}
+
+fn executeShellCommand(allocator: std.mem.Allocator, io: std.Io, command: []const u8) !?[]u8 {
+    const cache = getOrInitCommandCache(allocator);
+
+    // Check cache first
+    if (cache.get(command)) |cached| {
+        if (cached) |c| return try allocator.dupe(u8, c);
+        return null;
+    }
+
+    // Execute command using std.process.spawn
+    const argv = [_][]const u8{ "/bin/sh", "-c", command };
+    var child = std.process.spawn(io, .{
+        .argv = argv[0..],
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return null;
+
+    // Wait for child to finish (no explicit timeout - blocking wait)
+    const term = child.wait(io) catch return null;
+
+    // Read stdout if child exited successfully
+    var result: ?[]u8 = null;
+    if (term == .exited and term.exited == 0) {
+        if (child.stdout) |stdout_file| {
+            // Read output in fixed buffer and trim
+            var buffer: [8192]u8 = undefined;
+            const bytes_read = std.posix.read(stdout_file.handle, &buffer) catch 0;
+            if (bytes_read > 0) {
+                // Trim whitespace
+                const trimmed = std.mem.trim(u8, buffer[0..bytes_read], &std.ascii.whitespace);
+                if (trimmed.len > 0) {
+                    result = allocator.dupe(u8, trimmed) catch return null;
+                }
+            }
+        }
+    }
+
+    // Cache the result (including null failures)
+    try cache.put(command, result);
+
+    if (result) |r| return try allocator.dupe(u8, r);
+    return null;
+}
+
 pub fn resolveApiKey(
     allocator: std.mem.Allocator,
+    io: std.Io,
     env_map: *const std.process.Environ.Map,
     provider_id: []const u8,
     runtime_override: ?[]const u8,
     stored_api_key: ?[]const u8,
 ) !?ResolvedApiKey {
+    // Check for "!" prefix - execute as shell command
     if (runtime_override) |value| {
         if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) {
+            if (value[0] == '!') {
+                const result = executeShellCommand(allocator, io, value[1..]) catch return null;
+                if (result) |cmd_result| {
+                    return .{
+                        .api_key = cmd_result,
+                        .source = .runtime,
+                    };
+                }
+                return null;
+            }
             return .{
                 .api_key = value,
                 .source = .runtime,
@@ -571,8 +639,19 @@ pub fn resolveApiKey(
         }
     }
 
+    // Check for "!" prefix in stored API key
     if (stored_api_key) |value| {
         if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) {
+            if (value[0] == '!') {
+                const result = executeShellCommand(allocator, io, value[1..]) catch return null;
+                if (result) |cmd_result| {
+                    return .{
+                        .api_key = cmd_result,
+                        .source = .stored,
+                    };
+                }
+                return null;
+            }
             return .{
                 .api_key = value,
                 .source = .stored,
@@ -1554,6 +1633,7 @@ test "resolveApiKey prefers runtime overrides over stored and environment creden
 
     const resolved = (try resolveApiKey(
         allocator,
+        std.testing.io,
         &env_map,
         "openai",
         "runtime-openai-key",
@@ -1573,12 +1653,12 @@ test "resolveApiKey falls back to stored then environment credentials" {
     defer env_map.deinit();
     try env_map.put("OPENAI_API_KEY", "env-openai-key");
 
-    const stored = (try resolveApiKey(allocator, &env_map, "openai", null, "stored-openai-key")).?;
+    const stored = (try resolveApiKey(allocator, std.testing.io, &env_map, "openai", null, "stored-openai-key")).?;
     defer if (stored.owned_api_key) |value| allocator.free(value);
     try std.testing.expectEqual(CredentialSource.stored, stored.source);
     try std.testing.expectEqualStrings("stored-openai-key", stored.api_key);
 
-    const env_only = (try resolveApiKey(allocator, &env_map, "openai", "   ", null)).?;
+    const env_only = (try resolveApiKey(allocator, std.testing.io, &env_map, "openai", "   ", null)).?;
     defer if (env_only.owned_api_key) |value| allocator.free(value);
     try std.testing.expectEqual(CredentialSource.environment, env_only.source);
     try std.testing.expectEqualStrings("env-openai-key", env_only.api_key);

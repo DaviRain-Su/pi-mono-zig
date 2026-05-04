@@ -117,6 +117,7 @@ pub fn bootstrapInteractiveStateWithMissingCwd(
 ) !InteractiveBootstrap {
     var current_provider = try provider_config.resolveProviderConfig(
         allocator,
+        io,
         env_map,
         options.provider,
         options.model,
@@ -418,7 +419,7 @@ test "openInitialSession honors no_session without creating a session file" {
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "workspace/sessions");
     defer allocator.free(session_dir);
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     const options = RunInteractiveModeOptions{
@@ -458,7 +459,7 @@ test "openInitialSession resumes the most recent session when continue is enable
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "workspace/sessions");
     defer allocator.free(session_dir);
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var source_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -513,7 +514,7 @@ test "openInitialSession preserves stored cwd when it still exists" {
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -568,7 +569,7 @@ test "openInitialSessionWithMissingCwd reports missing-cwd issue and refuses to 
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -643,7 +644,7 @@ test "openInitialSessionWithMissingCwd applies fallback cwd when the user agreed
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -708,7 +709,7 @@ test "preflightInteractiveMissingCwd reports missing stored cwd for --continue w
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
 
-    var seed_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var seed_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer seed_provider.deinit(allocator);
     var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = stored_cwd,
@@ -762,7 +763,7 @@ test "preflightInteractiveMissingCwd returns null when stored cwd still exists" 
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
 
-    var seed_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var seed_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer seed_provider.deinit(allocator);
     var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = stored_cwd,
@@ -820,7 +821,7 @@ test "resolveResumeSessionPath returns the most recent session for --continue" {
     const session_dir = try makeSessionBootstrapTestPath(allocator, tmp, "workspace/sessions");
     defer allocator.free(session_dir);
 
-    var seed_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var seed_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer seed_provider.deinit(allocator);
     var seed_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = root_dir,

@@ -436,6 +436,7 @@ fn runCliWithInput(
 
     var provider_runtime = coding_agent.resolveProviderConfig(
         allocator,
+        io,
         &effective_env_map,
         prepared.provider_name,
         prepared.model_name,

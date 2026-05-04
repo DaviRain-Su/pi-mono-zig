@@ -787,7 +787,7 @@ test "appendVerboseStartupState adds startup banner and scoped model listing" {
     defer env_map.deinit();
     try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -1285,7 +1285,7 @@ test "handleInputKey respects configured exit binding" {
     defer env_map.deinit();
     try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -1383,7 +1383,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -1551,7 +1551,7 @@ test "submitEditorText queues steering messages while streaming" {
     defer env_map.deinit();
     try env_map.put("PI_FAUX_RESPONSE", "ignored");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -1631,7 +1631,7 @@ test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued d
     defer env_map.deinit();
     try env_map.put("PI_FAUX_RESPONSE", "ignored");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -1983,7 +1983,7 @@ test "persistLoginCredential writes auth.json for slash login flows" {
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
     defer runtime_config.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2060,7 +2060,7 @@ test "submitAuthFlowInput stores API key credentials for built-in providers" {
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
     defer runtime_config.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2170,7 +2170,7 @@ test "handleInputKey opens settings overlay for slash settings command" {
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
     defer runtime_config.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2272,7 +2272,7 @@ test "settings editor overlay saves settings.json and reloads runtime settings" 
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
     defer runtime_config.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2452,7 +2452,7 @@ test "theme overlay lists all themes with active marker and enter activates sele
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
     defer runtime_config.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2559,7 +2559,7 @@ test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2636,7 +2636,7 @@ test "handleInputKey opens model overlay for slash model command" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2710,7 +2710,7 @@ test "handleInputKey opens scoped model overlay for slash scoped-models command"
     defer env_map.deinit();
     try env_map.put("OPENAI_API_KEY", "test-openai-key");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "openai", "gpt-5.4", null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "openai", "gpt-5.4", null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2794,7 +2794,7 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
     defer env_map.deinit();
     try env_map.put("OPENAI_API_KEY", "test-openai-key");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "openai", "gpt-5.4", null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "openai", "gpt-5.4", null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2920,7 +2920,7 @@ test "handleInputKey reports when scoped models are not configured" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -2994,7 +2994,7 @@ test "handleInputKey reports unknown slash commands" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3068,7 +3068,7 @@ test "handleInputKey updates session name for slash name command" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3145,7 +3145,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3328,7 +3328,7 @@ test "submitEditorText resets editor autocomplete state after submit" {
     defer env_map.deinit();
     try env_map.put("PI_FAUX_RESPONSE", "submitted");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3434,7 +3434,7 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
     defer env_map.deinit();
     try env_map.put("PI_FAUX_RESPONSE", "clipboard");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3530,7 +3530,7 @@ test "submitEditorText includes pending clipboard images and clears the draft at
     defer env_map.deinit();
     try env_map.put("PI_FAUX_RESPONSE", "submitted");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3731,7 +3731,7 @@ test "handleInputKey shows session stats for slash session command" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3875,7 +3875,7 @@ test "handleInputKey appends condensed changelog markdown for slash changelog co
     const root_dir = try makeInteractiveTestPath(allocator, tmp, "");
     defer allocator.free(root_dir);
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -3954,7 +3954,7 @@ test "session overlays use persisted session names and labels" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var tmp = std.testing.tmpDir(.{});
@@ -4003,7 +4003,7 @@ test "handleInputKey imports a session from an explicit jsonl path" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var tmp = std.testing.tmpDir(.{});
@@ -4109,7 +4109,7 @@ test "handleInputKey starts a fresh session for slash new command" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var tmp = std.testing.tmpDir(.{});
@@ -4204,7 +4204,7 @@ test "handleInputKey exports session transcript to explicit html and jsonl paths
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var tmp = std.testing.tmpDir(.{});
@@ -4540,7 +4540,7 @@ test "interactive tool conversation renders tool lines and persists session entr
     try env_map.put("PI_FAUX_TOOL_ARGS_JSON", tool_args_json);
     try env_map.put("PI_FAUX_TOOL_FINAL_RESPONSE", "The file says: secret note");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var app_context = AppContext.init(root_dir, std.testing.io);
@@ -4644,7 +4644,7 @@ test "interactive bash tool conversation preserves structured details" {
     try env_map.put("PI_FAUX_TOOL_ARGS_JSON", "{\"command\":\"seq 3000\",\"timeout_seconds\":1}");
     try env_map.put("PI_FAUX_TOOL_FINAL_RESPONSE", "The command completed");
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var app_context = AppContext.init(root_dir, std.testing.io);
@@ -4733,7 +4733,7 @@ test "handleCopySlashCommand copies the last assistant message to the clipboard"
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
@@ -5225,7 +5225,7 @@ test "handleLogoutSlashCommand opens selector for stored auth providers" {
     var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
     defer runtime_config.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{

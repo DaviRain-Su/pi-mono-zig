@@ -409,6 +409,7 @@ pub fn switchSession(
 
     var candidate_provider = provider_config.resolveProviderConfig(
         allocator,
+        io,
         env_map,
         candidate.agent.getModel().provider,
         candidate.agent.getModel().id,
@@ -451,6 +452,7 @@ pub fn switchModel(
 ) !void {
     var next_provider = provider_config.resolveProviderConfig(
         allocator,
+        session.io,
         env_map,
         provider_name,
         model_id,
@@ -1288,6 +1290,7 @@ pub fn persistLoginCredential(
     if (std.mem.eql(u8, session.agent.getModel().provider, provider_id)) {
         const resolved = provider_config.resolveProviderConfig(
             allocator,
+            io,
             env_map,
             provider_id,
             session.agent.getModel().id,
@@ -1709,6 +1712,7 @@ pub fn logoutProviderById(
     if (affects_current_provider) {
         const resolved = provider_config.resolveProviderConfig(
             allocator,
+            io,
             env_map,
             provider_name,
             model_id,
@@ -2352,7 +2356,7 @@ test "switchModel shows provider-specific setup guidance when auth is missing" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var current_provider = try provider_config.resolveProviderConfig(allocator, &env_map, "faux", null, null, null);
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
     defer current_provider.deinit(allocator);
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{

@@ -95,6 +95,7 @@ pub const ConfiguredCredentials = struct {
 
 pub fn resolveProviderConfig(
     allocator: std.mem.Allocator,
+    io: std.Io,
     env_map: *const std.process.Environ.Map,
     provider: []const u8,
     model_override: ?[]const u8,
@@ -111,7 +112,7 @@ pub fn resolveProviderConfig(
     }
 
     const provider_descriptor = descriptor.?;
-    const resolved_api_key = try auth.resolveApiKey(allocator, env_map, provider, api_key_override, configured_api_key);
+    const resolved_api_key = try auth.resolveApiKey(allocator, io, env_map, provider, api_key_override, configured_api_key);
     if (resolved_api_key == null and !isLocalBaseUrl(provider_descriptor.base_url)) return error.MissingApiKey;
 
     const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
@@ -689,7 +690,7 @@ test "resolveProviderConfig uses canonical defaults from model registry" {
 
     try env_map.put("OPENAI_API_KEY", "openai-key");
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null, null);
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "openai", null, null, null);
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("openai-key", resolved.api_key.?);
@@ -711,7 +712,7 @@ test "resolveProviderConfig supports non-legacy built-in providers" {
 
     try env_map.put("MISTRAL_API_KEY", "mistral-key");
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "mistral", "devstral-medium-latest", null, null);
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "mistral", "devstral-medium-latest", null, null);
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("mistral-key", resolved.api_key.?);
@@ -727,7 +728,7 @@ test "resolveProviderConfig uses configured api key when env is missing" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null, "configured-openai-key");
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "openai", null, null, "configured-openai-key");
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
@@ -744,6 +745,7 @@ test "resolveProviderConfig prefers runtime override over stored and environment
 
     var resolved = try resolveProviderConfig(
         allocator,
+        std.testing.io,
         &env_map,
         "openai",
         null,
@@ -766,7 +768,7 @@ test "resolveProviderConfig can force faux responses for built-in providers" {
     try env_map.put("PI_FAUX_FORCE", "1");
     try env_map.put("PI_FAUX_RESPONSE", "forced faux response");
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "openai", null, null, null);
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "openai", null, null, null);
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqual(@as(?[]const u8, null), resolved.api_key);
@@ -786,7 +788,7 @@ test "resolveProviderConfig applies faux context window overrides" {
     try env_map.put("PI_FAUX_CONTEXT_WINDOW", "48");
     try env_map.put("PI_FAUX_RESPONSE", "forced faux response");
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "anthropic", null, null, null);
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "anthropic", null, null, null);
     defer resolved.deinit(allocator);
 
     try std.testing.expectEqualStrings("anthropic", resolved.model.provider);
@@ -1016,7 +1018,7 @@ test "local custom providers do not require api keys" {
     }
     try std.testing.expect(saw_local);
 
-    var resolved = try resolveProviderConfig(allocator, &env_map, "local-noauth", null, null, null);
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "local-noauth", null, null, null);
     defer resolved.deinit(allocator);
     try std.testing.expectEqualStrings("local-model", resolved.model.id);
     try std.testing.expect(resolved.api_key == null);
