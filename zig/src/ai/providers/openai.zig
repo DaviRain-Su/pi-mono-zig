@@ -6,6 +6,8 @@ const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const cloudflare = @import("cloudflare.zig");
+const github_copilot_headers = @import("github_copilot_headers.zig");
 
 pub const OpenAIProvider = struct {
     pub const api = "openai-completions";
@@ -75,7 +77,23 @@ pub const OpenAIProvider = struct {
         var headers = try buildRequestHeaders(allocator, model, resolved_options);
         defer deinitOwnedHeaders(allocator, &headers);
 
-        const request_target = try buildOpenAIChatRequestTarget(allocator, model.base_url);
+        if (std.mem.eql(u8, model.provider, "github-copilot")) {
+            var copilot_hdrs = try github_copilot_headers.buildCopilotDynamicHeaders(allocator, context.messages);
+            defer {
+                var it = copilot_hdrs.valueIterator();
+                while (it.next()) |v| allocator.free(v.*);
+                copilot_hdrs.deinit();
+            }
+            try mergeHeaders(allocator, &headers, copilot_hdrs);
+        }
+
+        const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
+            try cloudflare.resolveCloudflareBaseUrl(allocator, model)
+        else
+            null;
+        defer if (resolved_base_url) |url| allocator.free(url);
+
+        const request_target = try buildOpenAIChatRequestTarget(allocator, resolved_base_url orelse model.base_url);
         defer request_target.deinit(allocator);
 
         const req = http_client.HttpRequest{
@@ -4133,4 +4151,42 @@ test "parseChunkUsage cache write exceeds prompt saturates to zero" {
     try std.testing.expectEqual(@as(u32, 0), usage.cache_read);
     try std.testing.expectEqual(@as(u32, 20), usage.cache_write);
     try std.testing.expectEqual(@as(u32, 24), usage.total_tokens);
+}
+
+test "openai stream cloudflare provider resolves base_url placeholders via env" {
+    // Verifies that isCloudflareProvider gates resolveCloudflareBaseUrl: when the
+    // env var referenced in base_url is absent, the stream returns a terminal
+    // EnvironmentVariableNotFound error event rather than a networking error for a
+    // literal {VAR} URL.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const model = types.Model{
+        .id = "cloudflare-model",
+        .name = "Cloudflare Model",
+        .api = "openai-completions",
+        .provider = "cloudflare-workers-ai",
+        .base_url = "https://api.cloudflare.com/v1/{OPENAI_WIRE_IN_CF_TEST_ABSENT_VAR}/chat",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try OpenAIProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expectEqualStrings("EnvironmentVariableNotFound", event.error_message.?);
+    try std.testing.expect(stream.next() == null);
 }

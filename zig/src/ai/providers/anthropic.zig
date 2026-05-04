@@ -5,6 +5,8 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const cloudflare = @import("cloudflare.zig");
+const github_copilot_headers = @import("github_copilot_headers.zig");
 
 const AnthropicError = error{
     UnknownStopReason,
@@ -110,7 +112,13 @@ pub const AnthropicProvider = struct {
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
 
-        const url = try buildMessagesUrl(allocator, model.base_url);
+        const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
+            try cloudflare.resolveCloudflareBaseUrl(allocator, model)
+        else
+            null;
+        defer if (resolved_base_url) |b| allocator.free(b);
+
+        const url = try buildMessagesUrl(allocator, resolved_base_url orelse model.base_url);
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
@@ -124,6 +132,16 @@ pub const AnthropicProvider = struct {
         try mergeHeaders(allocator, &headers, model.headers);
         if (resolved_options.options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
+        }
+
+        if (std.mem.eql(u8, model.provider, "github-copilot")) {
+            var copilot_hdrs = try github_copilot_headers.buildCopilotDynamicHeaders(allocator, context.messages);
+            defer {
+                var it = copilot_hdrs.valueIterator();
+                while (it.next()) |v| allocator.free(v.*);
+                copilot_hdrs.deinit();
+            }
+            try mergeHeaders(allocator, &headers, copilot_hdrs);
         }
 
         var client = try http_client.HttpClient.init(allocator, io);
@@ -3059,4 +3077,35 @@ test "VAL-M9-STREAM-006 stream null api key options returns sanitized terminal e
     defer stream.deinit();
 
     try expectMissingApiKeyTerminalErrorAnthropic(&stream, "anthropic");
+}
+
+test "anthropic stream cloudflare provider resolves base_url placeholders via env" {
+    // Verifies that isCloudflareProvider gates resolveCloudflareBaseUrl: when the
+    // env var referenced in base_url is absent, the stream returns a terminal
+    // EnvironmentVariableNotFound error event rather than a networking error for a
+    // literal {VAR} URL.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const model = types.Model{
+        .id = "cloudflare-anthropic-model",
+        .name = "Cloudflare Anthropic Model",
+        .api = "anthropic-messages",
+        .provider = "cloudflare-ai-gateway",
+        .base_url = "https://gateway.ai.cloudflare.com/v1/{ANTHROPIC_WIRE_IN_CF_TEST_ABSENT_VAR}/{ANTHROPIC_WIRE_IN_CF_TEST_GATEWAY_ABSENT}/anthropic",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+
+    const context = streamErrorContractAnthropicContext();
+
+    var stream = try AnthropicProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.error_message != null);
+    try std.testing.expectEqualStrings("EnvironmentVariableNotFound", event.error_message.?);
+    try std.testing.expect(stream.next() == null);
 }

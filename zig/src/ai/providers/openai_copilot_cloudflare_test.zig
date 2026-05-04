@@ -1,29 +1,29 @@
 const std = @import("std");
-const anthropic = @import("anthropic.zig");
+const openai = @import("openai.zig");
 const types = @import("../types.zig");
 
-const CapturedRequest = struct {
-    headers: std.StringHashMap([]const u8),
-    body: []u8,
-
-    fn deinit(self: *CapturedRequest, allocator: std.mem.Allocator) void {
-        var iterator = self.headers.iterator();
-        while (iterator.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.headers.deinit();
-        allocator.free(self.body);
-        self.* = undefined;
-    }
-};
-
+/// A minimal server that accepts one connection, captures request headers, and
+/// responds with an empty 200 SSE stream so the provider can complete setup.
 const RequestCaptureServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     server: std.Io.net.Server,
     thread: ?std.Thread = null,
     captured: ?CapturedRequest = null,
+
+    const CapturedRequest = struct {
+        headers: std.StringHashMap([]const u8),
+
+        fn deinit(self: *CapturedRequest, allocator: std.mem.Allocator) void {
+            var iterator = self.headers.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            self.headers.deinit();
+            self.* = undefined;
+        }
+    };
 
     fn init(allocator: std.mem.Allocator, io: std.Io) !RequestCaptureServer {
         return .{
@@ -60,7 +60,7 @@ const RequestCaptureServer = struct {
     }
 
     fn captureRequest(self: *RequestCaptureServer, stream: std.Io.net.Stream) !void {
-        var read_buffer: [2048]u8 = undefined;
+        var read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(std.testing.io, &read_buffer);
 
         var head = std.ArrayList(u8).empty;
@@ -97,39 +97,21 @@ const RequestCaptureServer = struct {
         }
 
         var lines = std.mem.splitSequence(u8, head.items, "\r\n");
-        _ = lines.next();
+        _ = lines.next(); // skip request line
 
-        var content_length: usize = 0;
         while (lines.next()) |line| {
             if (line.len == 0) break;
-
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
             const raw_name = std.mem.trim(u8, line[0..colon], &std.ascii.whitespace);
             const raw_value = std.mem.trim(u8, line[colon + 1 ..], &std.ascii.whitespace);
-
             const name = try std.ascii.allocLowerString(self.allocator, raw_name);
             errdefer self.allocator.free(name);
-
             const value = try self.allocator.dupe(u8, raw_value);
             errdefer self.allocator.free(value);
-
             try headers.put(name, value);
-            if (std.mem.eql(u8, name, "content-length")) {
-                content_length = try std.fmt.parseUnsigned(usize, raw_value, 10);
-            }
         }
 
-        const body = try self.allocator.alloc(u8, content_length);
-        errdefer self.allocator.free(body);
-
-        for (body) |*byte| {
-            byte.* = try reader.interface.takeByte();
-        }
-
-        self.captured = .{
-            .headers = headers,
-            .body = body,
-        };
+        self.captured = .{ .headers = headers };
     }
 
     fn writeResponse(self: *RequestCaptureServer, stream: std.Io.net.Stream) !void {
@@ -146,86 +128,7 @@ const RequestCaptureServer = struct {
     }
 };
 
-fn createCompatValue(allocator: std.mem.Allocator, supports_eager_tool_input_streaming: bool) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        if (supports_eager_tool_input_streaming)
-            "{\"supportsEagerToolInputStreaming\":true}"
-        else
-            "{\"supportsEagerToolInputStreaming\":false}",
-        .{},
-    );
-}
-
-test "github-copilot eager streaming compat is applied to streamed anthropic requests" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const io = std.testing.io;
-
-    var server = try RequestCaptureServer.init(allocator, io);
-    defer server.deinit();
-    try server.start();
-
-    const base_url = try server.url();
-    defer allocator.free(base_url);
-
-    var tool_parameters = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
-    defer tool_parameters.deinit();
-
-    var compat = try createCompatValue(allocator, false);
-    defer compat.deinit();
-
-    const tools = &[_]types.Tool{.{
-        .name = "todoWrite",
-        .description = "Write todos",
-        .parameters = tool_parameters.value,
-    }};
-
-    const context = types.Context{
-        .messages = &[_]types.Message{
-            .{ .user = .{
-                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Use a tool" } }},
-                .timestamp = 1,
-            } },
-        },
-        .tools = tools,
-    };
-
-    const model = types.Model{
-        .id = "claude-sonnet-4.5",
-        .name = "Claude Sonnet 4.5",
-        .api = "anthropic-messages",
-        .provider = "github-copilot",
-        .base_url = base_url,
-        .reasoning = true,
-        .input_types = &[_][]const u8{ "text", "image" },
-        .context_window = 144000,
-        .max_tokens = 32000,
-        .compat = compat.value,
-    };
-
-    var stream = try anthropic.AnthropicProvider.stream(allocator, io, model, context, .{
-        .api_key = "copilot-token",
-    });
-    defer stream.deinit();
-
-    const request = server.captured orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(
-        "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
-        request.headers.get("anthropic-beta").?,
-    );
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request.body, .{});
-    defer parsed.deinit();
-
-    const first_tool = parsed.value.object.get("tools").?.array.items[0];
-    try std.testing.expect(first_tool == .object);
-    try std.testing.expect(first_tool.object.get("eager_input_streaming") == null);
-}
-
-test "anthropic stream github-copilot provider injects copilot dynamic headers" {
+test "openai stream github-copilot provider injects copilot dynamic headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -248,24 +151,24 @@ test "anthropic stream github-copilot provider injects copilot dynamic headers" 
     };
 
     const model = types.Model{
-        .id = "claude-sonnet-4.5",
-        .name = "Claude Sonnet 4.5",
-        .api = "anthropic-messages",
+        .id = "gpt-4o",
+        .name = "GPT-4o",
+        .api = "openai-completions",
         .provider = "github-copilot",
         .base_url = base_url,
         .input_types = &[_][]const u8{"text"},
-        .context_window = 144000,
-        .max_tokens = 32000,
+        .context_window = 128000,
+        .max_tokens = 4096,
     };
 
-    var stream = try anthropic.AnthropicProvider.stream(allocator, io, model, context, .{
+    var stream = try openai.OpenAIProvider.stream(allocator, io, model, context, .{
         .api_key = "copilot-token",
     });
     defer stream.deinit();
 
-    const request = server.captured orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("user", request.headers.get("x-initiator").?);
-    try std.testing.expectEqualStrings("conversation-edits", request.headers.get("openai-intent").?);
+    const captured = server.captured orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("user", captured.headers.get("x-initiator").?);
+    try std.testing.expectEqualStrings("conversation-edits", captured.headers.get("openai-intent").?);
     // No images in context, so Copilot-Vision-Request must be absent
-    try std.testing.expect(request.headers.get("copilot-vision-request") == null);
+    try std.testing.expect(captured.headers.get("copilot-vision-request") == null);
 }
