@@ -94,11 +94,17 @@ fn runCliWithInput(
         defer allocator.free(cwd);
         const agent_dir = try config_mod.resolveAgentDir(allocator, env_map);
         defer allocator.free(agent_dir);
+        const stdout_is_tty = std.Io.File.stdout().isTty(io) catch false;
         const result = try coding_agent.package_manager.executePackageCommand(
             allocator,
             io,
             package_command,
-            .{ .cwd = cwd, .agent_dir = agent_dir },
+            .{
+                .cwd = cwd,
+                .agent_dir = agent_dir,
+                .stdout_is_tty = stdout_is_tty,
+                .env_map = env_map,
+            },
             stdout,
             stderr,
         );
