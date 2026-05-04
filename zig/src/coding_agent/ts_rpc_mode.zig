@@ -1117,7 +1117,10 @@ const TsRpcServer = struct {
                 return;
             };
             if (self.extension_host) |ext_host| {
-                self.emitSessionBeforeSwitchEvent(ext_host, "new", parent_session);
+                // For new sessions, targetSessionFile is undefined (the new session file
+                // doesn't exist yet). parentSession is the old session being shut down,
+                // not the target for the switch event.
+                self.emitSessionBeforeSwitchEvent(ext_host, "new", null);
                 self.emitSessionShutdownEvent(ext_host, "new", parent_session);
             }
             var host = TsRpcSessionHost.init(self);
@@ -1870,10 +1873,27 @@ const TsRpcServer = struct {
 
         if (std.mem.eql(u8, request.method, "send_custom_message")) {
             const session = self.session orelse return;
-            const custom_type = optionalString(payload, "customType") catch return orelse "extension.message";
+            // Default customType is "extension.message" when the field is omitted.
+            const custom_type_or_null = optionalString(payload, "customType") catch {
+                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"customType must be a string\"}");
+                return;
+            };
+            const custom_type = custom_type_or_null orelse "extension.message";
             const display = optionalBool(payload, "display") orelse true;
             const trigger_turn = optionalBool(payload, "triggerTurn") orelse false;
-            const deliver_as = optionalString(payload, "deliverAs") catch return;
+            const deliver_as = optionalString(payload, "deliverAs") catch {
+                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs must be a string\"}");
+                return;
+            };
+
+            // deliverAs="nextTurn" is not yet supported — no holding queue is implemented.
+            // Return an explicit error so callers waiting on response_required don't hang.
+            if (deliver_as) |mode| {
+                if (std.mem.eql(u8, mode, "nextTurn")) {
+                    if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs nextTurn is not yet supported\"}");
+                    return;
+                }
+            }
 
             // Build content: prefer string, fall back to empty text.
             const content_text: []const u8 = if (payload.get("content")) |c|
@@ -1916,8 +1936,23 @@ const TsRpcServer = struct {
 
         if (std.mem.eql(u8, request.method, "send_user_message")) {
             const session = self.session orelse return;
-            const text = optionalString(payload, "text") catch return orelse "";
-            const deliver_as = optionalString(payload, "deliverAs") catch return;
+            const text = optionalString(payload, "text") catch {
+                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"text must be a string\"}");
+                return;
+            } orelse "";
+            const deliver_as = optionalString(payload, "deliverAs") catch {
+                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs must be a string\"}");
+                return;
+            };
+
+            // deliverAs="nextTurn" is not yet supported — no holding queue is implemented.
+            // Return an explicit error so callers waiting on response_required don't hang.
+            if (deliver_as) |mode| {
+                if (std.mem.eql(u8, mode, "nextTurn")) {
+                    if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs nextTurn is not yet supported\"}");
+                    return;
+                }
+            }
 
             if (session.isStreaming() or self.hasInFlightPrompt()) {
                 // Route based on deliverAs when the agent is busy.
@@ -2006,7 +2041,8 @@ const TsRpcServer = struct {
 
     /// Emit a `tool_result` extension event frame when a tool finishes executing.
     /// Mirrors the TS `ToolResultEvent` wire format: type, toolCallId, toolName,
-    /// input (empty since args not available at end), content, isError.
+    /// input (original call args from event.args), content, isError.
+    /// thinking and tool_call content blocks are skipped (not emitted as empty text).
     fn emitExtensionToolResultEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, event: agent.AgentEvent) void {
         const tool_call_id = event.tool_call_id orelse return;
         const tool_name = event.tool_name orelse return;
@@ -2016,27 +2052,39 @@ const TsRpcServer = struct {
         writeJsonString(self.allocator, &out.writer, tool_call_id) catch return;
         out.writer.writeAll(",\"toolName\":") catch return;
         writeJsonString(self.allocator, &out.writer, tool_name) catch return;
-        out.writer.writeAll(",\"input\":{},\"content\":[") catch return;
+        // Retain original tool-call args as input (TS ToolResultEvent.input = call arguments).
+        out.writer.writeAll(",\"input\":") catch return;
+        if (event.args) |args| {
+            const args_json = std.json.Stringify.valueAlloc(self.allocator, args, .{}) catch return;
+            defer self.allocator.free(args_json);
+            out.writer.writeAll(args_json) catch return;
+        } else {
+            out.writer.writeAll("{}") catch return;
+        }
+        out.writer.writeAll(",\"content\":[") catch return;
         if (event.result) |result| {
-            for (result.content, 0..) |block, idx| {
-                if (idx > 0) out.writer.writeAll(",") catch return;
+            var first = true;
+            for (result.content) |block| {
                 switch (block) {
                     .text => |text| {
+                        if (!first) out.writer.writeAll(",") catch return;
+                        first = false;
                         out.writer.writeAll("{\"type\":\"text\",\"text\":") catch return;
                         writeJsonString(self.allocator, &out.writer, text.text) catch return;
                         out.writer.writeAll("}") catch return;
                     },
                     .image => |image| {
+                        if (!first) out.writer.writeAll(",") catch return;
+                        first = false;
                         out.writer.writeAll("{\"type\":\"image\",\"mimeType\":") catch return;
                         writeJsonString(self.allocator, &out.writer, image.mime_type) catch return;
                         out.writer.writeAll(",\"data\":") catch return;
                         writeJsonString(self.allocator, &out.writer, image.data) catch return;
                         out.writer.writeAll("}") catch return;
                     },
-                    else => {
-                        // Skip thinking/tool_call blocks in extension events
-                        out.writer.writeAll("{\"type\":\"text\",\"text\":\"\"}") catch return;
-                    },
+                    // thinking and tool_call blocks are intentionally skipped —
+                    // they should not appear in the tool_result.content wire frame.
+                    else => {},
                 }
             }
         }
@@ -2100,22 +2148,21 @@ const TsRpcServer = struct {
         host.sendExtensionEventFrame(out.written());
     }
 
-    /// Emit a `turn_end` extension event frame with turnIndex and timestamp injected
-    /// after the type field. The base_frame (from json_event_wire) carries message and
+    /// Emit a `turn_end` extension event frame with turnIndex injected after the
+    /// type field. The base_frame (from json_event_wire) carries message and
     /// toolResults; this function prepends the parity fields before forwarding to the host.
+    /// Note: TS TurnEndEvent does not declare a timestamp field; timestamp is only on turn_start.
     fn emitExtensionTurnEndFrame(self: *TsRpcServer, host: *extension_host_mod.HostProcess, base_frame: []const u8) void {
         const base_prefix = "{\"type\":\"turn_end\"";
         if (!std.mem.startsWith(u8, base_frame, base_prefix)) {
             host.sendExtensionEventFrame(base_frame);
             return;
         }
-        const ts_ms = @divFloor(std.Io.Clock.now(.awake, self.io).nanoseconds, std.time.ns_per_ms);
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
-        out.writer.print("{s},\"turnIndex\":{d},\"timestamp\":{d}", .{
+        out.writer.print("{s},\"turnIndex\":{d}", .{
             base_prefix,
             self.turn_index,
-            ts_ms,
         }) catch return;
         out.writer.writeAll(base_frame[base_prefix.len..]) catch return;
         host.sendExtensionEventFrame(out.written());
@@ -6676,10 +6723,22 @@ test "event_emission: turn_start and turn_end frames contain turnIndex and times
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"timestamp\":") != null);
 
-    // turn_end frames must include turnIndex and timestamp
+    // turn_end frames include turnIndex but NOT timestamp (TS TurnEndEvent has no timestamp field).
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"turn_end\"") != null);
     // turn_start for turn 2 should carry turnIndex:2
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":2") != null);
+    // Verify each turn_end extension event: top-level must have turnIndex, not timestamp.
+    // (Nested message objects carry their own timestamp, which is expected.)
+    var line_iter = std.mem.tokenizeScalar(u8, capture, '\n');
+    while (line_iter.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"type\":\"turn_end\"") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "\"turnIndex\":") != null);
+            // Parse and check top-level keys: timestamp must not be a top-level field.
+            var parsed_line = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+            defer parsed_line.deinit();
+            try std.testing.expect(parsed_line.value.object.get("timestamp") == null);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6743,6 +6802,14 @@ test "session_lifecycle: new_session emits session_before_switch and session_shu
     // session_before_switch must appear with reason "new"
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_before_switch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"reason\":\"new\"") != null);
+    // For new sessions, targetSessionFile must be absent from session_before_switch
+    // (the new session file doesn't exist yet; parentSession is the old session, not the target).
+    var line_iter = std.mem.tokenizeScalar(u8, capture, '\n');
+    while (line_iter.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"type\":\"session_before_switch\"") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "\"targetSessionFile\"") == null);
+        }
+    }
     // session_shutdown must appear (from new_session and/or quit)
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_shutdown\"") != null);
 }
@@ -7205,4 +7272,184 @@ test "command_context: sendUserMessage starts background prompt when agent is id
     try std.testing.expectEqual(@as(usize, 2), messages.len);
     try std.testing.expect(messages[0] == .user);
     try std.testing.expect(messages[1] == .assistant);
+}
+
+// ---------------------------------------------------------------------------
+// Wire-format cleanup regression tests (items 1-7).
+// All test names begin with "wire_format_cleanup" for --test-filter matching.
+// ---------------------------------------------------------------------------
+
+test "wire_format_cleanup: tool_result frame carries call args as input and skips non-text blocks" {
+    // Items 2 & 3: tool_result.input must contain the original call args;
+    // thinking and tool_call content blocks must be skipped (not emitted as empty text).
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-wfc-tool-result.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-wfc-tool-result" };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/wfc-tool-result",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-wfc-tool-result",
+        .fixture = "wfc-tool-result",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    // Build args JSON: {"command": "echo hello"}
+    var parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"command\":\"echo hello\"}", .{});
+    defer parsed_args.deinit();
+    const args_value = parsed_args.value;
+
+    // Build result content: one text block + one thinking block (thinking should be skipped).
+    const result_content = try allocator.alloc(ai.ContentBlock, 2);
+    defer allocator.free(result_content);
+    result_content[0] = .{ .text = .{ .text = "hello" } };
+    result_content[1] = .{ .thinking = .{ .thinking = "internal reasoning" } };
+
+    const event = agent.AgentEvent{
+        .event_type = .tool_execution_end,
+        .tool_call_id = "tc-wfc-1",
+        .tool_name = "bash",
+        .args = args_value,
+        .result = .{ .content = result_content },
+        .is_error = false,
+    };
+
+    try server.writeEvent(event);
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // The tool_result extension event must carry the original call args as "input".
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"input\":{\"command\":\"echo hello\"}") != null);
+    // Text content must appear in "content".
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"text\",\"text\":\"hello\"") != null);
+    // Thinking block must NOT be emitted as an empty text placeholder.
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"text\",\"text\":\"\"") == null);
+}
+
+test "wire_format_cleanup: send_custom_message nextTurn returns error without persisting message" {
+    // Items 5 & 7: deliverAs="nextTurn" must be rejected; the message must NOT be persisted.
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/wfc-custom-next-turn",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "wfc-next-1"),
+        .method = try allocator.dupe(u8, "send_custom_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, "{\"customType\":\"test.msg\",\"content\":\"hello\",\"deliverAs\":\"nextTurn\"}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+
+    // The message must NOT be persisted — nextTurn is rejected before appendCustomMessageEntry.
+    try std.testing.expectEqual(@as(usize, 0), session.session_manager.getEntries().len);
+}
+
+test "wire_format_cleanup: send_user_message nextTurn does not queue the message" {
+    // Items 5 & 7: deliverAs="nextTurn" for send_user_message must return early without queuing.
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/wfc-user-next-turn",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    // Simulate agent busy so follow-up queuing would normally happen.
+    session.agent.is_streaming = true;
+
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "wfc-user-nt"),
+        .method = try allocator.dupe(u8, "send_user_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, "{\"text\":\"hello\",\"deliverAs\":\"nextTurn\"}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+
+    // Nothing must be queued since nextTurn is explicitly rejected.
+    try std.testing.expectEqual(@as(usize, 0), session.agent.followUpQueueLen());
+}
+
+test "wire_format_cleanup: send_custom_message malformed customType returns without persisting" {
+    // Item 5: when customType is a non-string value, an error frame is returned and
+    // the message is NOT persisted (early return before appendCustomMessageEntry).
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/wfc-custom-badtype",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    // customType is a number (not a string) — malformed payload.
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "wfc-bad-type"),
+        .method = try allocator.dupe(u8, "send_custom_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, "{\"customType\":123,\"content\":\"hello\"}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+
+    // Message must NOT be persisted since the error is caught before appendCustomMessageEntry.
+    try std.testing.expectEqual(@as(usize, 0), session.session_manager.getEntries().len);
 }
