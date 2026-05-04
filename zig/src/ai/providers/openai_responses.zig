@@ -6,6 +6,7 @@ const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
+const copilot_headers = @import("github_copilot_headers.zig");
 
 const MessagePartKind = enum {
     output_text,
@@ -331,9 +332,9 @@ fn buildRequestHeaders(
     try mergeHeaders(allocator, &headers, model.headers);
 
     if (std.mem.eql(u8, model.provider, "github-copilot")) {
-        try putOwnedHeader(allocator, &headers, "X-Initiator", inferCopilotInitiator(context));
+        try putOwnedHeader(allocator, &headers, "X-Initiator", copilot_headers.inferCopilotInitiator(context.messages));
         try putOwnedHeader(allocator, &headers, "Openai-Intent", "conversation-edits");
-        if (hasCopilotVisionInput(context)) {
+        if (copilot_headers.hasCopilotVisionInput(context.messages)) {
             try putOwnedHeader(allocator, &headers, "Copilot-Vision-Request", "true");
         }
     }
@@ -349,31 +350,6 @@ fn buildRequestHeaders(
     try mergeHeaders(allocator, &headers, options.headers);
 
     return headers;
-}
-
-fn inferCopilotInitiator(context: types.Context) []const u8 {
-    if (context.messages.len == 0) return "user";
-    return switch (context.messages[context.messages.len - 1]) {
-        .user => "user",
-        .assistant, .tool_result => "agent",
-    };
-}
-
-fn hasCopilotVisionInput(context: types.Context) bool {
-    for (context.messages) |message| {
-        const content = switch (message) {
-            .user => |user| user.content,
-            .tool_result => |tool_result| tool_result.content,
-            .assistant => continue,
-        };
-        for (content) |block| {
-            switch (block) {
-                .image => return true,
-                else => {},
-            }
-        }
-    }
-    return false;
 }
 
 fn parseSseStreamLines(
@@ -3219,9 +3195,9 @@ test "Copilot header inference follows final role and user or tool-result images
             } },
         },
     };
-    try std.testing.expectEqualStrings("user", inferCopilotInitiator(.{ .messages = &[_]types.Message{} }));
-    try std.testing.expectEqualStrings("user", inferCopilotInitiator(user_final));
-    try std.testing.expect(!hasCopilotVisionInput(user_final));
+    try std.testing.expectEqualStrings("user", copilot_headers.inferCopilotInitiator(&[_]types.Message{}));
+    try std.testing.expectEqualStrings("user", copilot_headers.inferCopilotInitiator(user_final.messages));
+    try std.testing.expect(!copilot_headers.hasCopilotVisionInput(user_final.messages));
 
     const tool_result_final = types.Context{
         .messages = &[_]types.Message{
@@ -3234,8 +3210,8 @@ test "Copilot header inference follows final role and user or tool-result images
             } },
         },
     };
-    try std.testing.expectEqualStrings("agent", inferCopilotInitiator(tool_result_final));
-    try std.testing.expect(hasCopilotVisionInput(tool_result_final));
+    try std.testing.expectEqualStrings("agent", copilot_headers.inferCopilotInitiator(tool_result_final.messages));
+    try std.testing.expect(copilot_headers.hasCopilotVisionInput(tool_result_final.messages));
 }
 
 test "parseSseStreamLines finalizes partial text before response.failed terminal error" {
