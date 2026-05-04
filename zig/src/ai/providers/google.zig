@@ -503,8 +503,12 @@ fn buildContentsValue(
                 }
             },
             .tool_result => {
-                const grouped = try buildToolResultMessageValue(allocator, model, messages[index..]);
+                var grouped = try buildToolResultMessageValue(allocator, model, messages[index..]);
+                defer grouped.image_turns.deinit(allocator);
                 try contents.append(grouped.value);
+                for (grouped.image_turns.items) |img_turn| {
+                    try contents.append(img_turn);
+                }
                 index += grouped.consumed - 1;
             },
         }
@@ -657,13 +661,51 @@ fn buildAssistantMessageValue(
     return try buildRoleMessageValue(allocator, "model", .{ .array = parts });
 }
 
+/// Returns the Gemini major version from a model ID, e.g. "gemini-2.5-pro" → 2,
+/// "gemini-live-3.0-pro" → 3. Returns null for non-Gemini models.
+fn getGeminiMajorVersion(model_id: []const u8) ?u32 {
+    var buf: [128]u8 = undefined;
+    const len = @min(model_id.len, buf.len);
+    const lower = std.ascii.lowerString(buf[0..len], model_id[0..len]);
+
+    const rest: []const u8 = if (std.mem.startsWith(u8, lower, "gemini-live-"))
+        lower["gemini-live-".len..]
+    else if (std.mem.startsWith(u8, lower, "gemini-"))
+        lower["gemini-".len..]
+    else
+        return null;
+
+    if (rest.len == 0 or !std.ascii.isDigit(rest[0])) return null;
+    var n: u32 = 0;
+    var i: usize = 0;
+    while (i < rest.len and std.ascii.isDigit(rest[i])) : (i += 1) {
+        n = n * 10 + (rest[i] - '0');
+    }
+    return n;
+}
+
+/// Mirrors TS supportsMultimodalFunctionResponse: Gemini 3+ and non-Gemini models
+/// keep image inlineData inside functionResponse.parts. Gemini < 3 requires a
+/// separate user turn for images.
+fn supportsMultimodalFunctionResponse(model_id: []const u8) bool {
+    if (getGeminiMajorVersion(model_id)) |version| {
+        return version >= 3;
+    }
+    return true;
+}
+
 fn buildToolResultMessageValue(
     allocator: std.mem.Allocator,
     model: types.Model,
     messages: []const types.Message,
-) !struct { value: std.json.Value, consumed: usize } {
+) !struct { value: std.json.Value, image_turns: std.ArrayList(std.json.Value), consumed: usize } {
     var parts = std.json.Array.init(allocator);
     errdefer parts.deinit();
+
+    var image_turns = std.ArrayList(std.json.Value).empty;
+
+    const supports_images = modelSupportsImages(model);
+    const supports_multimodal_fn = supportsMultimodalFunctionResponse(model.id);
 
     var consumed: usize = 0;
     while (consumed < messages.len) : (consumed += 1) {
@@ -682,7 +724,8 @@ fn buildToolResultMessageValue(
                 );
                 try function_response.put(allocator, try allocator.dupe(u8, "response"), .{ .object = response });
 
-                if (modelSupportsImages(model)) {
+                // Gemini 3+ and non-Gemini models: images inside functionResponse.parts
+                if (supports_images and supports_multimodal_fn) {
                     if (try buildToolResultImageParts(allocator, tool_result.content)) |image_parts| {
                         try function_response.put(allocator, try allocator.dupe(u8, "parts"), .{ .array = image_parts });
                     }
@@ -691,6 +734,20 @@ fn buildToolResultMessageValue(
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try part.put(allocator, try allocator.dupe(u8, "functionResponse"), .{ .object = function_response });
                 try parts.append(.{ .object = part });
+
+                // Gemini < 3: images in a separate user turn (mirrors TS behavior)
+                if (supports_images and !supports_multimodal_fn) {
+                    if (try buildToolResultImageParts(allocator, tool_result.content)) |raw_image_parts| {
+                        var img_parts = std.json.Array.init(allocator);
+                        try img_parts.append(try buildTextPartValue(allocator, "Tool result image:"));
+                        for (raw_image_parts.items) |img_part| {
+                            try img_parts.append(img_part);
+                        }
+                        var owned_raw = raw_image_parts;
+                        owned_raw.deinit(); // free backing slice; items transferred to img_parts
+                        try image_turns.append(allocator, try buildRoleMessageValue(allocator, "user", .{ .array = img_parts }));
+                    }
+                }
             },
             else => break,
         }
@@ -698,6 +755,7 @@ fn buildToolResultMessageValue(
 
     return .{
         .value = try buildRoleMessageValue(allocator, "user", .{ .array = parts }),
+        .image_turns = image_turns,
         .consumed = consumed,
     };
 }
@@ -1247,7 +1305,8 @@ test "buildRequestPayload converts assistant tool calls and tool results" {
 
     const contents = payload.object.get("contents").?;
     try std.testing.expect(contents == .array);
-    try std.testing.expectEqual(@as(usize, 2), contents.array.items.len);
+    // 3 items: assistant message, tool result user turn, separate image user turn (Gemini < 3)
+    try std.testing.expectEqual(@as(usize, 3), contents.array.items.len);
 
     const assistant_message = contents.array.items[0];
     try std.testing.expectEqualStrings("model", assistant_message.object.get("role").?.string);
@@ -1258,13 +1317,25 @@ test "buildRequestPayload converts assistant tool calls and tool results" {
     try std.testing.expectEqualStrings("tool-thought-sig", assistant_parts.items[2].object.get("thoughtSignature").?.string);
     try std.testing.expect(assistant_parts.items[2].object.get("functionCall").?.object.get("thoughtSignature") == null);
 
+    // For gemini-2.5-pro (Gemini 2.x < 3), images go in a separate user turn.
+    try std.testing.expectEqual(@as(usize, 3), contents.array.items.len);
+
     const tool_result_message = contents.array.items[1];
     try std.testing.expectEqualStrings("user", tool_result_message.object.get("role").?.string);
     const tool_result_parts = tool_result_message.object.get("parts").?.array;
     try std.testing.expectEqual(@as(usize, 1), tool_result_parts.items.len);
     const function_response = tool_result_parts.items[0].object.get("functionResponse").?;
     try std.testing.expect(function_response == .object);
-    try std.testing.expect(function_response.object.get("parts") != null);
+    // Gemini 2.x does NOT put images inside functionResponse.parts
+    try std.testing.expect(function_response.object.get("parts") == null);
+
+    // Separate user turn for images (Gemini < 3 behavior)
+    const image_turn = contents.array.items[2];
+    try std.testing.expectEqualStrings("user", image_turn.object.get("role").?.string);
+    const image_turn_parts = image_turn.object.get("parts").?.array;
+    try std.testing.expect(image_turn_parts.items.len >= 2); // "Tool result image:" text + image
+    try std.testing.expectEqualStrings("Tool result image:", image_turn_parts.items[0].object.get("text").?.string);
+    try std.testing.expect(image_turn_parts.items[1].object.get("inlineData") != null);
 }
 
 test "parse stream emits text events" {
@@ -1512,6 +1583,216 @@ test "stream returns error_event on setup failure instead of throwing" {
     const result = stream.result().?;
     try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+}
+
+test "VAL-MISC-004 buildGenerationConfigValue disabled thinking emits thinkingBudget 0 for reasoning model" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    const gen_config = try buildGenerationConfigValue(allocator, model, .{
+        .google_thinking = .{ .enabled = false },
+    });
+    defer freeJsonValue(allocator, gen_config);
+
+    const thinking_config = gen_config.object.get("thinkingConfig");
+    try std.testing.expect(thinking_config != null);
+    try std.testing.expect(thinking_config.? == .object);
+    try std.testing.expectEqual(@as(i64, 0), thinking_config.?.object.get("thinkingBudget").?.integer);
+    // includeThoughts must NOT be set when disabled
+    try std.testing.expect(thinking_config.?.object.get("includeThoughts") == null);
+}
+
+test "VAL-MISC-004 buildGenerationConfigValue non-reasoning model omits thinkingConfig" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gemini-2.0-flash",
+        .name = "Gemini 2.0 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = false,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    const gen_config = try buildGenerationConfigValue(allocator, model, .{
+        .google_thinking = .{ .enabled = false },
+    });
+    defer freeJsonValue(allocator, gen_config);
+
+    // Non-reasoning model must not get thinkingConfig regardless of the option
+    try std.testing.expect(gen_config.object.get("thinkingConfig") == null);
+}
+
+test "VAL-MISC-005 buildToolResultMessageValue Gemini 3 nests images inside functionResponse.parts" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gemini-3.0-pro",
+        .name = "Gemini 3.0 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    const messages = [_]types.Message{
+        .{ .tool_result = .{
+            .tool_call_id = "call-1",
+            .tool_name = "get_image",
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Here is the image" } },
+                .{ .image = .{ .data = "aGVsbG8=", .mime_type = "image/png" } },
+            },
+            .timestamp = 1,
+        } },
+    };
+
+    var result = try buildToolResultMessageValue(allocator, model, &messages);
+    defer result.image_turns.deinit(allocator);
+    defer freeJsonValue(allocator, result.value);
+
+    // No separate image turns for Gemini 3+
+    try std.testing.expectEqual(@as(usize, 0), result.image_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.consumed);
+
+    const parts = result.value.object.get("parts").?.array;
+    try std.testing.expectEqual(@as(usize, 1), parts.items.len);
+    const fn_response = parts.items[0].object.get("functionResponse").?;
+    // Image must be inside functionResponse.parts
+    const fn_parts = fn_response.object.get("parts");
+    try std.testing.expect(fn_parts != null);
+    try std.testing.expect(fn_parts.?.array.items.len > 0);
+    try std.testing.expect(fn_parts.?.array.items[0].object.get("inlineData") != null);
+}
+
+test "VAL-MISC-005 buildToolResultMessageValue Gemini 2.x puts images in separate user turn" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    const messages = [_]types.Message{
+        .{ .tool_result = .{
+            .tool_call_id = "call-1",
+            .tool_name = "get_image",
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Here is the image" } },
+                .{ .image = .{ .data = "aGVsbG8=", .mime_type = "image/png" } },
+            },
+            .timestamp = 1,
+        } },
+    };
+
+    var result = try buildToolResultMessageValue(allocator, model, &messages);
+    defer {
+        for (result.image_turns.items) |*turn| freeJsonValue(allocator, turn.*);
+        result.image_turns.deinit(allocator);
+    }
+    defer freeJsonValue(allocator, result.value);
+
+    // One separate image turn for Gemini 2.x
+    try std.testing.expectEqual(@as(usize, 1), result.image_turns.items.len);
+
+    const fn_response = result.value.object.get("parts").?.array.items[0].object.get("functionResponse").?;
+    // No parts inside functionResponse for Gemini 2.x
+    try std.testing.expect(fn_response.object.get("parts") == null);
+
+    // Separate image turn has "Tool result image:" text + inlineData
+    const img_turn_parts = result.image_turns.items[0].object.get("parts").?.array;
+    try std.testing.expectEqualStrings("Tool result image:", img_turn_parts.items[0].object.get("text").?.string);
+    try std.testing.expect(img_turn_parts.items[1].object.get("inlineData") != null);
+}
+
+test "VAL-MISC-005 non-Gemini model nests images inside functionResponse.parts" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "claude-3-5-sonnet",
+        .name = "Claude 3.5 Sonnet",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://example.googleapis.com/v1beta",
+        .reasoning = false,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const messages = [_]types.Message{
+        .{ .tool_result = .{
+            .tool_call_id = "call-1",
+            .tool_name = "get_image",
+            .content = &[_]types.ContentBlock{
+                .{ .image = .{ .data = "aGVsbG8=", .mime_type = "image/jpeg" } },
+            },
+            .timestamp = 1,
+        } },
+    };
+
+    var result = try buildToolResultMessageValue(allocator, model, &messages);
+    defer result.image_turns.deinit(allocator);
+    defer freeJsonValue(allocator, result.value);
+
+    // Non-Gemini model: no separate image turns
+    try std.testing.expectEqual(@as(usize, 0), result.image_turns.items.len);
+    const fn_response = result.value.object.get("parts").?.array.items[0].object.get("functionResponse").?;
+    try std.testing.expect(fn_response.object.get("parts") != null);
+}
+
+test "VAL-MISC-005 model without image input_types omits images entirely" {
+    const allocator = std.testing.allocator;
+    const model = types.Model{
+        .id = "gemini-3.0-pro",
+        .name = "Gemini 3.0 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"}, // no "image"
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    const messages = [_]types.Message{
+        .{ .tool_result = .{
+            .tool_call_id = "call-1",
+            .tool_name = "get_image",
+            .content = &[_]types.ContentBlock{
+                .{ .image = .{ .data = "aGVsbG8=", .mime_type = "image/png" } },
+            },
+            .timestamp = 1,
+        } },
+    };
+
+    var result = try buildToolResultMessageValue(allocator, model, &messages);
+    defer result.image_turns.deinit(allocator);
+    defer freeJsonValue(allocator, result.value);
+
+    // No image turns and no parts in functionResponse
+    try std.testing.expectEqual(@as(usize, 0), result.image_turns.items.len);
+    const fn_response = result.value.object.get("parts").?.array.items[0].object.get("functionResponse").?;
+    try std.testing.expect(fn_response.object.get("parts") == null);
 }
 
 test "stream happy path unchanged after streamProduction refactor" {
