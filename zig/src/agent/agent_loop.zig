@@ -1159,6 +1159,7 @@ fn emitToolCallOutcome(
         .event_type = .tool_execution_end,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
+        .args = tool_call.arguments,
         .result = result,
         .is_error = is_error,
     });

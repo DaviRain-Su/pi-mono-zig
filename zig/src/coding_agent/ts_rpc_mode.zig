@@ -7282,7 +7282,28 @@ test "command_context: sendUserMessage starts background prompt when agent is id
 test "wire_format_cleanup: tool_result frame carries call args as input and skips non-text blocks" {
     // Items 2 & 3: tool_result.input must contain the original call args;
     // thinking and tool_call content blocks must be skipped (not emitted as empty text).
+    // Drives through the real agent loop via faux provider tool dispatch to verify that
+    // emitToolCallOutcome populates .args = tool_call.arguments on the tool_execution_end
+    // event, which emitExtensionToolResultEvent then serializes as "input".
     const allocator = std.testing.allocator;
+
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    // Faux response 1: bash tool call with args {"command":"echo hello"}.
+    // Faux response 2: plain text after tool result is fed back.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const parsed_args = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"command\":\"echo hello\"}", .{});
+    const args_value = parsed_args.value;
+    const tool_call_block = try ai.providers.faux.fauxToolCall(arena.allocator(), "bash", args_value, .{ .id = "tc-wfc-1" });
+    const response_blocks = [_]ai.providers.faux.FauxContentBlock{tool_call_block};
+    const text_blocks = [_]ai.providers.faux.FauxContentBlock{ai.providers.faux.fauxText("done")};
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&response_blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&text_blocks, .{}) },
+    });
+
     const capture_path = "/tmp/pi-wfc-tool-result.jsonl";
     std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
     defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
@@ -7300,9 +7321,21 @@ test "wire_format_cleanup: tool_result frame carries call args as input and skip
     defer allocator.free(script);
     const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-wfc-tool-result" };
 
+    // wfcBashToolExecute returns text "hello" + a thinking block.
+    // The thinking block must be skipped by emitExtensionToolResultEvent.
+    const bash_tool = agent.AgentTool{
+        .name = "bash",
+        .description = "Run bash commands",
+        .label = "Bash",
+        .parameters = .null,
+        .execute = wfcBashToolExecute,
+    };
+
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp/wfc-tool-result",
         .system_prompt = "test",
+        .model = registration.getModel(),
+        .tools = &[_]agent.AgentTool{bash_tool},
     });
     defer session.deinit();
 
@@ -7321,27 +7354,9 @@ test "wire_format_cleanup: tool_result frame carries call args as input and skip
         .shutdown_timeout_ms = 500,
     });
 
-    // Build args JSON: {"command": "echo hello"}
-    var parsed_args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"command\":\"echo hello\"}", .{});
-    defer parsed_args.deinit();
-    const args_value = parsed_args.value;
-
-    // Build result content: one text block + one thinking block (thinking should be skipped).
-    const result_content = try allocator.alloc(ai.ContentBlock, 2);
-    defer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = "hello" } };
-    result_content[1] = .{ .thinking = .{ .thinking = "internal reasoning" } };
-
-    const event = agent.AgentEvent{
-        .event_type = .tool_execution_end,
-        .tool_call_id = "tc-wfc-1",
-        .tool_name = "bash",
-        .args = args_value,
-        .result = .{ .content = result_content },
-        .is_error = false,
-    };
-
-    try server.writeEvent(event);
+    // Trigger the agent loop via a prompt; the faux provider will issue the tool call.
+    try server.handleLine("{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"run a command\"}");
+    try waitForNoInFlightPrompt(&server, 5000);
     try server.finish();
 
     const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
@@ -7350,10 +7365,28 @@ test "wire_format_cleanup: tool_result frame carries call args as input and skip
     // The tool_result extension event must carry the original call args as "input".
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"tool_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"input\":{\"command\":\"echo hello\"}") != null);
-    // Text content must appear in "content".
-    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"text\",\"text\":\"hello\"") != null);
-    // Thinking block must NOT be emitted as an empty text placeholder.
-    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"text\",\"text\":\"\"") == null);
+    // Text content must appear in the tool_result "content" array; thinking block must be
+    // skipped (not emitted) — verify by asserting the exact content array value on the
+    // tool_result line (a thinking block converted to empty text would break this match).
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]") != null);
+}
+
+/// Tool execute function for the wire_format_cleanup tool_result test.
+/// Returns text "hello" + a thinking block to verify that thinking blocks are
+/// skipped (not emitted as empty text) in tool_result extension event frames.
+fn wfcBashToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?agent.types.AgentToolUpdateCallback,
+) anyerror!agent.AgentToolResult {
+    const content = try allocator.alloc(ai.ContentBlock, 2);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "hello") } };
+    content[1] = .{ .thinking = .{ .thinking = try allocator.dupe(u8, "internal reasoning") } };
+    return .{ .content = content, .details = null };
 }
 
 test "wire_format_cleanup: send_custom_message nextTurn returns error without persisting message" {
