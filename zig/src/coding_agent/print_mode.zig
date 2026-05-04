@@ -17,6 +17,7 @@ pub const RunPrintModeOptions = struct {
     signal: ?*std.atomic.Value(bool) = null,
     install_signal_handlers: bool = true,
     config_errors: []const config_mod.ConfigError = &.{},
+    initial_images: []const ai.ImageContent = &.{},
 };
 
 const SignalGuard = struct {
@@ -149,7 +150,11 @@ pub fn runPrintMode(
         watcher_thread.join();
     }
 
-    session.prompt(input) catch |err| {
+    const prompt_input = if (options.initial_images.len > 0)
+        session.prompt(.{ .text = input, .images = options.initial_images })
+    else
+        session.prompt(input);
+    prompt_input catch |err| {
         try stderr_writer.print("Error: {s}\n", .{@errorName(err)});
         try stderr_writer.flush();
         return 1;
@@ -888,4 +893,125 @@ test "print mode preserves context when session continues with a different provi
     try std.testing.expectEqual(@as(u8, 0), second_exit);
     try std.testing.expectEqualStrings("second provider saw first provider reply\n", second_stdout.writer.buffered());
     try std.testing.expectEqual(@as(usize, 4), second_session.agent.getMessages().len);
+}
+
+fn imageVerifyFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    // The initial user message must have a text block and an image block
+    try std.testing.expect(context.messages.len >= 1);
+    try std.testing.expect(context.messages[0] == .user);
+    const user_content = context.messages[0].user.content;
+    try std.testing.expect(user_content.len >= 2);
+    try std.testing.expect(user_content[0] == .text);
+    try std.testing.expect(user_content[1] == .image);
+    try std.testing.expectEqualStrings("dGVzdA==", user_content[1].image.data);
+    try std.testing.expectEqualStrings("image/png", user_content[1].image.mime_type);
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("saw image");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
+test "print mode initial_images included in user message" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .factory = imageVerifyFactory },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const test_images = [_]ai.ImageContent{
+        .{ .data = "dGVzdA==", .mime_type = "image/png" },
+    };
+
+    const exit_code = try runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        "describe the image",
+        .{
+            .mode = .text,
+            .install_signal_handlers = false,
+            .initial_images = &test_images,
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("saw image\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    // Session messages: user message (with image) + assistant message
+    try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
+    // Verify user message has both text and image content
+    const user_msg = session.agent.getMessages()[0].user;
+    try std.testing.expectEqual(@as(usize, 2), user_msg.content.len);
+    try std.testing.expect(user_msg.content[0] == .text);
+    try std.testing.expect(user_msg.content[1] == .image);
+}
+
+test "print mode without initial_images still works (regression)" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    const content = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = ai.providers.faux.fauxText("no images");
+
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(content, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        "text only",
+        .{
+            .mode = .text,
+            .install_signal_handlers = false,
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("no images\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    // User message should have only text content (1 block)
+    const user_msg = session.agent.getMessages()[0].user;
+    try std.testing.expectEqual(@as(usize, 1), user_msg.content.len);
+    try std.testing.expect(user_msg.content[0] == .text);
 }
