@@ -76,6 +76,7 @@ pub const ConfigOptions = struct {
 
 pub const UpdateTarget = union(enum) {
     all,
+    self,
     source: []const u8,
 };
 
@@ -88,6 +89,7 @@ pub const ParsedCommand = struct {
     update_target: ?UpdateTarget = null,
     config_options: ConfigOptions = .{},
     local: bool = false,
+    force: bool = false,
     help: bool = false,
     /// First parse-time diagnostic, if any. Mirrors TS where parse
     /// errors are reported as a single line followed by usage.
@@ -168,6 +170,20 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
         if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--local")) {
             if (command == .install or command == .remove or command == .config) {
                 result.local = true;
+            } else {
+                if (result.parse_error == null) {
+                    result.parse_error = try std.fmt.allocPrint(
+                        allocator,
+                        "Unknown option {s} for \"{s}\".",
+                        .{ arg, packageCommandName(command) },
+                    );
+                }
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--force")) {
+            if (command == .update) {
+                result.force = true;
             } else {
                 if (result.parse_error == null) {
                     result.parse_error = try std.fmt.allocPrint(
@@ -272,8 +288,11 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
 
     if (command == .update and !result.help and result.parse_error == null) {
         if (result.source) |value| {
-            // Treat positional `pi`/`self` as self-target (out of M12 local scope).
-            result.update_target = .{ .source = value };
+            if (std.mem.eql(u8, value, "self") or std.mem.eql(u8, value, "pi")) {
+                result.update_target = .self;
+            } else {
+                result.update_target = .{ .source = value };
+            }
         } else {
             result.update_target = .all;
         }
@@ -296,7 +315,7 @@ pub fn packageCommandUsage(command: PackageCommand) []const u8 {
     return switch (command) {
         .install => "pi install <source> [-l]",
         .remove => "pi remove <source> [-l]",
-        .update => "pi update [source]",
+        .update => "pi update [source|self|pi] [--force]",
         .list => "pi list",
         .config => "pi config [--toggle <kind> <pattern> --enable|--disable] [-l]",
     };
@@ -305,6 +324,10 @@ pub fn packageCommandUsage(command: PackageCommand) []const u8 {
 pub const ExecuteOptions = struct {
     cwd: []const u8,
     agent_dir: []const u8,
+    /// When non-null, used instead of detecting npm/bun for self-update.
+    /// Slice of argv strings; the first element is the executable.
+    /// Set to an empty slice to simulate "no package manager found".
+    self_update_command_override: ?[]const []const u8 = null,
 };
 
 pub const ExecuteResult = struct {
@@ -538,19 +561,10 @@ fn executeUpdate(
             try stdout.print("Updated packages\n", .{});
             return .{ .exit_code = 0 };
         },
+        .self => {
+            return executeSelfUpdate(allocator, io, command.force, options, stdout, stderr);
+        },
         .source => |source| {
-            // `pi update self` / `pi update pi` are reserved for the
-            // self-update path which is out of M12 local-fixtures
-            // scope. Report a deterministic diagnostic so users have
-            // an actionable message.
-            if (std.mem.eql(u8, source, "self") or std.mem.eql(u8, source, "pi")) {
-                try stderr.print(
-                    "Error: Self-update is not supported in this build.\n",
-                    .{},
-                );
-                return .{ .exit_code = 1 };
-            }
-
             const found_scope = try findInstalledScope(allocator, io, options, source);
             if (found_scope == null) {
                 try stderr.print(
@@ -563,6 +577,139 @@ fn executeUpdate(
             return .{ .exit_code = 0 };
         },
     }
+}
+
+const package_name = "@mariozechner/pi";
+
+/// Detect whether npm or bun is available in PATH and return the update
+/// command argv as a heap-allocated slice of heap-allocated strings.
+/// Returns null when no supported package manager is found.
+/// Caller owns all allocations.
+fn detectSelfUpdateCommand(allocator: std.mem.Allocator, io: std.Io) !?[][]u8 {
+    const candidates = [_]struct { pm: []const u8, install_args: []const []const u8 }{
+        .{ .pm = "npm", .install_args = &.{ "npm", "install", "-g", package_name } },
+        .{ .pm = "bun", .install_args = &.{ "bun", "install", "-g", package_name } },
+    };
+    for (candidates) |candidate| {
+        const which_result = std.process.run(allocator, io, .{
+            .argv = &.{ "which", candidate.pm },
+            .stdout_limit = .limited(256),
+            .stderr_limit = .limited(256),
+        }) catch continue;
+        defer allocator.free(which_result.stdout);
+        defer allocator.free(which_result.stderr);
+        const found = switch (which_result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (found) {
+            const argv = try allocator.alloc([]u8, candidate.install_args.len);
+            errdefer allocator.free(argv);
+            var i: usize = 0;
+            errdefer for (argv[0..i]) |arg| allocator.free(arg);
+            for (candidate.install_args) |arg| {
+                argv[i] = try allocator.dupe(u8, arg);
+                i += 1;
+            }
+            return argv;
+        }
+    }
+    return null;
+}
+
+fn executeSelfUpdate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    force: bool,
+    options: ExecuteOptions,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !ExecuteResult {
+    _ = force; // Version check skipped: always run when requested.
+
+    // Resolve argv: use test override when present, otherwise detect.
+    var detected_argv: ?[][]u8 = null;
+    defer if (detected_argv) |argv| {
+        for (argv) |arg| allocator.free(arg);
+        allocator.free(argv);
+    };
+
+    const argv: []const []const u8 = if (options.self_update_command_override) |override| blk: {
+        if (override.len == 0) {
+            // Empty override means "no package manager found".
+            try stderr.print(
+                "error: pi cannot self-update this installation.\nRun: npm install -g {s}\n",
+                .{package_name},
+            );
+            return .{ .exit_code = 1 };
+        }
+        break :blk override;
+    } else blk: {
+        detected_argv = try detectSelfUpdateCommand(allocator, io);
+        if (detected_argv == null) {
+            try stderr.print(
+                "error: pi cannot self-update this installation.\nRun: npm install -g {s}\n",
+                .{package_name},
+            );
+            return .{ .exit_code = 1 };
+        }
+        break :blk detected_argv.?;
+    };
+
+    // Build display string: space-join argv.
+    var display_buf: std.ArrayList(u8) = .empty;
+    defer display_buf.deinit(allocator);
+    for (argv, 0..) |arg, i| {
+        if (i > 0) try display_buf.append(allocator, ' ');
+        try display_buf.appendSlice(allocator, arg);
+    }
+    const display = display_buf.items;
+
+    // Spawn the update command and collect output.
+    const result = std.process.run(allocator, io, .{
+        .argv = argv,
+    }) catch |err| {
+        try stderr.print(
+            "Error: Failed to spawn update command: {s}\nIf this keeps failing, run this command yourself: {s}\n",
+            .{ @errorName(err), display },
+        );
+        return .{ .exit_code = 1 };
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => {},
+        .signal => |sig| {
+            try stderr.print(
+                "Error: {s} terminated by signal {d}\nIf this keeps failing, run this command yourself: {s}\n",
+                .{ display, sig, display },
+            );
+            return .{ .exit_code = 1 };
+        },
+        else => {
+            try stderr.print(
+                "Error: {s} terminated abnormally\nIf this keeps failing, run this command yourself: {s}\n",
+                .{ display, display },
+            );
+            return .{ .exit_code = 1 };
+        },
+    }
+    const exit_code: u8 = switch (result.term) {
+        .exited => |code| @intCast(code),
+        else => unreachable,
+    };
+
+    if (exit_code != 0) {
+        try stderr.print(
+            "Error: {s} exited with {d}\nIf this keeps failing, run this command yourself: {s}\n",
+            .{ display, exit_code, display },
+        );
+        return .{ .exit_code = 1 };
+    }
+
+    try stdout.print("Updated pi\n", .{});
+    return .{ .exit_code = 0 };
 }
 
 fn executeList(
@@ -642,16 +789,20 @@ fn writePackageCommandHelp(stdout: *std.Io.Writer, command: PackageCommand) !voi
         ),
         .update => try stdout.writeAll(
             \\Usage:
-            \\  pi update [source]
+            \\  pi update [source|self|pi] [--force]
             \\
-            \\Update installed packages. With no arguments this is an offline
-            \\no-op for local fixture packages and reports "Updated packages".
-            \\With a positional <source>, only that package is targeted; if
-            \\the source is not installed, an error is reported instead.
+            \\Update installed packages or self-update pi.
             \\
-            \\Note: self-update (e.g. `pi update self` or `pi update pi`) and
-            \\release/binary packaging are intentionally not implemented in
-            \\this build and will report a deterministic diagnostic.
+            \\  pi update             Update all installed packages (offline no-op for local sources)
+            \\  pi update self        Self-update pi via npm or bun
+            \\  pi update pi          Alias for pi update self
+            \\  pi update <source>    Update a specific installed package
+            \\
+            \\Options:
+            \\  --force    Skip version check, always run update
+            \\
+            \\Self-update requires npm or bun to be installed. On failure, a manual
+            \\instruction is printed showing the command you can run yourself.
             \\
         ),
         .list => try stdout.writeAll(
@@ -1599,7 +1750,7 @@ test "VAL-M12-PKG-012 package command --help text covers each subcommand" {
         },
         .{
             .args = &.{ "update", "--help" },
-            .must_contain = &.{ "pi update [source]", "self-update", "release/binary packaging" },
+            .must_contain = &.{ "pi update [source|self|pi]", "Self-update", "--force" },
         },
         .{
             .args = &.{ "list", "--help" },
@@ -2239,18 +2390,23 @@ test "VAL-M12-PKG-015 release and binary packaging surfaces stay excluded" {
     var stderr_buf: std.ArrayList(u8) = .empty;
     defer stderr_buf.deinit(allocator);
 
-    // `pi update self` is the user-visible self-update target. It must
-    // surface a deterministic excluded-surface diagnostic, not silently
-    // succeed or attempt any release/binary packaging operation.
+    // `pi update self` with no package manager available must surface
+    // a deterministic diagnostic. Use an empty command override to
+    // simulate "no package manager found" without network access.
+    const options_no_pm = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{},
+    };
     const result_self = try runCommand(
         allocator,
         &.{ "update", "self" },
-        options,
+        options_no_pm,
         &stdout_buf,
         &stderr_buf,
     );
     try std.testing.expectEqual(@as(u8, 1), result_self.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "Self-update is not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "self-update this installation") != null);
     try std.testing.expectEqualStrings("", stdout_buf.items);
 
     // Bare `pi config` and `pi config --help` must both document that
@@ -2279,4 +2435,180 @@ test "VAL-M12-PKG-015 release and binary packaging surfaces stay excluded" {
     );
     try std.testing.expectEqual(@as(u8, 0), result_config_help.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "release/binary packaging") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Self-update tests (VAL-PKG-120, VAL-PKG-121, VAL-PKG-122, VAL-PKG-123)
+// ---------------------------------------------------------------------------
+
+test "VAL-PKG-120 self_update pi update self triggers self-update path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    // Use /usr/bin/true as the update command: it always exits 0.
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "self" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated pi") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "VAL-PKG-121 self_update pi update pi treated as self-update alias" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    // Use /usr/bin/true as the update command.
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    // "pi" alias must behave identically to "self".
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "pi" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated pi") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "VAL-PKG-122 self_update --force flag parsed and sets force=true with update_target=self" {
+    const allocator = std.testing.allocator;
+
+    // Test that --force is parsed correctly without error.
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "self", "--force" });
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.parse_error == null);
+    try std.testing.expect(parsed.force == true);
+    try std.testing.expect(parsed.update_target != null);
+    try std.testing.expect(parsed.update_target.? == .self);
+}
+
+test "VAL-PKG-122 self_update --force rejected on non-update commands" {
+    const allocator = std.testing.allocator;
+
+    var parsed_install = try parsePackageCommand(allocator, &.{ "install", "./pkg", "--force" });
+    defer parsed_install.deinit(allocator);
+    try std.testing.expect(parsed_install.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed_install.parse_error.?, "--force") != null);
+
+    var parsed_list = try parsePackageCommand(allocator, &.{ "list", "--force" });
+    defer parsed_list.deinit(allocator);
+    try std.testing.expect(parsed_list.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed_list.parse_error.?, "--force") != null);
+}
+
+test "VAL-PKG-123 self_update fallback printed on command failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    // Use /bin/false as the update command: always exits non-zero.
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/bin/false"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "self" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    // Fallback instruction must mention the manual command.
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "If this keeps failing, run this command yourself") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "/bin/false") != null);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+test "VAL-PKG-120 self_update no package manager prints diagnostic" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    // Empty override = no package manager found.
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "self" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "self-update this installation") != null);
+    // Manual fallback command must be shown.
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, package_name) != null);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
 }
