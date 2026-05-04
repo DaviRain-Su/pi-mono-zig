@@ -271,7 +271,11 @@ const PromptTask = struct {
             .{ .context = self, .callback = writePromptAccepted },
         ) catch |err| {
             if (!self.response_sent.load(.seq_cst)) {
-                self.server.writeCommandError(self.id, "prompt", err) catch {};
+                // Only write error to stdout when there is a TS-RPC request ID to respond to.
+                // Background tasks (sendUserMessage) have id = null and must not pollute stdout.
+                if (self.id != null) {
+                    self.server.writeCommandError(self.id, "prompt", err) catch {};
+                }
                 self.response_sent.store(true, .seq_cst);
             }
         };
@@ -299,14 +303,19 @@ const PromptTask = struct {
 
     fn writePromptAccepted(context: ?*anyopaque) !void {
         const self: *PromptTask = @ptrCast(@alignCast(context.?));
-        try self.server.writeSuccessResponseNoData(self.id, "prompt");
+        // Only write the TS-RPC acceptance response when there is a request ID.
+        // Background tasks (from sendUserMessage) have id = null and must not
+        // pollute the TS-RPC output stream.
+        if (self.id != null) {
+            try self.server.writeSuccessResponseNoData(self.id, "prompt");
+            // TypeScript's RPC dispatcher accepts the prompt synchronously, then
+            // continues processing already-buffered JSONL input before later agent
+            // events can dominate the output stream. Yield briefly after the
+            // acceptance response so rapid controls can be handled in dispatcher
+            // order instead of racing the prompt worker.
+            std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch {};
+        }
         self.response_sent.store(true, .seq_cst);
-        // TypeScript's RPC dispatcher accepts the prompt synchronously, then
-        // continues processing already-buffered JSONL input before later agent
-        // events can dominate the output stream. Yield briefly after the
-        // acceptance response so rapid controls can be handled in dispatcher
-        // order instead of racing the prompt worker.
-        std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch {};
     }
 };
 
@@ -513,6 +522,9 @@ const TsRpcServer = struct {
     finished: bool = false,
     /// Incremented on each turn_start event so extension frames carry sequential turnIndex values.
     turn_index: usize = 0,
+    /// IDs of pending wait_for_idle requests from the extension host. Each ID is resolved
+    /// (and the response sent back to the host) when the agent becomes idle.
+    pending_wait_for_idle_ids: std.ArrayList([]u8) = .empty,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -631,6 +643,33 @@ const TsRpcServer = struct {
             if (!task.isDone()) return true;
         }
         return false;
+    }
+
+    /// Returns true when the agent is currently streaming or a prompt task is in flight.
+    fn isAgentBusy(self: *const TsRpcServer) bool {
+        if (self.session) |session| {
+            if (session.isStreaming()) return true;
+        }
+        return self.hasInFlightPrompt();
+    }
+
+    /// Resolve all pending wait_for_idle requests when the agent is idle.
+    /// Sends extension_ui_response back to the host for each pending ID and removes
+    /// it from the list. Safe to call repeatedly; no-op when agent is still busy or
+    /// no requests are pending.
+    fn resolveWaitForIdleRequests(self: *TsRpcServer) !void {
+        if (self.pending_wait_for_idle_ids.items.len == 0) return;
+        if (self.isAgentBusy()) return;
+        const host = self.extension_host;
+        var i: usize = self.pending_wait_for_idle_ids.items.len;
+        while (i > 0) {
+            i -= 1;
+            const id = self.pending_wait_for_idle_ids.orderedRemove(i);
+            defer self.allocator.free(id);
+            if (host) |h| {
+                try h.sendExtensionUiResponse(id, "{}");
+            }
+        }
     }
 
     fn markDeferredFlushActivity(self: *TsRpcServer) void {
@@ -754,6 +793,10 @@ const TsRpcServer = struct {
         }
         self.completed_extension_requests.deinit(self.allocator);
         self.completed_extension_requests = .empty;
+
+        for (self.pending_wait_for_idle_ids.items) |id| self.allocator.free(id);
+        self.pending_wait_for_idle_ids.deinit(self.allocator);
+        self.pending_wait_for_idle_ids = .empty;
     }
 
     fn registerPendingExtensionUIRequest(
@@ -1738,6 +1781,7 @@ const TsRpcServer = struct {
         _ = try self.drainAvailableExtensionHostUiRequests();
         if (elapsed_ms != 0) try self.advanceExtensionUITime(elapsed_ms);
         _ = try self.drainAvailableExtensionHostUiRequests();
+        try self.resolveWaitForIdleRequests();
     }
 
     fn writeExtensionUIRequestFromHost(self: *TsRpcServer, request: extension_host_mod.ExtensionUiRequest) !void {
@@ -1801,6 +1845,104 @@ const TsRpcServer = struct {
         if (std.mem.eql(u8, request.method, "set_editor_text")) {
             const text = requiredString(payload, "text") catch return;
             try self.writeExtensionUISetEditorTextRequest(request.id, text);
+            return;
+        }
+
+        // Extension command context APIs (VAL-EXT-031..036)
+
+        if (std.mem.eql(u8, request.method, "wait_for_idle")) {
+            if (!self.isAgentBusy()) {
+                // Agent is already idle — respond immediately.
+                if (self.extension_host) |host| {
+                    try host.sendExtensionUiResponse(request.id, "{}");
+                }
+            } else {
+                // Agent is busy — queue the ID; resolveWaitForIdleRequests will
+                // send the response once the agent becomes idle.
+                const id_copy = try self.allocator.dupe(u8, request.id);
+                errdefer self.allocator.free(id_copy);
+                try self.pending_wait_for_idle_ids.append(self.allocator, id_copy);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, request.method, "send_custom_message")) {
+            const session = self.session orelse return;
+            const custom_type = optionalString(payload, "customType") catch return orelse "extension.message";
+            const display = optionalBool(payload, "display") orelse true;
+            const trigger_turn = optionalBool(payload, "triggerTurn") orelse false;
+            const deliver_as = optionalString(payload, "deliverAs") catch return;
+
+            // Build content: prefer string, fall back to empty text.
+            const content_text: []const u8 = if (payload.get("content")) |c|
+                if (c == .string) c.string else ""
+            else "";
+            const content: session_manager_mod.CustomMessageContent = .{ .text = content_text };
+
+            // Persist the custom message entry in the session file.
+            const details = payload.get("details");
+            _ = try session.session_manager.appendCustomMessageEntry(custom_type, content, display, details);
+
+            // Handle delivery mode when the agent is streaming.
+            if (session.isStreaming() or self.hasInFlightPrompt()) {
+                if (deliver_as) |mode| {
+                    if (std.mem.eql(u8, mode, "steer")) {
+                        session.steer(content_text, &.{}) catch {};
+                    } else if (std.mem.eql(u8, mode, "followUp")) {
+                        session.followUp(content_text, &.{}) catch {};
+                    }
+                }
+            } else if (trigger_turn) {
+                // Not streaming but caller wants to trigger a new turn.
+                const text_copy = try self.allocator.dupe(u8, content_text);
+                errdefer self.allocator.free(text_copy);
+                const images = try self.allocator.alloc(ai.ImageContent, 0);
+                const task = try PromptTask.create(self.allocator, self.io, self, session, null, text_copy, images);
+                try self.prompt_tasks.append(self.allocator, task);
+                task.spawn() catch {
+                    _ = self.prompt_tasks.pop();
+                    task.joinAndDestroy();
+                };
+            }
+
+            // Acknowledge to the extension host.
+            if (self.extension_host) |host| {
+                try host.sendExtensionUiResponse(request.id, "{}");
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, request.method, "send_user_message")) {
+            const session = self.session orelse return;
+            const text = optionalString(payload, "text") catch return orelse "";
+            const deliver_as = optionalString(payload, "deliverAs") catch return;
+
+            if (session.isStreaming() or self.hasInFlightPrompt()) {
+                // Route based on deliverAs when the agent is busy.
+                const is_steer = if (deliver_as) |mode| std.mem.eql(u8, mode, "steer") else false;
+                if (is_steer) {
+                    session.steer(text, &.{}) catch {};
+                } else {
+                    // Default: followUp when streaming.
+                    session.followUp(text, &.{}) catch {};
+                }
+            } else {
+                // Not streaming: start a new background prompt task.
+                const text_copy = try self.allocator.dupe(u8, text);
+                errdefer self.allocator.free(text_copy);
+                const images = try self.allocator.alloc(ai.ImageContent, 0);
+                const task = try PromptTask.create(self.allocator, self.io, self, session, null, text_copy, images);
+                try self.prompt_tasks.append(self.allocator, task);
+                task.spawn() catch {
+                    _ = self.prompt_tasks.pop();
+                    task.joinAndDestroy();
+                };
+            }
+
+            // Acknowledge to the extension host.
+            if (self.extension_host) |host| {
+                try host.sendExtensionUiResponse(request.id, "{}");
+            }
             return;
         }
     }
@@ -2873,6 +3015,14 @@ fn parseRequiredBool(object: std.json.ObjectMap, key: []const u8) !bool {
     return switch (value) {
         .bool => |boolean| boolean,
         else => error.InvalidFieldType,
+    };
+}
+
+fn optionalBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .bool => |boolean| boolean,
+        else => null,
     };
 }
 
@@ -6807,4 +6957,250 @@ test "session_lifecycle: finish emits session_shutdown with reason quit" {
     // session_shutdown with reason "quit" must appear before the shutdown frame
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"session_shutdown\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"reason\":\"quit\"") != null);
+}
+
+// ─── Extension command context API tests (VAL-EXT-031..036) ──────────────────
+
+test "command_context: waitForIdle does not queue when agent is idle" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cmd-ctx-wfi-idle",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    // Agent is idle (not streaming). The request should be handled immediately
+    // without being queued into pending_wait_for_idle_ids.
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "wfi-1"),
+        .method = try allocator.dupe(u8, "wait_for_idle"),
+        .response_required = true,
+        .payload_json = try allocator.dupe(u8, "{}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+    try std.testing.expectEqual(@as(usize, 0), server.pending_wait_for_idle_ids.items.len);
+}
+
+test "command_context: waitForIdle queues when streaming and resolves after idle" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cmd-ctx-wfi-stream",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    // Simulate the agent being busy.
+    session.agent.is_streaming = true;
+
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "wfi-2"),
+        .method = try allocator.dupe(u8, "wait_for_idle"),
+        .response_required = true,
+        .payload_json = try allocator.dupe(u8, "{}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+    // Must be queued because the agent is busy.
+    try std.testing.expectEqual(@as(usize, 1), server.pending_wait_for_idle_ids.items.len);
+
+    // Agent becomes idle.
+    session.agent.is_streaming = false;
+
+    // The idle-tick resolves all pending wait_for_idle requests.
+    try server.serviceExtensionHostIdleTick(0);
+    try std.testing.expectEqual(@as(usize, 0), server.pending_wait_for_idle_ids.items.len);
+}
+
+test "command_context: sendCustomMessage creates session entry with correct fields" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cmd-ctx-custom-msg",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    const payload = "{\"customType\":\"ext.test\",\"content\":\"hello from extension\",\"display\":true}";
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "scm-1"),
+        .method = try allocator.dupe(u8, "send_custom_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, payload),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+
+    // Session must contain a custom_message entry with the correct customType and content.
+    const entries = session.session_manager.getEntries();
+    var found = false;
+    for (entries) |entry| {
+        switch (entry) {
+            .custom_message => |cm| {
+                if (!std.mem.eql(u8, cm.custom_type, "ext.test")) continue;
+                found = true;
+                switch (cm.content) {
+                    .text => |t| try std.testing.expectEqualStrings("hello from extension", t),
+                    .blocks => return error.UnexpectedContentType,
+                }
+                try std.testing.expect(cm.display);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "command_context: sendCustomMessage respects deliverAs followUp when streaming" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cmd-ctx-custom-follow",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    // Simulate agent streaming.
+    session.agent.is_streaming = true;
+
+    const payload = "{\"customType\":\"ext.note\",\"content\":\"follow-up note\",\"display\":false,\"deliverAs\":\"followUp\"}";
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "scm-fu"),
+        .method = try allocator.dupe(u8, "send_custom_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, payload),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+
+    // The session entry must be present.
+    const entries = session.session_manager.getEntries();
+    var found = false;
+    for (entries) |entry| {
+        switch (entry) {
+            .custom_message => |cm| {
+                if (std.mem.eql(u8, cm.custom_type, "ext.note")) {
+                    found = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found);
+    // deliverAs followUp must have enqueued a message in the follow-up queue.
+    try std.testing.expectEqual(@as(usize, 1), session.agent.followUpQueueLen());
+}
+
+test "command_context: sendUserMessage queues followUp when agent is streaming" {
+    const allocator = std.testing.allocator;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cmd-ctx-user-stream",
+        .system_prompt = "test",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    // Simulate agent busy.
+    session.agent.is_streaming = true;
+
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "sum-1"),
+        .method = try allocator.dupe(u8, "send_user_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, "{\"text\":\"hello agent\"}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+    // No deliverAs → defaults to followUp when streaming.
+    try std.testing.expectEqual(@as(usize, 1), session.agent.followUpQueueLen());
+}
+
+test "command_context: sendUserMessage starts background prompt when agent is idle" {
+    const allocator = std.testing.allocator;
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .message = ai.providers.faux.fauxAssistantMessage(&[_]ai.providers.faux.FauxContentBlock{
+            ai.providers.faux.fauxText("response from extension"),
+        }, .{}) },
+    });
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cmd-ctx-user-idle",
+        .system_prompt = "test",
+        .model = registration.getModel(),
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+
+    var req = extension_host_mod.ExtensionUiRequest{
+        .id = try allocator.dupe(u8, "sum-idle"),
+        .method = try allocator.dupe(u8, "send_user_message"),
+        .response_required = false,
+        .payload_json = try allocator.dupe(u8, "{\"text\":\"trigger a turn\"}"),
+    };
+    defer req.deinit(allocator);
+
+    try server.writeExtensionUIRequestFromHost(req);
+
+    // A background prompt task must have been spawned.
+    try std.testing.expectEqual(@as(usize, 1), server.prompt_tasks.items.len);
+
+    // Wait for the task to complete.
+    try waitForNoInFlightPrompt(&server, 2000);
+
+    // Session must now have a user message and an assistant response.
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expect(messages[0] == .user);
+    try std.testing.expect(messages[1] == .assistant);
 }
