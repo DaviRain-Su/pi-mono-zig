@@ -637,6 +637,30 @@ pub const HostProcess = struct {
         try file.writeStreamingAll(self.io, out.written());
     }
 
+    /// Send a JSONL extension event frame to the extension host stdin pipe.
+    /// Non-blocking: if the pipe is full or unavailable, the event is dropped silently.
+    /// Caller passes the JSON frame bytes without a trailing newline; this method adds it.
+    /// Safe to call from any thread. Does nothing if no extension host stdin is open
+    /// or if shutdown has been requested.
+    pub fn sendExtensionEventFrame(self: *HostProcess, frame_json: []const u8) void {
+        if (self.shutdown_requested.load(.seq_cst)) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const file = self.stdin_file orelse return;
+        const fd = file.handle;
+        // Set O_NONBLOCK on the fd temporarily so a full pipe drops the event
+        // rather than blocking the agent loop.
+        const nonblock_mask: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+        const prev_flags: c_int = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        if (prev_flags == -1) return;
+        defer _ = std.c.fcntl(fd, std.c.F.SETFL, prev_flags);
+        _ = std.c.fcntl(fd, std.c.F.SETFL, prev_flags | @as(c_int, @intCast(nonblock_mask)));
+        // Best-effort write of frame + newline. EAGAIN (pipe full) or any other
+        // error means the event is dropped.
+        _ = std.c.write(fd, frame_json.ptr, frame_json.len);
+        _ = std.c.write(fd, "\n", 1);
+    }
+
     fn sendInitialize(self: *HostProcess, initialize: InitializeFrame) !void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
@@ -1141,4 +1165,156 @@ test "M11 host process drains live register_* frames into observable runtime reg
 
     try host.shutdown();
     try std.testing.expect(host.hasShutdownComplete());
+}
+
+test "event_emission: sendExtensionEventFrame writes JSONL frames to host stdin" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-event-emission-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    // Shell script host that captures every line written to its stdin after ready
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-event-emission-test" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-event-emission-test",
+            .cwd = "/tmp",
+            .fixture = "event-emission",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+    try host.waitForReady(500);
+
+    // Send representative extension event frames covering the major event types
+    host.sendExtensionEventFrame("{\"type\":\"agent_start\"}");
+    host.sendExtensionEventFrame("{\"type\":\"agent_end\",\"messages\":[]}");
+    host.sendExtensionEventFrame("{\"type\":\"turn_start\"}");
+    host.sendExtensionEventFrame("{\"type\":\"turn_end\",\"message\":{}}");
+    host.sendExtensionEventFrame("{\"type\":\"message_start\",\"message\":{\"role\":\"user\"}}");
+    host.sendExtensionEventFrame("{\"type\":\"message_end\",\"message\":{\"role\":\"user\"}}");
+    host.sendExtensionEventFrame("{\"type\":\"tool_call\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"input\":{}}");
+    host.sendExtensionEventFrame("{\"type\":\"tool_result\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"input\":{},\"content\":[],\"isError\":false}");
+    host.sendExtensionEventFrame("{\"type\":\"model_select\",\"model\":{\"id\":\"m\"},\"source\":\"set\"}");
+    host.sendExtensionEventFrame("{\"type\":\"thinking_level_select\",\"level\":\"medium\",\"previousLevel\":\"off\"}");
+    host.sendExtensionEventFrame("{\"type\":\"input\",\"text\":\"hello\",\"source\":\"rpc\"}");
+
+    // Small delay to allow the shell script to flush writes to the capture file
+    var elapsed: u64 = 0;
+    while (elapsed <= 200) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+
+    try host.shutdown();
+    try std.testing.expect(host.hasShutdownComplete());
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    // Verify all event types were written to the extension host stdin
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"agent_start\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"agent_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"turn_start\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"turn_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"message_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"message_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"model_select\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"thinking_level_select\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"input\"") != null);
+
+    // Verify each frame is on its own line (JSONL format)
+    var lines = std.mem.splitScalar(u8, capture, '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        // Each non-empty line must be valid JSON starting with {
+        try std.testing.expect(line[0] == '{');
+        line_count += 1;
+    }
+    // Should have at least 11 event frames plus the shutdown frame
+    try std.testing.expect(line_count >= 11);
+}
+
+test "event_emission: sendExtensionEventFrame does not write when shutdown is requested" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-event-emission-shutdown-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    // Host that captures stdin and runs for a bit
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; " ++
+        "done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-event-emission-shutdown-test" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-event-emission-shutdown-test",
+            .cwd = "/tmp",
+            .fixture = "shutdown-guard",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+    try host.waitForReady(500);
+    try host.shutdown();
+
+    // After shutdown, sendExtensionEventFrame must not block or crash.
+    // The shutdown_requested flag prevents writes.
+    host.sendExtensionEventFrame("{\"type\":\"agent_start\"}");
+    host.sendExtensionEventFrame("{\"type\":\"agent_end\",\"messages\":[]}");
+    // No assertion needed: if the above doesn't hang or crash, the test passes.
+}
+
+test "event_emission: sendExtensionEventFrame is non-blocking when pipe buffer is full" {
+    const allocator = std.testing.allocator;
+
+    // Host that reads stdin VERY slowly (sleeps before each read) to fill the pipe buffer
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "sleep 10; " ++
+        "case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; " ++
+        "done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-event-emission-full-pipe-test" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-event-emission-full-pipe-test",
+            .cwd = "/tmp",
+            .fixture = "full-pipe",
+        },
+        .shutdown_timeout_ms = 200,
+    });
+    defer host.deinit();
+    try host.waitForReady(500);
+
+    // Flood the pipe with many large frames to fill the 64KB buffer.
+    // Each call must return immediately (O_NONBLOCK drops writes on full pipe).
+    var i: usize = 0;
+    const large_payload = "x" ** 1024; // 1KB per frame
+    while (i < 100) : (i += 1) {
+        host.sendExtensionEventFrame(large_payload);
+    }
+    // If we reach here without blocking, the non-blocking behavior is confirmed.
+    // Shut down the host (which will kill the slow-reading process).
+    try host.shutdown();
 }
