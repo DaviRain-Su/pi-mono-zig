@@ -256,6 +256,21 @@ pub const EditorComponentHook = struct {
     }
 };
 
+/// Message renderer hook for CustomMessage entries. Mirrors the TypeScript
+/// `MessageRenderer` registration surface in `types.ts`: extensions call
+/// `registerMessageRenderer(customType, renderer)` to supply a custom
+/// rendering component for entries with that `customType`.
+pub const MessageRenderer = struct {
+    custom_type: []u8,
+    extension_path: []u8,
+
+    pub fn deinit(self: *MessageRenderer, allocator: std.mem.Allocator) void {
+        allocator.free(self.custom_type);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
 /// Widget placement options
 pub const WidgetPlacement = enum {
     above_editor,
@@ -334,6 +349,9 @@ pub const Registry = struct {
     resource_discoveries: std.ArrayList(ResourceDiscovery) = .empty,
     /// Extension widgets (TS `setWidget`). Keyed by widget key for replacement.
     widgets: std.ArrayList(WidgetHook) = .empty,
+    /// Message renderers registered via `registerMessageRenderer`. Keyed by
+    /// customType; re-registering the same customType replaces the entry.
+    message_renderers: std.ArrayList(MessageRenderer) = .empty,
     /// Event bus for extension event handling
     event_bus: extension_events.EventBus,
 
@@ -366,6 +384,8 @@ pub const Registry = struct {
         self.resource_discoveries.deinit(self.allocator);
         for (self.widgets.items) |*widget| widget.deinit(self.allocator);
         self.widgets.deinit(self.allocator);
+        for (self.message_renderers.items) |*mr| mr.deinit(self.allocator);
+        self.message_renderers.deinit(self.allocator);
         self.event_bus.deinit();
         self.* = undefined;
     }
@@ -401,6 +421,46 @@ pub const Registry = struct {
     fn findProviderIndex(self: *const Registry, name: []const u8) ?usize {
         for (self.providers.items, 0..) |p, idx| {
             if (std.mem.eql(u8, p.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findMessageRendererIndex(self: *const Registry, custom_type: []const u8) ?usize {
+        for (self.message_renderers.items, 0..) |mr, idx| {
+            if (std.mem.eql(u8, mr.custom_type, custom_type)) return idx;
+        }
+        return null;
+    }
+
+    pub fn registerMessageRenderer(
+        self: *Registry,
+        custom_type: []const u8,
+        extension_path: []const u8,
+    ) !void {
+        if (self.findMessageRendererIndex(custom_type)) |idx| {
+            self.message_renderers.items[idx].deinit(self.allocator);
+            self.message_renderers.items[idx] = try makeMessageRenderer(self.allocator, custom_type, extension_path);
+            return;
+        }
+        const mr = try makeMessageRenderer(self.allocator, custom_type, extension_path);
+        try self.message_renderers.append(self.allocator, mr);
+    }
+
+    pub fn unregisterMessageRenderer(self: *Registry, custom_type: []const u8) bool {
+        if (self.findMessageRendererIndex(custom_type)) |idx| {
+            var removed = self.message_renderers.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            return true;
+        }
+        return false;
+    }
+
+    /// Returns a pointer to the MessageRenderer for the given customType, or
+    /// null if no renderer is registered. The pointer is valid until the next
+    /// mutation of `message_renderers`.
+    pub fn findMessageRenderer(self: *const Registry, custom_type: []const u8) ?*const MessageRenderer {
+        if (self.findMessageRendererIndex(custom_type)) |idx| {
+            return &self.message_renderers.items[idx];
         }
         return null;
     }
@@ -885,6 +945,20 @@ fn makeWidgetHook(
     };
 }
 
+fn makeMessageRenderer(
+    allocator: std.mem.Allocator,
+    custom_type: []const u8,
+    extension_path: []const u8,
+) !MessageRenderer {
+    const type_dup = try allocator.dupe(u8, custom_type);
+    errdefer allocator.free(type_dup);
+    const path_dup = try allocator.dupe(u8, extension_path);
+    return .{
+        .custom_type = type_dup,
+        .extension_path = path_dup,
+    };
+}
+
 /// Lightweight provider/model descriptor used as input to
 /// `Registry.registerProvider`. Strings are borrowed; the registry
 /// owns its own copies.
@@ -1121,6 +1195,15 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
         try root.put(allocator, try allocator.dupe(u8, "editorComponentHook"), .null);
     }
 
+    var mr_array = std.json.Array.init(allocator);
+    for (registry.message_renderers.items) |mr| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "customType"), .{ .string = try allocator.dupe(u8, mr.custom_type) });
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, mr.extension_path) });
+        try mr_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "messageRenderers"), .{ .array = mr_array });
+
     return .{ .object = root };
 }
 
@@ -1203,6 +1286,8 @@ pub const FrameOutcome = enum {
     set_widget_hook,
     cleared_widget_hook,
     cleared_ui_hooks_for_reload,
+    registered_message_renderer,
+    unregistered_message_renderer,
     ignored_unsupported,
     ignored_malformed,
 };
@@ -1436,6 +1521,18 @@ pub fn applyHostFrame(
     if (std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload")) {
         registry.clearUiHooksForReload();
         return .cleared_ui_hooks_for_reload;
+    }
+
+    if (std.mem.eql(u8, type_name, "register_message_renderer")) {
+        const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
+        try registry.registerMessageRenderer(custom_type, extension_path);
+        return .registered_message_renderer;
+    }
+
+    if (std.mem.eql(u8, type_name, "unregister_message_renderer")) {
+        const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
+        _ = registry.unregisterMessageRenderer(custom_type);
+        return .unregistered_message_renderer;
     }
 
     return .ignored_unsupported;
@@ -2117,4 +2214,127 @@ test "M11 snapshot JSON includes UI hook state" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"footerHook\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"terminalInputSubscriptions\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"editorComponentHook\":null") != null);
+}
+
+// --------------------------------------------------------------------------
+// message_renderer tests
+// --------------------------------------------------------------------------
+
+test "registerMessageRenderer stores renderer keyed by customType" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerMessageRenderer("my-type", "/tmp/ext.ts");
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("my-type", registry.message_renderers.items[0].custom_type);
+    try std.testing.expectEqualStrings("/tmp/ext.ts", registry.message_renderers.items[0].extension_path);
+
+    // Re-registering the same customType replaces the existing entry.
+    try registry.registerMessageRenderer("my-type", "/tmp/ext2.ts");
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("/tmp/ext2.ts", registry.message_renderers.items[0].extension_path);
+
+    // Registering a different customType adds a new entry.
+    try registry.registerMessageRenderer("other-type", "/tmp/ext3.ts");
+    try std.testing.expectEqual(@as(usize, 2), registry.message_renderers.items.len);
+}
+
+test "unregisterMessageRenderer removes renderer and returns correct bool" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerMessageRenderer("my-type", "/tmp/ext.ts");
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+
+    // First unregister returns true and removes the entry.
+    try std.testing.expect(registry.unregisterMessageRenderer("my-type"));
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+
+    // Second unregister returns false (not found).
+    try std.testing.expect(!registry.unregisterMessageRenderer("my-type"));
+}
+
+test "findMessageRenderer returns renderer or null" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    // Not found before registration.
+    try std.testing.expect(registry.findMessageRenderer("my-type") == null);
+
+    try registry.registerMessageRenderer("my-type", "/tmp/ext.ts");
+    const found = registry.findMessageRenderer("my-type");
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("my-type", found.?.custom_type);
+    try std.testing.expectEqualStrings("/tmp/ext.ts", found.?.extension_path);
+
+    // Lookup for unregistered type returns null.
+    try std.testing.expect(registry.findMessageRenderer("other-type") == null);
+}
+
+test "registry snapshot includes messageRenderers array" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    // Empty registry snapshot must have an empty messageRenderers array.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"messageRenderers\":[]") != null);
+
+    // After registration, the array must contain the entry.
+    try registry.registerMessageRenderer("my-type", "/tmp/ext.ts");
+    var out2: std.Io.Writer.Allocating = .init(allocator);
+    defer out2.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out2.writer);
+    const snap = out2.written();
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"messageRenderers\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"customType\":\"my-type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "\"extensionPath\":\"/tmp/ext.ts\"") != null);
+}
+
+test "applyHostFrame handles register_message_renderer and unregister_message_renderer JSONL frames" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const register_frame =
+        \\{ "type": "register_message_renderer", "customType": "my-type", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    const applied = try applyHostFrameStream(&registry, register_frame);
+    try std.testing.expectEqual(@as(usize, 1), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("my-type", registry.message_renderers.items[0].custom_type);
+
+    const unregister_frame =
+        \\{ "type": "unregister_message_renderer", "customType": "my-type" }
+        \\
+    ;
+    const applied2 = try applyHostFrameStream(&registry, unregister_frame);
+    try std.testing.expectEqual(@as(usize, 1), applied2);
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+
+    // Missing customType returns ignored_malformed (not counted).
+    const malformed_frame =
+        \\{ "type": "register_message_renderer", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    const applied3 = try applyHostFrameStream(&registry, malformed_frame);
+    try std.testing.expectEqual(@as(usize, 0), applied3);
+}
+
+test "MessageRenderer deinit frees all owned allocations (leak detection)" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerMessageRenderer("leak-type", "/tmp/leak.ts");
+    try registry.registerMessageRenderer("other-type", "/tmp/other.ts");
+    try std.testing.expectEqual(@as(usize, 2), registry.message_renderers.items.len);
+    // deinit is called by defer above; std.testing.allocator will fail the
+    // test if any allocations are leaked.
 }

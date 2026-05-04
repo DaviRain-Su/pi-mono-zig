@@ -1052,6 +1052,7 @@ test "loadModelOverlay marks current provider models available for runtime api k
 
     var current_provider = try provider_config.resolveProviderConfig(
         allocator,
+        std.testing.io,
         &env_map,
         "openai",
         "gpt-5.4",
