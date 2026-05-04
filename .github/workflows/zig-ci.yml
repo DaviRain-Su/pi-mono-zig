@@ -32,10 +32,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # mlugg/setup-zig@v1 still uses the pre-0.16 tarball naming
+      # (zig-<os>-<arch>-<ver>) and 404s on 0.16.0 which switched to
+      # zig-<arch>-<os>-<ver>. Install Zig directly from ziglang.org
+      # using the official index.json instead.
       - name: Setup Zig 0.16.0
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   ARCH=x86_64-linux ;;
+            Linux-ARM64) ARCH=aarch64-linux ;;
+            macOS-X64)   ARCH=x86_64-macos ;;
+            macOS-ARM64) ARCH=aarch64-macos ;;
+            *) echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+          esac
+          TARBALL="zig-${ARCH}-${ZIG_VERSION}.tar.xz"
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}"
+          echo "Downloading ${URL}"
+          curl -fsSL --retry 3 --retry-delay 5 -o "${TARBALL}" "${URL}"
+          mkdir -p "${HOME}/.zig"
+          tar -xJf "${TARBALL}" -C "${HOME}/.zig" --strip-components=1
+          rm -f "${TARBALL}"
+          echo "${HOME}/.zig" >> "${GITHUB_PATH}"
+          "${HOME}/.zig/zig" version
 
       - name: Install system tools (Linux)
         if: runner.os == 'Linux'
