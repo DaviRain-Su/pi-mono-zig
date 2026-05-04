@@ -67,6 +67,8 @@ test {
     _ = @import("providers/mistral.zig");
     _ = @import("providers/bedrock.zig");
     _ = @import("providers/register_builtins.zig");
+    _ = @import("providers/cloudflare.zig");
+    _ = @import("providers/github_copilot_headers.zig");
     _ = @import("model_registry.zig");
     _ = @import("model_discovery.zig");
     _ = @import("json_parse.zig");
