@@ -1,4 +1,5 @@
 const std = @import("std");
+const extension_events = @import("extension_events.zig");
 
 /// In-memory mirrors of the registration surfaces a Bun-hosted
 /// extension contributes through the JSONL host protocol.
@@ -80,17 +81,40 @@ pub const FlagValue = union(enum) {
     string: []const u8,
 };
 
+/// Tool render hook types mirroring TS ToolDefinition.renderCall/renderResult
+pub const ToolRenderHook = struct {
+    /// JSON-serialized render configuration from the extension
+    render_config: []u8,
+    /// Tool name this render hook belongs to
+    tool_name: []u8,
+    /// Extension path for cleanup
+    extension_path: []u8,
+
+    pub fn deinit(self: *ToolRenderHook, allocator: std.mem.Allocator) void {
+        allocator.free(self.render_config);
+        allocator.free(self.tool_name);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
 pub const ExtensionTool = struct {
     name: []u8,
     label: []u8,
     description: []u8,
     extension_path: []u8,
+    /// Optional render shell mode ("default" or "self")
+    render_shell: ?[]u8 = null,
+    /// Optional render hook configuration
+    render_hook: ?ToolRenderHook = null,
 
     pub fn deinit(self: *ExtensionTool, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.label);
         allocator.free(self.description);
         allocator.free(self.extension_path);
+        if (self.render_shell) |rs| allocator.free(rs);
+        if (self.render_hook) |*rh| rh.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -134,6 +158,18 @@ pub const ProviderModel = struct {
     }
 };
 
+/// OAuth configuration for extension providers.
+/// Mirrors TypeScript `ProviderConfig.oauth` field.
+pub const ProviderOAuth = struct {
+    /// Display name for the provider in login UI
+    name: []u8,
+    
+    pub fn deinit(self: *ProviderOAuth, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
 pub const ExtensionProvider = struct {
     name: []u8,
     display_name: ?[]u8,
@@ -141,6 +177,12 @@ pub const ExtensionProvider = struct {
     api: ?[]u8,
     models: []ProviderModel,
     extension_path: []u8,
+    /// OAuth configuration for /login support
+    oauth: ?ProviderOAuth = null,
+    /// Custom headers to include in requests
+    headers: ?std.StringHashMap([]u8) = null,
+    /// If true, adds Authorization: Bearer header with resolved API key
+    auth_header: bool = false,
 
     pub fn deinit(self: *ExtensionProvider, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -149,6 +191,15 @@ pub const ExtensionProvider = struct {
         if (self.api) |a| allocator.free(a);
         for (self.models) |*model| model.deinit(allocator);
         allocator.free(self.models);
+        if (self.oauth) |*oauth| oauth.deinit(allocator);
+        if (self.headers) |*headers| {
+            var iter = headers.iterator();
+            while (iter.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            headers.deinit();
+        }
         allocator.free(self.extension_path);
         self.* = undefined;
     }
@@ -205,12 +256,53 @@ pub const EditorComponentHook = struct {
     }
 };
 
+/// Widget placement options
+pub const WidgetPlacement = enum {
+    above_editor,
+    below_editor,
+};
+
+/// Extension widget hook. Mirrors TS `setWidget`.
+pub const WidgetHook = struct {
+    key: []u8,
+    lines: [][]u8,
+    placement: WidgetPlacement,
+    extension_path: []u8,
+
+    pub fn deinit(self: *WidgetHook, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        for (self.lines) |line| allocator.free(line);
+        allocator.free(self.lines);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
 /// Result of feeding terminal input bytes through the registered
 /// subscriptions. `consumed` blocks the default editor; `data` is the
 /// final transformed bytes (caller borrows).
 pub const TerminalInputResult = struct {
     consumed: bool,
     data: []const u8,
+};
+
+/// Resource discovery paths from extensions
+pub const ResourceDiscovery = struct {
+    skill_paths: std.ArrayList([]u8) = .empty,
+    prompt_paths: std.ArrayList([]u8) = .empty,
+    theme_paths: std.ArrayList([]u8) = .empty,
+    extension_path: []u8,
+
+    pub fn deinit(self: *ResourceDiscovery, allocator: std.mem.Allocator) void {
+        for (self.skill_paths.items) |path| allocator.free(path);
+        self.skill_paths.deinit(allocator);
+        for (self.prompt_paths.items) |path| allocator.free(path);
+        self.prompt_paths.deinit(allocator);
+        for (self.theme_paths.items) |path| allocator.free(path);
+        self.theme_paths.deinit(allocator);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
 };
 
 pub const Registry = struct {
@@ -238,9 +330,18 @@ pub const Registry = struct {
     /// Custom editor component hook (TS `setEditorComponent`).
     /// Single-slot; `null` means the default editor is in use.
     editor_component_hook: ?EditorComponentHook = null,
+    /// Resource discoveries from extensions (TS `resources_discover`)
+    resource_discoveries: std.ArrayList(ResourceDiscovery) = .empty,
+    /// Extension widgets (TS `setWidget`). Keyed by widget key for replacement.
+    widgets: std.ArrayList(WidgetHook) = .empty,
+    /// Event bus for extension event handling
+    event_bus: extension_events.EventBus,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .event_bus = extension_events.EventBus.init(allocator),
+        };
     }
 
     pub fn deinit(self: *Registry) void {
@@ -261,6 +362,11 @@ pub const Registry = struct {
         for (self.terminal_input_subs.items) |*sub| sub.deinit(self.allocator);
         self.terminal_input_subs.deinit(self.allocator);
         if (self.editor_component_hook) |*h| h.deinit(self.allocator);
+        for (self.resource_discoveries.items) |*discovery| discovery.deinit(self.allocator);
+        self.resource_discoveries.deinit(self.allocator);
+        for (self.widgets.items) |*widget| widget.deinit(self.allocator);
+        self.widgets.deinit(self.allocator);
+        self.event_bus.deinit();
         self.* = undefined;
     }
 
@@ -385,6 +491,21 @@ pub const Registry = struct {
         models: []const ProviderModelInput,
         extension_path: []const u8,
     ) !void {
+        try self.registerProviderFull(name, display_name, base_url, api, models, extension_path, null, null, false);
+    }
+
+    pub fn registerProviderFull(
+        self: *Registry,
+        name: []const u8,
+        display_name: ?[]const u8,
+        base_url: ?[]const u8,
+        api: ?[]const u8,
+        models: []const ProviderModelInput,
+        extension_path: []const u8,
+        oauth: ?ProviderOAuth,
+        headers: ?std.StringHashMap([]u8),
+        auth_header: bool,
+    ) !void {
         // Mirror TS: re-registering replaces all existing models.
         if (self.findProviderIndex(name)) |idx| {
             var removed = self.providers.orderedRemove(idx);
@@ -412,6 +533,14 @@ pub const Registry = struct {
         const api_dup = if (api) |n| try self.allocator.dupe(u8, n) else null;
         errdefer if (api_dup) |n| self.allocator.free(n);
 
+        var oauth_dup: ?ProviderOAuth = null;
+        if (oauth) |o| {
+            oauth_dup = .{
+                .name = try self.allocator.dupe(u8, o.name),
+            };
+        }
+        errdefer if (oauth_dup) |*o| o.deinit(self.allocator);
+
         const provider: ExtensionProvider = .{
             .name = try self.allocator.dupe(u8, name),
             .display_name = display_dup,
@@ -419,6 +548,9 @@ pub const Registry = struct {
             .api = api_dup,
             .models = owned_models,
             .extension_path = try self.allocator.dupe(u8, extension_path),
+            .oauth = oauth_dup,
+            .headers = headers,
+            .auth_header = auth_header,
         };
         try self.providers.append(self.allocator, provider);
     }
@@ -632,6 +764,51 @@ pub const Registry = struct {
         return false;
     }
 
+    /// Install or replace a widget hook (TS `setWidget`). Replaces any
+    /// existing widget with the same key.
+    pub fn setWidgetHook(
+        self: *Registry,
+        key: []const u8,
+        lines: []const []const u8,
+        placement: WidgetPlacement,
+        extension_path: []const u8,
+    ) !void {
+        // Replace existing widget with the same key
+        for (self.widgets.items, 0..) |*widget, idx| {
+            if (std.mem.eql(u8, widget.key, key)) {
+                widget.deinit(self.allocator);
+                self.widgets.items[idx] = try makeWidgetHook(self.allocator, key, lines, placement, extension_path);
+                return;
+            }
+        }
+        const widget = try makeWidgetHook(self.allocator, key, lines, placement, extension_path);
+        try self.widgets.append(self.allocator, widget);
+    }
+
+    /// Remove a widget by key. Returns true if a widget was removed.
+    pub fn clearWidgetHook(self: *Registry, key: []const u8) bool {
+        for (self.widgets.items, 0..) |*widget, idx| {
+            if (std.mem.eql(u8, widget.key, key)) {
+                var removed = self.widgets.orderedRemove(idx);
+                removed.deinit(self.allocator);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove all widgets for a given extension path.
+    pub fn clearWidgetsForExtension(self: *Registry, extension_path: []const u8) void {
+        var i: usize = self.widgets.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.widgets.items[i].extension_path, extension_path)) {
+                var removed = self.widgets.orderedRemove(i);
+                removed.deinit(self.allocator);
+            }
+        }
+    }
+
     /// Drop every UI hook that should not survive an extension reload
     /// or session replacement. This mirrors the TS interactive runtime
     /// teardown that clears extension header/footer factories,
@@ -655,6 +832,8 @@ pub const Registry = struct {
             existing.deinit(self.allocator);
             self.editor_component_hook = null;
         }
+        for (self.widgets.items) |*widget| widget.deinit(self.allocator);
+        self.widgets.clearRetainingCapacity();
     }
 };
 
@@ -674,6 +853,34 @@ fn makeTerminalInputSubscription(
         .id = id_dup,
         .consume = consume,
         .transform_to = transform_dup,
+        .extension_path = path_dup,
+    };
+}
+
+fn makeWidgetHook(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    lines: []const []const u8,
+    placement: WidgetPlacement,
+    extension_path: []const u8,
+) !WidgetHook {
+    const key_dup = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_dup);
+    var owned_lines = try allocator.alloc([]u8, lines.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_lines[0..initialized]) |line| allocator.free(line);
+        allocator.free(owned_lines);
+    }
+    for (lines, 0..) |line, idx| {
+        owned_lines[idx] = try allocator.dupe(u8, line);
+        initialized = idx + 1;
+    }
+    const path_dup = try allocator.dupe(u8, extension_path);
+    return .{
+        .key = key_dup,
+        .lines = owned_lines,
+        .placement = placement,
         .extension_path = path_dup,
     };
 }
@@ -984,6 +1191,7 @@ pub const FrameOutcome = enum {
     registered_flag,
     registered_provider,
     unregistered_provider,
+    resources_discovered,
     set_header_hook,
     cleared_header_hook,
     set_footer_hook,
@@ -992,6 +1200,8 @@ pub const FrameOutcome = enum {
     unregistered_terminal_input,
     set_editor_component_hook,
     cleared_editor_component_hook,
+    set_widget_hook,
+    cleared_widget_hook,
     cleared_ui_hooks_for_reload,
     ignored_unsupported,
     ignored_malformed,
@@ -1018,7 +1228,31 @@ pub fn applyHostFrame(
         const name = optionalString(object, "name") orelse return .ignored_malformed;
         const label = optionalString(object, "label") orelse name;
         const description = optionalString(object, "description") orelse "";
+        const render_shell = optionalString(object, "renderShell");
         try registry.registerTool(name, label, description, extension_path);
+        
+        // Apply render shell and render hook if present
+        if (registry.findToolIndex(name)) |idx| {
+            if (render_shell) |rs| {
+                registry.tools.items[idx].render_shell = try registry.allocator.dupe(u8, rs);
+            }
+            
+            if (object.get("renderHook")) |render_hook_val| {
+                if (render_hook_val == .object) {
+                    var render_config_buf: std.Io.Writer.Allocating = .init(registry.allocator);
+                    defer render_config_buf.deinit();
+                    try std.json.Stringify.value(render_hook_val, .{}, &render_config_buf.writer);
+                    const render_config = try registry.allocator.dupe(u8, render_config_buf.written());
+                    errdefer registry.allocator.free(render_config);
+                    registry.tools.items[idx].render_hook = .{
+                        .render_config = render_config,
+                        .tool_name = try registry.allocator.dupe(u8, name),
+                        .extension_path = try registry.allocator.dupe(u8, extension_path),
+                    };
+                }
+            }
+        }
+        
         return .registered_tool;
     }
 
@@ -1070,7 +1304,26 @@ pub fn applyHostFrame(
                 }
             }
         }
-        try registry.registerProvider(name, display_name, base_url, api, inputs.items, extension_path);
+        
+        // Parse auth_header
+        const auth_header = optionalBool(object, "authHeader") orelse false;
+        
+        try registry.registerProviderFull(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header);
+        
+        // Apply OAuth after provider is registered to avoid memory leak on failure
+        if (object.get("oauth")) |oauth_val| {
+            if (oauth_val == .object) {
+                const oauth_name = optionalString(oauth_val.object, "name") orelse name;
+                if (registry.findProviderIndex(name)) |idx| {
+                    const oauth_name_dup = try registry.allocator.dupe(u8, oauth_name);
+                    errdefer registry.allocator.free(oauth_name_dup);
+                    registry.providers.items[idx].oauth = .{
+                        .name = oauth_name_dup,
+                    };
+                }
+            }
+        }
+        
         return .registered_provider;
     }
 
@@ -1078,6 +1331,44 @@ pub fn applyHostFrame(
         const name = optionalString(object, "name") orelse return .ignored_malformed;
         _ = registry.unregisterProvider(name);
         return .unregistered_provider;
+    }
+
+    if (std.mem.eql(u8, type_name, "resources_discover")) {
+        var discovery = ResourceDiscovery{
+            .extension_path = try registry.allocator.dupe(u8, extension_path),
+        };
+        errdefer discovery.deinit(registry.allocator);
+
+        if (object.get("skillPaths")) |paths| {
+            if (paths == .array) {
+                for (paths.array.items) |item| {
+                    if (item == .string) {
+                        try discovery.skill_paths.append(registry.allocator, try registry.allocator.dupe(u8, item.string));
+                    }
+                }
+            }
+        }
+        if (object.get("promptPaths")) |paths| {
+            if (paths == .array) {
+                for (paths.array.items) |item| {
+                    if (item == .string) {
+                        try discovery.prompt_paths.append(registry.allocator, try registry.allocator.dupe(u8, item.string));
+                    }
+                }
+            }
+        }
+        if (object.get("themePaths")) |paths| {
+            if (paths == .array) {
+                for (paths.array.items) |item| {
+                    if (item == .string) {
+                        try discovery.theme_paths.append(registry.allocator, try registry.allocator.dupe(u8, item.string));
+                    }
+                }
+            }
+        }
+
+        try registry.resource_discoveries.append(registry.allocator, discovery);
+        return .resources_discovered;
     }
 
     if (std.mem.eql(u8, type_name, "extension_ui_request")) {
@@ -1127,6 +1418,20 @@ pub fn applyHostFrame(
     if (std.mem.eql(u8, type_name, "clear_editor_component")) {
         _ = registry.clearEditorComponentHook();
         return .cleared_editor_component_hook;
+    }
+    if (std.mem.eql(u8, type_name, "set_widget")) {
+        const key = optionalString(object, "key") orelse return .ignored_malformed;
+        const lines = try optionalLinesArray(registry.allocator, object, "lines");
+        defer registry.allocator.free(lines);
+        const placement_str = optionalString(object, "placement") orelse "aboveEditor";
+        const placement = if (std.mem.eql(u8, placement_str, "belowEditor")) WidgetPlacement.below_editor else WidgetPlacement.above_editor;
+        try registry.setWidgetHook(key, lines, placement, extension_path);
+        return .set_widget_hook;
+    }
+    if (std.mem.eql(u8, type_name, "clear_widget")) {
+        const key = optionalString(object, "key") orelse return .ignored_malformed;
+        _ = registry.clearWidgetHook(key);
+        return .cleared_widget_hook;
     }
     if (std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload")) {
         registry.clearUiHooksForReload();
@@ -1482,6 +1787,118 @@ test "applyHostFrame records ui request ids for bridge correlation" {
     try std.testing.expectEqual(@as(usize, 2), registry.ui_request_ids.items.len);
     try std.testing.expectEqualStrings("ui-1", registry.ui_request_ids.items[0]);
     try std.testing.expectEqualStrings("ui-2", registry.ui_request_ids.items[1]);
+}
+
+test "applyHostFrame parses OAuth provider registration" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "name": "oauth-provider", "displayName": "OAuth Provider", "api": "openai-completions", "baseUrl": "https://api.oauth-provider.com", "models": [{ "id": "model-1", "name": "Model 1" }], "oauth": { "name": "OAuth Login" }, "authHeader": true, "extensionPath": "/tmp/oauth.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 1), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("oauth-provider", registry.providers.items[0].name);
+    try std.testing.expect(registry.providers.items[0].oauth != null);
+    try std.testing.expectEqualStrings("OAuth Login", registry.providers.items[0].oauth.?.name);
+    try std.testing.expect(registry.providers.items[0].auth_header);
+}
+
+test "applyHostFrame handles resources_discover with skill/prompt/theme paths" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "resources_discover", "skillPaths": ["/path/to/skills"], "promptPaths": ["/path/to/prompts"], "themePaths": ["/path/to/themes"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/another/skill"], "extensionPath": "/tmp/ext2.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 2), applied);
+    try std.testing.expectEqual(@as(usize, 2), registry.resource_discoveries.items.len);
+    
+    const discovery1 = registry.resource_discoveries.items[0];
+    try std.testing.expectEqualStrings("/tmp/ext.ts", discovery1.extension_path);
+    try std.testing.expectEqual(@as(usize, 1), discovery1.skill_paths.items.len);
+    try std.testing.expectEqualStrings("/path/to/skills", discovery1.skill_paths.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), discovery1.prompt_paths.items.len);
+    try std.testing.expectEqualStrings("/path/to/prompts", discovery1.prompt_paths.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), discovery1.theme_paths.items.len);
+    try std.testing.expectEqualStrings("/path/to/themes", discovery1.theme_paths.items[0]);
+
+    const discovery2 = registry.resource_discoveries.items[1];
+    try std.testing.expectEqualStrings("/tmp/ext2.ts", discovery2.extension_path);
+    try std.testing.expectEqual(@as(usize, 1), discovery2.skill_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 0), discovery2.prompt_paths.items.len);
+}
+
+test "registerProvider with OAuth round-trips" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    var oauth = ProviderOAuth{
+        .name = try allocator.dupe(u8, "Test OAuth"),
+    };
+    defer oauth.deinit(allocator);
+
+    try registry.registerProviderFull(
+        "test-oauth",
+        "Test Provider",
+        "https://api.test.com",
+        "openai-completions",
+        &.{.{ .id = "test-model", .name = "Test Model" }},
+        "/tmp/test.ts",
+        oauth,
+        null,
+        true,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("test-oauth", registry.providers.items[0].name);
+    try std.testing.expect(registry.providers.items[0].oauth != null);
+    try std.testing.expectEqualStrings("Test OAuth", registry.providers.items[0].oauth.?.name);
+    try std.testing.expect(registry.providers.items[0].auth_header);
+}
+
+test "applyHostFrame handles set_widget and clear_widget" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "set_widget", "key": "status", "lines": ["Line 1", "Line 2"], "placement": "aboveEditor", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "status", "lines": ["Updated"], "placement": "belowEditor", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "other", "lines": ["Other widget"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "clear_widget", "key": "other", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 4), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.widgets.items.len);
+    try std.testing.expectEqualStrings("status", registry.widgets.items[0].key);
+    try std.testing.expectEqualStrings("Updated", registry.widgets.items[0].lines[0]);
+    try std.testing.expect(registry.widgets.items[0].placement == .below_editor);
+}
+
+test "Registry clearUiHooksForReload drops widgets" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const lines = [_][]const u8{"Widget line"};
+    try registry.setWidgetHook("test", &lines, .above_editor, "/tmp/ext.ts");
+    try std.testing.expectEqual(@as(usize, 1), registry.widgets.items.len);
+
+    registry.clearUiHooksForReload();
+    try std.testing.expectEqual(@as(usize, 0), registry.widgets.items.len);
 }
 
 // --------------------------------------------------------------------------

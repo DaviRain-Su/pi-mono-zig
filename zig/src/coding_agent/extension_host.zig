@@ -102,6 +102,25 @@ pub const RegistryFrame = struct {
     }
 };
 
+/// Resource paths discovered from extensions
+pub const ResourceDiscovery = struct {
+    skill_paths: [][]u8,
+    prompt_paths: [][]u8,
+    theme_paths: [][]u8,
+    extension_path: []u8,
+
+    pub fn deinit(self: *ResourceDiscovery, allocator: std.mem.Allocator) void {
+        for (self.skill_paths) |path| allocator.free(path);
+        allocator.free(self.skill_paths);
+        for (self.prompt_paths) |path| allocator.free(path);
+        allocator.free(self.prompt_paths);
+        for (self.theme_paths) |path| allocator.free(path);
+        allocator.free(self.theme_paths);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
 pub const HostMessage = union(enum) {
     ready,
     diagnostic: Diagnostic,
@@ -114,6 +133,8 @@ pub const HostMessage = union(enum) {
     /// `extension_registry.applyHostFrame` so the runtime registry
     /// reflects extension contributions in CLI / TS-RPC output.
     registry_frame: RegistryFrame,
+    /// Extension resource discovery result
+    resources_discover: ResourceDiscovery,
 
     pub fn deinit(self: *HostMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -121,6 +142,7 @@ pub const HostMessage = union(enum) {
             .extension_ui_request => |*request| request.deinit(allocator),
             .error_message => |*diagnostic| diagnostic.deinit(allocator),
             .registry_frame => |*frame| frame.deinit(allocator),
+            .resources_discover => |*discovery| discovery.deinit(allocator),
             else => {},
         }
         self.* = undefined;
@@ -143,7 +165,10 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "unregister_terminal_input",
     "set_editor_component",
     "clear_editor_component",
+    "set_widget",
+    "clear_widget",
     "clear_ui_hooks_for_reload",
+    "resources_discover",
 };
 
 fn isRegistryFrameType(type_name: []const u8) bool {
@@ -307,6 +332,7 @@ pub const ProtocolState = struct {
             .registry_frame => |frame| {
                 const outcome = extension_registry.applyHostFrame(&self.registry, frame.payload) catch |err| switch (err) {
                     error.OutOfMemory => return err,
+                    error.WriteFailed => return err,
                 };
                 switch (outcome) {
                     .registered_tool,
@@ -323,11 +349,17 @@ pub const ProtocolState = struct {
                     .unregistered_terminal_input,
                     .set_editor_component_hook,
                     .cleared_editor_component_hook,
+                    .set_widget_hook,
+                    .cleared_widget_hook,
                     .cleared_ui_hooks_for_reload,
+                    .resources_discovered,
                     => self.registry_frames_applied += 1,
-                    .none, .ignored_unsupported => {},
-                    .ignored_malformed => try self.addDiagnostic(.malformed_json, .@"error", "host emitted malformed register_* frame"),
+                    .none, .ignored_unsupported, .ignored_malformed => {},
                 }
+            },
+            .resources_discover => |discovery| {
+                // Resource discovery messages are handled by the caller
+                _ = discovery;
             },
         }
     }
