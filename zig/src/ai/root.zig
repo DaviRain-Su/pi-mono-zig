@@ -61,6 +61,7 @@ test {
     _ = @import("providers/openai_codex_responses.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/anthropic_copilot_compat_test.zig");
+    _ = @import("providers/openai_copilot_cloudflare_test.zig");
     _ = @import("providers/google.zig");
     _ = @import("providers/google_gemini_cli.zig");
     _ = @import("providers/google_vertex.zig");
