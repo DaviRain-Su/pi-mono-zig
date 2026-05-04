@@ -77,6 +77,8 @@ pub const ConfigOptions = struct {
 pub const UpdateTarget = union(enum) {
     all,
     self,
+    /// --extensions flag: update all extensions (skip self-update).
+    extensions,
     source: []const u8,
 };
 
@@ -91,6 +93,10 @@ pub const ParsedCommand = struct {
     local: bool = false,
     force: bool = false,
     help: bool = false,
+    /// True when self-update is included in an .all target (i.e. the user
+    /// passed --self alongside --extensions or used `pi update self --extensions`).
+    /// Used by executeUpdate(.all) to decide whether to also run self-update.
+    update_self: bool = false,
     /// First parse-time diagnostic, if any. Mirrors TS where parse
     /// errors are reported as a single line followed by usage.
     parse_error: ?[]u8 = null,
@@ -159,6 +165,12 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
     var pending_toggle_kind: ?ConfigKind = null;
     var pending_toggle_pattern_owned: ?[]u8 = null;
     errdefer if (pending_toggle_pattern_owned) |value| allocator.free(value);
+
+    // Tracks --self, --extensions, --extension <source> for `pi update`.
+    var saw_self_flag = false;
+    var saw_extensions_flag = false;
+    var saw_extension_source_owned: ?[]u8 = null;
+    errdefer if (saw_extension_source_owned) |value| allocator.free(value);
 
     var index: usize = 1;
     while (index < args.len) : (index += 1) {
@@ -235,6 +247,57 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
                 .disable;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--self")) {
+            if (command == .update) {
+                saw_self_flag = true;
+            } else {
+                if (result.parse_error == null) {
+                    result.parse_error = try std.fmt.allocPrint(
+                        allocator,
+                        "Unknown option {s} for \"{s}\".",
+                        .{ arg, packageCommandName(command) },
+                    );
+                }
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--extensions")) {
+            if (command == .update) {
+                saw_extensions_flag = true;
+            } else {
+                if (result.parse_error == null) {
+                    result.parse_error = try std.fmt.allocPrint(
+                        allocator,
+                        "Unknown option {s} for \"{s}\".",
+                        .{ arg, packageCommandName(command) },
+                    );
+                }
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--extension")) {
+            if (command != .update) {
+                if (result.parse_error == null) {
+                    result.parse_error = try std.fmt.allocPrint(
+                        allocator,
+                        "Unknown option {s} for \"{s}\".",
+                        .{ arg, packageCommandName(command) },
+                    );
+                }
+                continue;
+            }
+            const next_index = index + 1;
+            if (next_index >= args.len or std.mem.startsWith(u8, args[next_index], "-")) {
+                if (result.parse_error == null) {
+                    result.parse_error = try allocator.dupe(u8, "Missing value for --extension.");
+                }
+                continue;
+            }
+            if (saw_extension_source_owned) |existing| allocator.free(existing);
+            saw_extension_source_owned = try allocator.dupe(u8, args[next_index]);
+            index += 1;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-")) {
             if (result.parse_error == null) {
                 result.parse_error = try std.fmt.allocPrint(
@@ -286,16 +349,80 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
         );
     }
 
-    if (command == .update and !result.help and result.parse_error == null) {
-        if (result.source) |value| {
-            if (std.mem.eql(u8, value, "self") or std.mem.eql(u8, value, "pi")) {
-                result.update_target = .self;
+    if (command == .update and !result.help) {
+        // Conflict detection and update_target resolution incorporating
+        // --self, --extensions, --extension <source>, and positional sources.
+        if (saw_extension_source_owned) |ext_src| {
+            // --extension <source> conflicts with --self, --extensions, or positional.
+            if (saw_self_flag or saw_extensions_flag) {
+                allocator.free(ext_src);
+                saw_extension_source_owned = null;
+                if (result.parse_error == null) {
+                    result.parse_error = try allocator.dupe(
+                        u8,
+                        "--extension cannot be combined with --self or --extensions.",
+                    );
+                }
+            } else if (result.source != null) {
+                allocator.free(ext_src);
+                saw_extension_source_owned = null;
+                if (result.parse_error == null) {
+                    result.parse_error = try allocator.dupe(
+                        u8,
+                        "--extension cannot be combined with a positional source.",
+                    );
+                }
             } else {
-                result.update_target = .{ .source = value };
+                // No conflict: --extension source becomes the update target.
+                result.source = ext_src;
+                saw_extension_source_owned = null;
             }
-        } else {
-            result.update_target = .all;
+        } else if (result.source != null) {
+            // Positional source + --self/--extensions conflict check.
+            const val = result.source.?;
+            const source_is_self = std.mem.eql(u8, val, "self") or std.mem.eql(u8, val, "pi");
+            if (!source_is_self and (saw_extensions_flag or saw_self_flag)) {
+                if (result.parse_error == null) {
+                    result.parse_error = try allocator.dupe(
+                        u8,
+                        "Positional update targets cannot be combined with --self or --extensions.",
+                    );
+                }
+            }
         }
+
+        if (result.parse_error == null) {
+            if (result.source) |value| {
+                const source_is_self = std.mem.eql(u8, value, "self") or std.mem.eql(u8, value, "pi");
+                if (source_is_self) {
+                    // "self"/"pi" positional + --extensions means update all
+                    // (self-update + extension update).
+                    if (saw_extensions_flag) {
+                        result.update_target = .all;
+                        result.update_self = true;
+                    } else {
+                        result.update_target = .self;
+                    }
+                } else {
+                    result.update_target = .{ .source = value };
+                }
+            } else if (saw_self_flag and saw_extensions_flag) {
+                // --self + --extensions: update both self and all extensions.
+                result.update_target = .all;
+                result.update_self = true;
+            } else if (saw_self_flag) {
+                result.update_target = .self;
+            } else if (saw_extensions_flag) {
+                result.update_target = .extensions;
+            } else {
+                result.update_target = .all;
+            }
+        }
+    }
+
+    // Safety cleanup: free extension source if not consumed above.
+    if (saw_extension_source_owned) |value| {
+        allocator.free(value);
     }
 
     return result;
@@ -315,7 +442,7 @@ pub fn packageCommandUsage(command: PackageCommand) []const u8 {
     return switch (command) {
         .install => "pi install <source> [-l]",
         .remove => "pi remove <source> [-l]",
-        .update => "pi update [source|self|pi] [--force]",
+        .update => "pi update [source|self|pi] [--self] [--extensions] [--extension <source>] [--force]",
         .list => "pi list",
         .config => "pi config [--toggle <kind> <pattern> --enable|--disable] [-l]",
     };
@@ -554,15 +681,27 @@ fn executeUpdate(
 
     switch (target) {
         .all => {
+            // When --self was also requested (e.g. via `pi update --self
+            // --extensions` or `pi update self --extensions`), run self-update
+            // first before reporting extension update.
+            if (command.update_self) {
+                const self_result = try executeSelfUpdate(allocator, io, command.force, options, stdout, stderr);
+                if (self_result.exit_code != 0) return self_result;
+            }
             // Offline no-op for the local-fixtures scope: report the
             // deterministic "Updated packages" line without mutating any
             // settings on disk. Mirrors TS update path when no
-            // network/self-update work is needed.
+            // network work is needed.
             try stdout.print("Updated packages\n", .{});
             return .{ .exit_code = 0 };
         },
         .self => {
             return executeSelfUpdate(allocator, io, command.force, options, stdout, stderr);
+        },
+        .extensions => {
+            // Update all extensions (offline no-op for local sources).
+            try stdout.print("Updated packages\n", .{});
+            return .{ .exit_code = 0 };
         },
         .source => |source| {
             const found_scope = try findInstalledScope(allocator, io, options, source);
@@ -789,17 +928,24 @@ fn writePackageCommandHelp(stdout: *std.Io.Writer, command: PackageCommand) !voi
         ),
         .update => try stdout.writeAll(
             \\Usage:
-            \\  pi update [source|self|pi] [--force]
+            \\  pi update [source|self|pi] [--self] [--extensions] [--extension <source>] [--force]
             \\
             \\Update installed packages or self-update pi.
             \\
-            \\  pi update             Update all installed packages (offline no-op for local sources)
-            \\  pi update self        Self-update pi via npm or bun
-            \\  pi update pi          Alias for pi update self
-            \\  pi update <source>    Update a specific installed package
+            \\  pi update                     Update all installed packages (offline no-op for local sources)
+            \\  pi update self                Self-update pi via npm or bun
+            \\  pi update pi                  Alias for pi update self
+            \\  pi update <source>            Update a specific installed package
+            \\  pi update --self              Self-update pi only
+            \\  pi update --extensions        Update all extensions only (skip self-update)
+            \\  pi update --extension <src>   Update a single extension by source
+            \\  pi update --self --extensions Update both pi and all extensions
             \\
             \\Options:
-            \\  --force    Skip version check, always run update
+            \\  --self                Self-update pi via npm or bun
+            \\  --extensions          Update all installed extensions
+            \\  --extension <source>  Update a single installed extension by source
+            \\  --force               Skip version check, always run update
             \\
             \\Self-update requires npm or bun to be installed. On failure, a manual
             \\instruction is printed showing the command you can run yourself.
@@ -2610,5 +2756,818 @@ test "VAL-PKG-120 self_update no package manager prints diagnostic" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "self-update this installation") != null);
     // Manual fallback command must be shown.
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, package_name) != null);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+// ---------------------------------------------------------------------------
+// Update flags tests (VAL-PKG-130..139)
+// ---------------------------------------------------------------------------
+
+test "VAL-PKG-130 --self flag resolves update_target to .self" {
+    const allocator = std.testing.allocator;
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "--self" });
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.parse_error == null);
+    try std.testing.expect(parsed.update_target != null);
+    const target = parsed.update_target.?;
+    try std.testing.expect(target == .self);
+}
+
+test "VAL-PKG-131 --extensions flag resolves update_target to .extensions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+
+    // Verify parsed update_target.
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "--extensions" });
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.parse_error == null);
+    try std.testing.expect(parsed.update_target != null);
+    try std.testing.expect(parsed.update_target.? == .extensions);
+
+    // Verify execution: prints "Updated packages", no self-update output.
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(allocator, &.{ "update", "--extensions" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated packages") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "VAL-PKG-132 --extension <source> updates a single package" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    // Verify parsing: update_target must be .{ .source = "npm:@foo/bar" }.
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "--extension", "npm:@foo/bar" });
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.parse_error == null);
+    try std.testing.expect(parsed.update_target != null);
+    switch (parsed.update_target.?) {
+        .source => |src| try std.testing.expectEqualStrings("npm:@foo/bar", src),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Install the package first, then update it.
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+    _ = try runCommand(allocator, &.{ "install", "npm:@foo/bar" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "--extension", "npm:@foo/bar" },
+        options,
+        &buf_a,
+        &buf_b,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Updated npm:@foo/bar") != null);
+}
+
+test "VAL-PKG-133 --extension without value reports error" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "--extension" });
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.parse_error.?, "Missing value for --extension") != null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(allocator, &.{ "update", "--extension" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "--extension") != null);
+}
+
+test "VAL-PKG-134 --extension combined with --self or --extensions reports conflict" {
+    const allocator = std.testing.allocator;
+
+    // --extension + --self
+    var parsed_self = try parsePackageCommand(allocator, &.{ "update", "--extension", "npm:foo", "--self" });
+    defer parsed_self.deinit(allocator);
+    try std.testing.expect(parsed_self.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed_self.parse_error.?, "--extension") != null);
+
+    // --extension + --extensions
+    var parsed_ext = try parsePackageCommand(allocator, &.{ "update", "--extension", "npm:foo", "--extensions" });
+    defer parsed_ext.deinit(allocator);
+    try std.testing.expect(parsed_ext.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed_ext.parse_error.?, "--extension") != null);
+
+    // Verify exit code 1 on execute.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const r = try runCommand(
+        allocator,
+        &.{ "update", "--extension", "npm:foo", "--self" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), r.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+test "VAL-PKG-135 --extension combined with positional source reports conflict" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "npm:foo", "--extension", "npm:bar" });
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.parse_error.?, "--extension") != null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const r = try runCommand(
+        allocator,
+        &.{ "update", "npm:foo", "--extension", "npm:bar" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), r.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+test "VAL-PKG-136 --self --extensions resolves to update-all with both outputs" {
+    const allocator = std.testing.allocator;
+
+    // Verify parsing: update_target = .all, update_self = true.
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "--self", "--extensions" });
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.parse_error == null);
+    try std.testing.expect(parsed.update_target != null);
+    try std.testing.expect(parsed.update_target.? == .all);
+    try std.testing.expect(parsed.update_self == true);
+
+    // Verify execution: both self-update and extension update outputs.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "--self", "--extensions" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated pi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated packages") != null);
+}
+
+test "VAL-PKG-137 --force accepted only on update command" {
+    const allocator = std.testing.allocator;
+
+    // Accepted on update.
+    var p_update = try parsePackageCommand(allocator, &.{ "update", "--force" });
+    defer p_update.deinit(allocator);
+    try std.testing.expect(p_update.parse_error == null);
+    try std.testing.expect(p_update.force == true);
+
+    // Rejected on install.
+    var p_install = try parsePackageCommand(allocator, &.{ "install", "./pkg", "--force" });
+    defer p_install.deinit(allocator);
+    try std.testing.expect(p_install.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, p_install.parse_error.?, "--force") != null);
+
+    // Rejected on list.
+    var p_list = try parsePackageCommand(allocator, &.{ "list", "--force" });
+    defer p_list.deinit(allocator);
+    try std.testing.expect(p_list.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, p_list.parse_error.?, "--force") != null);
+}
+
+test "VAL-PKG-138 --self rejected on non-update commands" {
+    const allocator = std.testing.allocator;
+
+    var p_install = try parsePackageCommand(allocator, &.{ "install", "npm:foo", "--self" });
+    defer p_install.deinit(allocator);
+    try std.testing.expect(p_install.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, p_install.parse_error.?, "--self") != null);
+
+    var p_list = try parsePackageCommand(allocator, &.{ "list", "--self" });
+    defer p_list.deinit(allocator);
+    try std.testing.expect(p_list.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, p_list.parse_error.?, "--self") != null);
+}
+
+test "VAL-PKG-139 --extensions rejected on non-update commands" {
+    const allocator = std.testing.allocator;
+
+    var p_install = try parsePackageCommand(allocator, &.{ "install", "npm:foo", "--extensions" });
+    defer p_install.deinit(allocator);
+    try std.testing.expect(p_install.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, p_install.parse_error.?, "--extensions") != null);
+
+    var p_list = try parsePackageCommand(allocator, &.{ "list", "--extensions" });
+    defer p_list.deinit(allocator);
+    try std.testing.expect(p_list.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, p_list.parse_error.?, "--extensions") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Config selector tests (VAL-PKG-140..143)
+// ---------------------------------------------------------------------------
+
+test "VAL-PKG-140 bare pi config exits 0 and shows configurable kinds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{"config"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // Must list all configurable kinds.
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "extensions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "prompts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "themes") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "VAL-PKG-141 config selector shows current enable/disable state from settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    // Pre-populate settings with enabled and disabled entries.
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "extensions": ["+foo", "-bar"]
+        \\}
+    , true);
+
+    // Toggle foo to disabled (replaces +foo with -foo) and verify state.
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "config", "--toggle", "extensions", "foo", "--disable" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    // foo must be disabled now (not enabled).
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"-foo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"+foo\"") == null);
+    // bar still disabled.
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"-bar\"") != null);
+}
+
+test "VAL-PKG-142 config selector toggle replaces stale entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "extensions": ["+my-ext"] }
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    // Toggle to disabled: should replace +my-ext with -my-ext.
+    const result = try runCommand(
+        allocator,
+        &.{ "config", "--toggle", "extensions", "my-ext", "--disable" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    // Only one entry for my-ext, and it must be -my-ext.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, after, "my-ext"));
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"-my-ext\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"+my-ext\"") == null);
+}
+
+test "VAL-PKG-143 config selector respects --local scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "config", "--toggle", "extensions", "proj-ext", "--enable", "-l" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    // Project settings must have the toggle.
+    const project_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_path);
+    const project = try readSettings(allocator, project_path);
+    defer allocator.free(project);
+    try std.testing.expect(std.mem.indexOf(u8, project, "\"+proj-ext\"") != null);
+
+    // User settings must NOT exist.
+    const user_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_path);
+    const user_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, user_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(!user_exists);
+}
+
+// ---------------------------------------------------------------------------
+// Local source regression tests (VAL-PKG-160..168)
+// ---------------------------------------------------------------------------
+
+test "VAL-PKG-160 local path install still works at user scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/pkg");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "./fixtures/pkg" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/pkg") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"./fixtures/pkg\"") != null);
+}
+
+test "VAL-PKG-161 local path install still works at project scope with -l" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/pkg");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "./fixtures/pkg", "-l" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const project_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_path);
+    const project = try readSettings(allocator, project_path);
+    defer allocator.free(project);
+    try std.testing.expect(std.mem.indexOf(u8, project, "\"./fixtures/pkg\"") != null);
+
+    // User settings must not exist.
+    const user_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_path);
+    const user_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, user_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(!user_exists);
+}
+
+test "VAL-PKG-162 local path remove still works and preserves other settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "defaultProvider": "anthropic",
+        \\  "packages": [{ "source": "./fixtures/pkg" }]
+        \\}
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "remove", "./fixtures/pkg" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Removed ./fixtures/pkg") != null);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "./fixtures/pkg") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"defaultProvider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"anthropic\"") != null);
+}
+
+test "VAL-PKG-163 remove of non-existent local path reports error" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "remove", "./nonexistent" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "./nonexistent") != null);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+test "VAL-PKG-164 pi uninstall alias still works for remove" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var ignored: std.ArrayList(u8) = .empty;
+    defer ignored.deinit(allocator);
+    var ignored_err: std.ArrayList(u8) = .empty;
+    defer ignored_err.deinit(allocator);
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/pkg" }, options, &ignored, &ignored_err);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "uninstall", "./fixtures/pkg" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Removed ./fixtures/pkg") != null);
+}
+
+test "VAL-PKG-165 local path duplicate install is a no-op" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var buf_a: std.ArrayList(u8) = .empty;
+    defer buf_a.deinit(allocator);
+    var buf_b: std.ArrayList(u8) = .empty;
+    defer buf_b.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/pkg" }, options, &buf_a, &buf_b);
+    buf_a.clearRetainingCapacity();
+    buf_b.clearRetainingCapacity();
+
+    const r2 = try runCommand(allocator, &.{ "install", "./fixtures/pkg" }, options, &buf_a, &buf_b);
+    try std.testing.expectEqual(@as(u8, 0), r2.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Already installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "./fixtures/pkg") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, settings, "./fixtures/pkg"));
+}
+
+test "VAL-PKG-166 update no-op for local packages leaves settings unchanged" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var ignored: std.ArrayList(u8) = .empty;
+    defer ignored.deinit(allocator);
+    var ignored_err: std.ArrayList(u8) = .empty;
+    defer ignored_err.deinit(allocator);
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/pkg" }, options, &ignored, &ignored_err);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const before = try readSettings(allocator, settings_path);
+    defer allocator.free(before);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(allocator, &.{"update"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated packages") != null);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "VAL-PKG-167 targeted update of installed local source confirms without mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var ignored: std.ArrayList(u8) = .empty;
+    defer ignored.deinit(allocator);
+    var ignored_err: std.ArrayList(u8) = .empty;
+    defer ignored_err.deinit(allocator);
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/pkg" }, options, &ignored, &ignored_err);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const before = try readSettings(allocator, settings_path);
+    defer allocator.free(before);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "./fixtures/pkg" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated ./fixtures/pkg") != null);
+
+    const after = try readSettings(allocator, settings_path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "VAL-PKG-168 targeted update of missing source reports error" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "packages": [{ "source": "./fixtures/installed" }] }
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "update", "./fixtures/missing" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "./fixtures/missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "is not installed") != null);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+}
+
+test "VAL-PKG-170 help text for update documents all flags" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(allocator, &.{ "update", "--help" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "--self") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "--extensions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "--extension") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "--force") != null);
+}
+
+test "VAL-PKG-172 unknown flag on any command reports error with usage" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const result = try runCommand(
+        allocator,
+        &.{ "install", "--bogus", "npm:foo" },
+        options,
+        &stdout_buf,
+        &stderr_buf,
+    );
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "--bogus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "pi install") != null);
     try std.testing.expectEqualStrings("", stdout_buf.items);
 }
