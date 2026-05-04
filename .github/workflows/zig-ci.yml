@@ -21,6 +21,11 @@ jobs:
   build-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # ubuntu-latest currently SIGSEGVs in `zig build-exe pi` with Zig 0.16.0
+    # due to upstream bug https://github.com/ziglang/zig/issues/26028.
+    # The job is marked continue-on-error until Zig 0.16.1 stable is released.
+    # Revert by removing the `continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}` line.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
