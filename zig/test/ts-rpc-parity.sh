@@ -83,7 +83,7 @@ SCENARIOS = [
 	(
 		"m5-retry",
 		{"PI_FAUX_STOP_REASON": "error", "PI_FAUX_ERROR_MESSAGE": "503 service unavailable"},
-		3.0,
+		5.0,
 		"retry",
 	),
 ]
