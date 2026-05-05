@@ -238,6 +238,36 @@
 
   .arch pre { font-size: 0.82rem; line-height: 1.4; }
 
+  .quickstart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .command-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .command-card h3 {
+    margin: 0 0 10px;
+    font-size: 0.95rem;
+    color: var(--text);
+  }
+  .command-card p {
+    margin: 0 0 12px;
+    color: var(--text-dim);
+    font-size: 0.88rem;
+  }
+  .command-card pre {
+    margin: 0;
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-size: 0.84rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
   footer {
     border-top: 1px solid var(--border);
     padding: 32px 24px;
@@ -260,6 +290,7 @@
   html[lang="en"]    [data-en] { display: inline; }
   /* block-level overrides: re-show as block where needed */
   html[lang="zh-CN"] p[data-zh],
+  html[lang="zh-CN"] pre[data-zh],
   html[lang="zh-CN"] h1[data-zh],
   html[lang="zh-CN"] h2[data-zh],
   html[lang="zh-CN"] h3[data-zh],
@@ -270,6 +301,7 @@
   html[lang="zh-CN"] td[data-zh] { display: table-cell; }
   html[lang="zh-CN"] li[data-zh] { display: list-item; }
   html[lang="en"] p[data-en],
+  html[lang="en"] pre[data-en],
   html[lang="en"] h1[data-en],
   html[lang="en"] h2[data-en],
   html[lang="en"] h3[data-en],
@@ -572,42 +604,47 @@
     <h2 data-zh>快速开始</h2><h2 data-en>Getting started</h2>
     <p class="sub" data-zh>从 <code>zig/</code> 目录构建；产物是 <code>zig-out/bin/pi</code>。</p>
     <p class="sub" data-en>Build from <code>zig/</code>; the binary is <code>zig-out/bin/pi</code>.</p>
-<pre data-zh><code># 构建
-cd zig
-zig build -Doptimize=ReleaseFast
-
-# 交互模式
-./zig-out/bin/pi
-
-# 一次性 prompt
-./zig-out/bin/pi --print "帮我审查 src/main.zig 的内存管理"
-
-# JSON 事件流（机器消费）
-./zig-out/bin/pi --print --mode json "..."
-
-# 查看可用模型
-./zig-out/bin/pi --list-models
-
-# 续上一会话
-./zig-out/bin/pi --print --continue "继续上一轮"</code></pre>
-<pre data-en><code># Build
-cd zig
-zig build -Doptimize=ReleaseFast
-
-# Interactive mode
-./zig-out/bin/pi
-
-# One-shot prompt
-./zig-out/bin/pi --print "Review memory management in src/main.zig"
-
-# JSON event stream (for machines)
-./zig-out/bin/pi --print --mode json "..."
-
-# List available models
-./zig-out/bin/pi --list-models
-
-# Continue last session
-./zig-out/bin/pi --print --continue "Continue the last session"</code></pre>
+    <div class="quickstart-grid">
+      <div class="command-card">
+        <h3><span data-zh>构建二进制</span><span data-en>Build the binary</span></h3>
+        <p data-zh>进入 Zig package 目录并构建 release 产物。</p>
+        <p data-en>Enter the Zig package directory and build the release binary.</p>
+<pre><code>cd zig
+zig build -Doptimize=ReleaseFast</code></pre>
+      </div>
+      <div class="command-card">
+        <h3><span data-zh>交互模式</span><span data-en>Interactive mode</span></h3>
+        <p data-zh>启动完整 TUI，会自动创建或恢复 session。</p>
+        <p data-en>Start the full TUI; sessions are created or resumed automatically.</p>
+<pre><code>./zig-out/bin/pi</code></pre>
+      </div>
+      <div class="command-card">
+        <h3><span data-zh>一次性 prompt</span><span data-en>One-shot prompt</span></h3>
+        <p data-zh>适合脚本、CI 或快速问题。</p>
+        <p data-en>Use this for scripts, CI, or quick questions.</p>
+<pre data-zh><code>./zig-out/bin/pi --print "帮我审查 src/main.zig 的内存管理"</code></pre>
+<pre data-en><code>./zig-out/bin/pi --print "Review memory management in src/main.zig"</code></pre>
+      </div>
+      <div class="command-card">
+        <h3><span data-zh>JSON 事件流</span><span data-en>JSON event stream</span></h3>
+        <p data-zh>输出机器可消费的 JSON lines。</p>
+        <p data-en>Emit machine-readable JSON lines.</p>
+<pre><code>./zig-out/bin/pi --print --mode json "..."</code></pre>
+      </div>
+      <div class="command-card">
+        <h3><span data-zh>查看模型</span><span data-en>List models</span></h3>
+        <p data-zh>打印当前 registry 里的 provider 与 model。</p>
+        <p data-en>Print providers and models from the current registry.</p>
+<pre><code>./zig-out/bin/pi --list-models</code></pre>
+      </div>
+      <div class="command-card">
+        <h3><span data-zh>续上一会话</span><span data-en>Continue a session</span></h3>
+        <p data-zh>在非交互模式里继续最近 session。</p>
+        <p data-en>Continue the latest session in non-interactive mode.</p>
+<pre data-zh><code>./zig-out/bin/pi --print --continue "继续上一轮"</code></pre>
+<pre data-en><code>./zig-out/bin/pi --print --continue "Continue the last session"</code></pre>
+      </div>
+    </div>
   </div>
 </section>
 
