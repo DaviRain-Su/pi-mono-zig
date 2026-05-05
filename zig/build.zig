@@ -32,18 +32,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const ai_mod = b.createModule(.{
         .root_source_file = b.path("src/ai/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const agent_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     agent_mod.addImport("ai", ai_mod);
 
@@ -51,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tui/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     tui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
@@ -290,6 +294,20 @@ pub fn build(b: *std.Build) void {
     tui_test_step.dependOn(&run_coding_agent_rendering_tests.step);
 }
 
+fn getExtraToolPaths(allocator: std.mem.Allocator) []const []const u8 {
+    const home = std.process.Environ.getAlloc(.{ .block = .empty }, allocator, "HOME") catch return &[_][]const u8{};
+    defer allocator.free(home);
+    const pi_bin = std.fs.path.join(allocator, &.{ home, ".pi", "agent", "bin" }) catch return &[_][]const u8{};
+    const paths = allocator.alloc([]const u8, 1) catch return &[_][]const u8{};
+    paths[0] = pi_bin;
+    return paths;
+}
+
+fn freeExtraToolPaths(allocator: std.mem.Allocator, paths: []const []const u8) void {
+    if (paths.len > 0) allocator.free(paths[0]);
+    allocator.free(paths);
+}
+
 fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
     const step = b.step(
         "check-external-tools",
@@ -299,8 +317,11 @@ fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
     var missing_tools = std.ArrayList([]const u8).empty;
     defer missing_tools.deinit(b.allocator);
 
+    const extra_paths = getExtraToolPaths(b.allocator);
+    defer freeExtraToolPaths(b.allocator, extra_paths);
+
     for (required_external_tools) |tool| {
-        _ = b.findProgram(tool.names, &.{}) catch |err| switch (err) {
+        _ = b.findProgram(tool.names, extra_paths) catch |err| switch (err) {
             error.FileNotFound => missing_tools.append(
                 b.allocator,
                 b.fmt("- {s}: {s}", .{ tool.display_name, tool.reason }),

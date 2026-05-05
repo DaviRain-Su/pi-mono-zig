@@ -118,10 +118,9 @@ fn hasVertexAdcCredentials(allocator: std.mem.Allocator, env_map: *const std.pro
     return pathExists(allocator, default_path);
 }
 
-fn pathExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
-    defer allocator.free(path_z);
-    return std.c.access(path_z.ptr, 0) == 0;
+fn pathExists(_: std.mem.Allocator, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    return true;
 }
 
 fn resolveEnvVar(provider: []const u8) ?[]const u8 {
