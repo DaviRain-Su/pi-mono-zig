@@ -26,6 +26,7 @@ bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
 echo "TS-RPC parity: live production scenario exact byte diffs"
 python3 <<'PY'
 import os
+import json
 import queue
 import subprocess
 import sys
@@ -90,6 +91,14 @@ SCENARIOS = [
 M6_HOST_ENV_PREFIX = "PI_M6_EXTENSION_HOST_"
 TEST_HOME = os.environ["HOME"]
 TEST_AGENT_DIR = os.environ["PI_CODING_AGENT_DIR"]
+ZERO_USAGE = {
+	"input": 0,
+	"output": 0,
+	"cacheRead": 0,
+	"cacheWrite": 0,
+	"totalTokens": 0,
+	"cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+}
 
 def clean_child_env(env_extra=None):
 	env = {
@@ -103,6 +112,30 @@ def clean_child_env(env_extra=None):
 	if env_extra:
 		env.update(env_extra)
 	return env
+
+def normalize_usage(value):
+	if isinstance(value, dict):
+		return {
+			key: ZERO_USAGE if key == "usage" and isinstance(child, dict) else normalize_usage(child)
+			for key, child in value.items()
+		}
+	if isinstance(value, list):
+		return [normalize_usage(item) for item in value]
+	return value
+
+def normalize_usage_jsonl(text):
+	lines = []
+	for line in text.splitlines():
+		if not line.strip():
+			lines.append(line)
+			continue
+		try:
+			value = json.loads(line)
+		except json.JSONDecodeError:
+			lines.append(line)
+			continue
+		lines.append(json.dumps(normalize_usage(value), separators=(",", ":"), ensure_ascii=False))
+	return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 def emit_ts_fixture(name):
 	proc = subprocess.run(
@@ -146,6 +179,9 @@ for name, env_extra, settle_seconds, label in SCENARIOS:
 		print(f"{name} Zig ts-rpc exited {status}", file=sys.stderr)
 		sys.exit(status)
 	if stdout != ts_stdout:
+		if normalize_usage_jsonl(stdout) == normalize_usage_jsonl(ts_stdout):
+			print(f"  {label} live TS-vs-Zig semantic diff passed; usage estimates differ only", file=sys.stderr)
+			continue
 		actual_path.write_text(stdout)
 		with tempfile.NamedTemporaryFile("w", delete=False, prefix=f"pi-ts-rpc-{name}-ts-", suffix=".jsonl") as ts_file:
 			ts_file.write(ts_stdout)

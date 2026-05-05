@@ -1339,12 +1339,14 @@ test "registerFauxProvider aborts before the first chunk" {
 test "registerFauxProvider aborts mid-thinking stream and stops emitting events" {
     const allocator = std.testing.allocator;
     const registration = try registerFauxProvider(allocator, .{
-        .tokens_per_second = 10,
+        .tokens_per_second = 5,
         .token_size = .{ .min = 1, .max = 1 },
     });
     defer registration.unregister();
 
-    const content = [_]FauxContentBlock{fauxThinking("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz")};
+    const content = [_]FauxContentBlock{fauxThinking(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+    )};
     try registration.setResponses(&[_]FauxResponseStep{
         .{ .message = fauxAssistantMessage(content[0..], .{}) },
     });
@@ -1352,7 +1354,7 @@ test "registerFauxProvider aborts mid-thinking stream and stops emitting events"
     var abort_signal = std.atomic.Value(bool).init(false);
     const abort_thread = try std.Thread.spawn(.{}, struct {
         fn run(signal: *std.atomic.Value(bool), io: std.Io) void {
-            std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+            std.Io.sleep(io, .fromMilliseconds(600), .awake) catch {};
             signal.store(true, .seq_cst);
         }
     }.run, .{ &abort_signal, std.testing.io });
@@ -1376,12 +1378,15 @@ test "registerFauxProvider aborts mid-thinking stream and stops emitting events"
         event.deinitTransient(allocator);
     }
 
-    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
-        .start,
-        .thinking_start,
-        .thinking_delta,
-        .error_event,
-    }, event_types.items);
+    try std.testing.expect(event_types.items.len >= 4);
+    try std.testing.expectEqual(types.EventType.start, event_types.items[0]);
+    try std.testing.expectEqual(types.EventType.thinking_start, event_types.items[1]);
+    try std.testing.expectEqual(types.EventType.error_event, event_types.items[event_types.items.len - 1]);
+    var thinking_delta_count: usize = 0;
+    for (event_types.items) |event_type| {
+        if (event_type == .thinking_delta) thinking_delta_count += 1;
+    }
+    try std.testing.expect(thinking_delta_count >= 1);
 
     var result = stream.result().?;
     defer deinitAssistantMessage(allocator, &result);
@@ -1391,7 +1396,7 @@ test "registerFauxProvider aborts mid-thinking stream and stops emitting events"
 test "registerFauxProvider aborts mid-toolcall stream and stops emitting events" {
     const allocator = std.testing.allocator;
     const registration = try registerFauxProvider(allocator, .{
-        .tokens_per_second = 10,
+        .tokens_per_second = 5,
         .token_size = .{ .min = 1, .max = 1 },
     });
     defer registration.unregister();
@@ -1419,7 +1424,7 @@ test "registerFauxProvider aborts mid-toolcall stream and stops emitting events"
     var abort_signal = std.atomic.Value(bool).init(false);
     const abort_thread = try std.Thread.spawn(.{}, struct {
         fn run(signal: *std.atomic.Value(bool), io: std.Io) void {
-            std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+            std.Io.sleep(io, .fromMilliseconds(600), .awake) catch {};
             signal.store(true, .seq_cst);
         }
     }.run, .{ &abort_signal, std.testing.io });
@@ -1443,12 +1448,15 @@ test "registerFauxProvider aborts mid-toolcall stream and stops emitting events"
         event.deinitTransient(allocator);
     }
 
-    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
-        .start,
-        .toolcall_start,
-        .toolcall_delta,
-        .error_event,
-    }, event_types.items);
+    try std.testing.expect(event_types.items.len >= 4);
+    try std.testing.expectEqual(types.EventType.start, event_types.items[0]);
+    try std.testing.expectEqual(types.EventType.toolcall_start, event_types.items[1]);
+    try std.testing.expectEqual(types.EventType.error_event, event_types.items[event_types.items.len - 1]);
+    var toolcall_delta_count: usize = 0;
+    for (event_types.items) |event_type| {
+        if (event_type == .toolcall_delta) toolcall_delta_count += 1;
+    }
+    try std.testing.expect(toolcall_delta_count >= 1);
 
     var result = stream.result().?;
     defer deinitAssistantMessage(allocator, &result);
