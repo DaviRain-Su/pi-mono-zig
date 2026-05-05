@@ -245,3 +245,9 @@ The remaining work is narrower than before:
 - align provider catalog/type metadata with TS
 - harden extension dynamic-refresh behavior
 - restore Linux CI build/test when the Zig compiler issue is fixed
+
+Forward-looking extension architecture work is tracked separately in
+`zig/docs/wasm-extension-roadmap.md`. That roadmap covers the language-neutral
+Wasm extension direction inspired by Tree-sitter's declarative source plus
+compiled artifact model, while this review remains focused on current
+TypeScript parity status.
