@@ -1574,6 +1574,7 @@ pub fn persistLoginCredential(
         };
         current_provider.deinit(allocator);
         current_provider.* = resolved;
+        session.agent.setModel(resolved.model);
         session.setApiKey(resolved.api_key);
     }
 
@@ -2383,6 +2384,7 @@ pub fn logoutProviderById(
         if (resolved) |next_provider| {
             current_provider.deinit(allocator);
             current_provider.* = next_provider;
+            session.agent.setModel(next_provider.model);
             session.setApiKey(next_provider.api_key);
         }
     }

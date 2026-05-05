@@ -420,6 +420,11 @@ pub fn registerModel(model: types.Model) RegisterError!void {
     return getDefault().registerModel(model);
 }
 
+pub fn cloneOwnedModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!types.Model {
+    const cloned = try cloneModel(allocator, model);
+    return cloned.model;
+}
+
 fn cloneModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!ModelEntry {
     const owned_id = try allocator.dupe(u8, model.id);
     errdefer allocator.free(owned_id);
@@ -479,7 +484,7 @@ fn cloneInputTypes(allocator: std.mem.Allocator, input_types: []const []const u8
     return owned_input_types;
 }
 
-fn deinitOwnedModel(allocator: std.mem.Allocator, model: *types.Model) void {
+pub fn deinitOwnedModel(allocator: std.mem.Allocator, model: *types.Model) void {
     allocator.free(model.id);
     allocator.free(model.name);
     allocator.free(model.api);

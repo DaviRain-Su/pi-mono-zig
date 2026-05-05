@@ -51,6 +51,7 @@ pub const ResolvedProviderConfig = struct {
 
     pub fn deinit(self: *ResolvedProviderConfig, allocator: std.mem.Allocator) void {
         if (self.faux_registration) |registration| registration.unregister();
+        ai.model_registry.deinitOwnedModel(allocator, &self.model);
         if (self.owned_api_key) |api_key| allocator.free(api_key);
         if (self.owned_faux_messages) |messages| {
             for (messages) |*message| message.deinit(allocator);
@@ -117,13 +118,20 @@ pub fn resolveProviderConfig(
 
     const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
     const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(provider_descriptor, model_id);
+    var owned_model = ai.model_registry.cloneOwnedModel(allocator, model) catch |err| {
+        if (resolved_api_key) |api_key| {
+            if (api_key.owned_api_key) |owned_api_key| allocator.free(owned_api_key);
+        }
+        return err;
+    };
+    errdefer ai.model_registry.deinitOwnedModel(allocator, &owned_model);
     const auth_status: ProviderAuthStatus = if (resolved_api_key) |api_key|
         authStatusFromSource(api_key.source)
     else
         .local;
 
     return .{
-        .model = model,
+        .model = owned_model,
         .api_key = if (resolved_api_key) |api_key| api_key.api_key else null,
         .owned_api_key = if (resolved_api_key) |api_key| api_key.owned_api_key else null,
         .auth_status = auth_status,
@@ -492,8 +500,11 @@ fn resolveFauxProvider(
         });
     }
 
+    var owned_model = try ai.model_registry.cloneOwnedModel(allocator, registration.getModel());
+    errdefer ai.model_registry.deinitOwnedModel(allocator, &owned_model);
+
     return .{
-        .model = registration.getModel(),
+        .model = owned_model,
         .api_key = null,
         .auth_status = .local,
         .faux_registration = registration,
@@ -714,6 +725,69 @@ test "resolveProviderConfig uses canonical defaults from model registry" {
     try std.testing.expectEqual(@as(u32, 128000), resolved.model.max_tokens);
     try std.testing.expectEqual(@as(usize, 2), resolved.model.input_types.len);
     try std.testing.expectEqualStrings("image", resolved.model.input_types[1]);
+}
+
+test "resolveProviderConfig owns model strings across registry reload" {
+    const allocator = std.testing.allocator;
+    defer ai.model_registry.resetForTesting();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("OPENAI_API_KEY", "openai-key");
+
+    const registry_model = ai.model_registry.find("openai", "gpt-5.4").?;
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "openai", null, null, null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expect(registry_model.id.ptr != resolved.model.id.ptr);
+    try std.testing.expect(registry_model.name.ptr != resolved.model.name.ptr);
+    try std.testing.expect(registry_model.api.ptr != resolved.model.api.ptr);
+    try std.testing.expect(registry_model.provider.ptr != resolved.model.provider.ptr);
+    try std.testing.expect(registry_model.base_url.ptr != resolved.model.base_url.ptr);
+    try std.testing.expect(registry_model.input_types.ptr != resolved.model.input_types.ptr);
+    try std.testing.expect(registry_model.input_types[0].ptr != resolved.model.input_types[0].ptr);
+
+    ai.model_registry.clearDefault();
+
+    try std.testing.expectEqualStrings("openai", resolved.model.provider);
+    try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+    try std.testing.expectEqualStrings("OpenAI", providerDisplayName(resolved.model.provider));
+}
+
+test "resolveProviderConfig keeps registry-backed custom provider safe after clear" {
+    const allocator = std.testing.allocator;
+    defer ai.model_registry.resetForTesting();
+
+    try ai.model_registry.registerProvider(.{
+        .provider = "local-registry-backed",
+        .api = "openai-completions",
+        .base_url = "http://localhost:4321/v1",
+        .default_model_id = "local-registry-model",
+    });
+    try ai.model_registry.registerModel(.{
+        .id = "local-registry-model",
+        .name = "Local Registry Model",
+        .api = "openai-completions",
+        .provider = "local-registry-backed",
+        .base_url = "http://localhost:4321/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 4096,
+        .max_tokens = 1024,
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, "local-registry-backed", null, null, null);
+    defer resolved.deinit(allocator);
+
+    ai.model_registry.clearDefault();
+
+    try std.testing.expectEqualStrings("local-registry-backed", resolved.model.provider);
+    try std.testing.expectEqualStrings("local-registry-model", resolved.model.id);
+    try std.testing.expectEqualStrings("Local Registry Model", resolved.model.name);
+    try std.testing.expectEqualStrings("local-registry-backed", providerDisplayName(resolved.model.provider));
 }
 
 test "resolveProviderConfig supports non-legacy built-in providers" {
