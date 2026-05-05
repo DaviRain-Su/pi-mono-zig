@@ -23,9 +23,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     # ubuntu-latest currently SIGSEGVs in `zig build-exe pi` with Zig 0.16.0
     # due to upstream bug https://github.com/ziglang/zig/issues/26028.
-    # The job is marked continue-on-error until Zig 0.16.1 stable is released.
-    # Revert by removing the `continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}` line.
-    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    # Keep Linux in the matrix for setup/tool smoke coverage, but skip Zig
+    # build/test there until Zig 0.16.1 stable is released.
     strategy:
       fail-fast: false
       matrix:
@@ -91,8 +90,16 @@ jobs:
           fd --version
           zig version
 
+      - name: Skip Linux Zig build
+        if: runner.os == 'Linux'
+        run: |
+          echo "Skipping Linux Zig build/test because Zig 0.16.0 SIGSEGVs in build-exe on ubuntu-latest."
+          echo "Re-enable these steps after upgrading to a stable Zig release with ziglang/zig#26028 fixed."
+
       - name: Build
+        if: runner.os != 'Linux'
         run: zig build
 
       - name: Test
+        if: runner.os != 'Linux'
         run: zig build test
