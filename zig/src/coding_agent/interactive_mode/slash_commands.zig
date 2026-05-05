@@ -37,6 +37,7 @@ const loadModelOverlayWithSearch = overlays.loadModelOverlayWithSearch;
 const loadThemeOverlay = overlays.loadThemeOverlay;
 const loadScopedModelOverlay = overlays.loadScopedModelOverlay;
 const loadTreeOverlay = overlays.loadTreeOverlay;
+const loadForkOverlay = overlays.loadForkOverlay;
 const AppState = rendering.AppState;
 const rebuildAppStateFromSession = rendering.rebuildAppStateFromSession;
 const updateAppFooterFromSession = rendering.updateAppFooterFromSession;
@@ -272,16 +273,7 @@ pub fn handleSlashCommand(
                 try app_state.setStatus("wait for the current response to finish before forking the session");
                 return;
             }
-            try forkCurrentSession(
-                allocator,
-                io,
-                session,
-                current_provider,
-                session_dir,
-                tool_items,
-                app_state,
-                subscriber,
-            );
+            try loadForkOverlayOrStatus(allocator, session, app_state, overlay);
         },
         .clone => {
             if (prompt_worker_active.*) {
@@ -2432,14 +2424,19 @@ pub fn cloneCurrentSession(
         return;
     }
 
-    var candidate = try createDerivedSession(
+    const leaf_id = session.session_manager.getLeafId() orelse {
+        try app_state.setStatus("Nothing to clone yet");
+        return;
+    };
+
+    var candidate = try createForkedSessionFromLeaf(
         allocator,
         io,
         session,
         current_provider,
         session_dir,
         tool_items,
-        messages,
+        leaf_id,
     );
     errdefer candidate.deinit();
 
@@ -2447,6 +2444,21 @@ pub fn cloneCurrentSession(
     const message = try std.fmt.allocPrint(allocator, "Cloned session to {s}", .{currentSessionLabel(session)});
     defer allocator.free(message);
     try app_state.appendInfo(message);
+}
+
+pub fn loadForkOverlayOrStatus(
+    allocator: std.mem.Allocator,
+    session: *const session_mod.AgentSession,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+) !void {
+    overlay.* = loadForkOverlay(allocator, session) catch |err| switch (err) {
+        error.NoMessagesToFork => {
+            try app_state.setStatus("No messages to fork from");
+            return;
+        },
+        else => return err,
+    };
 }
 
 pub fn forkCurrentSession(
@@ -2461,7 +2473,7 @@ pub fn forkCurrentSession(
 ) !void {
     const messages = session.agent.getMessages();
     const last_user_index = findLastUserMessageIndex(messages) orelse {
-        try app_state.setStatus("No user messages to fork from");
+        try app_state.setStatus("No messages to fork from");
         return;
     };
 
@@ -2480,6 +2492,112 @@ pub fn forkCurrentSession(
     const message = try std.fmt.allocPrint(allocator, "Forked session at the latest user message into {s}", .{currentSessionLabel(session)});
     defer allocator.free(message);
     try app_state.appendInfo(message);
+}
+
+pub fn forkCurrentSessionBeforeUserMessage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    tool_items: []const agent.AgentTool,
+    entry_id: []const u8,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    subscriber: agent.AgentSubscriber,
+) !void {
+    const selected_entry = session.session_manager.getEntry(entry_id) orelse {
+        try app_state.setStatus("Invalid entry ID for forking");
+        return;
+    };
+    if (selected_entry.* != .message or selected_entry.message.message != .user) {
+        try app_state.setStatus("Invalid entry ID for forking");
+        return;
+    }
+
+    const selected_text = try textBlocksConcat(allocator, selected_entry.message.message.user.content);
+    defer allocator.free(selected_text);
+    const target_leaf_id = selected_entry.message.parent_id;
+
+    var candidate = try createForkedSessionFromLeaf(
+        allocator,
+        io,
+        session,
+        current_provider,
+        session_dir,
+        tool_items,
+        target_leaf_id,
+    );
+    errdefer candidate.deinit();
+
+    try replaceCurrentSession(allocator, session, &candidate, app_state, subscriber);
+    editor.reset();
+    if (selected_text.len > 0) {
+        _ = try editor.handlePaste(selected_text);
+    }
+    try app_state.setStatus("Forked to new session");
+}
+
+pub fn createForkedSessionFromLeaf(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_session: *const session_mod.AgentSession,
+    current_provider: *const provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    tool_items: []const agent.AgentTool,
+    target_leaf_id: ?[]const u8,
+) !session_mod.AgentSession {
+    var manager = try allocator.create(session_manager_mod.SessionManager);
+    errdefer allocator.destroy(manager);
+
+    manager.* = if (target_leaf_id) |leaf_id|
+        try source_session.session_manager.createBranchedSession(leaf_id)
+    else if (source_session.session_manager.getSessionFile() != null and session_dir.len > 0)
+        try session_manager_mod.SessionManager.createWithParent(
+            allocator,
+            io,
+            source_session.cwd,
+            session_dir,
+            source_session.session_manager.getSessionFile(),
+        )
+    else
+        try session_manager_mod.SessionManager.inMemory(allocator, io, source_session.cwd);
+
+    const cwd = manager.getCwd();
+    return session_mod.AgentSession.createWithManager(
+        allocator,
+        io,
+        manager,
+        .{
+            .cwd = cwd,
+            .system_prompt = source_session.system_prompt,
+            .model = current_provider.model,
+            .api_key = current_provider.api_key,
+            .thinking_level = source_session.agent.getThinkingLevel(),
+            .tools = tool_items,
+            .compaction = source_session.compaction_settings,
+            .retry = source_session.retry_settings,
+        },
+    ) catch |err| {
+        manager.deinit();
+        allocator.destroy(manager);
+        return err;
+    };
+}
+
+fn textBlocksConcat(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| try out.appendSlice(allocator, text.text),
+            else => {},
+        }
+    }
+    const text = std.mem.trim(u8, out.items, " \t\r\n");
+    const owned = try allocator.dupe(u8, text);
+    out.deinit(allocator);
+    return owned;
 }
 
 pub fn createDerivedSession(
@@ -2572,6 +2690,169 @@ pub fn resolveSessionPath(
     }
 
     return error.FileNotFound;
+}
+
+fn ignoreSlashTestAgentEvent(_: ?*anyopaque, _: agent.AgentEvent) anyerror!void {}
+
+test "fork selector lists user messages and fork branches before selected prompt" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "sessions", .default_dir);
+
+    const tmp_root = try makeSlashTestTempPath(allocator, &tmp, null);
+    defer allocator.free(tmp_root);
+    const session_dir = try makeSlashTestTempPath(allocator, &tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = tmp_root,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    const original_session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(original_session_file);
+
+    var first_user = try makeSlashTestUserMessage(allocator, "first prompt", 1);
+    defer session_manager_mod.deinitMessage(allocator, &first_user);
+    _ = try session.session_manager.appendMessage(first_user);
+
+    var assistant = try makeSlashTestAssistantMessage(allocator, "first reply", current_provider.model, 2);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    _ = try session.session_manager.appendMessage(assistant);
+
+    var second_user = try makeSlashTestUserMessage(allocator, "second prompt", 3);
+    defer session_manager_mod.deinitMessage(allocator, &second_user);
+    const second_user_id = try session.session_manager.appendMessage(second_user);
+    const second_user_id_copy = try allocator.dupe(u8, second_user_id);
+    defer allocator.free(second_user_id_copy);
+
+    var app_state = try AppState.init(allocator, std.testing.io);
+    defer app_state.deinit();
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+
+    try loadForkOverlayOrStatus(allocator, &session, &app_state, &overlay);
+    try std.testing.expectEqual(@as(std.meta.Tag(SelectorOverlay), .fork), std.meta.activeTag(overlay.?));
+    try std.testing.expectEqual(@as(usize, 2), overlay.?.fork.choices.len);
+    try std.testing.expectEqualStrings("second prompt", overlay.?.fork.choices[1].text);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    const subscriber = agent.AgentSubscriber{ .callback = ignoreSlashTestAgentEvent };
+    try forkCurrentSessionBeforeUserMessage(
+        allocator,
+        std.testing.io,
+        &session,
+        &current_provider,
+        session_dir,
+        &.{},
+        second_user_id_copy,
+        &app_state,
+        &editor,
+        subscriber,
+    );
+
+    try std.testing.expectEqualStrings("second prompt", editor.text());
+    try std.testing.expectEqualStrings(original_session_file, session.session_manager.header.parent_session.?);
+    try std.testing.expect(session.session_manager.getSessionFile() != null);
+    try std.testing.expect(!std.mem.eql(u8, original_session_file, session.session_manager.getSessionFile().?));
+
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("first prompt", messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("first reply", messages[1].assistant.content[0].text.text);
+
+    var reopened = try session_mod.AgentSession.open(allocator, std.testing.io, .{
+        .session_file = session.session_manager.getSessionFile().?,
+        .cwd_override = tmp_root,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings(original_session_file, reopened.session_manager.header.parent_session.?);
+    try std.testing.expectEqual(@as(usize, 2), reopened.agent.getMessages().len);
+}
+
+test "fork selector reports empty history without opening overlay" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var app_state = try AppState.init(allocator, std.testing.io);
+    defer app_state.deinit();
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+
+    try loadForkOverlayOrStatus(allocator, &session, &app_state, &overlay);
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqualStrings("No messages to fork from", app_state.status);
+}
+
+fn makeSlashTestTempPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: ?[]const u8) ![]u8 {
+    const relative_path = if (name) |value|
+        try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path, value })
+    else
+        try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_path);
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn makeSlashTestUserMessage(allocator: std.mem.Allocator, text: []const u8, timestamp: i64) !agent.AgentMessage {
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    return .{ .user = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = blocks,
+        .timestamp = timestamp,
+    } };
+}
+
+fn makeSlashTestAssistantMessage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    model: ai.Model,
+    timestamp: i64,
+) !agent.AgentMessage {
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    return .{ .assistant = .{
+        .role = try allocator.dupe(u8, "assistant"),
+        .content = blocks,
+        .tool_calls = null,
+        .api = try allocator.dupe(u8, model.api),
+        .provider = try allocator.dupe(u8, model.provider),
+        .model = try allocator.dupe(u8, model.id),
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = timestamp,
+    } };
 }
 
 test "switchModel shows provider-specific setup guidance when auth is missing" {

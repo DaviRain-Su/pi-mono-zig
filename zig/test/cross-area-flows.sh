@@ -80,6 +80,54 @@ if messages != expected:
 PY
 }
 
+assert_no_messages() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+session_path = sys.argv[1]
+messages = []
+with open(session_path, "r", encoding="utf-8") as handle:
+    for raw_line in handle:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        entry = json.loads(raw_line)
+        if entry.get("type") == "message":
+            messages.append(entry)
+
+if messages:
+    raise SystemExit(f"expected no message entries, found {len(messages)}")
+PY
+}
+
+assert_parent_session() {
+  python3 - "$1" "$2" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+session_path = sys.argv[1]
+expected_parent = str(Path(sys.argv[2]).resolve())
+
+with open(session_path, "r", encoding="utf-8") as handle:
+    for raw_line in handle:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        header = json.loads(raw_line)
+        if header.get("type") != "session":
+            raise SystemExit(f"expected session header, got {header!r}")
+        actual = header.get("parentSession")
+        actual_resolved = str(Path(actual).resolve()) if actual else actual
+        if actual_resolved != expected_parent:
+            raise SystemExit(f"unexpected parentSession: {actual!r} != {expected_parent!r}")
+        break
+    else:
+        raise SystemExit("missing session header")
+PY
+}
+
 assert_tool_entries() {
   python3 - "$1" "$2" <<'PY'
 import json
@@ -258,6 +306,96 @@ second_output="$(
 [[ "$second_output" == "second reply" ]]
 session_file="$(latest_session_file "$SESSION_PROJECT/.pi/sessions")"
 assert_messages_equal "$session_file" $'first prompt\nfirst reply\nsecond prompt\nsecond reply'
+
+log "VAL-CROSS-009 session lifecycle across new resume fork restart"
+make_case_dirs "lifecycle"
+LIFECYCLE_AGENT="$TMP_ROOT/lifecycle/agent"
+LIFECYCLE_HOME="$TMP_ROOT/lifecycle/home"
+LIFECYCLE_PROJECT="$TMP_ROOT/lifecycle/project"
+
+original_lifecycle_output="$(
+  cd "$LIFECYCLE_PROJECT"
+  env \
+    HOME="$LIFECYCLE_HOME" \
+    PI_CODING_AGENT_DIR="$LIFECYCLE_AGENT" \
+    PI_FAUX_RESPONSE="lifecycle reply" \
+    "$BIN_PATH" --provider faux --print "lifecycle original prompt"
+)"
+[[ "$original_lifecycle_output" == "lifecycle reply" ]]
+original_lifecycle_session="$(latest_session_file "$LIFECYCLE_PROJECT/.pi/sessions")"
+
+tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
+tuistory launch "$BIN_PATH --provider faux --model faux-1 --session $original_lifecycle_session" \
+  -s "$INTERACTIVE_SESSION" \
+  --cwd "$LIFECYCLE_PROJECT" \
+  --cols 140 \
+  --rows 36 \
+  --env "HOME=$LIFECYCLE_HOME" \
+  --env "PI_CODING_AGENT_DIR=$LIFECYCLE_AGENT" \
+  --env "PI_FAUX_FORCE=1" \
+  --env "PI_FAUX_RESPONSE=lifecycle reply"
+tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle original prompt" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle reply" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" type "/new"
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" wait "New session started" --timeout 5000
+new_lifecycle_session="$(latest_session_file "$LIFECYCLE_PROJECT/.pi/sessions")"
+if [[ "$new_lifecycle_session" == "$original_lifecycle_session" ]]; then
+  echo "expected /new to create a different session file" >&2
+  exit 1
+fi
+tuistory -s "$INTERACTIVE_SESSION" type "/resume"
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" wait "Session selector" --timeout 5000
+tuistory -s "$INTERACTIVE_SESSION" press down
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle original prompt" --timeout 5000
+tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle reply" --timeout 5000
+tuistory -s "$INTERACTIVE_SESSION" type "/fork"
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" wait "Fork from Message" --timeout 5000
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" wait "Forked to new session" --timeout 5000
+fork_prompt_snapshot="$(tuistory -s "$INTERACTIVE_SESSION" snapshot --trim)"
+printf '%s\n' "$fork_prompt_snapshot" | grep -F "lifecycle original prompt" >/dev/null
+fork_lifecycle_session="$(latest_session_file "$LIFECYCLE_PROJECT/.pi/sessions")"
+if [[ "$fork_lifecycle_session" == "$original_lifecycle_session" || "$fork_lifecycle_session" == "$new_lifecycle_session" ]]; then
+  echo "expected /fork to create a different session file" >&2
+  exit 1
+fi
+tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
+
+assert_messages_equal "$original_lifecycle_session" $'lifecycle original prompt\nlifecycle reply'
+assert_parent_session "$fork_lifecycle_session" "$original_lifecycle_session"
+assert_no_messages "$fork_lifecycle_session"
+
+tuistory launch "$BIN_PATH --provider faux --model faux-1 --session $original_lifecycle_session" \
+  -s "$INTERACTIVE_SESSION" \
+  --cwd "$LIFECYCLE_PROJECT" \
+  --cols 140 \
+  --rows 36 \
+  --env "HOME=$LIFECYCLE_HOME" \
+  --env "PI_CODING_AGENT_DIR=$LIFECYCLE_AGENT" \
+  --env "PI_FAUX_FORCE=1" \
+  --env "PI_FAUX_RESPONSE=lifecycle restart original"
+tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle original prompt" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle reply" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
+
+tuistory launch "$BIN_PATH --provider faux --model faux-1 --session $fork_lifecycle_session" \
+  -s "$INTERACTIVE_SESSION" \
+  --cwd "$LIFECYCLE_PROJECT" \
+  --cols 140 \
+  --rows 36 \
+  --env "HOME=$LIFECYCLE_HOME" \
+  --env "PI_CODING_AGENT_DIR=$LIFECYCLE_AGENT" \
+  --env "PI_FAUX_FORCE=1" \
+  --env "PI_FAUX_RESPONSE=lifecycle restart fork"
+tuistory -s "$INTERACTIVE_SESSION" wait "Welcome to pi" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
 
 log "VAL-CROSS-004 interactive tool execution"
 make_case_dirs "interactive"

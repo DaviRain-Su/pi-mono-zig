@@ -2501,6 +2501,7 @@ pub const OverlayPanelComponent = struct {
                     .model => |*model_overlay| &model_overlay.list,
                     .theme => |*theme_overlay| &theme_overlay.list,
                     .tree => |*tree_overlay| &tree_overlay.list,
+                    .fork => |*fork_overlay| &fork_overlay.list,
                     .auth => |*auth_overlay| &auth_overlay.list,
                     else => unreachable,
                 };
@@ -2583,6 +2584,7 @@ pub const OverlayPanelComponent = struct {
                         .model => |*model_overlay| &model_overlay.list,
                         .theme => |*theme_overlay| &theme_overlay.list,
                         .tree => |*tree_overlay| &tree_overlay.list,
+                        .fork => |*fork_overlay| &fork_overlay.list,
                         .auth => |*auth_overlay| &auth_overlay.list,
                         else => unreachable,
                     };

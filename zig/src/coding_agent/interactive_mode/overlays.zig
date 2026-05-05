@@ -22,6 +22,7 @@ pub const SelectorOverlay = union(enum) {
     model: ModelOverlay,
     theme: ThemeOverlay,
     tree: TreeOverlay,
+    fork: ForkOverlay,
     auth: AuthOverlay,
 
     pub fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
@@ -32,6 +33,7 @@ pub const SelectorOverlay = union(enum) {
             .model => |*overlay| overlay.deinit(allocator),
             .theme => |*overlay| overlay.deinit(allocator),
             .tree => |*overlay| overlay.deinit(allocator),
+            .fork => |*overlay| overlay.deinit(allocator),
             .auth => |*overlay| overlay.deinit(allocator),
         }
         self.* = undefined;
@@ -45,6 +47,7 @@ pub const SelectorOverlay = union(enum) {
             .model => self.model.title,
             .theme => "Theme selector",
             .tree => "Session tree",
+            .fork => "Fork from Message",
             .auth => if (self.auth.mode == .login) "Login" else "Logout",
         };
     }
@@ -54,6 +57,7 @@ pub const SelectorOverlay = union(enum) {
             .info => self.info.hint,
             .settings_editor => self.settings_editor.hint,
             .model => self.model.hint,
+            .fork => "Up/Down move • Enter fork • Esc cancel",
             else => "Up/Down move • Enter select • Esc cancel",
         };
     }
@@ -177,6 +181,32 @@ pub const TreeOverlay = struct {
 
     pub fn deinit(self: *TreeOverlay, allocator: std.mem.Allocator) void {
         for (self.choices) |choice| allocator.free(choice.entry_id);
+        allocator.free(self.choices);
+        for (self.items) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+pub const ForkChoice = struct {
+    entry_id: []u8,
+    text: []u8,
+};
+
+pub const ForkOverlay = struct {
+    choices: []ForkChoice,
+    items: []tui.SelectItem,
+    list: tui.SelectList,
+
+    pub fn deinit(self: *ForkOverlay, allocator: std.mem.Allocator) void {
+        for (self.choices) |choice| {
+            allocator.free(choice.entry_id);
+            allocator.free(choice.text);
+        }
         allocator.free(self.choices);
         for (self.items) |item| {
             allocator.free(@constCast(item.value));
@@ -881,6 +911,80 @@ pub fn loadTreeOverlay(
                 .items = items,
                 .selected_index = selected_index,
                 .max_visible = 12,
+            },
+        },
+    };
+}
+
+pub fn loadForkOverlay(
+    allocator: std.mem.Allocator,
+    session: *const session_mod.AgentSession,
+) !SelectorOverlay {
+    var choice_list = std.ArrayList(ForkChoice).empty;
+    errdefer {
+        for (choice_list.items) |choice| {
+            allocator.free(choice.entry_id);
+            allocator.free(choice.text);
+        }
+        choice_list.deinit(allocator);
+    }
+
+    var item_list = std.ArrayList(tui.SelectItem).empty;
+    errdefer {
+        for (item_list.items) |item| {
+            allocator.free(item.value);
+            allocator.free(item.label);
+            if (item.description) |description| allocator.free(description);
+        }
+        item_list.deinit(allocator);
+    }
+
+    for (session.session_manager.getEntries()) |entry| {
+        if (entry != .message) continue;
+        if (entry.message.message != .user) continue;
+
+        const text = try blocksToText(allocator, entry.message.message.user.content);
+        defer allocator.free(text);
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        const label = try std.fmt.allocPrint(allocator, "{s}", .{trimSummaryText(trimmed)});
+        errdefer allocator.free(label);
+        const description = try std.fmt.allocPrint(allocator, "Message {d} of forkable history", .{choice_list.items.len + 1});
+        errdefer allocator.free(description);
+
+        try choice_list.append(allocator, .{
+            .entry_id = try allocator.dupe(u8, entry.message.id),
+            .text = try allocator.dupe(u8, trimmed),
+        });
+        try item_list.append(allocator, .{
+            .value = try allocator.dupe(u8, entry.message.id),
+            .label = label,
+            .description = description,
+        });
+    }
+
+    if (choice_list.items.len == 0) return error.NoMessagesToFork;
+
+    const choices = try choice_list.toOwnedSlice(allocator);
+    errdefer {
+        for (choices) |choice| {
+            allocator.free(choice.entry_id);
+            allocator.free(choice.text);
+        }
+        allocator.free(choices);
+    }
+    const items = try item_list.toOwnedSlice(allocator);
+    errdefer freeOwnedSelectItems(allocator, items);
+
+    return .{
+        .fork = .{
+            .choices = choices,
+            .items = items,
+            .list = .{
+                .items = items,
+                .selected_index = items.len - 1,
+                .max_visible = 10,
             },
         },
     };

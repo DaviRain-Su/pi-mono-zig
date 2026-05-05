@@ -28,7 +28,8 @@ const saveSettingsEditorOverlay = slash_commands.saveSettingsEditorOverlay;
 const switchSession = slash_commands.switchSession;
 const switchModel = slash_commands.switchModel;
 const handleNewSlashCommand = slash_commands.handleNewSlashCommand;
-const forkCurrentSession = slash_commands.forkCurrentSession;
+const loadForkOverlayOrStatus = slash_commands.loadForkOverlayOrStatus;
+const forkCurrentSessionBeforeUserMessage = slash_commands.forkCurrentSessionBeforeUserMessage;
 const applyThemeByName = slash_commands.applyThemeByName;
 const navigateTree = slash_commands.navigateTree;
 const beginLoginFlow = slash_commands.beginLoginFlow;
@@ -159,6 +160,7 @@ pub fn handleInputKeyWithModifiers(
             .model => &overlay_value.model.list,
             .theme => &overlay_value.theme.list,
             .tree => &overlay_value.tree.list,
+            .fork => &overlay_value.fork.list,
             .auth => &overlay_value.auth.list,
             else => unreachable,
         };
@@ -232,6 +234,24 @@ pub fn handleInputKeyWithModifiers(
                             try app_state.setStatus("No tree entries available");
                         } else {
                             try navigateTree(session, tree_overlay.choices[index].entry_id, app_state);
+                        }
+                    },
+                    .fork => |fork_overlay| {
+                        if (fork_overlay.choices[index].entry_id.len == 0) {
+                            try app_state.setStatus("No messages to fork from");
+                        } else {
+                            try forkCurrentSessionBeforeUserMessage(
+                                allocator,
+                                io,
+                                session,
+                                current_provider,
+                                session_dir,
+                                tool_items,
+                                fork_overlay.choices[index].entry_id,
+                                app_state,
+                                editor,
+                                subscriber,
+                            );
                         }
                     },
                     .auth => |auth_overlay| switch (auth_overlay.mode) {
@@ -1170,16 +1190,7 @@ pub fn handleAppAction(
                 try app_state.setStatus("wait for the current response to finish before forking the session");
                 return;
             }
-            try forkCurrentSession(
-                allocator,
-                io,
-                session,
-                current_provider,
-                session_dir,
-                tool_items,
-                app_state,
-                subscriber,
-            );
+            try loadForkOverlayOrStatus(allocator, session, app_state, overlay);
         },
         .session_resume => {
             if (prompt_worker_active.*) {
