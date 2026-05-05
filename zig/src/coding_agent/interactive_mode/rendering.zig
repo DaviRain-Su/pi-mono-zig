@@ -175,6 +175,8 @@ pub const AppState = struct {
     extension_footer_statuses: std.StringHashMap([]u8),
     working_message: []u8 = &.{},
     working_visible: bool = true,
+    terminal_progress_active: bool = false,
+    terminal_progress_dirty: bool = false,
     clipboard_paste: clipboard_paste_task.ClipboardPasteTask,
     user_bash_task: user_bash_task_mod.UserBashTask = .{},
     scoped_model_override_active: bool = false,
@@ -649,6 +651,87 @@ pub const AppState = struct {
         self.working_visible = visible;
     }
 
+    pub fn takeTerminalProgressUpdate(self: *AppState) ?bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.terminal_progress_dirty) return null;
+        self.terminal_progress_dirty = false;
+        return self.terminal_progress_active;
+    }
+
+    pub fn markTerminalProgress(self: *AppState, active: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.markTerminalProgressLocked(active);
+    }
+
+    pub fn handleRetryLifecycleEvent(self: *AppState, event: session_mod.RetryLifecycleEvent) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.markTerminalProgressLocked(false);
+        switch (event) {
+            .start => |start| {
+                const seconds = (start.delay_ms + 999) / 1000;
+                const status_text = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Retrying ({d}/{d}) in {d}s... (Ctrl+C to cancel)",
+                    .{ start.attempt, start.max_attempts, seconds },
+                );
+                defer self.allocator.free(status_text);
+                try self.replaceLabelLocked(&self.status, status_text);
+            },
+            .end => |end| {
+                if (end.success) {
+                    try self.replaceLabelLocked(&self.status, "retry succeeded");
+                } else {
+                    const status_text = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Retry failed after {d} attempts: {s}",
+                        .{ end.attempt, end.final_error orelse "Unknown error" },
+                    );
+                    defer self.allocator.free(status_text);
+                    try self.replaceLabelLocked(&self.status, status_text);
+                }
+            },
+        }
+    }
+
+    pub fn handleCompactionLifecycleEvent(self: *AppState, event: session_mod.CompactionLifecycleEvent) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        switch (event) {
+            .start => |start| {
+                self.markTerminalProgressLocked(true);
+                const label = switch (start.reason) {
+                    .manual => "Compacting context... (Ctrl+C to cancel)",
+                    .threshold => "Auto-compacting... (Ctrl+C to cancel)",
+                    .overflow => "Context overflow detected, auto-compacting... (Ctrl+C to cancel)",
+                };
+                try self.replaceLabelLocked(&self.status, label);
+            },
+            .end => |end| {
+                self.markTerminalProgressLocked(false);
+                if (end.aborted) {
+                    try self.replaceLabelLocked(&self.status, if (end.reason == .manual) "Compaction cancelled" else "Auto-compaction cancelled");
+                } else if (end.error_message) |message| {
+                    try self.replaceLabelLocked(&self.status, message);
+                } else if (end.result) |result| {
+                    const status_text = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Compacted context ({d} tokens)",
+                        .{result.tokens_before},
+                    );
+                    defer self.allocator.free(status_text);
+                    try self.replaceLabelLocked(&self.status, status_text);
+                } else {
+                    try self.replaceLabelLocked(&self.status, "compaction finished");
+                }
+            },
+        }
+    }
+
     pub fn clearExtensionUiHooks(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -840,6 +923,8 @@ pub const AppState = struct {
         self.clearActiveToolUpdatesLocked();
         self.clearStreamingToolCallsLocked();
         self.clearQueuedMessagesLocked();
+        self.clearExtensionUiHooksLocked();
+        self.markTerminalProgressLocked(false);
 
         try self.replaceLabelLocked(&self.status, "idle");
         try self.replaceLabelLocked(&self.model_label, session.agent.getModel().id);
@@ -898,8 +983,12 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
 
         switch (event.event_type) {
-            .agent_start => try self.replaceLabelLocked(&self.status, "thinking"),
+            .agent_start => {
+                self.markTerminalProgressLocked(true);
+                try self.replaceLabelLocked(&self.status, "thinking");
+            },
             .agent_end => {
+                self.markTerminalProgressLocked(false);
                 if (std.mem.eql(u8, self.status, "streaming") or
                     std.mem.eql(u8, self.status, "thinking") or
                     std.mem.eql(u8, self.status, "working") or
@@ -910,6 +999,15 @@ pub const AppState = struct {
             },
             .message_start => {
                 if (event.message) |message| switch (message) {
+                    .user => |user_message| {
+                        self.removeQueuedMessageLocked(userMessageText(user_message));
+                        const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
+                        defer self.allocator.free(rendered);
+                        try self.appendItemLocked(.user, rendered);
+                        if (std.mem.eql(u8, self.status, "thinking")) {
+                            try self.ensureAssistantThinkingItemLocked();
+                        }
+                    },
                     .assistant => |assistant_message| {
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                         try self.replaceLabelLocked(&self.status, "thinking");
@@ -994,15 +1092,7 @@ pub const AppState = struct {
             },
             .message_end => {
                 if (event.message) |message| switch (message) {
-                    .user => |user_message| {
-                        self.removeQueuedMessageLocked(userMessageText(user_message));
-                        const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
-                        defer self.allocator.free(rendered);
-                        try self.appendItemLocked(.user, rendered);
-                        if (std.mem.eql(u8, self.status, "thinking")) {
-                            try self.ensureAssistantThinkingItemLocked();
-                        }
-                    },
+                    .user => {},
                     .assistant => |assistant_message| {
                         self.addUsageLocked(assistant_message.usage);
                         self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
@@ -1634,6 +1724,14 @@ pub const AppState = struct {
     fn removeQueuedMessageLocked(self: *AppState, text: []const u8) void {
         if (removeQueuedTextFromList(self.allocator, &self.queued_steering, text)) return;
         _ = removeQueuedTextFromList(self.allocator, &self.queued_follow_up, text);
+    }
+
+    fn markTerminalProgressLocked(self: *AppState, active: bool) void {
+        if (self.terminal_progress_active == active and self.terminal_progress_dirty) return;
+        if (self.terminal_progress_active != active or !self.terminal_progress_dirty) {
+            self.terminal_progress_active = active;
+            self.terminal_progress_dirty = true;
+        }
     }
 };
 
@@ -3063,6 +3161,16 @@ pub fn handleAppAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void 
     try app_state.handleAgentEvent(event);
 }
 
+pub fn handleAppRetryLifecycleEvent(context: ?*anyopaque, event: session_mod.RetryLifecycleEvent) !void {
+    const app_state: *AppState = @ptrCast(@alignCast(context.?));
+    try app_state.handleRetryLifecycleEvent(event);
+}
+
+pub fn handleAppCompactionLifecycleEvent(context: ?*anyopaque, event: session_mod.CompactionLifecycleEvent) !void {
+    const app_state: *AppState = @ptrCast(@alignCast(context.?));
+    try app_state.handleCompactionLifecycleEvent(event);
+}
+
 fn removeQueuedTextFromList(
     allocator: std.mem.Allocator,
     items: *std.ArrayList([]u8),
@@ -3551,6 +3659,14 @@ pub fn renderedLinesContain(lines: []const []const u8, needle: []const u8) bool 
         if (std.mem.indexOf(u8, line, needle) != null) return true;
     }
     return false;
+}
+
+fn countChatKind(items: []const ChatItem, kind: ChatKind) usize {
+    var count: usize = 0;
+    for (items) |item| {
+        if (item.kind == kind) count += 1;
+    }
+    return count;
 }
 
 test "chat scroll wheel updates offset only inside chat region and clamps" {
@@ -4242,6 +4358,119 @@ test "extension UI hooks render widgets editor footer and status lifecycle" {
     try std.testing.expectEqual(@as(usize, 1), cleared.extension_widgets.len);
     try std.testing.expectEqual(@as(?[]u8, null), cleared.extension_editor_label);
     try std.testing.expectEqual(@as(usize, 0), cleared.extension_footer_lines.len);
+}
+
+test "agent message_start synchronizes queued display before rendering user message" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.appendQueuedMessage(.steering, "queued steer");
+
+    const blocks = [_]ai.ContentBlock{.{ .text = .{ .text = "queued steer" } }};
+    const user_message = ai.UserMessage{
+        .role = "user",
+        .content = &blocks,
+        .timestamp = 1,
+    };
+    try state.handleAgentEvent(.{
+        .event_type = .message_start,
+        .message = .{ .user = user_message },
+    });
+
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqual(@as(usize, 0), state.queued_steering.items.len);
+    try std.testing.expectEqualStrings("You: queued steer", state.items.items[state.items.items.len - 1].text);
+    const user_count_after_start = countChatKind(state.items.items, .user);
+    state.mutex.unlock(state.io);
+
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .user = user_message },
+    });
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqual(user_count_after_start, countChatKind(state.items.items, .user));
+}
+
+test "session rebuild clears stale streaming queue extension and progress state" {
+    const allocator = std.testing.allocator;
+
+    var registry = extension_registry.Registry.init(allocator);
+    defer registry.deinit();
+    const frames =
+        \\{ "type": "set_header", "lines": ["stale header"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_footer", "lines": ["stale footer"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_editor_component", "label": "StaleEditor", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "stale", "lines": ["stale widget"], "placement": "aboveEditor", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    _ = try extension_registry.applyHostFrameStream(&registry, frames);
+
+    const model = ai.model_registry.find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .model = model,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.applyExtensionRegistryUi(&registry);
+    try state.setExtensionFooterStatus("stale", "status");
+    try state.appendQueuedMessage(.follow_up, "queued draft");
+    try state.appendMarkdown("stale streaming text");
+    state.markTerminalProgress(true);
+
+    try state.rebuildFromSession(&session, null);
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.queued_follow_up.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.extension_header_lines.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.extension_footer_lines.len);
+    try std.testing.expectEqual(@as(?[]u8, null), snapshot.extension_editor_label);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.extension_widgets.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.extension_footer_statuses.len);
+    try std.testing.expectEqual(false, state.takeTerminalProgressUpdate().?);
+}
+
+test "compaction and retry lifecycle update status and terminal progress state" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try state.handleCompactionLifecycleEvent(.{ .start = .{ .reason = .threshold } });
+    try std.testing.expectEqual(true, state.takeTerminalProgressUpdate().?);
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqualStrings("Auto-compacting... (Ctrl+C to cancel)", state.status);
+    state.mutex.unlock(state.io);
+
+    try state.handleCompactionLifecycleEvent(.{ .end = .{
+        .reason = .threshold,
+        .result = .{
+            .summary = "summary",
+            .first_kept_entry_id = "entry-1",
+            .tokens_before = 42,
+        },
+    } });
+    try std.testing.expectEqual(false, state.takeTerminalProgressUpdate().?);
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqualStrings("Compacted context (42 tokens)", state.status);
+    state.mutex.unlock(state.io);
+
+    try state.handleRetryLifecycleEvent(.{ .start = .{
+        .attempt = 1,
+        .max_attempts = 2,
+        .delay_ms = 1500,
+        .error_message = "rate limit",
+    } });
+    try std.testing.expectEqual(false, state.takeTerminalProgressUpdate().?);
+    state.mutex.lockUncancelable(state.io);
+    try std.testing.expectEqualStrings("Retrying (1/2) in 2s... (Ctrl+C to cancel)", state.status);
+    state.mutex.unlock(state.io);
 }
 
 test "extension widgets replace by key and truncate after ten lines" {

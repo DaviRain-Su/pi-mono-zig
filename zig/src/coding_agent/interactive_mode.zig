@@ -117,6 +117,8 @@ pub const renderAssistantChatItemInto = rendering.renderAssistantChatItemInto;
 pub const applyThemeAlloc = rendering.applyThemeAlloc;
 pub const fitLine = rendering.fitLine;
 pub const handleAppAgentEvent = rendering.handleAppAgentEvent;
+pub const handleAppRetryLifecycleEvent = rendering.handleAppRetryLifecycleEvent;
+pub const handleAppCompactionLifecycleEvent = rendering.handleAppCompactionLifecycleEvent;
 pub const InteractiveModeTestBackend = rendering.InteractiveModeTestBackend;
 pub const renderScreenWithMockBackend = rendering.renderScreenWithMockBackend;
 pub const renderScreenWithMockBackendAndOverlay = rendering.renderScreenWithMockBackendAndOverlay;
@@ -253,6 +255,8 @@ pub fn runInteractiveMode(
     };
     try bootstrap.session.agent.subscribe(subscriber);
     defer _ = bootstrap.session.agent.unsubscribe(subscriber);
+    installSessionUiCallbacks(&bootstrap.session, &app_state);
+    defer clearSessionUiCallbacks(&bootstrap.session);
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
     if (live_resources.runtime_config) |runtime_config| {
@@ -276,6 +280,12 @@ pub fn runInteractiveMode(
     });
     try terminal.start();
     defer terminal.stop();
+    var last_terminal_title: ?[]u8 = null;
+    defer if (last_terminal_title) |title| allocator.free(title);
+    try updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
+    defer if (showTerminalProgress(live_resources.runtime_config)) {
+        writeTerminalProgress(&terminal, false) catch {};
+    };
 
     var input_loop = try terminal.initInputLoop(allocator, io, env_map);
     defer input_loop.deinit();
@@ -348,6 +358,7 @@ pub fn runInteractiveMode(
             prompt_worker_active = false;
             if (should_exit) break;
         }
+        installSessionUiCallbacks(&bootstrap.session, &app_state);
         _ = app_state.pollBashExecution(allocator);
 
         try app_state.pollClipboardPaste(.{
@@ -371,6 +382,13 @@ pub fn runInteractiveMode(
             &bootstrap.session,
             now_ms,
         );
+
+        if (app_state.takeTerminalProgressUpdate()) |active| {
+            if (showTerminalProgress(live_resources.runtime_config)) {
+                try writeTerminalProgress(&terminal, active);
+            }
+        }
+        try updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
 
         const size = try terminal.refreshSize();
         screen.height = size.height;
@@ -453,6 +471,55 @@ pub fn runInteractiveMode(
     }
 
     return 0;
+}
+
+fn installSessionUiCallbacks(session: *session_mod.AgentSession, app_state: *AppState) void {
+    session.setRetryLifecycleCallback(.{
+        .context = app_state,
+        .callback = handleAppRetryLifecycleEvent,
+    });
+    session.setCompactionLifecycleCallback(.{
+        .context = app_state,
+        .callback = handleAppCompactionLifecycleEvent,
+    });
+}
+
+fn clearSessionUiCallbacks(session: *session_mod.AgentSession) void {
+    session.clearRetryLifecycleCallback();
+    session.clearCompactionLifecycleCallback();
+}
+
+fn showTerminalProgress(runtime_config: ?*const config_mod.RuntimeConfig) bool {
+    return if (runtime_config) |config| config.showTerminalProgress() else false;
+}
+
+fn writeTerminalProgress(terminal: *tui.Terminal, active: bool) !void {
+    try terminal.write(if (active) "\x1b]9;4;3\x07" else "\x1b]9;4;0;\x07");
+}
+
+fn updateInteractiveTerminalTitle(
+    allocator: std.mem.Allocator,
+    terminal: *tui.Terminal,
+    session: *const session_mod.AgentSession,
+    last_title: *?[]u8,
+) !void {
+    const cwd_basename = std.fs.path.basename(session.cwd);
+    const title = if (session.session_manager.getSessionName()) |name|
+        try std.fmt.allocPrint(allocator, "pi - {s} - {s}", .{ name, cwd_basename })
+    else
+        try std.fmt.allocPrint(allocator, "pi - {s}", .{cwd_basename});
+    defer allocator.free(title);
+
+    if (last_title.*) |existing| {
+        if (std.mem.eql(u8, existing, title)) return;
+        allocator.free(existing);
+        last_title.* = null;
+    }
+
+    const sequence = try std.fmt.allocPrint(allocator, "\x1b]0;{s}\x07", .{title});
+    defer allocator.free(sequence);
+    try terminal.write(sequence);
+    last_title.* = try allocator.dupe(u8, title);
 }
 
 fn suspendInteractiveTerminal(
@@ -796,7 +863,7 @@ test "screen renders welcome prompt footer and tool lines" {
     const args_object = std.json.Value{ .object = args_map };
     defer common.deinitJsonValue(allocator, args_object);
     try state.handleAgentEvent(.{
-        .event_type = .message_end,
+        .event_type = .message_start,
         .message = .{ .user = .{
             .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }},
             .timestamp = 1,
@@ -873,6 +940,43 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
     try std.testing.expect(renderedLinesContain(lines.items, "⏎ send"));
     try std.testing.expect(renderedLinesContain(lines.items, "Alt+⏎ queue"));
+}
+
+test "terminal title and progress helpers emit TS control sequences without duplicates" {
+    const allocator = std.testing.allocator;
+
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 24 } };
+    defer backend.deinit(allocator);
+
+    var terminal = tui.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .model = ai.model_registry.find("faux", "faux-1").?,
+    });
+    defer session.deinit();
+
+    var last_title: ?[]u8 = null;
+    defer if (last_title) |title| allocator.free(title);
+
+    try updateInteractiveTerminalTitle(allocator, &terminal, &session, &last_title);
+    try updateInteractiveTerminalTitle(allocator, &terminal, &session, &last_title);
+    try writeTerminalProgress(&terminal, true);
+    try writeTerminalProgress(&terminal, false);
+
+    var title_count: usize = 0;
+    var active_progress = false;
+    var cleared_progress = false;
+    for (backend.writes.items) |write| {
+        if (std.mem.eql(u8, write, "\x1b]0;pi - project\x07")) title_count += 1;
+        if (std.mem.eql(u8, write, "\x1b]9;4;3\x07")) active_progress = true;
+        if (std.mem.eql(u8, write, "\x1b]9;4;0;\x07")) cleared_progress = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), title_count);
+    try std.testing.expect(active_progress);
+    try std.testing.expect(cleared_progress);
 }
 
 test "appendVerboseStartupState adds startup banner and scoped model listing" {
@@ -1048,7 +1152,7 @@ test "interactive mode renders submitted user messages through a mock backend" {
     defer state.deinit();
     try state.setFooter("faux-1", "session.jsonl");
     try state.handleAgentEvent(.{
-        .event_type = .message_end,
+        .event_type = .message_start,
         .message = .{ .user = .{
             .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello from interactive mode" } }},
             .timestamp = 1,
@@ -1084,7 +1188,7 @@ test "interactive mode renders streaming assistant updates through a mock backen
         .event_type = .agent_start,
     });
     try state.handleAgentEvent(.{
-        .event_type = .message_start,
+        .event_type = .message_end,
         .message = .{ .assistant = .{
             .content = &[_]ai.ContentBlock{},
             .tool_calls = null,
@@ -1139,7 +1243,7 @@ test "interactive mode renders thinking placeholder before assistant text" {
 
     try state.handleAgentEvent(.{ .event_type = .agent_start });
     try state.handleAgentEvent(.{
-        .event_type = .message_end,
+        .event_type = .message_start,
         .message = .{ .user = .{
             .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello" } }},
             .timestamp = 1,
@@ -1300,7 +1404,7 @@ test "screen renders assistant markdown while keeping user messages plain" {
     try state.setFooter("faux-1", "session.jsonl");
 
     try state.handleAgentEvent(.{
-        .event_type = .message_end,
+        .event_type = .message_start,
         .message = .{ .user = .{
             .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "literal **stars** [plain](https://example.com)" } }},
             .timestamp = 1,
@@ -1483,7 +1587,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
     defer state.deinit();
     try state.setFooter("faux-1", "session.jsonl");
     try state.handleAgentEvent(.{
-        .event_type = .message_end,
+        .event_type = .message_start,
         .message = .{ .user = .{
             .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "keep me?" } }},
             .timestamp = 1,

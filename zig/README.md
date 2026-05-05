@@ -24,9 +24,16 @@ The binary is installed to `zig-out/bin/pi`.
 
 ## Run
 
+The interactive TUI is the default when no print flag is used. Run it from a
+real terminal so keybindings, selectors, slash commands, and terminal rendering
+can be validated.
+
 ```bash
 # Interactive mode
 ./zig-out/bin/pi
+
+# Local TUI smoke run with the faux provider
+./zig-out/bin/pi --provider faux
 
 # Print mode
 ./zig-out/bin/pi -p "your prompt"
@@ -50,6 +57,14 @@ zig build run             # Build and run
 ```bash
 cd zig
 zig build test           # Run unit tests
+
+# TUI-focused tests
+zig build test-tui
+
+# Terminal integration tests (require tuistory on PATH)
+zig build test-cross-area
+zig build test-vaxis-m8-e2e
+zig build test-missing-cwd-selector
 
 # Run specific parity tests
 zig build test-ts-rpc-parity

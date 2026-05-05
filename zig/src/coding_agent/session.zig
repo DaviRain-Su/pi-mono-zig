@@ -34,6 +34,30 @@ pub const RetryLifecycleCallback = struct {
     callback: *const fn (context: ?*anyopaque, event: RetryLifecycleEvent) anyerror!void,
 };
 
+pub const CompactionReason = enum {
+    manual,
+    threshold,
+    overflow,
+};
+
+pub const CompactionLifecycleEvent = union(enum) {
+    start: struct {
+        reason: CompactionReason,
+    },
+    end: struct {
+        reason: CompactionReason,
+        result: ?CompactionResult = null,
+        aborted: bool = false,
+        will_retry: bool = false,
+        error_message: ?[]const u8 = null,
+    },
+};
+
+pub const CompactionLifecycleCallback = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (context: ?*anyopaque, event: CompactionLifecycleEvent) anyerror!void,
+};
+
 pub const CompactionResult = struct {
     summary: []const u8,
     first_kept_entry_id: []const u8,
@@ -85,6 +109,7 @@ pub const AgentSession = struct {
     retry_settings: RetrySettings,
     retry_attempt: u32,
     retry_lifecycle_callback: ?RetryLifecycleCallback,
+    compaction_lifecycle_callback: ?CompactionLifecycleCallback,
     retry_abort_requested: std.atomic.Value(bool),
     retry_delay_active: std.atomic.Value(bool),
     overflow_recovery_attempted: bool,
@@ -273,7 +298,7 @@ pub const AgentSession = struct {
     }
 
     pub fn compact(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
-        return try self.runCompaction(custom_instructions);
+        return try self.runCompactionWithLifecycle(.manual, custom_instructions, false);
     }
 
     pub fn setRetryLifecycleCallback(self: *AgentSession, callback: RetryLifecycleCallback) void {
@@ -282,6 +307,14 @@ pub const AgentSession = struct {
 
     pub fn clearRetryLifecycleCallback(self: *AgentSession) void {
         self.retry_lifecycle_callback = null;
+    }
+
+    pub fn setCompactionLifecycleCallback(self: *AgentSession, callback: CompactionLifecycleCallback) void {
+        self.compaction_lifecycle_callback = callback;
+    }
+
+    pub fn clearCompactionLifecycleCallback(self: *AgentSession) void {
+        self.compaction_lifecycle_callback = null;
     }
 
     pub fn abortRetry(self: *AgentSession) void {
@@ -405,7 +438,7 @@ pub const AgentSession = struct {
 
         self.overflow_recovery_attempted = true;
         _ = removeLastAssistantError(self);
-        _ = try self.runCompaction(null);
+        _ = try self.runCompactionWithLifecycle(.overflow, null, true);
         try self.agent.continueRun();
         return true;
     }
@@ -416,7 +449,7 @@ pub const AgentSession = struct {
         const context_window = self.agent.getModel().context_window;
         if (context_window == 0) return false;
         if (!shouldAutoCompact(estimateContextTokens(self.agent.getMessages()), context_window, self.compaction_settings)) return false;
-        _ = self.runCompaction(null) catch |err| switch (err) {
+        _ = self.runCompactionWithLifecycle(.threshold, null, false) catch |err| switch (err) {
             error.NothingToCompact => return false,
             else => return err,
         };
@@ -473,6 +506,12 @@ pub const AgentSession = struct {
         }
     }
 
+    fn emitCompactionLifecycleEvent(self: *AgentSession, event: CompactionLifecycleEvent) !void {
+        if (self.compaction_lifecycle_callback) |callback| {
+            try callback.callback(callback.context, event);
+        }
+    }
+
     fn sleepRetryDelay(self: *AgentSession, delay_ms: u64) !bool {
         self.retry_abort_requested.store(false, .seq_cst);
         self.retry_delay_active.store(true, .seq_cst);
@@ -486,6 +525,33 @@ pub const AgentSession = struct {
             remaining -= step;
         }
         return !self.retry_abort_requested.load(.seq_cst);
+    }
+
+    fn runCompactionWithLifecycle(
+        self: *AgentSession,
+        reason: CompactionReason,
+        custom_instructions: ?[]const u8,
+        will_retry: bool,
+    ) !CompactionResult {
+        try self.emitCompactionLifecycleEvent(.{ .start = .{ .reason = reason } });
+        const result = self.runCompaction(custom_instructions) catch |err| {
+            try self.emitCompactionLifecycleEvent(.{ .end = .{
+                .reason = reason,
+                .result = null,
+                .aborted = false,
+                .will_retry = false,
+                .error_message = @errorName(err),
+            } });
+            return err;
+        };
+        try self.emitCompactionLifecycleEvent(.{ .end = .{
+            .reason = reason,
+            .result = result,
+            .aborted = false,
+            .will_retry = will_retry,
+            .error_message = null,
+        } });
+        return result;
     }
 
     fn runCompaction(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
@@ -575,6 +641,7 @@ pub const AgentSession = struct {
             .retry_settings = retry_settings,
             .retry_attempt = 0,
             .retry_lifecycle_callback = null,
+            .compaction_lifecycle_callback = null,
             .retry_abort_requested = std.atomic.Value(bool).init(false),
             .retry_delay_active = std.atomic.Value(bool).init(false),
             .overflow_recovery_attempted = false,

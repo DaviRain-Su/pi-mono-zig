@@ -1064,6 +1064,12 @@ pub fn submitEditorText(
     }
 
     if (parseSlashCommand(trimmed)) |command| {
+        if (selectorSlashBlockStatus(command.kind)) |status| {
+            if (selectorInteractionBlocked(session, prompt_worker_active)) {
+                try app_state.setStatus(status);
+                return;
+            }
+        }
         try handleSlashCommand(
             allocator,
             io,
@@ -1140,6 +1146,20 @@ pub fn submitEditorText(
     try editor.addToHistory(trimmed);
     clearEditor(app_state, editor);
     try app_state.setStatus("thinking");
+}
+
+fn selectorInteractionBlocked(session: *const session_mod.AgentSession, prompt_worker_active: *const bool) bool {
+    return prompt_worker_active.* or session.isStreaming() or session.isCompacting() or session.isRetrying();
+}
+
+fn selectorSlashBlockStatus(kind: slash_commands.SlashCommandKind) ?[]const u8 {
+    return switch (kind) {
+        .settings => "wait for the current response to finish before opening settings",
+        .model => "wait for the current response to finish before switching models",
+        .tree => "wait for the current response to finish before opening the session tree",
+        .@"resume" => "wait for the current response to finish before switching sessions",
+        else => null,
+    };
 }
 
 const BashShortcut = struct {
@@ -2207,7 +2227,7 @@ pub fn handleAppAction(
             );
         },
         .session_tree => {
-            if (prompt_worker_active.*) {
+            if (selectorInteractionBlocked(session, prompt_worker_active)) {
                 try app_state.setStatus("wait for the current response to finish before opening the session tree");
                 return;
             }
@@ -2221,14 +2241,14 @@ pub fn handleAppAction(
             try loadForkOverlayOrStatus(allocator, session, app_state, overlay);
         },
         .session_resume => {
-            if (prompt_worker_active.*) {
+            if (selectorInteractionBlocked(session, prompt_worker_active)) {
                 try app_state.setStatus("wait for the current response to finish before switching sessions");
                 return;
             }
             overlay.* = try loadSessionOverlay(allocator, io, session_dir, session.session_manager.getSessionFile());
         },
         .model_select => {
-            if (prompt_worker_active.*) {
+            if (selectorInteractionBlocked(session, prompt_worker_active)) {
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
@@ -3085,6 +3105,197 @@ test "settings command opens structured searchable rows and value changes persis
     defer allocator.free(settings_json);
     try std.testing.expect(std.mem.indexOf(u8, settings_json, "\"defaultProvider\": \"faux\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, settings_json, "\"editorPaddingX\": 1") != null);
+}
+
+test "idle selector cancellation preserves chat editor and metadata" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const agent_dir = try makeInputDispatchTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, agent_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+    try harness.env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &harness.env_map, cwd);
+    defer runtime.deinit();
+    harness.live_resources.runtime_config = &runtime;
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setBinding(.session_resume, &.{.{ .ctrl_alt = 'r' }});
+    try custom_keybindings.setBinding(.session_tree, &.{.{ .ctrl_alt = 't' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    try harness.state.appendInfo("chat marker before selectors");
+    _ = try harness.editor.handlePaste("draft before selector");
+
+    const initial_items_len = harness.state.items.items.len;
+    const initial_model_id = harness.session.agent.getModel().id;
+    const initial_provider = harness.session.agent.getModel().provider;
+    const initial_session_file = harness.session.session_manager.getSessionFile().?;
+    const SelectorTag = std.meta.Tag(SelectorOverlay);
+    const key_cases = [_]struct {
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+        tag: SelectorTag,
+    }{
+        .{ .key = .{ .ctrl = 'l' }, .modifiers = .{}, .tag = .model },
+        .{ .key = .{ .ctrl = 'r' }, .modifiers = .{ .alt = true }, .tag = .session },
+        .{ .key = .{ .ctrl = 't' }, .modifiers = .{ .alt = true }, .tag = .tree },
+    };
+
+    for (key_cases) |case| {
+        try harness.press(case.key, case.modifiers);
+        try std.testing.expect(harness.overlay != null);
+        try std.testing.expectEqual(case.tag, std.meta.activeTag(harness.overlay.?));
+        try harness.press(.escape, .{});
+        try std.testing.expect(harness.overlay == null);
+        try std.testing.expectEqualStrings("draft before selector", harness.editor.text());
+        try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+        try std.testing.expectEqualStrings(initial_provider, harness.session.agent.getModel().provider);
+        try std.testing.expectEqualStrings(initial_model_id, harness.session.agent.getModel().id);
+        try std.testing.expectEqualStrings(initial_session_file, harness.session.session_manager.getSessionFile().?);
+    }
+
+    try harness.submit("/settings");
+    try std.testing.expect(harness.overlay != null);
+    try std.testing.expectEqual(SelectorTag.settings, std.meta.activeTag(harness.overlay.?));
+    const settings_open_items_len = harness.state.items.items.len;
+    try harness.press(.escape, .{});
+    try std.testing.expect(harness.overlay == null);
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expectEqual(settings_open_items_len, harness.state.items.items.len);
+    try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+    try std.testing.expectEqualStrings(initial_provider, harness.session.agent.getModel().provider);
+    try std.testing.expectEqualStrings(initial_model_id, harness.session.agent.getModel().id);
+    try std.testing.expectEqualStrings(initial_session_file, harness.session.session_manager.getSessionFile().?);
+}
+
+test "active selector attempts preserve queued messages editor and chat" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const agent_dir = try makeInputDispatchTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, agent_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+    try harness.env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &harness.env_map, cwd);
+    defer runtime.deinit();
+    harness.live_resources.runtime_config = &runtime;
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setBinding(.session_resume, &.{.{ .ctrl_alt = 'r' }});
+    try custom_keybindings.setBinding(.session_tree, &.{.{ .ctrl_alt = 't' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    try harness.state.appendInfo("chat marker before blocked selectors");
+    try harness.session.steer("queued steering", &.{});
+    try harness.session.followUp("queued follow-up", &.{});
+    try harness.state.appendQueuedMessage(.steering, "queued steering");
+    try harness.state.appendQueuedMessage(.follow_up, "queued follow-up");
+
+    const initial_items_len = harness.state.items.items.len;
+    const initial_steering_len = harness.session.agent.steeringQueueLen();
+    const initial_follow_up_len = harness.session.agent.followUpQueueLen();
+    const initial_display_steering_len = harness.state.queued_steering.items.len;
+    const initial_display_follow_up_len = harness.state.queued_follow_up.items.len;
+
+    harness.session.agent.beginRun();
+    harness.prompt_worker_active = true;
+    _ = try harness.editor.handlePaste("draft during streaming");
+
+    const key_cases = [_]struct {
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+        status: []const u8,
+    }{
+        .{ .key = .{ .ctrl = 'l' }, .modifiers = .{}, .status = "wait for the current response to finish before switching models" },
+        .{ .key = .{ .ctrl = 'r' }, .modifiers = .{ .alt = true }, .status = "wait for the current response to finish before switching sessions" },
+        .{ .key = .{ .ctrl = 't' }, .modifiers = .{ .alt = true }, .status = "wait for the current response to finish before opening the session tree" },
+    };
+
+    for (key_cases) |case| {
+        try harness.press(case.key, case.modifiers);
+        try std.testing.expect(harness.overlay == null);
+        try std.testing.expectEqualStrings("draft during streaming", harness.editor.text());
+        try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+        try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
+        try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
+        try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
+        try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
+        try std.testing.expectEqualStrings(case.status, harness.state.status);
+    }
+
+    const slash_cases = [_]struct {
+        text: []const u8,
+        status: []const u8,
+    }{
+        .{ .text = "/model", .status = "wait for the current response to finish before switching models" },
+        .{ .text = "/resume", .status = "wait for the current response to finish before switching sessions" },
+        .{ .text = "/tree", .status = "wait for the current response to finish before opening the session tree" },
+        .{ .text = "/settings", .status = "wait for the current response to finish before opening settings" },
+    };
+
+    for (slash_cases) |case| {
+        try harness.submit(case.text);
+        try std.testing.expect(harness.overlay == null);
+        try std.testing.expectEqualStrings(case.text, harness.editor.text());
+        try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+        try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
+        try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
+        try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
+        try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
+        try std.testing.expectEqualStrings(case.status, harness.state.status);
+    }
+
+    harness.session.agent.finishRun();
+    harness.prompt_worker_active = false;
+    harness.session.compaction_active.store(true, .seq_cst);
+    defer harness.session.compaction_active.store(false, .seq_cst);
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("draft during compaction");
+    try harness.press(.{ .ctrl = 'l' }, .{});
+    try std.testing.expect(harness.overlay == null);
+    try std.testing.expectEqualStrings("draft during compaction", harness.editor.text());
+    try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+    try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
+    try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
+    try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
+    try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
+    try std.testing.expectEqualStrings("wait for the current response to finish before switching models", harness.state.status);
+
+    try harness.submit("/settings");
+    try std.testing.expect(harness.overlay == null);
+    try std.testing.expectEqualStrings("/settings", harness.editor.text());
+    try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+    try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
+    try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
+    try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
+    try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
+    try std.testing.expectEqualStrings("wait for the current response to finish before opening settings", harness.state.status);
 }
 
 test "external editor action replaces prompt on success and preserves on failure or missing editor" {
