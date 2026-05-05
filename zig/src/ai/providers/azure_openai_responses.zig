@@ -61,17 +61,28 @@ pub const AzureOpenAIResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        const deployment_name = resolveDeploymentName(allocator, model.id, options) catch |err| {
-            return emitProviderError(allocator, &stream_instance, model, err);
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
         };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
+        const deployment_name = try resolveDeploymentName(allocator, model.id, options);
         defer allocator.free(deployment_name);
 
         var request_model = model;
         request_model.id = deployment_name;
 
-        var payload = buildAzureRequestPayload(allocator, request_model, context, options) catch |err| {
-            return emitProviderError(allocator, &stream_instance, model, err);
-        };
+        var payload = try buildAzureRequestPayload(allocator, request_model, context, options);
         defer freeJsonValue(allocator, payload);
 
         if (options) |stream_options| {
@@ -86,24 +97,16 @@ pub const AzureOpenAIResponsesProvider = struct {
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
 
-        const base_url = resolveAzureBaseUrl(allocator, model, options) catch |err| {
-            return emitProviderError(allocator, &stream_instance, model, err);
-        };
+        const base_url = try resolveAzureBaseUrl(allocator, model, options);
         defer allocator.free(base_url);
 
-        const api_version = resolveAzureApiVersion(allocator, options) catch |err| {
-            return emitProviderError(allocator, &stream_instance, model, err);
-        };
+        const api_version = try resolveAzureApiVersion(allocator, options);
         defer if (api_version.owned) allocator.free(api_version.value);
 
-        const url = buildRequestUrl(allocator, base_url, api_version.value) catch |err| {
-            return emitProviderError(allocator, &stream_instance, model, err);
-        };
+        const url = try buildRequestUrl(allocator, base_url, api_version.value);
         defer allocator.free(url);
 
-        var headers = buildRequestHeaders(allocator, model, options) catch |err| {
-            return emitProviderError(allocator, &stream_instance, model, err);
-        };
+        var headers = try buildRequestHeaders(allocator, model, options);
         defer deinitOwnedHeaders(allocator, &headers);
 
         var client = try http_client.HttpClient.init(allocator, io);
@@ -134,12 +137,11 @@ pub const AzureOpenAIResponsesProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -152,6 +154,27 @@ pub const AzureOpenAIResponsesProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+}
 
 pub fn buildAzureRequestPayload(
     allocator: std.mem.Allocator,
@@ -1656,6 +1679,43 @@ test "stream forwards timeout_ms to HTTP streaming request" {
         }
     }
     try std.testing.expect(saw_timeout);
+}
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try AzureOpenAIResponsesProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("azure-openai-responses", event.message.?.api);
+    try std.testing.expectEqualStrings("azure-openai-responses", event.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-4.1", event.message.?.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(event.message.?.error_message.?.len > 0);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "stream HTTP status error is terminal sanitized event" {

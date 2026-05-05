@@ -147,7 +147,7 @@ pub const BedrockProvider = struct {
 
         streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => try emitSetupRuntimeFailure(allocator, &stream_instance, model, options, err),
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
         };
         return stream_instance;
     }
@@ -2324,22 +2324,23 @@ fn emitRuntimeFailure(
 }
 
 fn emitSetupRuntimeFailure(
-    allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     model: types.Model,
     options: ?types.StreamOptions,
     err: anyerror,
-) !void {
-    var output = initOutput(model);
-    var content_blocks = std.ArrayList(types.ContentBlock).empty;
-    defer content_blocks.deinit(allocator);
-    var tool_calls = std.ArrayList(types.ToolCall).empty;
-    defer tool_calls.deinit(allocator);
-    var active_blocks = std.ArrayList(BlockEntry).empty;
-    defer active_blocks.deinit(allocator);
-
+) void {
     const effective_err = if (isAbortRequested(options)) error.RequestAborted else err;
-    try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, effective_err);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = provider_error.runtimeErrorMessage(effective_err),
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 
 fn finalizeOutputSafely(

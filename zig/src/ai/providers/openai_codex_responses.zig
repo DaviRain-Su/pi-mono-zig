@@ -48,6 +48,21 @@ pub const OpenAICodexResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
+        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+        };
+        return stream_instance;
+    }
+
+    fn streamProduction(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+        stream_instance: *event_stream.AssistantMessageEventStream,
+    ) !void {
         var env_api_key: ?[]u8 = null;
         defer if (env_api_key) |key| allocator.free(key);
 
@@ -60,13 +75,15 @@ pub const OpenAICodexResponsesProvider = struct {
 
         if (api_key == null or std.mem.trim(u8, api_key.?, " \t\r\n").len == 0) {
             const error_message = try std.fmt.allocPrint(allocator, "No API key for provider: {s}", .{model.provider});
-            return emitErrorMessage(allocator, &stream_instance, model, error_message);
+            emitErrorMessage(stream_instance, model, error_message);
+            return;
         }
 
         const normalized_token = stripBearerPrefix(std.mem.trim(u8, api_key.?, " \t\r\n"));
         const account_id = extractAccountId(allocator, normalized_token) catch |err| {
             const error_message = try std.fmt.allocPrint(allocator, "Invalid Codex API key: {s}", .{@errorName(err)});
-            return emitErrorMessage(allocator, &stream_instance, model, error_message);
+            emitErrorMessage(stream_instance, model, error_message);
+            return;
         };
         defer allocator.free(account_id);
 
@@ -77,7 +94,8 @@ pub const OpenAICodexResponsesProvider = struct {
             if (stream_options.on_payload) |callback| {
                 const maybe_replacement = callback(allocator, payload, model) catch |err| {
                     const error_message = try std.fmt.allocPrint(allocator, "onPayload callback failed: {s}", .{@errorName(err)});
-                    return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                    emitErrorMessage(stream_instance, model, error_message);
+                    return;
                 };
                 if (maybe_replacement) |replacement| {
                     freeJsonValue(allocator, payload);
@@ -112,14 +130,16 @@ pub const OpenAICodexResponsesProvider = struct {
                 if (response.response_headers) |response_headers| {
                     callback(response.status, response_headers, model) catch |err| {
                         const error_message = try std.fmt.allocPrint(allocator, "onResponse callback failed: {s}", .{@errorName(err)});
-                        return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                        emitErrorMessage(stream_instance, model, error_message);
+                        return;
                     };
                 } else {
                     var response_headers = std.StringHashMap([]const u8).init(allocator);
                     defer response_headers.deinit();
                     callback(response.status, response_headers, model) catch |err| {
                         const error_message = try std.fmt.allocPrint(allocator, "onResponse callback failed: {s}", .{@errorName(err)});
-                        return emitErrorMessage(allocator, &stream_instance, model, error_message);
+                        emitErrorMessage(stream_instance, model, error_message);
+                        return;
                     };
                 }
             }
@@ -128,12 +148,11 @@ pub const OpenAICodexResponsesProvider = struct {
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
-            try provider_error.pushHttpStatusError(allocator, &stream_instance, model, response.status, response_body);
-            return stream_instance;
+            try provider_error.pushHttpStatusError(allocator, stream_instance, model, response.status, response_body);
+            return;
         }
 
-        try parseSseStreamLines(allocator, &stream_instance, &response, model, options);
-        return stream_instance;
+        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 
     pub fn streamSimple(
@@ -148,12 +167,10 @@ pub const OpenAICodexResponsesProvider = struct {
 };
 
 fn emitErrorMessage(
-    allocator: std.mem.Allocator,
     stream_instance: *event_stream.AssistantMessageEventStream,
     model: types.Model,
     error_message: []const u8,
-) !event_stream.AssistantMessageEventStream {
-    _ = allocator;
+) void {
     const message = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
         .api = model.api,
@@ -170,7 +187,27 @@ fn emitErrorMessage(
         .message = message,
     });
     stream_instance.end(message);
-    return stream_instance.*;
+}
+
+fn emitSetupRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    err: anyerror,
+) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = provider_error.runtimeStopReason(effective_err),
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 
 pub fn buildRequestPayload(
@@ -1757,6 +1794,47 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("openai-codex-responses", result.api);
+}
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "http://127.0.0.1:1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, context, .{ .api_key = api_key });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("openai-codex-responses", event.message.?.api);
+    try std.testing.expectEqualStrings("openai-codex", event.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-5.1-codex", event.message.?.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(event.message.?.error_message.?.len > 0);
+    try std.testing.expect(stream.next() == null);
 }
 
 fn buildTestCodexApiKey(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
