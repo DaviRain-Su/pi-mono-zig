@@ -936,9 +936,15 @@ test "M6 host protocol serializes deterministic Zig to host frames" {
 
 test "M6 host lifecycle starts once initializes becomes ready and shuts down" {
     const allocator = std.testing.allocator;
-    const capture_path = "/tmp/pi-m6-host-lifecycle-capture.jsonl";
-    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pi-m6-host-lifecycle-capture.jsonl",
+    });
+    defer allocator.free(capture_path);
 
     const script = try std.fmt.allocPrint(
         allocator,
@@ -1178,9 +1184,15 @@ test "M11 host process drains live register_* frames into observable runtime reg
 
 test "event_emission: sendExtensionEventFrame writes JSONL frames to host stdin" {
     const allocator = std.testing.allocator;
-    const capture_path = "/tmp/pi-event-emission-capture.jsonl";
-    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pi-event-emission-capture.jsonl",
+    });
+    defer allocator.free(capture_path);
 
     // Shell script host that captures every line written to its stdin after ready
     const script = try std.fmt.allocPrint(
@@ -1260,9 +1272,6 @@ test "event_emission: sendExtensionEventFrame writes JSONL frames to host stdin"
 
 test "event_emission: sendExtensionEventFrame does not write when shutdown is requested" {
     const allocator = std.testing.allocator;
-    const capture_path = "/tmp/pi-event-emission-shutdown-capture.jsonl";
-    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
-    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
 
     // Host that captures stdin and runs for a bit
     const script =

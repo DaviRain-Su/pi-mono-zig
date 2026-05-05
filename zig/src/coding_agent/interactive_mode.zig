@@ -5363,8 +5363,144 @@ test "handleCopySlashCommand copies the last assistant message to the clipboard"
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    try handleCopySlashCommand(allocator, std.testing.io, &session, &state);
+    try handleCopySlashCommand(allocator, std.testing.io, &session, &state, null);
     try std.testing.expectEqualStrings("copied reply", capture.text.?);
+}
+
+test "handleCopySlashCommand supports last all visible and invalid scopes" {
+    const allocator = std.testing.allocator;
+
+    var capture = ClipboardCapture{ .allocator = allocator };
+    defer capture.deinit();
+    const previous_context = slash_commands.clipboard_copy_context;
+    const previous_fn = slash_commands.clipboard_copy_fn;
+    slash_commands.clipboard_copy_context = &capture;
+    slash_commands.clipboard_copy_fn = captureClipboardText;
+    defer {
+        slash_commands.clipboard_copy_context = previous_context;
+        slash_commands.clipboard_copy_fn = previous_fn;
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var user = try makeInteractiveTestUserMessage("copy all prompt", 1);
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    var assistant = try makeInteractiveTestAssistantMessage("copy all reply", current_provider.model, ai.Usage.init(), 2);
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    var tool_result = agent.AgentMessage{ .tool_result = .{
+        .role = try allocator.dupe(u8, "toolResult"),
+        .tool_call_id = try allocator.dupe(u8, "tool-1"),
+        .tool_name = try allocator.dupe(u8, "read"),
+        .content = try common.makeTextContent(allocator, "tool output text"),
+        .is_error = false,
+        .details = null,
+        .timestamp = 3,
+    } };
+    defer session_manager_mod.deinitMessage(allocator, &tool_result);
+    _ = try session.session_manager.appendMessage(user);
+    _ = try session.session_manager.appendMessage(assistant);
+    _ = try session.session_manager.appendMessage(tool_result);
+    _ = try session.session_manager.appendCustomMessageEntry(
+        "bashExecution",
+        .{ .text = "Ran `printf bash-output`\n```\nbash-output\n```" },
+        true,
+        null,
+    );
+    try session.agent.setMessages(&.{ user, assistant, tool_result });
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try rebuildAppStateFromSession(allocator, std.testing.io, &state, &session, &current_provider);
+
+    try handleCopySlashCommand(allocator, std.testing.io, &session, &state, "last");
+    try std.testing.expectEqualStrings("copy all reply", capture.text.?);
+
+    try handleCopySlashCommand(allocator, std.testing.io, &session, &state, "all");
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "### User") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "copy all prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "### Assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "copy all reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "### Tool Result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "tool output text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "### Bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "bash-output") != null);
+
+    try rebuildAppStateFromSession(allocator, std.testing.io, &state, &session, &current_provider);
+    state.updateChatScrollLayout(100, 100, 0, 80);
+    try handleCopySlashCommand(allocator, std.testing.io, &session, &state, "visible");
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "copy all reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "Provider:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.text.?, "Status:") == null);
+
+    const before_invalid = try allocator.dupe(u8, capture.text.?);
+    defer allocator.free(before_invalid);
+    try handleCopySlashCommand(allocator, std.testing.io, &session, &state, "nonsense");
+    try std.testing.expectEqualStrings(before_invalid, capture.text.?);
+    try std.testing.expect(lastItemKindContains(&state, .@"error", "Usage: /copy [last|all|visible]"));
+}
+
+test "copyTextToClipboardWithFallback uses OSC52 then temp file" {
+    const allocator = std.testing.allocator;
+
+    const previous_context = slash_commands.clipboard_copy_context;
+    const previous_fn = slash_commands.clipboard_copy_fn;
+    slash_commands.clipboard_copy_context = null;
+    slash_commands.clipboard_copy_fn = failingClipboardText;
+    defer {
+        slash_commands.clipboard_copy_context = previous_context;
+        slash_commands.clipboard_copy_fn = previous_fn;
+    }
+
+    var osc_capture = ClipboardCapture{ .allocator = allocator };
+    defer osc_capture.deinit();
+    const previous_osc_context = slash_commands.osc52_write_context;
+    const previous_osc_fn = slash_commands.osc52_write_fn;
+    slash_commands.osc52_write_context = &osc_capture;
+    slash_commands.osc52_write_fn = captureClipboardText;
+    defer {
+        slash_commands.osc52_write_context = previous_osc_context;
+        slash_commands.osc52_write_fn = previous_osc_fn;
+    }
+
+    var outcome = try slash_commands.copyTextToClipboardWithFallback(allocator, std.testing.io, "osc payload");
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(std.meta.Tag(slash_commands.ClipboardCopyOutcome), .osc52), std.meta.activeTag(outcome));
+    try std.testing.expect(osc_capture.text != null);
+    try std.testing.expect(std.mem.startsWith(u8, osc_capture.text.?, "\x1b]52;c;"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const temp_path = try makeInteractiveTestPath(allocator, tmp, "copy-fallback.txt");
+    defer allocator.free(temp_path);
+
+    const previous_temp_override = slash_commands.copy_temp_file_override;
+    slash_commands.copy_temp_file_override = temp_path;
+    defer slash_commands.copy_temp_file_override = previous_temp_override;
+
+    const oversized = try allocator.alloc(u8, 80_000);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+
+    var temp_outcome = try slash_commands.copyTextToClipboardWithFallback(allocator, std.testing.io, oversized);
+    defer temp_outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(std.meta.Tag(slash_commands.ClipboardCopyOutcome), .temp_file), std.meta.activeTag(temp_outcome));
+    try std.testing.expectEqualStrings(temp_path, temp_outcome.temp_file);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, temp_path, allocator, .limited(100_000));
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings(oversized, written);
 }
 
 fn expectShareTmpRemoved(path: []const u8) !void {
@@ -6063,6 +6199,13 @@ fn captureClipboardText(context: ?*anyopaque, io: std.Io, text: []const u8) !voi
     const capture: *ClipboardCapture = @ptrCast(@alignCast(context.?));
     if (capture.text) |existing| capture.allocator.free(existing);
     capture.text = try capture.allocator.dupe(u8, text);
+}
+
+fn failingClipboardText(context: ?*anyopaque, io: std.Io, text: []const u8) !void {
+    _ = context;
+    _ = io;
+    _ = text;
+    return error.ClipboardCommandFailed;
 }
 
 test "loadSelectableModels respects CLI model patterns" {

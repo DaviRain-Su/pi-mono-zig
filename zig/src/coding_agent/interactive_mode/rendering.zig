@@ -87,6 +87,8 @@ pub const RenderStateSnapshot = struct {
     queued_follow_up: [][]u8 = &.{},
     pending_editor_images: []PendingEditorImage = &.{},
     chat_scroll_offset: usize = 0,
+    chat_visible_rows: usize = 0,
+    chat_width: usize = 1,
     all_expanded: bool = false,
     hide_thinking_blocks: bool = false,
     hidden_thinking_label: []u8 = &.{},
@@ -451,6 +453,8 @@ pub const AppState = struct {
             .context_window = self.context_window,
             .context_percent = self.context_percent,
             .chat_scroll_offset = self.chat_scroll_offset,
+            .chat_visible_rows = self.chat_visible_rows,
+            .chat_width = self.chat_width,
             .all_expanded = self.all_expanded,
             .hide_thinking_blocks = self.hide_thinking_blocks,
         };
@@ -3324,6 +3328,45 @@ pub fn renderChatItemIntoAt(
     lines: *tui.LineList,
 ) !void {
     try renderChatItemIntoWithOptions(allocator, width, null, theme, item, now_ms, true, lines);
+}
+
+pub fn visibleChatTextAlloc(
+    allocator: std.mem.Allocator,
+    app_state: *const AppState,
+) ![]u8 {
+    var snapshot = try app_state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+
+    const width = @max(snapshot.chat_width, 1);
+    for (snapshot.items) |item| {
+        try renderChatItemIntoWithOptions(
+            allocator,
+            width,
+            null,
+            null,
+            item,
+            0,
+            snapshot.all_expanded,
+            &lines,
+        );
+    }
+
+    const visible_rows = if (snapshot.chat_visible_rows == 0) lines.items.len else snapshot.chat_visible_rows;
+    const max_offset = lines.items.len -| visible_rows;
+    const offset = @min(snapshot.chat_scroll_offset, max_offset);
+    const start = max_offset -| offset;
+    const end = @min(start + visible_rows, lines.items.len);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    for (lines.items[start..end], 0..) |line, index| {
+        if (index > 0) try writer.writer.writeAll("\n");
+        try writer.writer.writeAll(std.mem.trim(u8, line, " "));
+    }
+    return try allocator.dupe(u8, std.mem.trim(u8, writer.written(), "\n"));
 }
 
 fn renderChatItemIntoWithOptions(

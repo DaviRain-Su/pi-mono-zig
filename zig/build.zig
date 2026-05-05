@@ -230,6 +230,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_main_tests = b.addRunArtifact(main_tests);
     run_main_tests.step.dependOn(b.getInstallStep());
+    run_main_tests.step.dependOn(&run_coding_agent_tests.step);
+    run_main_tests.step.dependOn(&ts_rpc_parity.step);
     test_step.dependOn(&run_main_tests.step);
 
     if (target.result.os.tag != .windows) {

@@ -3,6 +3,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
 const bootstrap = @import("cli/bootstrap.zig");
+const cli_preflight = @import("cli/preflight.zig");
 const input_prep = @import("cli/input_prep.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
 const output = @import("cli/output.zig");
@@ -12,6 +13,8 @@ const json_event_wire = @import("coding_agent/json_event_wire.zig");
 const extension_host_mod = @import("coding_agent/extension_host.zig");
 const extension_flags_mod = @import("coding_agent/extension_flags.zig");
 const extension_registry_mod = @import("coding_agent/extension_registry.zig");
+const builtin = @import("builtin");
+const cli_test = if (builtin.is_test) @import("cli/test_harness.zig") else struct {};
 
 const VERSION = "0.1.0";
 
@@ -323,7 +326,7 @@ fn runCliWithInput(
     // bootstrap path does not prompt twice.
     var preflight_continue_confirmed = false;
     {
-        const preflight_session_dir = try runtime_prep.resolvePreflightSessionDir(
+        const preflight_session_dir = try cli_preflight.resolvePreRuntimeSessionDir(
             allocator,
             io,
             &effective_env_map,
@@ -332,54 +335,16 @@ fn runCliWithInput(
         );
         defer allocator.free(preflight_session_dir);
 
-        const preflight_options: coding_agent.RunInteractiveModeOptions = .{
-            .cwd = cwd,
-            // The preflight only inspects session files / stored cwd. The
-            // system_prompt and provider strings below are placeholders that
-            // are never used during preflight resolution.
-            .system_prompt = "",
-            .session_dir = preflight_session_dir,
-            .provider = "faux",
-            .session = options.session,
-            .@"continue" = options.@"continue",
-            .@"resume" = options.@"resume",
-            .fork = options.fork,
-            .no_session = options.no_session,
-        };
-
-        if (try coding_agent.interactive_mode.preflightInteractiveMissingCwd(
+        const preflight_result = try cli_preflight.runMissingSessionCwdPreflight(
             allocator,
             io,
-            preflight_options,
-        )) |captured_preflight| {
-            var captured_preflight_mut = captured_preflight;
-            defer captured_preflight_mut.deinit(allocator);
-
-            if (app_mode != .interactive) {
-                const message = try coding_agent.formatMissingSessionCwdError(allocator, captured_preflight_mut.issue());
-                defer allocator.free(message);
-                try stderr.print("Error: {s}\n", .{message});
-                try stderr.flush();
-                return 1;
-            }
-
-            const choice = try coding_agent.runMissingCwdSelector(
-                allocator,
-                io,
-                &effective_env_map,
-                captured_preflight_mut.issue(),
-            );
-            switch (choice) {
-                .cancel => {
-                    try stderr.writeAll("Resume cancelled\n");
-                    try stderr.flush();
-                    return 0;
-                },
-                .continue_in_fallback => {
-                    preflight_continue_confirmed = true;
-                },
-            }
-        }
+            &effective_env_map,
+            cli_preflight.preRuntimeContext(cwd, preflight_session_dir, &options),
+            app_mode == .interactive,
+            stderr,
+        );
+        if (preflight_result.exit_code) |exit_code| return exit_code;
+        preflight_continue_confirmed = preflight_result.continue_confirmed;
     }
 
     var prepared = try runtime_prep.prepareCliRuntime(allocator, io, &effective_env_map, cwd, &options, selected_tools);
@@ -414,30 +379,15 @@ fn runCliWithInput(
         // Preflight stored-session cwd BEFORE provider/auth resolution and
         // tool construction so missing-cwd diagnostics always preempt
         // unrelated bootstrap failures. Matches TypeScript main.ts ordering.
-        const preflight_options: coding_agent.RunInteractiveModeOptions = .{
-            .cwd = cwd,
-            .system_prompt = prepared.system_prompt,
-            .session_dir = prepared.session_dir,
-            .provider = prepared.provider_name,
-            .session = options.session,
-            .@"continue" = options.@"continue",
-            .@"resume" = options.@"resume",
-            .fork = options.fork,
-            .no_session = options.no_session,
-        };
-        if (try coding_agent.interactive_mode.preflightInteractiveMissingCwd(
+        const preflight_result = try cli_preflight.runMissingSessionCwdPreflight(
             allocator,
             io,
-            preflight_options,
-        )) |captured_preflight| {
-            var captured_preflight_mut = captured_preflight;
-            defer captured_preflight_mut.deinit(allocator);
-            const message = try coding_agent.formatMissingSessionCwdError(allocator, captured_preflight_mut.issue());
-            defer allocator.free(message);
-            try stderr.print("Error: {s}\n", .{message});
-            try stderr.flush();
-            return 1;
-        }
+            &effective_env_map,
+            cli_preflight.preparedContext(cwd, prepared.session_dir, prepared.system_prompt, prepared.provider_name, &options),
+            false,
+            stderr,
+        );
+        if (preflight_result.exit_code) |exit_code| return exit_code;
     }
 
     var provider_runtime = coding_agent.resolveProviderConfig(
@@ -501,11 +451,9 @@ fn runCliWithInput(
         ) catch |err| switch (err) {
             error.MissingSessionCwd => {
                 if (missing_cwd_issue) |captured| {
-                    const message = try coding_agent.formatMissingSessionCwdError(allocator, captured.issue());
-                    defer allocator.free(message);
-                    try stderr.print("Error: {s}\n", .{message});
+                    try cli_preflight.writeMissingSessionCwdError(allocator, captured.issue(), stderr);
                 } else {
-                    try stderr.writeAll("Error: stored session working directory does not exist\n");
+                    try cli_preflight.writeMissingSessionCwdFallbackError(stderr);
                 }
                 try stderr.flush();
                 return 1;
@@ -665,6 +613,7 @@ fn runExtensionRegistryDump(
     const fixture = env_map.get("PI_M11_EXTENSION_HOST_FIXTURE") orelse "m11-fixture";
     const ready_timeout_ms: u64 = std.fmt.parseInt(u64, env_map.get("PI_M11_EXTENSION_READY_TIMEOUT_MS") orelse "1500", 10) catch 1500;
     const drain_timeout_ms: u64 = std.fmt.parseInt(u64, env_map.get("PI_M11_EXTENSION_DRAIN_TIMEOUT_MS") orelse "1500", 10) catch 1500;
+    const shutdown_timeout_ms: u64 = std.fmt.parseInt(u64, env_map.get("PI_M11_EXTENSION_SHUTDOWN_TIMEOUT_MS") orelse "1000", 10) catch 1000;
 
     // Prefer the first --extension path as the entry point; additional
     // paths are forwarded as host argv tail so a local shell stub can
@@ -689,7 +638,7 @@ fn runExtensionRegistryDump(
             .cwd = cwd,
             .fixture = fixture,
         },
-        .shutdown_timeout_ms = 1000,
+        .shutdown_timeout_ms = shutdown_timeout_ms,
     }) catch |err| {
         try stderr.print("Error: failed to start extension host: {s}\n", .{@errorName(err)});
         return 1;
@@ -729,7 +678,10 @@ fn runExtensionRegistryDump(
     defer allocator.free(snapshot);
     try stdout.print("{s}\n", .{snapshot});
 
-    host.shutdown() catch {};
+    host.shutdown() catch |err| {
+        try stderr.print("Error: extension host shutdown failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
     return 0;
 }
 
@@ -747,93 +699,6 @@ fn prepareEffectiveEnvMap(
     }
 
     return effective_env_map;
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
-}
-
-fn makeTmpPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
-    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
-        ".zig-cache",
-        "tmp",
-        &tmp.sub_path,
-        name,
-    });
-    defer allocator.free(relative_dir);
-    return try makeAbsoluteTestPath(allocator, relative_dir);
-}
-
-const CliExecutableResult = struct {
-    stdout: []u8,
-    stderr: []u8,
-    exit_code: u8,
-
-    fn deinit(self: *CliExecutableResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-        allocator.free(self.stderr);
-        self.* = undefined;
-    }
-};
-
-fn exitCodeFromTerm(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |code| code,
-        else => 1,
-    };
-}
-
-fn hasAnsiEscape(text: []const u8) bool {
-    return std.mem.indexOfScalar(u8, text, '\x1b') != null;
-}
-
-fn runCliExecutable(
-    allocator: std.mem.Allocator,
-    tmp: anytype,
-    args: []const []const u8,
-    env_entries: []const struct { []const u8, []const u8 },
-) !CliExecutableResult {
-    try tmp.dir.createDirPath(std.testing.io, "home");
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "project");
-
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
-    defer allocator.free(home_dir);
-    const agent_dir = try makeTmpPath(allocator, tmp, "agent");
-    defer allocator.free(agent_dir);
-    const project_dir = try makeTmpPath(allocator, tmp, "project");
-    defer allocator.free(project_dir);
-    const binary_path = try makeAbsoluteTestPath(allocator, "zig-out/bin/pi");
-    defer allocator.free(binary_path);
-
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, binary_path);
-    try argv.appendSlice(allocator, args);
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("HOME", home_dir);
-    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
-    for (env_entries) |entry| {
-        try env_map.put(entry[0], entry[1]);
-    }
-
-    const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = argv.items,
-        .cwd = .{ .path = project_dir },
-        .environ_map = &env_map,
-        .stdout_limit = .limited(128 * 1024),
-        .stderr_limit = .limited(128 * 1024),
-    });
-
-    return .{
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-        .exit_code = exitCodeFromTerm(result.term),
-    };
 }
 
 test "main help text includes expected CLI options" {
@@ -1038,7 +903,7 @@ test "runCli exports session files to html and jsonl" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-export");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-export");
     defer allocator.free(cwd);
     try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
 
@@ -1122,7 +987,7 @@ test "runCli injects @file text into the initial prompt" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try makeTmpPath(allocator, tmp, "cli-file-text");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-file-text");
     defer allocator.free(cwd);
     try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
     const note_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "note.txt" });
@@ -1181,7 +1046,7 @@ test "runCli injects image file arguments into the initial prompt" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try makeTmpPath(allocator, tmp, "cli-file-image");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-file-image");
     defer allocator.free(cwd);
     try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
     const image_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "screenshot.png" });
@@ -1257,7 +1122,7 @@ test "runCli omits oversized image with deterministic message when processor ret
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try makeTmpPath(allocator, tmp, "cli-file-image-omit");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-file-image-omit");
     defer allocator.free(cwd);
     try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
     const image_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "huge.png" });
@@ -1323,7 +1188,7 @@ test "runCli respects images.autoResize=false and attaches oversized image bytes
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try makeTmpPath(allocator, tmp, "cli-file-image-no-resize");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-file-image-no-resize");
     defer allocator.free(cwd);
     try std.Io.Dir.createDirAbsolute(std.testing.io, cwd, .default_dir);
     const project_pi = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" });
@@ -1394,7 +1259,7 @@ test "cli executable print mode writes assistant text to stdout without interact
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var result = try runCliExecutable(
+    var result = try cli_test.runCliExecutable(
         allocator,
         tmp,
         &.{ "--provider", "faux", "--print", "hello" },
@@ -1405,8 +1270,8 @@ test "cli executable print mode writes assistant text to stdout without interact
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqualStrings("hello from cli binary\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
-    try std.testing.expect(!hasAnsiEscape(result.stdout));
-    try std.testing.expect(!hasAnsiEscape(result.stderr));
+    try std.testing.expect(!cli_test.hasAnsiEscape(result.stdout));
+    try std.testing.expect(!cli_test.hasAnsiEscape(result.stderr));
 }
 
 test "cli executable print mode json writes valid JSON lines to stdout" {
@@ -1415,7 +1280,7 @@ test "cli executable print mode json writes valid JSON lines to stdout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var result = try runCliExecutable(
+    var result = try cli_test.runCliExecutable(
         allocator,
         tmp,
         &.{ "--provider", "faux", "--mode", "json", "--print", "hello" },
@@ -1425,7 +1290,7 @@ test "cli executable print mode json writes valid JSON lines to stdout" {
 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqualStrings("", result.stderr);
-    try std.testing.expect(!hasAnsiEscape(result.stdout));
+    try std.testing.expect(!cli_test.hasAnsiEscape(result.stdout));
 
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
     var line_count: usize = 0;
@@ -1459,7 +1324,7 @@ test "runCli persists and continues sessions across runs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-session");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-session");
     defer allocator.free(cwd);
 
     var first_env = std.process.Environ.Map.init(allocator);
@@ -1526,7 +1391,7 @@ test "runCli resume loads the latest session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-resume");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-resume");
     defer allocator.free(cwd);
 
     var first_env = std.process.Environ.Map.init(allocator);
@@ -1593,7 +1458,7 @@ test "runCli no-session keeps runs ephemeral" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-no-session");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-no-session");
     defer allocator.free(cwd);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -1631,9 +1496,9 @@ test "runCli stores sessions in overridden session directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-session-dir");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-session-dir");
     defer allocator.free(cwd);
-    const overridden_session_dir = try makeTmpPath(allocator, tmp, "custom-sessions");
+    const overridden_session_dir = try cli_test.makeTmpPath(allocator, tmp, "custom-sessions");
     defer allocator.free(overridden_session_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -1669,7 +1534,7 @@ test "runCli fork creates a new session from an existing session id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-fork");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-fork");
     defer allocator.free(cwd);
     const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "sessions" });
     defer allocator.free(session_dir);
@@ -1805,7 +1670,7 @@ test "runCli accepts registered extension boolean and string flags from local Bu
     defer env_map.deinit();
     try env_map.put("PI_FAUX_RESPONSE", "ext-flags ok");
 
-    const fixture_path = try makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
+    const fixture_path = try cli_test.makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
     defer allocator.free(fixture_path);
 
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
@@ -1867,7 +1732,7 @@ test "runCli M11 extension registry dump emits live registry snapshot for explic
         "printf '{\"type\":\"register_provider\",\"name\":\"fake-provider\",\"displayName\":\"Fake\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"fake-1\",\"name\":\"Fake 1\"}],\"extensionPath\":\"fixture/extension.ts\"}\\n'\n" ++
         "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ext-stub.sh", .data = script_body });
-    const ext_path = try makeTmpPath(allocator, tmp, "ext-stub.sh");
+    const ext_path = try cli_test.makeTmpPath(allocator, tmp, "ext-stub.sh");
     defer allocator.free(ext_path);
 
     // Also need a flags sidecar so the CLI accepts --plan and
@@ -1916,6 +1781,50 @@ test "runCli M11 extension registry dump emits live registry snapshot for explic
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
+test "runCli M11 extension registry dump surfaces shutdown failure without losing snapshot" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_M11_EXTENSION_REGISTRY_DUMP", "1");
+    try env_map.put("PI_M11_EXTENSION_HOST_RUNTIME", "/bin/sh");
+    try env_map.put("PI_M11_EXTENSION_READY_TIMEOUT_MS", "1500");
+    try env_map.put("PI_M11_EXTENSION_DRAIN_TIMEOUT_MS", "1500");
+    try env_map.put("PI_M11_EXTENSION_SHUTDOWN_TIMEOUT_MS", "50");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_body =
+        "IFS= read -r init\n" ++
+        "exec 0<&-\n" ++
+        "printf '{\"type\":\"ready\"}\\n'\n" ++
+        "printf '{\"type\":\"register_tool\",\"name\":\"shutdown-visible\",\"label\":\"Shutdown Visible\",\"description\":\"Survives failed shutdown\",\"extensionPath\":\"fixture/extension.ts\"}\\n'\n" ++
+        "while true; do sleep 1; done\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "shutdown-failure.sh", .data = script_body });
+    const ext_path = try cli_test.makeTmpPath(allocator, tmp, "shutdown-failure.sh");
+    defer allocator.free(ext_path);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--extension", ext_path },
+        "/tmp",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    const out = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"shutdown-visible\"") != null);
+    const err = stderr_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "Error: extension host shutdown failed: BrokenPipe") != null);
+}
+
 test "runCli M11 extension registry dump shows unregisterProvider removing the provider" {
     const allocator = std.testing.allocator;
 
@@ -1935,7 +1844,7 @@ test "runCli M11 extension registry dump shows unregisterProvider removing the p
         "printf '{\"type\":\"unregister_provider\",\"name\":\"fake-provider\"}\\n'\n" ++
         "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "unreg.sh", .data = script_body });
-    const ext_path = try makeTmpPath(allocator, tmp, "unreg.sh");
+    const ext_path = try cli_test.makeTmpPath(allocator, tmp, "unreg.sh");
     defer allocator.free(ext_path);
 
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
@@ -1966,7 +1875,7 @@ test "runCli help with --extension lists fixture extension flags" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    const fixture_path = try makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
+    const fixture_path = try cli_test.makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
     defer allocator.free(fixture_path);
 
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
@@ -1998,12 +1907,12 @@ test "cli executable continue resumes the latest session while preserving older 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
     defer allocator.free(project_dir);
     const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ project_dir, ".pi", "sessions" });
     defer allocator.free(session_dir);
 
-    var first = try runCliExecutable(
+    var first = try cli_test.runCliExecutable(
         allocator,
         tmp,
         &.{ "--provider", "faux", "--print", "first prompt" },
@@ -2028,7 +1937,7 @@ test "cli executable continue resumes the latest session while preserving older 
         if (byte == '\n') original_line_count_before_continue += 1;
     }
 
-    var second = try runCliExecutable(
+    var second = try cli_test.runCliExecutable(
         allocator,
         tmp,
         &.{ "--provider", "faux", "--print", "--continue", "second prompt" },
@@ -2064,7 +1973,7 @@ test "cli executable continue resumes the latest session while preserving older 
     try std.testing.expectEqualStrings("second prompt", original_context.messages[2].user.content[0].text.text);
     try std.testing.expectEqualStrings("second reply", original_context.messages[3].assistant.content[0].text.text);
 
-    var third = try runCliExecutable(
+    var third = try cli_test.runCliExecutable(
         allocator,
         tmp,
         &.{ "--provider", "faux", "--print", "third prompt" },
@@ -2095,7 +2004,7 @@ test "cli executable continue resumes the latest session while preserving older 
     const latest_session_path = try std.testing.allocator.dupe(u8, latest_session_before_continue);
     defer std.testing.allocator.free(latest_session_path);
 
-    var fourth = try runCliExecutable(
+    var fourth = try cli_test.runCliExecutable(
         allocator,
         tmp,
         &.{ "--provider", "faux", "--print", "--continue", "fourth prompt" },
@@ -2187,7 +2096,7 @@ test "runCli preserves context when continuing with a different provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try makeTmpPath(allocator, tmp, "cli-multi-provider");
+    const cwd = try cli_test.makeTmpPath(allocator, tmp, "cli-multi-provider");
     defer allocator.free(cwd);
 
     var first_env = std.process.Environ.Map.init(allocator);
@@ -2315,9 +2224,9 @@ test "prepareCliRuntime loads defaults resources context and prompt templates" {
         ,
     });
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2439,9 +2348,9 @@ test "prepareCliRuntime wires CLI resource overrides and discovery toggles" {
         ,
     });
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2507,9 +2416,9 @@ test "prepareCliRuntime skips context file discovery when requested" {
         .data = "Project instructions from AGENTS.md",
     });
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2550,9 +2459,9 @@ test "prepareCliRuntime selects default model from configured api key" {
         ,
     });
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2578,9 +2487,9 @@ test "prepareCliRuntime selects kimi-coding from KIMI_API_KEY" {
     try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2614,13 +2523,13 @@ test "runCli missing-cwd preflight wins over runtime_prep failures (M10 ordering
     try tmp.dir.createDirPath(std.testing.io, "launch");
     try tmp.dir.createDirPath(std.testing.io, "sessions");
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const stored_cwd = try makeTmpPath(allocator, tmp, "stored");
+    const stored_cwd = try cli_test.makeTmpPath(allocator, tmp, "stored");
     defer allocator.free(stored_cwd);
-    const launch_cwd = try makeTmpPath(allocator, tmp, "launch");
+    const launch_cwd = try cli_test.makeTmpPath(allocator, tmp, "launch");
     defer allocator.free(launch_cwd);
-    const session_dir = try makeTmpPath(allocator, tmp, "sessions");
+    const session_dir = try cli_test.makeTmpPath(allocator, tmp, "sessions");
     defer allocator.free(session_dir);
 
     // Seed a session whose stored cwd will be removed below.
@@ -2718,11 +2627,11 @@ test "resolvePreflightSessionDir prefers --session-dir over env and settings" {
         ,
     });
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
-    const explicit_dir = try makeTmpPath(allocator, tmp, "explicit");
+    const explicit_dir = try cli_test.makeTmpPath(allocator, tmp, "explicit");
     defer allocator.free(explicit_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2747,11 +2656,11 @@ test "resolvePreflightSessionDir uses PI_CODING_AGENT_SESSION_DIR when no flag" 
     try tmp.dir.createDirPath(std.testing.io, "envvar-sessions");
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
-    const env_dir = try makeTmpPath(allocator, tmp, "envvar-sessions");
+    const env_dir = try cli_test.makeTmpPath(allocator, tmp, "envvar-sessions");
     defer allocator.free(env_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2775,9 +2684,9 @@ test "resolvePreflightSessionDir falls back to default cwd/.pi/sessions" {
     try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2811,11 +2720,11 @@ test "resolvePreflightSessionDir and effectiveSessionDir agree when env and sett
         ,
     });
 
-    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
     defer allocator.free(home_dir);
-    const repo_dir = try makeTmpPath(allocator, tmp, "repo");
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
     defer allocator.free(repo_dir);
-    const env_dir = try makeTmpPath(allocator, tmp, "envvar-sessions");
+    const env_dir = try cli_test.makeTmpPath(allocator, tmp, "envvar-sessions");
     defer allocator.free(env_dir);
 
     var env_map = std.process.Environ.Map.init(allocator);

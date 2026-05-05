@@ -88,7 +88,7 @@ pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl)" },
     .{ .name = "import", .description = "Import and resume a session from a JSONL file" },
     .{ .name = "share", .description = "Share session as a secret GitHub gist" },
-    .{ .name = "copy", .description = "Copy last agent message to clipboard" },
+    .{ .name = "copy", .description = "Copy transcript content to clipboard", .argument_hint = "[last|all|visible]" },
     .{ .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
     .{ .name = "session", .description = "Show session info and stats" },
     .{ .name = "changelog", .description = "Show changelog entries" },
@@ -258,7 +258,7 @@ pub fn handleSlashCommand(
             );
         },
         .share => try handleShareSlashCommand(allocator, io, env_map, session, app_state),
-        .copy => try handleCopySlashCommand(allocator, io, session, app_state),
+        .copy => try handleCopySlashCommand(allocator, io, session, app_state, command.argument),
         .name => try handleNameSlashCommand(allocator, session, command.argument, app_state),
         .hotkeys => try handleHotkeysSlashCommand(allocator, app_state, live_resources.keybindings),
         .label => try handleLabelSlashCommand(allocator, session, command.argument, app_state),
@@ -1412,15 +1412,25 @@ fn startCallbackListenerForSession(
     io: std.Io,
     browser_session: *const auth.BrowserLoginSession,
 ) !*auth.OAuthCallbackListener {
-    const listener = try auth.OAuthCallbackListener.create(
-        allocator,
-        io,
-        callbackProviderKind(browser_session.kind),
-        browser_session.state,
-    );
-    errdefer listener.destroy();
-    try listener.start();
-    return listener;
+    var attempts: usize = 0;
+    while (attempts < 400) : (attempts += 1) {
+        const listener = auth.OAuthCallbackListener.create(
+            allocator,
+            io,
+            callbackProviderKind(browser_session.kind),
+            browser_session.state,
+        ) catch |err| switch (err) {
+            error.AddressInUse, error.AddressUnavailable => {
+                std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        errdefer listener.destroy();
+        try listener.start();
+        return listener;
+    }
+    return error.AddressInUse;
 }
 
 pub fn cancelAuthFlow(
@@ -1697,9 +1707,13 @@ pub fn defaultOpenBrowserBestEffort(_: ?*anyopaque, io: std.Io, url: []const u8)
 }
 
 pub const ClipboardCopyFn = *const fn (context: ?*anyopaque, io: std.Io, text: []const u8) anyerror!void;
+pub const Osc52WriteFn = *const fn (context: ?*anyopaque, io: std.Io, bytes: []const u8) anyerror!void;
 
 pub var clipboard_copy_context: ?*anyopaque = null;
 pub var clipboard_copy_fn: ClipboardCopyFn = defaultCopyTextToClipboard;
+pub var osc52_write_context: ?*anyopaque = null;
+pub var osc52_write_fn: Osc52WriteFn = defaultWriteOsc52;
+pub var copy_temp_file_override: ?[]const u8 = null;
 pub var test_auth_flow: ?AuthFlow = null;
 
 pub const BrowserOpenCapture = struct {
@@ -2151,27 +2165,96 @@ pub fn handleImportSlashCommand(
     try app_state.appendInfo(message);
 }
 
+pub const CopyScope = enum {
+    last,
+    all,
+    visible,
+};
+
+pub fn parseCopyScope(argument: ?[]const u8) !CopyScope {
+    const raw = argument orelse return .last;
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return .last;
+    if (std.ascii.eqlIgnoreCase(value, "last")) return .last;
+    if (std.ascii.eqlIgnoreCase(value, "all")) return .all;
+    if (std.ascii.eqlIgnoreCase(value, "visible")) return .visible;
+    return error.InvalidCopyScope;
+}
+
 pub fn handleCopySlashCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
     session: *const session_mod.AgentSession,
     app_state: *AppState,
+    argument: ?[]const u8,
 ) !void {
-    const text = lastAssistantTextAlloc(allocator, session) orelse {
-        try app_state.appendError("No assistant messages to copy yet.");
+    const scope = parseCopyScope(argument) catch {
+        try app_state.appendError("Usage: /copy [last|all|visible]");
         return;
+    };
+
+    const text = switch (scope) {
+        .last => lastAssistantTextAlloc(allocator, session) orelse {
+            try app_state.appendError("No assistant messages to copy yet.");
+            return;
+        },
+        .all => try sessionTranscriptTextAlloc(allocator, session),
+        .visible => try rendering.visibleChatTextAlloc(allocator, app_state),
     };
     defer allocator.free(text);
 
-    copyTextToClipboard(io, text) catch |err| {
-        const message = try std.fmt.allocPrint(allocator, "Failed to copy assistant message: {s}", .{@errorName(err)});
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        try app_state.appendError(switch (scope) {
+            .last => "No assistant messages to copy yet.",
+            .all => "No transcript content to copy yet.",
+            .visible => "No visible chat content to copy yet.",
+        });
+        return;
+    }
+
+    var outcome = copyTextToClipboardWithFallback(allocator, io, text) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Failed to copy {s}: {s}", .{ copyScopeStatusNoun(scope), @errorName(err) });
         defer allocator.free(message);
         try app_state.appendError(message);
         return;
     };
+    defer outcome.deinit(allocator);
 
-    try app_state.appendInfo("Copied last assistant message to clipboard");
-    try app_state.setStatus("copied");
+    const base_message = switch (scope) {
+        .last => "Copied last assistant message",
+        .all => "Copied full session transcript",
+        .visible => "Copied visible chat viewport",
+    };
+    switch (outcome) {
+        .clipboard => {
+            const message = try std.fmt.allocPrint(allocator, "{s} to clipboard", .{base_message});
+            defer allocator.free(message);
+            try app_state.appendInfo(message);
+            try app_state.setStatus("copied");
+        },
+        .osc52 => {
+            const message = try std.fmt.allocPrint(allocator, "{s} via OSC 52 clipboard fallback", .{base_message});
+            defer allocator.free(message);
+            try app_state.appendInfo(message);
+            try app_state.setStatus("copied via OSC 52");
+        },
+        .temp_file => |path| {
+            const message = try std.fmt.allocPrint(allocator, "{s} to temp file: {s}", .{ base_message, path });
+            defer allocator.free(message);
+            try app_state.appendInfo(message);
+            const status = try std.fmt.allocPrint(allocator, "copy saved to {s}", .{path});
+            defer allocator.free(status);
+            try app_state.setStatus(status);
+        },
+    }
+}
+
+fn copyScopeStatusNoun(scope: CopyScope) []const u8 {
+    return switch (scope) {
+        .last => "assistant message",
+        .all => "session transcript",
+        .visible => "visible chat",
+    };
 }
 
 pub const DEFAULT_SHARE_VIEWER_URL: []const u8 = "https://pi.dev/session/";
@@ -2531,6 +2614,110 @@ pub fn copyTextToClipboard(io: std.Io, text: []const u8) !void {
     try clipboard_copy_fn(clipboard_copy_context, io, text);
 }
 
+pub const ClipboardCopyOutcome = union(enum) {
+    clipboard,
+    osc52,
+    temp_file: []u8,
+
+    pub fn deinit(self: *ClipboardCopyOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .temp_file => |path| allocator.free(path),
+            .clipboard, .osc52 => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
+
+pub fn copyTextToClipboardWithFallback(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    text: []const u8,
+) !ClipboardCopyOutcome {
+    const platform_copied = blk: {
+        copyTextToClipboard(io, text) catch break :blk false;
+        break :blk true;
+    };
+    const remote = isRemoteSession();
+    if (platform_copied and !remote) return .clipboard;
+
+    if (emitOsc52(allocator, io, text)) {
+        return .osc52;
+    } else |_| {
+        if (platform_copied) return .clipboard;
+    }
+
+    const path = try writeCopyFallbackTempFile(allocator, io, text);
+    return .{ .temp_file = path };
+}
+
+fn isRemoteSession() bool {
+    return std.c.getenv("SSH_CONNECTION") != null or
+        std.c.getenv("SSH_CLIENT") != null or
+        std.c.getenv("MOSH_CONNECTION") != null;
+}
+
+fn emitOsc52(allocator: std.mem.Allocator, io: std.Io, text: []const u8) !void {
+    const encoded_len = std.base64.standard.Encoder.calcSize(text.len);
+    if (encoded_len > MAX_OSC52_ENCODED_LENGTH) return error.Osc52PayloadTooLarge;
+    const encoded = try allocator.alloc(u8, encoded_len);
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, text);
+
+    var sequence = std.ArrayList(u8).empty;
+    defer sequence.deinit(allocator);
+    try sequence.appendSlice(allocator, "\x1b]52;c;");
+    try sequence.appendSlice(allocator, encoded);
+    try sequence.append(allocator, 0x07);
+    try osc52_write_fn(osc52_write_context, io, sequence.items);
+}
+
+fn defaultWriteOsc52(_: ?*anyopaque, io: std.Io, bytes: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buffer);
+    try stdout.interface.writeAll(bytes);
+    try stdout.flush();
+}
+
+fn writeCopyFallbackTempFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    text: []const u8,
+) ![]u8 {
+    if (copy_temp_file_override) |path| {
+        try common.writeFileAbsolute(io, path, text, true);
+        return try allocator.dupe(u8, path);
+    }
+
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/pi-copy-{d}-{d}.txt",
+            .{ agent.nowMilliseconds(), attempts },
+        );
+        errdefer allocator.free(path);
+
+        if (std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true })) |file| {
+            var owned = file;
+            defer owned.close(io);
+            var buffer: [1024]u8 = undefined;
+            var writer = owned.writer(io, &buffer);
+            try writer.interface.writeAll(text);
+            try writer.flush();
+            return path;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => return err,
+        }
+    }
+    return error.CopyFallbackTempFileFailed;
+}
+
 pub fn defaultCopyTextToClipboard(_: ?*anyopaque, io: std.Io, text: []const u8) !void {
     switch (builtin.os.tag) {
         .macos => try runClipboardCommand(io, &[_][]const u8{"pbcopy"}, text),
@@ -2718,6 +2905,93 @@ pub fn blocksToShareText(allocator: std.mem.Allocator, blocks: []const ai.Conten
     }
 
     return try allocator.dupe(u8, writer.written());
+}
+
+pub fn sessionTranscriptTextAlloc(allocator: std.mem.Allocator, session: *const session_mod.AgentSession) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    const branch = session.session_manager.getBranch(allocator, null) catch |err| switch (err) {
+        error.EntryNotFound, error.InvalidSessionTree => null,
+        else => return err,
+    };
+    if (branch) |entries| {
+        defer allocator.free(entries);
+        for (entries) |entry| {
+            try appendTranscriptEntry(allocator, &writer, entry.*);
+        }
+    }
+
+    if (writer.written().len == 0) {
+        for (session.agent.getMessages()) |message| {
+            try appendTranscriptMessage(allocator, &writer, message);
+        }
+    }
+
+    return try allocator.dupe(u8, std.mem.trim(u8, writer.written(), "\n"));
+}
+
+fn appendTranscriptEntry(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer.Allocating,
+    entry: session_manager_mod.SessionEntry,
+) !void {
+    switch (entry) {
+        .message => |message_entry| try appendTranscriptMessage(allocator, writer, message_entry.message),
+        .custom_message => |custom_message_entry| {
+            if (!custom_message_entry.display) return;
+            try appendTranscriptSeparator(writer);
+            const title = if (std.mem.eql(u8, custom_message_entry.custom_type, "bashExecution"))
+                "Bash"
+            else
+                custom_message_entry.custom_type;
+            try writer.writer.print("### {s}\n\n", .{title});
+            const text = try customMessageContentTextAlloc(allocator, custom_message_entry.content);
+            defer allocator.free(text);
+            try writer.writer.print("{s}\n\n", .{text});
+        },
+        .branch_summary => |branch_summary_entry| {
+            try appendTranscriptSeparator(writer);
+            try writer.writer.print("### Branch Summary\n\n{s}\n\n", .{branch_summary_entry.summary});
+        },
+        .thinking_level_change, .model_change, .compaction, .custom, .label, .session_info => {},
+    }
+}
+
+fn appendTranscriptMessage(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer.Allocating,
+    message: agent.AgentMessage,
+) !void {
+    try appendTranscriptSeparator(writer);
+    try writer.writer.print("### {s}\n\n", .{switch (message) {
+        .user => "User",
+        .assistant => "Assistant",
+        .tool_result => "Tool Result",
+    }});
+    const markdown = try messageToShareMarkdown(allocator, message);
+    defer allocator.free(markdown);
+    if (markdown.len == 0) {
+        try writer.writer.writeAll("_No text content_\n\n");
+    } else {
+        try writer.writer.print("{s}\n\n", .{markdown});
+    }
+}
+
+fn appendTranscriptSeparator(writer: *std.Io.Writer.Allocating) !void {
+    if (writer.written().len > 0 and !std.mem.endsWith(u8, writer.written(), "\n\n")) {
+        try writer.writer.writeAll("\n\n");
+    }
+}
+
+fn customMessageContentTextAlloc(
+    allocator: std.mem.Allocator,
+    content: session_manager_mod.CustomMessageContent,
+) ![]u8 {
+    return switch (content) {
+        .text => |text| allocator.dupe(u8, text),
+        .blocks => |blocks| blocksToShareText(allocator, blocks),
+    };
 }
 
 pub fn removeStoredAuthToken(
