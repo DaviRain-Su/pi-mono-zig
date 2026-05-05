@@ -10,31 +10,41 @@ const session_manager_mod = @import("../session_manager.zig");
 const tui = @import("tui");
 const shared = @import("shared.zig");
 const formatting = @import("formatting.zig");
+const session_overlay_mod = @import("session_overlay.zig");
+const model_overlay_mod = @import("model_overlay.zig");
+const tree_overlay_mod = @import("tree_overlay.zig");
+const settings_overlay_mod = @import("settings_overlay.zig");
+const extension_dialog_mod = @import("extension_dialog.zig");
 const settingsResources = shared.settingsResources;
-const configuredCredentials = shared.configuredCredentials;
 const blocksToText = formatting.blocksToText;
 const formatAssistantMessage = formatting.formatAssistantMessage;
 
 pub const SelectorOverlay = union(enum) {
     info: InfoOverlay,
+    settings: SettingsOverlay,
     settings_editor: SettingsEditorOverlay,
     session: SessionOverlay,
     model: ModelOverlay,
+    scoped_models: ScopedModelsOverlay,
     theme: ThemeOverlay,
     tree: TreeOverlay,
     fork: ForkOverlay,
     auth: AuthOverlay,
+    extension_dialog: ExtensionDialog,
 
     pub fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .info => |*overlay| overlay.deinit(allocator),
+            .settings => |*overlay| overlay.deinit(allocator),
             .settings_editor => |*overlay| overlay.deinit(allocator),
             .session => |*overlay| overlay.deinit(allocator),
             .model => |*overlay| overlay.deinit(allocator),
+            .scoped_models => |*overlay| overlay.deinit(allocator),
             .theme => |*overlay| overlay.deinit(allocator),
             .tree => |*overlay| overlay.deinit(allocator),
             .fork => |*overlay| overlay.deinit(allocator),
             .auth => |*overlay| overlay.deinit(allocator),
+            .extension_dialog => |*overlay| overlay.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -42,26 +52,36 @@ pub const SelectorOverlay = union(enum) {
     pub fn title(self: *const SelectorOverlay) []const u8 {
         return switch (self.*) {
             .info => self.info.title,
+            .settings => "Settings",
             .settings_editor => self.settings_editor.title,
-            .session => "Session selector",
+            .session => self.session.title,
             .model => self.model.title,
+            .scoped_models => "Scoped model selector",
             .theme => "Theme selector",
-            .tree => "Session tree",
+            .tree => tree_overlay_mod.title(&self.tree),
             .fork => "Fork from Message",
             .auth => if (self.auth.mode == .login) "Login" else "Logout",
+            .extension_dialog => self.extension_dialog.title,
         };
     }
 
     pub fn hint(self: *const SelectorOverlay) []const u8 {
         return switch (self.*) {
             .info => self.info.hint,
+            .settings => self.settings.hint,
             .settings_editor => self.settings_editor.hint,
             .model => self.model.hint,
+            .session => self.session.hint,
+            .scoped_models => self.scoped_models.hint,
             .fork => "Up/Down move • Enter fork • Esc cancel",
+            .tree => tree_overlay_mod.hint(&self.tree),
+            .extension_dialog => self.extension_dialog.hint,
             else => "Up/Down move • Enter select • Esc cancel",
         };
     }
 };
+
+pub const ExtensionDialog = extension_dialog_mod.ExtensionDialog;
 
 pub const InfoOverlay = struct {
     title: []u8,
@@ -97,56 +117,21 @@ pub const SettingsEditorOverlay = struct {
     }
 };
 
-pub const SessionChoice = struct {
-    path: []u8,
-};
+pub const SettingsOverlay = settings_overlay_mod.Overlay;
+pub const SettingId = settings_overlay_mod.SettingId;
+pub const SettingsMode = settings_overlay_mod.Mode;
 
-pub const SessionOverlay = struct {
-    choices: []SessionChoice,
-    items: []tui.SelectItem,
-    list: tui.SelectList,
+pub const SessionChoice = session_overlay_mod.SessionChoice;
+pub const SessionScope = session_overlay_mod.SessionScope;
+pub const SessionSortMode = session_overlay_mod.SessionSortMode;
+pub const SessionNameFilter = session_overlay_mod.SessionNameFilter;
+pub const SessionOverlay = session_overlay_mod.SessionOverlay;
 
-    pub fn deinit(self: *SessionOverlay, allocator: std.mem.Allocator) void {
-        for (self.choices) |choice| allocator.free(choice.path);
-        allocator.free(self.choices);
-        for (self.items) |item| {
-            allocator.free(@constCast(item.value));
-            allocator.free(@constCast(item.label));
-            if (item.description) |description| allocator.free(@constCast(description));
-        }
-        allocator.free(self.items);
-        self.* = undefined;
-    }
-};
-
-pub const ModelChoice = struct {
-    provider: []u8,
-    model_id: []u8,
-};
-
-pub const ModelOverlay = struct {
-    title: []const u8 = "Model selector",
-    hint: []u8,
-    choices: []ModelChoice,
-    items: []tui.SelectItem,
-    list: tui.SelectList,
-
-    pub fn deinit(self: *ModelOverlay, allocator: std.mem.Allocator) void {
-        allocator.free(self.hint);
-        for (self.choices) |choice| {
-            allocator.free(choice.provider);
-            allocator.free(choice.model_id);
-        }
-        allocator.free(self.choices);
-        for (self.items) |item| {
-            allocator.free(@constCast(item.value));
-            allocator.free(@constCast(item.label));
-            if (item.description) |description| allocator.free(@constCast(description));
-        }
-        allocator.free(self.items);
-        self.* = undefined;
-    }
-};
+pub const ModelChoice = model_overlay_mod.ModelChoice;
+pub const ModelScope = model_overlay_mod.ModelScope;
+pub const ModelOverlay = model_overlay_mod.ModelOverlay;
+pub const ScopedModelChoice = model_overlay_mod.ScopedModelChoice;
+pub const ScopedModelsOverlay = model_overlay_mod.ScopedModelsOverlay;
 
 pub const ThemeChoice = struct {
     name: []u8,
@@ -170,27 +155,8 @@ pub const ThemeOverlay = struct {
     }
 };
 
-pub const TreeChoice = struct {
-    entry_id: []u8,
-};
-
-pub const TreeOverlay = struct {
-    choices: []TreeChoice,
-    items: []tui.SelectItem,
-    list: tui.SelectList,
-
-    pub fn deinit(self: *TreeOverlay, allocator: std.mem.Allocator) void {
-        for (self.choices) |choice| allocator.free(choice.entry_id);
-        allocator.free(self.choices);
-        for (self.items) |item| {
-            allocator.free(@constCast(item.value));
-            allocator.free(@constCast(item.label));
-            if (item.description) |description| allocator.free(@constCast(description));
-        }
-        allocator.free(self.items);
-        self.* = undefined;
-    }
-};
+pub const TreeChoice = tree_overlay_mod.Choice;
+pub const TreeOverlay = tree_overlay_mod.Overlay;
 
 pub const ForkChoice = struct {
     entry_id: []u8,
@@ -400,6 +366,39 @@ pub fn loadSettingsEditorOverlay(
     };
 }
 
+pub fn loadSettingsOverlay(
+    allocator: std.mem.Allocator,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    session: *const session_mod.AgentSession,
+    themes: []const resources_mod.Theme,
+    active_theme: ?*const resources_mod.Theme,
+    supports_images: bool,
+) !SelectorOverlay {
+    return .{
+        .settings = try settings_overlay_mod.load(allocator, runtime_config, session, themes, active_theme, supports_images),
+    };
+}
+
+pub fn refreshSettingsOverlay(allocator: std.mem.Allocator, overlay: *SettingsOverlay) !void {
+    return settings_overlay_mod.refresh(allocator, overlay);
+}
+
+pub fn updateSettingsSearch(allocator: std.mem.Allocator, overlay: *SettingsOverlay, next_search: []const u8) !void {
+    return settings_overlay_mod.updateSearch(allocator, overlay, next_search);
+}
+
+pub fn enterSettingsMode(allocator: std.mem.Allocator, overlay: *SettingsOverlay, mode: SettingsMode) !void {
+    return settings_overlay_mod.enterMode(allocator, overlay, mode);
+}
+
+pub fn exitSettingsSubmenu(allocator: std.mem.Allocator, overlay: *SettingsOverlay) !void {
+    return settings_overlay_mod.exitSubmenu(allocator, overlay);
+}
+
+pub fn selectedSettingsChoice(overlay: *const SettingsOverlay) ?settings_overlay_mod.Choice {
+    return settings_overlay_mod.selectedChoice(overlay);
+}
+
 pub fn loadHotkeysOverlay(
     allocator: std.mem.Allocator,
     keybindings: ?*const keybindings_mod.Keybindings,
@@ -523,29 +522,65 @@ pub fn loadSessionOverlay(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_dir: []const u8,
+    current_session_path: ?[]const u8,
 ) !SelectorOverlay {
-    const entries = try listSessions(allocator, io, session_dir);
-    errdefer {
-        for (entries.paths) |path| allocator.free(path);
-        allocator.free(entries.paths);
-        for (entries.items) |item| {
-            allocator.free(@constCast(item.value));
-            allocator.free(@constCast(item.label));
-            if (item.description) |description| allocator.free(@constCast(description));
-        }
-        allocator.free(entries.items);
-    }
+    return .{ .session = try session_overlay_mod.load(allocator, io, session_dir, current_session_path) };
+}
 
-    return .{
-        .session = .{
-            .choices = entries.paths,
-            .items = entries.items,
-            .list = .{
-                .items = entries.items,
-                .max_visible = 12,
-            },
-        },
-    };
+pub fn refreshSessionOverlay(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.refresh(allocator, overlay);
+}
+
+pub fn toggleSessionOverlayScope(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.toggleScope(allocator, overlay);
+}
+
+pub fn toggleSessionOverlaySort(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.toggleSort(allocator, overlay);
+}
+
+pub fn toggleSessionOverlayNameFilter(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.toggleNameFilter(allocator, overlay);
+}
+
+pub fn toggleSessionOverlayPath(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.togglePath(allocator, overlay);
+}
+
+pub fn updateSessionOverlaySearch(allocator: std.mem.Allocator, overlay: *SessionOverlay, next_search: []const u8) !void {
+    return session_overlay_mod.updateSearch(allocator, overlay, next_search);
+}
+
+pub fn moveSessionOverlaySelection(overlay: *SessionOverlay, delta: isize) void {
+    session_overlay_mod.moveSelection(overlay, delta);
+}
+
+pub fn beginSessionOverlayDelete(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.beginDelete(allocator, overlay);
+}
+
+pub fn confirmSessionOverlayDelete(allocator: std.mem.Allocator, io: std.Io, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.confirmDelete(allocator, io, overlay);
+}
+
+pub fn cancelSessionOverlayDelete(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.cancelDelete(allocator, overlay);
+}
+
+pub fn enterSessionOverlayRename(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.enterRename(allocator, overlay);
+}
+
+pub fn cancelSessionOverlayRename(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.cancelRename(allocator, overlay);
+}
+
+pub fn confirmSessionOverlayRename(allocator: std.mem.Allocator, io: std.Io, overlay: *SessionOverlay) !void {
+    return session_overlay_mod.confirmRename(allocator, io, overlay);
+}
+
+pub fn updateSessionOverlayRenameText(allocator: std.mem.Allocator, overlay: *SessionOverlay, next_text: []const u8) !void {
+    return session_overlay_mod.updateRenameText(allocator, overlay, next_text);
 }
 
 pub fn loadModelOverlay(
@@ -568,110 +603,19 @@ pub fn loadModelOverlayWithSearch(
     runtime_config: ?*const config_mod.RuntimeConfig,
     initial_search: ?[]const u8,
 ) !SelectorOverlay {
-    const available = try loadSelectableModels(allocator, env_map, current_model, current_provider, model_patterns, runtime_config);
-    defer allocator.free(available);
-
-    const search = if (initial_search) |value| std.mem.trim(u8, value, " \t\r\n") else "";
-    var visible_models = std.ArrayList(provider_config.AvailableModel).empty;
-    defer visible_models.deinit(allocator);
-    for (available) |entry| {
-        if (search.len == 0 or availableModelMatchesSearch(entry, search)) {
-            try visible_models.append(allocator, entry);
-        }
-    }
-
-    const has_empty_result = search.len > 0 and visible_models.items.len == 0;
-    const row_count = if (has_empty_result) 1 else visible_models.items.len;
-
-    const choices = try allocator.alloc(ModelChoice, row_count);
-    errdefer {
-        for (choices) |choice| {
-            allocator.free(choice.provider);
-            allocator.free(choice.model_id);
-        }
-        allocator.free(choices);
-    }
-
-    const items = try allocator.alloc(tui.SelectItem, row_count);
-    errdefer {
-        for (items) |item| {
-            allocator.free(@constCast(item.value));
-            allocator.free(@constCast(item.label));
-            if (item.description) |description| allocator.free(@constCast(description));
-        }
-        allocator.free(items);
-    }
-
-    var selected_index: usize = 0;
-    if (has_empty_result) {
-        choices[0] = .{
-            .provider = try allocator.dupe(u8, ""),
-            .model_id = try allocator.dupe(u8, ""),
-        };
-        items[0] = .{
-            .value = try allocator.dupe(u8, "none"),
-            .label = try allocator.dupe(u8, "No matching models"),
-            .description = try std.fmt.allocPrint(allocator, "Search: {s}", .{search}),
-        };
-    } else for (visible_models.items, 0..) |entry, index| {
-        const provider_changed = index == 0 or !std.mem.eql(u8, visible_models.items[index - 1].provider, entry.provider);
-        const label = try formatModelOverlayLabel(allocator, entry, provider_changed);
-        errdefer allocator.free(label);
-        const description = try formatModelOverlayDescription(allocator, entry);
-        errdefer allocator.free(description);
-        choices[index] = .{
-            .provider = try allocator.dupe(u8, entry.provider),
-            .model_id = try allocator.dupe(u8, entry.model_id),
-        };
-        items[index] = .{
-            .value = try allocator.dupe(u8, entry.model_id),
-            .label = label,
-            .description = description,
-        };
-        if (std.mem.eql(u8, entry.provider, current_model.provider) and std.mem.eql(u8, entry.model_id, current_model.id)) {
-            selected_index = index;
-        }
-    }
-
-    const hint = if (search.len > 0)
-        try std.fmt.allocPrint(allocator, "Search: {s} • Up/Down move • Enter select • Esc cancel", .{search})
-    else
-        try allocator.dupe(u8, "Up/Down move • Enter select • Esc cancel");
-    errdefer allocator.free(hint);
-
-    return .{
-        .model = .{
-            .title = "Model selector",
-            .hint = hint,
-            .choices = choices,
-            .items = items,
-            .list = .{
-                .items = items,
-                .selected_index = selected_index,
-                .max_visible = 12,
-            },
-        },
-    };
+    return .{ .model = try model_overlay_mod.loadWithSearch(allocator, env_map, current_model, current_provider, model_patterns, runtime_config, initial_search) };
 }
 
-fn availableModelMatchesSearch(entry: provider_config.AvailableModel, search: []const u8) bool {
-    if (containsIgnoreCase(entry.model_id, search)) return true;
-    if (containsIgnoreCase(entry.display_name, search)) return true;
-    if (containsIgnoreCase(entry.provider, search)) return true;
-
-    var provider_model_buffer: [512]u8 = undefined;
-    const provider_model = std.fmt.bufPrint(&provider_model_buffer, "{s}/{s}", .{ entry.provider, entry.model_id }) catch return false;
-    return containsIgnoreCase(provider_model, search);
+pub fn refreshModelOverlay(allocator: std.mem.Allocator, overlay: *ModelOverlay) !void {
+    return model_overlay_mod.refresh(allocator, overlay);
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
+pub fn toggleModelOverlayScope(allocator: std.mem.Allocator, overlay: *ModelOverlay) !void {
+    return model_overlay_mod.toggleScope(allocator, overlay);
+}
+
+pub fn updateModelOverlaySearch(allocator: std.mem.Allocator, overlay: *ModelOverlay, next_search: []const u8) !void {
+    return model_overlay_mod.updateSearch(allocator, overlay, next_search);
 }
 
 pub fn loadThemeOverlay(
@@ -728,70 +672,38 @@ pub fn loadScopedModelOverlay(
     env_map: *const std.process.Environ.Map,
     current_model: ai.Model,
     current_provider: ?*const provider_config.ResolvedProviderConfig,
-    model_patterns: ?[]const []const u8,
+    enabled_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
 ) !SelectorOverlay {
-    const patterns = model_patterns orelse return error.NoScopedModelPatterns;
-    if (patterns.len == 0) return error.NoScopedModelPatterns;
+    return .{ .scoped_models = try model_overlay_mod.loadScoped(allocator, env_map, current_model, current_provider, enabled_patterns, runtime_config) };
+}
 
-    const available = try loadSelectableModels(allocator, env_map, current_model, current_provider, patterns, runtime_config);
-    defer allocator.free(available);
+pub fn refreshScopedModelsOverlay(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay) !void {
+    return model_overlay_mod.refreshScoped(allocator, overlay);
+}
 
-    if (available.len == 0) return error.NoScopedModelsAvailable;
+pub fn updateScopedModelsSearch(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay, next_search: []const u8) !void {
+    return model_overlay_mod.updateScopedSearch(allocator, overlay, next_search);
+}
 
-    const choices = try allocator.alloc(ModelChoice, available.len);
-    errdefer {
-        for (choices) |choice| {
-            allocator.free(choice.provider);
-            allocator.free(choice.model_id);
-        }
-        allocator.free(choices);
-    }
+pub fn toggleScopedModel(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay) !void {
+    return model_overlay_mod.toggleScopedModel(allocator, overlay);
+}
 
-    const items = try allocator.alloc(tui.SelectItem, available.len);
-    errdefer {
-        for (items) |item| {
-            allocator.free(@constCast(item.value));
-            allocator.free(@constCast(item.label));
-            if (item.description) |description| allocator.free(@constCast(description));
-        }
-        allocator.free(items);
-    }
+pub fn enableScopedModels(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay) !void {
+    return model_overlay_mod.enableScopedModels(allocator, overlay);
+}
 
-    var selected_index: usize = 0;
-    for (available, 0..) |entry, index| {
-        const provider_changed = index == 0 or !std.mem.eql(u8, available[index - 1].provider, entry.provider);
-        const label = try formatModelOverlayLabel(allocator, entry, provider_changed);
-        errdefer allocator.free(label);
-        const description = try formatModelOverlayDescription(allocator, entry);
-        errdefer allocator.free(description);
-        choices[index] = .{
-            .provider = try allocator.dupe(u8, entry.provider),
-            .model_id = try allocator.dupe(u8, entry.model_id),
-        };
-        items[index] = .{
-            .value = try allocator.dupe(u8, entry.model_id),
-            .label = label,
-            .description = description,
-        };
-        if (std.mem.eql(u8, entry.provider, current_model.provider) and std.mem.eql(u8, entry.model_id, current_model.id)) {
-            selected_index = index;
-        }
-    }
+pub fn clearScopedModels(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay) !void {
+    return model_overlay_mod.clearScopedModels(allocator, overlay);
+}
 
-    return .{
-        .model = .{
-            .title = "Scoped model selector",
-            .hint = try allocator.dupe(u8, "Up/Down move • Enter select • Esc cancel"),
-            .choices = choices,
-            .items = items,
-            .list = .{
-                .items = items,
-                .selected_index = selected_index,
-                .max_visible = 12,
-            },
-        },
-    };
+pub fn toggleScopedProvider(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay) !void {
+    return model_overlay_mod.toggleScopedProvider(allocator, overlay);
+}
+
+pub fn reorderScopedModel(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay, delta: isize) !void {
+    return model_overlay_mod.reorderScopedModel(allocator, overlay, delta);
 }
 
 pub fn loadSelectableModels(
@@ -802,51 +714,11 @@ pub fn loadSelectableModels(
     model_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
 ) ![]provider_config.AvailableModel {
-    const available = try provider_config.listAvailableModels(allocator, env_map, current_model, configuredCredentials(runtime_config));
-    errdefer allocator.free(available);
-
-    if (current_provider) |resolved_provider| {
-        for (available) |*entry| {
-            if (!std.mem.eql(u8, entry.provider, resolved_provider.model.provider)) continue;
-            entry.auth_status = resolved_provider.auth_status;
-            entry.available = resolved_provider.auth_status != .missing;
-        }
-    }
-
-    const configured = try provider_config.filterConfiguredModels(allocator, available);
-    allocator.free(available);
-    errdefer allocator.free(configured);
-
-    const patterns = model_patterns orelse return configured;
-    const filtered = try provider_config.filterAvailableModels(allocator, configured, patterns);
-    allocator.free(configured);
-    return filtered;
+    return model_overlay_mod.loadSelectableModels(allocator, env_map, current_model, current_provider, model_patterns, runtime_config);
 }
 
-fn formatModelOverlayLabel(
-    allocator: std.mem.Allocator,
-    entry: provider_config.AvailableModel,
-    provider_changed: bool,
-) ![]u8 {
-    if (provider_changed) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{s} / {s}",
-            .{ provider_config.providerDisplayName(entry.provider), entry.display_name },
-        );
-    }
-    return std.fmt.allocPrint(allocator, "  {s}", .{entry.display_name});
-}
-
-fn formatModelOverlayDescription(
-    allocator: std.mem.Allocator,
-    entry: provider_config.AvailableModel,
-) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s} • {s}",
-        .{ entry.model_id, provider_config.providerAuthStatusLabel(entry.auth_status) },
-    );
+fn indexOfString(items: []const []const u8, needle: []const u8) ?usize {
+    return model_overlay_mod.indexOfString(items, needle);
 }
 
 pub fn modelSupportsInput(input_types: []const []const u8, expected: []const u8) bool {
@@ -860,59 +732,8 @@ pub fn loadTreeOverlay(
     allocator: std.mem.Allocator,
     session: *const session_mod.AgentSession,
 ) !SelectorOverlay {
-    const tree = try session.session_manager.getTree(allocator);
-    defer {
-        for (tree) |*node| node.deinit(allocator);
-        allocator.free(tree);
-    }
-
-    var choice_list = std.ArrayList(TreeChoice).empty;
-    errdefer {
-        for (choice_list.items) |choice| allocator.free(choice.entry_id);
-        choice_list.deinit(allocator);
-    }
-
-    var item_list = std.ArrayList(tui.SelectItem).empty;
-    errdefer {
-        for (item_list.items) |item| {
-            allocator.free(item.value);
-            allocator.free(item.label);
-            if (item.description) |description| allocator.free(description);
-        }
-        item_list.deinit(allocator);
-    }
-
-    var selected_index: usize = 0;
-    const current_leaf_id = session.session_manager.getLeafId();
-    try appendTreeNodes(allocator, tree, 0, current_leaf_id, &choice_list, &item_list, &selected_index);
-
-    if (item_list.items.len == 0) {
-        try choice_list.append(allocator, .{ .entry_id = try allocator.dupe(u8, "") });
-        try item_list.append(allocator, .{
-            .value = try allocator.dupe(u8, "none"),
-            .label = try allocator.dupe(u8, "No tree entries"),
-            .description = null,
-        });
-    }
-
-    const choices = try choice_list.toOwnedSlice(allocator);
-    errdefer {
-        for (choices) |choice| allocator.free(choice.entry_id);
-        allocator.free(choices);
-    }
-    const items = try item_list.toOwnedSlice(allocator);
-    errdefer freeOwnedSelectItems(allocator, items);
-
     return .{
-        .tree = .{
-            .choices = choices,
-            .items = items,
-            .list = .{
-                .items = items,
-                .selected_index = selected_index,
-                .max_visible = 12,
-            },
-        },
+        .tree = try tree_overlay_mod.load(allocator, session, .default),
     };
 }
 
@@ -1253,4 +1074,219 @@ test "loadModelOverlay marks current provider models available for runtime api k
 
     try std.testing.expect(saw_second_openai_model);
     try std.testing.expect(saw_runtime_status);
+}
+
+test "model overlay starts scoped, toggles all scope, and filters search tokens" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "openai-key");
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
+
+    const current_model = ai.model_registry.find("openai", "gpt-5.4").?;
+    const scoped = [_][]const u8{"anthropic/claude-sonnet-4-5"};
+    var overlay = try loadModelOverlay(allocator, &env_map, current_model, null, scoped[0..], null);
+    defer overlay.deinit(allocator);
+
+    try std.testing.expectEqual(ModelScope.scoped, overlay.model.scope);
+    try std.testing.expect(overlay.model.scoped_models.len > 0);
+    try std.testing.expect(overlay.model.choices.len >= 1);
+    var saw_scoped_anthropic = false;
+    for (overlay.model.choices) |choice| {
+        if (std.mem.eql(u8, choice.provider, "anthropic")) saw_scoped_anthropic = true;
+    }
+    try std.testing.expect(saw_scoped_anthropic);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.model.hint, "Scope: scoped") != null);
+
+    try toggleModelOverlayScope(allocator, &overlay.model);
+    try std.testing.expectEqual(ModelScope.all, overlay.model.scope);
+    try std.testing.expect(overlay.model.choices.len > 1);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.model.hint, "Scope: all") != null);
+
+    try updateModelOverlaySearch(allocator, &overlay.model, "openai gpt-5.4");
+    try std.testing.expect(overlay.model.choices.len >= 1);
+    for (overlay.model.choices) |choice| {
+        if (choice.provider.len == 0) continue;
+        try std.testing.expectEqualStrings("openai", choice.provider);
+        try std.testing.expect(std.mem.indexOf(u8, choice.model_id, "gpt-5.4") != null);
+    }
+}
+
+test "scoped models overlay toggles filtered bulk and reorders enabled ids" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "openai-key");
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
+
+    const current_model = ai.model_registry.find("openai", "gpt-5.4").?;
+    const enabled = [_][]const u8{
+        "openai/gpt-5.4",
+        "anthropic/claude-sonnet-4-5",
+    };
+    var overlay = try loadScopedModelOverlay(allocator, &env_map, current_model, null, enabled[0..], null);
+    defer overlay.deinit(allocator);
+
+    try std.testing.expectEqual(@as(std.meta.Tag(SelectorOverlay), .scoped_models), std.meta.activeTag(overlay));
+    try std.testing.expect(overlay.scoped_models.enabled_ids != null);
+    try std.testing.expectEqual(@as(usize, 2), overlay.scoped_models.enabled_ids.?.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", overlay.scoped_models.enabled_ids.?[0]);
+
+    try reorderScopedModel(allocator, &overlay.scoped_models, 1);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-5", overlay.scoped_models.enabled_ids.?[0]);
+    try std.testing.expect(overlay.scoped_models.dirty);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.scoped_models.hint, "(unsaved)") != null);
+
+    try updateScopedModelsSearch(allocator, &overlay.scoped_models, "claude");
+    try clearScopedModels(allocator, &overlay.scoped_models);
+    try std.testing.expect(overlay.scoped_models.enabled_ids != null);
+    try std.testing.expect(indexOfString(overlay.scoped_models.enabled_ids.?, "anthropic/claude-sonnet-4-5") == null);
+    try std.testing.expect(indexOfString(overlay.scoped_models.enabled_ids.?, "openai/gpt-5.4") != null);
+
+    try enableScopedModels(allocator, &overlay.scoped_models);
+    try std.testing.expect(overlay.scoped_models.enabled_ids != null);
+    try std.testing.expect(indexOfString(overlay.scoped_models.enabled_ids.?, "anthropic/claude-sonnet-4-5") != null);
+}
+
+test "session overlay search grammar filters regex phrases and named sessions" {
+    const allocator = std.testing.allocator;
+
+    const sessions = try allocator.alloc(session_manager_mod.SessionSearchInfo, 4);
+    sessions[0] = try testSessionSearchInfo(allocator, "alpha", "/tmp/alpha.jsonl", "Real Name", "Brave node\n\n   cve");
+    sessions[1] = try testSessionSearchInfo(allocator, "beta", "/tmp/beta.jsonl", "   ", "bravery node other");
+    sessions[2] = try testSessionSearchInfo(allocator, "gamma", "/tmp/gamma.jsonl", null, "node cve");
+    sessions[3] = try testSessionSearchInfo(allocator, "delta", "/tmp/delta.jsonl", "Named Two", "unrelated");
+
+    const all_sessions = try session_overlay_mod.cloneSessionSearchInfos(allocator, sessions);
+    var overlay = SessionOverlay{
+        .title = try allocator.dupe(u8, ""),
+        .hint = try allocator.dupe(u8, ""),
+        .choices = try allocator.alloc(SessionChoice, 0),
+        .items = try allocator.alloc(tui.SelectItem, 0),
+        .list = .{ .items = &.{}, .max_visible = 12 },
+        .current_sessions = sessions,
+        .all_sessions = all_sessions,
+    };
+    defer overlay.deinit(allocator);
+
+    try refreshSessionOverlay(allocator, &overlay);
+    try updateSessionOverlaySearch(allocator, &overlay, "\"node cve\"");
+    try std.testing.expectEqual(@as(usize, 2), nonEmptySessionChoiceCount(&overlay));
+
+    try updateSessionOverlaySearch(allocator, &overlay, "re:\\bbrave\\b");
+    try std.testing.expectEqual(@as(usize, 1), nonEmptySessionChoiceCount(&overlay));
+    try std.testing.expect(sessionOverlayContainsLabel(&overlay, "Real Name"));
+
+    try updateSessionOverlaySearch(allocator, &overlay, "re:(");
+    try std.testing.expectEqual(@as(usize, 0), nonEmptySessionChoiceCount(&overlay));
+    try std.testing.expect(std.mem.indexOf(u8, overlay.items[0].label, "No sessions") != null);
+
+    try updateSessionOverlaySearch(allocator, &overlay, "");
+    try toggleSessionOverlayNameFilter(allocator, &overlay);
+    try std.testing.expectEqual(@as(usize, 2), nonEmptySessionChoiceCount(&overlay));
+    try std.testing.expect(std.mem.indexOf(u8, overlay.hint, "Name: Named") != null);
+}
+
+test "session overlay threads current path aliases clamps and mutates safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "sessions", .default_dir);
+
+    const relative_session_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer allocator.free(relative_session_dir);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const session_dir = try std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_session_dir });
+    defer allocator.free(session_dir);
+
+    var parent = try session_manager_mod.SessionManager.create(allocator, std.testing.io, "/tmp/project", session_dir);
+    _ = try parent.appendSessionInfo("Parent");
+    const parent_path = try allocator.dupe(u8, parent.getSessionFile().?);
+    defer allocator.free(parent_path);
+    parent.deinit();
+
+    var child = try session_manager_mod.SessionManager.createWithParent(allocator, std.testing.io, "/tmp/project", session_dir, parent_path);
+    _ = try child.appendSessionInfo("Child");
+    const child_path = try allocator.dupe(u8, child.getSessionFile().?);
+    defer allocator.free(child_path);
+    child.deinit();
+
+    var selector = try loadSessionOverlay(allocator, std.testing.io, session_dir, parent_path);
+    defer selector.deinit(allocator);
+    const overlay = &selector.session;
+
+    try std.testing.expectEqual(@as(usize, 2), nonEmptySessionChoiceCount(overlay));
+    try std.testing.expect(std.mem.indexOf(u8, overlay.items[0].description.?, "current") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.items[1].label, "└─") != null);
+
+    overlay.list.selected_index = 0;
+    moveSessionOverlaySelection(overlay, -1);
+    try std.testing.expectEqual(@as(usize, 0), overlay.list.selected_index);
+    moveSessionOverlaySelection(overlay, 99);
+    try std.testing.expectEqual(@as(usize, 1), overlay.list.selected_index);
+
+    overlay.list.selected_index = 0;
+    beginSessionOverlayDelete(allocator, overlay) catch |err| {
+        try std.testing.expectEqual(error.CannotDeleteCurrentSession, err);
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), overlay.confirming_delete_path);
+
+    overlay.list.selected_index = 1;
+    try enterSessionOverlayRename(allocator, overlay);
+    try std.testing.expect(overlay.rename_mode);
+    try updateSessionOverlayRenameText(allocator, overlay, "  Renamed Child  ");
+    try confirmSessionOverlayRename(allocator, std.testing.io, overlay);
+    var reopened_child = try session_manager_mod.SessionManager.open(allocator, std.testing.io, child_path, null);
+    defer reopened_child.deinit();
+    try std.testing.expectEqualStrings("Renamed Child", reopened_child.getSessionName().?);
+
+    overlay.list.selected_index = 1;
+    try beginSessionOverlayDelete(allocator, overlay);
+    try confirmSessionOverlayDelete(allocator, std.testing.io, overlay);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(std.testing.io, child_path, .{}));
+}
+
+fn testSessionSearchInfo(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    path: []const u8,
+    name: ?[]const u8,
+    text: []const u8,
+) !session_manager_mod.SessionSearchInfo {
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .id = try allocator.dupe(u8, id),
+        .cwd = try allocator.dupe(u8, "/tmp/project"),
+        .name = if (name) |value| try allocator.dupe(u8, value) else null,
+        .parent_session = null,
+        .created_timestamp = try allocator.dupe(u8, "2026-01-01T00:00:00.000Z"),
+        .modified_timestamp = try allocator.dupe(u8, "2026-01-01T00:00:00.000Z"),
+        .message_count = 1,
+        .first_message = try allocator.dupe(u8, text),
+        .all_messages_text = try allocator.dupe(u8, text),
+        .search_text = try std.fmt.allocPrint(allocator, "{s} {s} {s} /tmp/project", .{ id, name orelse "", text }),
+    };
+}
+
+fn nonEmptySessionChoiceCount(overlay: *const SessionOverlay) usize {
+    var count: usize = 0;
+    for (overlay.choices) |choice| {
+        if (choice.path.len > 0) count += 1;
+    }
+    return count;
+}
+
+fn sessionOverlayContainsLabel(overlay: *const SessionOverlay, needle: []const u8) bool {
+    for (overlay.items) |item| {
+        if (std.mem.indexOf(u8, item.label, needle) != null) return true;
+    }
+    return false;
 }

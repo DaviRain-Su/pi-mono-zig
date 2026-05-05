@@ -184,6 +184,67 @@ verify_session_unchanged() {
   fi
 }
 
+verify_header_metadata_preserved() {
+  local case_dir="$1"
+  local session_file="$case_dir/sessions/missing-cwd.jsonl"
+  local before="$case_dir/missing-cwd.jsonl.before"
+  python3 - "$before" "$session_file" <<'PY'
+import json
+import sys
+
+before_path, after_path = sys.argv[1:]
+with open(before_path, "r", encoding="utf-8") as handle:
+    before_header = json.loads(handle.readline())
+with open(after_path, "r", encoding="utf-8") as handle:
+    after_header = json.loads(handle.readline())
+
+if before_header != after_header:
+    raise SystemExit(
+        "session header metadata mutated unexpectedly\n"
+        f"before: {before_header!r}\n"
+        f"after:  {after_header!r}"
+    )
+PY
+}
+
+assert_continue_prompt_messages() {
+  local session_file="$1"
+  python3 - "$session_file" <<'PY'
+import json
+import sys
+
+session_path = sys.argv[1]
+messages = []
+with open(session_path, "r", encoding="utf-8") as handle:
+    for raw_line in handle:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        entry = json.loads(raw_line)
+        if entry.get("type") != "message":
+            continue
+        message = entry["message"]
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        messages.append((role, text))
+
+expected = [("user", "continue prompt"), ("assistant", "ok")]
+if messages != expected:
+    raise SystemExit(f"unexpected Continue prompt messages: {messages!r} != {expected!r}")
+PY
+}
+
 log "case: prompt is rendered as a TUI selector"
 prompt_case_dir="$(prepare_case prompt)"
 prompt_launch_path="$(cat "$prompt_case_dir/launch.path")"
@@ -227,7 +288,6 @@ tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 log "case: continue confirms the launch cwd and bootstraps the interactive UI"
 continue_case_dir="$(prepare_case continue)"
 continue_launch_path="$(cat "$continue_case_dir/launch.path")"
-continue_stored_path="$(cat "$continue_case_dir/stored.path")"
 continue_session_file="$continue_case_dir/sessions/missing-cwd.jsonl"
 launch_pi_with_missing_cwd "$continue_case_dir"
 # Default selection is Continue (index 0).
@@ -241,30 +301,13 @@ snapshot_contains "$continue_snapshot" "Model:"
 snapshot_does_not_contain "$continue_snapshot" "Session cwd not found"
 snapshot_does_not_contain "$continue_snapshot" "Resume cancelled"
 
-# JSONL/header evidence: after Continue, the persisted session file's first
-# JSONL line (the header) must record the launch cwd as the new stored cwd
-# while preserving the session id/version. The header must no longer point
-# at the deleted stored path. This proves the fallback cwd is only persisted
-# AFTER user confirmation, not before.
-continue_header_line="$(head -n 1 "$continue_session_file")"
-python3 - "$continue_header_line" "$continue_launch_path" "$continue_stored_path" <<'PY'
-import json
-import sys
-
-header_line, launch_cwd, stored_cwd = sys.argv[1:]
-header = json.loads(header_line)
-assert header.get("type") == "session", f"unexpected type: {header.get('type')}"
-assert header.get("cwd") == launch_cwd, (
-    f"expected header cwd to match launch cwd after Continue\n"
-    f"  expected: {launch_cwd}\n"
-    f"  actual:   {header.get('cwd')}"
-)
-assert header.get("cwd") != stored_cwd, (
-    f"header cwd unexpectedly still points at the deleted stored cwd: {stored_cwd}"
-)
-assert "id" in header and header["id"], "header is missing session id"
-assert "timestamp" in header and header["timestamp"], "header is missing timestamp"
-PY
+# Submit after Continue to prove the runtime uses the launch cwd while the
+# stored session metadata remains unchanged.
+tuistory -s "$SESSION" type "continue prompt"
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "ok" --timeout 8000
+verify_header_metadata_preserved "$continue_case_dir"
+assert_continue_prompt_messages "$continue_session_file"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 log "case: selector wins over runtime_prep failures (M10 preflight ordering)"

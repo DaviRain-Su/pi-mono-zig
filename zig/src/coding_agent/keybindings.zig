@@ -45,10 +45,47 @@ pub const Action = enum(u8) {
     tree_filter_cycleBackward,
 };
 
+pub const EditorAction = enum(u8) {
+    cursor_up,
+    cursor_down,
+    cursor_left,
+    cursor_right,
+    cursor_word_left,
+    cursor_word_right,
+    cursor_line_start,
+    cursor_line_end,
+    jump_forward,
+    jump_backward,
+    page_up,
+    page_down,
+    delete_char_backward,
+    delete_char_forward,
+    delete_word_backward,
+    delete_word_forward,
+    delete_to_line_start,
+    delete_to_line_end,
+    yank,
+    yank_pop,
+    undo,
+    input_new_line,
+    input_submit,
+    input_tab,
+    input_copy,
+    select_up,
+    select_down,
+    select_page_up,
+    select_page_down,
+    select_confirm,
+    select_cancel,
+};
+
 pub const KeySpec = union(enum) {
     ctrl: u8,
+    ctrl_alt: u8,
+    alt: u8,
     escape,
     enter,
+    shift_enter,
     tab,
     shift_tab,
     alt_enter,
@@ -71,6 +108,8 @@ pub const KeySpec = union(enum) {
     page_down,
     backspace,
     delete,
+    alt_backspace,
+    alt_delete,
 
     pub fn matches(self: KeySpec, key: tui.Key, modifiers: tui.keys.KeyModifiers) bool {
         return switch (self) {
@@ -78,8 +117,22 @@ pub const KeySpec = union(enum) {
                 .ctrl => |pressed| pressed == value and !modifiers.hasAny(),
                 else => false,
             },
+            .ctrl_alt => |value| switch (key) {
+                .printable => |pk| pk.slice().len == 1 and
+                    std.ascii.toLower(pk.slice()[0]) == value and
+                    modifiers.ctrl and modifiers.alt and !modifiers.shift and !modifiers.super,
+                .ctrl => |pressed| pressed == value and modifiers.alt and !modifiers.shift and !modifiers.super,
+                else => false,
+            },
+            .alt => |value| switch (key) {
+                .printable => |pk| pk.slice().len == 1 and
+                    std.ascii.toLower(pk.slice()[0]) == value and
+                    modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
+                else => false,
+            },
             .escape => key == .escape and !modifiers.hasAny(),
             .enter => key == .enter and !modifiers.hasAny(),
+            .shift_enter => key == .enter and modifiers.shift and !modifiers.alt and !modifiers.ctrl and !modifiers.super,
             .tab => key == .tab and !modifiers.hasAny(),
             .shift_tab => key == .shift_tab and !modifiers.hasAny(),
             .alt_enter => key == .enter and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
@@ -120,14 +173,19 @@ pub const KeySpec = union(enum) {
             .page_down => key == .page_down and !modifiers.hasAny(),
             .backspace => key == .backspace and !modifiers.hasAny(),
             .delete => key == .delete and !modifiers.hasAny(),
+            .alt_backspace => key == .backspace and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
+            .alt_delete => key == .delete and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
         };
     }
 
     pub fn format(self: KeySpec, allocator: std.mem.Allocator) ![]u8 {
         return switch (self) {
             .ctrl => |value| std.fmt.allocPrint(allocator, "Ctrl+{c}", .{std.ascii.toUpper(value)}),
+            .ctrl_alt => |value| std.fmt.allocPrint(allocator, "Ctrl+Alt+{c}", .{std.ascii.toUpper(value)}),
+            .alt => |value| std.fmt.allocPrint(allocator, "Alt+{c}", .{std.ascii.toUpper(value)}),
             .escape => allocator.dupe(u8, "Esc"),
             .enter => allocator.dupe(u8, "Enter"),
+            .shift_enter => allocator.dupe(u8, "Shift+Enter"),
             .tab => allocator.dupe(u8, "Tab"),
             .shift_tab => allocator.dupe(u8, "Shift+Tab"),
             .alt_enter => allocator.dupe(u8, "Alt+Enter"),
@@ -150,6 +208,8 @@ pub const KeySpec = union(enum) {
             .page_down => allocator.dupe(u8, "PgDn"),
             .backspace => allocator.dupe(u8, "Backspace"),
             .delete => allocator.dupe(u8, "Delete"),
+            .alt_backspace => allocator.dupe(u8, "Alt+Backspace"),
+            .alt_delete => allocator.dupe(u8, "Alt+Delete"),
         };
     }
 };
@@ -209,9 +269,82 @@ comptime {
     std.debug.assert(DEFINITIONS.len == @typeInfo(Action).@"enum".fields.len);
 }
 
+const EDITOR_DEFINITIONS = [_]struct {
+    action: EditorAction,
+    id: []const u8,
+    defaults: []const []const u8,
+}{
+    .{ .action = .cursor_up, .id = "tui.editor.cursorUp", .defaults = &.{"up"} },
+    .{ .action = .cursor_down, .id = "tui.editor.cursorDown", .defaults = &.{"down"} },
+    .{ .action = .cursor_left, .id = "tui.editor.cursorLeft", .defaults = &.{ "left", "ctrl+b" } },
+    .{ .action = .cursor_right, .id = "tui.editor.cursorRight", .defaults = &.{ "right", "ctrl+f" } },
+    .{ .action = .cursor_word_left, .id = "tui.editor.cursorWordLeft", .defaults = &.{ "alt+left", "ctrl+left", "alt+b" } },
+    .{ .action = .cursor_word_right, .id = "tui.editor.cursorWordRight", .defaults = &.{ "alt+right", "ctrl+right", "alt+f" } },
+    .{ .action = .cursor_line_start, .id = "tui.editor.cursorLineStart", .defaults = &.{ "home", "ctrl+a" } },
+    .{ .action = .cursor_line_end, .id = "tui.editor.cursorLineEnd", .defaults = &.{ "end", "ctrl+e" } },
+    .{ .action = .jump_forward, .id = "tui.editor.jumpForward", .defaults = &.{"ctrl+]"} },
+    .{ .action = .jump_backward, .id = "tui.editor.jumpBackward", .defaults = &.{"ctrl+alt+]"} },
+    .{ .action = .page_up, .id = "tui.editor.pageUp", .defaults = &.{"pageUp"} },
+    .{ .action = .page_down, .id = "tui.editor.pageDown", .defaults = &.{"pageDown"} },
+    .{ .action = .delete_char_backward, .id = "tui.editor.deleteCharBackward", .defaults = &.{"backspace"} },
+    .{ .action = .delete_char_forward, .id = "tui.editor.deleteCharForward", .defaults = &.{ "delete", "ctrl+d" } },
+    .{ .action = .delete_word_backward, .id = "tui.editor.deleteWordBackward", .defaults = &.{ "ctrl+w", "alt+backspace" } },
+    .{ .action = .delete_word_forward, .id = "tui.editor.deleteWordForward", .defaults = &.{ "alt+d", "alt+delete" } },
+    .{ .action = .delete_to_line_start, .id = "tui.editor.deleteToLineStart", .defaults = &.{"ctrl+u"} },
+    .{ .action = .delete_to_line_end, .id = "tui.editor.deleteToLineEnd", .defaults = &.{"ctrl+k"} },
+    .{ .action = .yank, .id = "tui.editor.yank", .defaults = &.{"ctrl+y"} },
+    .{ .action = .yank_pop, .id = "tui.editor.yankPop", .defaults = &.{"alt+y"} },
+    .{ .action = .undo, .id = "tui.editor.undo", .defaults = &.{"ctrl+-"} },
+    .{ .action = .input_new_line, .id = "tui.input.newLine", .defaults = &.{"shift+enter"} },
+    .{ .action = .input_submit, .id = "tui.input.submit", .defaults = &.{"enter"} },
+    .{ .action = .input_tab, .id = "tui.input.tab", .defaults = &.{"tab"} },
+    .{ .action = .input_copy, .id = "tui.input.copy", .defaults = &.{"ctrl+c"} },
+    .{ .action = .select_up, .id = "tui.select.up", .defaults = &.{"up"} },
+    .{ .action = .select_down, .id = "tui.select.down", .defaults = &.{"down"} },
+    .{ .action = .select_page_up, .id = "tui.select.pageUp", .defaults = &.{"pageUp"} },
+    .{ .action = .select_page_down, .id = "tui.select.pageDown", .defaults = &.{"pageDown"} },
+    .{ .action = .select_confirm, .id = "tui.select.confirm", .defaults = &.{"enter"} },
+    .{ .action = .select_cancel, .id = "tui.select.cancel", .defaults = &.{ "escape", "ctrl+c" } },
+};
+
+comptime {
+    std.debug.assert(EDITOR_DEFINITIONS.len == @typeInfo(EditorAction).@"enum".fields.len);
+}
+
 /// Legacy keybinding name → modern dotted ID migration table.
 /// Matches TS KEYBINDING_NAME_MIGRATIONS (app-level entries only).
 const LEGACY_MIGRATIONS = [_]struct { legacy: []const u8, modern: []const u8 }{
+    .{ .legacy = "cursorUp", .modern = "tui.editor.cursorUp" },
+    .{ .legacy = "cursorDown", .modern = "tui.editor.cursorDown" },
+    .{ .legacy = "cursorLeft", .modern = "tui.editor.cursorLeft" },
+    .{ .legacy = "cursorRight", .modern = "tui.editor.cursorRight" },
+    .{ .legacy = "cursorWordLeft", .modern = "tui.editor.cursorWordLeft" },
+    .{ .legacy = "cursorWordRight", .modern = "tui.editor.cursorWordRight" },
+    .{ .legacy = "cursorLineStart", .modern = "tui.editor.cursorLineStart" },
+    .{ .legacy = "cursorLineEnd", .modern = "tui.editor.cursorLineEnd" },
+    .{ .legacy = "jumpForward", .modern = "tui.editor.jumpForward" },
+    .{ .legacy = "jumpBackward", .modern = "tui.editor.jumpBackward" },
+    .{ .legacy = "pageUp", .modern = "tui.editor.pageUp" },
+    .{ .legacy = "pageDown", .modern = "tui.editor.pageDown" },
+    .{ .legacy = "deleteCharBackward", .modern = "tui.editor.deleteCharBackward" },
+    .{ .legacy = "deleteCharForward", .modern = "tui.editor.deleteCharForward" },
+    .{ .legacy = "deleteWordBackward", .modern = "tui.editor.deleteWordBackward" },
+    .{ .legacy = "deleteWordForward", .modern = "tui.editor.deleteWordForward" },
+    .{ .legacy = "deleteToLineStart", .modern = "tui.editor.deleteToLineStart" },
+    .{ .legacy = "deleteToLineEnd", .modern = "tui.editor.deleteToLineEnd" },
+    .{ .legacy = "yank", .modern = "tui.editor.yank" },
+    .{ .legacy = "yankPop", .modern = "tui.editor.yankPop" },
+    .{ .legacy = "undo", .modern = "tui.editor.undo" },
+    .{ .legacy = "newLine", .modern = "tui.input.newLine" },
+    .{ .legacy = "submit", .modern = "tui.input.submit" },
+    .{ .legacy = "tab", .modern = "tui.input.tab" },
+    .{ .legacy = "copy", .modern = "tui.input.copy" },
+    .{ .legacy = "selectUp", .modern = "tui.select.up" },
+    .{ .legacy = "selectDown", .modern = "tui.select.down" },
+    .{ .legacy = "selectPageUp", .modern = "tui.select.pageUp" },
+    .{ .legacy = "selectPageDown", .modern = "tui.select.pageDown" },
+    .{ .legacy = "selectConfirm", .modern = "tui.select.confirm" },
+    .{ .legacy = "selectCancel", .modern = "tui.select.cancel" },
     .{ .legacy = "interrupt", .modern = "app.interrupt" },
     .{ .legacy = "clear", .modern = "app.clear" },
     .{ .legacy = "exit", .modern = "app.exit" },
@@ -245,22 +378,30 @@ const LEGACY_MIGRATIONS = [_]struct { legacy: []const u8, modern: []const u8 }{
 pub const Keybindings = struct {
     allocator: std.mem.Allocator,
     bindings: [DEFINITIONS.len][]KeySpec,
+    editor_bindings: [EDITOR_DEFINITIONS.len][]KeySpec,
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Keybindings {
         var result = Keybindings{
             .allocator = allocator,
             .bindings = undefined,
+            .editor_bindings = undefined,
         };
         errdefer result.deinit();
 
         for (DEFINITIONS, 0..) |definition, index| {
             result.bindings[index] = try parseBindingList(allocator, definition.defaults);
         }
+        for (EDITOR_DEFINITIONS, 0..) |definition, index| {
+            result.editor_bindings[index] = try parseBindingList(allocator, definition.defaults);
+        }
         return result;
     }
 
     pub fn deinit(self: *Keybindings) void {
         for (&self.bindings) |*binding| {
+            self.allocator.free(binding.*);
+        }
+        for (&self.editor_bindings) |*binding| {
             self.allocator.free(binding.*);
         }
         self.* = undefined;
@@ -271,6 +412,13 @@ pub const Keybindings = struct {
         const owned = try self.allocator.dupe(KeySpec, specs);
         self.allocator.free(self.bindings[index]);
         self.bindings[index] = owned;
+    }
+
+    pub fn setEditorBinding(self: *Keybindings, action: EditorAction, specs: []const KeySpec) !void {
+        const index = @intFromEnum(action);
+        const owned = try self.allocator.dupe(KeySpec, specs);
+        self.allocator.free(self.editor_bindings[index]);
+        self.editor_bindings[index] = owned;
     }
 
     pub fn actionForKey(self: *const Keybindings, key: tui.Key) ?Action {
@@ -290,12 +438,64 @@ pub const Keybindings = struct {
         return null;
     }
 
+    pub fn editorActionForKeyWithModifiers(
+        self: *const Keybindings,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+    ) ?EditorAction {
+        for (EDITOR_DEFINITIONS, 0..) |definition, index| {
+            for (self.editor_bindings[index]) |spec| {
+                if (spec.matches(key, modifiers)) return definition.action;
+            }
+        }
+        return null;
+    }
+
+    pub fn matchesAction(
+        self: *const Keybindings,
+        action: Action,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+    ) bool {
+        const binding = self.bindings[@intFromEnum(action)];
+        for (binding) |spec| {
+            if (spec.matches(key, modifiers)) return true;
+        }
+        return false;
+    }
+
+    pub fn matchesEditorAction(
+        self: *const Keybindings,
+        action: EditorAction,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+    ) bool {
+        const binding = self.editor_bindings[@intFromEnum(action)];
+        for (binding) |spec| {
+            if (spec.matches(key, modifiers)) return true;
+        }
+        return false;
+    }
+
     pub fn primaryLabel(self: *const Keybindings, allocator: std.mem.Allocator, action: Action) ![]u8 {
         const binding = self.bindings[@intFromEnum(action)];
         if (binding.len == 0) return allocator.dupe(u8, "Unbound");
         return binding[0].format(allocator);
     }
 };
+
+pub fn defaultEditorActionForKeyWithModifiers(
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) ?EditorAction {
+    for (EDITOR_DEFINITIONS) |definition| {
+        for (definition.defaults) |raw| {
+            const spec = parseKeySpec(raw) orelse continue;
+            if (spec.matches(key, modifiers)) return definition.action;
+        }
+    }
+    return null;
+}
 
 pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Keybindings {
     var keybindings = try Keybindings.initDefaults(allocator);
@@ -337,6 +537,12 @@ pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         const specs = parseBindingValue(allocator, raw_binding) catch continue;
         defer allocator.free(specs);
         try keybindings.setBinding(definition.action, specs);
+    }
+    for (EDITOR_DEFINITIONS) |definition| {
+        const raw_binding = resolved.get(definition.id) orelse continue;
+        const specs = parseBindingValue(allocator, raw_binding) catch continue;
+        defer allocator.free(specs);
+        try keybindings.setEditorBinding(definition.action, specs);
     }
 
     return keybindings;
@@ -391,6 +597,7 @@ fn parseKeySpec(raw: []const u8) ?KeySpec {
 
     if (std.mem.eql(u8, normalized, "escape") or std.mem.eql(u8, normalized, "esc")) return .escape;
     if (std.mem.eql(u8, normalized, "enter") or std.mem.eql(u8, normalized, "return")) return .enter;
+    if (std.mem.eql(u8, normalized, "shift+enter") or std.mem.eql(u8, normalized, "shift+return")) return .shift_enter;
     if (std.mem.eql(u8, normalized, "tab")) return .tab;
     if (std.mem.eql(u8, normalized, "shift+tab")) return .shift_tab;
     if (std.mem.eql(u8, normalized, "alt+enter")) return .alt_enter;
@@ -411,6 +618,8 @@ fn parseKeySpec(raw: []const u8) ?KeySpec {
     if (std.mem.eql(u8, normalized, "pagedown") or std.mem.eql(u8, normalized, "page_down")) return .page_down;
     if (std.mem.eql(u8, normalized, "backspace")) return .backspace;
     if (std.mem.eql(u8, normalized, "delete") or std.mem.eql(u8, normalized, "del")) return .delete;
+    if (std.mem.eql(u8, normalized, "alt+backspace")) return .alt_backspace;
+    if (std.mem.eql(u8, normalized, "alt+delete") or std.mem.eql(u8, normalized, "alt+del")) return .alt_delete;
 
     // shift+ctrl+<letter>: e.g. "shift+ctrl+p"
     if (std.mem.startsWith(u8, normalized, "shift+ctrl+") and normalized.len == 12) {
@@ -420,11 +629,25 @@ fn parseKeySpec(raw: []const u8) ?KeySpec {
         }
     }
 
-    // ctrl+<letter or digit>: e.g. "ctrl+c", "ctrl+0"
+    if (std.mem.startsWith(u8, normalized, "ctrl+alt+") and normalized.len == 10) {
+        const value = normalized[9];
+        if ((value >= 'a' and value <= 'z') or value == ']') {
+            return .{ .ctrl_alt = value };
+        }
+    }
+
+    // ctrl+<letter, digit, or TS-supported punctuation>: e.g. "ctrl+c", "ctrl+0", "ctrl+-", "ctrl+]"
     if (std.mem.startsWith(u8, normalized, "ctrl+") and normalized.len == 6) {
         const value = normalized[5];
-        if ((value >= 'a' and value <= 'z') or (value >= '0' and value <= '9')) {
+        if ((value >= 'a' and value <= 'z') or (value >= '0' and value <= '9') or value == '-' or value == ']') {
             return .{ .ctrl = value };
+        }
+    }
+
+    if (std.mem.startsWith(u8, normalized, "alt+") and normalized.len == 5) {
+        const value = normalized[4];
+        if (value >= 'a' and value <= 'z') {
+            return .{ .alt = value };
         }
     }
 
@@ -694,6 +917,48 @@ test "keybinding loadFromFile overrides defaults" {
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'v' }) == null);
     try std.testing.expectEqual(Action.session_rename, loaded.actionForKey(.{ .ctrl = '9' }).?);
     try std.testing.expect(loaded.actionForKey(.{ .ctrl = 'r' }) == null);
+}
+
+test "keybinding loadFromFile overrides editor and input bindings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "keybindings.json",
+        .data =
+        \\{
+        \\  "tui.editor.cursorLeft": "ctrl+h",
+        \\  "tui.editor.cursorRight": "ctrl+l",
+        \\  "tui.editor.cursorWordLeft": "alt+h",
+        \\  "tui.editor.deleteCharBackward": "ctrl+8",
+        \\  "tui.input.submit": "ctrl+j",
+        \\  "tui.input.newLine": "shift+enter",
+        \\  "tui.select.cancel": "ctrl+q"
+        \\}
+        ,
+    });
+
+    const config_path = try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path, "keybindings.json" });
+    defer allocator.free(config_path);
+
+    var loaded = try loadFromFile(allocator, std.testing.io, config_path);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(EditorAction.cursor_left, loaded.editorActionForKeyWithModifiers(.{ .ctrl = 'h' }, .{}).?);
+    try std.testing.expect(loaded.editorActionForKeyWithModifiers(.left, .{}) == null);
+    try std.testing.expectEqual(EditorAction.cursor_right, loaded.editorActionForKeyWithModifiers(.{ .ctrl = 'l' }, .{}).?);
+    try std.testing.expectEqual(EditorAction.cursor_word_left, loaded.editorActionForKeyWithModifiers(
+        .{ .printable = tui.keys.PrintableKey.fromSlice("h") },
+        .{ .alt = true },
+    ).?);
+    try std.testing.expectEqual(EditorAction.delete_char_backward, loaded.editorActionForKeyWithModifiers(.{ .ctrl = '8' }, .{}).?);
+    try std.testing.expectEqual(EditorAction.input_submit, loaded.editorActionForKeyWithModifiers(.{ .ctrl = 'j' }, .{}).?);
+    try std.testing.expectEqual(EditorAction.select_confirm, loaded.editorActionForKeyWithModifiers(.enter, .{}).?);
+    try std.testing.expectEqual(EditorAction.input_new_line, loaded.editorActionForKeyWithModifiers(.enter, .{ .shift = true }).?);
+    try std.testing.expectEqual(EditorAction.select_cancel, loaded.editorActionForKeyWithModifiers(.{ .ctrl = 'q' }, .{}).?);
+    try std.testing.expect(loaded.editorActionForKeyWithModifiers(.escape, .{}) == null);
 }
 
 test "keybinding loadFromFile handles missing file" {

@@ -311,7 +311,10 @@ fn asciiControlKeyFromCodepoint(codepoint: u32) ?u8 {
         0x01...0x07 => @intCast('a' + (codepoint - 1)),
         0x0B, 0x0C => @intCast('a' + (codepoint - 1)),
         0x0E...0x1A => @intCast('a' + (codepoint - 1)),
-        0x1C...0x1F => @intCast('a' + (codepoint - 1)),
+        0x1C => '\\',
+        0x1D => ']',
+        0x1E => '^',
+        0x1F => '_',
         else => null,
     };
 }

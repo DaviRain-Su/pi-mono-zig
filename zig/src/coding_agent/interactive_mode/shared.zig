@@ -27,6 +27,11 @@ pub const AppContext = struct {
     }
 };
 
+pub const ExtensionCommandSink = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (context: ?*anyopaque, raw_command: []const u8) anyerror!bool,
+};
+
 /// Controls how a stored session cwd that no longer exists is handled when
 /// resuming/forking/opening a persisted session.
 ///
@@ -58,6 +63,7 @@ pub const RunInteractiveModeOptions = struct {
     initial_prompt: ?[]const u8 = null,
     initial_images: []const ai.ImageContent = &.{},
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
+    skills: []const resources_mod.Skill = &.{},
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
     terminal_name: []const u8 = "term",
@@ -79,8 +85,10 @@ pub const LiveResources = struct {
     runtime_config: ?*const config_mod.RuntimeConfig,
     keybindings: ?*const keybindings_mod.Keybindings,
     prompt_templates: []const resources_mod.PromptTemplate,
+    skills: []const resources_mod.Skill,
     theme: ?*const resources_mod.Theme,
     terminal_name: []const u8,
+    extension_command_sink: ?ExtensionCommandSink = null,
     runtime_theme_name: ?[]u8 = null,
     owned_runtime_config: ?config_mod.RuntimeConfig = null,
     owned_resource_bundle: ?resources_mod.ResourceBundle = null,
@@ -90,9 +98,15 @@ pub const LiveResources = struct {
             .runtime_config = options.runtime_config,
             .keybindings = options.keybindings,
             .prompt_templates = options.prompt_templates,
+            .skills = options.skills,
             .theme = options.theme,
             .terminal_name = if (options.terminal_name.len > 0) options.terminal_name else "term",
         };
+    }
+
+    pub fn dispatchExtensionCommand(self: *LiveResources, raw_command: []const u8) !bool {
+        const sink = self.extension_command_sink orelse return false;
+        return try sink.callback(sink.context, raw_command);
     }
 
     pub fn deinit(self: *LiveResources, allocator: std.mem.Allocator) void {
@@ -176,6 +190,7 @@ pub const LiveResources = struct {
         self.runtime_config = &self.owned_runtime_config.?;
         self.keybindings = &self.owned_runtime_config.?.keybindings;
         self.prompt_templates = self.owned_resource_bundle.?.prompt_templates;
+        self.skills = self.owned_resource_bundle.?.skills;
         self.theme = self.owned_resource_bundle.?.selectedTheme();
         self.terminal_name = self.owned_resource_bundle.?.terminal_name;
         return self.owned_resource_bundle.?.diagnostics;

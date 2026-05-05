@@ -301,6 +301,63 @@ pub const AgentSession = struct {
         try self.reloadFromSession();
     }
 
+    pub const NavigateTreeOptions = struct {
+        summarize: bool = false,
+        summary_text: ?[]const u8 = null,
+        label: ?[]const u8 = null,
+    };
+
+    pub const NavigateTreeResult = struct {
+        editor_text: ?[]u8 = null,
+        summary_entry_id: ?[]const u8 = null,
+
+        pub fn deinit(self: *NavigateTreeResult, allocator: std.mem.Allocator) void {
+            if (self.editor_text) |text| allocator.free(text);
+            self.* = .{};
+        }
+    };
+
+    pub fn navigateTree(
+        self: *AgentSession,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        options: NavigateTreeOptions,
+    ) !NavigateTreeResult {
+        if (self.session_manager.getLeafId()) |leaf_id| {
+            if (std.mem.eql(u8, leaf_id, target_id)) return .{};
+        }
+
+        const target_entry = self.session_manager.getEntry(target_id) orelse return error.EntryNotFound;
+        const new_leaf_id = treeNavigationLeaf(target_entry);
+        const editor_text = try treeNavigationEditorText(allocator, target_entry);
+        errdefer if (editor_text) |text| allocator.free(text);
+
+        var summary_entry_id: ?[]const u8 = null;
+        if (options.summarize) {
+            const summary = options.summary_text orelse "Branch summary";
+            summary_entry_id = try self.session_manager.branchWithSummary(new_leaf_id, summary, null, false);
+            if (options.label) |label| {
+                _ = try self.session_manager.appendLabelChange(summary_entry_id.?, label);
+            }
+        } else if (new_leaf_id) |id| {
+            try self.session_manager.branch(id);
+            if (options.label) |label| {
+                _ = try self.session_manager.appendLabelChange(target_id, label);
+            }
+        } else {
+            self.session_manager.resetLeaf();
+            if (options.label) |label| {
+                _ = try self.session_manager.appendLabelChange(target_id, label);
+            }
+        }
+
+        try self.reloadFromSession();
+        return .{
+            .editor_text = editor_text,
+            .summary_entry_id = summary_entry_id,
+        };
+    }
+
     pub fn setThinkingLevel(self: *AgentSession, thinking_level: agent.ThinkingLevel) !void {
         self.agent.setThinkingLevel(thinking_level);
         _ = try self.session_manager.appendThinkingLevelChange(thinking_level);
@@ -649,6 +706,40 @@ fn resolveModel(explicit_model: ?ai.Model, restored: ?session_manager.SessionMod
         return model;
     }
     return agent.DEFAULT_MODEL;
+}
+
+fn treeNavigationLeaf(entry: *const session_manager.SessionEntry) ?[]const u8 {
+    return switch (entry.*) {
+        .message => |message_entry| switch (message_entry.message) {
+            .user => message_entry.parent_id,
+            else => entry.id(),
+        },
+        .custom_message => |custom_message_entry| custom_message_entry.parent_id,
+        else => entry.id(),
+    };
+}
+
+fn treeNavigationEditorText(allocator: std.mem.Allocator, entry: *const session_manager.SessionEntry) !?[]u8 {
+    return switch (entry.*) {
+        .message => |message_entry| switch (message_entry.message) {
+            .user => |user_message| try contentBlocksTextAlloc(allocator, user_message.content),
+            else => null,
+        },
+        .custom_message => |custom_message_entry| switch (custom_message_entry.content) {
+            .text => |text| try allocator.dupe(u8, text),
+            .blocks => |blocks| try contentBlocksTextAlloc(allocator, blocks),
+        },
+        else => null,
+    };
+}
+
+fn contentBlocksTextAlloc(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    for (blocks) |block| {
+        if (block == .text) try writer.writer.writeAll(block.text.text);
+    }
+    return try allocator.dupe(u8, writer.written());
 }
 
 fn handleSessionManagerEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
@@ -1139,6 +1230,82 @@ test "agent session navigation switches visible branch transcript" {
     try session.navigateTo(branch_id);
     try std.testing.expectEqual(@as(usize, 2), session.agent.getMessages().len);
     try std.testing.expectEqualStrings("branch", session.agent.getMessages()[1].assistant.content[0].text.text);
+}
+
+test "agent session tree navigation matches user parentage and summary attachment" {
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    const manager = try std.testing.allocator.create(session_manager.SessionManager);
+    var manager_transferred = false;
+    errdefer if (!manager_transferred) std.testing.allocator.destroy(manager);
+    manager.* = try session_manager.SessionManager.inMemory(std.testing.allocator, std.testing.io, "/tmp/project");
+    errdefer if (!manager_transferred) manager.deinit();
+
+    var root = try makeUserMessage("root prompt", 1);
+    defer session_manager.deinitMessage(std.testing.allocator, &root);
+    const root_id = try manager.appendMessage(root);
+
+    var main = try makeAssistantMessage("main branch", model, 2);
+    defer session_manager.deinitMessage(std.testing.allocator, &main);
+    const main_id = try manager.appendMessage(main);
+
+    try manager.branch(root_id);
+    var alternate_prompt = try makeUserMessage("alternate prompt", 3);
+    defer session_manager.deinitMessage(std.testing.allocator, &alternate_prompt);
+    const alternate_user_id = try manager.appendMessage(alternate_prompt);
+
+    var alternate_reply = try makeAssistantMessage("alternate reply", model, 4);
+    defer session_manager.deinitMessage(std.testing.allocator, &alternate_reply);
+    const alternate_reply_id = try manager.appendMessage(alternate_reply);
+
+    try manager.branch(main_id);
+
+    var session = try AgentSession.initWithManager(
+        std.testing.allocator,
+        std.testing.io,
+        "/tmp/project",
+        "system prompt",
+        model,
+        null,
+        .off,
+        &.{},
+        .{},
+        .{},
+        manager,
+    );
+    manager_transferred = true;
+    defer session.deinit();
+
+    var user_result = try session.navigateTree(std.testing.allocator, alternate_user_id, .{});
+    defer user_result.deinit(std.testing.allocator);
+    try std.testing.expect(user_result.editor_text != null);
+    try std.testing.expectEqualStrings("alternate prompt", user_result.editor_text.?);
+    try std.testing.expectEqualStrings(root_id, session.session_manager.getLeafId().?);
+    try std.testing.expectEqual(@as(usize, 1), session.agent.getMessages().len);
+    try std.testing.expectEqualStrings("root prompt", session.agent.getMessages()[0].user.content[0].text.text);
+
+    try session.navigateTo(main_id);
+    var summary_result = try session.navigateTree(std.testing.allocator, alternate_reply_id, .{
+        .summarize = true,
+        .summary_text = "summarized abandoned branch",
+    });
+    defer summary_result.deinit(std.testing.allocator);
+    try std.testing.expect(summary_result.summary_entry_id != null);
+    const summary_entry = session.session_manager.getEntry(summary_result.summary_entry_id.?);
+    try std.testing.expect(summary_entry != null);
+    try std.testing.expect(summary_entry.?.* == .branch_summary);
+    try std.testing.expectEqualStrings(alternate_reply_id, summary_entry.?.branch_summary.parent_id.?);
+    try std.testing.expectEqualStrings(summary_result.summary_entry_id.?, session.session_manager.getLeafId().?);
+    try std.testing.expect(std.mem.indexOf(u8, session.agent.getMessages()[session.agent.getMessages().len - 1].user.content[0].text.text, "summarized abandoned branch") != null);
 }
 
 test "VAL-CROSS-006 session reload keeps errored partial assistant inert" {

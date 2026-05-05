@@ -30,6 +30,7 @@ const SelectorOverlay = overlays.SelectorOverlay;
 const AuthFlow = overlays.AuthFlow;
 const loadAuthOverlay = overlays.loadAuthOverlay;
 const loadSelectableModels = overlays.loadSelectableModels;
+const loadSettingsOverlay = overlays.loadSettingsOverlay;
 const loadSettingsEditorOverlay = overlays.loadSettingsEditorOverlay;
 const loadSessionOverlay = overlays.loadSessionOverlay;
 const loadModelOverlay = overlays.loadModelOverlay;
@@ -81,27 +82,26 @@ pub const BuiltinSlashCommand = struct {
 };
 
 pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
-    .{ .name = "settings", .description = "Open settings editor" },
-    .{ .name = "model", .description = "Select model (opens selector UI)", .argument_hint = "<provider/model>" },
-    .{ .name = "theme", .description = "Switch active theme (no arg opens selector UI)", .argument_hint = "<name>" },
-    .{ .name = "scoped-models", .description = "Select from the scoped model cycling list" },
-    .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl/.json/.md)", .argument_hint = "<path.html|path.jsonl>" },
-    .{ .name = "import", .description = "Import and resume a session from JSONL", .argument_hint = "<path.jsonl>" },
-    .{ .name = "share", .description = "Upload session as a private GitHub gist with a shareable HTML link" },
-    .{ .name = "copy", .description = "Copy last assistant message" },
+    .{ .name = "settings", .description = "Open settings menu" },
+    .{ .name = "model", .description = "Select model (opens selector UI)" },
+    .{ .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling" },
+    .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl)" },
+    .{ .name = "import", .description = "Import and resume a session from a JSONL file" },
+    .{ .name = "share", .description = "Share session as a secret GitHub gist" },
+    .{ .name = "copy", .description = "Copy last agent message to clipboard" },
     .{ .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
     .{ .name = "session", .description = "Show session info and stats" },
-    .{ .name = "changelog", .description = "Show CHANGELOG.md", .argument_hint = "<full|condensed>" },
-    .{ .name = "hotkeys", .description = "Show keyboard shortcut help" },
-    .{ .name = "fork", .description = "Create a new fork from the latest user message" },
+    .{ .name = "changelog", .description = "Show changelog entries" },
+    .{ .name = "hotkeys", .description = "Show all keyboard shortcuts" },
+    .{ .name = "fork", .description = "Create a new fork from a previous user message" },
     .{ .name = "clone", .description = "Duplicate the current session at the current position" },
-    .{ .name = "tree", .description = "Navigate the session tree" },
-    .{ .name = "login", .description = "Log into a provider", .argument_hint = "<provider>" },
-    .{ .name = "logout", .description = "Remove stored authentication", .argument_hint = "<provider>" },
-    .{ .name = "new", .description = "Start a fresh session" },
-    .{ .name = "compact", .description = "Manually compact the session context", .argument_hint = "<instructions>" },
+    .{ .name = "tree", .description = "Navigate session tree (switch branches)" },
+    .{ .name = "login", .description = "Configure provider authentication" },
+    .{ .name = "logout", .description = "Remove provider authentication" },
+    .{ .name = "new", .description = "Start a new session" },
+    .{ .name = "compact", .description = "Manually compact the session context" },
     .{ .name = "resume", .description = "Resume a different session" },
-    .{ .name = "reload", .description = "Reload keybindings, skills, prompts, and themes" },
+    .{ .name = "reload", .description = "Reload keybindings, extensions, skills, prompts, and themes" },
     .{ .name = "quit", .description = "Quit pi" },
 };
 
@@ -199,7 +199,10 @@ pub fn handleSlashCommand(
         .settings => try handleSettingsSlashCommand(
             allocator,
             io,
+            env_map,
             session,
+            command.argument,
+            options,
             app_state,
             overlay,
             live_resources,
@@ -353,7 +356,7 @@ pub fn handleSlashCommand(
                 try app_state.setStatus("wait for the current response to finish before switching sessions");
                 return;
             }
-            overlay.* = try loadSessionOverlay(allocator, io, session_dir);
+            overlay.* = try loadSessionOverlay(allocator, io, session_dir, session.session_manager.getSessionFile());
         },
         .reload => {
             if (prompt_worker_active.*) {
@@ -637,6 +640,58 @@ fn persistDefaultModelSelection(
     try common.writeFileAbsolute(io, settings_path, serialized, true);
 }
 
+pub fn persistEnabledModelSelection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    patterns: ?[]const []const u8,
+) !void {
+    const config = runtime_config orelse return;
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ config.agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    const existing = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (existing) |bytes| allocator.free(bytes);
+
+    var parsed = if (existing) |bytes|
+        std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+            try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{})
+    else
+        try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        parsed.deinit();
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    }
+
+    if (patterns) |values| {
+        var array = std.json.Array.init(allocator);
+        errdefer array.deinit();
+        for (values) |pattern| {
+            try array.append(.{ .string = pattern });
+        }
+        if (parsed.value.object.getPtr("enabledModels")) |existing_value| {
+            existing_value.* = .{ .array = array };
+        } else {
+            try parsed.value.object.put(allocator, "enabledModels", .{ .array = array });
+        }
+    } else {
+        if (parsed.value.object.getPtr("enabledModels")) |existing_value| {
+            existing_value.* = .null;
+        } else {
+            try parsed.value.object.put(allocator, "enabledModels", .null);
+        }
+    }
+
+    const serialized = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, settings_path, serialized, true);
+}
+
 fn putJsonString(
     allocator: std.mem.Allocator,
     object: *std.json.ObjectMap,
@@ -674,12 +729,13 @@ pub fn handleModelSlashCommand(
     app_state: *AppState,
     overlay: *?SelectorOverlay,
 ) !void {
+    const scoped_patterns = currentScopedModelPatterns(app_state, options, runtime_config);
     const search = argument orelse {
-        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
+        overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, scoped_patterns, runtime_config);
         return;
     };
 
-    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
+    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), current_provider, scoped_patterns, runtime_config);
     defer allocator.free(available);
 
     if (findExactModelEntry(available, search)) |entry| {
@@ -697,7 +753,7 @@ pub fn handleModelSlashCommand(
         return;
     }
 
-    overlay.* = try loadModelOverlayWithSearch(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config, search);
+    overlay.* = try loadModelOverlayWithSearch(allocator, env_map, session.agent.getModel(), current_provider, scoped_patterns, runtime_config, search);
 }
 
 fn findExactModelEntry(
@@ -876,24 +932,35 @@ pub fn handleScopedModelsSlashCommand(
     app_state: *AppState,
     overlay: *?SelectorOverlay,
 ) !void {
+    const scoped_patterns = currentScopedModelPatterns(app_state, options, runtime_config);
     overlay.* = loadScopedModelOverlay(
         allocator,
         env_map,
         session.agent.getModel(),
         current_provider,
-        options.model_patterns,
+        scoped_patterns,
         runtime_config,
     ) catch |err| switch (err) {
-        error.NoScopedModelPatterns => {
-            try app_state.setStatus("No scoped models configured. Launch pi with --models to limit model cycling.");
-            return;
-        },
         error.NoScopedModelsAvailable => {
-            try app_state.setStatus("No scoped models matched the current model scope.");
+            try app_state.setStatus("No models available to configure.");
             return;
         },
         else => return err,
     };
+}
+
+fn currentScopedModelPatterns(
+    app_state: *const AppState,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) ?[]const []const u8 {
+    if (app_state.hasScopedModelOverride()) return app_state.scopedModelPatterns();
+    if (runtime_config) |config| {
+        if (config.settings.enabled_models) |patterns| {
+            if (patterns.len > 0) return patterns;
+        }
+    }
+    return options.model_patterns;
 }
 
 pub fn handleSessionSlashCommand(
@@ -1559,17 +1626,391 @@ pub const BrowserOpenCapture = struct {
 pub fn handleSettingsSlashCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
+    env_map: *const std.process.Environ.Map,
     session: *const session_mod.AgentSession,
+    argument: ?[]const u8,
+    options: RunInteractiveModeOptions,
     app_state: *AppState,
     overlay: *?SelectorOverlay,
     live_resources: *LiveResources,
 ) !void {
-    _ = session;
     const runtime_config = live_resources.runtime_config orelse {
         try app_state.setStatus("Settings editor is unavailable in this session");
         return;
     };
-    overlay.* = try loadSettingsEditorOverlay(allocator, io, runtime_config, live_resources.theme);
+    if (argument) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, "raw") or std.ascii.eqlIgnoreCase(trimmed, "json")) {
+            overlay.* = try loadSettingsEditorOverlay(allocator, io, runtime_config, live_resources.theme);
+            return;
+        }
+    }
+    try live_resources.ensureOwnedBundle(allocator, io, env_map, options.cwd);
+    const themes = if (live_resources.owned_resource_bundle) |*bundle| bundle.themes else &.{};
+    overlay.* = try loadSettingsOverlay(allocator, runtime_config, session, themes, live_resources.theme, false);
+}
+
+pub fn handleSettingsOverlayKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    key: tui.Key,
+    session: *session_mod.AgentSession,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    live_resources: *LiveResources,
+) !void {
+    var overlay_value = overlay.* orelse return;
+    if (std.meta.activeTag(overlay_value) != .settings) return;
+    const settings = &overlay_value.settings;
+
+    switch (key) {
+        .escape => {
+            if (settings.mode == .theme) {
+                applyThemeByName(allocator, io, env_map, options.cwd, settings.original_theme, app_state, live_resources) catch {};
+                try overlays.exitSettingsSubmenu(allocator, settings);
+                overlay.* = overlay_value;
+                return;
+            }
+            if (settings.mode != .main) {
+                try overlays.exitSettingsSubmenu(allocator, settings);
+                overlay.* = overlay_value;
+                return;
+            }
+            overlay_value.deinit(allocator);
+            overlay.* = null;
+            return;
+        },
+        .backspace => {
+            if (settings.mode == .main and settings.search.len > 0) {
+                try overlays.updateSettingsSearch(allocator, settings, settings.search[0 .. settings.search.len - 1]);
+            }
+            overlay.* = overlay_value;
+            return;
+        },
+        .up, .down => {
+            _ = settings.list.handleKey(key);
+            if (settings.mode == .theme) {
+                if (overlays.selectedSettingsChoice(settings)) |choice| {
+                    applyThemeByName(allocator, io, env_map, options.cwd, choice.value, app_state, live_resources) catch {};
+                }
+            }
+            overlay.* = overlay_value;
+            return;
+        },
+        .enter => {
+            try activateSettingsChoice(allocator, io, env_map, session, options, app_state, editor, &overlay_value, overlay, live_resources);
+            return;
+        },
+        .printable => |printable| {
+            const text = printable.slice();
+            if (std.mem.eql(u8, text, " ")) {
+                try activateSettingsChoice(allocator, io, env_map, session, options, app_state, editor, &overlay_value, overlay, live_resources);
+                return;
+            }
+            if (settings.mode == .main and (std.mem.eql(u8, text, "r") or std.mem.eql(u8, text, "R"))) {
+                const runtime_config = live_resources.runtime_config orelse {
+                    try app_state.setStatus("Settings editor is unavailable in this session");
+                    overlay.* = overlay_value;
+                    return;
+                };
+                overlay_value.deinit(allocator);
+                overlay.* = try loadSettingsEditorOverlay(allocator, io, runtime_config, live_resources.theme);
+                return;
+            }
+            if (settings.mode == .main) {
+                const next_search = try std.fmt.allocPrint(allocator, "{s}{s}", .{ settings.search, text });
+                defer allocator.free(next_search);
+                try overlays.updateSettingsSearch(allocator, settings, next_search);
+            }
+            overlay.* = overlay_value;
+            return;
+        },
+        else => {
+            _ = settings.list.handleKey(key);
+            overlay.* = overlay_value;
+            return;
+        },
+    }
+}
+
+fn activateSettingsChoice(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay_value: *SelectorOverlay,
+    overlay: *?SelectorOverlay,
+    live_resources: *LiveResources,
+) !void {
+    const settings = &overlay_value.settings;
+    const choice = overlays.selectedSettingsChoice(settings) orelse return;
+    switch (settings.mode) {
+        .main => switch (choice.id) {
+            .none => return,
+            .raw_json => {
+                const runtime_config = live_resources.runtime_config orelse {
+                    try app_state.setStatus("Settings editor is unavailable in this session");
+                    return;
+                };
+                overlay_value.deinit(allocator);
+                overlay.* = try loadSettingsEditorOverlay(allocator, io, runtime_config, live_resources.theme);
+                return;
+            },
+            .thinking => try overlays.enterSettingsMode(allocator, settings, .thinking),
+            .theme => try overlays.enterSettingsMode(allocator, settings, .theme),
+            .warnings => try overlays.enterSettingsMode(allocator, settings, .warnings),
+            else => try cycleStructuredSetting(allocator, io, env_map, session, options, app_state, editor, settings, choice, live_resources),
+        },
+        .thinking => {
+            const next = parseThinkingLevelName(choice.value) orelse return;
+            try session.setThinkingLevel(next);
+            try app_state.setStatus("thinking level updated");
+            try overlays.exitSettingsSubmenu(allocator, settings);
+        },
+        .theme => {
+            try persistStructuredSetting(allocator, io, env_map, options, .theme, choice.value, app_state, live_resources);
+            try app_state.setStatus("theme updated");
+            try overlays.exitSettingsSubmenu(allocator, settings);
+        },
+        .warnings => {
+            const next_value = if (std.mem.eql(u8, choice.value, "true")) "false" else "true";
+            try persistStructuredSetting(allocator, io, env_map, options, .warnings, next_value, app_state, live_resources);
+            try overlays.refreshSettingsOverlay(allocator, settings);
+        },
+    }
+    settings.runtime_config = live_resources.runtime_config;
+    overlay.* = overlay_value.*;
+}
+
+fn cycleStructuredSetting(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    settings: *overlays.SettingsOverlay,
+    choice: @import("settings_overlay.zig").Choice,
+    live_resources: *LiveResources,
+) !void {
+    const next_value = try nextSettingsValue(allocator, choice.id, choice.value);
+    defer allocator.free(next_value);
+    try persistStructuredSetting(allocator, io, env_map, options, choice.id, next_value, app_state, live_resources);
+    try applyStructuredSettingSideEffect(session, app_state, editor, choice.id, next_value, live_resources);
+    settings.runtime_config = live_resources.runtime_config;
+    try overlays.refreshSettingsOverlay(allocator, settings);
+}
+
+fn nextSettingsValue(allocator: std.mem.Allocator, id: overlays.SettingId, current: []const u8) ![]u8 {
+    return switch (id) {
+        .autocompact,
+        .show_images,
+        .auto_resize_images,
+        .block_images,
+        .skill_commands,
+        .show_hardware_cursor,
+        .clear_on_shrink,
+        .terminal_progress,
+        .hide_thinking,
+        .collapse_changelog,
+        .quiet_startup,
+        .install_telemetry,
+        => allocator.dupe(u8, if (std.mem.eql(u8, current, "true")) "false" else "true"),
+        .image_width_cells => nextFromList(allocator, &.{ "60", "80", "120" }, current),
+        .editor_padding => nextFromList(allocator, &.{ "0", "1", "2", "3" }, current),
+        .autocomplete_max_visible => nextFromList(allocator, &.{ "3", "5", "7", "10", "15", "20" }, current),
+        .steering_mode, .follow_up_mode => nextFromList(allocator, &.{ "one-at-a-time", "all" }, current),
+        .transport => nextFromList(allocator, &.{ "sse", "websocket", "websocket-cached", "auto" }, current),
+        .double_escape_action => nextFromList(allocator, &.{ "tree", "fork", "none" }, current),
+        .tree_filter_mode => nextFromList(allocator, &.{ "default", "no-tools", "user-only", "labeled-only", "all" }, current),
+        else => allocator.dupe(u8, current),
+    };
+}
+
+fn nextFromList(allocator: std.mem.Allocator, values: []const []const u8, current: []const u8) ![]u8 {
+    var next_index: usize = 0;
+    for (values, 0..) |value, index| {
+        if (std.mem.eql(u8, value, current)) {
+            next_index = (index + 1) % values.len;
+            break;
+        }
+    }
+    return allocator.dupe(u8, values[next_index]);
+}
+
+fn persistStructuredSetting(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    options: RunInteractiveModeOptions,
+    id: overlays.SettingId,
+    value: []const u8,
+    app_state: *AppState,
+    live_resources: *LiveResources,
+) !void {
+    const runtime_config = live_resources.runtime_config orelse {
+        try app_state.setStatus("Settings are unavailable in this session");
+        return;
+    };
+    var settings_json = loadSettingsJsonValue(allocator, io, runtime_config.agent_dir) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "Invalid settings.json: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.appendError(message);
+        return;
+    };
+    defer common.deinitJsonValue(allocator, settings_json);
+    if (settings_json != .object) {
+        try app_state.appendError("Invalid settings.json: top-level value must be an object");
+        return;
+    }
+
+    try updateSettingsJsonValue(allocator, &settings_json.object, id, value);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const serialized = try std.json.Stringify.valueAlloc(allocator, settings_json, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, settings_path, serialized, true);
+
+    const diagnostics = try live_resources.reload(allocator, io, env_map, options.cwd);
+    try appendResourceDiagnostics(allocator, app_state, diagnostics);
+}
+
+fn loadSettingsJsonValue(allocator: std.mem.Allocator, io: std.Io, agent_dir: []const u8) !std.json.Value {
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const content = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) },
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    return common.cloneJsonValue(allocator, parsed.value);
+}
+
+fn updateSettingsJsonValue(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    id: overlays.SettingId,
+    value: []const u8,
+) !void {
+    switch (id) {
+        .autocompact => try putNestedBool(allocator, object, "compaction", "enabled", parseBoolText(value)),
+        .show_images => try putNestedBool(allocator, object, "terminal", "showImages", parseBoolText(value)),
+        .image_width_cells => try putNestedInteger(allocator, object, "terminal", "imageWidthCells", try parseUsizeText(value)),
+        .auto_resize_images => try putNestedBool(allocator, object, "images", "autoResize", parseBoolText(value)),
+        .block_images => try putNestedBool(allocator, object, "images", "blockImages", parseBoolText(value)),
+        .skill_commands => try putBool(allocator, object, "enableSkillCommands", parseBoolText(value)),
+        .show_hardware_cursor => try putBool(allocator, object, "showHardwareCursor", parseBoolText(value)),
+        .editor_padding => try putInteger(allocator, object, "editorPaddingX", try parseUsizeText(value)),
+        .autocomplete_max_visible => try putInteger(allocator, object, "autocompleteMaxVisible", try parseUsizeText(value)),
+        .clear_on_shrink => try putNestedBool(allocator, object, "terminal", "clearOnShrink", parseBoolText(value)),
+        .terminal_progress => try putNestedBool(allocator, object, "terminal", "showTerminalProgress", parseBoolText(value)),
+        .steering_mode => try putString(allocator, object, "steeringMode", value),
+        .follow_up_mode => try putString(allocator, object, "followUpMode", value),
+        .transport => try putString(allocator, object, "transport", value),
+        .hide_thinking => try putBool(allocator, object, "hideThinkingBlock", parseBoolText(value)),
+        .collapse_changelog => try putBool(allocator, object, "collapseChangelog", parseBoolText(value)),
+        .quiet_startup => try putBool(allocator, object, "quietStartup", parseBoolText(value)),
+        .install_telemetry => try putBool(allocator, object, "enableInstallTelemetry", parseBoolText(value)),
+        .double_escape_action => try putString(allocator, object, "doubleEscapeAction", value),
+        .tree_filter_mode => try putString(allocator, object, "treeFilterMode", value),
+        .theme => try putString(allocator, object, "theme", value),
+        .warnings => try putNestedBool(allocator, object, "warnings", "anthropicExtraUsage", parseBoolText(value)),
+        else => {},
+    }
+}
+
+fn applyStructuredSettingSideEffect(
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    id: overlays.SettingId,
+    value: []const u8,
+    live_resources: *LiveResources,
+) !void {
+    switch (id) {
+        .autocompact => session.compaction_settings = configuredCompactionSettings(live_resources.runtime_config),
+        .steering_mode => session.agent.steering_queue.mode = parseQueueMode(value),
+        .follow_up_mode => session.agent.follow_up_queue.mode = parseQueueMode(value),
+        .hide_thinking => try app_state.setThinkingBlockVisibility(parseBoolText(value)),
+        .editor_padding, .autocomplete_max_visible => configurePrimaryEditor(editor, live_resources.runtime_config),
+        else => {},
+    }
+    try app_state.setStatus("setting updated");
+}
+
+fn putString(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try putOwnedValue(allocator, object, key, .{ .string = try allocator.dupe(u8, value) });
+}
+
+fn putBool(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
+    try putOwnedValue(allocator, object, key, .{ .bool = value });
+}
+
+fn putInteger(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: usize) !void {
+    try putOwnedValue(allocator, object, key, .{ .integer = @intCast(value) });
+}
+
+fn putNestedBool(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, nested_key: []const u8, value: bool) !void {
+    const nested = try ensureNestedObject(allocator, object, key);
+    try putBool(allocator, nested, nested_key, value);
+}
+
+fn putNestedInteger(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, nested_key: []const u8, value: usize) !void {
+    const nested = try ensureNestedObject(allocator, object, key);
+    try putInteger(allocator, nested, nested_key, value);
+}
+
+fn ensureNestedObject(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8) !*std.json.ObjectMap {
+    if (object.getPtr(key)) |existing| {
+        if (existing.* != .object) {
+            common.deinitJsonValue(allocator, existing.*);
+            existing.* = .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+        }
+        return &existing.object;
+    }
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) });
+    return &object.getPtr(key).?.object;
+}
+
+fn putOwnedValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
+    if (object.getPtr(key)) |existing| {
+        common.deinitJsonValue(allocator, existing.*);
+        existing.* = value;
+        return;
+    }
+    try object.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+fn parseBoolText(value: []const u8) bool {
+    return std.mem.eql(u8, value, "true");
+}
+
+fn parseUsizeText(value: []const u8) !usize {
+    return try std.fmt.parseInt(usize, value, 10);
+}
+
+fn parseQueueMode(value: []const u8) agent.QueueMode {
+    return if (std.mem.eql(u8, value, "all")) .all else .one_at_a_time;
+}
+
+fn parseThinkingLevelName(value: []const u8) ?agent.ThinkingLevel {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return null;
 }
 
 pub fn handleImportSlashCommand(
@@ -2304,11 +2745,13 @@ pub fn saveSettingsEditorOverlay(
     var overlay_value = overlay.* orelse return;
     if (std.meta.activeTag(overlay_value) != .settings_editor) return;
 
-    const trimmed = std.mem.trim(u8, overlay_value.settings_editor.editor.text(), " \t\r\n");
+    const expanded_text = try overlay_value.settings_editor.editor.expandedTextAlloc(allocator);
+    defer allocator.free(expanded_text);
+    const trimmed = std.mem.trim(u8, expanded_text, " \t\r\n");
     const serialized = if (trimmed.len == 0)
         "{\n}\n"
     else
-        overlay_value.settings_editor.editor.text();
+        expanded_text;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, serialized, .{}) catch |err| {
         const message = try std.fmt.allocPrint(allocator, "Invalid settings.json: {s}", .{@errorName(err)});
@@ -2326,6 +2769,9 @@ pub fn saveSettingsEditorOverlay(
 
     const diagnostics = try live_resources.reload(allocator, io, env_map, options.cwd);
     configurePrimaryEditor(editor, live_resources.runtime_config);
+    if (live_resources.runtime_config) |runtime_config| {
+        try app_state.setThinkingBlockVisibility(runtime_config.hideThinkingBlock());
+    }
     session.compaction_settings = configuredCompactionSettings(live_resources.runtime_config);
     session.retry_settings = configuredRetrySettings(live_resources.runtime_config);
 
@@ -2646,13 +3092,23 @@ pub fn replaceCurrentSession(
 }
 
 pub fn navigateTree(
+    allocator: std.mem.Allocator,
     session: *session_mod.AgentSession,
     entry_id: []const u8,
     app_state: *AppState,
+    editor: *tui.Editor,
+    options: session_mod.AgentSession.NavigateTreeOptions,
 ) !void {
-    try session.navigateTo(entry_id);
-    try rebuildAppStateFromSession(session.allocator, session.io, app_state, session, null);
-    try app_state.setStatus("session tree updated");
+    var result = try session.navigateTree(allocator, entry_id, options);
+    defer result.deinit(allocator);
+    try rebuildAppStateFromSession(allocator, session.io, app_state, session, null);
+    if (result.editor_text) |text| {
+        if (std.mem.trim(u8, editor.text(), " \t\r\n").len == 0 and text.len > 0) {
+            editor.reset();
+            _ = try editor.handlePaste(text);
+        }
+    }
+    try app_state.setStatus(if (result.summary_entry_id != null) "session tree updated with branch summary" else "session tree updated");
 }
 
 pub fn findLastUserMessageIndex(messages: []const agent.AgentMessage) ?usize {
@@ -2911,4 +3367,38 @@ test "parseGistIdFromOutput extracts gist ID from URL" {
     try std.testing.expect(parseGistIdFromOutput("   \n  ") == null);
     // ID with invalid characters should be rejected
     try std.testing.expect(parseGistIdFromOutput("https://gist.github.com/user/abc!def") == null);
+}
+
+test "built-in slash command autocomplete matrix matches TypeScript order" {
+    const expected = [_][]const u8{
+        "settings",
+        "model",
+        "scoped-models",
+        "export",
+        "import",
+        "share",
+        "copy",
+        "name",
+        "session",
+        "changelog",
+        "hotkeys",
+        "fork",
+        "clone",
+        "tree",
+        "login",
+        "logout",
+        "new",
+        "compact",
+        "resume",
+        "reload",
+        "quit",
+    };
+
+    try std.testing.expectEqual(expected.len, BUILTIN_SLASH_COMMANDS.len);
+    for (expected, 0..) |name, index| {
+        try std.testing.expectEqualStrings(name, BUILTIN_SLASH_COMMANDS[index].name);
+        var buffer: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "/{s}", .{name});
+        try std.testing.expect(parseSlashCommand(text) != null);
+    }
 }

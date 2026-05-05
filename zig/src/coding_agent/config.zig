@@ -19,18 +19,56 @@ pub const ConfigError = config_errors.ConfigError;
 pub const ConfigErrorSource = config_errors.Source;
 pub const configErrorSourceName = config_errors.sourceName;
 
+pub const DoubleEscapeAction = enum {
+    fork,
+    tree,
+    none,
+};
+
+pub const QueueModeSetting = enum {
+    all,
+    one_at_a_time,
+};
+
+pub const TreeFilterMode = enum {
+    default,
+    no_tools,
+    user_only,
+    labeled_only,
+    all,
+};
+
 pub const Settings = struct {
     default_provider: ?[]u8 = null,
     default_model: ?[]u8 = null,
+    enabled_models: ?[]const []const u8 = null,
     default_thinking_level: ?agent.ThinkingLevel = null,
+    transport: ?ai.types.Transport = null,
+    steering_mode: ?QueueModeSetting = null,
+    follow_up_mode: ?QueueModeSetting = null,
     theme: ?[]u8 = null,
     session_dir: ?[]u8 = null,
+    hide_thinking_block: ?bool = null,
+    quiet_startup: ?bool = null,
+    collapse_changelog: ?bool = null,
+    enable_install_telemetry: ?bool = null,
+    enable_skill_commands: ?bool = null,
+    show_hardware_cursor: ?bool = null,
+    terminal_show_images: ?bool = null,
+    terminal_image_width_cells: ?usize = null,
+    terminal_clear_on_shrink: ?bool = null,
+    terminal_show_progress: ?bool = null,
     editor_padding_x: ?usize = null,
     autocomplete_max_visible: ?usize = null,
     /// Mirrors TypeScript `settings.images.autoResize`. When null the
     /// runtime defaults to `true` (TS default) via
     /// `RuntimeConfig.imageAutoResize`.
     image_auto_resize: ?bool = null,
+    image_block_images: ?bool = null,
+    double_escape_action: ?DoubleEscapeAction = null,
+    tree_filter_mode: ?TreeFilterMode = null,
+    warning_anthropic_extra_usage: ?bool = null,
+    branch_summary_skip_prompt: ?bool = null,
     compaction: ?session_mod.CompactionSettings = null,
     retry: ?session_mod.RetrySettings = null,
     packages: ?[]const resources_mod.PackageSourceConfig = null,
@@ -42,6 +80,7 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, allocator: std.mem.Allocator) void {
         if (self.default_provider) |value| allocator.free(value);
         if (self.default_model) |value| allocator.free(value);
+        freeStringList(allocator, self.enabled_models);
         if (self.theme) |value| allocator.free(value);
         if (self.session_dir) |value| allocator.free(value);
         freePackageSources(allocator, self.packages);
@@ -56,12 +95,31 @@ pub const Settings = struct {
         return .{
             .default_provider = if (self.default_provider) |value| try allocator.dupe(u8, value) else null,
             .default_model = if (self.default_model) |value| try allocator.dupe(u8, value) else null,
+            .enabled_models = try cloneStringList(allocator, self.enabled_models),
             .default_thinking_level = self.default_thinking_level,
+            .transport = self.transport,
+            .steering_mode = self.steering_mode,
+            .follow_up_mode = self.follow_up_mode,
             .theme = if (self.theme) |value| try allocator.dupe(u8, value) else null,
             .session_dir = if (self.session_dir) |value| try allocator.dupe(u8, value) else null,
+            .hide_thinking_block = self.hide_thinking_block,
+            .quiet_startup = self.quiet_startup,
+            .collapse_changelog = self.collapse_changelog,
+            .enable_install_telemetry = self.enable_install_telemetry,
+            .enable_skill_commands = self.enable_skill_commands,
+            .show_hardware_cursor = self.show_hardware_cursor,
+            .terminal_show_images = self.terminal_show_images,
+            .terminal_image_width_cells = self.terminal_image_width_cells,
+            .terminal_clear_on_shrink = self.terminal_clear_on_shrink,
+            .terminal_show_progress = self.terminal_show_progress,
             .editor_padding_x = self.editor_padding_x,
             .autocomplete_max_visible = self.autocomplete_max_visible,
             .image_auto_resize = self.image_auto_resize,
+            .image_block_images = self.image_block_images,
+            .double_escape_action = self.double_escape_action,
+            .tree_filter_mode = self.tree_filter_mode,
+            .warning_anthropic_extra_usage = self.warning_anthropic_extra_usage,
+            .branch_summary_skip_prompt = self.branch_summary_skip_prompt,
             .compaction = self.compaction,
             .retry = self.retry,
             .packages = try clonePackageSources(allocator, self.packages),
@@ -100,6 +158,80 @@ pub const RuntimeConfig = struct {
     /// when the merged `images.autoResize` is unset.
     pub fn imageAutoResize(self: *const RuntimeConfig) bool {
         return self.settings.image_auto_resize orelse true;
+    }
+
+    pub fn blockImages(self: *const RuntimeConfig) bool {
+        return self.settings.image_block_images orelse false;
+    }
+
+    pub fn showImages(self: *const RuntimeConfig) bool {
+        return self.settings.terminal_show_images orelse true;
+    }
+
+    pub fn imageWidthCells(self: *const RuntimeConfig) usize {
+        return self.settings.terminal_image_width_cells orelse 60;
+    }
+
+    pub fn clearOnShrink(self: *const RuntimeConfig) bool {
+        return self.settings.terminal_clear_on_shrink orelse false;
+    }
+
+    pub fn showTerminalProgress(self: *const RuntimeConfig) bool {
+        return self.settings.terminal_show_progress orelse false;
+    }
+
+    pub fn enableSkillCommands(self: *const RuntimeConfig) bool {
+        return self.settings.enable_skill_commands orelse true;
+    }
+
+    pub fn hideThinkingBlock(self: *const RuntimeConfig) bool {
+        return self.settings.hide_thinking_block orelse false;
+    }
+
+    pub fn collapseChangelog(self: *const RuntimeConfig) bool {
+        return self.settings.collapse_changelog orelse false;
+    }
+
+    pub fn quietStartup(self: *const RuntimeConfig) bool {
+        return self.settings.quiet_startup orelse false;
+    }
+
+    pub fn enableInstallTelemetry(self: *const RuntimeConfig) bool {
+        return self.settings.enable_install_telemetry orelse true;
+    }
+
+    pub fn showHardwareCursor(self: *const RuntimeConfig) bool {
+        return self.settings.show_hardware_cursor orelse false;
+    }
+
+    pub fn transport(self: *const RuntimeConfig) ai.types.Transport {
+        return self.settings.transport orelse .auto;
+    }
+
+    pub fn steeringMode(self: *const RuntimeConfig) QueueModeSetting {
+        return self.settings.steering_mode orelse .one_at_a_time;
+    }
+
+    pub fn followUpMode(self: *const RuntimeConfig) QueueModeSetting {
+        return self.settings.follow_up_mode orelse .one_at_a_time;
+    }
+
+    /// Mirrors TS `settingsManager.getDoubleEscapeAction()`: defaults to
+    /// opening the session tree on a double Escape when unset.
+    pub fn doubleEscapeAction(self: *const RuntimeConfig) DoubleEscapeAction {
+        return self.settings.double_escape_action orelse .tree;
+    }
+
+    pub fn treeFilterMode(self: *const RuntimeConfig) TreeFilterMode {
+        return self.settings.tree_filter_mode orelse .default;
+    }
+
+    pub fn warningAnthropicExtraUsage(self: *const RuntimeConfig) bool {
+        return self.settings.warning_anthropic_extra_usage orelse true;
+    }
+
+    pub fn branchSummarySkipPrompt(self: *const RuntimeConfig) bool {
+        return self.settings.branch_summary_skip_prompt orelse false;
     }
 
     pub fn lookupApiKey(self: *const RuntimeConfig, provider: []const u8) ?[]const u8 {
@@ -292,14 +424,58 @@ fn parseSettingsContent(
     if (parsed.value.object.get("defaultModel")) |value| {
         if (value == .string) result.default_model = try allocator.dupe(u8, value.string);
     }
+    result.enabled_models = try parseStringList(allocator, parsed.value.object.get("enabledModels"));
     if (parsed.value.object.get("defaultThinkingLevel")) |value| {
         if (value == .string) result.default_thinking_level = parseThinkingLevel(value.string);
+    }
+    if (parsed.value.object.get("transport")) |value| {
+        if (value == .string) result.transport = parseTransport(value.string);
+    }
+    if (parsed.value.object.get("steeringMode")) |value| {
+        if (value == .string) result.steering_mode = parseQueueModeSetting(value.string);
+    }
+    if (parsed.value.object.get("followUpMode")) |value| {
+        if (value == .string) result.follow_up_mode = parseQueueModeSetting(value.string);
     }
     if (parsed.value.object.get("theme")) |value| {
         if (value == .string) result.theme = try allocator.dupe(u8, value.string);
     }
     if (parsed.value.object.get("sessionDir")) |value| {
         if (value == .string) result.session_dir = try allocator.dupe(u8, value.string);
+    }
+    if (parsed.value.object.get("hideThinkingBlock")) |value| {
+        if (value == .bool) result.hide_thinking_block = value.bool;
+    }
+    if (parsed.value.object.get("quietStartup")) |value| {
+        if (value == .bool) result.quiet_startup = value.bool;
+    }
+    if (parsed.value.object.get("collapseChangelog")) |value| {
+        if (value == .bool) result.collapse_changelog = value.bool;
+    }
+    if (parsed.value.object.get("enableInstallTelemetry")) |value| {
+        if (value == .bool) result.enable_install_telemetry = value.bool;
+    }
+    if (parsed.value.object.get("enableSkillCommands")) |value| {
+        if (value == .bool) result.enable_skill_commands = value.bool;
+    }
+    if (parsed.value.object.get("showHardwareCursor")) |value| {
+        if (value == .bool) result.show_hardware_cursor = value.bool;
+    }
+    if (parsed.value.object.get("terminal")) |terminal_value| {
+        if (terminal_value == .object) {
+            if (terminal_value.object.get("showImages")) |inner| {
+                if (inner == .bool) result.terminal_show_images = inner.bool;
+            }
+            if (terminal_value.object.get("imageWidthCells")) |inner| {
+                result.terminal_image_width_cells = parsePositiveUsize(inner);
+            }
+            if (terminal_value.object.get("clearOnShrink")) |inner| {
+                if (inner == .bool) result.terminal_clear_on_shrink = inner.bool;
+            }
+            if (terminal_value.object.get("showTerminalProgress")) |inner| {
+                if (inner == .bool) result.terminal_show_progress = inner.bool;
+            }
+        }
     }
     if (parsed.value.object.get("editorPaddingX")) |value| {
         result.editor_padding_x = parseNonNegativeUsize(value);
@@ -311,6 +487,29 @@ fn parseSettingsContent(
         if (images_value == .object) {
             if (images_value.object.get("autoResize")) |inner| {
                 if (inner == .bool) result.image_auto_resize = inner.bool;
+            }
+            if (images_value.object.get("blockImages")) |inner| {
+                if (inner == .bool) result.image_block_images = inner.bool;
+            }
+        }
+    }
+    if (parsed.value.object.get("doubleEscapeAction")) |value| {
+        if (value == .string) result.double_escape_action = parseDoubleEscapeAction(value.string);
+    }
+    if (parsed.value.object.get("treeFilterMode")) |value| {
+        if (value == .string) result.tree_filter_mode = parseTreeFilterMode(value.string);
+    }
+    if (parsed.value.object.get("warnings")) |warnings_value| {
+        if (warnings_value == .object) {
+            if (warnings_value.object.get("anthropicExtraUsage")) |inner| {
+                if (inner == .bool) result.warning_anthropic_extra_usage = inner.bool;
+            }
+        }
+    }
+    if (parsed.value.object.get("branchSummary")) |value| {
+        if (value == .object) {
+            if (value.object.get("skipPrompt")) |inner| {
+                if (inner == .bool) result.branch_summary_skip_prompt = inner.bool;
             }
         }
     }
@@ -340,9 +539,16 @@ fn mergeSettings(allocator: std.mem.Allocator, base: Settings, overrides: Settin
         if (merged.default_model) |existing| allocator.free(existing);
         merged.default_model = try allocator.dupe(u8, value);
     }
+    if (overrides.enabled_models != null) {
+        freeStringList(allocator, merged.enabled_models);
+        merged.enabled_models = try cloneStringList(allocator, overrides.enabled_models);
+    }
     if (overrides.default_thinking_level) |value| {
         merged.default_thinking_level = value;
     }
+    if (overrides.transport) |value| merged.transport = value;
+    if (overrides.steering_mode) |value| merged.steering_mode = value;
+    if (overrides.follow_up_mode) |value| merged.follow_up_mode = value;
     if (overrides.theme) |value| {
         if (merged.theme) |existing| allocator.free(existing);
         merged.theme = try allocator.dupe(u8, value);
@@ -351,9 +557,24 @@ fn mergeSettings(allocator: std.mem.Allocator, base: Settings, overrides: Settin
         if (merged.session_dir) |existing| allocator.free(existing);
         merged.session_dir = try allocator.dupe(u8, value);
     }
+    if (overrides.hide_thinking_block) |value| merged.hide_thinking_block = value;
+    if (overrides.quiet_startup) |value| merged.quiet_startup = value;
+    if (overrides.collapse_changelog) |value| merged.collapse_changelog = value;
+    if (overrides.enable_install_telemetry) |value| merged.enable_install_telemetry = value;
+    if (overrides.enable_skill_commands) |value| merged.enable_skill_commands = value;
+    if (overrides.show_hardware_cursor) |value| merged.show_hardware_cursor = value;
+    if (overrides.terminal_show_images) |value| merged.terminal_show_images = value;
+    if (overrides.terminal_image_width_cells) |value| merged.terminal_image_width_cells = value;
+    if (overrides.terminal_clear_on_shrink) |value| merged.terminal_clear_on_shrink = value;
+    if (overrides.terminal_show_progress) |value| merged.terminal_show_progress = value;
     if (overrides.editor_padding_x) |value| merged.editor_padding_x = value;
     if (overrides.autocomplete_max_visible) |value| merged.autocomplete_max_visible = value;
     if (overrides.image_auto_resize) |value| merged.image_auto_resize = value;
+    if (overrides.image_block_images) |value| merged.image_block_images = value;
+    if (overrides.double_escape_action) |value| merged.double_escape_action = value;
+    if (overrides.tree_filter_mode) |value| merged.tree_filter_mode = value;
+    if (overrides.warning_anthropic_extra_usage) |value| merged.warning_anthropic_extra_usage = value;
+    if (overrides.branch_summary_skip_prompt) |value| merged.branch_summary_skip_prompt = value;
     merged.compaction = mergeCompaction(base.compaction, overrides.compaction);
     merged.retry = mergeRetry(base.retry, overrides.retry);
     if (overrides.packages != null) {
@@ -797,6 +1018,36 @@ fn parseThinkingLevel(value: []const u8) ?agent.ThinkingLevel {
     return null;
 }
 
+fn parseTransport(value: []const u8) ?ai.types.Transport {
+    if (std.mem.eql(u8, value, "sse")) return .sse;
+    if (std.mem.eql(u8, value, "websocket")) return .websocket;
+    if (std.mem.eql(u8, value, "websocket-cached")) return .websocket_cached;
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    return null;
+}
+
+fn parseQueueModeSetting(value: []const u8) ?QueueModeSetting {
+    if (std.mem.eql(u8, value, "all")) return .all;
+    if (std.mem.eql(u8, value, "one-at-a-time")) return .one_at_a_time;
+    return null;
+}
+
+fn parseDoubleEscapeAction(value: []const u8) ?DoubleEscapeAction {
+    if (std.mem.eql(u8, value, "fork")) return .fork;
+    if (std.mem.eql(u8, value, "tree")) return .tree;
+    if (std.mem.eql(u8, value, "none")) return .none;
+    return null;
+}
+
+fn parseTreeFilterMode(value: []const u8) ?TreeFilterMode {
+    if (std.mem.eql(u8, value, "default")) return .default;
+    if (std.mem.eql(u8, value, "no-tools")) return .no_tools;
+    if (std.mem.eql(u8, value, "user-only")) return .user_only;
+    if (std.mem.eql(u8, value, "labeled-only")) return .labeled_only;
+    if (std.mem.eql(u8, value, "all")) return .all;
+    return null;
+}
+
 fn parseNonNegativeUsize(value: std.json.Value) ?usize {
     return switch (value) {
         .integer => |number| if (number >= 0) @intCast(number) else null,
@@ -1085,6 +1336,7 @@ test "runtime config merges global and project settings with nested overrides" {
         \\  "defaultModel": "gpt-5.4",
         \\  "defaultThinkingLevel": "low",
         \\  "sessionDir": "~/sessions",
+        \\  "doubleEscapeAction": "fork",
         \\  "editorPaddingX": 1,
         \\  "compaction": {
         \\    "enabled": true,
@@ -1099,6 +1351,7 @@ test "runtime config merges global and project settings with nested overrides" {
         .data =
         \\{
         \\  "defaultProvider": "faux",
+        \\  "doubleEscapeAction": "none",
         \\  "editorPaddingX": 3,
         \\  "autocompleteMaxVisible": 9,
         \\  "compaction": {
@@ -1131,6 +1384,7 @@ test "runtime config merges global and project settings with nested overrides" {
     try std.testing.expectEqualStrings("faux", runtime.settings.default_provider.?);
     try std.testing.expectEqualStrings("gpt-5.4", runtime.settings.default_model.?);
     try std.testing.expectEqual(agent.ThinkingLevel.low, runtime.settings.default_thinking_level.?);
+    try std.testing.expectEqual(DoubleEscapeAction.none, runtime.doubleEscapeAction());
     try std.testing.expectEqual(@as(usize, 3), runtime.settings.editor_padding_x.?);
     try std.testing.expectEqual(@as(usize, 9), runtime.settings.autocomplete_max_visible.?);
     try std.testing.expectEqual(@as(usize, 0), runtime.errors.len);

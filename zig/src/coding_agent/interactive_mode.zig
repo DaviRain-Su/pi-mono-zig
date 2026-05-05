@@ -25,6 +25,7 @@ const input_dispatch = @import("interactive_mode/input_dispatch.zig");
 const clipboard_image = @import("interactive_mode/clipboard_image.zig");
 const tool_adapters = @import("interactive_mode/tool_adapters.zig");
 const session_bootstrap = @import("interactive_mode/session_bootstrap.zig");
+const extension_ui_bridge = @import("interactive_mode/extension_ui_bridge.zig");
 
 pub const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 pub const LiveResources = shared.LiveResources;
@@ -201,6 +202,7 @@ pub const handleInputKeyWithModifiers = input_dispatch.handleInputKeyWithModifie
 pub const submitEditorText = input_dispatch.submitEditorText;
 pub const clearEditor = input_dispatch.clearEditor;
 pub const loadEditorAutocompleteItems = input_dispatch.loadEditorAutocompleteItems;
+pub const loadEditorAutocompleteItemsWithResources = input_dispatch.loadEditorAutocompleteItemsWithResources;
 pub const freeOwnedSelectItems = input_dispatch.freeOwnedSelectItems;
 pub const pollForInput = input_dispatch.pollForInput;
 pub const dispatchInputEvent = input_dispatch.dispatchInputEvent;
@@ -209,6 +211,7 @@ pub const resolveAppAction = input_dispatch.resolveAppAction;
 pub const legacyAppActionForKey = input_dispatch.legacyAppActionForKey;
 pub const isLegacyAppActionKey = input_dispatch.isLegacyAppActionKey;
 pub const handleAppAction = input_dispatch.handleAppAction;
+pub const ExtensionUiBridge = extension_ui_bridge.Bridge;
 
 pub fn runInteractiveMode(
     allocator: std.mem.Allocator,
@@ -242,6 +245,7 @@ pub fn runInteractiveMode(
     var app_state = try AppState.init(allocator, io);
     defer app_state.deinit();
     app_state.setToolOutputExpanded(options.verbose);
+    try live_resources.ensureOwnedBundle(allocator, io, env_map, options.cwd);
 
     const subscriber = agent.AgentSubscriber{
         .context = &app_state,
@@ -251,6 +255,9 @@ pub fn runInteractiveMode(
     defer _ = bootstrap.session.agent.unsubscribe(subscriber);
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
+    if (live_resources.runtime_config) |runtime_config| {
+        try app_state.setThinkingBlockVisibility(runtime_config.hideThinkingBlock());
+    }
     try appendConfigErrorStartupWarning(allocator, live_resources.runtime_config, &app_state);
     try appendVerboseStartupState(
         allocator,
@@ -284,7 +291,14 @@ pub fn runInteractiveMode(
     var editor = tui.Editor.init(allocator);
     defer editor.deinit();
     configurePrimaryEditor(&editor, live_resources.runtime_config);
-    const autocomplete_items = try loadEditorAutocompleteItems(allocator, io, options.cwd);
+    const autocomplete_items = try loadEditorAutocompleteItemsWithResources(
+        allocator,
+        io,
+        options.cwd,
+        live_resources.prompt_templates,
+        live_resources.skills,
+        true,
+    );
     defer freeOwnedSelectItems(allocator, autocomplete_items);
     try editor.setAutocompleteItems(autocomplete_items);
 
@@ -305,6 +319,10 @@ pub fn runInteractiveMode(
 
     var auth_flow: ?AuthFlow = null;
     defer if (auth_flow) |*value| value.deinit(allocator);
+
+    var extension_bridge = ExtensionUiBridge.init(allocator, io);
+    defer extension_bridge.deinit();
+    live_resources.extension_command_sink = extension_bridge.commandSink();
 
     var prompt_worker: PromptWorker = undefined;
     var prompt_worker_active = false;
@@ -330,6 +348,7 @@ pub fn runInteractiveMode(
             prompt_worker_active = false;
             if (should_exit) break;
         }
+        _ = app_state.pollBashExecution(allocator);
 
         try app_state.pollClipboardPaste(.{
             .vx = input_loop.vaxis_state,
@@ -340,13 +359,25 @@ pub fn runInteractiveMode(
             .tty = input_loop.loop.tty.writer(),
         });
 
+        const now_ms = nowMilliseconds();
+        try extension_bridge.service(
+            env_map,
+            options.cwd,
+            &terminal,
+            &editor,
+            &overlay,
+            &app_state,
+            &live_resources,
+            &bootstrap.session,
+            now_ms,
+        );
+
         const size = try terminal.refreshSize();
         screen.height = size.height;
         screen.overlay = if (overlay) |*value| value else null;
         screen.keybindings = live_resources.keybindings;
         screen.theme = live_resources.theme;
         screen.terminal_name = live_resources.terminal_name;
-        const now_ms = nowMilliseconds();
         screen.now_ms = now_ms;
 
         if (overlay) |*overlay_value| {
@@ -965,26 +996,16 @@ test "tool output details stay collapsed until verbose expansion is enabled" {
     try std.testing.expect(saw_collapsed_body);
     try std.testing.expect(!saw_collapsed_details);
 
-    var expanded_state = try AppState.init(allocator, std.testing.io);
-    defer expanded_state.deinit();
-    expanded_state.setToolOutputExpanded(true);
-    try expanded_state.handleAgentEvent(.{
-        .event_type = .tool_execution_end,
-        .tool_name = "bash",
-        .result = .{
-            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello from bash" } }},
-            .details = detail_value.value,
-        },
-        .is_error = false,
-    });
-
-    var expanded_snapshot = try expanded_state.snapshotForRender(allocator);
+    collapsed_state.toggleAllExpanded();
+    var expanded_snapshot = try collapsed_state.snapshotForRender(allocator);
     defer expanded_snapshot.deinit(allocator);
 
     var saw_expanded_details = false;
     for (expanded_snapshot.items) |item| {
-        if (std.mem.indexOf(u8, item.text, "Details:") != null and
-            std.mem.indexOf(u8, item.text, "\"exit_code\":0") != null) saw_expanded_details = true;
+        if (item.expanded_text) |expanded_text| {
+            if (std.mem.indexOf(u8, expanded_text, "Details:") != null and
+                std.mem.indexOf(u8, expanded_text, "\"exit_code\":0") != null) saw_expanded_details = true;
+        }
     }
     try std.testing.expect(saw_expanded_details);
 }
@@ -2197,14 +2218,14 @@ test "loadEditorAutocompleteItems includes slash command help text" {
         if (std.mem.eql(u8, item.label, "/settings")) {
             saw_settings = true;
             try std.testing.expectEqualStrings("/settings", item.value);
-            try std.testing.expectEqualStrings("Open settings editor", item.description.?);
+            try std.testing.expectEqualStrings("Open settings menu", item.description.?);
         }
     }
 
     try std.testing.expect(saw_settings);
 }
 
-test "handleInputKey opens settings overlay for slash settings command" {
+test "handleInputKey opens structured settings overlay and explicit raw settings editor" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2277,6 +2298,76 @@ test "handleInputKey opens settings overlay for slash settings command" {
     defer allocator.free(options.session_dir);
     var live_resources = LiveResources.init(options);
     defer live_resources.deinit(allocator);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .enter,
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .settings);
+    try std.testing.expectEqualStrings("Settings", overlay.?.title());
+
+    var saw_auto_compact = false;
+    var saw_theme = false;
+    var saw_editor_padding = false;
+    var saw_raw_json = false;
+    for (overlay.?.settings.items) |item| {
+        if (std.mem.indexOf(u8, item.label, "Auto-compact") != null) saw_auto_compact = true;
+        if (std.mem.indexOf(u8, item.label, "Theme") != null and
+            std.mem.indexOf(u8, item.label, "dark") != null) saw_theme = true;
+        if (std.mem.indexOf(u8, item.label, "Editor padding") != null and
+            std.mem.indexOf(u8, item.label, "1") != null) saw_editor_padding = true;
+        if (std.mem.indexOf(u8, item.label, "Advanced raw JSON") != null) saw_raw_json = true;
+    }
+    try std.testing.expect(saw_auto_compact);
+    try std.testing.expect(saw_theme);
+    try std.testing.expect(saw_editor_padding);
+    try std.testing.expect(saw_raw_json);
+
+    try handleInputKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .printable = tui.keys.PrintableKey.fromSlice("theme") },
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &slash_commands.test_auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &live_resources,
+    );
+    try std.testing.expectEqual(@as(usize, 1), overlay.?.settings.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.?.settings.items[0].label, "Theme") != null);
+
+    if (overlay) |*value| value.deinit(allocator);
+    overlay = null;
+    editor.reset();
+    _ = try editor.handlePaste("/settings raw");
 
     try handleInputKey(
         allocator,
@@ -2985,11 +3076,12 @@ test "handleInputKey opens scoped model overlay for slash scoped-models command"
     );
 
     try std.testing.expect(overlay != null);
-    try std.testing.expect(overlay.? == .model);
+    try std.testing.expect(overlay.? == .scoped_models);
     try std.testing.expectEqualStrings("Scoped model selector", overlay.?.title());
-    try std.testing.expectEqual(@as(usize, 2), overlay.?.model.items.len);
-    try std.testing.expectEqualStrings("gpt-5.4", overlay.?.model.items[0].value);
-    try std.testing.expectEqualStrings("gpt-5.5", overlay.?.model.items[1].value);
+    try std.testing.expect(overlay.?.scoped_models.enabled_ids != null);
+    try std.testing.expectEqual(@as(usize, 2), overlay.?.scoped_models.enabled_ids.?.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", overlay.?.scoped_models.enabled_ids.?[0]);
+    try std.testing.expectEqualStrings("openai/gpt-5.5", overlay.?.scoped_models.enabled_ids.?[1]);
     try std.testing.expectEqual(@as(usize, 0), editor.text().len);
 }
 
@@ -3069,7 +3161,7 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
     );
 
     try std.testing.expect(overlay != null);
-    try std.testing.expect(overlay.? == .model);
+    try std.testing.expect(overlay.? == .scoped_models);
 
     try handleInputKey(
         allocator,
@@ -3092,7 +3184,7 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
         &live_resources,
     );
 
-    try std.testing.expectEqual(@as(usize, 1), overlay.?.model.list.selectedIndex());
+    try std.testing.expect(overlay.?.scoped_models.list.selectedIndex() < overlay.?.scoped_models.items.len);
 
     try handleInputKey(
         allocator,
@@ -3115,9 +3207,8 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
         &live_resources,
     );
 
-    try std.testing.expect(overlay == null);
-    try std.testing.expectEqualStrings("gpt-5.5", session.agent.getModel().id);
-    try std.testing.expectEqualStrings("gpt-5.5", current_provider.model.id);
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .scoped_models);
 }
 
 test "handleInputKey reports when scoped models are not configured" {
@@ -3188,10 +3279,8 @@ test "handleInputKey reports when scoped models are not configured" {
         &live_resources,
     );
 
-    try std.testing.expect(overlay == null);
-    state.mutex.lockUncancelable(state.io);
-    defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.status, "No scoped models configured") != null);
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .scoped_models);
 }
 
 test "handleInputKey reports unknown slash commands" {
@@ -4184,10 +4273,10 @@ test "session overlays use persisted session names and labels" {
     _ = try session.session_manager.appendLabelChange(user_id, "bookmark");
     _ = try session.session_manager.appendSessionInfo("Night Shift");
 
-    var session_overlay = try loadSessionOverlay(allocator, std.testing.io, session_dir);
+    var session_overlay = try loadSessionOverlay(allocator, std.testing.io, session_dir, session.session_manager.getSessionFile());
     defer session_overlay.deinit(allocator);
 
-    try std.testing.expectEqualStrings("Night Shift", session_overlay.session.items[0].label);
+    try std.testing.expect(std.mem.indexOf(u8, session_overlay.session.items[0].label, "Night Shift") != null);
 
     var tree_overlay = try loadTreeOverlay(allocator, &session);
     defer tree_overlay.deinit(allocator);

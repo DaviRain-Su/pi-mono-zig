@@ -346,10 +346,8 @@ fn openSessionAtPathCapturing(
                 // The caller (interactive mode) has already prompted the user
                 // and confirmed the fallback. Reopen with the launch cwd as an
                 // explicit override so the in-memory cwd reflects the user
-                // choice, then persist the rewritten header back to disk.
-                // This guarantees the fallback cwd is recorded ONLY after
-                // confirmation, matching TS `SessionManager.open(file,
-                // sessionDir, cwd)` behavior.
+                // choice while preserving the stored session header metadata,
+                // matching TS `SessionManager.open(file, sessionDir, cwd)`.
                 session.deinit();
                 var resumed = try session_mod.AgentSession.open(allocator, io, .{
                     .session_file = session_path,
@@ -363,7 +361,6 @@ fn openSessionAtPathCapturing(
                     .retry = configuredRetrySettings(options.runtime_config),
                 });
                 errdefer resumed.deinit();
-                try resumed.session_manager.persistToDiskNow();
                 return resumed;
             },
         }
@@ -682,12 +679,13 @@ test "openInitialSessionWithMissingCwd applies fallback cwd when the user agreed
     try std.testing.expectEqualStrings(launch_cwd, resumed.session_manager.getCwd());
     try std.testing.expectEqualStrings(launch_cwd, resumed.cwd);
 
-    // The on-disk session header must reflect the new launch cwd because the
-    // fallback cwd is persisted ONLY after user confirmation.
+    // The runtime uses the launch cwd, but the on-disk session header remains
+    // the original stored metadata. TypeScript's cwd override changes the
+    // SessionManager runtime cwd without rewriting the header line.
     const session_file_after = resumed.session_manager.getSessionFile().?;
     var on_disk_header = try session_manager_mod.readSessionHeader(allocator, std.testing.io, session_file_after);
     defer session_manager_mod.freeSessionHeader(allocator, &on_disk_header);
-    try std.testing.expectEqualStrings(launch_cwd, on_disk_header.cwd);
+    try std.testing.expectEqualStrings(stored_cwd, on_disk_header.cwd);
 }
 
 test "preflightInteractiveMissingCwd reports missing stored cwd for --continue without provider/auth resolution" {

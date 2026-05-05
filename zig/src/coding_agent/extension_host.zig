@@ -587,6 +587,15 @@ pub const HostProcess = struct {
         return self.state.registry_frames_applied;
     }
 
+    pub fn hasRegisteredCommand(self: *HostProcess, name: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.state.registry.commands.items) |command| {
+            if (std.mem.eql(u8, command.name, name)) return true;
+        }
+        return false;
+    }
+
     /// Render a deterministic JSON snapshot of the runtime registry
     /// the host has accumulated. Caller owns the returned bytes.
     pub fn snapshotRegistryJson(self: *HostProcess, allocator: std.mem.Allocator) ![]u8 {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("agent");
+const ai = @import("ai");
 const auth = @import("../auth.zig");
 const tui = @import("tui");
 const config_mod = @import("../config.zig");
@@ -12,6 +13,8 @@ const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
 const prompt_worker_mod = @import("prompt_worker.zig");
 const slash_commands = @import("slash_commands.zig");
+const tree_overlay_mod = @import("tree_overlay.zig");
+const extension_dialog = @import("extension_dialog.zig");
 const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 const LiveResources = shared.LiveResources;
 const SelectorOverlay = overlays.SelectorOverlay;
@@ -19,12 +22,35 @@ const AuthFlow = overlays.AuthFlow;
 const loadSessionOverlay = overlays.loadSessionOverlay;
 const loadModelOverlay = overlays.loadModelOverlay;
 const loadSelectableModels = overlays.loadSelectableModels;
+const toggleSessionOverlayScope = overlays.toggleSessionOverlayScope;
+const toggleSessionOverlaySort = overlays.toggleSessionOverlaySort;
+const toggleSessionOverlayNameFilter = overlays.toggleSessionOverlayNameFilter;
+const toggleSessionOverlayPath = overlays.toggleSessionOverlayPath;
+const updateSessionOverlaySearch = overlays.updateSessionOverlaySearch;
+const moveSessionOverlaySelection = overlays.moveSessionOverlaySelection;
+const beginSessionOverlayDelete = overlays.beginSessionOverlayDelete;
+const confirmSessionOverlayDelete = overlays.confirmSessionOverlayDelete;
+const cancelSessionOverlayDelete = overlays.cancelSessionOverlayDelete;
+const enterSessionOverlayRename = overlays.enterSessionOverlayRename;
+const cancelSessionOverlayRename = overlays.cancelSessionOverlayRename;
+const confirmSessionOverlayRename = overlays.confirmSessionOverlayRename;
+const updateSessionOverlayRenameText = overlays.updateSessionOverlayRenameText;
+const toggleModelOverlayScope = overlays.toggleModelOverlayScope;
+const updateModelOverlaySearch = overlays.updateModelOverlaySearch;
+const updateScopedModelsSearch = overlays.updateScopedModelsSearch;
+const toggleScopedModel = overlays.toggleScopedModel;
+const enableScopedModels = overlays.enableScopedModels;
+const clearScopedModels = overlays.clearScopedModels;
+const toggleScopedProvider = overlays.toggleScopedProvider;
+const reorderScopedModel = overlays.reorderScopedModel;
 const loadTreeOverlay = overlays.loadTreeOverlay;
 const AppState = rendering.AppState;
 const PromptWorker = prompt_worker_mod.PromptWorker;
 const parseSlashCommand = slash_commands.parseSlashCommand;
 const handleSlashCommand = slash_commands.handleSlashCommand;
 const saveSettingsEditorOverlay = slash_commands.saveSettingsEditorOverlay;
+const handleSettingsOverlayKey = slash_commands.handleSettingsOverlayKey;
+const persistEnabledModelSelection = slash_commands.persistEnabledModelSelection;
 const switchSession = slash_commands.switchSession;
 const switchModel = slash_commands.switchModel;
 const handleNewSlashCommand = slash_commands.handleNewSlashCommand;
@@ -145,6 +171,85 @@ pub fn handleInputKeyWithModifiers(
             return;
         }
 
+        if (std.meta.activeTag(overlay_value.*) == .settings) {
+            try handleSettingsOverlayKey(
+                allocator,
+                io,
+                env_map,
+                key,
+                session,
+                options,
+                app_state,
+                editor,
+                overlay,
+                live_resources,
+            );
+            return;
+        }
+
+        if (std.meta.activeTag(overlay_value.*) == .model) {
+            if (try handleModelOverlayInteractiveKey(allocator, key, modifiers, &overlay_value.model, live_resources.keybindings)) {
+                return;
+            }
+        }
+
+        if (std.meta.activeTag(overlay_value.*) == .session) {
+            if (try handleSessionOverlayInteractiveKey(
+                allocator,
+                io,
+                key,
+                modifiers,
+                &overlay_value.session,
+                live_resources.keybindings,
+                app_state,
+            )) {
+                return;
+            }
+        }
+
+        if (std.meta.activeTag(overlay_value.*) == .scoped_models) {
+            try handleScopedModelsOverlayKey(
+                allocator,
+                io,
+                key,
+                modifiers,
+                &overlay_value.scoped_models,
+                app_state,
+                live_resources.runtime_config,
+                live_resources.keybindings,
+                overlay,
+            );
+            return;
+        }
+
+        if (std.meta.activeTag(overlay_value.*) == .tree) {
+            if (try handleTreeOverlayInteractiveKey(
+                allocator,
+                key,
+                modifiers,
+                &overlay_value.tree,
+                session,
+                app_state,
+                editor,
+                live_resources.runtime_config,
+                live_resources.keybindings,
+                overlay,
+            )) {
+                return;
+            }
+        }
+
+        if (std.meta.activeTag(overlay_value.*) == .extension_dialog) {
+            try extension_dialog.handleDialogKey(
+                allocator,
+                &overlay_value.extension_dialog,
+                key,
+                modifiers,
+                live_resources.keybindings,
+            );
+            return;
+        }
+
         switch (key) {
             .escape => {
                 overlay_value.deinit(allocator);
@@ -156,12 +261,15 @@ pub fn handleInputKeyWithModifiers(
 
         const overlay_list = switch (overlay_value.*) {
             .info => &overlay_value.info.list,
+            .settings => &overlay_value.settings.list,
             .session => &overlay_value.session.list,
             .model => &overlay_value.model.list,
+            .scoped_models => &overlay_value.scoped_models.list,
             .theme => &overlay_value.theme.list,
             .tree => &overlay_value.tree.list,
             .fork => &overlay_value.fork.list,
             .auth => &overlay_value.auth.list,
+            .extension_dialog => unreachable,
             else => unreachable,
         };
         const result = overlay_list.handleKey(key);
@@ -233,7 +341,7 @@ pub fn handleInputKeyWithModifiers(
                         if (tree_overlay.choices[index].entry_id.len == 0) {
                             try app_state.setStatus("No tree entries available");
                         } else {
-                            try navigateTree(session, tree_overlay.choices[index].entry_id, app_state);
+                            try navigateTree(allocator, session, tree_overlay.choices[index].entry_id, app_state, editor, .{});
                         }
                     },
                     .fork => |fork_overlay| {
@@ -276,6 +384,7 @@ pub fn handleInputKeyWithModifiers(
                             live_resources,
                         ),
                     },
+                    .extension_dialog => unreachable,
                     else => unreachable,
                 }
                 overlay_value.deinit(allocator);
@@ -345,6 +454,35 @@ pub fn handleInputKeyWithModifiers(
         return;
     }
 
+    if (editor.isShowingAutocomplete()) {
+        if (resolveEditorAction(live_resources.keybindings, key, modifiers)) |editor_action| {
+            try handleEditorAction(
+                allocator,
+                io,
+                env_map,
+                editor_action,
+                session,
+                current_provider,
+                session_dir,
+                options,
+                tool_items,
+                app_state,
+                editor,
+                overlay,
+                auth_flow,
+                prompt_worker,
+                prompt_worker_active,
+                subscriber,
+                should_exit,
+                live_resources,
+            );
+            return;
+        }
+        if (live_resources.keybindings != null and keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) != null) {
+            return;
+        }
+    }
+
     if (key == .escape and editor.isShowingAutocomplete()) {
         _ = try editor.handleKey(key);
         return;
@@ -380,20 +518,40 @@ pub fn handleInputKeyWithModifiers(
         return;
     }
 
+    if (resolveEditorAction(live_resources.keybindings, key, modifiers)) |editor_action| {
+        try handleEditorAction(
+            allocator,
+            io,
+            env_map,
+            editor_action,
+            session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
+            app_state,
+            editor,
+            overlay,
+            auth_flow,
+            prompt_worker,
+            prompt_worker_active,
+            subscriber,
+            should_exit,
+            live_resources,
+        );
+        return;
+    }
+    if (live_resources.keybindings != null and keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) != null) {
+        return;
+    }
+
     switch (key) {
         .enter => {
             if (!modifiers.hasAny()) {
-                if (editor.isShowingAutocomplete()) {
-                    _ = try editor.handleKey(key);
-                    return;
-                }
-                const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
-                if (trimmed.len == 0) return;
-                try submitEditorText(
+                try submitEditorIfNotEmpty(
                     allocator,
                     io,
                     env_map,
-                    trimmed,
                     session,
                     current_provider,
                     session_dir,
@@ -417,17 +575,452 @@ pub fn handleInputKeyWithModifiers(
 
     const handled = try editor.handleKey(key);
     switch (handled) {
-        .interrupt => {
-            if (prompt_worker_active.*) {
-                session.agent.abort();
-                try app_state.setStatus("interrupt requested");
-            }
-        },
+        .interrupt => try handleInterruptAction(
+            allocator,
+            session,
+            app_state,
+            editor,
+            overlay,
+            prompt_worker_active,
+            live_resources.runtime_config,
+        ),
         .exit => {
             should_exit.* = true;
             if (prompt_worker_active.*) session.agent.abort();
         },
         else => {},
+    }
+}
+
+fn handleModelOverlayInteractiveKey(
+    allocator: std.mem.Allocator,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    model_overlay: *overlays.ModelOverlay,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) !bool {
+    if (matchesEditorAction(keybindings, .input_tab, key, modifiers)) {
+        try toggleModelOverlayScope(allocator, model_overlay);
+        return true;
+    }
+    if (try updateSearchFromKey(allocator, model_overlay.search, key, modifiers)) |next_search| {
+        defer allocator.free(next_search);
+        try updateModelOverlaySearch(allocator, model_overlay, next_search);
+        return true;
+    }
+    return false;
+}
+
+fn handleSessionOverlayInteractiveKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    session_overlay: *overlays.SessionOverlay,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    app_state: *AppState,
+) !bool {
+    if (session_overlay.rename_mode) {
+        if (matchesEditorAction(keybindings, .select_cancel, key, modifiers)) {
+            try cancelSessionOverlayRename(allocator, session_overlay);
+            return true;
+        }
+        if (matchesEditorAction(keybindings, .select_confirm, key, modifiers)) {
+            try confirmSessionOverlayRename(allocator, io, session_overlay);
+            try app_state.setStatus("Session renamed");
+            return true;
+        }
+        if (try updateSearchFromKey(allocator, session_overlay.rename_text, key, modifiers)) |next_text| {
+            defer allocator.free(next_text);
+            try updateSessionOverlayRenameText(allocator, session_overlay, next_text);
+            return true;
+        }
+        return true;
+    }
+
+    if (session_overlay.confirming_delete_path != null) {
+        if (matchesEditorAction(keybindings, .select_cancel, key, modifiers)) {
+            try cancelSessionOverlayDelete(allocator, session_overlay);
+            return true;
+        }
+        if (matchesEditorAction(keybindings, .select_confirm, key, modifiers)) {
+            try confirmSessionOverlayDelete(allocator, io, session_overlay);
+            try app_state.setStatus("Session deleted");
+            return true;
+        }
+        return true;
+    }
+
+    if (matchesEditorAction(keybindings, .input_tab, key, modifiers)) {
+        try toggleSessionOverlayScope(allocator, session_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .session_toggleSort, key, modifiers)) {
+        try toggleSessionOverlaySort(allocator, session_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .session_toggleNamedFilter, key, modifiers)) {
+        try toggleSessionOverlayNameFilter(allocator, session_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .session_togglePath, key, modifiers)) {
+        try toggleSessionOverlayPath(allocator, session_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .session_rename, key, modifiers)) {
+        try enterSessionOverlayRename(allocator, session_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .session_delete, key, modifiers)) {
+        beginSessionOverlayDelete(allocator, session_overlay) catch |err| switch (err) {
+            error.CannotDeleteCurrentSession => try app_state.setStatus("Cannot delete the currently active session"),
+            else => return err,
+        };
+        return true;
+    }
+    if (matchesAction(keybindings, .session_deleteNoninvasive, key, modifiers) and session_overlay.search.len == 0) {
+        beginSessionOverlayDelete(allocator, session_overlay) catch |err| switch (err) {
+            error.CannotDeleteCurrentSession => try app_state.setStatus("Cannot delete the currently active session"),
+            else => return err,
+        };
+        return true;
+    }
+
+    if (matchesEditorAction(keybindings, .select_up, key, modifiers)) {
+        moveSessionOverlaySelection(session_overlay, -1);
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_down, key, modifiers)) {
+        moveSessionOverlaySelection(session_overlay, 1);
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_page_up, key, modifiers)) {
+        moveSessionOverlaySelection(session_overlay, -@as(isize, @intCast(session_overlay.list.max_visible)));
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_page_down, key, modifiers)) {
+        moveSessionOverlaySelection(session_overlay, @intCast(session_overlay.list.max_visible));
+        return true;
+    }
+
+    if (try updateSearchFromKey(allocator, session_overlay.search, key, modifiers)) |next_search| {
+        defer allocator.free(next_search);
+        try updateSessionOverlaySearch(allocator, session_overlay, next_search);
+        return true;
+    }
+    return false;
+}
+
+fn handleScopedModelsOverlayKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    scoped_overlay: *overlays.ScopedModelsOverlay,
+    app_state: *AppState,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    overlay: *?SelectorOverlay,
+) !void {
+    if (matchesEditorAction(keybindings, .select_up, key, modifiers)) {
+        _ = scoped_overlay.list.handleKey(.up);
+        return;
+    }
+    if (matchesEditorAction(keybindings, .select_down, key, modifiers)) {
+        _ = scoped_overlay.list.handleKey(.down);
+        return;
+    }
+    if (matchesEditorAction(keybindings, .select_confirm, key, modifiers)) {
+        try toggleScopedModel(allocator, scoped_overlay);
+        try applyScopedModelSelectionToRuntime(allocator, scoped_overlay, app_state);
+        return;
+    }
+    if (matchesAction(keybindings, .models_enableAll, key, modifiers)) {
+        try enableScopedModels(allocator, scoped_overlay);
+        try applyScopedModelSelectionToRuntime(allocator, scoped_overlay, app_state);
+        return;
+    }
+    if (matchesAction(keybindings, .models_clearAll, key, modifiers)) {
+        try clearScopedModels(allocator, scoped_overlay);
+        try applyScopedModelSelectionToRuntime(allocator, scoped_overlay, app_state);
+        return;
+    }
+    if (matchesAction(keybindings, .models_toggleProvider, key, modifiers)) {
+        try toggleScopedProvider(allocator, scoped_overlay);
+        try applyScopedModelSelectionToRuntime(allocator, scoped_overlay, app_state);
+        return;
+    }
+    if (matchesAction(keybindings, .models_reorderUp, key, modifiers)) {
+        try reorderScopedModel(allocator, scoped_overlay, -1);
+        try applyScopedModelSelectionToRuntime(allocator, scoped_overlay, app_state);
+        return;
+    }
+    if (matchesAction(keybindings, .models_reorderDown, key, modifiers)) {
+        try reorderScopedModel(allocator, scoped_overlay, 1);
+        try applyScopedModelSelectionToRuntime(allocator, scoped_overlay, app_state);
+        return;
+    }
+    if (matchesAction(keybindings, .models_save, key, modifiers)) {
+        try persistEnabledModelSelection(allocator, io, runtime_config, scopedPatternsForRuntime(scoped_overlay));
+        scoped_overlay.dirty = false;
+        try overlays.refreshScopedModelsOverlay(allocator, scoped_overlay);
+        try app_state.setStatus("Model selection saved to settings");
+        return;
+    }
+    if (matchesEditorAction(keybindings, .select_cancel, key, modifiers)) {
+        if (key == .ctrl and scoped_overlay.search.len > 0) {
+            try updateScopedModelsSearch(allocator, scoped_overlay, "");
+            return;
+        }
+        if (overlay.*) |*value| {
+            value.deinit(allocator);
+            overlay.* = null;
+        }
+        return;
+    }
+    if (try updateSearchFromKey(allocator, scoped_overlay.search, key, modifiers)) |next_search| {
+        defer allocator.free(next_search);
+        try updateScopedModelsSearch(allocator, scoped_overlay, next_search);
+        return;
+    }
+}
+
+fn handleTreeOverlayInteractiveKey(
+    allocator: std.mem.Allocator,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    tree_overlay: *overlays.TreeOverlay,
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    overlay: *?SelectorOverlay,
+) !bool {
+    if (tree_overlay.mode == .label) {
+        if (matchesEditorAction(keybindings, .select_cancel, key, modifiers)) {
+            try tree_overlay_mod.cancelLabelMode(allocator, tree_overlay);
+            return true;
+        }
+        if (matchesEditorAction(keybindings, .select_confirm, key, modifiers)) {
+            if (tree_overlay.label_target_id) |target_id| {
+                const label = std.mem.trim(u8, tree_overlay.label_text, &std.ascii.whitespace);
+                _ = try session.session_manager.appendLabelChange(target_id, if (label.len == 0) null else label);
+                try tree_overlay_mod.applyLabelToNode(allocator, tree_overlay, target_id, if (label.len == 0) null else label, null);
+                try app_state.setStatus(if (label.len == 0) "label cleared" else "label updated");
+            }
+            return true;
+        }
+        if (try updateSearchFromKey(allocator, tree_overlay.label_text, key, modifiers)) |next_text| {
+            defer allocator.free(next_text);
+            try tree_overlay_mod.updateLabelText(allocator, tree_overlay, next_text);
+            return true;
+        }
+        return true;
+    }
+
+    if (tree_overlay.mode == .summary) {
+        if (matchesEditorAction(keybindings, .select_cancel, key, modifiers)) {
+            try tree_overlay_mod.cancelSummaryPrompt(allocator, tree_overlay);
+            return true;
+        }
+        if (matchesEditorAction(keybindings, .select_up, key, modifiers)) {
+            try tree_overlay_mod.moveSelection(allocator, tree_overlay, -1, true);
+            return true;
+        }
+        if (matchesEditorAction(keybindings, .select_down, key, modifiers)) {
+            try tree_overlay_mod.moveSelection(allocator, tree_overlay, 1, true);
+            return true;
+        }
+        if (matchesEditorAction(keybindings, .select_confirm, key, modifiers)) {
+            const target_id = tree_overlay.summary_target_id orelse return true;
+            const summarize = tree_overlay.list.selectedIndex() != 0;
+            const summary_text: ?[]const u8 = if (summarize)
+                "Branch summary selected from the session tree."
+            else
+                null;
+            try navigateTree(allocator, session, target_id, app_state, editor, .{
+                .summarize = summarize,
+                .summary_text = summary_text,
+            });
+            if (overlay.*) |*value| value.deinit(allocator);
+            overlay.* = null;
+            return true;
+        }
+        return true;
+    }
+
+    if (matchesEditorAction(keybindings, .select_cancel, key, modifiers)) {
+        if (try tree_overlay_mod.clearSearchAndFolds(allocator, tree_overlay)) return true;
+        return false;
+    }
+    if (matchesEditorAction(keybindings, .select_up, key, modifiers)) {
+        try tree_overlay_mod.moveSelection(allocator, tree_overlay, -1, true);
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_down, key, modifiers)) {
+        try tree_overlay_mod.moveSelection(allocator, tree_overlay, 1, true);
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_page_up, key, modifiers) or key == .left) {
+        try tree_overlay_mod.moveSelection(allocator, tree_overlay, -@as(isize, @intCast(tree_overlay.list.max_visible)), false);
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_page_down, key, modifiers) or key == .right) {
+        try tree_overlay_mod.moveSelection(allocator, tree_overlay, @intCast(tree_overlay.list.max_visible), false);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_foldOrUp, key, modifiers)) {
+        try tree_overlay_mod.foldOrMoveUp(allocator, tree_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_unfoldOrDown, key, modifiers)) {
+        try tree_overlay_mod.unfoldOrMoveDown(allocator, tree_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_editLabel, key, modifiers)) {
+        try tree_overlay_mod.beginLabelMode(allocator, tree_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_toggleLabelTimestamp, key, modifiers)) {
+        try tree_overlay_mod.toggleLabelTimestamps(allocator, tree_overlay);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_default, key, modifiers)) {
+        try tree_overlay_mod.setFilterMode(allocator, tree_overlay, .default);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_noTools, key, modifiers)) {
+        try tree_overlay_mod.setFilterMode(allocator, tree_overlay, if (tree_overlay.filter_mode == .no_tools) .default else .no_tools);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_userOnly, key, modifiers)) {
+        try tree_overlay_mod.setFilterMode(allocator, tree_overlay, if (tree_overlay.filter_mode == .user_only) .default else .user_only);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_labeledOnly, key, modifiers)) {
+        try tree_overlay_mod.setFilterMode(allocator, tree_overlay, if (tree_overlay.filter_mode == .labeled_only) .default else .labeled_only);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_all, key, modifiers)) {
+        try tree_overlay_mod.setFilterMode(allocator, tree_overlay, if (tree_overlay.filter_mode == .all) .default else .all);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_cycleForward, key, modifiers)) {
+        try tree_overlay_mod.cycleFilter(allocator, tree_overlay, 1);
+        return true;
+    }
+    if (matchesAction(keybindings, .tree_filter_cycleBackward, key, modifiers)) {
+        try tree_overlay_mod.cycleFilter(allocator, tree_overlay, -1);
+        return true;
+    }
+    if (matchesEditorAction(keybindings, .select_confirm, key, modifiers)) {
+        const target_id = tree_overlay_mod.selectedEntryId(tree_overlay) orelse {
+            try app_state.setStatus("No tree entries available");
+            return true;
+        };
+        if (tree_overlay.current_leaf_id) |leaf_id| {
+            if (std.mem.eql(u8, leaf_id, target_id)) {
+                try app_state.setStatus("Already at this point");
+                if (overlay.*) |*value| value.deinit(allocator);
+                overlay.* = null;
+                return true;
+            }
+        }
+        const skip_prompt = if (runtime_config) |config| config.branchSummarySkipPrompt() else false;
+        if (!skip_prompt) {
+            try tree_overlay_mod.beginSummaryPrompt(allocator, tree_overlay, target_id);
+            return true;
+        }
+        try navigateTree(allocator, session, target_id, app_state, editor, .{});
+        if (overlay.*) |*value| value.deinit(allocator);
+        overlay.* = null;
+        return true;
+    }
+    if (try updateSearchFromKey(allocator, tree_overlay.search, key, modifiers)) |next_search| {
+        defer allocator.free(next_search);
+        try tree_overlay_mod.updateSearch(allocator, tree_overlay, next_search);
+        return true;
+    }
+    return false;
+}
+
+fn applyScopedModelSelectionToRuntime(
+    allocator: std.mem.Allocator,
+    scoped_overlay: *const overlays.ScopedModelsOverlay,
+    app_state: *AppState,
+) !void {
+    try app_state.setScopedModelOverride(scopedPatternsForRuntime(scoped_overlay));
+    if (scopedPatternsForRuntime(scoped_overlay)) |patterns| {
+        const status = try std.fmt.allocPrint(allocator, "{d} scoped models enabled", .{patterns.len});
+        defer allocator.free(status);
+        try app_state.setStatus(status);
+    } else {
+        try app_state.setStatus("All models enabled");
+    }
+}
+
+fn scopedPatternsForRuntime(scoped_overlay: *const overlays.ScopedModelsOverlay) ?[]const []const u8 {
+    const ids = scoped_overlay.enabled_ids orelse return null;
+    if (ids.len == 0 or ids.len == scoped_overlay.all_ids.len) return null;
+    return ids;
+}
+
+fn effectiveScopedModelPatterns(
+    app_state: *const AppState,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) ?[]const []const u8 {
+    if (app_state.hasScopedModelOverride()) return app_state.scopedModelPatterns();
+    if (runtime_config) |config| {
+        if (config.settings.enabled_models) |patterns| {
+            if (patterns.len > 0) return patterns;
+        }
+    }
+    return options.model_patterns;
+}
+
+fn matchesAction(
+    keybindings: ?*const keybindings_mod.Keybindings,
+    action: keybindings_mod.Action,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) bool {
+    if (keybindings) |bindings| return bindings.matchesAction(action, key, modifiers);
+    return false;
+}
+
+fn matchesEditorAction(
+    keybindings: ?*const keybindings_mod.Keybindings,
+    action: keybindings_mod.EditorAction,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) bool {
+    if (keybindings) |bindings| return bindings.matchesEditorAction(action, key, modifiers);
+    return keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) == action;
+}
+
+fn updateSearchFromKey(
+    allocator: std.mem.Allocator,
+    current_search: []const u8,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) !?[]u8 {
+    if (modifiers.ctrl or modifiers.alt or modifiers.super) return null;
+    switch (key) {
+        .printable => |printable| {
+            const text = printable.slice();
+            if (text.len == 0) return null;
+            var next = try allocator.alloc(u8, current_search.len + text.len);
+            @memcpy(next[0..current_search.len], current_search);
+            @memcpy(next[current_search.len..], text);
+            return next;
+        },
+        .backspace => {
+            if (current_search.len == 0) return null;
+            return try allocator.dupe(u8, current_search[0 .. current_search.len - 1]);
+        },
+        else => return null,
     }
 }
 
@@ -451,6 +1044,25 @@ pub fn submitEditorText(
     should_exit: *bool,
     live_resources: *LiveResources,
 ) !void {
+    if (parseBashShortcut(trimmed)) |bash_shortcut| {
+        if (bash_shortcut.command.len == 0) return;
+        if (prompt_worker_active.*) {
+            try app_state.setStatus("wait for the current response to finish before running bash");
+            return;
+        }
+        if (app_state.isBashExecutionActive()) {
+            try app_state.setStatus("A bash command is already running. Press Esc to cancel it first.");
+            return;
+        }
+        if (!(try app_state.startBashExecution(allocator, session, bash_shortcut.command, bash_shortcut.exclude_from_context))) {
+            try app_state.setStatus("A bash command is already running. Press Esc to cancel it first.");
+            return;
+        }
+        try editor.addToHistory(trimmed);
+        clearEditor(app_state, editor);
+        return;
+    }
+
     if (parseSlashCommand(trimmed)) |command| {
         try handleSlashCommand(
             allocator,
@@ -474,10 +1086,20 @@ pub fn submitEditorText(
         return;
     }
 
-    const expanded = try resources_mod.expandPromptTemplate(allocator, trimmed, live_resources.prompt_templates);
+    const skill_expanded = try resources_mod.expandSkillCommand(allocator, io, trimmed, live_resources.skills);
+    defer allocator.free(skill_expanded);
+    const expanded = try resources_mod.expandPromptTemplate(allocator, skill_expanded, live_resources.prompt_templates);
     defer allocator.free(expanded);
 
-    if (trimmed.len > 0 and trimmed[0] == '/' and std.mem.eql(u8, expanded, trimmed)) {
+    if (trimmed.len > 0 and trimmed[0] == '/' and
+        std.mem.eql(u8, skill_expanded, trimmed) and
+        std.mem.eql(u8, expanded, trimmed))
+    {
+        if (try live_resources.dispatchExtensionCommand(trimmed)) {
+            clearEditor(app_state, editor);
+            try app_state.setStatus("extension command dispatched");
+            return;
+        }
         const message = try std.fmt.allocPrint(allocator, "Unknown slash command: {s}", .{trimmed});
         defer allocator.free(message);
         clearEditor(app_state, editor);
@@ -486,16 +1108,23 @@ pub fn submitEditorText(
     }
 
     if (prompt_worker_active.*) {
-        if (session.isStreaming() or session.isCompacting()) {
+        if (session.isStreaming() or session.isCompacting() or session.isRetrying()) {
             try queueEditorText(
                 allocator,
+                io,
                 trimmed,
                 session,
                 app_state,
                 editor,
                 .steering,
-                if (session.isCompacting()) "queued steering message for after compaction" else "queued steering message",
+                if (session.isCompacting())
+                    "queued steering message for after compaction"
+                else if (session.isRetrying())
+                    "queued steering message for after retry"
+                else
+                    "queued steering message",
                 live_resources.prompt_templates,
+                live_resources.skills,
             );
             return;
         }
@@ -508,12 +1137,33 @@ pub fn submitEditorText(
 
     try prompt_worker.start(allocator, session, app_state, expanded, prompt_images);
     prompt_worker_active.* = true;
+    try editor.addToHistory(trimmed);
     clearEditor(app_state, editor);
     try app_state.setStatus("thinking");
 }
 
+const BashShortcut = struct {
+    command: []const u8,
+    exclude_from_context: bool,
+};
+
+fn parseBashShortcut(trimmed: []const u8) ?BashShortcut {
+    if (trimmed.len == 0 or trimmed[0] != '!') return null;
+    if (std.mem.startsWith(u8, trimmed, "!!")) {
+        return .{
+            .command = std.mem.trim(u8, trimmed[2..], " \t\r\n"),
+            .exclude_from_context = true,
+        };
+    }
+    return .{
+        .command = std.mem.trim(u8, trimmed[1..], " \t\r\n"),
+        .exclude_from_context = false,
+    };
+}
+
 fn queueEditorText(
     allocator: std.mem.Allocator,
+    io: std.Io,
     trimmed: []const u8,
     session: *session_mod.AgentSession,
     app_state: *AppState,
@@ -521,8 +1171,11 @@ fn queueEditorText(
     mode: rendering.QueueDisplayMode,
     status_text: []const u8,
     prompt_templates: []const resources_mod.PromptTemplate,
+    skills: []const resources_mod.Skill,
 ) !void {
-    const expanded = try resources_mod.expandPromptTemplate(allocator, trimmed, prompt_templates);
+    const skill_expanded = try resources_mod.expandSkillCommand(allocator, io, trimmed, skills);
+    defer allocator.free(skill_expanded);
+    const expanded = try resources_mod.expandPromptTemplate(allocator, skill_expanded, prompt_templates);
     defer allocator.free(expanded);
 
     const prompt_images = try app_state.clonePendingEditorImages(allocator);
@@ -533,6 +1186,7 @@ fn queueEditorText(
         .follow_up => try session.followUp(expanded, prompt_images),
     }
 
+    try editor.addToHistory(trimmed);
     try app_state.appendQueuedMessage(mode, expanded);
     clearEditor(app_state, editor);
     try app_state.setStatus(status_text);
@@ -562,7 +1216,9 @@ fn handleFollowUpAction(
         return;
     }
 
-    const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
+    const expanded_text = try editor.expandedTextAlloc(allocator);
+    defer allocator.free(expanded_text);
+    const trimmed = std.mem.trim(u8, expanded_text, " \t\r\n");
     if (trimmed.len == 0) return;
 
     if (parseSlashCommand(trimmed) != null or trimmed[0] == '/') {
@@ -589,16 +1245,23 @@ fn handleFollowUpAction(
         return;
     }
 
-    if (prompt_worker_active.* and (session.isStreaming() or session.isCompacting())) {
+    if (prompt_worker_active.* and (session.isStreaming() or session.isCompacting() or session.isRetrying())) {
         try queueEditorText(
             allocator,
+            io,
             trimmed,
             session,
             app_state,
             editor,
             .follow_up,
-            if (session.isCompacting()) "queued follow-up for after compaction" else "queued follow-up message",
+            if (session.isCompacting())
+                "queued follow-up for after compaction"
+            else if (session.isRetrying())
+                "queued follow-up for after retry"
+            else
+                "queued follow-up message",
             live_resources.prompt_templates,
+            live_resources.skills,
         );
         return;
     }
@@ -703,6 +1366,17 @@ pub fn clearEditor(app_state: *AppState, editor: *tui.Editor) void {
 }
 
 pub fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) ![]tui.SelectItem {
+    return loadEditorAutocompleteItemsWithResources(allocator, io, cwd, &.{}, &.{}, false);
+}
+
+pub fn loadEditorAutocompleteItemsWithResources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    prompt_templates: []const resources_mod.PromptTemplate,
+    skills: []const resources_mod.Skill,
+    enable_skill_commands: bool,
+) ![]tui.SelectItem {
     var dir = try std.Io.Dir.openDirAbsolute(io, cwd, .{ .iterate = true });
     defer dir.close(io);
 
@@ -731,6 +1405,41 @@ pub fn loadEditorAutocompleteItems(allocator: std.mem.Allocator, io: std.Io, cwd
             .label = label,
             .description = description,
         });
+    }
+
+    for (prompt_templates) |template| {
+        const value = try std.fmt.allocPrint(allocator, "/{s} ", .{template.name});
+        errdefer allocator.free(value);
+        const label = if (template.argument_hint) |argument_hint|
+            try std.fmt.allocPrint(allocator, "/{s} {s}", .{ template.name, argument_hint })
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{template.name});
+        errdefer allocator.free(label);
+        const description = try allocator.dupe(u8, template.description);
+        errdefer allocator.free(description);
+
+        try items.append(allocator, .{
+            .value = value,
+            .label = label,
+            .description = description,
+        });
+    }
+
+    if (enable_skill_commands) {
+        for (skills) |skill| {
+            const value = try std.fmt.allocPrint(allocator, "/skill:{s} ", .{skill.name});
+            errdefer allocator.free(value);
+            const label = try std.fmt.allocPrint(allocator, "/skill:{s}", .{skill.name});
+            errdefer allocator.free(label);
+            const description = try allocator.dupe(u8, skill.description);
+            errdefer allocator.free(description);
+
+            try items.append(allocator, .{
+                .value = value,
+                .label = label,
+                .description = description,
+            });
+        }
     }
 
     var iterator = dir.iterate();
@@ -908,6 +1617,177 @@ pub fn consumeInputBytes(buffer: *std.ArrayList(u8), consumed: usize) void {
     buffer.items.len -= consumed;
 }
 
+fn resolveEditorAction(
+    keybindings: ?*const keybindings_mod.Keybindings,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) ?keybindings_mod.EditorAction {
+    if (keybindings) |bindings| return bindings.editorActionForKeyWithModifiers(key, modifiers);
+    return keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers);
+}
+
+fn toTuiEditorAction(action: keybindings_mod.EditorAction) ?tui.components.editor.EditorAction {
+    return switch (action) {
+        .cursor_up => .cursor_up,
+        .cursor_down => .cursor_down,
+        .cursor_left => .cursor_left,
+        .cursor_right => .cursor_right,
+        .cursor_word_left => .cursor_word_left,
+        .cursor_word_right => .cursor_word_right,
+        .cursor_line_start => .cursor_line_start,
+        .cursor_line_end => .cursor_line_end,
+        .jump_forward => .jump_forward,
+        .jump_backward => .jump_backward,
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .delete_char_backward => .delete_char_backward,
+        .delete_char_forward => .delete_char_forward,
+        .delete_word_backward => .delete_word_backward,
+        .delete_word_forward => .delete_word_forward,
+        .delete_to_line_start => .delete_to_line_start,
+        .delete_to_line_end => .delete_to_line_end,
+        .yank => .yank,
+        .yank_pop => .yank_pop,
+        .undo => .undo,
+        .input_new_line => .input_new_line,
+        .input_tab => .input_tab,
+        .select_cancel => .select_cancel,
+        .select_up => .select_up,
+        .select_down => .select_down,
+        .select_page_up => .select_page_up,
+        .select_page_down => .select_page_down,
+        .select_confirm => .select_confirm,
+        .input_submit, .input_copy => null,
+    };
+}
+
+fn submitEditorIfNotEmpty(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    live_resources: *LiveResources,
+) !void {
+    if (editor.isShowingAutocomplete()) {
+        const selected = editor.selectedAutocompleteItem();
+        _ = try editor.handleAction(.select_confirm);
+        if (selected) |item| {
+            if (std.mem.startsWith(u8, item.value, "/")) {
+                try submitEditorIfNotEmpty(
+                    allocator,
+                    io,
+                    env_map,
+                    session,
+                    current_provider,
+                    session_dir,
+                    options,
+                    tool_items,
+                    app_state,
+                    editor,
+                    overlay,
+                    auth_flow,
+                    prompt_worker,
+                    prompt_worker_active,
+                    subscriber,
+                    should_exit,
+                    live_resources,
+                );
+            }
+        }
+        return;
+    }
+
+    if (editor.cursorPrecededBy("\\")) {
+        _ = try editor.handleAction(.delete_char_backward);
+        _ = try editor.handleAction(.input_new_line);
+        return;
+    }
+
+    const expanded_text = try editor.expandedTextAlloc(allocator);
+    defer allocator.free(expanded_text);
+    const trimmed = std.mem.trim(u8, expanded_text, " \t\r\n");
+    if (trimmed.len == 0) return;
+    try submitEditorText(
+        allocator,
+        io,
+        env_map,
+        trimmed,
+        session,
+        current_provider,
+        session_dir,
+        options,
+        tool_items,
+        app_state,
+        editor,
+        overlay,
+        auth_flow,
+        prompt_worker,
+        prompt_worker_active,
+        subscriber,
+        should_exit,
+        live_resources,
+    );
+}
+
+fn handleEditorAction(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    action: keybindings_mod.EditorAction,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    live_resources: *LiveResources,
+) !void {
+    switch (action) {
+        .input_submit => try submitEditorIfNotEmpty(
+            allocator,
+            io,
+            env_map,
+            session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
+            app_state,
+            editor,
+            overlay,
+            auth_flow,
+            prompt_worker,
+            prompt_worker_active,
+            subscriber,
+            should_exit,
+            live_resources,
+        ),
+        .input_copy => {},
+        else => if (toTuiEditorAction(action)) |editor_action| {
+            _ = try editor.handleAction(editor_action);
+        },
+    }
+}
+
 pub fn resolveAppAction(keybindings: ?*const keybindings_mod.Keybindings, key: tui.Key) ?keybindings_mod.Action {
     if (keybindings) |bindings| return bindings.actionForKey(key);
     return legacyAppActionForKey(key);
@@ -986,6 +1866,56 @@ pub fn isLegacyParsedAppActionKey(key: tui.Key, modifiers: tui.keys.KeyModifiers
 }
 
 const CLEAR_DOUBLE_PRESS_WINDOW_MS: i64 = 500;
+const ESCAPE_DOUBLE_PRESS_WINDOW_MS: i64 = 500;
+
+fn handleInterruptAction(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    prompt_worker_active: *bool,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) !void {
+    if (session.isRetrying()) {
+        session.abortRetry();
+        try app_state.setStatus("retry cancel requested");
+    } else if (prompt_worker_active.*) {
+        session.agent.abort();
+        try app_state.setStatus("interrupt requested");
+    } else if (app_state.cancelBashExecution()) {
+        try app_state.setStatus("bash cancel requested");
+    } else if (parseBashShortcut(std.mem.trim(u8, editor.text(), " \t\r\n")) != null) {
+        clearEditor(app_state, editor);
+        try app_state.setStatus("bash entry cancelled");
+    } else if (std.mem.trim(u8, editor.text(), " \t\r\n").len == 0) {
+        try handleDoubleEscapeAction(allocator, session, app_state, overlay, runtime_config);
+    }
+}
+
+fn handleDoubleEscapeAction(
+    allocator: std.mem.Allocator,
+    session: *session_mod.AgentSession,
+    app_state: *AppState,
+    overlay: *?SelectorOverlay,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+) !void {
+    const action = if (runtime_config) |config| config.doubleEscapeAction() else config_mod.DoubleEscapeAction.tree;
+    if (action == .none) return;
+
+    const now_ms = app_state.currentNowMs();
+    if (app_state.takeLastEscapeActionMs()) |last_ms| {
+        if (now_ms - last_ms < ESCAPE_DOUBLE_PRESS_WINDOW_MS) {
+            switch (action) {
+                .tree => overlay.* = try loadTreeOverlay(allocator, session),
+                .fork => try loadForkOverlayOrStatus(allocator, session, app_state, overlay),
+                .none => {},
+            }
+            return;
+        }
+    }
+    app_state.setLastEscapeActionMs(now_ms);
+}
 
 fn handleClearAction(
     app_state: *AppState,
@@ -1014,14 +1944,7 @@ fn cycleThinkingLevel(session: *session_mod.AgentSession, app_state: *AppState) 
         return;
     }
 
-    const next: agent.ThinkingLevel = switch (session.agent.getThinkingLevel()) {
-        .off => .minimal,
-        .minimal => .low,
-        .low => .medium,
-        .medium => .high,
-        .high => .xhigh,
-        .xhigh => .off,
-    };
+    const next = nextSupportedThinkingLevel(session.agent.getModel(), session.agent.getThinkingLevel());
     try session.setThinkingLevel(next);
     try app_state.setStatus(switch (next) {
         .off => "Thinking level: off",
@@ -1031,6 +1954,26 @@ fn cycleThinkingLevel(session: *session_mod.AgentSession, app_state: *AppState) 
         .high => "Thinking level: high",
         .xhigh => "Thinking level: xhigh",
     });
+}
+
+fn nextSupportedThinkingLevel(model: ai.Model, current: agent.ThinkingLevel) agent.ThinkingLevel {
+    const levels = [_]agent.ThinkingLevel{ .off, .minimal, .low, .medium, .high, .xhigh };
+    const current_index = for (levels, 0..) |level, index| {
+        if (level == current) break index;
+    } else 0;
+
+    for (1..levels.len + 1) |offset| {
+        const candidate = levels[(current_index + offset) % levels.len];
+        if (thinkingLevelSupported(model, candidate)) return candidate;
+    }
+    return .off;
+}
+
+fn thinkingLevelSupported(model: ai.Model, level: agent.ThinkingLevel) bool {
+    if (level == .off) return true;
+    if (!model.reasoning) return false;
+    if (level == .xhigh) return ai.model_registry.supportsXhigh(model);
+    return true;
 }
 
 const ModelCycleDirection = enum { forward, backward };
@@ -1100,6 +2043,84 @@ fn cycleModel(
     }
 }
 
+fn openExternalEditor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    app_state: *AppState,
+    editor: *tui.Editor,
+) !void {
+    const editor_cmd = env_map.get("VISUAL") orelse env_map.get("EDITOR") orelse {
+        try app_state.setStatus("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+        return;
+    };
+    const trimmed_editor_cmd = std.mem.trim(u8, editor_cmd, " \t\r\n");
+    if (trimmed_editor_cmd.len == 0) {
+        try app_state.setStatus("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+        return;
+    }
+
+    const tmp_dir = env_map.get("TMPDIR") orelse "/tmp";
+    const tmp_name = try std.fmt.allocPrint(
+        allocator,
+        "pi-editor-{d}.pi.md",
+        .{app_state.currentNowMs()},
+    );
+    defer allocator.free(tmp_name);
+    const tmp_path = try std.fs.path.join(allocator, &[_][]const u8{ tmp_dir, tmp_name });
+    defer allocator.free(tmp_path);
+    defer std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+
+    try std.Io.Dir.writeFile(.cwd(), io, .{
+        .sub_path = tmp_path,
+        .data = editor.text(),
+    });
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    var parts = std.mem.tokenizeScalar(u8, trimmed_editor_cmd, ' ');
+    while (parts.next()) |part| {
+        try argv.append(allocator, part);
+    }
+    if (argv.items.len == 0) {
+        try app_state.setStatus("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+        return;
+    }
+    try argv.append(allocator, tmp_path);
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
+    const exit_code = exitCodeFromChildTerm(term);
+    if (exit_code == 0) {
+        const edited = try std.Io.Dir.readFileAlloc(.cwd(), io, tmp_path, allocator, .limited(1024 * 1024));
+        defer allocator.free(edited);
+        const replacement = stripSingleTrailingNewline(edited);
+        try editor.setText(replacement);
+        try app_state.setStatus("Updated prompt from external editor");
+    } else {
+        const message = try std.fmt.allocPrint(allocator, "External editor exited with status {d}; prompt unchanged", .{exit_code});
+        defer allocator.free(message);
+        try app_state.setStatus(message);
+    }
+}
+
+fn stripSingleTrailingNewline(content: []const u8) []const u8 {
+    if (content.len > 0 and content[content.len - 1] == '\n') return content[0 .. content.len - 1];
+    return content;
+}
+
+fn exitCodeFromChildTerm(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
+}
+
 pub fn handleAppAction(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1120,12 +2141,15 @@ pub fn handleAppAction(
     app_context: *AppContext,
 ) !void {
     switch (action) {
-        .interrupt => {
-            if (prompt_worker_active.*) {
-                session.agent.abort();
-                try app_state.setStatus("interrupt requested");
-            }
-        },
+        .interrupt => try handleInterruptAction(
+            allocator,
+            session,
+            app_state,
+            editor,
+            overlay,
+            prompt_worker_active,
+            runtime_config,
+        ),
         .exit => {
             if (editor.text().len == 0) {
                 should_exit.* = true;
@@ -1138,13 +2162,17 @@ pub fn handleAppAction(
         .app_suspend => app_context.suspend_requested = true,
         .tools_expand => app_state.toggleAllExpanded(),
         .thinking_cycle => try cycleThinkingLevel(session, app_state),
-        .thinking_toggle => try app_state.setStatus("Thinking blocks: visible"),
+        .thinking_toggle => {
+            const hidden = try app_state.toggleThinkingBlockVisibility();
+            try app_state.setStatus(if (hidden) "Thinking blocks: hidden" else "Thinking blocks: visible");
+        },
+        .editor_external => try openExternalEditor(allocator, io, env_map, app_state, editor),
         .model_cycleForward => try cycleModel(
             allocator,
             env_map,
             session,
             current_provider,
-            options.model_patterns,
+            effectiveScopedModelPatterns(app_state, options, runtime_config),
             options,
             runtime_config,
             app_state,
@@ -1155,7 +2183,7 @@ pub fn handleAppAction(
             env_map,
             session,
             current_provider,
-            options.model_patterns,
+            effectiveScopedModelPatterns(app_state, options, runtime_config),
             options,
             runtime_config,
             app_state,
@@ -1197,14 +2225,14 @@ pub fn handleAppAction(
                 try app_state.setStatus("wait for the current response to finish before switching sessions");
                 return;
             }
-            overlay.* = try loadSessionOverlay(allocator, io, session_dir);
+            overlay.* = try loadSessionOverlay(allocator, io, session_dir, session.session_manager.getSessionFile());
         },
         .model_select => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
-            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
+            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, effectiveScopedModelPatterns(app_state, options, runtime_config), runtime_config);
         },
         .message_followUp, .message_dequeue => {},
         .clipboard_pasteImage => {},
@@ -1225,6 +2253,55 @@ test "legacy app actions include clipboard image paste" {
     try std.testing.expectEqual(keybindings_mod.Action.clipboard_pasteImage, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
     try std.testing.expectEqual(keybindings_mod.Action.editor_external, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
     try std.testing.expect(legacyAppActionForKey(.{ .ctrl = 'r' }) == null);
+}
+
+test "thinking cycle skips xhigh unless the active model supports it" {
+    const allocator = std.testing.allocator;
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .model = ai.model_registry.find("openai", "gpt-4.1-mini").?,
+    });
+    defer session.deinit();
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try cycleThinkingLevel(&session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.minimal, session.agent.getThinkingLevel());
+    try cycleThinkingLevel(&session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.low, session.agent.getThinkingLevel());
+    try cycleThinkingLevel(&session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.medium, session.agent.getThinkingLevel());
+    try cycleThinkingLevel(&session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.high, session.agent.getThinkingLevel());
+    try cycleThinkingLevel(&session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.off, session.agent.getThinkingLevel());
+    try std.testing.expectEqualStrings("Thinking level: off", state.status);
+
+    var xhigh_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .model = ai.model_registry.find("openai", "gpt-5.5").?,
+        .thinking_level = .high,
+    });
+    defer xhigh_session.deinit();
+    try cycleThinkingLevel(&xhigh_session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.xhigh, xhigh_session.agent.getThinkingLevel());
+}
+
+test "thinking cycle reports unsupported model without changing level" {
+    const allocator = std.testing.allocator;
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .model = ai.model_registry.find("faux", "faux-1").?,
+    });
+    defer session.deinit();
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try cycleThinkingLevel(&session, &state);
+    try std.testing.expectEqual(agent.ThinkingLevel.off, session.agent.getThinkingLevel());
+    try std.testing.expectEqualStrings("Current model does not support thinking", state.status);
 }
 
 fn ignoreAgentEvent(_: ?*anyopaque, _: agent.AgentEvent) anyerror!void {}
@@ -1479,4 +2556,859 @@ test "configured app keybindings drive clear exit and suspend while old defaults
         &live_resources,
     );
     try std.testing.expect(app_context.suspend_requested);
+}
+
+fn makeInputDispatchTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
+    const relative_path = if (name.len == 0)
+        try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path })
+    else
+        try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path, name });
+    defer allocator.free(relative_path);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return try std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn waitForBashCompletion(app_state: *AppState, allocator: std.mem.Allocator) !void {
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        if (app_state.pollBashExecution(allocator)) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    }
+    return error.BashCompletionTimeout;
+}
+
+const BashSubmitHarness = struct {
+    allocator: std.mem.Allocator,
+    env_map: std.process.Environ.Map,
+    current_provider: provider_config.ResolvedProviderConfig,
+    session: session_mod.AgentSession,
+    state: AppState,
+    editor: tui.Editor,
+    options: RunInteractiveModeOptions,
+    live_resources: LiveResources,
+    overlay: ?SelectorOverlay = null,
+    auth_flow: ?AuthFlow = null,
+    prompt_worker: PromptWorker = undefined,
+    prompt_worker_active: bool = false,
+    should_exit: bool = false,
+    subscriber: agent.AgentSubscriber = .{ .callback = ignoreAgentEvent },
+
+    fn init(allocator: std.mem.Allocator, cwd: []const u8, session_dir: []const u8) !BashSubmitHarness {
+        var env_map = std.process.Environ.Map.init(allocator);
+        errdefer env_map.deinit();
+
+        var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+        errdefer current_provider.deinit(allocator);
+
+        var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+            .cwd = cwd,
+            .system_prompt = "sys",
+            .model = current_provider.model,
+            .api_key = current_provider.api_key,
+            .session_dir = session_dir,
+        });
+        errdefer session.deinit();
+
+        var state = try AppState.init(allocator, std.testing.io);
+        errdefer state.deinit();
+
+        var editor = tui.Editor.init(allocator);
+        errdefer editor.deinit();
+
+        const options = RunInteractiveModeOptions{
+            .cwd = cwd,
+            .system_prompt = "sys",
+            .session_dir = session_dir,
+            .provider = "faux",
+        };
+        const live_resources = LiveResources.init(options);
+
+        return .{
+            .allocator = allocator,
+            .env_map = env_map,
+            .current_provider = current_provider,
+            .session = session,
+            .state = state,
+            .editor = editor,
+            .options = options,
+            .live_resources = live_resources,
+        };
+    }
+
+    fn deinit(self: *BashSubmitHarness) void {
+        if (self.overlay) |*value| value.deinit(self.allocator);
+        if (self.auth_flow) |*value| value.deinit(self.allocator);
+        self.live_resources.deinit(self.allocator);
+        self.editor.deinit();
+        self.state.deinit();
+        self.session.deinit();
+        self.current_provider.deinit(self.allocator);
+        self.env_map.deinit();
+    }
+
+    fn submit(self: *BashSubmitHarness, text: []const u8) !void {
+        self.editor.reset();
+        _ = try self.editor.handlePaste(text);
+        try submitEditorText(
+            self.allocator,
+            std.testing.io,
+            &self.env_map,
+            std.mem.trim(u8, self.editor.text(), " \t\r\n"),
+            &self.session,
+            &self.current_provider,
+            self.options.session_dir,
+            self.options,
+            &.{},
+            &self.state,
+            &self.editor,
+            &self.overlay,
+            &self.auth_flow,
+            &self.prompt_worker,
+            &self.prompt_worker_active,
+            self.subscriber,
+            &self.should_exit,
+            &self.live_resources,
+        );
+    }
+
+    fn press(self: *BashSubmitHarness, key: tui.Key, modifiers: tui.keys.KeyModifiers) !void {
+        var app_context = AppContext.init(self.options.cwd, std.testing.io);
+        try handleInputKeyWithModifiers(
+            self.allocator,
+            std.testing.io,
+            &self.env_map,
+            key,
+            modifiers,
+            &self.session,
+            &self.current_provider,
+            self.options.session_dir,
+            self.options,
+            &.{},
+            &self.state,
+            &self.editor,
+            &self.overlay,
+            &self.auth_flow,
+            &self.prompt_worker,
+            &self.prompt_worker_active,
+            self.subscriber,
+            &self.should_exit,
+            &app_context,
+            &self.live_resources,
+        );
+    }
+};
+
+test "configured editor keybindings drive movement and submit while old defaults stop" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setEditorBinding(.cursor_left, &.{.{ .ctrl = 'h' }});
+    try custom_keybindings.setEditorBinding(.input_submit, &.{.{ .ctrl = 'j' }});
+    try custom_keybindings.setEditorBinding(.input_new_line, &.{.{ .ctrl = '9' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    _ = try harness.editor.handlePaste("ab");
+    try harness.press(.left, .{});
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("X") }, .{});
+    try std.testing.expectEqualStrings("abX", harness.editor.text());
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("ab");
+    try harness.press(.{ .ctrl = 'h' }, .{});
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("X") }, .{});
+    try std.testing.expectEqualStrings("aXb", harness.editor.text());
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("line");
+    try harness.press(.enter, .{});
+    try std.testing.expectEqualStrings("line", harness.editor.text());
+    try harness.press(.{ .ctrl = '9' }, .{});
+    try std.testing.expectEqualStrings("line\n", harness.editor.text());
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("/hotkeys");
+    try harness.press(.enter, .{});
+    try std.testing.expectEqualStrings("/hotkeys", harness.editor.text());
+    try harness.press(.{ .ctrl = 'j' }, .{});
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expect(harness.state.items.items.len > 0);
+}
+
+test "enter inserts newline after trailing backslash and shift enter inserts newline" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    _ = try harness.editor.handlePaste("line\\");
+    try harness.press(.enter, .{});
+    try std.testing.expectEqualStrings("line\n", harness.editor.text());
+    try std.testing.expect(!harness.prompt_worker_active);
+
+    try harness.press(.enter, .{ .shift = true });
+    try std.testing.expectEqualStrings("line\n\n", harness.editor.text());
+    try std.testing.expect(!harness.prompt_worker_active);
+}
+
+test "resource autocomplete includes prompt templates and skill commands" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+
+    var template = resources_mod.PromptTemplate{
+        .name = try allocator.dupe(u8, "fix"),
+        .description = try allocator.dupe(u8, "Fix an issue"),
+        .argument_hint = try allocator.dupe(u8, "<bug>"),
+        .content = try allocator.dupe(u8, "Fix $ARGUMENTS"),
+        .file_path = try allocator.dupe(u8, "/tmp/fix.md"),
+        .source_info = .{
+            .path = try allocator.dupe(u8, "/tmp/fix.md"),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .temporary,
+            .origin = .top_level,
+            .base_dir = null,
+        },
+    };
+    defer template.deinit(allocator);
+    var skill = resources_mod.Skill{
+        .name = try allocator.dupe(u8, "reviewer"),
+        .description = try allocator.dupe(u8, "Review code"),
+        .file_path = try allocator.dupe(u8, "/tmp/reviewer/SKILL.md"),
+        .base_dir = try allocator.dupe(u8, "/tmp/reviewer"),
+        .source_info = .{
+            .path = try allocator.dupe(u8, "/tmp/reviewer/SKILL.md"),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .temporary,
+            .origin = .top_level,
+            .base_dir = null,
+        },
+    };
+    defer skill.deinit(allocator);
+
+    const items = try loadEditorAutocompleteItemsWithResources(allocator, std.testing.io, cwd, &.{template}, &.{skill}, true);
+    defer freeOwnedSelectItems(allocator, items);
+
+    var saw_template = false;
+    var saw_skill = false;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.value, "/fix ")) saw_template = true;
+        if (std.mem.eql(u8, item.value, "/skill:reviewer ")) saw_skill = true;
+    }
+    try std.testing.expect(saw_template);
+    try std.testing.expect(saw_skill);
+}
+
+test "command pipeline expands skill before prompt template and unknown slash errors before queue" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const skill_dir = try makeInputDispatchTestPath(allocator, tmp, "skills/reviewer");
+    defer allocator.free(skill_dir);
+    const skill_path = try makeInputDispatchTestPath(allocator, tmp, "skills/reviewer/SKILL.md");
+    defer allocator.free(skill_path);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, skill_dir);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = skill_path,
+        .data =
+        \\---
+        \\name: reviewer
+        \\description: Review code
+        \\---
+        \\Use the reviewer skill.
+        \\
+        ,
+    });
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var skill = resources_mod.Skill{
+        .name = try allocator.dupe(u8, "reviewer"),
+        .description = try allocator.dupe(u8, "Review code"),
+        .file_path = try allocator.dupe(u8, skill_path),
+        .base_dir = try allocator.dupe(u8, skill_dir),
+        .source_info = .{
+            .path = try allocator.dupe(u8, skill_path),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .temporary,
+            .origin = .top_level,
+            .base_dir = try allocator.dupe(u8, skill_dir),
+        },
+    };
+    defer skill.deinit(allocator);
+    var conflicting_template = resources_mod.PromptTemplate{
+        .name = try allocator.dupe(u8, "skill:reviewer"),
+        .description = try allocator.dupe(u8, "Conflicting template"),
+        .content = try allocator.dupe(u8, "template fallback $ARGUMENTS"),
+        .file_path = try allocator.dupe(u8, "/tmp/skill-reviewer.md"),
+        .source_info = .{
+            .path = try allocator.dupe(u8, "/tmp/skill-reviewer.md"),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .temporary,
+            .origin = .top_level,
+            .base_dir = null,
+        },
+    };
+    defer conflicting_template.deinit(allocator);
+    harness.live_resources.skills = &.{skill};
+    harness.live_resources.prompt_templates = &.{conflicting_template};
+
+    harness.prompt_worker_active = true;
+    harness.session.compaction_active.store(true, .seq_cst);
+    defer harness.session.compaction_active.store(false, .seq_cst);
+
+    try harness.submit("/skill:reviewer focus src");
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_steering.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.queued_steering.items[0], "<skill name=\"reviewer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.queued_steering.items[0], "focus src") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.queued_steering.items[0], "template fallback") == null);
+
+    try harness.submit("/definitely-unknown");
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_steering.items.len);
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expectEqualStrings("Unknown slash command: /definitely-unknown", harness.state.status);
+}
+
+test "retry countdown preserves command entry queue and interrupt cancels retry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var template = resources_mod.PromptTemplate{
+        .name = try allocator.dupe(u8, "fix"),
+        .description = try allocator.dupe(u8, "Fix"),
+        .content = try allocator.dupe(u8, "Fix $ARGUMENTS"),
+        .file_path = try allocator.dupe(u8, "/tmp/fix.md"),
+        .source_info = .{
+            .path = try allocator.dupe(u8, "/tmp/fix.md"),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .temporary,
+            .origin = .top_level,
+            .base_dir = null,
+        },
+    };
+    defer template.deinit(allocator);
+    harness.live_resources.prompt_templates = &.{template};
+
+    harness.prompt_worker_active = true;
+    harness.session.retry_delay_active.store(true, .seq_cst);
+    defer harness.session.retry_delay_active.store(false, .seq_cst);
+
+    try harness.submit("/fix retry path");
+    try std.testing.expectEqualStrings("queued steering message for after retry", harness.state.status);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_steering.items.len);
+    try std.testing.expectEqualStrings("Fix retry path", harness.state.queued_steering.items[0]);
+
+    try harness.press(.escape, .{});
+    try std.testing.expectEqualStrings("retry cancel requested", harness.state.status);
+}
+
+const InputDispatchFixedClock = struct {
+    value: i64,
+
+    fn now(context: ?*anyopaque) i64 {
+        const self: *InputDispatchFixedClock = @ptrCast(@alignCast(context.?));
+        return self.value;
+    }
+};
+
+test "double Escape follows settings action for tree and disabled states" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var clock = InputDispatchFixedClock{ .value = 1000 };
+    harness.state.setClockForTesting(&clock, InputDispatchFixedClock.now);
+
+    try harness.press(.escape, .{});
+    try std.testing.expect(harness.overlay == null);
+    clock.value += 100;
+    try harness.press(.escape, .{});
+    try std.testing.expect(harness.overlay != null);
+    try std.testing.expectEqual(std.meta.Tag(SelectorOverlay).tree, std.meta.activeTag(harness.overlay.?));
+    harness.overlay.?.deinit(allocator);
+    harness.overlay = null;
+
+    const agent_dir = try makeInputDispatchTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = settings_path,
+        .data =
+        \\{
+        \\  "doubleEscapeAction": "none"
+        \\}
+        ,
+    });
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, cwd);
+    defer runtime.deinit();
+    try std.testing.expectEqual(config_mod.DoubleEscapeAction.none, runtime.doubleEscapeAction());
+    harness.live_resources.runtime_config = &runtime;
+    harness.state.setLastEscapeActionMs(0);
+    clock.value = 2000;
+
+    try harness.press(.escape, .{});
+    clock.value += 100;
+    try harness.press(.escape, .{});
+    try std.testing.expect(harness.overlay == null);
+}
+
+test "settings command opens structured searchable rows and value changes persist with live editor effects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    const agent_dir = try makeInputDispatchTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, agent_dir);
+    const initial_settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(initial_settings_path);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = initial_settings_path,
+        .data =
+        \\{
+        \\  "defaultProvider": "faux"
+        \\}
+        ,
+    });
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+    try harness.env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &harness.env_map, cwd);
+    defer runtime.deinit();
+    harness.live_resources.runtime_config = &runtime;
+    harness.live_resources.keybindings = &runtime.keybindings;
+
+    try harness.submit("/settings");
+    try std.testing.expect(harness.overlay != null);
+    try std.testing.expectEqual(std.meta.Tag(SelectorOverlay).settings, std.meta.activeTag(harness.overlay.?));
+
+    var saw_auto_compact = false;
+    var saw_raw = false;
+    for (harness.overlay.?.settings.items) |item| {
+        if (std.mem.indexOf(u8, item.label, "Auto-compact") != null) saw_auto_compact = true;
+        if (std.mem.indexOf(u8, item.label, "Advanced raw JSON") != null) saw_raw = true;
+    }
+    try std.testing.expect(saw_auto_compact);
+    try std.testing.expect(saw_raw);
+
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("theme") }, .{});
+    try std.testing.expectEqual(@as(usize, 1), harness.overlay.?.settings.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, harness.overlay.?.settings.items[0].label, "Theme") != null);
+
+    try harness.press(.backspace, .{});
+    try harness.press(.backspace, .{});
+    try harness.press(.backspace, .{});
+    try harness.press(.backspace, .{});
+    try harness.press(.backspace, .{});
+
+    for (harness.overlay.?.settings.items, 0..) |item, index| {
+        if (std.mem.indexOf(u8, item.label, "Editor padding") != null) {
+            harness.overlay.?.settings.list.selected_index = index;
+            break;
+        }
+    }
+    try harness.press(.enter, .{});
+    try std.testing.expectEqual(@as(usize, 1), harness.editor.padding_x);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings_json = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(settings_json);
+    try std.testing.expect(std.mem.indexOf(u8, settings_json, "\"defaultProvider\": \"faux\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings_json, "\"editorPaddingX\": 1") != null);
+}
+
+test "external editor action replaces prompt on success and preserves on failure or missing editor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    _ = try harness.editor.handlePaste("draft");
+    try harness.press(.{ .ctrl = 'g' }, .{});
+    try std.testing.expectEqualStrings("draft", harness.editor.text());
+    try std.testing.expectEqualStrings("No editor configured. Set $VISUAL or $EDITOR environment variable.", harness.state.status);
+
+    const success_script = try makeInputDispatchTestPath(allocator, tmp, "success-editor.sh");
+    defer allocator.free(success_script);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = success_script,
+        .data =
+        \\printf 'edited prompt\n' > "$1"
+        \\
+        ,
+    });
+    const success_cmd = try std.fmt.allocPrint(allocator, "/bin/sh {s}", .{success_script});
+    defer allocator.free(success_cmd);
+    try harness.env_map.put("EDITOR", success_cmd);
+
+    try harness.press(.{ .ctrl = 'g' }, .{});
+    try std.testing.expectEqualStrings("edited prompt", harness.editor.text());
+    try std.testing.expectEqualStrings("Updated prompt from external editor", harness.state.status);
+
+    const failure_script = try makeInputDispatchTestPath(allocator, tmp, "failure-editor.sh");
+    defer allocator.free(failure_script);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = failure_script,
+        .data =
+        \\printf 'corrupt prompt\n' > "$1"
+        \\exit 7
+        \\
+        ,
+    });
+    const failure_cmd = try std.fmt.allocPrint(allocator, "/bin/sh {s}", .{failure_script});
+    defer allocator.free(failure_cmd);
+    try harness.env_map.put("EDITOR", failure_cmd);
+
+    try harness.press(.{ .ctrl = 'g' }, .{});
+    try std.testing.expectEqualStrings("edited prompt", harness.editor.text());
+    try std.testing.expectEqualStrings("External editor exited with status 7; prompt unchanged", harness.state.status);
+}
+
+test "bare bash shortcuts do not submit and Escape clears bash entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    try harness.submit("!");
+    try std.testing.expectEqualStrings("!", harness.editor.text());
+    try std.testing.expect(!harness.state.isBashExecutionActive());
+    try std.testing.expectEqual(@as(usize, 0), harness.session.agent.getMessages().len);
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("!!");
+    try submitEditorText(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        std.mem.trim(u8, harness.editor.text(), " \t\r\n"),
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("!!", harness.editor.text());
+    try std.testing.expectEqual(@as(usize, 0), harness.session.agent.getMessages().len);
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("! draft");
+    var app_context = AppContext.init(cwd, std.testing.io);
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .escape,
+        .{},
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expectEqualStrings("bash entry cancelled", harness.state.status);
+}
+
+test "configured interrupt clears bash entry and cancels running bash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setBinding(.interrupt, &.{.{ .ctrl = 'x' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    var app_context = AppContext.init(cwd, std.testing.io);
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("! rebound");
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .escape,
+        .{},
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("! rebound", harness.editor.text());
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .ctrl = 'x' },
+        .{},
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expectEqualStrings("bash entry cancelled", harness.state.status);
+
+    try harness.submit("! printf start; sleep 5; printf end");
+    try std.testing.expect(harness.state.isBashExecutionActive());
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .ctrl = 'x' },
+        .{},
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("bash cancel requested", harness.state.status);
+    try waitForBashCompletion(&harness.state, allocator);
+    try std.testing.expect(!harness.state.isBashExecutionActive());
+}
+
+test "bash shortcuts persist included output and exclude double bang from context" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    try harness.submit("! printf BASH_INCLUDED_CONTEXT_42");
+    try waitForBashCompletion(&harness.state, allocator);
+    try harness.submit("!! printf BASH_EXCLUDED_CONTEXT_42");
+    try waitForBashCompletion(&harness.state, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.session.agent.getMessages().len);
+    try std.testing.expect(std.mem.indexOf(u8, harness.session.agent.getMessages()[0].user.content[0].text.text, "BASH_INCLUDED_CONTEXT_42") != null);
+
+    var context = try harness.session.session_manager.buildSessionContext(allocator);
+    defer context.deinit(allocator);
+    var saw_included = false;
+    var saw_excluded = false;
+    for (context.messages) |message| {
+        if (message == .user and message.user.content.len > 0 and message.user.content[0] == .text) {
+            if (std.mem.indexOf(u8, message.user.content[0].text.text, "BASH_INCLUDED_CONTEXT_42") != null) saw_included = true;
+            if (std.mem.indexOf(u8, message.user.content[0].text.text, "BASH_EXCLUDED_CONTEXT_42") != null) saw_excluded = true;
+        }
+    }
+    try std.testing.expect(saw_included);
+    try std.testing.expect(!saw_excluded);
+
+    const session_file = harness.session.session_manager.getSessionFile().?;
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"customType\":\"bashExecution\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"excludeFromContext\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.items.items[harness.state.items.items.len - 1].text, "[excluded from context]") != null);
+}
+
+test "concurrent bash shortcut warns and Escape cancels running bash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    try harness.submit("! printf start; sleep 5; printf end");
+    try std.testing.expect(harness.state.isBashExecutionActive());
+
+    try harness.submit("! printf second");
+    try std.testing.expectEqualStrings("A bash command is already running. Press Esc to cancel it first.", harness.state.status);
+    try std.testing.expectEqualStrings("! printf second", harness.editor.text());
+
+    var app_context = AppContext.init(cwd, std.testing.io);
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .escape,
+        .{},
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("bash cancel requested", harness.state.status);
+    try waitForBashCompletion(&harness.state, allocator);
+    try std.testing.expect(!harness.state.isBashExecutionActive());
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.items.items[harness.state.items.items.len - 1].text, "(cancelled)") != null);
 }

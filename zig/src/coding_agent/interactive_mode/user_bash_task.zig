@@ -119,7 +119,9 @@ pub const UserBashTask = struct {
         };
         defer result.deinit(allocator);
 
-        const output_text = bash_execution.contentBlocksTextAlloc(allocator, result.content) catch return;
+        const raw_output_text = bash_execution.contentBlocksTextAlloc(allocator, result.content) catch return;
+        defer allocator.free(raw_output_text);
+        const output_text = bash_execution.sanitizeBashToolOutputForDisplayAlloc(allocator, raw_output_text) catch return;
         defer allocator.free(output_text);
 
         const exit_code = if (result.details) |details| details.exit_code else null;
@@ -159,7 +161,9 @@ pub const UserBashTask = struct {
     fn updateCallback(context: ?*anyopaque, result: bash_tool_mod.BashExecutionResult) anyerror!void {
         const self: *UserBashTask = @ptrCast(@alignCast(context.?));
         const hooks = self.hooks orelse return;
-        const output_text = try bash_execution.contentBlocksTextAlloc(hooks.allocator, result.content);
+        const raw_output_text = try bash_execution.contentBlocksTextAlloc(hooks.allocator, result.content);
+        defer hooks.allocator.free(raw_output_text);
+        const output_text = try bash_execution.sanitizeBashToolOutputForDisplayAlloc(hooks.allocator, raw_output_text);
         defer hooks.allocator.free(output_text);
         try hooks.update(hooks.context, self.item_index, self.command, output_text, self.exclude_from_context);
     }

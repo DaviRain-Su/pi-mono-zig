@@ -664,6 +664,50 @@ pub fn expandPromptTemplate(allocator: std.mem.Allocator, text: []const u8, temp
     return allocator.dupe(u8, text);
 }
 
+pub fn expandSkillCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    text: []const u8,
+    skills: []const Skill,
+) ![]u8 {
+    if (!std.mem.startsWith(u8, text, "/skill:")) return allocator.dupe(u8, text);
+
+    const space_index = std.mem.indexOfScalar(u8, text, ' ');
+    const skill_name = if (space_index) |value| text["/skill:".len..value] else text["/skill:".len..];
+    const args = if (space_index) |value| std.mem.trim(u8, text[value + 1 ..], " \t\r\n") else "";
+
+    for (skills) |skill| {
+        if (!std.mem.eql(u8, skill.name, skill_name)) continue;
+
+        const bytes = readOptionalFile(allocator, io, skill.file_path) catch {
+            return allocator.dupe(u8, text);
+        };
+        defer if (bytes) |value| allocator.free(value);
+        if (bytes == null) return allocator.dupe(u8, text);
+
+        const parsed = parseFrontmatter(allocator, bytes.?) catch {
+            return allocator.dupe(u8, text);
+        };
+        defer parsed.deinit(allocator);
+
+        const body = std.mem.trim(u8, parsed.body, " \t\r\n");
+        if (args.len > 0) {
+            return std.fmt.allocPrint(
+                allocator,
+                "<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>\n\n{s}",
+                .{ skill.name, skill.file_path, skill.base_dir, body, args },
+            );
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>",
+            .{ skill.name, skill.file_path, skill.base_dir, body },
+        );
+    }
+
+    return allocator.dupe(u8, text);
+}
+
 fn defaultThemeStyles() [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec {
     var styles: [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec = undefined;
     for (&styles) |*style| style.* = .{};
@@ -2036,6 +2080,58 @@ test "loadResourceBundle loads skills templates and themes with selected theme" 
     const styled = try bundle.selectedTheme().applyAlloc(allocator, .assistant, "Pi:");
     defer allocator.free(styled);
     try std.testing.expectEqualStrings("Pi:", styled);
+}
+
+test "expandSkillCommand strips frontmatter and appends arguments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "skills/reviewer");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "skills/reviewer/SKILL.md",
+        .data =
+        \\---
+        \\name: reviewer
+        \\description: Review code
+        \\---
+        \\Use this skill body.
+        \\
+        ,
+    });
+
+    const skill_path = try makeTmpPath(allocator, tmp, "skills/reviewer/SKILL.md");
+    defer allocator.free(skill_path);
+    const base_dir = try makeTmpPath(allocator, tmp, "skills/reviewer");
+    defer allocator.free(base_dir);
+    var skill = Skill{
+        .name = try allocator.dupe(u8, "reviewer"),
+        .description = try allocator.dupe(u8, "Review code"),
+        .file_path = try allocator.dupe(u8, skill_path),
+        .base_dir = try allocator.dupe(u8, base_dir),
+        .source_info = .{
+            .path = try allocator.dupe(u8, skill_path),
+            .source = try allocator.dupe(u8, "local"),
+            .scope = .temporary,
+            .origin = .top_level,
+            .base_dir = try allocator.dupe(u8, base_dir),
+        },
+    };
+    defer skill.deinit(allocator);
+
+    const expanded = try expandSkillCommand(allocator, std.testing.io, "/skill:reviewer focus src", &.{skill});
+    defer allocator.free(expanded);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "<skill name=\"reviewer\" location=\"{s}\">\nReferences are relative to {s}.\n\nUse this skill body.\n</skill>\n\nfocus src",
+        .{ skill_path, base_dir },
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, expanded);
+
+    const unknown = try expandSkillCommand(allocator, std.testing.io, "/skill:missing", &.{skill});
+    defer allocator.free(unknown);
+    try std.testing.expectEqualStrings("/skill:missing", unknown);
 }
 
 test "loadResourceBundle exposes built-in dark light and codex themes" {

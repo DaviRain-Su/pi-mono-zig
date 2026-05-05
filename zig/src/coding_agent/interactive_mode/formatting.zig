@@ -15,19 +15,29 @@ pub fn formatPrefixedBlocks(allocator: std.mem.Allocator, prefix: []const u8, bl
 pub fn formatAssistantMessage(allocator: std.mem.Allocator, message: ai.AssistantMessage) ![]u8 {
     const body = try blocksToTextWithoutThinking(allocator, message.content);
     defer allocator.free(body);
-    if (body.len > 0) {
-        return allocator.dupe(u8, body);
+    const trimmed_body = std.mem.trim(u8, body, " \t\r\n");
+    const should_render_stop = !assistantHasToolCalls(message) and
+        (message.stop_reason == .error_reason or message.stop_reason == .aborted);
+    if (!should_render_stop) {
+        return allocator.dupe(u8, trimmed_body);
     }
-    if (message.stop_reason == .error_reason) {
-        return try std.fmt.allocPrint(allocator, "Error: {s}", .{message.error_message orelse "unknown error"});
+
+    const stop_text = if (message.stop_reason == .error_reason)
+        try std.fmt.allocPrint(allocator, "Error: {s}", .{message.error_message orelse "Unknown error"})
+    else if (message.error_message) |error_message|
+        try allocator.dupe(u8, if (std.mem.eql(u8, error_message, "Request was aborted")) "Operation aborted" else error_message)
+    else
+        try allocator.dupe(u8, "Operation aborted");
+    defer allocator.free(stop_text);
+
+    if (trimmed_body.len == 0) {
+        return allocator.dupe(u8, stop_text);
     }
-    if (message.stop_reason == .aborted) {
-        return try allocator.dupe(u8, "[interrupted]");
-    }
-    return try allocator.dupe(u8, "");
+    return try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed_body, stop_text });
 }
 
 pub fn formatToolCall(allocator: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]u8 {
+    if (std.mem.eql(u8, name, "bash")) return formatBashToolCall(allocator, args);
     if (std.mem.eql(u8, name, "read")) return formatReadToolCall(allocator, args);
     if (std.mem.eql(u8, name, "write")) return formatWriteToolCall(allocator, args);
     if (std.mem.eql(u8, name, "edit")) return formatEditToolCall(allocator, args);
@@ -36,6 +46,28 @@ pub fn formatToolCall(allocator: std.mem.Allocator, name: []const u8, args: std.
     const json = try std.json.Stringify.valueAlloc(allocator, args, .{});
     defer allocator.free(json);
     return try std.fmt.allocPrint(allocator, "Tool {s}: {s}", .{ name, json });
+}
+
+fn formatBashToolCall(allocator: std.mem.Allocator, args: std.json.Value) ![]u8 {
+    const command = getStringArg(args, "command");
+    const timeout = getIntegerArg(args, "timeout") orelse getIntegerArg(args, "timeout_seconds");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "$ ");
+    if (command) |value| {
+        if (value.len == 0) {
+            try out.appendSlice(allocator, "...");
+        } else {
+            try out.appendSlice(allocator, value);
+        }
+    } else {
+        try out.appendSlice(allocator, "[invalid arg]");
+    }
+    if (timeout) |seconds| {
+        try appendPrint(&out, allocator, " (timeout {d}s)", .{seconds});
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 pub fn formatStreamingToolCall(allocator: std.mem.Allocator, name: ?[]const u8, args_fragment: []const u8) ![]u8 {
@@ -287,7 +319,7 @@ fn blocksToTextFiltered(allocator: std.mem.Allocator, blocks: []const ai.Content
             },
             .image => |image| {
                 if (appended) try out.appendSlice(allocator, "\n");
-                const note = try std.fmt.allocPrint(allocator, "[image:{s}:{d}]", .{ image.mime_type, image.data.len });
+                const note = try std.fmt.allocPrint(allocator, "[Image: [{s}]]", .{image.mime_type});
                 defer allocator.free(note);
                 try out.appendSlice(allocator, note);
                 appended = true;
@@ -301,6 +333,16 @@ fn blocksToTextFiltered(allocator: std.mem.Allocator, blocks: []const ai.Content
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn assistantHasToolCalls(message: ai.AssistantMessage) bool {
+    if (message.tool_calls) |tool_calls| {
+        if (tool_calls.len > 0) return true;
+    }
+    for (message.content) |block| {
+        if (block == .tool_call) return true;
+    }
+    return false;
 }
 
 test "formatAssistantMessage hides thinking blocks" {
@@ -321,6 +363,55 @@ test "formatAssistantMessage hides thinking blocks" {
     defer allocator.free(rendered);
 
     try std.testing.expectEqualStrings("visible answer", rendered);
+}
+
+test "formatAssistantMessage appends TS-equivalent abort and error text" {
+    const allocator = std.testing.allocator;
+    const text_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = " partial answer \n" } }};
+    const rendered_error = try formatAssistantMessage(allocator, .{
+        .content = &text_blocks,
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "boom",
+        .timestamp = 0,
+    });
+    defer allocator.free(rendered_error);
+    try std.testing.expectEqualStrings("partial answer\n\nError: boom", rendered_error);
+
+    const rendered_abort = try formatAssistantMessage(allocator, .{
+        .content = &[_]ai.ContentBlock{},
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .aborted,
+        .error_message = "Request was aborted",
+        .timestamp = 0,
+    });
+    defer allocator.free(rendered_abort);
+    try std.testing.expectEqualStrings("Operation aborted", rendered_abort);
+}
+
+test "formatToolCall renders bash command like TS renderer" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"command\":\"echo hi\",\"timeout\":2}", .{});
+    defer parsed.deinit();
+
+    const rendered = try formatToolCall(allocator, "bash", parsed.value);
+    defer allocator.free(rendered);
+
+    try std.testing.expectEqualStrings("$ echo hi (timeout 2s)", rendered);
+}
+
+test "blocksToText renders deterministic image fallback" {
+    const allocator = std.testing.allocator;
+    const blocks = [_]ai.ContentBlock{.{ .image = .{ .mime_type = "image/png", .data = "abcd" } }};
+    const rendered = try blocksToText(allocator, &blocks);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("[Image: [image/png]]", rendered);
 }
 
 test "formatToolCall renders read arguments as a concise status line" {

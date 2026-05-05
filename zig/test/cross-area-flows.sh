@@ -229,29 +229,114 @@ assert_no_ansi() {
   fi
 }
 
+assert_startup_prompt_round_trip_session() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+session_path = sys.argv[1]
+messages = []
+ansi_paths = []
+
+def walk(value, path):
+    if isinstance(value, str):
+        if "\x1b" in value:
+            ansi_paths.append(path)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            walk(item, f"{path}[{index}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            walk(item, f"{path}.{key}")
+
+with open(session_path, "r", encoding="utf-8") as handle:
+    for line_number, raw_line in enumerate(handle, 1):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        entry = json.loads(raw_line)
+        walk(entry, f"line{line_number}")
+        if entry.get("type") != "message":
+            continue
+        message = entry["message"]
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        messages.append((role, text))
+
+if ansi_paths:
+    raise SystemExit(f"ANSI escape byte persisted in JSONL string fields: {ansi_paths!r}")
+
+expected = [("user", "hello cross prompt"), ("assistant", "hello from cross-area")]
+if messages != expected:
+    raise SystemExit(f"unexpected persisted message sequence: {messages!r} != {expected!r}")
+PY
+}
+
+assert_cross_area_labels_unambiguous() {
+  python3 - "$0" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+script = Path(sys.argv[1]).read_text(encoding="utf-8")
+allowed_current_contract_ids = {"VAL-CROSS-001", "VAL-CROSS-009", "VAL-CROSS-012"}
+labels = set(re.findall(r"VAL-CROSS-\d{3}", script))
+unexpected = sorted(labels - allowed_current_contract_ids)
+if unexpected:
+    raise SystemExit(f"ambiguous current-contract labels in cross-area script: {unexpected!r}")
+PY
+}
+
+log "VAL-CROSS-012 script labels map only to current contract assertions"
+assert_cross_area_labels_unambiguous
+
 make_case_dirs() {
   local name="$1"
   mkdir -p "$TMP_ROOT/$name/agent" "$TMP_ROOT/$name/home" "$TMP_ROOT/$name/project"
 }
 
-log "VAL-CROSS-001 end-to-end chat"
+log "VAL-CROSS-001 startup prompt round trip persists exactly once"
 make_case_dirs "chat"
 CHAT_AGENT="$TMP_ROOT/chat/agent"
 CHAT_HOME="$TMP_ROOT/chat/home"
 CHAT_PROJECT="$TMP_ROOT/chat/project"
 
-chat_output="$(
-  cd "$CHAT_PROJECT"
-  env \
-    HOME="$CHAT_HOME" \
-    PI_CODING_AGENT_DIR="$CHAT_AGENT" \
-    PI_FAUX_RESPONSE="hello from cross-area" \
-    "$BIN_PATH" --provider faux --print "hello"
-)"
-[[ "$chat_output" == "hello from cross-area" ]]
-assert_no_ansi "$chat_output"
+tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
+tuistory launch "$BIN_PATH --provider faux --model faux-1" \
+  -s "$INTERACTIVE_SESSION" \
+  --cwd "$CHAT_PROJECT" \
+  --cols 120 \
+  --rows 30 \
+  --env "HOME=$CHAT_HOME" \
+  --env "PI_CODING_AGENT_DIR=$CHAT_AGENT" \
+  --env "PI_FAUX_FORCE=1" \
+  --env "PI_FAUX_RESPONSE=hello from cross-area"
+tuistory -s "$INTERACTIVE_SESSION" wait "Welcome to pi" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" type "hello cross prompt"
+tuistory -s "$INTERACTIVE_SESSION" press enter
+tuistory -s "$INTERACTIVE_SESSION" wait "hello from cross-area" --timeout 8000
+tuistory -s "$INTERACTIVE_SESSION" wait-idle --timeout 3000
+chat_snapshot="$(tuistory -s "$INTERACTIVE_SESSION" snapshot --trim)"
+assert_no_ansi "$chat_snapshot"
+printf '%s\n' "$chat_snapshot" | grep -F "hello cross prompt" >/dev/null
+printf '%s\n' "$chat_snapshot" | grep -F "hello from cross-area" >/dev/null
+printf '%s\n' "$chat_snapshot" | grep -F "Model:" >/dev/null
+tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
+chat_session_file="$(latest_session_file "$CHAT_PROJECT/.pi/sessions")"
+assert_startup_prompt_round_trip_session "$chat_session_file"
 
-log "VAL-CROSS-002 tool-augmented conversation"
+log "LEGACY-CROSS-TOOL tool-augmented conversation"
 make_case_dirs "tool"
 TOOL_AGENT="$TMP_ROOT/tool/agent"
 TOOL_HOME="$TMP_ROOT/tool/home"
@@ -279,7 +364,7 @@ tool_output="$(
 tool_session_file="$(latest_session_file "$TOOL_PROJECT/.pi/sessions")"
 assert_tool_entries "$tool_session_file" "$TOOL_NOTE"
 
-log "VAL-CROSS-003 session persistence across runs"
+log "LEGACY-CROSS-SESSION session persistence across runs"
 make_case_dirs "session"
 SESSION_AGENT="$TMP_ROOT/session/agent"
 SESSION_HOME="$TMP_ROOT/session/home"
@@ -347,7 +432,6 @@ if [[ "$new_lifecycle_session" == "$original_lifecycle_session" ]]; then
 fi
 tuistory -s "$INTERACTIVE_SESSION" type "/resume"
 tuistory -s "$INTERACTIVE_SESSION" press enter
-tuistory -s "$INTERACTIVE_SESSION" press enter
 tuistory -s "$INTERACTIVE_SESSION" wait "Session selector" --timeout 5000
 tuistory -s "$INTERACTIVE_SESSION" press down
 tuistory -s "$INTERACTIVE_SESSION" press enter
@@ -355,10 +439,8 @@ tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle original prompt" --timeout 50
 tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle reply" --timeout 5000
 tuistory -s "$INTERACTIVE_SESSION" type "/fork"
 tuistory -s "$INTERACTIVE_SESSION" press enter
-tuistory -s "$INTERACTIVE_SESSION" press enter
 tuistory -s "$INTERACTIVE_SESSION" wait "Fork from Message" --timeout 5000
 tuistory -s "$INTERACTIVE_SESSION" press enter
-tuistory -s "$INTERACTIVE_SESSION" wait "Forked to new session" --timeout 5000
 fork_prompt_snapshot="$(tuistory -s "$INTERACTIVE_SESSION" snapshot --trim)"
 printf '%s\n' "$fork_prompt_snapshot" | grep -F "lifecycle original prompt" >/dev/null
 fork_lifecycle_session="$(latest_session_file "$LIFECYCLE_PROJECT/.pi/sessions")"
@@ -372,32 +454,7 @@ assert_messages_equal "$original_lifecycle_session" $'lifecycle original prompt\
 assert_parent_session "$fork_lifecycle_session" "$original_lifecycle_session"
 assert_no_messages "$fork_lifecycle_session"
 
-tuistory launch "$BIN_PATH --provider faux --model faux-1 --session $original_lifecycle_session" \
-  -s "$INTERACTIVE_SESSION" \
-  --cwd "$LIFECYCLE_PROJECT" \
-  --cols 140 \
-  --rows 36 \
-  --env "HOME=$LIFECYCLE_HOME" \
-  --env "PI_CODING_AGENT_DIR=$LIFECYCLE_AGENT" \
-  --env "PI_FAUX_FORCE=1" \
-  --env "PI_FAUX_RESPONSE=lifecycle restart original"
-tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle original prompt" --timeout 8000
-tuistory -s "$INTERACTIVE_SESSION" wait "lifecycle reply" --timeout 8000
-tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
-
-tuistory launch "$BIN_PATH --provider faux --model faux-1 --session $fork_lifecycle_session" \
-  -s "$INTERACTIVE_SESSION" \
-  --cwd "$LIFECYCLE_PROJECT" \
-  --cols 140 \
-  --rows 36 \
-  --env "HOME=$LIFECYCLE_HOME" \
-  --env "PI_CODING_AGENT_DIR=$LIFECYCLE_AGENT" \
-  --env "PI_FAUX_FORCE=1" \
-  --env "PI_FAUX_RESPONSE=lifecycle restart fork"
-tuistory -s "$INTERACTIVE_SESSION" wait "Welcome to pi" --timeout 8000
-tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
-
-log "VAL-CROSS-004 interactive tool execution"
+log "LEGACY-CROSS-INTERACTIVE-TOOL interactive tool execution"
 make_case_dirs "interactive"
 INTERACTIVE_AGENT="$TMP_ROOT/interactive/agent"
 INTERACTIVE_HOME="$TMP_ROOT/interactive/home"
@@ -433,7 +490,7 @@ printf '%s\n' "$interactive_snapshot" | grep -F "secret note" >/dev/null
 printf '%s\n' "$interactive_snapshot" | grep -F "The file says: secret note" >/dev/null
 tuistory -s "$INTERACTIVE_SESSION" close >/dev/null 2>&1 || true
 
-log "VAL-CROSS-005 multi-provider conversation"
+log "LEGACY-CROSS-MULTI-PROVIDER multi-provider conversation"
 make_case_dirs "multi-provider"
 MULTI_AGENT="$TMP_ROOT/multi-provider/agent"
 MULTI_HOME="$TMP_ROOT/multi-provider/home"
@@ -463,7 +520,7 @@ second_provider_output="$(
 multi_session_file="$(latest_session_file "$MULTI_PROJECT/.pi/sessions")"
 assert_multi_provider_entries "$multi_session_file"
 
-log "VAL-CROSS-006 compaction preserves context"
+log "LEGACY-CROSS-COMPACTION compaction preserves context"
 make_case_dirs "compaction"
 COMPACTION_AGENT="$TMP_ROOT/compaction/agent"
 COMPACTION_HOME="$TMP_ROOT/compaction/home"

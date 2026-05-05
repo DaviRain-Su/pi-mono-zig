@@ -260,8 +260,16 @@ pub const SessionSearchToken = struct {
     value: []const u8,
 };
 
+pub const SessionSearchQueryMode = enum {
+    tokens,
+    regex,
+};
+
 pub const ParsedSessionSearchQuery = struct {
+    mode: SessionSearchQueryMode = .tokens,
     tokens: []const SessionSearchToken,
+    regex_pattern: []const u8 = "",
+    regex_valid: bool = true,
 
     pub fn deinit(self: *ParsedSessionSearchQuery, allocator: std.mem.Allocator) void {
         allocator.free(self.tokens);
@@ -300,6 +308,7 @@ pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     header: SessionHeader,
+    runtime_cwd: []const u8,
     session_dir: []const u8,
     session_file: ?[]const u8,
     persist: bool,
@@ -368,15 +377,14 @@ pub const SessionManager = struct {
         var header = try parseHeaderLine(allocator, header_line);
         errdefer deinitHeader(allocator, &header);
 
-        if (cwd_override) |cwd| {
-            allocator.free(header.cwd);
-            header.cwd = try allocator.dupe(u8, cwd);
-        }
+        const runtime_cwd = try allocator.dupe(u8, cwd_override orelse header.cwd);
+        errdefer allocator.free(runtime_cwd);
 
         var manager = SessionManager{
             .allocator = allocator,
             .io = io,
             .header = header,
+            .runtime_cwd = runtime_cwd,
             .session_dir = try deriveSessionDir(allocator, session_file),
             .session_file = try allocator.dupe(u8, session_file),
             .persist = true,
@@ -437,6 +445,7 @@ pub const SessionManager = struct {
         self.labels_by_id.deinit();
         self.label_timestamps_by_id.deinit();
         deinitHeader(self.allocator, &self.header);
+        self.allocator.free(self.runtime_cwd);
         self.allocator.free(self.session_dir);
         if (self.session_file) |path| self.allocator.free(path);
         self.* = undefined;
@@ -451,7 +460,7 @@ pub const SessionManager = struct {
     }
 
     pub fn getCwd(self: *const SessionManager) []const u8 {
-        return self.header.cwd;
+        return self.runtime_cwd;
     }
 
     pub fn getSessionDir(self: *const SessionManager) []const u8 {
@@ -765,7 +774,7 @@ pub const SessionManager = struct {
         var manager = try initEmpty(
             self.allocator,
             self.io,
-            self.header.cwd,
+            self.getCwd(),
             self.session_dir,
             self.persist,
             if (self.persist) self.session_file else null,
@@ -975,10 +984,7 @@ pub const SessionManager = struct {
     }
 
     /// Forces a full rewrite of the session JSONL file from the in-memory
-    /// header and entries. Used by lifecycle paths that need the on-disk
-    /// header to reflect a recent in-memory mutation (for example, the
-    /// missing-cwd Continue flow that overrides the stored cwd only after
-    /// user confirmation).
+    /// header and entries.
     pub fn persistToDiskNow(self: *SessionManager) !void {
         try self.persistToDisk();
     }
@@ -1127,27 +1133,38 @@ pub fn parseSessionSearchQuery(
     allocator: std.mem.Allocator,
     query: []const u8,
 ) !ParsedSessionSearchQuery {
+    const trimmed_query = std.mem.trim(u8, query, &std.ascii.whitespace);
+    if (std.mem.startsWith(u8, trimmed_query, "re:")) {
+        const pattern = std.mem.trim(u8, trimmed_query[3..], &std.ascii.whitespace);
+        return .{
+            .mode = .regex,
+            .tokens = try allocator.alloc(SessionSearchToken, 0),
+            .regex_pattern = pattern,
+            .regex_valid = pattern.len > 0 and simpleRegexPatternIsValid(pattern),
+        };
+    }
+
     var tokens = std.ArrayList(SessionSearchToken).empty;
     errdefer tokens.deinit(allocator);
 
     var index: usize = 0;
-    while (index < query.len) {
-        while (index < query.len and std.ascii.isWhitespace(query[index])) : (index += 1) {}
-        if (index >= query.len) break;
+    while (index < trimmed_query.len) {
+        while (index < trimmed_query.len and std.ascii.isWhitespace(trimmed_query[index])) : (index += 1) {}
+        if (index >= trimmed_query.len) break;
 
         var field: SessionSearchField = .any;
-        if (detectSessionSearchField(query[index..])) |match| {
+        if (detectSessionSearchField(trimmed_query[index..])) |match| {
             field = match.field;
             index += match.consumed;
         }
 
-        if (index >= query.len) break;
+        if (index >= trimmed_query.len) break;
 
-        if (query[index] == '"') {
+        if (trimmed_query[index] == '"') {
             index += 1;
             const start = index;
-            while (index < query.len and query[index] != '"') : (index += 1) {}
-            const value = std.mem.trim(u8, query[start..@min(index, query.len)], &std.ascii.whitespace);
+            while (index < trimmed_query.len and trimmed_query[index] != '"') : (index += 1) {}
+            const value = std.mem.trim(u8, trimmed_query[start..@min(index, trimmed_query.len)], &std.ascii.whitespace);
             if (value.len > 0) {
                 try tokens.append(allocator, .{
                     .field = field,
@@ -1155,13 +1172,13 @@ pub fn parseSessionSearchQuery(
                     .value = value,
                 });
             }
-            if (index < query.len and query[index] == '"') index += 1;
+            if (index < trimmed_query.len and trimmed_query[index] == '"') index += 1;
             continue;
         }
 
         const start = index;
-        while (index < query.len and !std.ascii.isWhitespace(query[index])) : (index += 1) {}
-        const value = std.mem.trim(u8, query[start..index], &std.ascii.whitespace);
+        while (index < trimmed_query.len and !std.ascii.isWhitespace(trimmed_query[index])) : (index += 1) {}
+        const value = std.mem.trim(u8, trimmed_query[start..index], &std.ascii.whitespace);
         if (value.len == 0) continue;
 
         try tokens.append(allocator, .{
@@ -1172,6 +1189,7 @@ pub fn parseSessionSearchQuery(
     }
 
     return .{
+        .mode = .tokens,
         .tokens = try tokens.toOwnedSlice(allocator),
     };
 }
@@ -1469,6 +1487,15 @@ fn matchSessionSearchQuery(
     session: SessionSearchInfo,
     query: ParsedSessionSearchQuery,
 ) SessionSearchMatchResult {
+    if (query.mode == .regex) {
+        if (!query.regex_valid) return .{ .matches = false, .score = 0 };
+        const match_index = simpleRegexIndexOfCaseInsensitive(session.search_text, query.regex_pattern) orelse return .{
+            .matches = false,
+            .score = 0,
+        };
+        return .{ .matches = true, .score = @intCast(match_index) };
+    }
+
     if (query.tokens.len == 0) return .{ .matches = true, .score = 0 };
 
     var total_score: i32 = 0;
@@ -1483,7 +1510,7 @@ fn matchSessionSearchQuery(
 
         switch (token.kind) {
             .phrase => {
-                const match_index = indexOfCaseInsensitive(text, token.value) orelse return .{
+                const match_index = (normalizedPhraseIndex(std.heap.page_allocator, text, token.value) catch null) orelse return .{
                     .matches = false,
                     .score = 0,
                 };
@@ -1528,6 +1555,100 @@ fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+fn normalizedPhraseIndex(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8) !?usize {
+    const normalized_haystack = try normalizeWhitespaceLowerAlloc(allocator, haystack);
+    defer allocator.free(normalized_haystack);
+    const normalized_needle = try normalizeWhitespaceLowerAlloc(allocator, needle);
+    defer allocator.free(normalized_needle);
+    return std.mem.indexOf(u8, normalized_haystack, normalized_needle);
+}
+
+fn normalizeWhitespaceLowerAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    var pending_space = false;
+    var wrote_any = false;
+    for (text) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            if (wrote_any) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            try out.append(allocator, ' ');
+            pending_space = false;
+        }
+        try out.append(allocator, std.ascii.toLower(byte));
+        wrote_any = true;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn simpleRegexPatternIsValid(pattern: []const u8) bool {
+    var escaped = false;
+    var paren_depth: usize = 0;
+    for (pattern) |byte| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '(') {
+            paren_depth += 1;
+        } else if (byte == ')') {
+            if (paren_depth == 0) return false;
+            paren_depth -= 1;
+        } else if (byte == '[') {
+            return false;
+        }
+    }
+    return !escaped and paren_depth == 0;
+}
+
+fn simpleRegexIndexOfCaseInsensitive(haystack: []const u8, pattern: []const u8) ?usize {
+    if (!simpleRegexPatternIsValid(pattern)) return null;
+    var start: usize = 0;
+    while (start <= haystack.len) : (start += 1) {
+        if (simpleRegexMatchesAt(haystack, start, pattern)) return start;
+        if (start == haystack.len) break;
+    }
+    return null;
+}
+
+fn simpleRegexMatchesAt(haystack: []const u8, start: usize, pattern: []const u8) bool {
+    var hay_index = start;
+    var pat_index: usize = 0;
+    while (pat_index < pattern.len) {
+        if (pat_index + 1 < pattern.len and pattern[pat_index] == '\\' and pattern[pat_index + 1] == 'b') {
+            if (!isWordBoundary(haystack, hay_index)) return false;
+            pat_index += 2;
+            continue;
+        }
+        if (pattern[pat_index] == '\\' and pat_index + 1 < pattern.len) {
+            pat_index += 1;
+        }
+        if (hay_index >= haystack.len) return false;
+        const pattern_byte = pattern[pat_index];
+        if (pattern_byte != '.' and std.ascii.toLower(haystack[hay_index]) != std.ascii.toLower(pattern_byte)) return false;
+        hay_index += 1;
+        pat_index += 1;
+    }
+    return true;
+}
+
+fn isWordBoundary(text: []const u8, index: usize) bool {
+    const before_word = index > 0 and isRegexWordByte(text[index - 1]);
+    const after_word = index < text.len and isRegexWordByte(text[index]);
+    return before_word != after_word;
+}
+
+fn isRegexWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
 fn initEmpty(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1551,15 +1672,25 @@ fn initEmpty(
         null;
     errdefer if (session_file) |path| allocator.free(path);
 
+    const header_cwd = try allocator.dupe(u8, cwd);
+    errdefer allocator.free(header_cwd);
+
+    const runtime_cwd = try allocator.dupe(u8, cwd);
+    errdefer allocator.free(runtime_cwd);
+
+    const parent_session_copy = if (parent_session) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (parent_session_copy) |path| allocator.free(path);
+
     return .{
         .allocator = allocator,
         .io = io,
         .header = .{
             .id = session_id,
             .timestamp = timestamp,
-            .cwd = try allocator.dupe(u8, cwd),
-            .parent_session = if (parent_session) |path| try allocator.dupe(u8, path) else null,
+            .cwd = header_cwd,
+            .parent_session = parent_session_copy,
         },
+        .runtime_cwd = runtime_cwd,
         .session_dir = session_dir_copy,
         .session_file = session_file,
         .persist = persist,
@@ -1900,6 +2031,7 @@ fn appendContextEntry(
             try appendOwnedVisibleMessage(messages, allocator, message);
         },
         .custom_message => |custom_message_entry| {
+            if (customMessageExcludedFromContext(custom_message_entry)) return;
             var message = try createCustomContextMessage(
                 allocator,
                 custom_message_entry.content,
@@ -1916,6 +2048,14 @@ fn appendContextEntry(
         .session_info,
         => {},
     }
+}
+
+fn customMessageExcludedFromContext(entry: CustomMessageEntry) bool {
+    if (!std.mem.eql(u8, entry.custom_type, "bashExecution")) return false;
+    const details = entry.details orelse return false;
+    if (details != .object) return false;
+    const value = details.object.get("excludeFromContext") orelse return false;
+    return value == .bool and value.bool;
 }
 
 fn appendClonedVisibleMessage(

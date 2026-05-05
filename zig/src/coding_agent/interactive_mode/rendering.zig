@@ -7,13 +7,22 @@ const provider_config = @import("../provider_config.zig");
 const resources_mod = @import("../resources.zig");
 const session_mod = @import("../session.zig");
 const session_advanced = @import("../session_advanced.zig");
+const extension_registry = @import("../extension_registry.zig");
 const common = @import("../tools/common.zig");
 const bash_execution = @import("bash_execution.zig");
 const user_bash_task_mod = @import("user_bash_task.zig");
 const shared = @import("shared.zig");
 const formatting = @import("formatting.zig");
 const overlays = @import("overlays.zig");
-const clipboard_image = @import("clipboard_image.zig");
+const clipboard_paste_task = @import("clipboard_paste_task.zig");
+const chat_items = @import("chat_items.zig");
+const chat_rendering = @import("chat_rendering.zig");
+const extension_ui = @import("extension_ui.zig");
+const git_status = @import("git_status.zig");
+const overlay_panel = @import("overlay_panel.zig");
+const pending_editor_images_mod = @import("pending_editor_images.zig");
+const prompt_rendering = @import("prompt_rendering.zig");
+const render_text = @import("render_text.zig");
 const currentSessionLabel = shared.currentSessionLabel;
 const SelectorOverlay = overlays.SelectorOverlay;
 const ASSISTANT_PREFIX = formatting.ASSISTANT_PREFIX;
@@ -24,39 +33,10 @@ const formatToolCall = formatting.formatToolCall;
 const formatStreamingToolCall = formatting.formatStreamingToolCall;
 const WHEEL_LINES_PER_NOTCH: usize = 3;
 
-pub const ChatKind = enum {
-    welcome,
-    info,
-    @"error",
-    markdown,
-    user,
-    assistant,
-    thinking,
-    tool_call,
-    tool_result,
-    bash_execution,
-};
+pub const ChatKind = chat_items.ChatKind;
+pub const ChatItem = chat_items.ChatItem;
 
-pub const ChatItem = struct {
-    kind: ChatKind,
-    text: []u8,
-    expanded_text: ?[]u8 = null,
-    start_ms: ?i64 = null,
-    frozen_frame_index: ?usize = null,
-};
-
-pub const PendingEditorImage = struct {
-    data: []const u8,
-    mime_type: []const u8,
-    kitty_image: ?tui.components.image.KittyImage = null,
-
-    fn content(self: PendingEditorImage) ai.ImageContent {
-        return .{
-            .data = self.data,
-            .mime_type = self.mime_type,
-        };
-    }
-};
+pub const PendingEditorImage = pending_editor_images_mod.PendingEditorImage;
 
 pub const TerminalImageContext = struct {
     vx: *tui.vaxis.Vaxis,
@@ -70,6 +50,10 @@ pub const FooterUsageTotals = struct {
     cache_write: u64 = 0,
     cost: f64 = 0,
 };
+
+pub const ExtensionWidgetPlacement = extension_ui.WidgetPlacement;
+pub const ExtensionWidget = extension_ui.Widget;
+pub const EXTENSION_WIDGET_TRUNCATION_MARKER = extension_ui.WIDGET_TRUNCATION_MARKER;
 
 pub const ChatRegion = struct {
     row_start: usize = 0,
@@ -105,9 +89,17 @@ pub const RenderStateSnapshot = struct {
     chat_scroll_offset: usize = 0,
     all_expanded: bool = false,
     hide_thinking_blocks: bool = false,
+    hidden_thinking_label: []u8 = &.{},
+    extension_header_lines: [][]u8 = &.{},
+    extension_footer_lines: [][]u8 = &.{},
+    extension_editor_label: ?[]u8 = null,
+    extension_widgets: []ExtensionWidget = &.{},
+    extension_footer_statuses: [][]u8 = &.{},
+    working_message: ?[]u8 = null,
+    working_visible: bool = true,
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
-        for (self.items) |*item| deinitChatItem(allocator, item);
+        for (self.items) |*item| chat_items.deinit(allocator, item);
         if (self.items.len > 0) allocator.free(self.items);
         if (self.status) |status| allocator.free(status);
         if (self.provider_label) |provider_label| allocator.free(provider_label);
@@ -117,7 +109,14 @@ pub const RenderStateSnapshot = struct {
         if (self.git_branch) |git_branch| allocator.free(git_branch);
         deinitOwnedStringList(allocator, self.queued_steering);
         deinitOwnedStringList(allocator, self.queued_follow_up);
-        deinitImageContentsForRender(allocator, self.pending_editor_images);
+        pending_editor_images_mod.deinitForRender(allocator, self.pending_editor_images);
+        deinitOwnedStringList(allocator, self.extension_header_lines);
+        deinitOwnedStringList(allocator, self.extension_footer_lines);
+        if (self.extension_editor_label) |label| allocator.free(label);
+        for (self.extension_widgets) |*widget| widget.deinit(allocator);
+        if (self.extension_widgets.len > 0) allocator.free(self.extension_widgets);
+        deinitOwnedStringList(allocator, self.extension_footer_statuses);
+        if (self.working_message) |message| allocator.free(message);
         self.* = undefined;
     }
 };
@@ -134,110 +133,6 @@ const StreamingToolCall = struct {
 };
 
 const ClockNowMsFn = *const fn (?*anyopaque) i64;
-
-const CLIPBOARD_PASTE_PROGRESS_MIN_MS: i64 = 120;
-
-const ClipboardPasteResult = union(enum) {
-    none,
-    success: ai.ImageContent,
-    empty,
-    unsupported,
-    failure,
-};
-
-const ClipboardPasteTask = struct {
-    io: std.Io,
-    env_map: ?*const std.process.Environ.Map = null,
-    thread: ?std.Thread = null,
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    result_mutex: std.Io.Mutex = .init,
-    result: ClipboardPasteResult = .none,
-    started_at_ms: i64 = 0,
-
-    fn start(self: *ClipboardPasteTask, env_map: *const std.process.Environ.Map) !bool {
-        if (self.thread != null) return false;
-        self.env_map = env_map;
-        self.started_at_ms = nowMilliseconds();
-        self.running.store(true, .seq_cst);
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
-        return true;
-    }
-
-    fn poll(self: *ClipboardPasteTask) ?ClipboardPasteResult {
-        if (self.thread == null) return null;
-        if (self.running.load(.seq_cst)) return null;
-        if (nowMilliseconds() - self.started_at_ms < CLIPBOARD_PASTE_PROGRESS_MIN_MS) return null;
-
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-
-        self.result_mutex.lockUncancelable(self.io);
-        defer self.result_mutex.unlock(self.io);
-
-        const result = self.result;
-        self.result = .none;
-        return result;
-    }
-
-    fn isActive(self: *const ClipboardPasteTask) bool {
-        return self.thread != null;
-    }
-
-    fn deinit(self: *ClipboardPasteTask) void {
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.running.store(false, .seq_cst);
-
-        self.result_mutex.lockUncancelable(self.io);
-        defer self.result_mutex.unlock(self.io);
-        freeClipboardPasteResult(&self.result);
-        self.result = .none;
-    }
-
-    fn run(self: *ClipboardPasteTask) void {
-        defer self.running.store(false, .seq_cst);
-
-        const allocator = std.heap.page_allocator;
-        const env_map = self.env_map orelse {
-            self.storeResult(.failure);
-            return;
-        };
-
-        const read_result = clipboard_image.readClipboardImage(allocator, self.io, env_map) catch {
-            self.storeResult(.failure);
-            return;
-        };
-        switch (read_result) {
-            .image => |raw_image| {
-                var image = raw_image;
-                defer image.deinit(allocator);
-
-                const encoded = clipboard_image.encodeImageContent(allocator, image) catch {
-                    self.storeResult(.failure);
-                    return;
-                };
-                self.storeResult(.{ .success = encoded });
-            },
-            .unsupported => self.storeResult(.unsupported),
-            .none => self.storeResult(.empty),
-        }
-    }
-
-    fn storeResult(self: *ClipboardPasteTask, result: ClipboardPasteResult) void {
-        self.result_mutex.lockUncancelable(self.io);
-        defer self.result_mutex.unlock(self.io);
-        freeClipboardPasteResult(&self.result);
-        self.result = result;
-    }
-};
-
-fn freeClipboardPasteResult(result: *ClipboardPasteResult) void {
-    switch (result.*) {
-        .success => |*image| clipboard_image.deinitImageContent(std.heap.page_allocator, image),
-        else => {},
-    }
-    result.* = .none;
-}
 
 pub const AppState = struct {
     allocator: std.mem.Allocator,
@@ -272,7 +167,15 @@ pub const AppState = struct {
     streaming_tool_calls: std.ArrayList(StreamingToolCall) = .empty,
     tool_output_expanded: bool = false,
     hide_thinking_blocks: bool = false,
-    clipboard_paste: ClipboardPasteTask,
+    hidden_thinking_label: []u8 = &.{},
+    extension_header_lines: [][]u8 = &.{},
+    extension_footer_lines: [][]u8 = &.{},
+    extension_editor_label: ?[]u8 = null,
+    extension_widgets: std.ArrayList(ExtensionWidget) = .empty,
+    extension_footer_statuses: std.StringHashMap([]u8),
+    working_message: []u8 = &.{},
+    working_visible: bool = true,
+    clipboard_paste: clipboard_paste_task.ClipboardPasteTask,
     user_bash_task: user_bash_task_mod.UserBashTask = .{},
     scoped_model_override_active: bool = false,
     scoped_model_patterns: ?[][]u8 = null,
@@ -285,6 +188,7 @@ pub const AppState = struct {
         var state = AppState{
             .allocator = allocator,
             .io = io,
+            .extension_footer_statuses = std.StringHashMap([]u8).init(allocator),
             .clipboard_paste = .{ .io = io },
         };
         errdefer state.deinit();
@@ -294,11 +198,17 @@ pub const AppState = struct {
         state.model_label = try allocator.dupe(u8, "unknown");
         state.session_label = try allocator.dupe(u8, "new");
         state.git_branch = try allocator.dupe(u8, "");
+        state.hidden_thinking_label = try allocator.dupe(u8, ASSISTANT_THINKING_TEXT);
+        state.working_message = try allocator.dupe(u8, "Working...");
         try state.appendItemLocked(.welcome, "Welcome to pi (Zig interactive mode). Type a prompt and press Enter.");
         return state;
     }
 
     pub fn deinit(self: *AppState) void {
+        self.clearExtensionUiHooksLocked();
+        self.extension_widgets.deinit(self.allocator);
+        extension_ui.clearFooterStatuses(self.allocator, &self.extension_footer_statuses);
+        self.extension_footer_statuses.deinit();
         self.user_bash_task.deinit(self.allocator);
         self.clearScopedModelOverrideLocked();
         self.clearPendingEditorImagesLocked();
@@ -312,7 +222,7 @@ pub const AppState = struct {
         self.clearQueuedMessagesLocked();
         self.queued_steering.deinit(self.allocator);
         self.queued_follow_up.deinit(self.allocator);
-        for (self.items.items) |*item| deinitChatItem(self.allocator, item);
+        for (self.items.items) |*item| chat_items.deinit(self.allocator, item);
         self.items.deinit(self.allocator);
         self.allocator.free(self.status);
         self.allocator.free(self.provider_label);
@@ -320,6 +230,8 @@ pub const AppState = struct {
         self.allocator.free(self.model_label);
         self.allocator.free(self.session_label);
         self.allocator.free(self.git_branch);
+        self.allocator.free(self.hidden_thinking_label);
+        self.allocator.free(self.working_message);
         self.* = undefined;
     }
 
@@ -347,22 +259,18 @@ pub const AppState = struct {
     }
 
     pub fn pollClipboardPaste(self: *AppState, terminal_image_context: ?TerminalImageContext) !void {
-        const result = self.clipboard_paste.poll() orelse return;
+        var result = self.clipboard_paste.poll() orelse return;
+        defer clipboard_paste_task.deinitResult(&result);
 
         switch (result) {
             .success => |image| {
-                defer {
-                    var owned = image;
-                    clipboard_image.deinitImageContent(std.heap.page_allocator, &owned);
-                }
-
                 var pending = PendingEditorImage{
                     .data = try self.allocator.dupe(u8, image.data),
                     .mime_type = try self.allocator.dupe(u8, image.mime_type),
                     .kitty_image = try self.transmitKittyImage(image, terminal_image_context),
                 };
                 var appended = false;
-                errdefer if (!appended) self.deinitPendingEditorImage(&pending);
+                errdefer if (!appended) pending_editor_images_mod.deinit(self.allocator, &pending);
 
                 {
                     self.mutex.lockUncancelable(self.io);
@@ -518,10 +426,17 @@ pub const AppState = struct {
         snapshot.git_branch = try allocator.dupe(u8, self.git_branch);
 
         const start_index = @min(self.visible_start_index, self.items.items.len);
-        snapshot.items = try cloneChatItems(allocator, self.items.items[start_index..]);
+        snapshot.items = try chat_items.clone(allocator, self.items.items[start_index..]);
         snapshot.queued_steering = try cloneOwnedStringList(allocator, self.queued_steering.items);
         snapshot.queued_follow_up = try cloneOwnedStringList(allocator, self.queued_follow_up.items);
-        snapshot.pending_editor_images = try cloneImageContentsForRender(allocator, self.pending_editor_images.items);
+        snapshot.pending_editor_images = try pending_editor_images_mod.cloneForRender(allocator, self.pending_editor_images.items);
+        snapshot.extension_header_lines = try cloneOwnedStringList(allocator, self.extension_header_lines);
+        snapshot.extension_footer_lines = try cloneOwnedStringList(allocator, self.extension_footer_lines);
+        snapshot.extension_editor_label = if (self.extension_editor_label) |label| try allocator.dupe(u8, label) else null;
+        snapshot.extension_widgets = try extension_ui.cloneWidgets(allocator, self.extension_widgets.items);
+        snapshot.extension_footer_statuses = try extension_ui.cloneFooterStatusesSorted(allocator, &self.extension_footer_statuses);
+        snapshot.working_message = if (self.working_message.len > 0) try allocator.dupe(u8, self.working_message) else null;
+        snapshot.working_visible = self.working_visible;
         return snapshot;
     }
 
@@ -628,6 +543,24 @@ pub const AppState = struct {
         return self.hide_thinking_blocks;
     }
 
+    pub fn setThinkingBlockVisibility(self: *AppState, hidden: bool) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.hide_thinking_blocks = hidden;
+        try self.applyThinkingBlockVisibilityLocked();
+    }
+
+    pub fn setHiddenThinkingLabel(self: *AppState, label: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        try self.replaceLabelLocked(&self.hidden_thinking_label, if (label.len > 0) label else ASSISTANT_THINKING_TEXT);
+        if (self.hide_thinking_blocks) {
+            try self.applyThinkingBlockVisibilityLocked();
+        }
+    }
+
     pub fn currentNowMs(self: *AppState) i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -694,6 +627,57 @@ pub const AppState = struct {
         try self.replaceLabelLocked(&self.status, text);
     }
 
+    pub fn setExtensionFooterStatus(self: *AppState, key: []const u8, text: ?[]const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.setExtensionFooterStatusLocked(key, text);
+    }
+
+    fn setExtensionFooterStatusLocked(self: *AppState, key: []const u8, text: ?[]const u8) !void {
+        return extension_ui.setFooterStatus(self.allocator, &self.extension_footer_statuses, key, text);
+    }
+
+    pub fn setWorkingMessage(self: *AppState, message: ?[]const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.replaceLabelLocked(&self.working_message, message orelse "Working...");
+    }
+
+    pub fn setWorkingVisible(self: *AppState, visible: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.working_visible = visible;
+    }
+
+    pub fn clearExtensionUiHooks(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.clearExtensionUiHooksLocked();
+    }
+
+    pub fn applyExtensionRegistryUi(self: *AppState, registry: *const extension_registry.Registry) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        try self.replaceExtensionLinesLocked(&self.extension_header_lines, if (registry.header_hook) |hook| hook.lines else &.{});
+        try self.replaceExtensionLinesLocked(&self.extension_footer_lines, if (registry.footer_hook) |hook| hook.lines else &.{});
+
+        const next_editor_label = if (registry.editor_component_hook) |hook| hook.label else null;
+        if (self.extension_editor_label) |old| {
+            self.allocator.free(old);
+            self.extension_editor_label = null;
+        }
+        if (next_editor_label) |label| {
+            self.extension_editor_label = try self.allocator.dupe(u8, label);
+        }
+
+        for (self.extension_widgets.items) |*widget| widget.deinit(self.allocator);
+        self.extension_widgets.clearRetainingCapacity();
+        for (registry.widgets.items) |widget| {
+            try self.extension_widgets.append(self.allocator, try extension_ui.cloneRegistryWidget(self.allocator, widget));
+        }
+    }
+
     pub fn appendInfo(self: *AppState, text: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -717,7 +701,7 @@ pub const AppState = struct {
         const text = try bash_execution.formatBashExecutionDisplay(
             self.allocator,
             command,
-            "Running...",
+            "",
             null,
             false,
             false,
@@ -727,7 +711,7 @@ pub const AppState = struct {
         );
         defer self.allocator.free(text);
 
-        try self.appendItemLocked(.bash_execution, text);
+        try self.appendItemWithExpandedTextLocked(.bash_execution, text, null, null, null);
         try self.replaceLabelLocked(&self.status, "running bash");
         return self.items.items.len - 1;
     }
@@ -743,7 +727,7 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
 
         const index = item_index orelse return;
-        const text = try bash_execution.formatBashExecutionDisplay(
+        const text = try bash_execution.formatBashExecutionDisplayExpanded(
             self.allocator,
             command,
             output,
@@ -753,9 +737,24 @@ pub const AppState = struct {
             null,
             exclude_from_context,
             true,
+            false,
         );
         defer self.allocator.free(text);
-        try self.replaceItemTextLocked(index, text);
+        const expanded = try bash_execution.formatBashExecutionDisplayExpanded(
+            self.allocator,
+            command,
+            output,
+            null,
+            false,
+            false,
+            null,
+            exclude_from_context,
+            true,
+            true,
+        );
+        defer self.allocator.free(expanded);
+        const expanded_text: ?[]const u8 = if (std.mem.eql(u8, text, expanded)) null else expanded;
+        try self.replaceItemExpandedTextLocked(index, text, expanded_text);
         try self.replaceLabelLocked(&self.status, "running bash");
     }
 
@@ -773,7 +772,7 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const text = try bash_execution.formatBashExecutionDisplay(
+        const text = try bash_execution.formatBashExecutionDisplayExpanded(
             self.allocator,
             command,
             output,
@@ -783,12 +782,27 @@ pub const AppState = struct {
             full_output_path,
             exclude_from_context,
             false,
+            false,
         );
         defer self.allocator.free(text);
+        const expanded = try bash_execution.formatBashExecutionDisplayExpanded(
+            self.allocator,
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            exclude_from_context,
+            false,
+            true,
+        );
+        defer self.allocator.free(expanded);
+        const expanded_text: ?[]const u8 = if (std.mem.eql(u8, text, expanded)) null else expanded;
         if (item_index) |index| {
-            try self.replaceItemTextLocked(index, text);
+            try self.replaceItemExpandedTextLocked(index, text, expanded_text);
         } else {
-            try self.appendItemLocked(.bash_execution, text);
+            try self.appendItemWithExpandedTextLocked(.bash_execution, text, expanded_text, null, null);
         }
         try self.replaceLabelLocked(&self.status, "idle");
     }
@@ -812,7 +826,7 @@ pub const AppState = struct {
         const messages = session.agent.getMessages();
         const stats = session_advanced.getSessionStats(session);
 
-        for (self.items.items) |*item| deinitChatItem(self.allocator, item);
+        for (self.items.items) |*item| chat_items.deinit(self.allocator, item);
         self.items.clearRetainingCapacity();
         self.visible_start_index = 0;
         self.chat_scroll_offset = 0;
@@ -1246,7 +1260,7 @@ pub const AppState = struct {
         frozen_frame_index: ?usize,
     ) !void {
         const was_at_tail = self.chat_scroll_offset == 0;
-        const display_text = if (kind == .thinking and self.hide_thinking_blocks) ASSISTANT_THINKING_TEXT else text;
+        const display_text = if (kind == .thinking and self.hide_thinking_blocks) self.hidden_thinking_label else text;
         const stored_expanded_text = if (kind == .thinking and self.hide_thinking_blocks) text else expanded_text;
         const owned_text = try self.allocator.dupe(u8, display_text);
         errdefer self.allocator.free(owned_text);
@@ -1369,7 +1383,7 @@ pub const AppState = struct {
 
     pub fn removeItemLocked(self: *AppState, index: usize) void {
         if (index >= self.items.items.len) return;
-        deinitChatItem(self.allocator, &self.items.items[index]);
+        chat_items.deinit(self.allocator, &self.items.items[index]);
         _ = self.items.orderedRemove(index);
         for (self.active_tool_updates.items) |*entry| {
             if (entry.item_index > index) entry.item_index -= 1;
@@ -1397,13 +1411,36 @@ pub const AppState = struct {
         field.* = try self.allocator.dupe(u8, text);
     }
 
+    fn replaceExtensionLinesLocked(self: *AppState, field: *[][]u8, lines: []const []const u8) !void {
+        deinitOwnedStringList(self.allocator, field.*);
+        field.* = try cloneConstStringList(self.allocator, lines);
+    }
+
+    fn clearExtensionUiHooksLocked(self: *AppState) void {
+        deinitOwnedStringList(self.allocator, self.extension_header_lines);
+        self.extension_header_lines = &.{};
+        deinitOwnedStringList(self.allocator, self.extension_footer_lines);
+        self.extension_footer_lines = &.{};
+        if (self.extension_editor_label) |label| self.allocator.free(label);
+        self.extension_editor_label = null;
+        for (self.extension_widgets.items) |*widget| widget.deinit(self.allocator);
+        self.extension_widgets.clearRetainingCapacity();
+        extension_ui.clearFooterStatuses(self.allocator, &self.extension_footer_statuses);
+        self.working_visible = true;
+        self.replaceLabelLocked(&self.working_message, "Working...") catch {};
+    }
+
     fn applyThinkingBlockVisibilityLocked(self: *AppState) !void {
         for (self.items.items) |*item| {
             if (item.kind != .thinking) continue;
             if (self.hide_thinking_blocks) {
-                if (item.expanded_text != null) continue;
+                if (item.expanded_text != null) {
+                    self.allocator.free(item.text);
+                    item.text = try self.allocator.dupe(u8, self.hidden_thinking_label);
+                    continue;
+                }
                 const original = item.text;
-                item.text = try self.allocator.dupe(u8, ASSISTANT_THINKING_TEXT);
+                item.text = try self.allocator.dupe(u8, self.hidden_thinking_label);
                 item.expanded_text = original;
             } else if (item.expanded_text) |original| {
                 self.allocator.free(item.text);
@@ -1457,15 +1494,9 @@ pub const AppState = struct {
     fn clearPendingEditorImagesLocked(self: *AppState) void {
         for (self.pending_editor_images.items) |*image| {
             self.retirePendingEditorImageLocked(image);
-            self.deinitPendingEditorImage(image);
+            pending_editor_images_mod.deinit(self.allocator, image);
         }
         self.pending_editor_images.clearRetainingCapacity();
-    }
-
-    fn deinitPendingEditorImage(self: *AppState, image: *PendingEditorImage) void {
-        self.allocator.free(image.data);
-        self.allocator.free(image.mime_type);
-        image.* = undefined;
     }
 
     fn retirePendingEditorImageLocked(self: *AppState, image: *PendingEditorImage) void {
@@ -1734,6 +1765,7 @@ pub const ScreenComponent = struct {
 
         if (self.after_snapshot_hook) |hook| hook.run();
 
+        try appendPlainExtensionLines(allocator, self.theme, snapshot.extension_header_lines, width, &chat_lines);
         for (snapshot.items) |item| {
             try renderChatItemIntoWithOptions(
                 allocator,
@@ -1749,14 +1781,24 @@ pub const ScreenComponent = struct {
 
         var prompt_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &prompt_lines);
+        try appendWidgetLines(allocator, self.theme, snapshot.extension_widgets, .above_editor, width, &prompt_lines);
+        if (snapshot.extension_editor_label) |label| {
+            const editor_label = try std.fmt.allocPrint(allocator, "Extension editor: {s}", .{label});
+            defer allocator.free(editor_label);
+            try appendPlainExtensionLine(allocator, self.theme, editor_label, width, &prompt_lines);
+        }
         try renderPromptLines(allocator, self.theme, self.editor, snapshot.pending_editor_images, width, &prompt_lines);
+        try appendWidgetLines(allocator, self.theme, snapshot.extension_widgets, .below_editor, width, &prompt_lines);
         var queued_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &queued_lines);
         try renderQueuedMessageLines(allocator, self.keybindings, self.theme, &snapshot, width, &queued_lines);
         var task_panel_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &task_panel_lines);
         try renderTaskPanelLines(allocator, self.theme, &snapshot, width, &task_panel_lines);
-        const footer_line = try formatFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width);
+        const footer_line = if (snapshot.extension_footer_lines.len > 0)
+            try formatExtensionFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width)
+        else
+            try formatFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
         defer allocator.free(hints_line);
@@ -1818,15 +1860,22 @@ pub const ScreenComponent = struct {
         if (self.after_snapshot_hook) |hook| hook.run();
 
         const width = @max(@as(usize, window.width), 1);
-        const footer_text = try formatFooterText(ctx.arena, &snapshot, width);
+        const footer_text = if (snapshot.extension_footer_lines.len > 0)
+            try formatExtensionFooterLineWithTerminal(ctx.arena, null, &snapshot, self.terminal_name, width)
+        else
+            try formatFooterText(ctx.arena, &snapshot, width);
         const hints_text = try formatHintsText(ctx.arena, self.keybindings, width);
-        const prompt_height = try measurePromptHeight(
+        const extension_above_height = extensionWidgetLineCount(snapshot.extension_widgets, .above_editor);
+        const extension_editor_height: usize = if (snapshot.extension_editor_label != null) 1 else 0;
+        const extension_below_height = extensionWidgetLineCount(snapshot.extension_widgets, .below_editor);
+        const core_prompt_height = try measurePromptHeight(
             ctx.arena,
             self.theme,
             self.editor,
             snapshot.pending_editor_images,
             width,
         );
+        const prompt_height = core_prompt_height + extension_above_height + extension_editor_height + extension_below_height;
         const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
         const task_panel_height = taskPanelHeightForWidth(width);
@@ -1877,11 +1926,21 @@ pub const ScreenComponent = struct {
         }
         row += queued_height;
 
-        const prompt_start_row = row;
+        const prompt_start_row = row + extension_above_height + extension_editor_height;
+        if (extension_above_height > 0 and row < window.height) {
+            row += drawExtensionWidgetLines(window, row, snapshot.extension_widgets, .above_editor, self.theme);
+        }
+        if (snapshot.extension_editor_label) |label| {
+            if (row < window.height) {
+                const editor_label = try std.fmt.allocPrint(ctx.arena, "Extension editor: {s}", .{label});
+                drawFittedLine(window, row, editor_label, styleForToken(self.theme, .status));
+            }
+            row += 1;
+        }
         if (row < window.height) {
             const prompt_window = window.child(.{
                 .y_off = @intCast(row),
-                .height = @intCast(@min(prompt_height, @as(usize, window.height) - row)),
+                .height = @intCast(@min(core_prompt_height, @as(usize, window.height) - row)),
             });
             _ = try drawPromptLines(
                 prompt_window,
@@ -1891,7 +1950,10 @@ pub const ScreenComponent = struct {
                 snapshot.pending_editor_images,
             );
         }
-        row += prompt_height;
+        row += core_prompt_height;
+        if (extension_below_height > 0 and row < window.height) {
+            row += drawExtensionWidgetLines(window, row, snapshot.extension_widgets, .below_editor, self.theme);
+        }
 
         const editor_window_width = promptEditorWidth(width);
         const editor_x = promptEditorOffsetX(width);
@@ -1964,6 +2026,34 @@ fn drawFittedLine(
         .text = text,
         .style = style,
     }, .{ .wrap = .none });
+}
+
+fn extensionWidgetLineCount(widgets: []const ExtensionWidget, placement: ExtensionWidgetPlacement) usize {
+    var count: usize = 0;
+    for (widgets) |widget| {
+        if (widget.placement != placement) continue;
+        count += @max(widget.lines.len, 1);
+    }
+    return count;
+}
+
+fn drawExtensionWidgetLines(
+    window: tui.vaxis.Window,
+    start_row: usize,
+    widgets: []const ExtensionWidget,
+    placement: ExtensionWidgetPlacement,
+    theme: ?*const resources_mod.Theme,
+) usize {
+    var row = start_row;
+    for (widgets) |widget| {
+        if (widget.placement != placement) continue;
+        for (widget.lines) |line| {
+            if (row >= window.height) return row - start_row;
+            drawFittedLine(window, row, line, styleForToken(theme, .status));
+            row += 1;
+        }
+    }
+    return row - start_row;
 }
 
 fn drawFooterWithTerminal(
@@ -2091,31 +2181,6 @@ fn estimateWrappedRows(text: []const u8, width: usize) usize {
     return rows;
 }
 
-fn measureEditorHeight(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    editor: *tui.Editor,
-    width: usize,
-) !usize {
-    const height_hint = @max(@as(usize, 1), estimateWrappedRows(editor.text(), width) + editor.padding_y * 2);
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const measure_window = tui.draw.rootWindow(&screen);
-    measure_window.clear();
-    const size = try editor.draw(measure_window, .{
-        .window = measure_window,
-        .arena = allocator,
-        .theme = theme,
-    });
-    return @max(@as(usize, size.height), 1);
-}
-
 fn measurePromptHeight(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -2123,15 +2188,7 @@ fn measurePromptHeight(
     pending_images: []const PendingEditorImage,
     width: usize,
 ) !usize {
-    _ = allocator;
-    _ = theme;
-    _ = editor;
-    const editor_width = promptEditorWidth(width);
-    const prompt_rows: usize = switch (layoutMode(width)) {
-        .full, .medium, .narrow => PROMPT_BOX_HEIGHT,
-        .mini, .compact => 1,
-    };
-    return prompt_rows + pendingImagesRenderHeight(pending_images, editor_width);
+    return prompt_rendering.measureHeight(allocator, theme, editor, pending_images, width);
 }
 
 fn drawPromptLines(
@@ -2141,128 +2198,7 @@ fn drawPromptLines(
     editor: *tui.Editor,
     pending_images: []const PendingEditorImage,
 ) !tui.DrawSize {
-    const prompt_style = styleForToken(theme, .prompt);
-    const glyph_style = styleForToken(theme, .prompt_glyph);
-    const border_style = styleForToken(theme, .prompt_border);
-    const width = @as(usize, window.width);
-    const mode = layoutMode(width);
-    const editor_width = promptEditorWidth(width);
-    const prompt_rows: usize = switch (mode) {
-        .full, .medium, .narrow => PROMPT_BOX_HEIGHT,
-        .mini, .compact => 1,
-    };
-    const prompt_height = @min(prompt_rows, @as(usize, window.height));
-    const prompt_inner = if (mode != .mini and mode != .compact and window.width >= 2 and window.height >= 2)
-        window.child(.{
-            .height = @intCast(prompt_height),
-            .border = .{
-                .where = .all,
-                .style = border_style,
-                .glyphs = .single_rounded,
-            },
-        })
-    else
-        window.child(.{ .height = @intCast(prompt_height) });
-    prompt_inner.clear();
-
-    const full_editor_height = try measureEditorHeight(ctx.arena, theme, editor, editor_width);
-    const has_overflow = mode != .mini and mode != .compact and full_editor_height > @as(usize, @max(prompt_inner.height, 1));
-
-    if (prompt_inner.height > 0) {
-        const prefix = promptPrefixForWidth(width);
-        const prefix_rows = if (mode == .mini or mode == .compact) @as(usize, 1) else @as(usize, prompt_inner.height);
-        for (0..prefix_rows) |line_index| {
-            _ = prompt_inner.printSegment(.{
-                .text = prefix,
-                .style = glyph_style,
-            }, .{
-                .wrap = .none,
-                .row_offset = @intCast(line_index),
-            });
-        }
-    }
-
-    const editor_x = if (mode == .mini or mode == .compact) promptEditorOffsetX(width) else PROMPT_GLYPH_WIDTH;
-    if (@as(usize, prompt_inner.width) > editor_x) {
-        const editor_window = prompt_inner.child(.{
-            .x_off = @intCast(editor_x),
-            .width = @intCast(editor_width),
-            .height = @max(prompt_inner.height, 1),
-        });
-        _ = try editor.draw(editor_window, .{
-            .window = editor_window,
-            .arena = ctx.arena,
-            .theme = theme,
-        });
-    }
-
-    if (has_overflow and window.height >= PROMPT_BOX_HEIGHT and window.width > 8) {
-        const indicator = "↓ more";
-        const indicator_width = tui.ansi.visibleWidth(indicator);
-        const indicator_col = @max(@as(usize, 1), @as(usize, window.width) -| (indicator_width + 2));
-        _ = window.printSegment(.{
-            .text = indicator,
-            .style = glyph_style,
-        }, .{
-            .wrap = .none,
-            .row_offset = @intCast(PROMPT_BOX_HEIGHT - 1),
-            .col_offset = @intCast(indicator_col),
-        });
-    }
-
-    const prefix_width = promptEditorOffsetX(@as(usize, window.width));
-    const blank_prefix = try ctx.arena.alloc(u8, prefix_width);
-    @memset(blank_prefix, ' ');
-    var image_row: usize = 0;
-    for (pending_images, 0..) |image, index| {
-        const row_count = pendingImageRenderHeight(image, editor_width);
-        if (prompt_rows + image_row >= window.height) break;
-
-        const continuation_window = window.child(.{
-            .x_off = 0,
-            .y_off = @intCast(prompt_rows + image_row),
-            .height = @intCast(@min(row_count, @as(usize, window.height) -| (prompt_rows + image_row))),
-        });
-
-        if (image.kitty_image) |kitty| {
-            const image_window = continuation_window.child(.{
-                .x_off = @intCast(prefix_width),
-                .width = @intCast(editor_width),
-                .height = @intCast(@min(row_count, @as(usize, continuation_window.height))),
-            });
-            const image_component = tui.Image{
-                .mime_type = image.mime_type,
-                .kitty_image = kitty,
-                .max_width_cells = editor_width,
-                .max_height_cells = row_count,
-            };
-            _ = try image_component.drawComponent().draw(image_window, .{
-                .window = image_window,
-                .arena = ctx.arena,
-                .theme = theme,
-            });
-        } else {
-            const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
-            drawFittedLine(continuation_window, 0, placeholder, prompt_style);
-        }
-
-        image_row += row_count;
-    }
-    return .{
-        .width = window.width,
-        .height = @intCast(@min(prompt_rows + image_row, @as(usize, window.height))),
-    };
-}
-
-fn pendingImagesRenderHeight(images: []const PendingEditorImage, width: usize) usize {
-    var height: usize = 0;
-    for (images) |image| height += pendingImageRenderHeight(image, width);
-    return height;
-}
-
-fn pendingImageRenderHeight(image: PendingEditorImage, width: usize) usize {
-    _ = width;
-    return if (image.kitty_image != null) 4 else 1;
+    return prompt_rendering.drawLines(window, ctx, theme, editor, pending_images);
 }
 
 fn measureAutocompleteHeight(
@@ -2355,10 +2291,7 @@ fn drawQueuedMessages(
     };
 }
 
-const ChatViewportMetrics = struct {
-    rendered_height: usize,
-    visible_height: usize,
-};
+const ChatViewportMetrics = chat_rendering.ViewportMetrics;
 
 fn drawChatViewport(
     allocator: std.mem.Allocator,
@@ -2372,69 +2305,7 @@ fn drawChatViewport(
     now_ms: i64,
     all_expanded: bool,
 ) !ChatViewportMetrics {
-    if (start_row >= window.height or height == 0) return .{ .rendered_height = 0, .visible_height = 0 };
-
-    const visible_height = @min(height, @as(usize, window.height) - start_row);
-    const width = @max(@as(usize, window.width), 1);
-    const scratch_height = @max(visible_height, estimateChatRows(items, width, all_expanded));
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = @intCast(@min(scratch_height, @as(usize, std.math.maxInt(u16)))),
-        .cols = window.width,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const scratch_window = tui.draw.rootWindow(&screen);
-    scratch_window.clear();
-    const rendered = try drawChatItems(scratch_window, allocator, keybindings, theme, items, now_ms, all_expanded);
-    const rendered_height = @min(@as(usize, rendered.height), @as(usize, screen.height));
-    const max_offset = rendered_height -| visible_height;
-    const offset = @min(chat_scroll_offset, max_offset);
-    const src_start = max_offset -| offset;
-    const dst = window.child(.{
-        .y_off = @intCast(start_row),
-        .height = @intCast(visible_height),
-    });
-    blitScreenRows(&screen, dst, src_start, visible_height);
-    drawChatScrollIndicators(dst, theme, src_start, rendered_height, visible_height);
-    return .{ .rendered_height = rendered_height, .visible_height = visible_height };
-}
-
-fn drawChatScrollIndicators(
-    window: tui.vaxis.Window,
-    theme: ?*const resources_mod.Theme,
-    src_start: usize,
-    rendered_height: usize,
-    visible_height: usize,
-) void {
-    if (visible_height == 0 or window.width == 0) return;
-    const style = styleForToken(theme, .status);
-    if (src_start > 0) {
-        drawChatScrollIndicator(window, 0, "↑ more", style);
-    }
-    if (src_start + visible_height < rendered_height) {
-        drawChatScrollIndicator(window, visible_height - 1, "↓ more", style);
-    }
-}
-
-fn drawChatScrollIndicator(
-    window: tui.vaxis.Window,
-    row: usize,
-    text: []const u8,
-    style: tui.vaxis.Cell.Style,
-) void {
-    if (row >= window.height) return;
-    const text_width = tui.ansi.visibleWidth(text);
-    const col = @as(usize, window.width) -| text_width;
-    _ = window.printSegment(.{
-        .text = text,
-        .style = style,
-    }, .{
-        .wrap = .none,
-        .row_offset = @intCast(row),
-        .col_offset = @intCast(col),
-    });
+    return chat_rendering.drawViewport(allocator, keybindings, theme, items, window, start_row, height, chat_scroll_offset, now_ms, all_expanded);
 }
 
 fn drawChatItems(
@@ -2446,15 +2317,7 @@ fn drawChatItems(
     now_ms: i64,
     all_expanded: bool,
 ) !tui.DrawSize {
-    var row: usize = 0;
-    for (items) |item| {
-        if (row >= window.height) break;
-        row += try drawChatItem(window, allocator, keybindings, theme, item, row, now_ms, all_expanded);
-    }
-    return .{
-        .width = window.width,
-        .height = @intCast(@min(row, @as(usize, window.height))),
-    };
+    return chat_rendering.drawItems(window, allocator, keybindings, theme, items, now_ms, all_expanded);
 }
 
 fn drawChatItem(
@@ -2467,253 +2330,27 @@ fn drawChatItem(
     now_ms: i64,
     all_expanded: bool,
 ) !usize {
-    const remaining_height = @as(usize, window.height) -| start_row;
-    if (remaining_height == 0) return 0;
-    const child = window.child(.{
-        .y_off = @intCast(start_row),
-        .height = @intCast(remaining_height),
-    });
-    if (!all_expanded) {
-        if (previewThreshold(item.kind)) |threshold| {
-            const full_height_hint = @max(@as(usize, 1), estimateChatItemRowsFull(item, @max(@as(usize, window.width), 1), true));
-            var scratch = try tui.vaxis.Screen.init(allocator, .{
-                .rows = @intCast(@min(full_height_hint, @as(usize, std.math.maxInt(u16)))),
-                .cols = window.width,
-                .x_pixel = 0,
-                .y_pixel = 0,
-            });
-            defer scratch.deinit(allocator);
-
-            const scratch_window = tui.draw.rootWindow(&scratch);
-            scratch_window.clear();
-            const rendered_height = @min(
-                try drawChatItemFull(scratch_window, allocator, theme, item, 0, now_ms, true),
-                @as(usize, scratch.height),
-            );
-            if (rendered_height > threshold) {
-                const preview_rows = @min(threshold, remaining_height);
-                blitScreenRows(&scratch, child, 0, preview_rows);
-                if (threshold < remaining_height) {
-                    try drawCollapseIndicator(child, allocator, keybindings, theme, item.kind, threshold, rendered_height - threshold);
-                }
-                return @min(threshold + 1, remaining_height);
-            }
-        }
-    }
-
-    return drawChatItemFull(child, allocator, theme, item, 0, now_ms, all_expanded);
-}
-
-fn drawChatItemFull(
-    window: tui.vaxis.Window,
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    item: ChatItem,
-    start_row: usize,
-    now_ms: i64,
-    all_expanded: bool,
-) !usize {
-    const remaining_height = @as(usize, window.height) -| start_row;
-    if (remaining_height == 0) return 0;
-    const child = window.child(.{
-        .y_off = @intCast(start_row),
-        .height = @intCast(remaining_height),
-    });
-    const item_text = chatItemDisplayText(item, all_expanded);
-    switch (item.kind) {
-        .assistant => {
-            var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, styleForToken(theme, .role_assistant));
-            if (std.mem.trim(u8, item_text, " \t\r\n").len == 0) return row;
-            const markdown_window = child.child(.{
-                .y_off = @intCast(row),
-                .height = child.height - @as(u16, @intCast(row)),
-            });
-            const markdown = tui.Markdown{ .text = item_text, .theme = theme };
-            const size = try markdown.draw(markdown_window, .{
-                .window = markdown_window,
-                .arena = allocator,
-                .theme = theme,
-            });
-            row += @as(usize, size.height);
-            return row;
-        },
-        .markdown => {
-            const markdown = tui.Markdown{ .text = item_text, .theme = theme };
-            const size = try markdown.draw(child, .{
-                .window = child,
-                .arena = allocator,
-                .theme = theme,
-            });
-            return @as(usize, size.height);
-        },
-        .thinking => return drawThinkingChatItem(child, theme, item, now_ms),
-        else => return drawWrappedText(child, 0, item_text, styleForToken(theme, chatToken(item.kind))),
-    }
-}
-
-fn chatItemDisplayText(item: ChatItem, all_expanded: bool) []const u8 {
-    if (all_expanded and item.kind == .tool_result) {
-        if (item.expanded_text) |expanded_text| return expanded_text;
-    }
-    return item.text;
+    return chat_rendering.drawItem(window, allocator, keybindings, theme, item, start_row, now_ms, all_expanded);
 }
 
 fn previewThreshold(kind: ChatKind) ?usize {
-    return switch (kind) {
-        .thinking => 1,
-        .tool_result => 3,
-        .assistant, .markdown => 5,
-        .welcome, .info, .@"error", .user, .tool_call, .bash_execution => null,
-    };
-}
-
-fn drawCollapseIndicator(
-    window: tui.vaxis.Window,
-    allocator: std.mem.Allocator,
-    keybindings: ?*const keybindings_mod.Keybindings,
-    theme: ?*const resources_mod.Theme,
-    kind: ChatKind,
-    row: usize,
-    hidden_rows: usize,
-) !void {
-    if (row >= window.height) return;
-    const label = try actionLabel(allocator, keybindings, .tools_expand, "Ctrl+O");
-    const text = try std.fmt.allocPrint(allocator, "… +{d} lines ({s} to expand)", .{ hidden_rows, label });
-    _ = window.printSegment(.{
-        .text = text,
-        .style = collapseIndicatorStyle(theme, kind),
-    }, .{
-        .wrap = .none,
-        .row_offset = @intCast(row),
-    });
-}
-
-fn collapseIndicatorStyle(
-    theme: ?*const resources_mod.Theme,
-    kind: ChatKind,
-) tui.vaxis.Cell.Style {
-    var style = switch (kind) {
-        .thinking => styleForToken(theme, .role_thinking),
-        .tool_result => styleForToken(theme, .role_tool_result),
-        .assistant, .markdown => styleForToken(theme, .markdown_text),
-        else => styleForToken(theme, .status),
-    };
-    style.dim = true;
-    if (kind == .assistant or kind == .markdown) {
-        style.italic = true;
-    }
-    return style;
-}
-
-fn drawThinkingChatItem(
-    window: tui.vaxis.Window,
-    theme: ?*const resources_mod.Theme,
-    item: ChatItem,
-    now_ms: i64,
-) usize {
-    if (window.height == 0 or window.width == 0) return 0;
-
-    const glyph_style = styleForToken(theme, .role_thinking_glyph);
-    const text_style = styleForToken(theme, .role_thinking);
-    const glyph = thinkingFrameGlyph(item, now_ms);
-    window.writeCell(0, 0, .{
-        .char = .{ .grapheme = glyph, .width = 1 },
-        .style = glyph_style,
-    });
-    if (window.width > 1) {
-        window.writeCell(1, 0, .{
-            .char = .{ .grapheme = " ", .width = 1 },
-            .style = text_style,
-        });
-    }
-
-    if (window.width <= 2 or item.text.len == 0) return 1;
-
-    const text_window = window.child(.{
-        .x_off = 2,
-        .width = window.width - 2,
-    });
-    return @max(@as(usize, 1), drawWrappedText(text_window, 0, item.text, text_style));
-}
-
-fn thinkingFrameGlyph(item: ChatItem, now_ms: i64) []const u8 {
-    var loader = tui.Loader{};
-    loader.setFrameIndex(thinkingFrameIndex(item, now_ms));
-    return loader.currentFrame();
+    return chat_rendering.previewThreshold(kind);
 }
 
 fn thinkingFrameIndex(item: ChatItem, now_ms: i64) usize {
-    if (item.frozen_frame_index) |index| return index;
-    const start_ms = item.start_ms orelse now_ms;
-    const elapsed_i64 = @max(now_ms - start_ms, 0);
-    var loader = tui.Loader{};
-    return loader.frameIndexForElapsed(@intCast(elapsed_i64));
+    return chat_rendering.thinkingFrameIndex(item, now_ms);
 }
 
 fn chatToken(kind: ChatKind) resources_mod.ThemeToken {
-    return switch (kind) {
-        .welcome => .welcome,
-        .info => .status,
-        .@"error" => .@"error",
-        .markdown => .markdown_text,
-        .user => .role_user,
-        .assistant => .role_assistant,
-        .thinking => .role_thinking,
-        .tool_call => .role_tool_call,
-        .tool_result => .role_tool_result,
-        .bash_execution => .role_tool_result,
-    };
+    return chat_rendering.token(kind);
 }
 
 fn estimateChatRows(items: []const ChatItem, width: usize, all_expanded: bool) usize {
-    var rows: usize = 1;
-    for (items) |item| {
-        rows += estimateChatItemRowsVisible(item, width, all_expanded);
-    }
-    return rows;
+    return chat_rendering.estimateRows(items, width, all_expanded);
 }
 
 fn estimateChatItemRowsVisible(item: ChatItem, width: usize, all_expanded: bool) usize {
-    const full_rows = estimateChatItemRowsFull(item, width, true);
-    if (!all_expanded) {
-        if (previewThreshold(item.kind)) |threshold| {
-            if (full_rows > threshold) return threshold + 1;
-        }
-    }
-    return estimateChatItemRowsFull(item, width, all_expanded);
-}
-
-fn estimateChatItemRowsFull(item: ChatItem, width: usize, all_expanded: bool) usize {
-    const item_text = chatItemDisplayText(item, all_expanded);
-    return switch (item.kind) {
-        .assistant => 1 + estimateWrappedRows(item_text, width) + 8,
-        .markdown => estimateWrappedRows(item_text, width) + 8,
-        .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item_text, width - 2)),
-        else => estimateWrappedRows(item_text, width),
-    };
-}
-
-fn blitScreenRows(
-    source: *tui.vaxis.Screen,
-    dest: tui.vaxis.Window,
-    source_start_row: usize,
-    height: usize,
-) void {
-    const rows = @min(height, @as(usize, dest.height));
-    const cols = @min(@as(usize, source.width), @as(usize, dest.width));
-    for (0..rows) |row| {
-        for (0..cols) |col| {
-            const cell = source.readCell(@intCast(col), @intCast(source_start_row + row)) orelse continue;
-            dest.writeCell(@intCast(col), @intCast(row), normalizeCellForBlit(cell));
-        }
-    }
-}
-
-fn normalizeCellForBlit(cell: tui.vaxis.Cell) tui.vaxis.Cell {
-    if (cell.char.grapheme.len != 0) return cell;
-    var normalized = cell;
-    normalized.char = .{ .grapheme = " ", .width = 1 };
-    return normalized;
+    return chat_rendering.estimateItemRowsVisible(item, width, all_expanded);
 }
 
 const RenderHook = struct {
@@ -2874,11 +2511,47 @@ pub const OverlayPanelComponent = struct {
                 };
                 try content.addChild(allocator, .{ .component = editor_viewport.component() });
             },
+            .extension_dialog => |*dialog| {
+                if (dialog.message.len > 0) {
+                    const message_component = tui.Text{
+                        .text = dialog.message,
+                        .padding_x = 0,
+                        .padding_y = 0,
+                    };
+                    try content.addChild(allocator, .{ .component = message_component.component() });
+                }
+                const chrome_lines = border_lines + box_padding_y * 2 + 4;
+                const body_height = @max(@as(usize, 3), if (self.max_height > chrome_lines) self.max_height - chrome_lines else 3);
+                switch (dialog.kind) {
+                    .select, .confirm => {
+                        dialog.list.theme = self.theme;
+                        dialog.list.max_visible = body_height;
+                        const list_viewport = tui.Viewport{
+                            .child = dialog.list.component(),
+                            .height = body_height,
+                            .show_indicators = true,
+                            .theme = self.theme,
+                            .indicator_token = .select_scroll,
+                        };
+                        try content.addChild(allocator, .{ .component = list_viewport.component() });
+                    },
+                    .input, .editor => {
+                        dialog.editor.setTheme(self.theme);
+                        const editor_viewport = tui.Viewport{
+                            .child = dialog.editor.component(),
+                            .height = body_height,
+                            .anchor = .top,
+                        };
+                        try content.addChild(allocator, .{ .component = editor_viewport.component() });
+                    },
+                }
+            },
             else => {
                 const chrome_lines = border_lines + box_padding_y * 2 + 3;
                 const body_height = @max(@as(usize, 3), if (self.max_height > chrome_lines) self.max_height - chrome_lines else 3);
                 const overlay_list = switch (self.overlay.*) {
                     .info => |*info_overlay| &info_overlay.list,
+                    .settings => |*settings_overlay| &settings_overlay.list,
                     .session => |*session_overlay| &session_overlay.list,
                     .model => |*model_overlay| &model_overlay.list,
                     .scoped_models => |*scoped_models_overlay| &scoped_models_overlay.list,
@@ -2959,10 +2632,48 @@ pub const OverlayPanelComponent = struct {
                     row += @as(usize, size.height);
                 }
             },
+            .extension_dialog => |*dialog| {
+                if (dialog.message.len > 0) {
+                    drawFittedLine(content_window, row, dialog.message, styleForToken(self.theme, .text));
+                    row += 2;
+                }
+                if (row < content_window.height) {
+                    switch (dialog.kind) {
+                        .select, .confirm => {
+                            dialog.list.theme = self.theme;
+                            dialog.list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
+                            const list_window = content_window.child(.{
+                                .y_off = @intCast(row),
+                                .height = content_window.height - @as(u16, @intCast(row)),
+                            });
+                            const size = try dialog.list.draw(list_window, .{
+                                .window = list_window,
+                                .arena = ctx.arena,
+                                .theme = self.theme,
+                            });
+                            row += @as(usize, size.height);
+                        },
+                        .input, .editor => {
+                            dialog.editor.setTheme(self.theme);
+                            const editor_window = content_window.child(.{
+                                .y_off = @intCast(row),
+                                .height = content_window.height - @as(u16, @intCast(row)),
+                            });
+                            const size = try dialog.editor.draw(editor_window, .{
+                                .window = editor_window,
+                                .arena = ctx.arena,
+                                .theme = self.theme,
+                            });
+                            row += @as(usize, size.height);
+                        },
+                    }
+                }
+            },
             else => {
                 if (row < content_window.height) {
                     const overlay_list = switch (self.overlay.*) {
                         .info => |*info_overlay| &info_overlay.list,
+                        .settings => |*settings_overlay| &settings_overlay.list,
                         .session => |*session_overlay| &session_overlay.list,
                         .model => |*model_overlay| &model_overlay.list,
                         .scoped_models => |*scoped_models_overlay| &scoped_models_overlay.list,
@@ -3006,44 +2717,18 @@ pub const OverlayPanelComponent = struct {
     }
 };
 
-pub fn overlayPanelMaxHeight(height: usize) usize {
-    return if (height > 4) height - 4 else @max(height, 3);
-}
-
-pub fn overlayPanelWidth(width: usize) usize {
-    if (width <= 24) return @max(width -| 2, 12);
-    return std.math.clamp((width * 2) / 3, @as(usize, 24), @min(width -| 2, @as(usize, 96)));
-}
-
-pub fn overlayAnimationProgress(now_ms: i64, opened_at_ms: ?i64) f32 {
-    const opened = opened_at_ms orelse return 1.0;
-    const elapsed_ms = @max(now_ms - opened, 0);
-    const duration_ms: f32 = 140.0;
-    const progress = @as(f32, @floatFromInt(elapsed_ms)) / duration_ms;
-    return std.math.clamp(progress, 0.0, 1.0);
-}
-
-pub fn nowMilliseconds() i64 {
-    var now: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&now, null);
-    return @as(i64, @intCast(now.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(now.usec)), std.time.us_per_ms);
-}
+pub const overlayPanelMaxHeight = overlay_panel.maxHeight;
+pub const overlayPanelWidth = overlay_panel.width;
+pub const overlayAnimationProgress = overlay_panel.animationProgress;
+pub const nowMilliseconds = overlay_panel.nowMilliseconds;
+pub const overlayPanelOptions = overlay_panel.options;
+pub const resolveGitBranch = git_status.resolveGitBranch;
+pub const findGitRoot = git_status.findGitRoot;
+pub const resolveGitDirectory = git_status.resolveGitDirectory;
+pub const parseGitHeadBranch = git_status.parseGitHeadBranch;
 
 fn systemNowMilliseconds(_: ?*anyopaque) i64 {
     return nowMilliseconds();
-}
-
-pub fn overlayPanelOptions(size: tui.Size, progress: f32) tui.OverlayOptions {
-    return .{
-        .width = overlayPanelWidth(size.width),
-        .max_height = overlayPanelMaxHeight(size.height),
-        .anchor = .center,
-        .margin = .{ .top = 1, .right = 1, .bottom = 1, .left = 1 },
-        .animation = .{
-            .kind = .slide_from_top,
-            .progress = progress,
-        },
-    };
 }
 
 pub fn rebuildAppStateFromSession(
@@ -3053,7 +2738,7 @@ pub fn rebuildAppStateFromSession(
     session: *const session_mod.AgentSession,
     current_provider: ?*const provider_config.ResolvedProviderConfig,
 ) !void {
-    const git_branch = try resolveGitBranch(allocator, io, session.cwd);
+    const git_branch = try git_status.resolveGitBranch(allocator, io, session.cwd);
     defer if (git_branch) |branch| allocator.free(branch);
     try app_state.rebuildFromSession(session, git_branch);
     if (current_provider) |resolved_provider| {
@@ -3074,7 +2759,7 @@ pub fn updateAppFooterFromSession(
     session: *const session_mod.AgentSession,
     current_provider: *const provider_config.ResolvedProviderConfig,
 ) !void {
-    const git_branch = try resolveGitBranch(allocator, io, session.cwd);
+    const git_branch = try git_status.resolveGitBranch(allocator, io, session.cwd);
     defer if (git_branch) |branch| allocator.free(branch);
     try app_state.setFooterDetails(
         session.agent.getModel(),
@@ -3087,97 +2772,6 @@ pub fn updateAppFooterFromSession(
 
 pub fn assistantContextTokens(usage: ai.Usage) ?u32 {
     return usage.input +| usage.cache_read +| usage.cache_write;
-}
-
-pub fn resolveGitBranch(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !?[]u8 {
-    const repo_root = try findGitRoot(allocator, io, cwd) orelse return null;
-    defer allocator.free(repo_root);
-
-    const git_path = try std.fs.path.join(allocator, &[_][]const u8{ repo_root, ".git" });
-    defer allocator.free(git_path);
-
-    const git_dir = try resolveGitDirectory(allocator, io, repo_root, git_path) orelse return null;
-    defer allocator.free(git_dir);
-
-    const head_path = try std.fs.path.join(allocator, &[_][]const u8{ git_dir, "HEAD" });
-    defer allocator.free(head_path);
-
-    const head = std.Io.Dir.readFileAlloc(.cwd(), io, head_path, allocator, .limited(4096)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(head);
-
-    return parseGitHeadBranch(allocator, head);
-}
-
-pub fn findGitRoot(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !?[]u8 {
-    var current = try allocator.dupe(u8, cwd);
-    errdefer allocator.free(current);
-
-    while (true) {
-        const git_path = try std.fs.path.join(allocator, &[_][]const u8{ current, ".git" });
-        defer allocator.free(git_path);
-
-        const stat = std.Io.Dir.statFile(.cwd(), io, git_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (stat != null) {
-            return current;
-        }
-
-        const parent = std.fs.path.dirname(current) orelse {
-            allocator.free(current);
-            return null;
-        };
-        if (std.mem.eql(u8, parent, current)) {
-            allocator.free(current);
-            return null;
-        }
-
-        const owned_parent = try allocator.dupe(u8, parent);
-        allocator.free(current);
-        current = owned_parent;
-    }
-}
-
-pub fn resolveGitDirectory(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    repo_root: []const u8,
-    git_path: []const u8,
-) !?[]u8 {
-    const stat = std.Io.Dir.statFile(.cwd(), io, git_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-
-    if (stat.kind == .directory) return try allocator.dupe(u8, git_path);
-    if (stat.kind != .file) return null;
-
-    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, git_path, allocator, .limited(4096));
-    defer allocator.free(content);
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    const prefix = "gitdir:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
-
-    const gitdir = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
-    if (std.fs.path.isAbsolute(gitdir)) return try allocator.dupe(u8, gitdir);
-    return try std.fs.path.resolve(allocator, &[_][]const u8{ repo_root, gitdir });
-}
-
-pub fn parseGitHeadBranch(allocator: std.mem.Allocator, head_contents: []const u8) !?[]u8 {
-    const trimmed = std.mem.trim(u8, head_contents, " \t\r\n");
-    const prefix = "ref:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
-
-    const ref_name = std.mem.trim(u8, trimmed[prefix.len..], " \t");
-    const heads_prefix = "refs/heads/";
-    if (std.mem.startsWith(u8, ref_name, heads_prefix)) {
-        return try allocator.dupe(u8, ref_name[heads_prefix.len..]);
-    }
-    return try allocator.dupe(u8, std.fs.path.basename(ref_name));
 }
 
 pub fn parseEnvSize(value: ?[]const u8) ?usize {
@@ -3193,76 +2787,145 @@ pub fn freeLinesSafe(allocator: std.mem.Allocator, lines: *tui.LineList) void {
     tui.component.freeLines(allocator, lines);
 }
 
-pub const INPUT_PROMPT_PREFIX = "> ";
-const COMPACT_INPUT_PROMPT_PREFIX = "Input: ";
-const TOP_PANEL_HEIGHT: usize = 3;
-const COLLAPSED_TOP_PANEL_HEIGHT: usize = 1;
-const PROMPT_BOX_HEIGHT: usize = 3;
-const PROMPT_BORDER_TOP_ROWS: usize = 1;
-const PROMPT_GLYPH_WIDTH: usize = 2;
-const PROMPT_EDITOR_WIDTH_OVERHEAD: usize = 4;
-
-const LayoutMode = enum {
-    full,
-    medium,
-    narrow,
-    mini,
-    compact,
-};
-
-fn layoutMode(width: usize) LayoutMode {
-    if (width >= 100) return .full;
-    if (width >= 80) return .medium;
-    if (width >= 60) return .narrow;
-    if (width >= 40) return .mini;
-    return .compact;
+pub const INPUT_PROMPT_PREFIX = render_text.INPUT_PROMPT_PREFIX;
+const TOP_PANEL_HEIGHT = render_text.TOP_PANEL_HEIGHT;
+const PROMPT_BORDER_TOP_ROWS = render_text.PROMPT_BORDER_TOP_ROWS;
+const LayoutMode = render_text.LayoutMode;
+const layoutMode = render_text.layoutMode;
+const taskPanelHeightForWidth = render_text.taskPanelHeightForWidth;
+const hintsHeightForWidth = render_text.hintsHeightForWidth;
+const promptEditorWidth = render_text.promptEditorWidth;
+const promptEditorOffsetX = render_text.promptEditorOffsetX;
+const promptEditorOffsetY = render_text.promptEditorOffsetY;
+pub fn formatFooterLine(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+) ![]u8 {
+    return render_text.formatFooterLine(allocator, theme, snapshot, width);
 }
 
-fn taskPanelHeightForWidth(width: usize) usize {
-    return switch (layoutMode(width)) {
-        .full, .medium => TOP_PANEL_HEIGHT,
-        .narrow => COLLAPSED_TOP_PANEL_HEIGHT,
-        .mini, .compact => 0,
-    };
+pub fn formatFooterLineWithTerminal(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    terminal_name: []const u8,
+    width: usize,
+) ![]u8 {
+    return render_text.formatFooterLineWithTerminal(allocator, theme, snapshot, terminal_name, width);
 }
 
-fn hintsHeightForWidth(width: usize) usize {
-    return switch (layoutMode(width)) {
-        .full, .medium, .narrow => 1,
-        .mini, .compact => 0,
-    };
+pub fn formatExtensionFooterLineWithTerminal(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    terminal_name: []const u8,
+    width: usize,
+) ![]u8 {
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+    if (snapshot.extension_footer_lines.len > 0) {
+        try builder.appendSlice(allocator, snapshot.extension_footer_lines[0]);
+    }
+    for (snapshot.extension_footer_statuses) |status| {
+        if (status.len == 0) continue;
+        if (builder.items.len > 0) try builder.appendSlice(allocator, " • ");
+        try builder.appendSlice(allocator, status);
+    }
+    if (builder.items.len == 0) {
+        return render_text.formatFooterLineWithTerminal(allocator, theme, snapshot, terminal_name, width);
+    }
+    const fitted = try fitLine(allocator, builder.items, width);
+    defer allocator.free(fitted);
+    return try applyThemeAlloc(allocator, theme, .footer, fitted);
 }
 
-fn promptPrefixForWidth(width: usize) []const u8 {
-    return switch (layoutMode(width)) {
-        .compact => COMPACT_INPUT_PROMPT_PREFIX,
-        else => INPUT_PROMPT_PREFIX,
-    };
+pub fn formatTaskHeaderText(
+    allocator: std.mem.Allocator,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+) ![]u8 {
+    return render_text.formatTaskHeaderText(allocator, snapshot, width);
 }
 
-fn promptEditorWidth(width: usize) usize {
-    return switch (layoutMode(width)) {
-        .full, .medium, .narrow => @max(@as(usize, 1), width -| PROMPT_EDITOR_WIDTH_OVERHEAD),
-        .mini => @max(@as(usize, 1), width -| PROMPT_GLYPH_WIDTH),
-        .compact => @max(@as(usize, 1), width -| tui.ansi.visibleWidth(COMPACT_INPUT_PROMPT_PREFIX)),
-    };
+fn formatTaskHeaderTextForMode(
+    allocator: std.mem.Allocator,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    mode: LayoutMode,
+) ![]u8 {
+    return render_text.formatTaskHeaderTextForMode(allocator, snapshot, width, mode);
 }
 
-fn promptEditorOffsetX(width: usize) usize {
-    return switch (layoutMode(width)) {
-        .full, .medium, .narrow => @min(width, PROMPT_BORDER_TOP_ROWS + PROMPT_GLYPH_WIDTH),
-        .mini => @min(width, PROMPT_GLYPH_WIDTH),
-        .compact => @min(width, tui.ansi.visibleWidth(COMPACT_INPUT_PROMPT_PREFIX)),
-    };
+pub fn formatFooterText(allocator: std.mem.Allocator, snapshot: *const RenderStateSnapshot, width: usize) ![]u8 {
+    return render_text.formatFooterText(allocator, snapshot, width);
 }
 
-fn promptEditorOffsetY(width: usize) usize {
-    return switch (layoutMode(width)) {
-        .full, .medium, .narrow => PROMPT_BORDER_TOP_ROWS,
-        .mini, .compact => 0,
-    };
+pub fn formatFooterTextWithTerminal(
+    allocator: std.mem.Allocator,
+    snapshot: *const RenderStateSnapshot,
+    terminal_name: []const u8,
+    width: usize,
+) ![]u8 {
+    return render_text.formatFooterTextWithTerminal(allocator, snapshot, terminal_name, width);
 }
 
+pub fn appendFooterPart(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    needs_separator: *bool,
+    text: []const u8,
+) std.mem.Allocator.Error!void {
+    return render_text.appendFooterPart(allocator, builder, needs_separator, text);
+}
+
+pub fn formatCompactTokenCount(allocator: std.mem.Allocator, count: u64) ![]u8 {
+    return render_text.formatCompactTokenCount(allocator, count);
+}
+
+pub fn formatHintsLine(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    width: usize,
+) ![]u8 {
+    return render_text.formatHintsLine(allocator, keybindings, theme, width);
+}
+
+pub fn formatHintsText(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    width: usize,
+) ![]u8 {
+    return render_text.formatHintsText(allocator, keybindings, width);
+}
+
+pub fn actionLabel(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    action: keybindings_mod.Action,
+    fallback: []const u8,
+) ![]u8 {
+    return render_text.actionLabel(allocator, keybindings, action, fallback);
+}
+
+pub fn applyThemeAlloc(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    token: resources_mod.ThemeToken,
+    text: []const u8,
+) ![]u8 {
+    return render_text.applyThemeAlloc(allocator, theme, token, text);
+}
+
+pub fn fitLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    return render_text.fitLine(allocator, text, width);
+}
+
+fn formatTerminalBadge(allocator: std.mem.Allocator, terminal_name: []const u8) ![]u8 {
+    return render_text.formatTerminalBadge(allocator, terminal_name);
+}
 pub fn renderTaskPanelLines(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -3303,413 +2966,7 @@ pub fn renderPromptLines(
     width: usize,
     lines: *tui.LineList,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const scratch_allocator = arena.allocator();
-
-    const height = try measurePromptHeight(scratch_allocator, theme, editor, pending_images, width);
-    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
-        .rows = @intCast(@max(height, 1)),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(scratch_allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-    const rendered = try drawPromptLines(window, .{
-        .window = window,
-        .arena = scratch_allocator,
-        .theme = theme,
-    }, theme, editor, pending_images);
-    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
-}
-
-pub fn formatFooterLine(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-) ![]u8 {
-    const fitted = try formatFooterText(allocator, snapshot, width);
-    defer allocator.free(fitted);
-    return try applyThemeAlloc(allocator, theme, .footer, fitted);
-}
-
-pub fn formatFooterLineWithTerminal(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    snapshot: *const RenderStateSnapshot,
-    terminal_name: []const u8,
-    width: usize,
-) ![]u8 {
-    const fitted = try formatFooterTextWithTerminal(allocator, snapshot, terminal_name, width);
-    defer allocator.free(fitted);
-    return try applyThemeAlloc(allocator, theme, .footer, fitted);
-}
-
-pub fn formatTaskHeaderText(
-    allocator: std.mem.Allocator,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-) ![]u8 {
-    return formatTaskHeaderTextForMode(allocator, snapshot, width, layoutMode(width));
-}
-
-fn formatTaskHeaderTextForMode(
-    allocator: std.mem.Allocator,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-    mode: LayoutMode,
-) ![]u8 {
-    const session_label = nonEmptyOr(snapshot.session_label, "(unsaved)");
-    const status_label = nonEmptyOr(snapshot.status, "idle");
-    const model_label = nonEmptyOr(snapshot.model_label, "unknown");
-    const provider_label = nonEmptyOr(snapshot.provider_label, "unknown");
-
-    const title = try std.fmt.allocPrint(allocator, "pi · {s}", .{session_label});
-    defer allocator.free(title);
-
-    const single_line_status = try sanitizeSingleLineStatusAlloc(allocator, status_label);
-    defer allocator.free(single_line_status);
-    if (mode == .narrow) return try fitLine(allocator, title, width);
-
-    const meta = switch (mode) {
-        .full => try std.fmt.allocPrint(
-            allocator,
-            "Status: {s} · Model: {s} · Provider: {s}",
-            .{ single_line_status, model_label, provider_label },
-        ),
-        .medium => try std.fmt.allocPrint(
-            allocator,
-            "Status: {s} · Model: {s}",
-            .{ single_line_status, model_label },
-        ),
-        else => try std.fmt.allocPrint(
-            allocator,
-            "Status: {s} · Model: {s}",
-            .{ single_line_status, model_label },
-        ),
-    };
-    defer allocator.free(meta);
-
-    const title_width = tui.ansi.visibleWidth(title);
-    const meta_width = tui.ansi.visibleWidth(meta);
-    if (width > 0 and title_width + 1 + meta_width <= width) {
-        var builder = std.ArrayList(u8).empty;
-        errdefer builder.deinit(allocator);
-        try builder.appendSlice(allocator, title);
-        const padding = width - title_width - meta_width;
-        try builder.appendNTimes(allocator, ' ', padding);
-        try builder.appendSlice(allocator, meta);
-        return builder.toOwnedSlice(allocator);
-    }
-
-    const combined = try std.fmt.allocPrint(allocator, "{s} · {s}", .{ title, meta });
-    defer allocator.free(combined);
-    return try fitLine(allocator, combined, width);
-}
-
-fn nonEmptyOr(value: ?[]const u8, fallback: []const u8) []const u8 {
-    const text = value orelse return fallback;
-    return if (text.len > 0) text else fallback;
-}
-
-pub fn formatFooterText(
-    allocator: std.mem.Allocator,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-) ![]u8 {
-    switch (layoutMode(width)) {
-        .mini => return formatMiniFooterText(allocator, snapshot, width),
-        .compact => return formatCompactFooterText(allocator, snapshot, width),
-        else => {},
-    }
-
-    var builder = std.ArrayList(u8).empty;
-    defer builder.deinit(allocator);
-
-    var needs_separator = false;
-    if (snapshot.git_branch) |git_branch| {
-        if (git_branch.len > 0) {
-            const branch_text = try std.fmt.allocPrint(allocator, "Branch: {s}", .{git_branch});
-            defer allocator.free(branch_text);
-            try appendFooterPart(allocator, &builder, &needs_separator, branch_text);
-        }
-    }
-    const compact_session_label = try truncateVisibleTextAlloc(allocator, snapshot.session_label.?, 16);
-    defer allocator.free(compact_session_label);
-    const session_text = try std.fmt.allocPrint(allocator, "Session: {s}", .{compact_session_label});
-    defer allocator.free(session_text);
-    try appendFooterPart(allocator, &builder, &needs_separator, session_text);
-
-    if (snapshot.queued_steering.len > 0 or snapshot.queued_follow_up.len > 0) {
-        const queue_text = try formatQueueSummary(allocator, snapshot.queued_steering.len, snapshot.queued_follow_up.len);
-        defer allocator.free(queue_text);
-        try appendFooterPart(allocator, &builder, &needs_separator, queue_text);
-    }
-
-    if (snapshot.usage_totals.input > 0) {
-        const input_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.input);
-        defer allocator.free(input_text);
-        const input_part = try std.fmt.allocPrint(allocator, "↑{s}", .{input_text});
-        defer allocator.free(input_part);
-        try appendFooterPart(allocator, &builder, &needs_separator, input_part);
-    }
-    if (snapshot.usage_totals.output > 0) {
-        const output_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.output);
-        defer allocator.free(output_text);
-        const output_part = try std.fmt.allocPrint(allocator, "↓{s}", .{output_text});
-        defer allocator.free(output_part);
-        try appendFooterPart(allocator, &builder, &needs_separator, output_part);
-    }
-
-    if (snapshot.usage_totals.cache_read > 0) {
-        const cache_read_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.cache_read);
-        defer allocator.free(cache_read_text);
-        const cache_read_part = try std.fmt.allocPrint(allocator, "R{s}", .{cache_read_text});
-        defer allocator.free(cache_read_part);
-        try appendFooterPart(allocator, &builder, &needs_separator, cache_read_part);
-    }
-    if (snapshot.usage_totals.cache_write > 0) {
-        const cache_write_text = try formatCompactTokenCount(allocator, snapshot.usage_totals.cache_write);
-        defer allocator.free(cache_write_text);
-        const cache_write_part = try std.fmt.allocPrint(allocator, "W{s}", .{cache_write_text});
-        defer allocator.free(cache_write_part);
-        try appendFooterPart(allocator, &builder, &needs_separator, cache_write_part);
-    }
-    if (snapshot.usage_totals.cost > 0) {
-        const cost_text = try std.fmt.allocPrint(allocator, "${d:.3}", .{snapshot.usage_totals.cost});
-        defer allocator.free(cost_text);
-        try appendFooterPart(allocator, &builder, &needs_separator, cost_text);
-    }
-    const has_usage_totals = snapshot.usage_totals.input > 0 or
-        snapshot.usage_totals.output > 0 or
-        snapshot.usage_totals.cache_read > 0 or
-        snapshot.usage_totals.cache_write > 0 or
-        snapshot.usage_totals.cost > 0;
-    const show_context = snapshot.context_window > 0 and (has_usage_totals or snapshot.context_percent == null or snapshot.context_percent.? > 0.0);
-    if (show_context) {
-        const window_text = try formatCompactTokenCount(allocator, snapshot.context_window);
-        defer allocator.free(window_text);
-        const context_text = if (snapshot.context_percent) |percent|
-            try std.fmt.allocPrint(allocator, "ctx {d:.1}%/{s}", .{ percent, window_text })
-        else
-            try std.fmt.allocPrint(allocator, "ctx ?/{s}", .{window_text});
-        defer allocator.free(context_text);
-        try appendFooterPart(allocator, &builder, &needs_separator, context_text);
-    }
-
-    const fitted = try fitLine(allocator, builder.items, width);
-    return fitted;
-}
-
-fn formatMiniFooterText(
-    allocator: std.mem.Allocator,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-) ![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    defer builder.deinit(allocator);
-
-    var needs_separator = false;
-    const model_label = nonEmptyOr(snapshot.model_label, "unknown");
-    const model_text = try std.fmt.allocPrint(allocator, "Model: {s}", .{model_label});
-    defer allocator.free(model_text);
-    try appendFooterPart(allocator, &builder, &needs_separator, model_text);
-
-    if (snapshot.context_window > 0) {
-        const window_text = try formatCompactTokenCount(allocator, snapshot.context_window);
-        defer allocator.free(window_text);
-        const context_text = if (snapshot.context_percent) |percent|
-            try std.fmt.allocPrint(allocator, "ctx {d:.1}%/{s}", .{ percent, window_text })
-        else
-            try std.fmt.allocPrint(allocator, "ctx ?/{s}", .{window_text});
-        defer allocator.free(context_text);
-        try appendFooterPart(allocator, &builder, &needs_separator, context_text);
-    }
-
-    return try fitLine(allocator, builder.items, width);
-}
-
-fn formatCompactFooterText(
-    allocator: std.mem.Allocator,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-) ![]u8 {
-    const status_label = nonEmptyOr(snapshot.status, "idle");
-    const single_line_status = try sanitizeSingleLineStatusAlloc(allocator, status_label);
-    defer allocator.free(single_line_status);
-    const status_text = try std.fmt.allocPrint(allocator, "Status: {s}", .{single_line_status});
-    defer allocator.free(status_text);
-    return try fitLine(allocator, status_text, width);
-}
-
-pub fn formatFooterTextWithTerminal(
-    allocator: std.mem.Allocator,
-    snapshot: *const RenderStateSnapshot,
-    terminal_name: []const u8,
-    width: usize,
-) ![]u8 {
-    if (width == 0) return allocator.dupe(u8, "");
-    if (layoutMode(width) == .mini or layoutMode(width) == .compact) {
-        return formatFooterText(allocator, snapshot, width);
-    }
-
-    const badge = try formatTerminalBadge(allocator, terminal_name);
-    defer allocator.free(badge);
-    const badge_width = tui.ansi.visibleWidth(badge);
-    if (badge_width == 0 or width <= badge_width + 1) {
-        return formatFooterText(allocator, snapshot, width);
-    }
-
-    const footer_width = width - badge_width - 1;
-    const footer_text = try formatFooterText(allocator, snapshot, footer_width);
-    defer allocator.free(footer_text);
-
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    try builder.appendSlice(allocator, footer_text);
-    const current_width = tui.ansi.visibleWidth(builder.items);
-    if (width > current_width + badge_width) {
-        try builder.appendNTimes(allocator, ' ', width - current_width - badge_width);
-    }
-    try builder.appendSlice(allocator, badge);
-    return builder.toOwnedSlice(allocator);
-}
-
-fn formatTerminalBadge(allocator: std.mem.Allocator, terminal_name: []const u8) ![]u8 {
-    const source = if (terminal_name.len > 0) terminal_name else "term";
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    for (source) |byte| {
-        try builder.append(allocator, std.ascii.toUpper(byte));
-    }
-    return builder.toOwnedSlice(allocator);
-}
-
-pub fn appendFooterPart(
-    allocator: std.mem.Allocator,
-    builder: *std.ArrayList(u8),
-    needs_separator: *bool,
-    text: []const u8,
-) std.mem.Allocator.Error!void {
-    if (needs_separator.*) try builder.appendSlice(allocator, " • ");
-    try builder.appendSlice(allocator, text);
-    needs_separator.* = true;
-}
-
-fn formatQueueSummary(allocator: std.mem.Allocator, steering_count: usize, follow_up_count: usize) ![]u8 {
-    if (steering_count > 0 and follow_up_count > 0) {
-        return std.fmt.allocPrint(
-            allocator,
-            "Queue: {d} steering, {d} follow-up",
-            .{ steering_count, follow_up_count },
-        );
-    }
-    if (steering_count > 0) {
-        return std.fmt.allocPrint(allocator, "Queue: {d} steering", .{steering_count});
-    }
-    return std.fmt.allocPrint(allocator, "Queue: {d} follow-up", .{follow_up_count});
-}
-
-pub fn formatCompactTokenCount(allocator: std.mem.Allocator, count: u64) ![]u8 {
-    if (count < 1_000) return std.fmt.allocPrint(allocator, "{d}", .{count});
-    if (count < 10_000) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{d}.{d}k",
-            .{ count / 1_000, (count % 1_000) / 100 },
-        );
-    }
-    if (count < 1_000_000) return std.fmt.allocPrint(allocator, "{d}k", .{(count + 500) / 1_000});
-    if (count < 10_000_000) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{d}.{d}M",
-            .{ count / 1_000_000, (count % 1_000_000) / 100_000 },
-        );
-    }
-    return std.fmt.allocPrint(allocator, "{d}M", .{(count + 500_000) / 1_000_000});
-}
-
-pub fn formatHintsLine(
-    allocator: std.mem.Allocator,
-    keybindings: ?*const keybindings_mod.Keybindings,
-    theme: ?*const resources_mod.Theme,
-    width: usize,
-) ![]u8 {
-    const fitted = try formatHintsText(allocator, keybindings, width);
-    defer allocator.free(fitted);
-    return try applyThemeAlloc(allocator, theme, .prompt, fitted);
-}
-
-pub fn formatHintsText(
-    allocator: std.mem.Allocator,
-    keybindings: ?*const keybindings_mod.Keybindings,
-    width: usize,
-) ![]u8 {
-    if (hintsHeightForWidth(width) == 0) return allocator.dupe(u8, "");
-
-    const open_sessions = try actionLabel(allocator, keybindings, .session_resume, "Unbound");
-    defer allocator.free(open_sessions);
-    const open_models = try actionLabel(allocator, keybindings, .model_select, "Ctrl+L");
-    defer allocator.free(open_models);
-    const queue_label = try actionLabel(allocator, keybindings, .message_followUp, "Alt+Enter");
-    defer allocator.free(queue_label);
-    const queue_follow_up = try hintKeyLabel(allocator, queue_label);
-    defer allocator.free(queue_follow_up);
-    const dequeue_label = try actionLabel(allocator, keybindings, .message_dequeue, "Alt+Up");
-    defer allocator.free(dequeue_label);
-    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Esc");
-    defer allocator.free(interrupt);
-    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+C");
-    defer allocator.free(clear);
-    const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
-    defer allocator.free(exit);
-    const suspend_label = try actionLabel(allocator, keybindings, .app_suspend, "Ctrl+Z");
-    defer allocator.free(suspend_label);
-
-    const line = switch (layoutMode(width)) {
-        .full => try std.fmt.allocPrint(
-            allocator,
-            "⏎ send · {s} follow-up · {s} dequeue · {s} sessions · {s} models · {s} interrupt · {s}/{s} clear/exit · {s} suspend",
-            .{ queue_follow_up, dequeue_label, open_sessions, open_models, interrupt, clear, exit, suspend_label },
-        ),
-        .medium => try std.fmt.allocPrint(
-            allocator,
-            "⏎ send · {s} queue · {s} dequeue · {s} sessions · {s} models",
-            .{ queue_follow_up, dequeue_label, open_sessions, open_models },
-        ),
-        .narrow => try std.fmt.allocPrint(
-            allocator,
-            "⏎ send · {s} sessions · {s} models",
-            .{ open_sessions, open_models },
-        ),
-        .mini, .compact => try allocator.dupe(u8, ""),
-    };
-    defer allocator.free(line);
-    const fitted = try fitLine(allocator, line, width);
-    return fitted;
-}
-
-fn hintKeyLabel(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
-    if (std.mem.eql(u8, label, "Enter")) return allocator.dupe(u8, "⏎");
-    if (std.mem.eql(u8, label, "Alt+Enter")) return allocator.dupe(u8, "Alt+⏎");
-    return allocator.dupe(u8, label);
-}
-
-pub fn actionLabel(
-    allocator: std.mem.Allocator,
-    keybindings: ?*const keybindings_mod.Keybindings,
-    action: keybindings_mod.Action,
-    fallback: []const u8,
-) ![]u8 {
-    if (keybindings) |bindings| {
-        return bindings.primaryLabel(allocator, action);
-    }
-    return allocator.dupe(u8, fallback);
+    return prompt_rendering.renderLines(allocator, theme, editor, pending_images, width, lines);
 }
 
 pub fn themeChatItem(
@@ -3801,36 +3058,6 @@ pub fn renderMarkdownChatItemInto(
     try renderChatItemInto(allocator, width, theme, .{ .kind = .markdown, .text = @constCast(text) }, lines);
 }
 
-pub fn applyThemeAlloc(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    token: resources_mod.ThemeToken,
-    text: []const u8,
-) ![]u8 {
-    if (theme) |selected_theme| {
-        return selected_theme.applyAlloc(allocator, token, text);
-    }
-    return allocator.dupe(u8, text);
-}
-
-pub fn fitLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
-    if (width == 0) return allocator.dupe(u8, "");
-    if (tui.ansi.visibleWidth(text) <= width) return tui.ansi.padRightVisibleAlloc(allocator, text, width);
-
-    const limit = if (width > 1) width - 1 else 0;
-    const prefix = try tui.ansi.sliceVisibleAlloc(allocator, text, 0, limit);
-    defer allocator.free(prefix);
-
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    try builder.appendSlice(allocator, prefix);
-    if (width > 0) try builder.append(allocator, '.');
-
-    const fitted = try tui.ansi.padRightVisibleAlloc(allocator, builder.items, width);
-    builder.deinit(allocator);
-    return fitted;
-}
-
 pub fn handleAppAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
     const app_state: *AppState = @ptrCast(@alignCast(context.?));
     try app_state.handleAgentEvent(event);
@@ -3894,74 +3121,42 @@ pub fn renderQueuedMessageLines(
     try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
 }
 
-fn cloneChatItems(allocator: std.mem.Allocator, items: []const ChatItem) ![]ChatItem {
-    if (items.len == 0) return &.{};
-
-    const cloned = try allocator.alloc(ChatItem, items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (cloned[0..initialized]) |*item| deinitChatItem(allocator, item);
-        allocator.free(cloned);
-    }
-
-    for (items, 0..) |item, index| {
-        const expanded_text = if (item.expanded_text) |value| try allocator.dupe(u8, value) else null;
-        errdefer if (expanded_text) |value| allocator.free(value);
-        cloned[index] = .{
-            .kind = item.kind,
-            .text = try allocator.dupe(u8, item.text),
-            .expanded_text = expanded_text,
-            .start_ms = item.start_ms,
-            .frozen_frame_index = item.frozen_frame_index,
-        };
-        initialized += 1;
-    }
-    return cloned;
+fn appendPlainExtensionLines(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    source_lines: []const []const u8,
+    width: usize,
+    lines: *tui.LineList,
+) !void {
+    for (source_lines) |line| try appendPlainExtensionLine(allocator, theme, line, width, lines);
 }
 
-fn deinitChatItem(allocator: std.mem.Allocator, item: *ChatItem) void {
-    allocator.free(item.text);
-    if (item.expanded_text) |expanded_text| allocator.free(expanded_text);
-    item.* = undefined;
+fn appendPlainExtensionLine(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    line: []const u8,
+    width: usize,
+    lines: *tui.LineList,
+) !void {
+    const fitted = try fitLine(allocator, line, width);
+    defer allocator.free(fitted);
+    const themed = try applyThemeAlloc(allocator, theme, .status, fitted);
+    defer allocator.free(themed);
+    try tui.component.appendOwnedLine(lines, allocator, themed);
 }
 
-fn sanitizeSingleLineStatusAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-
-    var previous_was_space = false;
-    for (text) |char| {
-        const is_whitespace = char == '\n' or char == '\r' or char == '\t';
-        if (is_whitespace) {
-            if (!previous_was_space) {
-                try builder.append(allocator, ' ');
-                previous_was_space = true;
-            }
-            continue;
-        }
-        try builder.append(allocator, char);
-        previous_was_space = char == ' ';
+fn appendWidgetLines(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    widgets: []const ExtensionWidget,
+    placement: ExtensionWidgetPlacement,
+    width: usize,
+    lines: *tui.LineList,
+) !void {
+    for (widgets) |widget| {
+        if (widget.placement != placement) continue;
+        try appendPlainExtensionLines(allocator, theme, widget.lines, width, lines);
     }
-
-    if (builder.items.len > 0 and builder.items[builder.items.len - 1] == ' ') {
-        _ = builder.pop();
-    }
-    return builder.toOwnedSlice(allocator);
-}
-
-fn truncateVisibleTextAlloc(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
-    if (max_width == 0) return allocator.dupe(u8, "");
-    if (tui.ansi.visibleWidth(text) <= max_width) return allocator.dupe(u8, text);
-
-    const limit = if (max_width > 1) max_width - 1 else 0;
-    const prefix = try tui.ansi.sliceVisibleAlloc(allocator, text, 0, limit);
-    defer allocator.free(prefix);
-
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    try builder.appendSlice(allocator, prefix);
-    if (max_width > 0) try builder.append(allocator, '.');
-    return builder.toOwnedSlice(allocator);
 }
 
 fn cloneOwnedStringList(allocator: std.mem.Allocator, items: []const []u8) ![][]u8 {
@@ -3981,210 +3176,26 @@ fn cloneOwnedStringList(allocator: std.mem.Allocator, items: []const []u8) ![][]
     return cloned;
 }
 
-fn deinitOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
-    for (items) |item| allocator.free(item);
-    if (items.len > 0) allocator.free(items);
-}
+fn cloneConstStringList(allocator: std.mem.Allocator, items: []const []const u8) ![][]u8 {
+    if (items.len == 0) return &.{};
 
-fn cloneImageContentsForRender(allocator: std.mem.Allocator, images: []const PendingEditorImage) ![]PendingEditorImage {
-    if (images.len == 0) return &.{};
-
-    const cloned = try allocator.alloc(PendingEditorImage, images.len);
+    const cloned = try allocator.alloc([]u8, items.len);
     var initialized: usize = 0;
     errdefer {
-        for (cloned[0..initialized]) |image| {
-            allocator.free(image.data);
-            allocator.free(image.mime_type);
-        }
+        for (cloned[0..initialized]) |item| allocator.free(item);
         allocator.free(cloned);
     }
 
-    for (images, 0..) |image, index| {
-        cloned[index] = .{
-            .data = try allocator.dupe(u8, image.data),
-            .mime_type = try allocator.dupe(u8, image.mime_type),
-            .kitty_image = image.kitty_image,
-        };
+    for (items, 0..) |item, index| {
+        cloned[index] = try allocator.dupe(u8, item);
         initialized += 1;
     }
     return cloned;
 }
 
-fn deinitImageContentsForRender(allocator: std.mem.Allocator, images: []const PendingEditorImage) void {
-    for (images) |image| {
-        allocator.free(image.data);
-        allocator.free(image.mime_type);
-    }
-    if (images.len > 0) allocator.free(images);
-}
-
-test "drawPromptLines places Kitty image cells for transmitted pending images" {
-    const allocator = std.testing.allocator;
-
-    var editor = tui.Editor.init(allocator);
-    defer editor.deinit();
-
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = 8,
-        .cols = 80,
-        .x_pixel = 320,
-        .y_pixel = 128,
-    });
-    defer screen.deinit(allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const pending = [_]PendingEditorImage{.{
-        .data = "AQID",
-        .mime_type = "image/png",
-        .kitty_image = .{
-            .id = 77,
-            .width_px = 64,
-            .height_px = 32,
-        },
-    }};
-
-    _ = try drawPromptLines(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    }, null, &editor, &pending);
-
-    const image_col: u16 = @intCast(promptEditorOffsetX(80));
-    const image_cell = screen.readCell(image_col, PROMPT_BOX_HEIGHT) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(image_cell.image != null);
-    try std.testing.expectEqual(@as(u32, 77), image_cell.image.?.img_id);
-}
-
-test "drawPromptLines renders bordered prompt with glyph prefix" {
-    const allocator = std.testing.allocator;
-
-    var theme = try resources_mod.Theme.initDefault(allocator);
-    defer theme.deinit(allocator);
-
-    var editor = tui.Editor.init(allocator);
-    defer editor.deinit();
-    _ = try editor.handlePaste("hello");
-
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 80,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    _ = try drawPromptLines(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-        .theme = &theme,
-    }, &theme, &editor, &.{});
-
-    const top_left = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("╭", top_left.char.grapheme);
-    try std.testing.expectEqual(styleForToken(&theme, .prompt_border), top_left.style);
-
-    const bottom_left = screen.readCell(0, 2) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("╰", bottom_left.char.grapheme);
-    try std.testing.expectEqual(styleForToken(&theme, .prompt_border), bottom_left.style);
-
-    const glyph = screen.readCell(1, 1) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings(">", glyph.char.grapheme);
-    try std.testing.expectEqual(styleForToken(&theme, .prompt_glyph), glyph.style);
-
-    const first_text = screen.readCell(3, 1) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("h", first_text.char.grapheme);
-    try std.testing.expectEqual(styleForToken(&theme, .editor), first_text.style);
-}
-
-test "drawPromptLines places cursor after border and glyph offset" {
-    const allocator = std.testing.allocator;
-
-    var editor = tui.Editor.init(allocator);
-    defer editor.deinit();
-    _ = try editor.handlePaste("hello");
-
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 80,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    _ = try drawPromptLines(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    }, null, &editor, &.{});
-
-    try std.testing.expect(screen.cursor_vis);
-    try std.testing.expectEqual(@as(u16, 8), screen.cursor.col);
-    try std.testing.expectEqual(@as(u16, 1), screen.cursor.row);
-}
-
-test "measurePromptHeight uses fixed border height and editor width overhead" {
-    const allocator = std.testing.allocator;
-
-    var editor = tui.Editor.init(allocator);
-    defer editor.deinit();
-    _ = try editor.handlePaste("a long prompt that would previously grow the prompt area");
-
-    try std.testing.expectEqual(@as(usize, 76), promptEditorWidth(80));
-    try std.testing.expectEqual(@as(usize, 3), try measurePromptHeight(allocator, null, &editor, &.{}, 80));
-}
-
-test "drawPromptLines shows overflow indicator on bottom border" {
-    const allocator = std.testing.allocator;
-
-    var editor = tui.Editor.init(allocator);
-    defer editor.deinit();
-    _ = try editor.handlePaste("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
-
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 60,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    _ = try drawPromptLines(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    }, null, &editor, &.{});
-
-    var rendered = try tui.vaxis.AllocatingScreen.init(allocator, 60, 3);
-    defer rendered.deinit(allocator);
-    for (0..3) |row| {
-        for (0..60) |col| {
-            const cell = screen.readCell(@intCast(col), @intCast(row)) orelse continue;
-            rendered.writeCell(@intCast(col), @intCast(row), cell);
-        }
-    }
-    const text = try tui.test_helpers.screenToString(&rendered);
-    defer allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "↓ more") != null);
+fn deinitOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
+    for (items) |item| allocator.free(item);
+    if (items.len > 0) allocator.free(items);
 }
 
 test "screen draw renders top task panel and shifts chat below it" {
@@ -4390,38 +3401,6 @@ test "prompt m5 applies breakpoint-specific layout collapse rules" {
     defer allocator.free(text_36);
     try std.testing.expect(std.mem.indexOf(u8, text_36, "Input: hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, text_36, "Status: ready") != null);
-}
-
-test "prompt m5 keeps CJK text visible inside bordered prompt" {
-    const allocator = std.testing.allocator;
-
-    var editor = tui.Editor.init(allocator);
-    defer editor.deinit();
-    _ = try editor.handlePaste("你好");
-
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 100,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    _ = try drawPromptLines(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    }, null, &editor, &.{});
-
-    const first = screen.readCell(3, 1) orelse return error.TestUnexpectedResult;
-    const second = screen.readCell(5, 1) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("你", first.char.grapheme);
-    try std.testing.expectEqualStrings("好", second.char.grapheme);
 }
 
 test "screen draw re-reads theme after runtime switch without stale structural cells" {
@@ -5165,6 +4144,130 @@ test "tool expansion rerenders existing bash details immediately" {
     try std.testing.expect(renderedLinesContain(expanded_lines.items, "\"exit_code\":0"));
 }
 
+test "tool expansion rerenders existing user bash tail preview immediately" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(allocator);
+    for (0..25) |index| {
+        const line = try std.fmt.allocPrint(allocator, "line {d}\n", .{index + 1});
+        defer allocator.free(line);
+        try output.appendSlice(allocator, line);
+    }
+
+    const item_index = try state.appendBashExecutionStart("seq 25", true);
+    try state.finishBashExecution(item_index, "seq 25", output.items, 0, false, false, null, true);
+
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "... 6 more lines") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "line 5\n") == null);
+    try std.testing.expect(state.items.items[1].expanded_text != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].expanded_text.?, "line 1") != null);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 16,
+    };
+
+    var collapsed_lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &collapsed_lines);
+    try screen_component.renderInto(allocator, 80, &collapsed_lines);
+    try std.testing.expect(renderedLinesContain(collapsed_lines.items, "line 25"));
+    try std.testing.expect(!renderedLinesContain(collapsed_lines.items, "line 5"));
+
+    state.toggleAllExpanded();
+    var expanded_lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &expanded_lines);
+    try screen_component.renderInto(allocator, 80, &expanded_lines);
+    try std.testing.expect(renderedLinesContain(expanded_lines.items, "line 1"));
+}
+
+test "extension UI hooks render widgets editor footer and status lifecycle" {
+    const allocator = std.testing.allocator;
+
+    var registry = extension_registry.Registry.init(allocator);
+    defer registry.deinit();
+    const frames =
+        \\{ "type": "set_header", "lines": ["ext header"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_footer", "lines": ["ext footer"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_editor_component", "label": "VimEditor", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "above", "lines": ["above one", "above two"], "placement": "aboveEditor", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "below", "lines": ["below one"], "placement": "belowEditor", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    _ = try extension_registry.applyHostFrameStream(&registry, frames);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.applyExtensionRegistryUi(&registry);
+    try state.setExtensionFooterStatus("z-last", "last");
+    try state.setExtensionFooterStatus("a-first", "first");
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("ext header", snapshot.extension_header_lines[0]);
+    try std.testing.expectEqualStrings("VimEditor", snapshot.extension_editor_label.?);
+    try std.testing.expectEqualStrings("first", snapshot.extension_footer_statuses[0]);
+    try std.testing.expectEqualStrings("last", snapshot.extension_footer_statuses[1]);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 14,
+    };
+
+    var lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &lines);
+    try screen.renderInto(allocator, 100, &lines);
+    try std.testing.expect(renderedLinesContain(lines.items, "ext header"));
+    try std.testing.expect(renderedLinesContain(lines.items, "above one"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Extension editor: VimEditor"));
+    try std.testing.expect(renderedLinesContain(lines.items, "below one"));
+    try std.testing.expect(renderedLinesContain(lines.items, "ext footer"));
+    try std.testing.expect(renderedLinesContain(lines.items, "first"));
+
+    _ = registry.clearWidgetHook("above");
+    _ = registry.clearFooterHook();
+    _ = registry.clearEditorComponentHook();
+    try state.applyExtensionRegistryUi(&registry);
+    var cleared = try state.snapshotForRender(allocator);
+    defer cleared.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), cleared.extension_widgets.len);
+    try std.testing.expectEqual(@as(?[]u8, null), cleared.extension_editor_label);
+    try std.testing.expectEqual(@as(usize, 0), cleared.extension_footer_lines.len);
+}
+
+test "extension widgets replace by key and truncate after ten lines" {
+    const allocator = std.testing.allocator;
+
+    var registry = extension_registry.Registry.init(allocator);
+    defer registry.deinit();
+    const frames =
+        \\{ "type": "set_widget", "key": "status", "lines": ["old"], "placement": "aboveEditor", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "status", "lines": ["1","2","3","4","5","6","7","8","9","10","11"], "placement": "belowEditor", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    _ = try extension_registry.applyHostFrameStream(&registry, frames);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.applyExtensionRegistryUi(&registry);
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.extension_widgets.len);
+    try std.testing.expectEqual(ExtensionWidgetPlacement.below_editor, snapshot.extension_widgets[0].placement);
+    try std.testing.expectEqual(@as(usize, 11), snapshot.extension_widgets[0].lines.len);
+    try std.testing.expectEqualStrings(EXTENSION_WIDGET_TRUNCATION_MARKER, snapshot.extension_widgets[0].lines[10]);
+}
+
 test "collapse m2 estimateChatRows uses collapsed or expanded heights" {
     const text =
         \\one
@@ -5291,6 +4394,60 @@ test "app state replaces streaming tool updates with the final tool result" {
     try std.testing.expectEqualStrings("thinking", state.status);
 }
 
+test "app state replaces repeated partial tool updates and final error styling text" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const first_partial = try allocator.alloc(ai.ContentBlock, 1);
+    defer common.deinitContentBlocks(allocator, first_partial);
+    first_partial[0] = .{ .text = .{ .text = try allocator.dupe(u8, "partial one") } };
+
+    const second_partial = try allocator.alloc(ai.ContentBlock, 1);
+    defer common.deinitContentBlocks(allocator, second_partial);
+    second_partial[0] = .{ .text = .{ .text = try allocator.dupe(u8, "partial two") } };
+
+    const final_blocks = try allocator.alloc(ai.ContentBlock, 1);
+    defer common.deinitContentBlocks(allocator, final_blocks);
+    final_blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, "final failure") } };
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_update,
+        .tool_call_id = "tool-repeat",
+        .tool_name = "write",
+        .partial_result = .{
+            .content = first_partial,
+            .details = null,
+        },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_update,
+        .tool_call_id = "tool-repeat",
+        .tool_name = "write",
+        .partial_result = .{
+            .content = second_partial,
+            .details = null,
+        },
+    });
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_call_id = "tool-repeat",
+        .tool_name = "write",
+        .result = .{
+            .content = final_blocks,
+            .details = null,
+        },
+        .is_error = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "partial one") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "partial two") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Tool error write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "final failure") != null);
+}
+
 test "route-a m1 streams tool-call arguments and dedupes execution start" {
     const allocator = std.testing.allocator;
 
@@ -5331,7 +4488,7 @@ test "route-a m1 streams tool-call arguments and dedupes execution start" {
         .assistant_message_event = .{ .event_type = .toolcall_end, .content_index = 0, .tool_call = tool_call },
     });
     try std.testing.expectEqual(@as(usize, 2), state.items.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Tool bash:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "$ echo hi") != null);
 
     try state.handleAgentEvent(.{
         .event_type = .tool_execution_start,

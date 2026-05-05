@@ -127,6 +127,26 @@ snapshot_contains "$hotkeys_snapshot" "Keyboard shortcuts"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
+  --env "PI_FAUX_RESPONSE=extension ui smoke" \
+  --env "PI_M6_EXTENSION_HOST_RUNTIME=/bin/sh" \
+  --env "PI_M6_EXTENSION_HOST_ENTRY=$ROOT_DIR/test/fixtures/extensions/ui-bridge-fixture.sh"
+tuistory -s "$SESSION" type "/extension-ui-smoke"
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "Pick extension value" --timeout 8000
+extension_select_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+snapshot_contains "$extension_select_snapshot" "Pick extension value"
+snapshot_contains "$extension_select_snapshot" "alpha"
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "Extension input" --timeout 8000
+tuistory -s "$SESSION" type "typed extension value"
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "extension custom result" --timeout 8000
+extension_result_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+snapshot_contains "$extension_result_snapshot" "extension custom result"
+snapshot_contains "$extension_result_snapshot" "extension editor text"
+tuistory -s "$SESSION" close >/dev/null 2>&1 || true
+
+launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
   --env "PI_FAUX_RESPONSE=queue paste error smoke"
 tuistory -s "$SESSION" type "queued follow-up from m8"
 tuistory -s "$SESSION" press alt enter
@@ -202,9 +222,9 @@ PY
     --env "PI_FAUX_RESPONSE=$SCROLL_RESPONSE"
   tuistory -s "$SESSION" type "$name smoke"
   tuistory -s "$SESSION" press enter
-  tuistory -s "$SESSION" wait "Ctrl+O 展开" --timeout 8000
+  tuistory -s "$SESSION" wait "Ctrl+O to expand" --timeout 8000
   terminal_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-  snapshot_contains "$terminal_snapshot" "Ctrl+O 展开"
+  snapshot_contains "$terminal_snapshot" "Ctrl+O to expand"
   snapshot_contains "$terminal_snapshot" "$badge"
   tuistory -s "$SESSION" press ctrl o
   tuistory -s "$SESSION" wait "$name scroll tail" --timeout 8000
