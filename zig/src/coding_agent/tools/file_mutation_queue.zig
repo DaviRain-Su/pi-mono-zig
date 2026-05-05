@@ -108,6 +108,10 @@ const QueueOrderRecorder = struct {
         const index = self.next_index.fetchAdd(1, .seq_cst);
         self.events[index] = event;
     }
+
+    fn count(self: *QueueOrderRecorder) usize {
+        return self.next_index.load(.seq_cst);
+    }
 };
 
 const QueueThreadContext = struct {
@@ -116,6 +120,7 @@ const QueueThreadContext = struct {
     start_event: QueueEvent,
     end_event: QueueEvent,
     hold_ms: i64 = 0,
+    wait_for_event_count_before_end: usize = 0,
     recorder: *QueueOrderRecorder,
 };
 
@@ -124,6 +129,12 @@ fn runQueuedThread(context: *QueueThreadContext) void {
     defer guard.release();
 
     context.recorder.record(context.start_event);
+    if (context.wait_for_event_count_before_end > 0) {
+        var elapsed_ms: usize = 0;
+        while (context.recorder.count() < context.wait_for_event_count_before_end and elapsed_ms < 2000) : (elapsed_ms += 1) {
+            std.Io.sleep(context.io, .fromMilliseconds(1), .awake) catch unreachable;
+        }
+    }
     if (context.hold_ms > 0) {
         std.Io.sleep(context.io, .fromMilliseconds(context.hold_ms), .awake) catch unreachable;
     }
@@ -189,14 +200,13 @@ test "file mutation queue allows different files to proceed in parallel" {
         .path = "/tmp/pi-file-mutation-queue-a",
         .start_event = .first_start,
         .end_event = .first_end,
-        .hold_ms = 30,
+        .wait_for_event_count_before_end = 2,
         .recorder = &recorder,
     };
     var second = QueueThreadContext{
         .path = "/tmp/pi-file-mutation-queue-b",
         .start_event = .second_start,
         .end_event = .second_end,
-        .hold_ms = 30,
         .recorder = &recorder,
     };
 

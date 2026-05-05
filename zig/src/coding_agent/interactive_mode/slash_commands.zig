@@ -5,6 +5,7 @@ const agent = @import("agent");
 const tui = @import("tui");
 const auth = @import("../auth.zig");
 const config_mod = @import("../config.zig");
+const keybindings_mod = @import("../keybindings.zig");
 const provider_config = @import("../provider_config.zig");
 const resources_mod = @import("../resources.zig");
 const session_mod = @import("../session.zig");
@@ -29,10 +30,10 @@ const SelectorOverlay = overlays.SelectorOverlay;
 const AuthFlow = overlays.AuthFlow;
 const loadAuthOverlay = overlays.loadAuthOverlay;
 const loadSelectableModels = overlays.loadSelectableModels;
-const loadHotkeysOverlay = overlays.loadHotkeysOverlay;
 const loadSettingsEditorOverlay = overlays.loadSettingsEditorOverlay;
 const loadSessionOverlay = overlays.loadSessionOverlay;
 const loadModelOverlay = overlays.loadModelOverlay;
+const loadModelOverlayWithSearch = overlays.loadModelOverlayWithSearch;
 const loadThemeOverlay = overlays.loadThemeOverlay;
 const loadScopedModelOverlay = overlays.loadScopedModelOverlay;
 const loadTreeOverlay = overlays.loadTreeOverlay;
@@ -255,7 +256,7 @@ pub fn handleSlashCommand(
         .share => try handleShareSlashCommand(allocator, io, env_map, session, app_state),
         .copy => try handleCopySlashCommand(allocator, io, session, app_state),
         .name => try handleNameSlashCommand(allocator, session, command.argument, app_state),
-        .hotkeys => overlay.* = try loadHotkeysOverlay(allocator, live_resources.keybindings),
+        .hotkeys => try handleHotkeysSlashCommand(allocator, app_state, live_resources.keybindings),
         .label => try handleLabelSlashCommand(allocator, session, command.argument, app_state),
         .session => try handleSessionSlashCommand(allocator, session, app_state),
         .changelog => try handleChangelogSlashCommand(allocator, io, session, command.argument, app_state),
@@ -383,6 +384,133 @@ pub fn handleSlashCommand(
     }
 }
 
+pub fn handleHotkeysSlashCommand(
+    allocator: std.mem.Allocator,
+    app_state: *AppState,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) !void {
+    const markdown = try buildHotkeysMarkdown(allocator, keybindings);
+    defer allocator.free(markdown);
+    try app_state.appendMarkdown(markdown);
+}
+
+fn buildHotkeysMarkdown(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) ![]u8 {
+    const interrupt = try appKeyLabel(allocator, keybindings, .interrupt);
+    defer allocator.free(interrupt);
+    const clear = try appKeyLabel(allocator, keybindings, .clear);
+    defer allocator.free(clear);
+    const exit = try appKeyLabel(allocator, keybindings, .exit);
+    defer allocator.free(exit);
+    const suspend_label = try appKeyLabel(allocator, keybindings, .app_suspend);
+    defer allocator.free(suspend_label);
+    const cycle_thinking = try appKeyLabel(allocator, keybindings, .thinking_cycle);
+    defer allocator.free(cycle_thinking);
+    const cycle_model_forward = try appKeyLabel(allocator, keybindings, .model_cycleForward);
+    defer allocator.free(cycle_model_forward);
+    const cycle_model_backward = try appKeyLabel(allocator, keybindings, .model_cycleBackward);
+    defer allocator.free(cycle_model_backward);
+    const select_model = try appKeyLabel(allocator, keybindings, .model_select);
+    defer allocator.free(select_model);
+    const expand_tools = try appKeyLabel(allocator, keybindings, .tools_expand);
+    defer allocator.free(expand_tools);
+    const toggle_thinking = try appKeyLabel(allocator, keybindings, .thinking_toggle);
+    defer allocator.free(toggle_thinking);
+    const external_editor = try appKeyLabel(allocator, keybindings, .editor_external);
+    defer allocator.free(external_editor);
+    const follow_up = try appKeyLabel(allocator, keybindings, .message_followUp);
+    defer allocator.free(follow_up);
+    const dequeue = try appKeyLabel(allocator, keybindings, .message_dequeue);
+    defer allocator.free(dequeue);
+    const paste_image = try appKeyLabel(allocator, keybindings, .clipboard_pasteImage);
+    defer allocator.free(paste_image);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    try writer.writer.writeAll(
+        \\# Keyboard shortcuts
+        \\
+        \\**Navigation**
+        \\| Key | Action |
+        \\|-----|--------|
+        \\| `Up` / `Down` / `Left` / `Right` | Move cursor / browse history (Up when empty) |
+        \\| `Alt+Left` / `Alt+Right` | Move by word |
+        \\| `Home` | Start of line |
+        \\| `End` | End of line |
+        \\| `Ctrl+F` | Jump forward to character |
+        \\| `Ctrl+B` | Jump backward to character |
+        \\| `PgUp` / `PgDn` | Scroll by page |
+        \\
+        \\**Editing**
+        \\| Key | Action |
+        \\|-----|--------|
+        \\| `Enter` | Send message |
+        \\| `Shift+Enter` | New line |
+        \\| `Ctrl+W` | Delete word backwards |
+        \\| `Alt+D` | Delete word forwards |
+        \\| `Ctrl+U` | Delete to start of line |
+        \\| `Ctrl+K` | Delete to end of line |
+        \\| `Ctrl+Y` | Paste the most-recently-deleted text |
+        \\| `Alt+Y` | Cycle through the deleted text after pasting |
+        \\| `Ctrl+_` | Undo |
+        \\
+        \\**Other**
+        \\| Key | Action |
+        \\|-----|--------|
+        \\| `Tab` | Path completion / accept autocomplete |
+    );
+    try writer.writer.print(
+        \\| `{s}` | Cancel autocomplete / abort streaming |
+        \\| `{s}` | Clear editor (first) / exit (second) |
+        \\| `{s}` | Exit (when editor is empty) |
+        \\| `{s}` | Suspend to background |
+        \\| `{s}` | Cycle thinking level |
+        \\| `{s}` / `{s}` | Cycle models |
+        \\| `{s}` | Open model selector |
+        \\| `{s}` | Toggle tool output expansion |
+        \\| `{s}` | Toggle thinking block visibility |
+        \\| `{s}` | Edit message in external editor |
+        \\| `{s}` | Queue follow-up message |
+        \\| `{s}` | Restore queued messages |
+        \\| `{s}` | Paste image from clipboard |
+        \\| `/` | Slash commands |
+        \\| `!` | Run bash command |
+        \\| `!!` | Run bash command (excluded from context) |
+        \\
+    , .{
+        interrupt,
+        clear,
+        exit,
+        suspend_label,
+        cycle_thinking,
+        cycle_model_forward,
+        cycle_model_backward,
+        select_model,
+        expand_tools,
+        toggle_thinking,
+        external_editor,
+        follow_up,
+        dequeue,
+        paste_image,
+    });
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn appKeyLabel(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    action: keybindings_mod.Action,
+) ![]u8 {
+    if (keybindings) |bindings| return bindings.primaryLabel(allocator, action);
+    var defaults = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer defaults.deinit();
+    return defaults.primaryLabel(allocator, action);
+}
+
 pub fn switchSession(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -472,9 +600,63 @@ pub fn switchModel(
     current_provider.deinit(allocator);
     current_provider.* = next_provider;
     try session.setModel(next_provider.model);
+    try persistDefaultModelSelection(allocator, session.io, runtime_config, next_provider.model.provider, next_provider.model.id);
     session.setApiKey(next_provider.api_key);
     try updateAppFooterFromSession(allocator, session.io, app_state, session, current_provider);
-    try app_state.setStatus("idle");
+    const status = try std.fmt.allocPrint(allocator, "Model: {s}", .{next_provider.model.id});
+    defer allocator.free(status);
+    try app_state.setStatus(status);
+}
+
+fn persistDefaultModelSelection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    provider: []const u8,
+    model_id: []const u8,
+) !void {
+    const config = runtime_config orelse return;
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ config.agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    const existing = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (existing) |bytes| allocator.free(bytes);
+
+    var parsed = if (existing) |bytes|
+        std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+            try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{})
+    else
+        try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        parsed.deinit();
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    }
+
+    try putJsonString(allocator, &parsed.value.object, "defaultProvider", provider);
+    try putJsonString(allocator, &parsed.value.object, "defaultModel", model_id);
+
+    const serialized = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, settings_path, serialized, true);
+}
+
+fn putJsonString(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (object.getPtr(key)) |existing_value| {
+        existing_value.* = .{ .string = value };
+        return;
+    }
+
+    try object.put(allocator, key, .{ .string = value });
 }
 
 fn presentProviderSelectionError(
@@ -508,16 +690,7 @@ pub fn handleModelSlashCommand(
     const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
     defer allocator.free(available);
 
-    for (available) |entry| {
-        const scoped = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.provider, entry.model_id });
-        defer allocator.free(scoped);
-        if (!std.mem.eql(u8, search, entry.model_id) and
-            !std.mem.eql(u8, search, scoped) and
-            !std.mem.eql(u8, search, entry.display_name))
-        {
-            continue;
-        }
-
+    if (findExactModelEntry(available, search)) |entry| {
         try switchModel(
             allocator,
             env_map,
@@ -532,10 +705,45 @@ pub fn handleModelSlashCommand(
         return;
     }
 
-    const message = try std.fmt.allocPrint(allocator, "No exact model match for {s}; opening model selector", .{search});
-    defer allocator.free(message);
-    try app_state.appendInfo(message);
-    overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
+    overlay.* = try loadModelOverlayWithSearch(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config, search);
+}
+
+fn findExactModelEntry(
+    available: []const provider_config.AvailableModel,
+    search: []const u8,
+) ?provider_config.AvailableModel {
+    var matched: ?provider_config.AvailableModel = null;
+    for (available) |entry| {
+        if (!entry.available) continue;
+        if (!modelEntryMatchesReference(entry, search)) continue;
+        if (matched != null) return null;
+        matched = entry;
+    }
+    return matched;
+}
+
+fn modelEntryMatchesReference(entry: provider_config.AvailableModel, search: []const u8) bool {
+    const trimmed = std.mem.trim(u8, search, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, entry.model_id)) return true;
+    if (entry.display_name.len > 0 and std.ascii.eqlIgnoreCase(trimmed, entry.display_name)) return true;
+    if (providerModelReferenceMatches(entry.provider, entry.model_id, trimmed)) return true;
+
+    const slash_index = std.mem.indexOfScalar(u8, trimmed, '/') orelse return false;
+    const provider = std.mem.trim(u8, trimmed[0..slash_index], " \t\r\n");
+    const model_id = std.mem.trim(u8, trimmed[slash_index + 1 ..], " \t\r\n");
+    return provider.len > 0 and model_id.len > 0 and
+        std.ascii.eqlIgnoreCase(provider, entry.provider) and
+        std.ascii.eqlIgnoreCase(model_id, entry.model_id);
+}
+
+fn providerModelReferenceMatches(provider: []const u8, model_id: []const u8, search: []const u8) bool {
+    const slash_index = std.mem.indexOfScalar(u8, search, '/') orelse return false;
+    const provider_part = std.mem.trim(u8, search[0..slash_index], " \t\r\n");
+    const model_part = std.mem.trim(u8, search[slash_index + 1 ..], " \t\r\n");
+    return provider_part.len > 0 and model_part.len > 0 and
+        std.ascii.eqlIgnoreCase(provider_part, provider) and
+        std.ascii.eqlIgnoreCase(model_part, model_id);
 }
 
 pub fn handleThemeSlashCommand(

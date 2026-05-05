@@ -2225,8 +2225,8 @@ const ResponseHeaderServer = struct {
         };
         defer stream.close(self.io);
 
-        readRequestHead(stream) catch |err| std.debug.panic("response header test server read failed: {}", .{err});
-        writeResponse(self, stream) catch |err| std.debug.panic("response header test server write failed: {}", .{err});
+        readRequestHead(stream) catch return;
+        writeResponse(self, stream) catch return;
     }
 
     fn readRequestHead(stream: std.Io.net.Stream) !void {

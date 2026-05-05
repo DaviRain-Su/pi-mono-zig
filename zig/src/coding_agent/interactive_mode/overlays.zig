@@ -53,6 +53,7 @@ pub const SelectorOverlay = union(enum) {
         return switch (self.*) {
             .info => self.info.hint,
             .settings_editor => self.settings_editor.hint,
+            .model => self.model.hint,
             else => "Up/Down move • Enter select • Esc cancel",
         };
     }
@@ -121,11 +122,13 @@ pub const ModelChoice = struct {
 
 pub const ModelOverlay = struct {
     title: []const u8 = "Model selector",
+    hint: []u8,
     choices: []ModelChoice,
     items: []tui.SelectItem,
     list: tui.SelectList,
 
     pub fn deinit(self: *ModelOverlay, allocator: std.mem.Allocator) void {
+        allocator.free(self.hint);
         for (self.choices) |choice| {
             allocator.free(choice.provider);
             allocator.free(choice.model_id);
@@ -389,10 +392,21 @@ pub fn loadHotkeysOverlay(
     };
 
     try appendHotkeyOverlayItem(allocator, &items, bindings, .interrupt, "Cancel autocomplete or abort streaming");
-    try appendHotkeyOverlayItem(allocator, &items, bindings, .clear, "Clear the chat display");
-    try appendHotkeyOverlayItem(allocator, &items, bindings, .exit, "Exit interactive mode");
-    try appendHotkeyOverlayItem(allocator, &items, bindings, .session_tree, "Open the session selector");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .clear, "Clear editor/display; press twice within 500ms to exit");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .exit, "Exit when editor is empty");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .app_suspend, "Suspend to background");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .model_cycleForward, "Cycle to next model");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .model_cycleBackward, "Cycle to previous model");
     try appendHotkeyOverlayItem(allocator, &items, bindings, .model_select, "Open the model selector");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .session_resume, "Open the session selector");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .session_tree, "Open the session tree");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .session_fork, "Fork the current session");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .session_new, "Start a new session");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .message_followUp, "Queue follow-up message");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .message_dequeue, "Restore queued messages");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .tools_expand, "Toggle tool output expansion");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .thinking_cycle, "Cycle thinking level");
+    try appendHotkeyOverlayItem(allocator, &items, bindings, .thinking_toggle, "Toggle thinking block visibility");
     try appendInfoOverlayItem(allocator, &items, "Enter", try allocator.dupe(u8, "Submit the current prompt"));
     try appendInfoOverlayItem(allocator, &items, "Tab", try allocator.dupe(u8, "Accept the selected autocomplete entry"));
     try appendInfoOverlayItem(allocator, &items, "/", try allocator.dupe(u8, "Start a slash command"));
@@ -404,7 +418,7 @@ pub fn loadHotkeysOverlay(
         "Keyboard shortcuts",
         "Up/Down scroll • Enter close • Esc close",
         try items.toOwnedSlice(allocator),
-        12,
+        24,
     );
 }
 
@@ -512,10 +526,34 @@ pub fn loadModelOverlay(
     model_patterns: ?[]const []const u8,
     runtime_config: ?*const config_mod.RuntimeConfig,
 ) !SelectorOverlay {
+    return loadModelOverlayWithSearch(allocator, env_map, current_model, current_provider, model_patterns, runtime_config, null);
+}
+
+pub fn loadModelOverlayWithSearch(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    current_model: ai.Model,
+    current_provider: ?*const provider_config.ResolvedProviderConfig,
+    model_patterns: ?[]const []const u8,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    initial_search: ?[]const u8,
+) !SelectorOverlay {
     const available = try loadSelectableModels(allocator, env_map, current_model, current_provider, model_patterns, runtime_config);
     defer allocator.free(available);
 
-    const choices = try allocator.alloc(ModelChoice, available.len);
+    const search = if (initial_search) |value| std.mem.trim(u8, value, " \t\r\n") else "";
+    var visible_models = std.ArrayList(provider_config.AvailableModel).empty;
+    defer visible_models.deinit(allocator);
+    for (available) |entry| {
+        if (search.len == 0 or availableModelMatchesSearch(entry, search)) {
+            try visible_models.append(allocator, entry);
+        }
+    }
+
+    const has_empty_result = search.len > 0 and visible_models.items.len == 0;
+    const row_count = if (has_empty_result) 1 else visible_models.items.len;
+
+    const choices = try allocator.alloc(ModelChoice, row_count);
     errdefer {
         for (choices) |choice| {
             allocator.free(choice.provider);
@@ -524,7 +562,7 @@ pub fn loadModelOverlay(
         allocator.free(choices);
     }
 
-    const items = try allocator.alloc(tui.SelectItem, available.len);
+    const items = try allocator.alloc(tui.SelectItem, row_count);
     errdefer {
         for (items) |item| {
             allocator.free(@constCast(item.value));
@@ -535,8 +573,18 @@ pub fn loadModelOverlay(
     }
 
     var selected_index: usize = 0;
-    for (available, 0..) |entry, index| {
-        const provider_changed = index == 0 or !std.mem.eql(u8, available[index - 1].provider, entry.provider);
+    if (has_empty_result) {
+        choices[0] = .{
+            .provider = try allocator.dupe(u8, ""),
+            .model_id = try allocator.dupe(u8, ""),
+        };
+        items[0] = .{
+            .value = try allocator.dupe(u8, "none"),
+            .label = try allocator.dupe(u8, "No matching models"),
+            .description = try std.fmt.allocPrint(allocator, "Search: {s}", .{search}),
+        };
+    } else for (visible_models.items, 0..) |entry, index| {
+        const provider_changed = index == 0 or !std.mem.eql(u8, visible_models.items[index - 1].provider, entry.provider);
         const label = try formatModelOverlayLabel(allocator, entry, provider_changed);
         errdefer allocator.free(label);
         const description = try formatModelOverlayDescription(allocator, entry);
@@ -555,9 +603,16 @@ pub fn loadModelOverlay(
         }
     }
 
+    const hint = if (search.len > 0)
+        try std.fmt.allocPrint(allocator, "Search: {s} • Up/Down move • Enter select • Esc cancel", .{search})
+    else
+        try allocator.dupe(u8, "Up/Down move • Enter select • Esc cancel");
+    errdefer allocator.free(hint);
+
     return .{
         .model = .{
             .title = "Model selector",
+            .hint = hint,
             .choices = choices,
             .items = items,
             .list = .{
@@ -567,6 +622,26 @@ pub fn loadModelOverlay(
             },
         },
     };
+}
+
+fn availableModelMatchesSearch(entry: provider_config.AvailableModel, search: []const u8) bool {
+    if (containsIgnoreCase(entry.model_id, search)) return true;
+    if (containsIgnoreCase(entry.display_name, search)) return true;
+    if (containsIgnoreCase(entry.provider, search)) return true;
+
+    var provider_model_buffer: [512]u8 = undefined;
+    const provider_model = std.fmt.bufPrint(&provider_model_buffer, "{s}/{s}", .{ entry.provider, entry.model_id }) catch return false;
+    return containsIgnoreCase(provider_model, search);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 pub fn loadThemeOverlay(
@@ -677,6 +752,7 @@ pub fn loadScopedModelOverlay(
     return .{
         .model = .{
             .title = "Scoped model selector",
+            .hint = try allocator.dupe(u8, "Up/Down move • Enter select • Esc cancel"),
             .choices = choices,
             .items = items,
             .list = .{

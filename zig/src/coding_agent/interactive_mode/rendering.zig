@@ -269,6 +269,7 @@ pub const AppState = struct {
     clipboard_paste: ClipboardPasteTask,
     clock_context: ?*anyopaque = null,
     clock_now_ms_fn: ClockNowMsFn = systemNowMilliseconds,
+    last_clear_action_ms: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
@@ -490,6 +491,7 @@ pub const AppState = struct {
 
         const was_at_tail = self.chat_scroll_offset == 0;
         self.all_expanded = !self.all_expanded;
+        self.tool_output_expanded = self.all_expanded;
         const start_index = @min(self.visible_start_index, self.items.items.len);
         const total_rows = estimateChatRows(self.items.items[start_index..], @max(self.chat_width, 1), self.all_expanded);
         const max_offset = total_rows -| self.chat_visible_rows;
@@ -540,6 +542,27 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.tool_output_expanded = expanded;
+        self.all_expanded = expanded;
+    }
+
+    pub fn currentNowMs(self: *AppState) i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.currentNowMsLocked();
+    }
+
+    pub fn takeLastClearActionMs(self: *AppState) ?i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const value = self.last_clear_action_ms;
+        self.last_clear_action_ms = null;
+        return value;
+    }
+
+    pub fn setLastClearActionMs(self: *AppState, timestamp_ms: i64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.last_clear_action_ms = timestamp_ms;
     }
 
     pub fn setFooter(self: *AppState, model_label: []const u8, session_label: []const u8) !void {
@@ -3243,7 +3266,7 @@ pub fn formatHintsText(
 ) ![]u8 {
     if (hintsHeightForWidth(width) == 0) return allocator.dupe(u8, "");
 
-    const open_sessions = try actionLabel(allocator, keybindings, .session_tree, "Unbound");
+    const open_sessions = try actionLabel(allocator, keybindings, .session_resume, "Unbound");
     defer allocator.free(open_sessions);
     const open_models = try actionLabel(allocator, keybindings, .model_select, "Ctrl+L");
     defer allocator.free(open_models);
@@ -3251,21 +3274,27 @@ pub fn formatHintsText(
     defer allocator.free(queue_label);
     const queue_follow_up = try hintKeyLabel(allocator, queue_label);
     defer allocator.free(queue_follow_up);
+    const dequeue_label = try actionLabel(allocator, keybindings, .message_dequeue, "Alt+Up");
+    defer allocator.free(dequeue_label);
     const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Esc");
     defer allocator.free(interrupt);
+    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+C");
+    defer allocator.free(clear);
     const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
     defer allocator.free(exit);
+    const suspend_label = try actionLabel(allocator, keybindings, .app_suspend, "Ctrl+Z");
+    defer allocator.free(suspend_label);
 
     const line = switch (layoutMode(width)) {
         .full => try std.fmt.allocPrint(
             allocator,
-            "⏎ send · {s} queue · {s} sessions · {s} models · {s} interrupt · {s} exit",
-            .{ queue_follow_up, open_sessions, open_models, interrupt, exit },
+            "⏎ send · {s} follow-up · {s} dequeue · {s} sessions · {s} models · {s} interrupt · {s}/{s} clear/exit · {s} suspend",
+            .{ queue_follow_up, dequeue_label, open_sessions, open_models, interrupt, clear, exit, suspend_label },
         ),
         .medium => try std.fmt.allocPrint(
             allocator,
-            "⏎ send · {s} queue · {s} sessions · {s} models",
-            .{ queue_follow_up, open_sessions, open_models },
+            "⏎ send · {s} queue · {s} dequeue · {s} sessions · {s} models",
+            .{ queue_follow_up, dequeue_label, open_sessions, open_models },
         ),
         .narrow => try std.fmt.allocPrint(
             allocator,
@@ -3863,7 +3892,9 @@ test "prompt m2 renders hints above compact footer with distinct styles and term
     const rendered = try tui.test_helpers.screenToString(&screen);
     defer allocator.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ queue · Unbound sessions · Ctrl+L models · Esc interrupt · Ctrl+D exit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ follow-up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Alt+Up dequeue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Ctrl+L models") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "GHOSTTY") != null);
 
     const prompt_top = screen.readCell(0, 9) orelse return error.TestUnexpectedResult;
@@ -5057,7 +5088,9 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "> pending prompt"));
-    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send · Alt+⏎ queue · Unbound sessions · Ctrl+L models · Esc interrupt · Ctrl+D exit"));
+    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send · Alt+⏎ follow-up"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Alt+Up dequeue"));
+    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+C/Ctrl+D clear/exit"));
     try std.testing.expect(renderedLinesContain(lines.items, "Faux"));
     try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));

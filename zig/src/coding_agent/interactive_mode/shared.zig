@@ -15,6 +15,7 @@ pub const ToolRuntime = struct {
 pub const AppContext = struct {
     tool_runtime: ToolRuntime,
     kitty_protocol_active: bool = false,
+    suspend_requested: bool = false,
 
     pub fn init(cwd: []const u8, io: std.Io) AppContext {
         return .{

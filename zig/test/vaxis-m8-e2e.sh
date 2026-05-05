@@ -92,6 +92,13 @@ snapshot_contains "$chat_snapshot" "m8 secret note"
 snapshot_contains "$chat_snapshot" "M8 assistant response"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
+cat > "$AGENT_DIR/keybindings.json" <<'JSON'
+{
+  "app.model.cycleForward": [],
+  "app.model.select": "ctrl+p",
+  "app.session.resume": "ctrl+s"
+}
+JSON
 launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
   --env "PI_FAUX_RESPONSE=selector smoke"
 tuistory -s "$SESSION" press ctrl p
@@ -126,7 +133,7 @@ tuistory -s "$SESSION" press alt enter
 tuistory -s "$SESSION" wait "queued follow-up" --timeout 5000
 queue_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
 snapshot_contains "$queue_snapshot" "queued follow-up"
-snapshot_contains "$queue_snapshot" "Alt+⏎ queue"
+snapshot_contains "$queue_snapshot" "Alt+⏎ follow-up"
 
 tuistory -s "$SESSION" press ctrl v
 tuistory -s "$SESSION" wait "clipboard" --timeout 8000
@@ -195,17 +202,17 @@ PY
     --env "PI_FAUX_RESPONSE=$SCROLL_RESPONSE"
   tuistory -s "$SESSION" type "$name smoke"
   tuistory -s "$SESSION" press enter
-  tuistory -s "$SESSION" wait "Ctrl+R 展开" --timeout 8000
+  tuistory -s "$SESSION" wait "Ctrl+O 展开" --timeout 8000
   terminal_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-  snapshot_contains "$terminal_snapshot" "Ctrl+R 展开"
+  snapshot_contains "$terminal_snapshot" "Ctrl+O 展开"
   snapshot_contains "$terminal_snapshot" "$badge"
-  tuistory -s "$SESSION" press ctrl r
+  tuistory -s "$SESSION" press ctrl o
   tuistory -s "$SESSION" wait "$name scroll tail" --timeout 8000
   tuistory -s "$SESSION" scroll --x 10 --y 6 up 6
   tuistory -s "$SESSION" wait-idle --timeout 3000
   scrolled_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
   snapshot_contains "$scrolled_snapshot" "↓ more"
-  tuistory -s "$SESSION" press ctrl g
+  tuistory -s "$SESSION" scroll --x 10 --y 6 down 20
   tuistory -s "$SESSION" wait-idle --timeout 3000
   tail_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
   snapshot_contains "$tail_snapshot" "$name scroll tail"

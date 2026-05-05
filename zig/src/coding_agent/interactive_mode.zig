@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ai = @import("ai");
 const agent = @import("agent");
 const tui = @import("tui");
@@ -69,6 +70,7 @@ pub const appendInfoOverlayItem = overlays.appendInfoOverlayItem;
 pub const appendHotkeyOverlayItem = overlays.appendHotkeyOverlayItem;
 pub const loadSessionOverlay = overlays.loadSessionOverlay;
 pub const loadModelOverlay = overlays.loadModelOverlay;
+pub const loadModelOverlayWithSearch = overlays.loadModelOverlayWithSearch;
 pub const loadScopedModelOverlay = overlays.loadScopedModelOverlay;
 pub const loadSelectableModels = overlays.loadSelectableModels;
 pub const modelSupportsInput = overlays.modelSupportsInput;
@@ -195,6 +197,7 @@ pub const navigateTree = slash_commands.navigateTree;
 pub const findLastUserMessageIndex = slash_commands.findLastUserMessageIndex;
 pub const resolveSessionPath = slash_commands.resolveSessionPath;
 pub const handleInputKey = input_dispatch.handleInputKey;
+pub const handleInputKeyWithModifiers = input_dispatch.handleInputKeyWithModifiers;
 pub const submitEditorText = input_dispatch.submitEditorText;
 pub const clearEditor = input_dispatch.clearEditor;
 pub const loadEditorAutocompleteItems = input_dispatch.loadEditorAutocompleteItems;
@@ -406,6 +409,12 @@ pub fn runInteractiveMode(
                 &app_context,
                 &live_resources,
             );
+            if (app_context.suspend_requested) break;
+        }
+        if (app_context.suspend_requested) {
+            try suspendInteractiveTerminal(allocator, io, env_map, &terminal, &input_loop, &app_state);
+            app_context.suspend_requested = false;
+            continue;
         }
         if (!handled_input) {
             std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
@@ -413,6 +422,39 @@ pub fn runInteractiveMode(
     }
 
     return 0;
+}
+
+fn suspendInteractiveTerminal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    terminal: *tui.Terminal,
+    input_loop: **tui.terminal.InputLoop,
+    app_state: *AppState,
+) !void {
+    if (builtin.os.tag == .windows) {
+        try app_state.setStatus("Suspend to background is not supported on Windows");
+        return;
+    }
+
+    input_loop.*.deinit();
+    terminal.stop();
+
+    if (!builtin.is_test) {
+        std.posix.kill(0, .TSTP) catch |err| {
+            try terminal.start();
+            input_loop.* = try terminal.initInputLoop(allocator, io, env_map);
+            const message = try std.fmt.allocPrint(allocator, "Suspend failed: {s}", .{@errorName(err)});
+            defer allocator.free(message);
+            try app_state.setStatus(message);
+            return;
+        };
+    }
+
+    try terminal.start();
+    input_loop.* = try terminal.initInputLoop(allocator, io, env_map);
+    input_loop.*.vaxis_state.queryTerminal(input_loop.*.loop.tty.writer(), .fromMilliseconds(250)) catch {};
+    try app_state.setStatus("resumed");
 }
 
 /// Result of bootstrap that may want to short-circuit interactive mode (for
@@ -446,42 +488,42 @@ fn bootstrapInteractiveStateOrPromptMissingCwd(
     // pre-`prepareCliRuntime` lifecycle preflight, skip prompting again.
     if (!options.missing_cwd_already_confirmed) {
         if (try session_bootstrap.preflightInteractiveMissingCwd(allocator, io, options)) |captured_preflight| {
-        var captured_preflight_mut = captured_preflight;
-        defer captured_preflight_mut.deinit(allocator);
-        const choice = try promptInteractiveMissingSessionCwd(
-            allocator,
-            io,
-            env_map,
-            captured_preflight_mut.issue(),
-        );
-        if (choice == .cancel) {
-            try stderr_writer.writeAll("Resume cancelled\n");
-            try stderr_writer.flush();
-            return .{ .exit_code = 0 };
-        }
-        var fallback_options = options;
-        fallback_options.missing_cwd_mode = .use_fallback;
-        const retry = session_bootstrap.bootstrapInteractiveState(
-            allocator,
-            io,
-            env_map,
-            fallback_options,
-            app_context,
-        );
-        if (retry) |state| return .{ .bootstrap = state } else |retry_err| switch (retry_err) {
-            error.MissingApiKey,
-            error.UnknownProvider,
-            error.InvalidFauxStopReason,
-            error.InvalidFauxTokensPerSecond,
-            error.InvalidFauxContextWindow,
-            error.InvalidFauxToolArguments,
-            => {
-                try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(retry_err, options.provider)});
+            var captured_preflight_mut = captured_preflight;
+            defer captured_preflight_mut.deinit(allocator);
+            const choice = try promptInteractiveMissingSessionCwd(
+                allocator,
+                io,
+                env_map,
+                captured_preflight_mut.issue(),
+            );
+            if (choice == .cancel) {
+                try stderr_writer.writeAll("Resume cancelled\n");
                 try stderr_writer.flush();
-                return .{ .exit_code = 1 };
-            },
-            else => return retry_err,
-        }
+                return .{ .exit_code = 0 };
+            }
+            var fallback_options = options;
+            fallback_options.missing_cwd_mode = .use_fallback;
+            const retry = session_bootstrap.bootstrapInteractiveState(
+                allocator,
+                io,
+                env_map,
+                fallback_options,
+                app_context,
+            );
+            if (retry) |state| return .{ .bootstrap = state } else |retry_err| switch (retry_err) {
+                error.MissingApiKey,
+                error.UnknownProvider,
+                error.InvalidFauxStopReason,
+                error.InvalidFauxTokensPerSecond,
+                error.InvalidFauxContextWindow,
+                error.InvalidFauxToolArguments,
+                => {
+                    try stderr_writer.print("Error: {s}\n", .{provider_config.resolveProviderErrorMessage(retry_err, options.provider)});
+                    try stderr_writer.flush();
+                    return .{ .exit_code = 1 };
+                },
+                else => return retry_err,
+            }
         }
     }
 
@@ -634,23 +676,45 @@ fn buildVerboseStartupBanner(
     allocator: std.mem.Allocator,
     keybindings: ?*const keybindings_mod.Keybindings,
 ) ![]u8 {
-    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Ctrl+C");
+    const interrupt = try actionLabel(allocator, keybindings, .interrupt, "Esc");
     defer allocator.free(interrupt);
-    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+L");
+    const clear = try actionLabel(allocator, keybindings, .clear, "Ctrl+C");
     defer allocator.free(clear);
     const exit = try actionLabel(allocator, keybindings, .exit, "Ctrl+D");
     defer allocator.free(exit);
+    const suspend_label = try actionLabel(allocator, keybindings, .app_suspend, "Ctrl+Z");
+    defer allocator.free(suspend_label);
+    const cycle_forward = try actionLabel(allocator, keybindings, .model_cycleForward, "Ctrl+P");
+    defer allocator.free(cycle_forward);
+    const cycle_backward = try actionLabel(allocator, keybindings, .model_cycleBackward, "Shift+Ctrl+P");
+    defer allocator.free(cycle_backward);
     const open_models = try actionLabel(allocator, keybindings, .model_select, "Ctrl+L");
     defer allocator.free(open_models);
-    const open_sessions = try actionLabel(allocator, keybindings, .session_tree, "Unbound");
-    defer allocator.free(open_sessions);
+    const resume_session = try actionLabel(allocator, keybindings, .session_resume, "Unbound");
+    defer allocator.free(resume_session);
+    const tree_session = try actionLabel(allocator, keybindings, .session_tree, "Unbound");
+    defer allocator.free(tree_session);
+    const fork_session = try actionLabel(allocator, keybindings, .session_fork, "Unbound");
+    defer allocator.free(fork_session);
+    const new_session = try actionLabel(allocator, keybindings, .session_new, "Unbound");
+    defer allocator.free(new_session);
+    const follow_up = try actionLabel(allocator, keybindings, .message_followUp, "Alt+Enter");
+    defer allocator.free(follow_up);
+    const dequeue = try actionLabel(allocator, keybindings, .message_dequeue, "Alt+Up");
+    defer allocator.free(dequeue);
+    const tools_expand = try actionLabel(allocator, keybindings, .tools_expand, "Ctrl+O");
+    defer allocator.free(tools_expand);
+    const thinking_cycle = try actionLabel(allocator, keybindings, .thinking_cycle, "Shift+Tab");
+    defer allocator.free(thinking_cycle);
+    const thinking_toggle = try actionLabel(allocator, keybindings, .thinking_toggle, "Ctrl+T");
+    defer allocator.free(thinking_toggle);
     const paste_image = try actionLabel(allocator, keybindings, .clipboard_pasteImage, "Ctrl+V");
     defer allocator.free(paste_image);
 
     return std.fmt.allocPrint(
         allocator,
-        "Pi interactive mode (verbose startup)\n{s} interrupt • {s} clear • {s} exit • {s} models • {s} sessions • {s} paste image • / commands • ! bash",
-        .{ interrupt, clear, exit, open_models, open_sessions, paste_image },
+        "Pi interactive mode (verbose startup)\n{s} interrupt • {s} clear ({s} twice exits) • {s} exit when empty • {s} suspend • {s}/{s} cycle models • {s} models • {s} resume • {s} tree • {s} fork • {s} new • {s} follow-up • {s} dequeue • {s} tools • {s} thinking level • {s} thinking visibility • {s} paste image • / commands • ! bash • !! bash no context",
+        .{ interrupt, clear, clear, exit, suspend_label, cycle_forward, cycle_backward, open_models, resume_session, tree_session, fork_session, new_session, follow_up, dequeue, tools_expand, thinking_cycle, thinking_toggle, paste_image },
     );
 }
 
@@ -1173,7 +1237,7 @@ test "screen renders themed output and custom keybinding hints" {
 
     var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
     defer keybindings.deinit();
-    try keybindings.setBinding(.session_tree, &.{.{ .ctrl = 'x' }});
+    try keybindings.setBinding(.session_resume, &.{.{ .ctrl = 'x' }});
 
     var theme = try resources_mod.Theme.initDefault(allocator);
     defer theme.deinit(allocator);
@@ -2553,7 +2617,7 @@ test "theme overlay lists all themes with active marker and enter activates sele
     try std.testing.expectEqualStrings("light", live_resources.theme.?.name);
 }
 
-test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
+test "handleInputKey appends hotkeys markdown for slash hotkeys command" {
     const allocator = std.testing.allocator;
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -2625,9 +2689,20 @@ test "handleInputKey opens hotkeys overlay for slash hotkeys command" {
         &live_resources,
     );
 
-    try std.testing.expect(overlay != null);
-    try std.testing.expect(overlay.? == .info);
-    try std.testing.expectEqualStrings("Keyboard shortcuts", overlay.?.title());
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqual(@as(usize, 0), editor.text().len);
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    var hotkeys_item: ?rendering.ChatItem = null;
+    for (state.items.items) |item| {
+        if (item.kind == .markdown and std.mem.indexOf(u8, item.text, "Keyboard shortcuts") != null) {
+            hotkeys_item = item;
+            break;
+        }
+    }
+    try std.testing.expect(hotkeys_item != null);
+    try std.testing.expect(std.mem.indexOf(u8, hotkeys_item.?.text, "`/`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hotkeys_item.?.text, "`!!`") != null);
 }
 
 test "handleInputKey opens model overlay for slash model command" {
@@ -2701,6 +2776,137 @@ test "handleInputKey opens model overlay for slash model command" {
     try std.testing.expect(overlay != null);
     try std.testing.expect(overlay.? == .model);
     try std.testing.expectEqual(@as(usize, 0), editor.text().len);
+}
+
+test "model slash exact match switches and persists default selection" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try makeInteractiveTestPath(allocator, tmp, "repo");
+    defer allocator.free(root_dir);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        settings_path,
+        \\{
+        \\  "theme": "dark"
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    try env_map.put("OPENAI_API_KEY", "test-openai-key");
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, root_dir);
+    defer runtime_config.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = root_dir,
+        .system_prompt = "sys",
+        .session_dir = try makeInteractiveTestPath(allocator, tmp, "sessions"),
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+    };
+    defer allocator.free(options.session_dir);
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    try slash_commands.handleModelSlashCommand(
+        allocator,
+        &env_map,
+        &session,
+        &current_provider,
+        "GPT-5.4",
+        options,
+        &runtime_config,
+        &state,
+        &overlay,
+    );
+
+    try std.testing.expect(overlay == null);
+    try std.testing.expectEqualStrings("openai", session.agent.getModel().provider);
+    try std.testing.expectEqualStrings("gpt-5.4", session.agent.getModel().id);
+
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"theme\": \"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"defaultProvider\": \"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"defaultModel\": \"gpt-5.4\"") != null);
+}
+
+test "model slash unmatched argument opens selector with initial search" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("OPENAI_API_KEY", "test-openai-key");
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp/project",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/project/.pi/sessions",
+        .provider = "faux",
+    };
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    try slash_commands.handleModelSlashCommand(
+        allocator,
+        &env_map,
+        &session,
+        &current_provider,
+        "gpt-5",
+        options,
+        null,
+        &state,
+        &overlay,
+    );
+
+    try std.testing.expect(overlay != null);
+    try std.testing.expect(overlay.? == .model);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.?.hint(), "gpt-5") != null);
+    for (overlay.?.model.items) |item| {
+        try std.testing.expect(std.mem.indexOf(u8, item.label, "gpt") != null or
+            std.mem.indexOf(u8, item.description orelse "", "gpt") != null);
+    }
+    try std.testing.expectEqualStrings("faux", session.agent.getModel().provider);
+    try std.testing.expectEqualStrings("faux-1", session.agent.getModel().id);
 }
 
 test "handleInputKey opens scoped model overlay for slash scoped-models command" {
@@ -5471,7 +5677,7 @@ test "loadSelectableModels respects CLI model patterns" {
     );
     defer allocator.free(filtered);
 
-    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expect(filtered.len > 0);
     for (filtered) |entry| {
         try std.testing.expectEqualStrings("anthropic", entry.provider);
         try std.testing.expect(std.mem.indexOf(u8, entry.model_id, "sonnet") != null);

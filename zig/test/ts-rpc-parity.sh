@@ -28,6 +28,7 @@ python3 <<'PY'
 import os
 import json
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -91,6 +92,10 @@ SCENARIOS = [
 M6_HOST_ENV_PREFIX = "PI_M6_EXTENSION_HOST_"
 TEST_HOME = os.environ["HOME"]
 TEST_AGENT_DIR = os.environ["PI_CODING_AGENT_DIR"]
+NODE_BIN = shutil.which("node")
+if NODE_BIN is None:
+	print("node executable not found for TS-RPC parity", file=sys.stderr)
+	sys.exit(1)
 ZERO_USAGE = {
 	"input": 0,
 	"output": 0,
@@ -314,7 +319,7 @@ def run_live_extension_ui(args, env, label):
 
 ts_extension_ui_stdout = run_live_extension_ui(
 	[
-		"node",
+		NODE_BIN,
 		"--import",
 		deterministic_crypto_import(),
 		"--import",
@@ -420,7 +425,7 @@ def run_m6_configured(label, marker, expected_stdout, response_input):
 		pass
 	env = clean_child_env({
 		"PI_M6_EXTENSION_HOST_ENTRY": "test/m6-extension-host-fixture.mjs",
-		"PI_M6_EXTENSION_HOST_RUNTIME": "bun",
+		"PI_M6_EXTENSION_HOST_RUNTIME": NODE_BIN,
 		"PI_M6_EXTENSION_HOST_FIXTURE": "m6-extension-host",
 		"PI_M6_EXTENSION_HOST_MARKER": marker,
 		"PI_M6_EXTENSION_HOST_CAPTURE": str(capture_path),

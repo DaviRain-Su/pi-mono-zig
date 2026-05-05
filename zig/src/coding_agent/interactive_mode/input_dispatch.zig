@@ -18,6 +18,8 @@ const SelectorOverlay = overlays.SelectorOverlay;
 const AuthFlow = overlays.AuthFlow;
 const loadSessionOverlay = overlays.loadSessionOverlay;
 const loadModelOverlay = overlays.loadModelOverlay;
+const loadSelectableModels = overlays.loadSelectableModels;
+const loadTreeOverlay = overlays.loadTreeOverlay;
 const AppState = rendering.AppState;
 const PromptWorker = prompt_worker_mod.PromptWorker;
 const parseSlashCommand = slash_commands.parseSlashCommand;
@@ -25,6 +27,8 @@ const handleSlashCommand = slash_commands.handleSlashCommand;
 const saveSettingsEditorOverlay = slash_commands.saveSettingsEditorOverlay;
 const switchSession = slash_commands.switchSession;
 const switchModel = slash_commands.switchModel;
+const handleNewSlashCommand = slash_commands.handleNewSlashCommand;
+const forkCurrentSession = slash_commands.forkCurrentSession;
 const applyThemeByName = slash_commands.applyThemeByName;
 const navigateTree = slash_commands.navigateTree;
 const beginLoginFlow = slash_commands.beginLoginFlow;
@@ -54,8 +58,55 @@ pub fn handleInputKey(
     should_exit: *bool,
     live_resources: *LiveResources,
 ) !void {
+    var app_context = AppContext.init(options.cwd, io);
+    try handleInputKeyWithModifiers(
+        allocator,
+        io,
+        env_map,
+        key,
+        .{},
+        session,
+        current_provider,
+        session_dir,
+        options,
+        tool_items,
+        app_state,
+        editor,
+        overlay,
+        auth_flow,
+        prompt_worker,
+        prompt_worker_active,
+        subscriber,
+        should_exit,
+        &app_context,
+        live_resources,
+    );
+}
+
+pub fn handleInputKeyWithModifiers(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    app_context: *AppContext,
+    live_resources: *LiveResources,
+) !void {
     if (overlay.*) |*overlay_value| {
-        if (resolveAppAction(live_resources.keybindings, key)) |action| {
+        if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
             if (action == .exit) {
                 should_exit.* = true;
                 if (prompt_worker_active.*) session.agent.abort();
@@ -144,6 +195,15 @@ pub fn handleInputKey(
                         );
                     },
                     .model => |model_overlay| {
+                        if (index >= model_overlay.choices.len or
+                            model_overlay.choices[index].provider.len == 0 or
+                            model_overlay.choices[index].model_id.len == 0)
+                        {
+                            try app_state.setStatus("No matching models");
+                            overlay_value.deinit(allocator);
+                            overlay.* = null;
+                            return;
+                        }
                         try switchModel(
                             allocator,
                             env_map,
@@ -206,7 +266,7 @@ pub fn handleInputKey(
     }
 
     if (auth_flow.* != null) {
-        if (resolveAppAction(live_resources.keybindings, key)) |action| {
+        if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
             if (action == .exit) {
                 should_exit.* = true;
                 if (prompt_worker_active.*) session.agent.abort();
@@ -270,7 +330,7 @@ pub fn handleInputKey(
         return;
     }
 
-    if (resolveAppAction(live_resources.keybindings, key)) |action| {
+    if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
         if (action == .clipboard_pasteImage) {
             try handlePasteImageAction(allocator, io, env_map, app_state);
             return;
@@ -283,48 +343,54 @@ pub fn handleInputKey(
             session,
             current_provider,
             session_dir,
-            options.model_patterns,
+            options,
             live_resources.runtime_config,
             app_state,
             overlay,
+            editor,
             prompt_worker_active,
+            tool_items,
+            subscriber,
             should_exit,
+            app_context,
         );
         return;
     }
-    if (live_resources.keybindings != null and isLegacyAppActionKey(key)) {
+    if (live_resources.keybindings != null and isLegacyParsedAppActionKey(key, modifiers)) {
         return;
     }
 
     switch (key) {
         .enter => {
-            if (editor.isShowingAutocomplete()) {
-                _ = try editor.handleKey(key);
+            if (!modifiers.hasAny()) {
+                if (editor.isShowingAutocomplete()) {
+                    _ = try editor.handleKey(key);
+                    return;
+                }
+                const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
+                if (trimmed.len == 0) return;
+                try submitEditorText(
+                    allocator,
+                    io,
+                    env_map,
+                    trimmed,
+                    session,
+                    current_provider,
+                    session_dir,
+                    options,
+                    tool_items,
+                    app_state,
+                    editor,
+                    overlay,
+                    auth_flow,
+                    prompt_worker,
+                    prompt_worker_active,
+                    subscriber,
+                    should_exit,
+                    live_resources,
+                );
                 return;
             }
-            const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
-            if (trimmed.len == 0) return;
-            try submitEditorText(
-                allocator,
-                io,
-                env_map,
-                trimmed,
-                session,
-                current_provider,
-                session_dir,
-                options,
-                tool_items,
-                app_state,
-                editor,
-                overlay,
-                auth_flow,
-                prompt_worker,
-                prompt_worker_active,
-                subscriber,
-                should_exit,
-                live_resources,
-            );
-            return;
         },
         else => {},
     }
@@ -767,11 +833,12 @@ pub fn dispatchInputEvent(
                     }
                 }
             }
-            try handleInputKey(
+            try handleInputKeyWithModifiers(
                 allocator,
                 io,
                 env_map,
                 key,
+                parsed.modifiers,
                 session,
                 current_provider,
                 session_dir,
@@ -785,6 +852,7 @@ pub fn dispatchInputEvent(
                 prompt_worker_active,
                 subscriber,
                 should_exit,
+                app_context,
                 live_resources,
             );
         },
@@ -857,6 +925,18 @@ pub fn legacyParsedAppActionForKey(
         };
     }
 
+    if (modifiers.shift and modifiers.ctrl and !modifiers.alt and !modifiers.super) {
+        return switch (key) {
+            .ctrl => |ctrl| switch (ctrl) {
+                'p' => .model_cycleBackward,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    if (modifiers.hasAny()) return null;
+
     return switch (key) {
         .ctrl => |ctrl| switch (ctrl) {
             'c' => .clear,
@@ -881,6 +961,125 @@ pub fn isLegacyAppActionKey(key: tui.Key) bool {
     return legacyAppActionForKey(key) != null;
 }
 
+pub fn isLegacyParsedAppActionKey(key: tui.Key, modifiers: tui.keys.KeyModifiers) bool {
+    return legacyParsedAppActionForKey(key, modifiers) != null;
+}
+
+const CLEAR_DOUBLE_PRESS_WINDOW_MS: i64 = 500;
+
+fn handleClearAction(
+    app_state: *AppState,
+    editor: *tui.Editor,
+    session: *session_mod.AgentSession,
+    prompt_worker_active: *bool,
+    should_exit: *bool,
+) !void {
+    const now_ms = app_state.currentNowMs();
+    if (app_state.takeLastClearActionMs()) |last_ms| {
+        if (now_ms - last_ms < CLEAR_DOUBLE_PRESS_WINDOW_MS) {
+            should_exit.* = true;
+            if (prompt_worker_active.*) session.agent.abort();
+            return;
+        }
+    }
+
+    clearEditor(app_state, editor);
+    app_state.clearDisplay();
+    app_state.setLastClearActionMs(now_ms);
+}
+
+fn cycleThinkingLevel(session: *session_mod.AgentSession, app_state: *AppState) !void {
+    if (!session.agent.getModel().reasoning) {
+        try app_state.setStatus("Current model does not support thinking");
+        return;
+    }
+
+    const next: agent.ThinkingLevel = switch (session.agent.getThinkingLevel()) {
+        .off => .minimal,
+        .minimal => .low,
+        .low => .medium,
+        .medium => .high,
+        .high => .xhigh,
+        .xhigh => .off,
+    };
+    try session.setThinkingLevel(next);
+    try app_state.setStatus(switch (next) {
+        .off => "Thinking level: off",
+        .minimal => "Thinking level: minimal",
+        .low => "Thinking level: low",
+        .medium => "Thinking level: medium",
+        .high => "Thinking level: high",
+        .xhigh => "Thinking level: xhigh",
+    });
+}
+
+const ModelCycleDirection = enum { forward, backward };
+
+fn cycleModel(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    model_patterns: ?[]const []const u8,
+    options: RunInteractiveModeOptions,
+    runtime_config: ?*const config_mod.RuntimeConfig,
+    app_state: *AppState,
+    direction: ModelCycleDirection,
+) !void {
+    const available = try loadSelectableModels(allocator, env_map, session.agent.getModel(), current_provider, model_patterns, runtime_config);
+    defer allocator.free(available);
+
+    var selectable_count: usize = 0;
+    var current_selectable_index: ?usize = null;
+    for (available) |entry| {
+        if (!entry.available) continue;
+        if (std.mem.eql(u8, entry.provider, session.agent.getModel().provider) and
+            std.mem.eql(u8, entry.model_id, session.agent.getModel().id))
+        {
+            current_selectable_index = selectable_count;
+        }
+        selectable_count += 1;
+    }
+
+    if (selectable_count <= 1) {
+        try app_state.setStatus(if (model_patterns != null) "Only one model in scope" else "Only one model available");
+        return;
+    }
+
+    const current_index = current_selectable_index orelse 0;
+    const target_selectable_index = switch (direction) {
+        .forward => (current_index + 1) % selectable_count,
+        .backward => if (current_index == 0) selectable_count - 1 else current_index - 1,
+    };
+
+    var selectable_index: usize = 0;
+    for (available) |entry| {
+        if (!entry.available) continue;
+        if (selectable_index == target_selectable_index) {
+            try switchModel(
+                allocator,
+                env_map,
+                session,
+                current_provider,
+                entry.provider,
+                entry.model_id,
+                options,
+                runtime_config,
+                app_state,
+            );
+            const status = try std.fmt.allocPrint(
+                allocator,
+                "Switched to {s}",
+                .{if (entry.display_name.len > 0) entry.display_name else entry.model_id},
+            );
+            defer allocator.free(status);
+            try app_state.setStatus(status);
+            return;
+        }
+        selectable_index += 1;
+    }
+}
+
 pub fn handleAppAction(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -889,12 +1088,16 @@ pub fn handleAppAction(
     session: *session_mod.AgentSession,
     current_provider: *provider_config.ResolvedProviderConfig,
     session_dir: []const u8,
-    model_patterns: ?[]const []const u8,
+    options: RunInteractiveModeOptions,
     runtime_config: ?*const config_mod.RuntimeConfig,
     app_state: *AppState,
     overlay: *?SelectorOverlay,
+    editor: *tui.Editor,
     prompt_worker_active: *bool,
+    tool_items: []const agent.AgentTool,
+    subscriber: agent.AgentSubscriber,
     should_exit: *bool,
+    app_context: *AppContext,
 ) !void {
     switch (action) {
         .interrupt => {
@@ -904,11 +1107,81 @@ pub fn handleAppAction(
             }
         },
         .exit => {
-            should_exit.* = true;
-            if (prompt_worker_active.*) session.agent.abort();
+            if (editor.text().len == 0) {
+                should_exit.* = true;
+                if (prompt_worker_active.*) session.agent.abort();
+                return;
+            }
+            _ = try editor.handleKey(.delete);
         },
-        .clear => app_state.clearDisplay(),
+        .clear => try handleClearAction(app_state, editor, session, prompt_worker_active, should_exit),
+        .app_suspend => app_context.suspend_requested = true,
+        .tools_expand => app_state.toggleAllExpanded(),
+        .thinking_cycle => try cycleThinkingLevel(session, app_state),
+        .thinking_toggle => try app_state.setStatus("Thinking blocks: visible"),
+        .model_cycleForward => try cycleModel(
+            allocator,
+            env_map,
+            session,
+            current_provider,
+            options.model_patterns,
+            options,
+            runtime_config,
+            app_state,
+            .forward,
+        ),
+        .model_cycleBackward => try cycleModel(
+            allocator,
+            env_map,
+            session,
+            current_provider,
+            options.model_patterns,
+            options,
+            runtime_config,
+            app_state,
+            .backward,
+        ),
+        .session_new => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before starting a new session");
+                return;
+            }
+            try handleNewSlashCommand(
+                allocator,
+                io,
+                session,
+                current_provider,
+                session_dir,
+                options,
+                tool_items,
+                app_state,
+                subscriber,
+            );
+        },
         .session_tree => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before opening the session tree");
+                return;
+            }
+            overlay.* = try loadTreeOverlay(allocator, session);
+        },
+        .session_fork => {
+            if (prompt_worker_active.*) {
+                try app_state.setStatus("wait for the current response to finish before forking the session");
+                return;
+            }
+            try forkCurrentSession(
+                allocator,
+                io,
+                session,
+                current_provider,
+                session_dir,
+                tool_items,
+                app_state,
+                subscriber,
+            );
+        },
+        .session_resume => {
             if (prompt_worker_active.*) {
                 try app_state.setStatus("wait for the current response to finish before switching sessions");
                 return;
@@ -920,7 +1193,7 @@ pub fn handleAppAction(
                 try app_state.setStatus("wait for the current response to finish before switching models");
                 return;
             }
-            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, model_patterns, runtime_config);
+            overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, options.model_patterns, runtime_config);
         },
         .message_followUp, .message_dequeue => {},
         .clipboard_pasteImage => {},
@@ -941,4 +1214,258 @@ test "legacy app actions include clipboard image paste" {
     try std.testing.expectEqual(keybindings_mod.Action.clipboard_pasteImage, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
     try std.testing.expectEqual(keybindings_mod.Action.editor_external, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
     try std.testing.expect(legacyAppActionForKey(.{ .ctrl = 'r' }) == null);
+}
+
+fn ignoreAgentEvent(_: ?*anyopaque, _: agent.AgentEvent) anyerror!void {}
+
+test "configured app keybindings drive clear exit and suspend while old defaults stop" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    defer current_provider.deinit(allocator);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+    });
+    defer session.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    _ = try editor.handlePaste("draft");
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+    try keybindings.setBinding(.clear, &.{.{ .ctrl = 'x' }});
+    try keybindings.setBinding(.exit, &.{.{ .ctrl = 'q' }});
+    try keybindings.setBinding(.app_suspend, &.{.{ .ctrl = 'y' }});
+
+    const options = RunInteractiveModeOptions{
+        .cwd = "/tmp",
+        .system_prompt = "sys",
+        .session_dir = "/tmp/pi-input-dispatch-test-sessions",
+        .provider = "faux",
+        .keybindings = &keybindings,
+    };
+    var live_resources = LiveResources.init(options);
+    defer live_resources.deinit(allocator);
+
+    var overlay: ?SelectorOverlay = null;
+    defer if (overlay) |*value| value.deinit(allocator);
+    var auth_flow: ?AuthFlow = null;
+    defer if (auth_flow) |*value| value.deinit(allocator);
+    var prompt_worker: PromptWorker = undefined;
+    var prompt_worker_active = false;
+    var should_exit = false;
+    var app_context = AppContext.init(options.cwd, std.testing.io);
+    const subscriber = agent.AgentSubscriber{ .callback = ignoreAgentEvent };
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'c' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expectEqualStrings("draft", editor.text());
+    try std.testing.expect(!should_exit);
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'x' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expectEqualStrings("", editor.text());
+    try std.testing.expect(!should_exit);
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'x' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expect(should_exit);
+
+    should_exit = false;
+    _ = try editor.handlePaste("keep");
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'd' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expectEqualStrings("keep", editor.text());
+    try std.testing.expect(!should_exit);
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'q' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expectEqualStrings("keep", editor.text());
+    try std.testing.expect(!should_exit);
+
+    editor.reset();
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'q' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expect(should_exit);
+
+    app_context.suspend_requested = false;
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'z' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expect(!app_context.suspend_requested);
+
+    try handleInputKeyWithModifiers(
+        allocator,
+        std.testing.io,
+        &env_map,
+        .{ .ctrl = 'y' },
+        .{},
+        &session,
+        &current_provider,
+        options.session_dir,
+        options,
+        &.{},
+        &state,
+        &editor,
+        &overlay,
+        &auth_flow,
+        &prompt_worker,
+        &prompt_worker_active,
+        subscriber,
+        &should_exit,
+        &app_context,
+        &live_resources,
+    );
+    try std.testing.expect(app_context.suspend_requested);
 }
