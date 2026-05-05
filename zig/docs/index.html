@@ -314,13 +314,13 @@
     <h1 data-en>A high-performance<br/>coding agent in <span class="accent">Zig</span></h1>
 
     <p class="lead" data-zh>
-      原生二进制、低内存、毫秒级启动；保留与 TypeScript 版本完整的能力 ——
-      包括交互式 TUI、多 provider、session、工具链与扩展生态。
+      原生二进制、低内存、毫秒级启动；核心 runtime、TUI、session、
+      provider、工具链与 TypeScript 扩展兼容层已经进入可替代状态。
     </p>
     <p class="lead" data-en>
-      Native binary, low memory, sub-second startup. Keeps full feature parity with
-      the TypeScript version — interactive TUI, multi-provider, sessions, tools,
-      and extension ecosystem.
+      Native binary, low memory, sub-second startup. Core runtime, TUI, sessions,
+      providers, tools, and the TypeScript extension compatibility layer are now
+      replacement-ready for the main workflows.
     </p>
 
     <div class="cta">
@@ -331,9 +331,9 @@
     </div>
 
     <div class="meta">
-      <span data-zh>独立可用度 ≈ 90%</span><span data-en>Standalone ready ≈ 90%</span>
-      <span data-zh>核心 runtime parity 89%</span><span data-en>Core runtime parity 89%</span>
-      <span data-zh>JSON event wire 93%</span><span data-en>JSON event wire 93%</span>
+      <span data-zh>独立可用度 ≈ 96%</span><span data-en>Standalone ready ≈ 96%</span>
+      <span data-zh>核心 runtime parity 94%</span><span data-en>Core runtime parity 94%</span>
+      <span data-zh>TS-RPC parity 已有 golden 覆盖</span><span data-en>TS-RPC parity covered by goldens</span>
       <span data-zh>25+ 内置 provider</span><span data-en>25+ built-in providers</span>
     </div>
   </div>
@@ -364,22 +364,20 @@
       </div>
       <div class="card">
         <h3 data-zh>完整交互式 TUI</h3><h3 data-en>Full interactive TUI</h3>
-        <p data-zh>差分渲染、Unicode 宽度、剪贴板图片、scoped models、changelog 等都已实现。</p>
-        <p data-en>Diff rendering, Unicode width, clipboard images, scoped models, changelog, all in.</p>
+        <p data-zh>差分渲染、Unicode 宽度、剪贴板图片、session tree、fork selector、missing-cwd selector 等都已实现。</p>
+        <p data-en>Diff rendering, Unicode width, clipboard images, session tree, fork selector, and missing-cwd selector are implemented.</p>
       </div>
       <div class="card">
         <h3 data-zh>多 Provider & OAuth</h3><h3 data-en>Multi-provider & OAuth</h3>
-        <p data-zh>OpenAI / Anthropic / Mistral / Kimi / Google / Bedrock / Azure 等 25+ provider；
-        Anthropic / GitHub Copilot / Gemini 真实 OAuth 已可用。</p>
-        <p data-en>25+ providers including OpenAI, Anthropic, Mistral, Kimi, Google, Bedrock, Azure.
-        Real OAuth flows for Anthropic, GitHub Copilot, and Gemini are working.</p>
+        <p data-zh>OpenAI / Anthropic / Mistral / Kimi / Google / Bedrock / Azure / MiniMax 等 provider；
+        API-key env 映射、Vertex ADC 检查与主要 OAuth 流程已接入。</p>
+        <p data-en>Providers include OpenAI, Anthropic, Mistral, Kimi, Google, Bedrock, Azure, and MiniMax.
+        API-key env mapping, Vertex ADC checks, and major OAuth flows are wired in.</p>
       </div>
       <div class="card">
         <h3 data-zh>兼容 TS 扩展生态</h3><h3 data-en>TS extension compat</h3>
-        <p data-zh>通过 Bun 子进程 + JSON-RPC 复用既有 TS 扩展，零迁移成本。
-        热重载、崩溃自愈、版本锁定全套支持。</p>
-        <p data-en>Reuse existing TS extensions via a Bun subprocess + JSON-RPC. Zero migration.
-        Hot-reload, crash recovery, and version locking included.</p>
+        <p data-zh>通过 Bun 子进程 + JSON-RPC 复用既有 TS 扩展；工具、命令、快捷键、flag、provider、UI hook 和包管理路径已打通。</p>
+        <p data-en>Reuse existing TS extensions through Bun + JSON-RPC. Tools, commands, shortcuts, flags, providers, UI hooks, and package flows are wired.</p>
       </div>
     </div>
   </div>
@@ -390,8 +388,8 @@
     <h2 data-zh>与 TypeScript 版的能力对齐</h2>
     <h2 data-en>Parity with the TypeScript version</h2>
 
-    <p class="sub" data-zh>第三轮 Review 数据。完整内容见 <a href="REVIEW.md">REVIEW.md</a>。</p>
-    <p class="sub" data-en>Numbers from the third review pass. Full details in <a href="REVIEW.md">REVIEW.md</a>.</p>
+    <p class="sub" data-zh>基于 2026-05-05 当前 Zig 代码的 Review 摘要。完整内容见 <a href="REVIEW.md">REVIEW.md</a>。</p>
+    <p class="sub" data-en>Review summary based on the current Zig code as of 2026-05-05. Full details in <a href="REVIEW.md">REVIEW.md</a>.</p>
 
     <table>
       <thead>
@@ -404,53 +402,53 @@
       <tbody>
         <tr>
           <td><span data-zh>Agent 核心 loop / runtime</span><span data-en>Agent core loop / runtime</span></td>
-          <td><span class="bar green"><span style="width:89%"></span></span> 89%</td>
-          <td><span data-zh>steering / tool / hook / abort 全部就绪</span><span data-en>steering / tool / hook / abort all in place</span></td>
+          <td><span class="bar green"><span style="width:94%"></span></span> 94%</td>
+          <td><span data-zh>prompt、tool、abort、retry、compaction、queue steering 已有 parity 覆盖</span><span data-en>prompt, tools, abort, retry, compaction, and queue steering covered by parity tests</span></td>
         </tr>
         <tr>
           <td>JSON mode / event wire</td>
-          <td><span class="bar green"><span style="width:93%"></span></span> 93%</td>
-          <td><span data-zh>校验 + 富 schema</span><span data-en>validation + rich schema</span></td>
+          <td><span class="bar green"><span style="width:96%"></span></span> 96%</td>
+          <td><span data-zh>schema 校验、CLI JSON 输出与 TS-RPC golden 覆盖</span><span data-en>schema validation, CLI JSON output, and TS-RPC goldens</span></td>
         </tr>
         <tr>
           <td>CLI / bootstrap</td>
-          <td><span class="bar green"><span style="width:89%"></span></span> 89%</td>
-          <td><span data-zh>主流 flag 已对齐</span><span data-en>major flags aligned</span></td>
+          <td><span class="bar green"><span style="width:94%"></span></span> 94%</td>
+          <td><span data-zh>print/json/ts-rpc/session/export/package/extension flags 已覆盖</span><span data-en>print/json/ts-rpc/session/export/package/extension flags covered</span></td>
         </tr>
         <tr>
           <td><span data-zh>内置 tools</span><span data-en>Built-in tools</span></td>
-          <td><span class="bar green"><span style="width:87%"></span></span> 87%</td>
-          <td>read / bash / edit / write / grep / find / ls</td>
+          <td><span class="bar green"><span style="width:92%"></span></span> 92%</td>
+          <td>read / bash / edit / write / grep / find / ls + parallel mutation queue</td>
         </tr>
         <tr>
           <td>TUI / interactive</td>
-          <td><span class="bar green"><span style="width:86%"></span></span> 86%</td>
-          <td><span data-zh>多模块拆分，渲染锁优化</span><span data-en>multi-module split, render lock optimized</span></td>
+          <td><span class="bar green"><span style="width:91%"></span></span> 91%</td>
+          <td><span data-zh>模块化 TUI、selector、session tree、fork、clipboard image、M8 parity 测试</span><span data-en>modular TUI, selectors, session tree, fork, clipboard image, M8 parity tests</span></td>
         </tr>
         <tr>
           <td><span data-zh>Sessions / 分支 / 导出</span><span data-en>Sessions / branching / export</span></td>
-          <td><span class="bar green"><span style="width:84%"></span></span> 84%</td>
-          <td><span data-zh>session v3 + 分支 + 跨 provider 续会话</span><span data-en>session v3 + branching + cross-provider continuation</span></td>
+          <td><span class="bar green"><span style="width:93%"></span></span> 93%</td>
+          <td><span data-zh>session v3、resume/continue/fork/clone、missing-cwd 选择器、HTML/JSONL export</span><span data-en>session v3, resume/continue/fork/clone, missing-cwd selector, HTML/JSONL export</span></td>
         </tr>
         <tr>
           <td>Providers / auth / model registry</td>
-          <td><span class="bar green"><span style="width:78%"></span></span> 78%</td>
-          <td><span data-zh>25+ provider，真实 OAuth</span><span data-en>25+ providers, real OAuth</span></td>
+          <td><span class="bar green"><span style="width:86%"></span></span> 86%</td>
+          <td><span data-zh>主要 provider 已注册；moonshot/xiaomi/cloudflare 独立 provider 仍是缺口</span><span data-en>major providers registered; standalone moonshot/xiaomi/cloudflare providers remain gaps</span></td>
         </tr>
         <tr>
           <td><span data-zh>RPC 协议兼容</span><span data-en>RPC protocol compat</span></td>
-          <td><span class="bar red"><span style="width:30%"></span></span> 30%</td>
-          <td><span data-zh>独立 JSON-RPC OK，TS-JSONL 控制面待做</span><span data-en>standalone JSON-RPC ok; TS JSONL control plane pending</span></td>
+          <td><span class="bar green"><span style="width:92%"></span></span> 92%</td>
+          <td><span data-zh>TS-RPC prompt/tool/compaction/retry/extension UI/M6 host golden 已通过</span><span data-en>TS-RPC prompt/tool/compaction/retry/extension UI/M6 host goldens pass</span></td>
         </tr>
         <tr>
           <td><span data-zh>扩展 / 包管理 / 自定义 UI</span><span data-en>Extensions / packages / custom UI</span></td>
-          <td><span class="bar red"><span style="width:12%"></span></span> 12%</td>
-          <td><span data-zh>路线 B 阶段 1 主目标</span><span data-en>main target of Plan B Stage 1</span></td>
+          <td><span class="bar green"><span style="width:84%"></span></span> 84%</td>
+          <td><span data-zh>Bun host、注册协议、UI hook、package CLI 已实现；动态刷新细节需继续验证</span><span data-en>Bun host, registration protocol, UI hooks, and package CLI implemented; dynamic refresh details need more verification</span></td>
         </tr>
         <tr>
           <td>MCP</td>
-          <td><span class="bar red"><span style="width:5%"></span></span> 5%</td>
-          <td><span data-zh>经扩展通道接入</span><span data-en>to be reached via extensions</span></td>
+          <td><span class="bar red"><span style="width:20%"></span></span> 20%</td>
+          <td><span data-zh>仍主要依赖扩展通道，原生 MCP host 不是当前已完成项</span><span data-en>still mostly reached through extensions; native MCP host is not complete</span></td>
         </tr>
       </tbody>
     </table>
@@ -460,8 +458,8 @@
 <section id="architecture">
   <div class="wrap">
     <h2 data-zh>架构总览</h2><h2 data-en>Architecture</h2>
-    <p class="sub" data-zh>最终形态：Zig 内核 + 双扩展通道（TS 兼容 + Wasm 原生）。</p>
-    <p class="sub" data-en>Final shape: Zig core + dual extension channels (TS-compat + Wasm native).</p>
+    <p class="sub" data-zh>当前形态：Zig 内核 + Bun 扩展兼容层；Wasm 原生扩展仍是后续方向。</p>
+    <p class="sub" data-en>Current shape: Zig core + Bun extension compatibility layer. Wasm-native extensions remain future work.</p>
     <div class="arch">
 <pre>
 ┌──────────────────────────────────────────────────────┐
@@ -474,7 +472,7 @@
 │                       │                              │
 │              ┌────────┴────────┐                     │
 │              │   extension     │                     │
-│              │     loader      │                     │
+│              │ host / registry │                     │
 │              └─┬────────────┬──┘                     │
 │                │            │                        │
 │   ┌────────────▼──┐    ┌────▼─────────────────────┐  │
@@ -493,64 +491,64 @@
   <div class="wrap">
     <h2 data-zh>路线图</h2><h2 data-en>Roadmap</h2>
 
-    <p class="sub" data-zh>两条并行路径。路线 A 让 Zig 版独立可用；路线 B 实现完整 TS 替代。</p>
-    <p class="sub" data-en>Two tracks. Plan A gets the Zig version standalone-ready; Plan B is full TS replacement.</p>
+    <p class="sub" data-zh>当前主线已经从“能跑”转为“收敛剩余 parity gap 与 CI/发布稳定性”。</p>
+    <p class="sub" data-en>The main track has moved from "make it run" to closing remaining parity gaps and stabilizing CI/release behavior.</p>
 
-    <h3 style="margin-top:32px;color:var(--accent);" data-zh>路线 A · 独立可用版（≈ 1–2 周）</h3>
-    <h3 style="margin-top:32px;color:var(--accent);" data-en>Plan A · Standalone ready (≈ 1–2 weeks)</h3>
+    <h3 style="margin-top:32px;color:var(--accent);" data-zh>当前收敛项</h3>
+    <h3 style="margin-top:32px;color:var(--accent);" data-en>Current convergence items</h3>
 
     <div class="timeline">
       <div class="step">
         <span class="when">S</span>
-        <h4 data-zh>toolcall 流式事件转发</h4>
-        <h4 data-en>Forward toolcall stream events</h4>
-        <p data-zh>补 <code>streamAssistantResponse</code> 的 switch case，让 JSON event 闭环。</p>
-        <p data-en>Add the missing switch cases in <code>streamAssistantResponse</code> to close the JSON-event loop.</p>
+        <h4 data-zh>统一 abort 原子读顺序</h4>
+        <h4 data-en>Unify abort atomic ordering</h4>
+        <p data-zh><code>stream.zig</code> 仍使用 <code>.monotonic</code>，provider/shared 路径使用 <code>.seq_cst</code>。</p>
+        <p data-en><code>stream.zig</code> still uses <code>.monotonic</code>; provider/shared paths use <code>.seq_cst</code>.</p>
       </div>
       <div class="step">
         <span class="when">M</span>
-        <h4 data-zh>agent_loop 并行模式真·流式</h4>
-        <h4 data-en>True live streaming in parallel mode</h4>
-        <p data-zh>把 per-task buffered updates 改成线程安全实时 emit。</p>
-        <p data-en>Replace per-task buffered updates with a thread-safe live emit channel.</p>
+        <h4 data-zh>补齐 TS KnownProvider 差异</h4>
+        <h4 data-en>Close TS KnownProvider deltas</h4>
+        <p data-zh>Moonshot、Xiaomi、Cloudflare 独立 provider 与 <code>ModelThinkingLevel = "off"</code> 仍未完全对齐。</p>
+        <p data-en>Standalone Moonshot, Xiaomi, Cloudflare providers and <code>ModelThinkingLevel = "off"</code> are still not fully aligned.</p>
       </div>
       <div class="step">
         <span class="when">S</span>
-        <h4 data-zh>去掉生产路径的 resetForTesting()</h4>
-        <h4 data-en>Drop resetForTesting() in production path</h4>
-        <p data-zh>引入显式 <code>clear()</code> / <code>resetToBuiltIns()</code> API。</p>
-        <p data-en>Introduce explicit <code>clear()</code> / <code>resetToBuiltIns()</code> APIs.</p>
+        <h4 data-zh>补 setup-failure smoke test</h4>
+        <h4 data-en>Backfill setup-failure smoke tests</h4>
+        <p data-zh><code>openai_responses.zig</code> 仍缺 canonical setup failure regression。</p>
+        <p data-en><code>openai_responses.zig</code> still lacks the canonical setup-failure regression.</p>
       </div>
       <div class="step">
         <span class="when">S–M</span>
-        <h4 data-zh>catch {} → 结构化 error 收集</h4>
-        <h4 data-en>catch {} → structured error collection</h4>
-        <p data-zh>config 错误不再静默吞掉，启动后统一告警。</p>
-        <p data-en>Config errors no longer swallowed; surface them after startup.</p>
+        <h4 data-zh>Linux CI 恢复 Zig build/test</h4>
+        <h4 data-en>Restore Linux Zig build/test in CI</h4>
+        <p data-zh>Zig 0.16.0 在 ubuntu-latest 上 <code>build-exe</code> 会 SEGV；当前 Linux job 只做 setup/tool smoke。</p>
+        <p data-en>Zig 0.16.0 SEGVs in <code>build-exe</code> on ubuntu-latest; the Linux job currently only runs setup/tool smoke checks.</p>
       </div>
       <div class="step">
         <span class="when">S–M</span>
-        <h4 data-zh>JSON 输出 golden 兼容性测试</h4>
-        <h4 data-en>JSON output golden tests</h4>
-        <p data-zh>钉死 wire 契约，避免 schema 漂移。</p>
-        <p data-en>Lock the wire contract to prevent schema drift.</p>
+        <h4 data-zh>扩展动态刷新验证</h4>
+        <h4 data-en>Verify extension dynamic refresh</h4>
+        <p data-zh>注册/注销、UI hook、package CLI 已实现；动态 registry refresh 还需要更窄的端到端回归。</p>
+        <p data-en>Registration, UI hooks, and package CLI are implemented; dynamic registry refresh still needs narrower end-to-end regressions.</p>
       </div>
     </div>
 
-    <h3 style="margin-top:48px;color:var(--accent);" data-zh>路线 B · 完整 TS 替代（≈ 12–16 周）</h3>
-    <h3 style="margin-top:48px;color:var(--accent);" data-en>Plan B · Full TS replacement (≈ 12–16 weeks)</h3>
+    <h3 style="margin-top:48px;color:var(--accent);" data-zh>后续方向</h3>
+    <h3 style="margin-top:48px;color:var(--accent);" data-en>Next direction</h3>
 
     <div class="timeline">
       <div class="step">
-        <span class="when" data-zh>阶段 1 · 12–16 周</span>
-        <span class="when" data-en>Stage 1 · 12–16 weeks</span>
-        <h4 data-zh>Bun 作为扩展运行时</h4>
-        <h4 data-en>Bun as extension runtime</h4>
-        <p data-zh>子进程 + JSON-RPC + 热重载 + 包管理；复用 TS / npm 扩展生态。</p>
-        <p data-en>Subprocess + JSON-RPC + hot-reload + package management; reuse the TS / npm ecosystem.</p>
+        <span class="when" data-zh>持续</span>
+        <span class="when" data-en>ongoing</span>
+        <h4 data-zh>继续以 Bun 兼容层承载 TS 扩展</h4>
+        <h4 data-en>Keep TS extensions on the Bun compatibility layer</h4>
+        <p data-zh>这是主路径，不重新定义扩展生态；Zig 负责 host、sessions、tools、providers 和 TUI。</p>
+        <p data-en>This remains the primary path; Zig owns host, sessions, tools, providers, and TUI without redefining the extension ecosystem.</p>
       </div>
       <div class="step">
-        <span class="when" data-zh>阶段 2 · 持续</span>
+        <span class="when" data-zh>可选优化 · 持续</span>
         <span class="when" data-en>Stage 2 · ongoing</span>
         <h4 data-zh>把热门扩展原生化</h4>
         <h4 data-en>Nativize popular extensions</h4>
@@ -558,8 +556,8 @@
         <p data-en>Data-driven. Rewrite the top-N extensions in Zig as native ones for perf, size, and independence.</p>
       </div>
       <div class="step">
-        <span class="when" data-zh>阶段 3 · 2–3 周</span>
-        <span class="when" data-en>Stage 3 · 2–3 weeks</span>
+        <span class="when" data-zh>后续</span>
+        <span class="when" data-en>later</span>
         <h4 data-zh>Wasm 原生扩展加载器</h4>
         <h4 data-en>Wasm-based native extension loader</h4>
         <p data-zh>Zig / Rust / AssemblyScript 写的扩展通过 Wasm 沙箱热加载。</p>
@@ -572,42 +570,44 @@
 <section id="getting-started">
   <div class="wrap">
     <h2 data-zh>快速开始</h2><h2 data-en>Getting started</h2>
-    <p class="sub" data-zh>单二进制，无需安装运行时。</p>
-    <p class="sub" data-en>Single binary, no runtime to install.</p>
+    <p class="sub" data-zh>从 <code>zig/</code> 目录构建；产物是 <code>zig-out/bin/pi</code>。</p>
+    <p class="sub" data-en>Build from <code>zig/</code>; the binary is <code>zig-out/bin/pi</code>.</p>
 <pre data-zh><code># 构建
+cd zig
 zig build -Doptimize=ReleaseFast
 
 # 交互模式
-./zig-out/bin/pi-agent
+./zig-out/bin/pi
 
 # 一次性 prompt
-./zig-out/bin/pi-agent --prompt "帮我审查 src/main.zig 的内存管理"
+./zig-out/bin/pi --print "帮我审查 src/main.zig 的内存管理"
 
 # JSON 事件流（机器消费）
-./zig-out/bin/pi-agent --json --prompt "..."
+./zig-out/bin/pi --print --mode json "..."
 
 # 查看可用模型
-./zig-out/bin/pi-agent --list-models
+./zig-out/bin/pi --list-models
 
 # 续上一会话
-./zig-out/bin/pi-agent --continue</code></pre>
+./zig-out/bin/pi --print --continue "继续上一轮"</code></pre>
 <pre data-en><code># Build
+cd zig
 zig build -Doptimize=ReleaseFast
 
 # Interactive mode
-./zig-out/bin/pi-agent
+./zig-out/bin/pi
 
 # One-shot prompt
-./zig-out/bin/pi-agent --prompt "Review memory management in src/main.zig"
+./zig-out/bin/pi --print "Review memory management in src/main.zig"
 
 # JSON event stream (for machines)
-./zig-out/bin/pi-agent --json --prompt "..."
+./zig-out/bin/pi --print --mode json "..."
 
 # List available models
-./zig-out/bin/pi-agent --list-models
+./zig-out/bin/pi --list-models
 
 # Continue last session
-./zig-out/bin/pi-agent --continue</code></pre>
+./zig-out/bin/pi --print --continue "Continue the last session"</code></pre>
   </div>
 </section>
 
