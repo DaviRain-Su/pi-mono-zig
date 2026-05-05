@@ -37,6 +37,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        working-directory: .
+        run: npm ci
+
       # mlugg/setup-zig@v1 still uses the pre-0.16 tarball naming
       # (zig-<os>-<arch>-<ver>) and 404s on 0.16.0 which switched to
       # zig-<arch>-<os>-<ver>. Install Zig directly from ziglang.org
