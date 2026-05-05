@@ -4,7 +4,6 @@
       "cacheControlFormat": "anthropic",
       "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {},
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": false,
       "requiresThinkingAsText": false,

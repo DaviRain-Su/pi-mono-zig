@@ -3,7 +3,6 @@
     "resolvedCompat": {
       "maxTokensField": "max_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {},
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": false,
       "requiresThinkingAsText": false,

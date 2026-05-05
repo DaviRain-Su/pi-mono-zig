@@ -5,7 +5,7 @@
       "payload": {
         "additionalModelRequestFields": {
           "output_config": {
-            "effort": "max"
+            "effort": "high"
           },
           "thinking": {
             "display": "summarized",

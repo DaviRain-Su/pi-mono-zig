@@ -4,13 +4,6 @@
       "cacheControlFormat": "anthropic",
       "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {
-        "high": "high",
-        "low": "high",
-        "medium": "high",
-        "minimal": "high",
-        "xhigh": "max"
-      },
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": true,
       "requiresThinkingAsText": false,
@@ -44,7 +37,7 @@
           }
         ],
         "model": "anthropic/mixed-deepseek",
-        "reasoning_effort": "high",
+        "reasoning_effort": "minimal",
         "stream": true,
         "stream_options": {
           "include_usage": true

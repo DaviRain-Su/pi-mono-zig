@@ -3,13 +3,6 @@
     "resolvedCompat": {
       "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {
-        "high": "default",
-        "low": "default",
-        "medium": "default",
-        "minimal": "default",
-        "xhigh": "default"
-      },
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": false,
       "requiresThinkingAsText": false,
@@ -43,7 +36,7 @@
           }
         ],
         "model": "qwen/qwen3-32b",
-        "reasoning_effort": "default",
+        "reasoning_effort": "low",
         "store": false,
         "stream": true,
         "stream_options": {

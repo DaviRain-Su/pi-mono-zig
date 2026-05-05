@@ -267,7 +267,7 @@ pub fn buildRequestPayload(
             if (stream_options.responses_reasoning_effort) |reasoning_effort| {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, clampReasoningEffort(model.id, reasoning_effort)) });
+                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, thinkingLevelString(reasoning_effort)) });
                 try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, stream_options.responses_reasoning_summary orelse "auto") });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
             }
@@ -1034,25 +1034,6 @@ fn thinkingLevelString(level: types.ThinkingLevel) []const u8 {
         .high => "high",
         .xhigh => "xhigh",
     };
-}
-
-fn clampReasoningEffort(model_id: []const u8, level: types.ThinkingLevel) []const u8 {
-    const id = if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |index| model_id[index + 1 ..] else model_id;
-    if ((std.mem.startsWith(u8, id, "gpt-5.2") or
-        std.mem.startsWith(u8, id, "gpt-5.3") or
-        std.mem.startsWith(u8, id, "gpt-5.4") or
-        std.mem.startsWith(u8, id, "gpt-5.5")) and level == .minimal)
-    {
-        return "low";
-    }
-    if (std.mem.eql(u8, id, "gpt-5.1") and level == .xhigh) return "high";
-    if (std.mem.eql(u8, id, "gpt-5.1-codex-mini")) {
-        return switch (level) {
-            .high, .xhigh => "high",
-            else => "medium",
-        };
-    }
-    return thinkingLevelString(level);
 }
 
 fn stripBearerPrefix(token: []const u8) []const u8 {
@@ -2028,7 +2009,7 @@ test "buildRequestPayload omits instructions when no system prompt is provided" 
     try std.testing.expect(payload.object.get("instructions") == null);
 }
 
-test "buildRequestPayload preserves xhigh reasoning for GPT-5.5" {
+test "buildRequestPayload preserves requested Codex reasoning effort" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "gpt-5.5",
@@ -2087,7 +2068,7 @@ test "buildRequestPayload applies Codex request option parity fields" {
     try std.testing.expect(payload.object.get("metadata") == null);
     try std.testing.expectEqualStrings("priority", payload.object.get("service_tier").?.string);
     try std.testing.expectEqualStrings("high", payload.object.get("text").?.object.get("verbosity").?.string);
-    try std.testing.expectEqualStrings("low", payload.object.get("reasoning").?.object.get("effort").?.string);
+    try std.testing.expectEqualStrings("minimal", payload.object.get("reasoning").?.object.get("effort").?.string);
     try std.testing.expectEqualStrings("concise", payload.object.get("reasoning").?.object.get("summary").?.string);
 }
 

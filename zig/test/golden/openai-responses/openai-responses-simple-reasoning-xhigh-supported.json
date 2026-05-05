@@ -25,7 +25,7 @@
         "max_output_tokens": 4096,
         "model": "gpt-5.5-simple-responses",
         "reasoning": {
-          "effort": "xhigh",
+          "effort": "high",
           "summary": "auto"
         },
         "store": false,

@@ -28,7 +28,7 @@
         "model": "gpt-5.1-codex-mini",
         "parallel_tool_calls": true,
         "reasoning": {
-          "effort": "medium",
+          "effort": "low",
           "summary": "on"
         },
         "store": false,

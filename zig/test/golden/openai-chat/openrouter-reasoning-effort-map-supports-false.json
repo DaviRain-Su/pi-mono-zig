@@ -3,9 +3,6 @@
     "resolvedCompat": {
       "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {
-        "high": "router-high"
-      },
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": false,
       "requiresThinkingAsText": false,
@@ -40,7 +37,7 @@
         ],
         "model": "openrouter-effort-map-fixture",
         "reasoning": {
-          "effort": "router-high"
+          "effort": "high"
         },
         "store": false,
         "stream": true,

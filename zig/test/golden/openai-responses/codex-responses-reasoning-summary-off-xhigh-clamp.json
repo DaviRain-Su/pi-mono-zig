@@ -28,7 +28,7 @@
         "model": "gpt-5.1",
         "parallel_tool_calls": true,
         "reasoning": {
-          "effort": "high",
+          "effort": "xhigh",
           "summary": "off"
         },
         "store": false,

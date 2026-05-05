@@ -781,12 +781,7 @@ fn mapThinkingLevelToEffort(level: types.ThinkingLevel, model: types.Model) []co
         .minimal, .low => "low",
         .medium => "medium",
         .high => "high",
-        .xhigh => if (modelMatchCandidateContains(model, "opus-4-6"))
-            "max"
-        else if (modelMatchCandidateContains(model, "opus-4-7"))
-            "xhigh"
-        else
-            "high",
+        .xhigh => if (modelMatchCandidateContains(model, "opus-4-7")) "xhigh" else "high",
     };
 }
 

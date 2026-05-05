@@ -65,6 +65,7 @@ pub const runInteractiveMode = interactive_mode.runInteractiveMode;
 test {
     _ = @import("tools/root.zig");
     _ = @import("session_manager.zig");
+    _ = @import("session_search.zig");
     _ = @import("session.zig");
     _ = @import("session_cwd.zig");
     _ = @import("missing_cwd_selector.zig");

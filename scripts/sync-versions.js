@@ -5,27 +5,36 @@
  * This ensures lockstep versioning across the monorepo.
  */
 
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 
 const packagesDir = join(process.cwd(), 'packages');
+const rootPackagePath = join(process.cwd(), 'package.json');
 const packageDirs = readdirSync(packagesDir, { withFileTypes: true })
 	.filter(dirent => dirent.isDirectory())
+	.filter(dirent => existsSync(join(packagesDir, dirent.name, 'package.json')))
 	.map(dirent => dirent.name);
 
 // Read all package.json files and build version map
-const packages = {};
+const packageManifests = [];
 const versionMap = {};
 
 for (const dir of packageDirs) {
 	const pkgPath = join(packagesDir, dir, 'package.json');
 	try {
 		const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-		packages[dir] = { path: pkgPath, data: pkg };
+		packageManifests.push({ path: pkgPath, data: pkg });
 		versionMap[pkg.name] = pkg.version;
 	} catch (e) {
 		console.error(`Failed to read ${pkgPath}:`, e.message);
 	}
+}
+
+try {
+	const rootPkg = JSON.parse(readFileSync(rootPackagePath, 'utf8'));
+	packageManifests.push({ path: rootPackagePath, data: rootPkg });
+} catch (e) {
+	console.error(`Failed to read ${rootPackagePath}:`, e.message);
 }
 
 console.log('Current versions:');
@@ -48,37 +57,29 @@ console.log('\n✅ All packages at same version (lockstep)');
 
 // Update all inter-package dependencies
 let totalUpdates = 0;
-for (const [dir, pkg] of Object.entries(packages)) {
+const dependencySections = [
+	'dependencies',
+	'devDependencies',
+	'peerDependencies',
+	'optionalDependencies',
+];
+
+for (const pkg of packageManifests) {
 	let updated = false;
 	
-	// Check dependencies
-	if (pkg.data.dependencies) {
-		for (const [depName, currentVersion] of Object.entries(pkg.data.dependencies)) {
-			if (versionMap[depName]) {
-				const newVersion = `^${versionMap[depName]}`;
-				if (currentVersion !== newVersion) {
-					console.log(`\n${pkg.data.name}:`);
-					console.log(`  ${depName}: ${currentVersion} → ${newVersion}`);
-					pkg.data.dependencies[depName] = newVersion;
-					updated = true;
-					totalUpdates++;
-				}
-			}
-		}
-	}
-	
-	// Check devDependencies
-	if (pkg.data.devDependencies) {
-		for (const [depName, currentVersion] of Object.entries(pkg.data.devDependencies)) {
-			if (versionMap[depName]) {
-				const newVersion = `^${versionMap[depName]}`;
-				if (currentVersion !== newVersion) {
-					console.log(`\n${pkg.data.name}:`);
-					console.log(`  ${depName}: ${currentVersion} → ${newVersion} (devDependencies)`);
-					pkg.data.devDependencies[depName] = newVersion;
-					updated = true;
-					totalUpdates++;
-				}
+	for (const section of dependencySections) {
+		if (!pkg.data[section]) continue;
+
+		for (const [depName, currentVersion] of Object.entries(pkg.data[section])) {
+			if (!versionMap[depName]) continue;
+
+			const newVersion = `^${versionMap[depName]}`;
+			if (currentVersion !== newVersion) {
+				console.log(`\n${pkg.data.name}:`);
+				console.log(`  ${depName}: ${currentVersion} → ${newVersion} (${section})`);
+				pkg.data[section][depName] = newVersion;
+				updated = true;
+				totalUpdates++;
 			}
 		}
 	}

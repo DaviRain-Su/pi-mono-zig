@@ -19,6 +19,32 @@ const required_external_tools = [_]RequiredExternalTool{
     },
 };
 
+const ParityExecutableRunOptions = struct {
+    name: []const u8,
+    root_source_path: []const u8,
+    step_name: []const u8,
+    step_description: []const u8,
+};
+
+const ParityScriptStepOptions = struct {
+    script_path: []const u8,
+    step_name: []const u8,
+    step_description: []const u8,
+    command_depends_on_external_tools: bool = false,
+    command_depends_on_install: bool = false,
+    step_depends_on_external_tools: bool = false,
+};
+
+const ProviderParitySuiteOptions = struct {
+    executable_name: []const u8,
+    executable_root_source_path: []const u8,
+    run_step_name: []const u8,
+    run_step_description: []const u8,
+    script_path: []const u8,
+    test_step_name: []const u8,
+    test_step_description: []const u8,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -109,77 +135,47 @@ pub fn build(b: *std.Build) void {
     tidy_step.dependOn(&run_tidy_tests.step);
     tidy_step.dependOn(&run_tidy.step);
 
-    const ts_rpc_parity = b.addSystemCommand(&.{"bash"});
-    ts_rpc_parity.addFileArg(b.path("test/ts-rpc-parity.sh"));
-    ts_rpc_parity.step.dependOn(b.getInstallStep());
+    const ts_rpc_parity = addParityScriptStep(b, external_tool_check_step, .{
+        .script_path = "test/ts-rpc-parity.sh",
+        .step_name = "test-ts-rpc-parity",
+        .step_description = "Run TS-vs-Zig ts-rpc exact-byte parity harness",
+        .command_depends_on_install = true,
+        .step_depends_on_external_tools = true,
+    });
     test_step.dependOn(&ts_rpc_parity.step);
 
-    const ts_rpc_parity_step = b.step("test-ts-rpc-parity", "Run TS-vs-Zig ts-rpc exact-byte parity harness");
-    ts_rpc_parity_step.dependOn(external_tool_check_step);
-    ts_rpc_parity_step.dependOn(&ts_rpc_parity.step);
-
-    const openai_chat_parity_exe_mod = b.createModule(.{
-        .root_source_file = b.path("test/openai_chat_parity.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    openai_chat_parity_exe_mod.addImport("ai", ai_mod);
-    const openai_chat_parity_exe = b.addExecutable(.{
-        .name = "openai-chat-parity",
-        .root_module = openai_chat_parity_exe_mod,
-    });
-    const run_openai_chat_parity = b.addRunArtifact(openai_chat_parity_exe);
-    const run_openai_chat_parity_step = b.step("run-openai-chat-parity", "Run Zig OpenAI Chat fixture parity comparator");
-    run_openai_chat_parity_step.dependOn(external_tool_check_step);
-    run_openai_chat_parity_step.dependOn(&run_openai_chat_parity.step);
-
-    const openai_chat_parity = b.addSystemCommand(&.{"bash"});
-    openai_chat_parity.addFileArg(b.path("test/openai-chat-parity.sh"));
-    openai_chat_parity.step.dependOn(external_tool_check_step);
-    const openai_chat_parity_step = b.step("test-openai-chat-parity", "Run OpenAI Chat TypeScript-vs-Zig semantic request parity harness");
-    openai_chat_parity_step.dependOn(&openai_chat_parity.step);
-
-    const openai_responses_parity_exe_mod = b.createModule(.{
-        .root_source_file = b.path("test/openai_responses_parity.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    openai_responses_parity_exe_mod.addImport("ai", ai_mod);
-    const openai_responses_parity_exe = b.addExecutable(.{
-        .name = "openai-responses-parity",
-        .root_module = openai_responses_parity_exe_mod,
-    });
-    const run_openai_responses_parity = b.addRunArtifact(openai_responses_parity_exe);
-    const run_openai_responses_parity_step = b.step("run-openai-responses-parity", "Run Zig OpenAI Responses fixture parity comparator");
-    run_openai_responses_parity_step.dependOn(external_tool_check_step);
-    run_openai_responses_parity_step.dependOn(&run_openai_responses_parity.step);
-
-    const openai_responses_parity = b.addSystemCommand(&.{"bash"});
-    openai_responses_parity.addFileArg(b.path("test/openai-responses-parity.sh"));
-    openai_responses_parity.step.dependOn(external_tool_check_step);
-    const openai_responses_parity_step = b.step("test-openai-responses-parity", "Run OpenAI Responses TypeScript-vs-Zig semantic request parity harness");
-    openai_responses_parity_step.dependOn(&openai_responses_parity.step);
-
-    const bedrock_parity_exe_mod = b.createModule(.{
-        .root_source_file = b.path("test/bedrock_parity.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    bedrock_parity_exe_mod.addImport("ai", ai_mod);
-    const bedrock_parity_exe = b.addExecutable(.{
-        .name = "bedrock-parity",
-        .root_module = bedrock_parity_exe_mod,
-    });
-    const run_bedrock_parity = b.addRunArtifact(bedrock_parity_exe);
-    const run_bedrock_parity_step = b.step("run-bedrock-parity", "Run Zig Bedrock fixture parity comparator");
-    run_bedrock_parity_step.dependOn(external_tool_check_step);
-    run_bedrock_parity_step.dependOn(&run_bedrock_parity.step);
-
-    const bedrock_parity = b.addSystemCommand(&.{"bash"});
-    bedrock_parity.addFileArg(b.path("test/bedrock-parity.sh"));
-    bedrock_parity.step.dependOn(external_tool_check_step);
-    const bedrock_parity_step = b.step("test-bedrock-parity", "Run Bedrock TypeScript-vs-Zig semantic request and stream parity harness");
-    bedrock_parity_step.dependOn(&bedrock_parity.step);
+    const provider_parity_suites = [_]ProviderParitySuiteOptions{
+        .{
+            .executable_name = "openai-chat-parity",
+            .executable_root_source_path = "test/openai_chat_parity.zig",
+            .run_step_name = "run-openai-chat-parity",
+            .run_step_description = "Run Zig OpenAI Chat fixture parity comparator",
+            .script_path = "test/openai-chat-parity.sh",
+            .test_step_name = "test-openai-chat-parity",
+            .test_step_description = "Run OpenAI Chat TypeScript-vs-Zig semantic request parity harness",
+        },
+        .{
+            .executable_name = "openai-responses-parity",
+            .executable_root_source_path = "test/openai_responses_parity.zig",
+            .run_step_name = "run-openai-responses-parity",
+            .run_step_description = "Run Zig OpenAI Responses fixture parity comparator",
+            .script_path = "test/openai-responses-parity.sh",
+            .test_step_name = "test-openai-responses-parity",
+            .test_step_description = "Run OpenAI Responses TypeScript-vs-Zig semantic request parity harness",
+        },
+        .{
+            .executable_name = "bedrock-parity",
+            .executable_root_source_path = "test/bedrock_parity.zig",
+            .run_step_name = "run-bedrock-parity",
+            .run_step_description = "Run Zig Bedrock fixture parity comparator",
+            .script_path = "test/bedrock-parity.sh",
+            .test_step_name = "test-bedrock-parity",
+            .test_step_description = "Run Bedrock TypeScript-vs-Zig semantic request and stream parity harness",
+        },
+    };
+    for (provider_parity_suites) |provider_parity_suite| {
+        addProviderParitySuite(b, target, optimize, ai_mod, external_tool_check_step, provider_parity_suite);
+    }
 
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
@@ -339,4 +335,74 @@ fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
     }
 
     return step;
+}
+
+fn addParityExecutableRunStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ai_mod: *std.Build.Module,
+    external_tool_check_step: *std.Build.Step,
+    options: ParityExecutableRunOptions,
+) void {
+    const parity_exe_mod = b.createModule(.{
+        .root_source_file = b.path(options.root_source_path),
+        .target = target,
+        .optimize = optimize,
+    });
+    parity_exe_mod.addImport("ai", ai_mod);
+
+    const parity_exe = b.addExecutable(.{
+        .name = options.name,
+        .root_module = parity_exe_mod,
+    });
+    const run_parity_exe = b.addRunArtifact(parity_exe);
+    const run_parity_step = b.step(options.step_name, options.step_description);
+    run_parity_step.dependOn(external_tool_check_step);
+    run_parity_step.dependOn(&run_parity_exe.step);
+}
+
+fn addParityScriptStep(
+    b: *std.Build,
+    external_tool_check_step: *std.Build.Step,
+    options: ParityScriptStepOptions,
+) *std.Build.Step.Run {
+    const parity_script = b.addSystemCommand(&.{"bash"});
+    parity_script.addFileArg(b.path(options.script_path));
+    if (options.command_depends_on_external_tools) {
+        parity_script.step.dependOn(external_tool_check_step);
+    }
+    if (options.command_depends_on_install) {
+        parity_script.step.dependOn(b.getInstallStep());
+    }
+
+    const parity_step = b.step(options.step_name, options.step_description);
+    if (options.step_depends_on_external_tools) {
+        parity_step.dependOn(external_tool_check_step);
+    }
+    parity_step.dependOn(&parity_script.step);
+
+    return parity_script;
+}
+
+fn addProviderParitySuite(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ai_mod: *std.Build.Module,
+    external_tool_check_step: *std.Build.Step,
+    options: ProviderParitySuiteOptions,
+) void {
+    addParityExecutableRunStep(b, target, optimize, ai_mod, external_tool_check_step, .{
+        .name = options.executable_name,
+        .root_source_path = options.executable_root_source_path,
+        .step_name = options.run_step_name,
+        .step_description = options.run_step_description,
+    });
+    _ = addParityScriptStep(b, external_tool_check_step, .{
+        .script_path = options.script_path,
+        .step_name = options.test_step_name,
+        .step_description = options.test_step_description,
+        .command_depends_on_external_tools = true,
+    });
 }

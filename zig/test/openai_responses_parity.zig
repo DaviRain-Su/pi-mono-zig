@@ -365,22 +365,9 @@ fn stopReasonFromFixture(value: ?[]const u8) types.StopReason {
 }
 
 fn clampSimpleReasoning(allocator: std.mem.Allocator, model_id: []const u8, effort: []const u8) ![]const u8 {
+    _ = model_id;
     if (!std.mem.eql(u8, effort, "xhigh")) return effort;
-    if (supportsXhigh(model_id)) return effort;
     return try allocator.dupe(u8, "high");
-}
-
-fn supportsXhigh(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "gpt-5.2") != null or
-        std.mem.indexOf(u8, model_id, "gpt-5.3") != null or
-        std.mem.indexOf(u8, model_id, "gpt-5.4") != null or
-        std.mem.indexOf(u8, model_id, "gpt-5.5") != null or
-        std.mem.indexOf(u8, model_id, "deepseek-v4-pro") != null or
-        std.mem.indexOf(u8, model_id, "deepseek-v4-flash") != null or
-        std.mem.indexOf(u8, model_id, "opus-4-6") != null or
-        std.mem.indexOf(u8, model_id, "opus-4.6") != null or
-        std.mem.indexOf(u8, model_id, "opus-4-7") != null or
-        std.mem.indexOf(u8, model_id, "opus-4.7") != null;
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {

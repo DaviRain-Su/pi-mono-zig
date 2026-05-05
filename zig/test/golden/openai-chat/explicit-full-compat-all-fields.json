@@ -34,13 +34,6 @@
         "sort": "latency",
         "zdr": true
       },
-      "reasoningEffortMap": {
-        "high": "large",
-        "low": "small",
-        "medium": "normal",
-        "minimal": "tiny",
-        "xhigh": "huge"
-      },
       "requiresAssistantAfterToolResult": true,
       "requiresReasoningContentOnAssistantMessages": true,
       "requiresThinkingAsText": true,

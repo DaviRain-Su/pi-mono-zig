@@ -28,7 +28,7 @@
         "model": "gpt-5.3-codex",
         "parallel_tool_calls": true,
         "reasoning": {
-          "effort": "low",
+          "effort": "minimal",
           "summary": "auto"
         },
         "store": false,

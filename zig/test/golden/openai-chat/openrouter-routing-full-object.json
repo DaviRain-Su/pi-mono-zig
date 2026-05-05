@@ -44,7 +44,6 @@
         },
         "zdr": true
       },
-      "reasoningEffortMap": {},
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": false,
       "requiresThinkingAsText": false,

@@ -1269,17 +1269,17 @@ fn buildRequestPayloadWithCacheRetentionEnv(
             try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, if (effort != null) "enabled" else "disabled") });
             try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
             if (effort) |value| {
-                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, mapReasoningEffort(compat, value)) });
+                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, value) });
             }
         } else if (std.mem.eql(u8, compat.thinking_format, "openrouter")) {
             var reasoning = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
             errdefer reasoning.deinit(allocator);
-            const value = if (effort) |requested| mapReasoningEffort(compat, requested) else "none";
+            const value = effort orelse "none";
             try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, value) });
             try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
         } else if (effort) |value| {
             if (compat.supports_reasoning_effort) {
-                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, mapReasoningEffort(compat, value)) });
+                try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, value) });
             }
         }
     }
@@ -1460,18 +1460,10 @@ fn hasToolHistory(messages: []const types.Message) bool {
     return false;
 }
 
-const ReasoningEffortMap = union(enum) {
-    empty,
-    deepseek,
-    groq_qwen3,
-    explicit: std.json.Value,
-};
-
 const OpenAICompat = struct {
     supports_store: bool = true,
     supports_developer_role: bool = true,
     supports_reasoning_effort: bool = true,
-    reasoning_effort_map: ReasoningEffortMap = .empty,
     supports_usage_in_streaming: bool = true,
     max_tokens_field: []const u8 = "max_completion_tokens",
     requires_tool_result_name: bool = false,
@@ -1492,17 +1484,10 @@ fn getCompat(model: types.Model) OpenAICompat {
     const is_non_standard = isNonStandardProvider(model);
     const is_chutes = std.mem.indexOf(u8, model.base_url, "chutes.ai") != null;
     const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null;
-    const is_groq = std.mem.eql(u8, model.provider, "groq") or std.mem.indexOf(u8, model.base_url, "groq.com") != null;
     const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
     const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
     const is_cloudflare_workers_ai = std.mem.eql(u8, model.provider, "cloudflare-workers-ai") or std.mem.indexOf(u8, model.base_url, "api.cloudflare.com") != null;
     const is_cloudflare_ai_gateway = std.mem.eql(u8, model.provider, "cloudflare-ai-gateway") or std.mem.indexOf(u8, model.base_url, "gateway.ai.cloudflare.com") != null;
-    const detected_reasoning_effort_map: ReasoningEffortMap = if (is_deepseek)
-        .deepseek
-    else if (is_groq and std.mem.eql(u8, model.id, "qwen/qwen3-32b"))
-        .groq_qwen3
-    else
-        .empty;
     const detected_thinking_format = if (is_deepseek)
         "deepseek"
     else if (is_zai)
@@ -1520,7 +1505,6 @@ fn getCompat(model: types.Model) OpenAICompat {
         .supports_store = compatBoolField(model.compat, "supportsStore") orelse !is_non_standard,
         .supports_developer_role = compatBoolField(model.compat, "supportsDeveloperRole") orelse !is_non_standard,
         .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai and !is_cloudflare_ai_gateway),
-        .reasoning_effort_map = compatObjectField(model.compat, "reasoningEffortMap") orelse detected_reasoning_effort_map,
         .supports_usage_in_streaming = compatBoolField(model.compat, "supportsUsageInStreaming") orelse true,
         .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes or is_cloudflare_ai_gateway) "max_tokens" else "max_completion_tokens",
         .requires_tool_result_name = compatBoolField(model.compat, "requiresToolResultName") orelse false,
@@ -1552,14 +1536,6 @@ fn compatStringField(compat: ?std.json.Value, key: []const u8) ?[]const u8 {
     const field = value.object.get(key) orelse return null;
     if (field != .string) return null;
     return field.string;
-}
-
-fn compatObjectField(compat: ?std.json.Value, key: []const u8) ?ReasoningEffortMap {
-    const value = compat orelse return null;
-    if (value != .object) return null;
-    const field = value.object.get(key) orelse return null;
-    if (field != .object) return null;
-    return .{ .explicit = field };
 }
 
 fn compatObjectValueField(compat: ?std.json.Value, key: []const u8) ?std.json.Value {
@@ -1731,7 +1707,6 @@ pub fn buildResolvedCompatSnapshotValue(allocator: std.mem.Allocator, model: typ
     try putBoolValue(allocator, &object, "requiresThinkingAsText", compat.requires_thinking_as_text);
     try putBoolValue(allocator, &object, "requiresToolResultName", compat.requires_tool_result_name);
     try putObjectValue(allocator, &object, "openRouterRouting", if (compat.open_router_routing) |routing| try cloneJsonValue(allocator, routing) else try emptyObjectValue(allocator));
-    try putObjectValue(allocator, &object, "reasoningEffortMap", try buildReasoningEffortMapValue(allocator, compat.reasoning_effort_map));
     try putBoolValue(allocator, &object, "sendSessionAffinityHeaders", compat.send_session_affinity_headers);
     try putBoolValue(allocator, &object, "supportsDeveloperRole", compat.supports_developer_role);
     try putBoolValue(allocator, &object, "supportsLongCacheRetention", compat.supports_long_cache_retention);
@@ -1764,52 +1739,6 @@ fn putObjectValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key
 
 fn emptyObjectValue(allocator: std.mem.Allocator) !std.json.Value {
     return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
-}
-
-fn buildReasoningEffortMapValue(allocator: std.mem.Allocator, map: ReasoningEffortMap) !std.json.Value {
-    switch (map) {
-        .empty => return try emptyObjectValue(allocator),
-        .explicit => |value| return try cloneJsonValue(allocator, value),
-        .deepseek => {
-            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer object.deinit(allocator);
-            try putStringValue(allocator, &object, "high", "high");
-            try putStringValue(allocator, &object, "low", "high");
-            try putStringValue(allocator, &object, "medium", "high");
-            try putStringValue(allocator, &object, "minimal", "high");
-            try putStringValue(allocator, &object, "xhigh", "max");
-            return .{ .object = object };
-        },
-        .groq_qwen3 => {
-            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer object.deinit(allocator);
-            try putStringValue(allocator, &object, "high", "default");
-            try putStringValue(allocator, &object, "low", "default");
-            try putStringValue(allocator, &object, "medium", "default");
-            try putStringValue(allocator, &object, "minimal", "default");
-            try putStringValue(allocator, &object, "xhigh", "default");
-            return .{ .object = object };
-        },
-    }
-}
-
-fn mapReasoningEffort(compat: OpenAICompat, effort: []const u8) []const u8 {
-    switch (compat.reasoning_effort_map) {
-        .empty => return effort,
-        .deepseek => {
-            if (std.mem.eql(u8, effort, "xhigh")) return "max";
-            return "high";
-        },
-        .groq_qwen3 => return "default",
-        .explicit => |value| {
-            if (value == .object) {
-                if (value.object.get(effort)) |mapped| {
-                    if (mapped == .string) return mapped.string;
-                }
-            }
-            return effort;
-        },
-    }
 }
 
 pub fn buildRequestSnapshotValue(

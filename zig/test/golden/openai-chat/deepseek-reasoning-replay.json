@@ -3,13 +3,6 @@
     "resolvedCompat": {
       "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {
-        "high": "high",
-        "low": "high",
-        "medium": "high",
-        "minimal": "high",
-        "xhigh": "max"
-      },
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": true,
       "requiresThinkingAsText": false,
@@ -48,7 +41,7 @@
           }
         ],
         "model": "deepseek-reasoner",
-        "reasoning_effort": "max",
+        "reasoning_effort": "xhigh",
         "stream": true,
         "stream_options": {
           "include_usage": true

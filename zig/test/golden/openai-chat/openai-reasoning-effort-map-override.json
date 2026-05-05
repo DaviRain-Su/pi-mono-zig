@@ -3,9 +3,6 @@
     "resolvedCompat": {
       "maxTokensField": "max_completion_tokens",
       "openRouterRouting": {},
-      "reasoningEffortMap": {
-        "low": "fixture-low"
-      },
       "requiresAssistantAfterToolResult": false,
       "requiresReasoningContentOnAssistantMessages": false,
       "requiresThinkingAsText": false,
@@ -39,7 +36,7 @@
           }
         ],
         "model": "openai-effort-map-fixture",
-        "reasoning_effort": "fixture-low",
+        "reasoning_effort": "low",
         "store": false,
         "stream": true,
         "stream_options": {
