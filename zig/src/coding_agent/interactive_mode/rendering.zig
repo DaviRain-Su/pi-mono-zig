@@ -8,6 +8,8 @@ const resources_mod = @import("../resources.zig");
 const session_mod = @import("../session.zig");
 const session_advanced = @import("../session_advanced.zig");
 const common = @import("../tools/common.zig");
+const bash_execution = @import("bash_execution.zig");
+const user_bash_task_mod = @import("user_bash_task.zig");
 const shared = @import("shared.zig");
 const formatting = @import("formatting.zig");
 const overlays = @import("overlays.zig");
@@ -32,11 +34,13 @@ pub const ChatKind = enum {
     thinking,
     tool_call,
     tool_result,
+    bash_execution,
 };
 
 pub const ChatItem = struct {
     kind: ChatKind,
     text: []u8,
+    expanded_text: ?[]u8 = null,
     start_ms: ?i64 = null,
     frozen_frame_index: ?usize = null,
 };
@@ -100,9 +104,10 @@ pub const RenderStateSnapshot = struct {
     pending_editor_images: []PendingEditorImage = &.{},
     chat_scroll_offset: usize = 0,
     all_expanded: bool = false,
+    hide_thinking_blocks: bool = false,
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
-        for (self.items) |item| allocator.free(item.text);
+        for (self.items) |*item| deinitChatItem(allocator, item);
         if (self.items.len > 0) allocator.free(self.items);
         if (self.status) |status| allocator.free(status);
         if (self.provider_label) |provider_label| allocator.free(provider_label);
@@ -266,10 +271,15 @@ pub const AppState = struct {
     active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
     streaming_tool_calls: std.ArrayList(StreamingToolCall) = .empty,
     tool_output_expanded: bool = false,
+    hide_thinking_blocks: bool = false,
     clipboard_paste: ClipboardPasteTask,
+    user_bash_task: user_bash_task_mod.UserBashTask = .{},
+    scoped_model_override_active: bool = false,
+    scoped_model_patterns: ?[][]u8 = null,
     clock_context: ?*anyopaque = null,
     clock_now_ms_fn: ClockNowMsFn = systemNowMilliseconds,
     last_clear_action_ms: ?i64 = null,
+    last_escape_action_ms: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
@@ -289,6 +299,8 @@ pub const AppState = struct {
     }
 
     pub fn deinit(self: *AppState) void {
+        self.user_bash_task.deinit(self.allocator);
+        self.clearScopedModelOverrideLocked();
         self.clearPendingEditorImagesLocked();
         self.pending_editor_images.deinit(self.allocator);
         self.retired_kitty_images.deinit(self.allocator);
@@ -300,7 +312,7 @@ pub const AppState = struct {
         self.clearQueuedMessagesLocked();
         self.queued_steering.deinit(self.allocator);
         self.queued_follow_up.deinit(self.allocator);
-        for (self.items.items) |item| self.allocator.free(item.text);
+        for (self.items.items) |*item| deinitChatItem(self.allocator, item);
         self.items.deinit(self.allocator);
         self.allocator.free(self.status);
         self.allocator.free(self.provider_label);
@@ -371,6 +383,67 @@ pub const AppState = struct {
         return self.clipboard_paste.isActive();
     }
 
+    pub fn scopedModelPatterns(self: *const AppState) ?[]const []const u8 {
+        if (!self.scoped_model_override_active) return null;
+        return self.scoped_model_patterns;
+    }
+
+    pub fn hasScopedModelOverride(self: *const AppState) bool {
+        return self.scoped_model_override_active;
+    }
+
+    pub fn setScopedModelOverride(self: *AppState, patterns: ?[]const []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.clearScopedModelOverrideLocked();
+        self.scoped_model_override_active = true;
+        if (patterns) |source| {
+            if (source.len > 0) {
+                var cloned = try self.allocator.alloc([]u8, source.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (cloned[0..initialized]) |item| self.allocator.free(item);
+                    self.allocator.free(cloned);
+                }
+                for (source, 0..) |item, index| {
+                    cloned[index] = try self.allocator.dupe(u8, item);
+                    initialized += 1;
+                }
+                self.scoped_model_patterns = cloned;
+            }
+        }
+    }
+
+    fn clearScopedModelOverrideLocked(self: *AppState) void {
+        if (self.scoped_model_patterns) |patterns| {
+            deinitOwnedStringList(self.allocator, patterns);
+            self.scoped_model_patterns = null;
+        }
+        self.scoped_model_override_active = false;
+    }
+
+    pub fn startBashExecution(
+        self: *AppState,
+        allocator: std.mem.Allocator,
+        session: *session_mod.AgentSession,
+        command: []const u8,
+        exclude_from_context: bool,
+    ) !bool {
+        return try self.user_bash_task.start(allocator, session, bashTaskHooks(self), command, exclude_from_context);
+    }
+
+    pub fn isBashExecutionActive(self: *const AppState) bool {
+        return self.user_bash_task.isActive();
+    }
+
+    pub fn cancelBashExecution(self: *AppState) bool {
+        return self.user_bash_task.abort();
+    }
+
+    pub fn pollBashExecution(self: *AppState, allocator: std.mem.Allocator) bool {
+        return self.user_bash_task.poll(allocator);
+    }
+
     pub fn setClockForTesting(self: *AppState, context: ?*anyopaque, now_ms_fn: ClockNowMsFn) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -433,6 +506,7 @@ pub const AppState = struct {
             .context_percent = self.context_percent,
             .chat_scroll_offset = self.chat_scroll_offset,
             .all_expanded = self.all_expanded,
+            .hide_thinking_blocks = self.hide_thinking_blocks,
         };
         errdefer snapshot.deinit(allocator);
 
@@ -545,6 +619,15 @@ pub const AppState = struct {
         self.all_expanded = expanded;
     }
 
+    pub fn toggleThinkingBlockVisibility(self: *AppState) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.hide_thinking_blocks = !self.hide_thinking_blocks;
+        try self.applyThinkingBlockVisibilityLocked();
+        return self.hide_thinking_blocks;
+    }
+
     pub fn currentNowMs(self: *AppState) i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -563,6 +646,20 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.last_clear_action_ms = timestamp_ms;
+    }
+
+    pub fn takeLastEscapeActionMs(self: *AppState) ?i64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const value = self.last_escape_action_ms;
+        self.last_escape_action_ms = null;
+        return value;
+    }
+
+    pub fn setLastEscapeActionMs(self: *AppState, timestamp_ms: i64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.last_escape_action_ms = timestamp_ms;
     }
 
     pub fn setFooter(self: *AppState, model_label: []const u8, session_label: []const u8) !void {
@@ -609,6 +706,93 @@ pub const AppState = struct {
         try self.appendItemLocked(.markdown, text);
     }
 
+    fn appendBashExecutionStart(
+        self: *AppState,
+        command: []const u8,
+        exclude_from_context: bool,
+    ) !usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const text = try bash_execution.formatBashExecutionDisplay(
+            self.allocator,
+            command,
+            "Running...",
+            null,
+            false,
+            false,
+            null,
+            exclude_from_context,
+            true,
+        );
+        defer self.allocator.free(text);
+
+        try self.appendItemLocked(.bash_execution, text);
+        try self.replaceLabelLocked(&self.status, "running bash");
+        return self.items.items.len - 1;
+    }
+
+    fn updateBashExecution(
+        self: *AppState,
+        item_index: ?usize,
+        command: []const u8,
+        output: []const u8,
+        exclude_from_context: bool,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const index = item_index orelse return;
+        const text = try bash_execution.formatBashExecutionDisplay(
+            self.allocator,
+            command,
+            output,
+            null,
+            false,
+            false,
+            null,
+            exclude_from_context,
+            true,
+        );
+        defer self.allocator.free(text);
+        try self.replaceItemTextLocked(index, text);
+        try self.replaceLabelLocked(&self.status, "running bash");
+    }
+
+    fn finishBashExecution(
+        self: *AppState,
+        item_index: ?usize,
+        command: []const u8,
+        output: []const u8,
+        exit_code: ?u8,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: ?[]const u8,
+        exclude_from_context: bool,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const text = try bash_execution.formatBashExecutionDisplay(
+            self.allocator,
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            exclude_from_context,
+            false,
+        );
+        defer self.allocator.free(text);
+        if (item_index) |index| {
+            try self.replaceItemTextLocked(index, text);
+        } else {
+            try self.appendItemLocked(.bash_execution, text);
+        }
+        try self.replaceLabelLocked(&self.status, "idle");
+    }
+
     pub fn appendError(self: *AppState, text: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -628,7 +812,7 @@ pub const AppState = struct {
         const messages = session.agent.getMessages();
         const stats = session_advanced.getSessionStats(session);
 
-        for (self.items.items) |item| self.allocator.free(item.text);
+        for (self.items.items) |*item| deinitChatItem(self.allocator, item);
         self.items.clearRetainingCapacity();
         self.visible_start_index = 0;
         self.chat_scroll_offset = 0;
@@ -684,16 +868,12 @@ pub const AppState = struct {
                     }
                 },
                 .tool_result => |tool_result| {
-                    const rendered = try formatting.formatToolResultWithExpansion(
-                        self.allocator,
+                    try self.appendToolResultItemLocked(
                         tool_result.tool_name,
                         tool_result.content,
                         tool_result.is_error,
                         tool_result.details,
-                        self.tool_output_expanded,
                     );
-                    defer self.allocator.free(rendered);
-                    try self.appendItemLocked(.tool_result, rendered);
                 },
             }
         }
@@ -863,19 +1043,21 @@ pub const AppState = struct {
                 defer self.allocator.free(status_text);
                 if (event.tool_call_id) |tool_call_id| {
                     if (event.partial_result) |partial_result| {
-                        const rendered = try formatting.formatToolResultWithExpansion(
-                            self.allocator,
-                            tool_name,
-                            partial_result.content,
-                            false,
-                            partial_result.details,
-                            self.tool_output_expanded,
-                        );
-                        defer self.allocator.free(rendered);
                         if (self.activeToolUpdateIndexLocked(tool_call_id)) |index| {
-                            try self.replaceItemTextLocked(index, rendered);
+                            try self.replaceToolResultItemLocked(
+                                index,
+                                tool_name,
+                                partial_result.content,
+                                false,
+                                partial_result.details,
+                            );
                         } else {
-                            try self.appendItemLocked(.tool_result, rendered);
+                            try self.appendToolResultItemLocked(
+                                tool_name,
+                                partial_result.content,
+                                false,
+                                partial_result.details,
+                            );
                             try self.setActiveToolUpdateLocked(tool_call_id, self.items.items.len - 1);
                         }
                     }
@@ -885,23 +1067,30 @@ pub const AppState = struct {
             .tool_execution_end => {
                 const tool_name = event.tool_name orelse "tool";
                 const result = event.result orelse return;
-                const rendered = try formatting.formatToolResultWithExpansion(
-                    self.allocator,
-                    tool_name,
-                    result.content,
-                    event.is_error orelse false,
-                    result.details,
-                    self.tool_output_expanded,
-                );
-                defer self.allocator.free(rendered);
                 if (event.tool_call_id) |tool_call_id| {
                     if (self.takeActiveToolUpdateIndexLocked(tool_call_id)) |index| {
-                        try self.replaceItemTextLocked(index, rendered);
+                        try self.replaceToolResultItemLocked(
+                            index,
+                            tool_name,
+                            result.content,
+                            event.is_error orelse false,
+                            result.details,
+                        );
                     } else {
-                        try self.appendItemLocked(.tool_result, rendered);
+                        try self.appendToolResultItemLocked(
+                            tool_name,
+                            result.content,
+                            event.is_error orelse false,
+                            result.details,
+                        );
                     }
                 } else {
-                    try self.appendItemLocked(.tool_result, rendered);
+                    try self.appendToolResultItemLocked(
+                        tool_name,
+                        result.content,
+                        event.is_error orelse false,
+                        result.details,
+                    );
                 }
                 try self.replaceLabelLocked(&self.status, "thinking");
             },
@@ -1031,7 +1220,7 @@ pub const AppState = struct {
 
     pub fn appendItemLocked(self: *AppState, kind: ChatKind, text: []const u8) !void {
         const frozen_frame_index: ?usize = if (kind == .thinking) 0 else null;
-        try self.appendItemWithTimingLocked(kind, text, null, frozen_frame_index);
+        try self.appendItemWithExpandedTextLocked(kind, text, null, null, frozen_frame_index);
     }
 
     fn appendStreamingThinkingItemLocked(self: *AppState, text: []const u8) !void {
@@ -1045,14 +1234,64 @@ pub const AppState = struct {
         start_ms: ?i64,
         frozen_frame_index: ?usize,
     ) !void {
+        try self.appendItemWithExpandedTextLocked(kind, text, null, start_ms, frozen_frame_index);
+    }
+
+    fn appendItemWithExpandedTextLocked(
+        self: *AppState,
+        kind: ChatKind,
+        text: []const u8,
+        expanded_text: ?[]const u8,
+        start_ms: ?i64,
+        frozen_frame_index: ?usize,
+    ) !void {
         const was_at_tail = self.chat_scroll_offset == 0;
+        const display_text = if (kind == .thinking and self.hide_thinking_blocks) ASSISTANT_THINKING_TEXT else text;
+        const stored_expanded_text = if (kind == .thinking and self.hide_thinking_blocks) text else expanded_text;
+        const owned_text = try self.allocator.dupe(u8, display_text);
+        errdefer self.allocator.free(owned_text);
+        const owned_expanded_text = if (stored_expanded_text) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_expanded_text) |value| self.allocator.free(value);
         try self.items.append(self.allocator, .{
             .kind = kind,
-            .text = try self.allocator.dupe(u8, text),
+            .text = owned_text,
+            .expanded_text = owned_expanded_text,
             .start_ms = start_ms,
             .frozen_frame_index = frozen_frame_index,
         });
         if (was_at_tail) self.chat_scroll_offset = 0;
+    }
+
+    fn appendToolResultItemLocked(
+        self: *AppState,
+        tool_name: []const u8,
+        blocks: []const ai.ContentBlock,
+        is_error: bool,
+        details: ?std.json.Value,
+    ) !void {
+        const collapsed = try formatting.formatToolResultWithExpansion(
+            self.allocator,
+            tool_name,
+            blocks,
+            is_error,
+            details,
+            false,
+        );
+        defer self.allocator.free(collapsed);
+        const expanded = try formatting.formatToolResultWithExpansion(
+            self.allocator,
+            tool_name,
+            blocks,
+            is_error,
+            details,
+            true,
+        );
+        defer self.allocator.free(expanded);
+        const expanded_text: ?[]const u8 = if (std.mem.eql(u8, collapsed, expanded)) null else expanded;
+        try self.appendItemWithExpandedTextLocked(.tool_result, collapsed, expanded_text, null, null);
     }
 
     fn currentNowMsLocked(self: *const AppState) i64 {
@@ -1061,23 +1300,76 @@ pub const AppState = struct {
 
     pub fn appendToItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
         if (index >= self.items.items.len or text.len == 0) return;
-        const old = self.items.items[index].text;
+        const item = &self.items.items[index];
+        if (item.kind == .thinking) {
+            if (item.expanded_text) |old_hidden_text| {
+                const combined = try self.allocator.alloc(u8, old_hidden_text.len + text.len);
+                @memcpy(combined[0..old_hidden_text.len], old_hidden_text);
+                @memcpy(combined[old_hidden_text.len..], text);
+                self.allocator.free(old_hidden_text);
+                item.expanded_text = combined;
+                return;
+            }
+        }
+        const old = item.text;
         const combined = try self.allocator.alloc(u8, old.len + text.len);
         @memcpy(combined[0..old.len], old);
         @memcpy(combined[old.len..], text);
         self.allocator.free(old);
-        self.items.items[index].text = combined;
+        item.text = combined;
     }
 
     pub fn replaceItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
         if (index >= self.items.items.len) return;
+        try self.replaceItemExpandedTextLocked(index, text, null);
+    }
+
+    fn replaceToolResultItemLocked(
+        self: *AppState,
+        index: usize,
+        tool_name: []const u8,
+        blocks: []const ai.ContentBlock,
+        is_error: bool,
+        details: ?std.json.Value,
+    ) !void {
+        const collapsed = try formatting.formatToolResultWithExpansion(
+            self.allocator,
+            tool_name,
+            blocks,
+            is_error,
+            details,
+            false,
+        );
+        defer self.allocator.free(collapsed);
+        const expanded = try formatting.formatToolResultWithExpansion(
+            self.allocator,
+            tool_name,
+            blocks,
+            is_error,
+            details,
+            true,
+        );
+        defer self.allocator.free(expanded);
+        const expanded_text: ?[]const u8 = if (std.mem.eql(u8, collapsed, expanded)) null else expanded;
+        try self.replaceItemExpandedTextLocked(index, collapsed, expanded_text);
+    }
+
+    fn replaceItemExpandedTextLocked(self: *AppState, index: usize, text: []const u8, expanded_text: ?[]const u8) !void {
+        if (index >= self.items.items.len) return;
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        const owned_expanded_text = if (expanded_text) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_expanded_text) |value| self.allocator.free(value);
+
         self.allocator.free(self.items.items[index].text);
-        self.items.items[index].text = try self.allocator.dupe(u8, text);
+        if (self.items.items[index].expanded_text) |value| self.allocator.free(value);
+        self.items.items[index].text = owned_text;
+        self.items.items[index].expanded_text = owned_expanded_text;
     }
 
     pub fn removeItemLocked(self: *AppState, index: usize) void {
         if (index >= self.items.items.len) return;
-        self.allocator.free(self.items.items[index].text);
+        deinitChatItem(self.allocator, &self.items.items[index]);
         _ = self.items.orderedRemove(index);
         for (self.active_tool_updates.items) |*entry| {
             if (entry.item_index > index) entry.item_index -= 1;
@@ -1103,6 +1395,22 @@ pub const AppState = struct {
     pub fn replaceLabelLocked(self: *AppState, field: *[]u8, text: []const u8) !void {
         self.allocator.free(field.*);
         field.* = try self.allocator.dupe(u8, text);
+    }
+
+    fn applyThinkingBlockVisibilityLocked(self: *AppState) !void {
+        for (self.items.items) |*item| {
+            if (item.kind != .thinking) continue;
+            if (self.hide_thinking_blocks) {
+                if (item.expanded_text != null) continue;
+                const original = item.text;
+                item.text = try self.allocator.dupe(u8, ASSISTANT_THINKING_TEXT);
+                item.expanded_text = original;
+            } else if (item.expanded_text) |original| {
+                self.allocator.free(item.text);
+                item.text = original;
+                item.expanded_text = null;
+            }
+        }
     }
 
     pub fn addUsageLocked(self: *AppState, usage: ai.Usage) void {
@@ -1297,6 +1605,69 @@ pub const AppState = struct {
         _ = removeQueuedTextFromList(self.allocator, &self.queued_follow_up, text);
     }
 };
+
+fn bashTaskHooks(state: *AppState) user_bash_task_mod.Hooks {
+    return .{
+        .allocator = state.allocator,
+        .io = state.io,
+        .context = state,
+        .append_start = bashAppendStartHook,
+        .update = bashUpdateHook,
+        .finish = bashFinishHook,
+        .set_status = bashSetStatusHook,
+        .append_error = bashAppendErrorHook,
+    };
+}
+
+fn bashAppendStartHook(context: *anyopaque, command: []const u8, exclude_from_context: bool) anyerror!usize {
+    const state: *AppState = @ptrCast(@alignCast(context));
+    return state.appendBashExecutionStart(command, exclude_from_context);
+}
+
+fn bashUpdateHook(
+    context: *anyopaque,
+    item_index: ?usize,
+    command: []const u8,
+    output: []const u8,
+    exclude_from_context: bool,
+) anyerror!void {
+    const state: *AppState = @ptrCast(@alignCast(context));
+    try state.updateBashExecution(item_index, command, output, exclude_from_context);
+}
+
+fn bashFinishHook(
+    context: *anyopaque,
+    item_index: ?usize,
+    command: []const u8,
+    output: []const u8,
+    exit_code: ?u8,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: ?[]const u8,
+    exclude_from_context: bool,
+) anyerror!void {
+    const state: *AppState = @ptrCast(@alignCast(context));
+    try state.finishBashExecution(
+        item_index,
+        command,
+        output,
+        exit_code,
+        cancelled,
+        truncated,
+        full_output_path,
+        exclude_from_context,
+    );
+}
+
+fn bashSetStatusHook(context: *anyopaque, text: []const u8) anyerror!void {
+    const state: *AppState = @ptrCast(@alignCast(context));
+    try state.setStatus(text);
+}
+
+fn bashAppendErrorHook(context: *anyopaque, text: []const u8) anyerror!void {
+    const state: *AppState = @ptrCast(@alignCast(context));
+    try state.appendError(text);
+}
 
 fn adjustOptionalIndexAfterRemove(index: *?usize, removed_index: usize) void {
     const current = index.* orelse return;
@@ -2104,7 +2475,7 @@ fn drawChatItem(
     });
     if (!all_expanded) {
         if (previewThreshold(item.kind)) |threshold| {
-            const full_height_hint = @max(@as(usize, 1), estimateChatItemRowsFull(item, @max(@as(usize, window.width), 1)));
+            const full_height_hint = @max(@as(usize, 1), estimateChatItemRowsFull(item, @max(@as(usize, window.width), 1), true));
             var scratch = try tui.vaxis.Screen.init(allocator, .{
                 .rows = @intCast(@min(full_height_hint, @as(usize, std.math.maxInt(u16)))),
                 .cols = window.width,
@@ -2116,7 +2487,7 @@ fn drawChatItem(
             const scratch_window = tui.draw.rootWindow(&scratch);
             scratch_window.clear();
             const rendered_height = @min(
-                try drawChatItemFull(scratch_window, allocator, theme, item, 0, now_ms),
+                try drawChatItemFull(scratch_window, allocator, theme, item, 0, now_ms, true),
                 @as(usize, scratch.height),
             );
             if (rendered_height > threshold) {
@@ -2130,7 +2501,7 @@ fn drawChatItem(
         }
     }
 
-    return drawChatItemFull(child, allocator, theme, item, 0, now_ms);
+    return drawChatItemFull(child, allocator, theme, item, 0, now_ms, all_expanded);
 }
 
 fn drawChatItemFull(
@@ -2140,6 +2511,7 @@ fn drawChatItemFull(
     item: ChatItem,
     start_row: usize,
     now_ms: i64,
+    all_expanded: bool,
 ) !usize {
     const remaining_height = @as(usize, window.height) -| start_row;
     if (remaining_height == 0) return 0;
@@ -2147,15 +2519,16 @@ fn drawChatItemFull(
         .y_off = @intCast(start_row),
         .height = @intCast(remaining_height),
     });
+    const item_text = chatItemDisplayText(item, all_expanded);
     switch (item.kind) {
         .assistant => {
             var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, styleForToken(theme, .role_assistant));
-            if (std.mem.trim(u8, item.text, " \t\r\n").len == 0) return row;
+            if (std.mem.trim(u8, item_text, " \t\r\n").len == 0) return row;
             const markdown_window = child.child(.{
                 .y_off = @intCast(row),
                 .height = child.height - @as(u16, @intCast(row)),
             });
-            const markdown = tui.Markdown{ .text = item.text, .theme = theme };
+            const markdown = tui.Markdown{ .text = item_text, .theme = theme };
             const size = try markdown.draw(markdown_window, .{
                 .window = markdown_window,
                 .arena = allocator,
@@ -2165,7 +2538,7 @@ fn drawChatItemFull(
             return row;
         },
         .markdown => {
-            const markdown = tui.Markdown{ .text = item.text, .theme = theme };
+            const markdown = tui.Markdown{ .text = item_text, .theme = theme };
             const size = try markdown.draw(child, .{
                 .window = child,
                 .arena = allocator,
@@ -2174,8 +2547,15 @@ fn drawChatItemFull(
             return @as(usize, size.height);
         },
         .thinking => return drawThinkingChatItem(child, theme, item, now_ms),
-        else => return drawWrappedText(child, 0, item.text, styleForToken(theme, chatToken(item.kind))),
+        else => return drawWrappedText(child, 0, item_text, styleForToken(theme, chatToken(item.kind))),
     }
+}
+
+fn chatItemDisplayText(item: ChatItem, all_expanded: bool) []const u8 {
+    if (all_expanded and item.kind == .tool_result) {
+        if (item.expanded_text) |expanded_text| return expanded_text;
+    }
+    return item.text;
 }
 
 fn previewThreshold(kind: ChatKind) ?usize {
@@ -2183,7 +2563,7 @@ fn previewThreshold(kind: ChatKind) ?usize {
         .thinking => 1,
         .tool_result => 3,
         .assistant, .markdown => 5,
-        .welcome, .info, .@"error", .user, .tool_call => null,
+        .welcome, .info, .@"error", .user, .tool_call, .bash_execution => null,
     };
 }
 
@@ -2198,7 +2578,7 @@ fn drawCollapseIndicator(
 ) !void {
     if (row >= window.height) return;
     const label = try actionLabel(allocator, keybindings, .tools_expand, "Ctrl+O");
-    const text = try std.fmt.allocPrint(allocator, "… +{d} lines ({s} 展开)", .{ hidden_rows, label });
+    const text = try std.fmt.allocPrint(allocator, "… +{d} lines ({s} to expand)", .{ hidden_rows, label });
     _ = window.printSegment(.{
         .text = text,
         .style = collapseIndicatorStyle(theme, kind),
@@ -2281,6 +2661,7 @@ fn chatToken(kind: ChatKind) resources_mod.ThemeToken {
         .thinking => .role_thinking,
         .tool_call => .role_tool_call,
         .tool_result => .role_tool_result,
+        .bash_execution => .role_tool_result,
     };
 }
 
@@ -2293,21 +2674,22 @@ fn estimateChatRows(items: []const ChatItem, width: usize, all_expanded: bool) u
 }
 
 fn estimateChatItemRowsVisible(item: ChatItem, width: usize, all_expanded: bool) usize {
-    const full_rows = estimateChatItemRowsFull(item, width);
+    const full_rows = estimateChatItemRowsFull(item, width, true);
     if (!all_expanded) {
         if (previewThreshold(item.kind)) |threshold| {
             if (full_rows > threshold) return threshold + 1;
         }
     }
-    return full_rows;
+    return estimateChatItemRowsFull(item, width, all_expanded);
 }
 
-fn estimateChatItemRowsFull(item: ChatItem, width: usize) usize {
+fn estimateChatItemRowsFull(item: ChatItem, width: usize, all_expanded: bool) usize {
+    const item_text = chatItemDisplayText(item, all_expanded);
     return switch (item.kind) {
-        .assistant => 1 + estimateWrappedRows(item.text, width) + 8,
-        .markdown => estimateWrappedRows(item.text, width) + 8,
-        .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item.text, width - 2)),
-        else => estimateWrappedRows(item.text, width),
+        .assistant => 1 + estimateWrappedRows(item_text, width) + 8,
+        .markdown => estimateWrappedRows(item_text, width) + 8,
+        .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item_text, width - 2)),
+        else => estimateWrappedRows(item_text, width),
     };
 }
 
@@ -2499,6 +2881,7 @@ pub const OverlayPanelComponent = struct {
                     .info => |*info_overlay| &info_overlay.list,
                     .session => |*session_overlay| &session_overlay.list,
                     .model => |*model_overlay| &model_overlay.list,
+                    .scoped_models => |*scoped_models_overlay| &scoped_models_overlay.list,
                     .theme => |*theme_overlay| &theme_overlay.list,
                     .tree => |*tree_overlay| &tree_overlay.list,
                     .fork => |*fork_overlay| &fork_overlay.list,
@@ -2582,6 +2965,7 @@ pub const OverlayPanelComponent = struct {
                         .info => |*info_overlay| &info_overlay.list,
                         .session => |*session_overlay| &session_overlay.list,
                         .model => |*model_overlay| &model_overlay.list,
+                        .scoped_models => |*scoped_models_overlay| &scoped_models_overlay.list,
                         .theme => |*theme_overlay| &theme_overlay.list,
                         .tree => |*tree_overlay| &tree_overlay.list,
                         .fork => |*fork_overlay| &fork_overlay.list,
@@ -3343,6 +3727,7 @@ pub fn themeChatItem(
         .thinking => .role_thinking,
         .tool_call => .role_tool_call,
         .tool_result => .role_tool_result,
+        .bash_execution => .role_tool_result,
     }, item.text);
 }
 
@@ -3515,20 +3900,29 @@ fn cloneChatItems(allocator: std.mem.Allocator, items: []const ChatItem) ![]Chat
     const cloned = try allocator.alloc(ChatItem, items.len);
     var initialized: usize = 0;
     errdefer {
-        for (cloned[0..initialized]) |item| allocator.free(item.text);
+        for (cloned[0..initialized]) |*item| deinitChatItem(allocator, item);
         allocator.free(cloned);
     }
 
     for (items, 0..) |item, index| {
+        const expanded_text = if (item.expanded_text) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (expanded_text) |value| allocator.free(value);
         cloned[index] = .{
             .kind = item.kind,
             .text = try allocator.dupe(u8, item.text),
+            .expanded_text = expanded_text,
             .start_ms = item.start_ms,
             .frozen_frame_index = item.frozen_frame_index,
         };
         initialized += 1;
     }
     return cloned;
+}
+
+fn deinitChatItem(allocator: std.mem.Allocator, item: *ChatItem) void {
+    allocator.free(item.text);
+    if (item.expanded_text) |expanded_text| allocator.free(expanded_text);
+    item.* = undefined;
 }
 
 fn sanitizeSingleLineStatusAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -4539,6 +4933,37 @@ test "roles m0 rebuildFromSession preserves thinking before assistant text" {
     try std.testing.expectEqualStrings("public answer", state.items.items[2].text);
 }
 
+test "thinking visibility toggle hides and restores thinking without dropping chat state" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.appendItemLocked(.thinking, "private chain");
+    try state.appendItemLocked(.assistant, "public answer");
+    try state.appendQueuedMessage(.follow_up, "queued draft");
+
+    const hidden = try state.toggleThinkingBlockVisibility();
+    try std.testing.expect(hidden);
+    try std.testing.expect(state.hide_thinking_blocks);
+    try std.testing.expectEqualStrings(ASSISTANT_THINKING_TEXT, state.items.items[1].text);
+    try std.testing.expectEqualStrings("private chain", state.items.items[1].expanded_text.?);
+    try std.testing.expectEqualStrings("public answer", state.items.items[2].text);
+    try std.testing.expectEqual(@as(usize, 1), state.queued_follow_up.items.len);
+
+    state.last_streaming_thinking_index = 1;
+    try state.appendThinkingDeltaLocked(" continued");
+    try std.testing.expectEqualStrings(ASSISTANT_THINKING_TEXT, state.items.items[1].text);
+    try std.testing.expectEqualStrings("private chain continued", state.items.items[1].expanded_text.?);
+
+    const visible = try state.toggleThinkingBlockVisibility();
+    try std.testing.expect(!visible);
+    try std.testing.expect(!state.hide_thinking_blocks);
+    try std.testing.expectEqualStrings("private chain continued", state.items.items[1].text);
+    try std.testing.expect(state.items.items[1].expanded_text == null);
+    try std.testing.expectEqualStrings("public answer", state.items.items[2].text);
+    try std.testing.expectEqual(@as(usize, 1), state.queued_follow_up.items.len);
+}
+
 test "roles m0 chatToken maps visible roles to role tokens" {
     try std.testing.expectEqual(resources_mod.ThemeToken.role_user, chatToken(.user));
     try std.testing.expectEqual(resources_mod.ThemeToken.role_assistant, chatToken(.assistant));
@@ -4688,7 +5113,56 @@ test "collapse m2 items at or under threshold render without indicator" {
     var lines = tui.LineList.empty;
     defer tui.component.freeLines(allocator, &lines);
     try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, 80, rendered, &lines);
-    try std.testing.expect(!renderedLinesContain(lines.items, "展开"));
+    try std.testing.expect(!renderedLinesContain(lines.items, "to expand"));
+}
+
+test "tool expansion rerenders existing bash details immediately" {
+    const allocator = std.testing.allocator;
+
+    const detail_value = try std.json.parseFromSlice(std.json.Value, allocator, "{\"exit_code\":0,\"timed_out\":false}", .{});
+    defer detail_value.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_name = "bash",
+        .result = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text =
+            \\line one
+            \\line two
+            \\line three
+            \\line four
+            } }},
+            .details = detail_value.value,
+        },
+        .is_error = false,
+    });
+
+    try std.testing.expect(!state.all_expanded);
+    try std.testing.expectEqualStrings("Tool result bash:\nline one\nline two\nline three\nline four", state.items.items[1].text);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].expanded_text.?, "Details:") != null);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 12,
+    };
+
+    var collapsed_lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &collapsed_lines);
+    try screen_component.renderInto(allocator, 80, &collapsed_lines);
+    try std.testing.expect(!renderedLinesContain(collapsed_lines.items, "Details:"));
+    try std.testing.expect(renderedLinesContain(collapsed_lines.items, "to expand"));
+
+    state.toggleAllExpanded();
+    var expanded_lines = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &expanded_lines);
+    try screen_component.renderInto(allocator, 80, &expanded_lines);
+    try std.testing.expect(renderedLinesContain(expanded_lines.items, "Details:"));
+    try std.testing.expect(renderedLinesContain(expanded_lines.items, "\"exit_code\":0"));
 }
 
 test "collapse m2 estimateChatRows uses collapsed or expanded heights" {
