@@ -24,8 +24,10 @@ and issues have been identified through code review:
    signature diverges from all other providers (requires `allocator` parameter
    and returns `!void` instead of `void`).
 2. ❌ **Concurrent memory-order mismatch** — `isAbortRequested` uses `.monotonic`
-   in `stream.zig` but `.seq_cst` in `provider_error.zig`, creating potential
-   race conditions.
+   in `stream.zig` but `.seq_cst` everywhere else (all providers and
+   `provider_error.zig`). This means the pre-flight abort check in `stream.zig`
+   may not see an abort signal set by another thread, causing the stream to
+   continue when it should have been aborted.
 
 ### Major Gaps (P1)
 
@@ -38,12 +40,20 @@ and issues have been identified through code review:
 
 ### Medium Issues (P2)
 
-6. ⚠️ **Non-uniform error handling** — `openai.zig` uses `pushEarlyTerminalError`
-   instead of standard `emitSetupRuntimeFailure`, duplicating logic.
-7. ⚠️ **Missing `ModelThinkingLevel` "off" state** — TS has `"off" | ThinkingLevel`;
+6. ⚠️ **Missing `ModelThinkingLevel` "off" state** — TS has `"off" | ThinkingLevel`;
    Zig only has `ThinkingLevel` enum.
-8. ⚠️ **Incomplete setup-failure regression tests** — Several providers lack
-   canonical stream-contract smoke tests per AGENTS.md spec.
+7. ⚠️ **Incomplete setup-failure regression tests** — `google.zig`,
+   `google_vertex.zig`, `google_gemini_cli.zig`, `mistral.zig`, `kimi.zig`,
+   `openai_responses.zig`, `openai_codex_responses.zig`, and
+   `azure_openai_responses.zig` lack canonical stream-contract smoke tests
+   per AGENTS.md spec. (`openai.zig` and `anthropic.zig` have coverage.)
+
+### Low Issues (P3)
+
+8. ⚠️ **Non-uniform error handling in `openai.zig`** — Uses `pushEarlyTerminalError`
+   instead of standard `emitSetupRuntimeFailure`. The logic is not fully
+   duplicated (it delegates to `provider_error.pushTerminalRuntimeError`), but
+   the separate code path adds maintenance burden.
 
 ### Previously Resolved (still valid)
 
@@ -171,49 +181,46 @@ Callers cannot treat all providers uniformly.
 **Location:** `zig/src/ai/providers/openai.zig` lines 25-30, 201-229
 
 **Problem:** `openai.zig` uses `pushEarlyTerminalError` instead of the standard
-`emitSetupRuntimeFailure`, duplicating nearly identical logic.
+`emitSetupRuntimeFailure`. However, the actual logic is **not fully duplicated** —
+`pushEarlyTerminalError` delegates to `provider_error.pushTerminalRuntimeError`:
 
-**Standard pattern (anthropic, kimi, google, etc.):**
 ```zig
-streamProduction(...) catch |err| switch (err) {
-    error.OutOfMemory => return err,
-    else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
-};
+fn pushEarlyTerminalError(...) void {
+    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
+    const error_message = provider_error.runtimeErrorMessage(effective_err);
+    // ... build message ...
+    provider_error.pushTerminalRuntimeError(stream_ptr, message);  // ← delegates to shared helper
+}
 ```
 
-**openai.zig (duplicated logic):**
-```zig
-streamProduction(...) catch |err| switch (err) {
-    error.OutOfMemory => return err,
-    else => {
-        pushEarlyTerminalError(&event_stream_instance, model, options, err);
-        return event_stream_instance;
-    },
-};
-```
-
-**Impact:** Maintenance burden of two nearly identical error-handling paths.
-Risk of divergence if one is updated and the other is not.
+**Impact:** Low. The separate code path adds minor maintenance burden, but the
+behavior is consistent with other providers because it uses the same underlying
+helpers. Not a correctness issue.
 
 ### Issue 1C: `isAbortRequested` Memory-Order Mismatch
 
 **Location:** 
-- `zig/src/ai/stream.zig` — uses `.monotonic`
-- `zig/src/ai/shared/provider_error.zig` — uses `.seq_cst`
+- `zig/src/ai/stream.zig` — uses `.monotonic` (line 190)
+- `zig/src/ai/shared/provider_error.zig` — uses `.seq_cst` (line 56)
+- All providers (`anthropic.zig`, `bedrock.zig`, `google.zig`, `google_vertex.zig`,
+  `kimi.zig`, `mistral.zig`, `openai_responses.zig`, `openai_codex_responses.zig`,
+  `azure_openai_responses.zig`) — use `.seq_cst`
 
-**Problem:** Two functions with the same name use different atomic memory orders.
+**Problem:** `stream.zig` is the **only** file using `.monotonic`. Every other
+location (all providers + shared module) uses `.seq_cst`.
 
 ```zig
-// stream.zig
+// stream.zig — the outlier
 return signal.load(.monotonic);
 
-// provider_error.zig
+// Everywhere else (provider_error.zig, all providers)
 return signal.load(.seq_cst);
 ```
 
-**Impact:** Potential race condition. The `.monotonic` load in `stream.zig` may
-not see an abort signal set by another thread in time, causing the stream to
-continue when it should have been aborted.
+**Impact:** The pre-flight abort check in `stream.zig` (`dispatchProviderStream`)
+may not see an abort signal set by another thread in time, causing the stream to
+continue when it should have been aborted. This is a real race condition because
+`stream.zig` is the entry point that all provider calls go through.
 
 ### Priority
 
@@ -743,7 +750,7 @@ not broad aspirational checklists.
 
 | Area | Current Status | Replacement Risk | Priority |
 |---|---|---:|---:|
-| Provider stream contract | ⚠️ Partial — `bedrock.zig` signature diverges; `openai.zig` duplicates logic; atomic ordering mismatch | **High** | P0 |
+| Provider stream contract | ⚠️ Partial — `bedrock.zig` signature diverges; `stream.zig` atomic ordering mismatch | **High** | P0 |
 | Provider coverage | ❌ Missing ~10 providers (moonshotai, xiaomi, minimax, etc.) | Medium | P1 |
 | Environment/credential edge cases | ❌ Missing Bun `/proc/self/environ` fallback; missing Vertex ADC file check | Low-Medium | P1 |
 | Bun-hosted TS extension parity | ✅ Core surfaces implemented | Low | Complete |
@@ -770,11 +777,12 @@ captured in the previous assessment:**
 
 ### Critical (P0)
 1. **Stream contract non-uniformity** — `bedrock.zig` uses a different
-   `emitSetupRuntimeFailure` signature than all other providers. `openai.zig`
-   duplicates error-handling logic instead of using the standard helper.
+   `emitSetupRuntimeFailure` signature (requires `allocator`, returns `!void`)
+   than all other providers (no `allocator`, returns `void`).
 2. **Atomic memory-order mismatch** — `isAbortRequested` uses `.monotonic` in
-   `stream.zig` and `.seq_cst` in `provider_error.zig`, creating a potential
-   race condition on abort signals.
+   `stream.zig` but `.seq_cst` everywhere else (all providers + shared module),
+   creating a potential race condition where the pre-flight abort check may not
+   see an abort signal set by another thread.
 
 ### Major (P1)
 3. **Missing provider implementations** — ~10 providers in TS `KnownProvider`
@@ -787,8 +795,16 @@ captured in the previous assessment:**
 ### Medium (P2)
 6. **Missing `ModelThinkingLevel` "off" state** — Zig cannot represent models
    with reasoning explicitly disabled.
-7. **Incomplete setup-failure test coverage** — Several providers lack the
-   canonical smoke test template from AGENTS.md.
+7. **Incomplete setup-failure test coverage** — `google.zig`, `google_vertex.zig`,
+   `google_gemini_cli.zig`, `mistral.zig`, `kimi.zig`, `openai_responses.zig`,
+   `openai_codex_responses.zig`, and `azure_openai_responses.zig` lack the
+   canonical smoke test template from AGENTS.md. (`openai.zig` and
+   `anthropic.zig` have coverage.)
+
+### Low (P3)
+8. **`openai.zig` non-standard error handler** — Uses `pushEarlyTerminalError`
+   instead of `emitSetupRuntimeFailure`, but delegates to shared helpers so
+   behavior is consistent. Minor maintenance burden.
 
 ### Recommended Next Steps
 

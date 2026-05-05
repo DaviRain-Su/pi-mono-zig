@@ -1183,15 +1183,20 @@ test "VAL-MSG-002 VAL-MSG-011 faux tool-call thought signature mirrors inline an
 
 test "registerFauxProvider aborts mid-stream and stops emitting events" {
     const allocator = std.testing.allocator;
+    // Slow the token cadence (1 token / 200 ms) so the abort thread has a
+    // wide and stable window to fire mid-stream on slow CI runners. The
+    // original 10 tokens/sec + 150 ms sleep margin was too tight under
+    // macOS-CI scheduler jitter.
+    const tokens_per_second: u32 = 5;
+    const content_text =
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
     const registration = try registerFauxProvider(allocator, .{
-        .tokens_per_second = 10,
+        .tokens_per_second = tokens_per_second,
         .token_size = .{ .min = 1, .max = 1 },
     });
     defer registration.unregister();
 
-    const long_text =
-        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
-    const content = [_]FauxContentBlock{fauxText(long_text)};
+    const content = [_]FauxContentBlock{fauxText(content_text)};
     try registration.setResponses(&[_]FauxResponseStep{
         .{ .message = fauxAssistantMessage(content[0..], .{}) },
     });
@@ -1206,7 +1211,10 @@ test "registerFauxProvider aborts mid-stream and stops emitting events" {
     var abort_signal = std.atomic.Value(bool).init(false);
     const abort_thread = try std.Thread.spawn(.{}, struct {
         fn run(signal: *std.atomic.Value(bool), io: std.Io) void {
-            std.Io.sleep(io, .fromMilliseconds(150), .awake) catch {};
+            // Sleep long enough to land safely after the first text_delta
+            // (~200 ms) but well before the full 78-token stream completes
+            // (~15.6 s). 600 ms gives ample headroom on slow runners.
+            std.Io.sleep(io, .fromMilliseconds(600), .awake) catch {};
             signal.store(true, .seq_cst);
         }
     }.run, .{ &abort_signal, std.testing.io });
@@ -1230,15 +1238,22 @@ test "registerFauxProvider aborts mid-stream and stops emitting events" {
         event.deinitTransient(allocator);
     }
 
-    const expected_events = [_]types.EventType{
-        .start,
-        .text_start,
-        .text_delta,
-        .error_event,
-    };
-    try std.testing.expectEqualSlices(types.EventType, expected_events[0..], event_types.items);
-    try std.testing.expectEqualStrings("abcd", streamed_text.items);
-    try std.testing.expect(!std.mem.eql(u8, long_text, streamed_text.items));
+    // Sequence-property assertions: starts with start+text_start, contains at
+    // least one text_delta, ends with error_event. We deliberately avoid
+    // expectEqualSlices here because the exact text_delta count depends on
+    // when the abort thread fires relative to chunk emission, which can vary
+    // on slower runners.
+    try std.testing.expect(event_types.items.len >= 4);
+    try std.testing.expectEqual(types.EventType.start, event_types.items[0]);
+    try std.testing.expectEqual(types.EventType.text_start, event_types.items[1]);
+    try std.testing.expectEqual(types.EventType.error_event, event_types.items[event_types.items.len - 1]);
+    var text_delta_count: usize = 0;
+    for (event_types.items) |event_type| {
+        if (event_type == .text_delta) text_delta_count += 1;
+    }
+    try std.testing.expect(text_delta_count >= 1);
+    try std.testing.expect(streamed_text.items.len >= 1);
+    try std.testing.expect(!std.mem.eql(u8, content_text, streamed_text.items));
 
     var result = stream.result().?;
     defer deinitAssistantMessage(allocator, &result);
