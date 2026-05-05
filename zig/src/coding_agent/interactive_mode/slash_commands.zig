@@ -1342,7 +1342,7 @@ pub fn beginLoginFlow(
             return;
         }
 
-        const browser_session = auth.startBrowserLogin(allocator, io, env_map, resolved_provider.id) catch |err| {
+        var browser_session = auth.startBrowserLogin(allocator, io, env_map, resolved_provider.id) catch |err| {
             if (try auth.formatOAuthClientConfigError(allocator, env_map, resolved_provider.id, err)) |message| {
                 defer allocator.free(message);
                 try app_state.appendError(message);
@@ -1350,27 +1350,77 @@ pub fn beginLoginFlow(
             }
             return err;
         };
+        errdefer browser_session.deinit(allocator);
+
+        var callback_listener: ?*auth.OAuthCallbackListener = startCallbackListenerForSession(
+            allocator,
+            io,
+            &browser_session,
+        ) catch |err| switch (err) {
+            error.AddressInUse, error.AddressUnavailable => null,
+            else => return err,
+        };
+        errdefer if (callback_listener) |listener| listener.destroy();
+
         openBrowserBestEffort(io, browser_session.auth_url);
 
-        const intro = try std.fmt.allocPrint(
-            allocator,
-            "{s} login started. Open the browser URL below. If the localhost callback page says connection refused, copy that full address-bar URL and paste it into the prompt.",
-            .{resolved_provider.name},
-        );
+        const intro = if (callback_listener) |listener|
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} login started. A local callback listener is waiting at {s}. If the browser cannot reach it, paste the full localhost callback URL into the prompt.",
+                .{ resolved_provider.name, listener.redirect_uri },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} login started. Could not start the local callback listener, so paste the full localhost callback URL into the prompt after browser login.",
+                .{resolved_provider.name},
+            );
         defer allocator.free(intro);
         try app_state.appendInfo(intro);
         try app_state.appendInfo(browser_session.auth_url);
         if (browser_session.kind == .google_gemini_cli) {
             try app_state.appendInfo("You will be prompted for a Google Cloud project ID after the redirect is accepted.");
         }
-        try app_state.setStatus("Paste the localhost callback URL and press Enter, or Esc to cancel");
-        auth_flow.* = .{ .browser_redirect = .{ .session = browser_session } };
+        try app_state.setStatus(if (callback_listener != null)
+            "Waiting for localhost callback. You can paste the callback URL manually, or Esc to cancel"
+        else
+            "Local callback listener unavailable. Paste the callback URL manually, or Esc to cancel");
+        auth_flow.* = .{ .browser_redirect = .{
+            .session = browser_session,
+            .callback_listener = callback_listener,
+        } };
+        callback_listener = null;
         return;
     }
 
     const message = try std.fmt.allocPrint(allocator, "Unsupported login provider: {s}", .{provider_id});
     defer allocator.free(message);
     try app_state.appendError(message);
+}
+
+fn callbackProviderKind(kind: auth.BrowserLoginKind) auth.OAuthCallbackProviderKind {
+    return switch (kind) {
+        .anthropic => .anthropic,
+        .openai_codex => .openai_codex,
+        .google_gemini_cli => .google_gemini_cli,
+    };
+}
+
+fn startCallbackListenerForSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    browser_session: *const auth.BrowserLoginSession,
+) !*auth.OAuthCallbackListener {
+    const listener = try auth.OAuthCallbackListener.create(
+        allocator,
+        io,
+        callbackProviderKind(browser_session.kind),
+        browser_session.state,
+    );
+    errdefer listener.destroy();
+    try listener.start();
+    return listener;
 }
 
 pub fn cancelAuthFlow(
@@ -1383,6 +1433,43 @@ pub fn cancelAuthFlow(
         auth_flow.* = null;
     }
     try app_state.setStatus("login cancelled");
+}
+
+pub fn pollAuthFlowCallback(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    auth_flow: *?AuthFlow,
+    live_resources: *LiveResources,
+) !void {
+    if (auth_flow.* == null) return;
+    switch (auth_flow.*.?) {
+        .browser_redirect => |redirect| {
+            const listener = redirect.callback_listener orelse return;
+            const callback_url = listener.takeCompletedCallbackUrl() orelse return;
+            defer allocator.free(callback_url);
+            try app_state.setStatus("Received localhost OAuth callback; completing login");
+            try submitAuthFlowInput(
+                allocator,
+                io,
+                env_map,
+                callback_url,
+                session,
+                current_provider,
+                options,
+                app_state,
+                editor,
+                auth_flow,
+                live_resources,
+            );
+        },
+        else => return,
+    }
 }
 
 pub fn submitAuthFlowInput(
@@ -1407,7 +1494,7 @@ pub fn submitAuthFlowInput(
             }
 
             switch (redirect.session.kind) {
-                .anthropic => {
+                .anthropic, .openai_codex => {
                     var credential = try auth.completeBrowserLogin(allocator, io, &redirect.session, trimmed);
                     defer credential.deinit(allocator);
                     try persistLoginCredential(
@@ -1617,10 +1704,12 @@ pub var test_auth_flow: ?AuthFlow = null;
 
 pub const BrowserOpenCapture = struct {
     called: bool = false,
+    url: ?[]const u8 = null,
 
-    pub fn capture(context: ?*anyopaque, _: std.Io, _: []const u8) void {
+    pub fn capture(context: ?*anyopaque, _: std.Io, url: []const u8) void {
         const self: *BrowserOpenCapture = @ptrCast(@alignCast(context.?));
         self.called = true;
+        self.url = url;
     }
 };
 

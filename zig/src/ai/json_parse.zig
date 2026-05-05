@@ -8,6 +8,29 @@ const parse_options: std.json.ParseOptions = .{ .allocate = .alloc_always };
 const PartialParseError = error{ OutOfMemory, LimitExceeded };
 const JSON_REPAIR_VALUE_WORK_UNITS: usize = 32;
 
+/// Parse a complete JSON value, retrying once after applying the same repair
+/// pass used by TypeScript's `parseJsonWithRepair`.
+pub fn parseJsonWithRepair(allocator: std.mem.Allocator, input: []const u8) !std.json.Parsed(std.json.Value) {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len > JSON_REPAIR_MAX_INPUT_BYTES) return error.LimitExceeded;
+    if (try exceedsStreamingJsonLimits(allocator, trimmed)) return error.LimitExceeded;
+
+    if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, parse_options)) |parsed| {
+        return parsed;
+    } else |parse_err| {
+        const repaired = try repairJson(allocator, trimmed);
+        defer allocator.free(repaired);
+
+        if (!std.mem.eql(u8, repaired, trimmed)) {
+            if (std.json.parseFromSlice(std.json.Value, allocator, repaired, parse_options)) |parsed| {
+                return parsed;
+            } else |_| {}
+        }
+
+        return parse_err;
+    }
+}
+
 /// Parse a JSON string, handling incomplete/partial JSON gracefully.
 /// Returns a parsed JSON value (caller must call `.deinit()` on the result).
 pub fn parseStreamingJson(allocator: std.mem.Allocator, input: ?[]const u8) !std.json.Parsed(std.json.Value) {
@@ -495,6 +518,15 @@ test "parseStreamingJson matches TypeScript-generated repair fixtures" {
         case_count += 1;
     }
     try std.testing.expect(case_count >= 12);
+}
+
+test "parseJsonWithRepair escapes invalid complete JSON string escapes" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseJsonWithRepair(allocator, "{\"text\":\"Hello \\_Kimi\"}");
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("Hello \\_Kimi", parsed.value.object.get("text").?.string);
 }
 
 test "parseStreamingJson enforces deterministic input size limit" {

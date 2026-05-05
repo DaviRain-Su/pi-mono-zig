@@ -634,7 +634,7 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
         return "OpenAI Responses credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-responses to save a key.";
     }
     if (std.mem.eql(u8, provider, "openai-codex")) {
-        return "OpenAI Codex credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-codex to save a key.";
+        return "OpenAI Codex credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-codex for ChatGPT Plus/Pro subscription auth.";
     }
     if (std.mem.eql(u8, provider, "azure-openai-responses")) {
         return "Azure OpenAI credentials required.\nSet AZURE_OPENAI_API_KEY, pass --api-key, or run /login azure-openai-responses to save a key.";

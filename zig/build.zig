@@ -80,6 +80,31 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(external_tool_check_step);
 
+    const tidy_fail_on_warning = b.option(
+        bool,
+        "tidy-fail-on-warning",
+        "Make `zig build test-tidy` fail when tidy warnings are reported",
+    ) orelse false;
+    const tidy_mod = b.createModule(.{
+        .root_source_file = b.path("test/tidy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const tidy_exe = b.addExecutable(.{
+        .name = "zig-tidy",
+        .root_module = tidy_mod,
+    });
+    const run_tidy = b.addRunArtifact(tidy_exe);
+    if (tidy_fail_on_warning) run_tidy.addArg("--fail-on-warning");
+    if (b.args) |args| run_tidy.addArgs(args);
+    const tidy_tests = b.addTest(.{
+        .root_module = tidy_mod,
+    });
+    const run_tidy_tests = b.addRunArtifact(tidy_tests);
+    const tidy_step = b.step("test-tidy", "Run Zig source tidy guardrails");
+    tidy_step.dependOn(&run_tidy_tests.step);
+    tidy_step.dependOn(&run_tidy.step);
+
     const ts_rpc_parity = b.addSystemCommand(&.{"bash"});
     ts_rpc_parity.addFileArg(b.path("test/ts-rpc-parity.sh"));
     ts_rpc_parity.step.dependOn(b.getInstallStep());
@@ -157,6 +182,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_ai_tests = b.addRunArtifact(ai_tests);
     test_step.dependOn(&run_ai_tests.step);
+
+    const ai_test_step = b.step("test-ai", "Run AI unit tests only");
+    ai_test_step.dependOn(external_tool_check_step);
+    ai_test_step.dependOn(&run_ai_tests.step);
 
     const agent_tests = b.addTest(.{
         .root_module = agent_mod,

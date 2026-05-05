@@ -236,8 +236,10 @@ pub const AuthFlow = union(enum) {
 
 pub const PendingBrowserRedirect = struct {
     session: auth.BrowserLoginSession,
+    callback_listener: ?*auth.OAuthCallbackListener = null,
 
     pub fn deinit(self: *PendingBrowserRedirect, allocator: std.mem.Allocator) void {
+        if (self.callback_listener) |listener| listener.destroy();
         self.session.deinit(allocator);
         self.* = undefined;
     }

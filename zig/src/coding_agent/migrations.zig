@@ -52,6 +52,7 @@ fn migrateAuthStorage(
     }
 
     var migrated_oauth = false;
+    var preserves_client_config = false;
     if (oauth_content) |content| {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch null;
         if (parsed) |*parsed_value| {
@@ -60,6 +61,10 @@ fn migrateAuthStorage(
                 var iterator = parsed_value.value.object.iterator();
                 while (iterator.next()) |entry| {
                     if (entry.value_ptr.* != .object) continue;
+                    if (looksLikeOAuthClientConfig(entry.value_ptr.object)) {
+                        preserves_client_config = true;
+                        continue;
+                    }
                     try migrated_auth.put(
                         allocator,
                         try allocator.dupe(u8, entry.key_ptr.*),
@@ -139,8 +144,22 @@ fn migrateAuthStorage(
                 try common.writeFileAbsolute(io, migrated_path, content, true);
             }
         }
-        try deleteFileIfExists(io, oauth_path);
+        if (!preserves_client_config) {
+            try deleteFileIfExists(io, oauth_path);
+        }
     }
+}
+
+fn looksLikeOAuthClientConfig(object: std.json.ObjectMap) bool {
+    return hasStringField(object, "client_id") or
+        hasStringField(object, "clientId") or
+        hasStringField(object, "client_secret") or
+        hasStringField(object, "clientSecret");
+}
+
+fn hasStringField(object: std.json.ObjectMap, key: []const u8) bool {
+    const value = object.get(key) orelse return false;
+    return value == .string and value.string.len > 0;
 }
 
 fn migrateLegacySessionPaths(
@@ -582,6 +601,79 @@ test "run migrates oauth credentials and settings api keys into auth.json" {
     defer allocator.free(settings_bytes);
     try std.testing.expect(std.mem.indexOf(u8, settings_bytes, "\"defaultProvider\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, settings_bytes, "\"apiKeys\"") == null);
+}
+
+test "run preserves OAuth client config while migrating legacy oauth tokens" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
+    defer allocator.free(oauth_path);
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+    const migrated_oauth_path = try std.fmt.allocPrint(allocator, "{s}.migrated", .{oauth_path});
+    defer allocator.free(migrated_oauth_path);
+    const safe_client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth-clients.json" });
+    defer allocator.free(safe_client_config_path);
+
+    try common.writeFileAbsolute(
+        std.testing.io,
+        oauth_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "legacy-client-id",
+        \\    "client_secret": "legacy-client-secret"
+        \\  },
+        \\  "anthropic": {
+        \\    "access": "oauth-access",
+        \\    "refresh": "oauth-refresh",
+        \\    "expires": 42
+        \\  }
+        \\}
+    ,
+        true,
+    );
+    try common.writeFileAbsolute(
+        std.testing.io,
+        safe_client_config_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "safe-client-id",
+        \\    "client_secret": "safe-client-secret"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    try run(allocator, std.testing.io, agent_dir);
+
+    try std.testing.expect(try pathExists(std.testing.io, auth_path));
+    try std.testing.expect(try pathExists(std.testing.io, oauth_path));
+    try std.testing.expect(try pathExists(std.testing.io, migrated_oauth_path));
+    try std.testing.expect(try pathExists(std.testing.io, safe_client_config_path));
+
+    const oauth_bytes = (try readOptionalFile(allocator, std.testing.io, oauth_path)).?;
+    defer allocator.free(oauth_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, oauth_bytes, "legacy-client-id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oauth_bytes, "legacy-client-secret") != null);
+
+    const safe_client_bytes = (try readOptionalFile(allocator, std.testing.io, safe_client_config_path)).?;
+    defer allocator.free(safe_client_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, safe_client_bytes, "safe-client-id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_client_bytes, "safe-client-secret") != null);
+
+    const auth_value = try auth.readStoredCredentialsObject(allocator, std.testing.io, auth_path);
+    defer common.deinitJsonValue(allocator, auth_value);
+    try std.testing.expect(auth_value == .object);
+    try std.testing.expect(auth_value.object.get("google-gemini-cli") == null);
+    const anthropic_entry = auth_value.object.get("anthropic").?;
+    try std.testing.expectEqualStrings("oauth", anthropic_entry.object.get("type").?.string);
+    try std.testing.expectEqualStrings("oauth-access", anthropic_entry.object.get("access").?.string);
 }
 
 test "run migrates legacy session files into project session directories and preserves content" {

@@ -1,14 +1,29 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("tools/common.zig");
+const oauth_callback_listener = @import("oauth_callback_listener.zig");
+
+pub const OAuthCallbackListener = oauth_callback_listener.OAuthCallbackListener;
+pub const OAuthCallbackProviderKind = oauth_callback_listener.ProviderKind;
+pub const defaultOAuthCallbackPath = oauth_callback_listener.defaultCallbackPath;
+pub const defaultOAuthCallbackPort = oauth_callback_listener.defaultCallbackPort;
 
 const DEFAULT_ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const DEFAULT_GITHUB_COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98";
+const DEFAULT_OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_REDIRECT_URI = "http://localhost:53692/callback";
 const ANTHROPIC_SCOPES =
     "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
+const OPENAI_CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
+const OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
+const OPENAI_CODEX_SCOPES = "openid profile email offline_access";
+const OPENAI_CODEX_ORIGINATOR = "pi";
+const OPENAI_CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
 const GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -27,7 +42,7 @@ const COPILOT_USER_AGENT = "GitHubCopilotChat/0.35.0";
 const COPILOT_EDITOR_VERSION = "vscode/1.107.0";
 const COPILOT_PLUGIN_VERSION = "copilot-chat/0.35.0";
 const COPILOT_INTEGRATION_ID = "vscode-chat";
-const OAUTH_CONFIG_FILE_NAME = "oauth.json";
+const OAUTH_CLIENT_CONFIG_FILE_NAME = "oauth-clients.json";
 const AUTH_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
     std.Io.File.Permissions.fromMode(0o600)
 else
@@ -35,6 +50,13 @@ else
 const AUTH_LOCK_SUFFIX = ".lock";
 const AUTH_LOCK_RETRY_DELAY_MS: i64 = 20;
 const AUTH_LOCK_MAX_ATTEMPTS: usize = 250;
+
+const OAuthRefreshEndpoints = struct {
+    anthropic_token_url: []const u8 = ANTHROPIC_TOKEN_URL,
+    github_copilot_token_url: []const u8 = GITHUB_COPILOT_TOKEN_URL,
+    openai_codex_token_url: []const u8 = OPENAI_CODEX_TOKEN_URL,
+    google_token_url: []const u8 = GOOGLE_TOKEN_URL,
+};
 
 pub const OAuthClientCredentials = struct {
     client_id: []u8,
@@ -60,6 +82,7 @@ pub const ProviderInfo = struct {
 
 pub const OAUTH_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "anthropic", .name = "Anthropic (Claude Pro/Max)", .auth_type = .oauth },
+    .{ .id = "openai-codex", .name = "ChatGPT Plus/Pro (Codex Subscription)", .auth_type = .oauth },
     .{ .id = "github-copilot", .name = "GitHub Copilot", .auth_type = .oauth },
     .{ .id = "google-gemini-cli", .name = "Google Cloud Code Assist (Gemini CLI)", .auth_type = .oauth },
 };
@@ -133,6 +156,7 @@ pub const ResolvedApiKey = struct {
 
 pub const BrowserLoginKind = enum {
     anthropic,
+    openai_codex,
     google_gemini_cli,
 };
 
@@ -143,11 +167,13 @@ pub const BrowserLoginSession = struct {
     oauth_client: OAuthClientCredentials,
     auth_url: []u8,
     verifier: []u8,
+    state: []u8,
 
     pub fn deinit(self: *BrowserLoginSession, allocator: std.mem.Allocator) void {
         self.oauth_client.deinit(allocator);
         allocator.free(self.auth_url);
         allocator.free(self.verifier);
+        allocator.free(self.state);
         self.* = undefined;
     }
 };
@@ -248,28 +274,8 @@ pub fn startBrowserLogin(
     env_map: *const std.process.Environ.Map,
     provider_id: []const u8,
 ) !BrowserLoginSession {
-    // Check if OAuth config exists before starting the flow
-    const oauth_path = try resolveOAuthConfigPath(allocator, env_map);
-    defer allocator.free(oauth_path);
-
-    const content = std.Io.Dir.readFileAlloc(.cwd(), io, oauth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => {
-            return error.MissingOAuthConfigFile;
-        },
-        else => return err,
-    };
-    defer allocator.free(content);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.InvalidOAuthConfigFile;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidOAuthConfigFile;
-
-    const provider_object = findOAuthProviderObject(parsed.value.object, provider_id);
-    if (provider_object == null) {
-        return error.MissingOAuthClientConfig;
-    }
-
     if (std.mem.eql(u8, provider_id, "anthropic")) return startAnthropicBrowserLogin(allocator, io, env_map);
+    if (std.mem.eql(u8, provider_id, "openai-codex")) return startOpenAICodexBrowserLogin(allocator, io, env_map);
     if (std.mem.eql(u8, provider_id, "google-gemini-cli")) return startGoogleBrowserLogin(allocator, io, env_map);
     return error.UnsupportedProvider;
 }
@@ -282,6 +288,8 @@ pub fn startAnthropicBrowserLogin(
     const provider = findSupportedProvider("anthropic").?;
     const verifier = try generatePkceVerifier(allocator, io);
     errdefer allocator.free(verifier);
+    const state = try allocator.dupe(u8, verifier);
+    errdefer allocator.free(state);
     const challenge = try generatePkceChallenge(allocator, verifier);
     defer allocator.free(challenge);
     var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, false);
@@ -294,7 +302,7 @@ pub fn startAnthropicBrowserLogin(
     defer allocator.free(encoded_scope);
     const encoded_challenge = try formEncode(allocator, challenge);
     defer allocator.free(encoded_challenge);
-    const encoded_state = try formEncode(allocator, verifier);
+    const encoded_state = try formEncode(allocator, state);
     defer allocator.free(encoded_state);
 
     const auth_url = try std.fmt.allocPrint(
@@ -317,6 +325,59 @@ pub fn startAnthropicBrowserLogin(
         .oauth_client = oauth_client,
         .auth_url = auth_url,
         .verifier = verifier,
+        .state = state,
+    };
+}
+
+pub fn startOpenAICodexBrowserLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+) !BrowserLoginSession {
+    const provider = findSupportedProviderByAuthType("openai-codex", .oauth).?;
+    const verifier = try generatePkceVerifier(allocator, io);
+    errdefer allocator.free(verifier);
+    const state = try generateOpenAICodexState(allocator, io);
+    errdefer allocator.free(state);
+    const challenge = try generatePkceChallenge(allocator, verifier);
+    defer allocator.free(challenge);
+    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, false);
+    errdefer oauth_client.deinit(allocator);
+    const encoded_client_id = try formEncode(allocator, oauth_client.client_id);
+    defer allocator.free(encoded_client_id);
+    const encoded_redirect_uri = try formEncode(allocator, OPENAI_CODEX_REDIRECT_URI);
+    defer allocator.free(encoded_redirect_uri);
+    const encoded_scope = try formEncode(allocator, OPENAI_CODEX_SCOPES);
+    defer allocator.free(encoded_scope);
+    const encoded_challenge = try formEncode(allocator, challenge);
+    defer allocator.free(encoded_challenge);
+    const encoded_state = try formEncode(allocator, state);
+    defer allocator.free(encoded_state);
+    const encoded_originator = try formEncode(allocator, OPENAI_CODEX_ORIGINATOR);
+    defer allocator.free(encoded_originator);
+
+    const auth_url = try std.fmt.allocPrint(
+        allocator,
+        "{s}?response_type=code&client_id={s}&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator={s}",
+        .{
+            OPENAI_CODEX_AUTHORIZE_URL,
+            encoded_client_id,
+            encoded_redirect_uri,
+            encoded_scope,
+            encoded_challenge,
+            encoded_state,
+            encoded_originator,
+        },
+    );
+
+    return .{
+        .kind = .openai_codex,
+        .provider_id = provider.id,
+        .provider_name = provider.name,
+        .oauth_client = oauth_client,
+        .auth_url = auth_url,
+        .verifier = verifier,
+        .state = state,
     };
 }
 
@@ -328,6 +389,8 @@ pub fn startGoogleBrowserLogin(
     const provider = findSupportedProvider("google-gemini-cli").?;
     const verifier = try generatePkceVerifier(allocator, io);
     errdefer allocator.free(verifier);
+    const state = try allocator.dupe(u8, verifier);
+    errdefer allocator.free(state);
     const challenge = try generatePkceChallenge(allocator, verifier);
     defer allocator.free(challenge);
     var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, true);
@@ -342,7 +405,7 @@ pub fn startGoogleBrowserLogin(
     defer allocator.free(encoded_scope);
     const encoded_challenge = try formEncode(allocator, challenge);
     defer allocator.free(encoded_challenge);
-    const encoded_state = try formEncode(allocator, verifier);
+    const encoded_state = try formEncode(allocator, state);
     defer allocator.free(encoded_state);
 
     const auth_url = try std.fmt.allocPrint(
@@ -365,6 +428,7 @@ pub fn startGoogleBrowserLogin(
         .oauth_client = oauth_client,
         .auth_url = auth_url,
         .verifier = verifier,
+        .state = state,
     };
 }
 
@@ -376,6 +440,7 @@ pub fn completeBrowserLogin(
 ) !StoredCredential {
     return switch (session.kind) {
         .anthropic => .{ .oauth = try exchangeAnthropicAuthorizationCode(allocator, io, session, input) },
+        .openai_codex => .{ .oauth = try exchangeOpenAICodexAuthorizationCode(allocator, io, session, input) },
         .google_gemini_cli => return error.MissingProjectId,
     };
 }
@@ -386,12 +451,22 @@ pub fn exchangeGoogleAuthorizationCode(
     session: *const BrowserLoginSession,
     input: []const u8,
 ) !GoogleExchangeResult {
+    return exchangeGoogleAuthorizationCodeWithTokenUrl(allocator, io, session, input, GOOGLE_TOKEN_URL);
+}
+
+fn exchangeGoogleAuthorizationCodeWithTokenUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const BrowserLoginSession,
+    input: []const u8,
+    token_url: []const u8,
+) !GoogleExchangeResult {
     if (session.kind != .google_gemini_cli) return error.UnsupportedProvider;
     const parsed = try parseAuthorizationInput(allocator, input);
     defer parsed.deinit(allocator);
 
     const state = parsed.state orelse return error.InvalidOAuthState;
-    if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
+    if (!std.mem.eql(u8, state, session.state)) return error.InvalidOAuthState;
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
     const body = try buildFormBody(allocator, &.{
@@ -404,7 +479,7 @@ pub fn exchangeGoogleAuthorizationCode(
     });
     defer allocator.free(body);
 
-    const response_body = try postForm(allocator, io, GOOGLE_TOKEN_URL, body, null);
+    const response_body = try postForm(allocator, io, token_url, body, null);
     defer allocator.free(response_body);
 
     var parsed_response = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch return error.InvalidAuthResponse;
@@ -548,6 +623,77 @@ pub fn buildApiKeyFromStoredEntry(
                 return try buildGoogleStoredApiKey(allocator, access, project_id);
             }
             return try allocator.dupe(u8, access);
+        }
+    }
+
+    if (getObjectString(object, "key")) |key| return try allocator.dupe(u8, key);
+    return null;
+}
+
+pub fn buildApiKeyFromStoredEntryRefreshing(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    auth_path: []const u8,
+    provider_id: []const u8,
+    object: std.json.ObjectMap,
+) !?[]u8 {
+    return buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        env_map,
+        auth_path,
+        provider_id,
+        object,
+        .{},
+    );
+}
+
+fn buildApiKeyFromStoredEntryWithRefreshEndpoints(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    auth_path: ?[]const u8,
+    provider_id: []const u8,
+    object: std.json.ObjectMap,
+    endpoints: OAuthRefreshEndpoints,
+) !?[]u8 {
+    const type_value = getObjectString(object, "type");
+    if (type_value) |value| {
+        if (std.mem.eql(u8, value, "api_key")) {
+            const key = getObjectString(object, "key") orelse return null;
+            return try allocator.dupe(u8, key);
+        }
+        if (std.mem.eql(u8, value, "oauth")) {
+            var credential = (try parseStoredOAuthCredential(allocator, provider_id, object)) orelse return null;
+            defer credential.deinit(allocator);
+
+            if (getObjectInt(object, "expires")) |expires| {
+                if (currentTimeMs(io) >= expires) {
+                    if (credential.refresh.len == 0) return null;
+                    var refreshed = refreshOAuthCredentialWithEndpoints(
+                        allocator,
+                        io,
+                        env_map,
+                        provider_id,
+                        &credential,
+                        endpoints,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return null,
+                    };
+                    defer refreshed.deinit(allocator);
+
+                    if (auth_path) |path| {
+                        const stored = StoredCredential{ .oauth = refreshed };
+                        try upsertStoredCredential(allocator, io, path, provider_id, &stored);
+                    }
+
+                    return try buildApiKeyFromOAuthCredential(allocator, provider_id, &refreshed);
+                }
+            }
+
+            return try buildApiKeyFromOAuthCredential(allocator, provider_id, &credential);
         }
     }
 
@@ -933,7 +1079,7 @@ pub fn formatOAuthClientConfigError(
     if (!handled) return null;
 
     const provider = findSupportedProvider(provider_id) orelse return null;
-    const oauth_path = try resolveOAuthConfigPath(allocator, env_map);
+    const oauth_path = try resolveOAuthClientConfigPath(allocator, env_map);
     defer allocator.free(oauth_path);
     const snippet = oauthConfigSnippet(provider_id);
 
@@ -948,7 +1094,7 @@ pub fn formatOAuthClientConfigError(
 
     return try std.fmt.allocPrint(
         allocator,
-        "{s} Create {s} with an entry for {s}, for example:\n{s}",
+        "{s} Create {s} with an entry for {s}, for example:\n{s}\n\nThis file stores OAuth client application credentials only. Stored OAuth tokens remain in auth.json; legacy oauth.json is ignored for client config.",
         .{ reason, oauth_path, provider.name, snippet },
     );
 }
@@ -962,6 +1108,7 @@ pub fn formatAuthenticationError(allocator: std.mem.Allocator, err: anyerror) !?
         error.InvalidAuthResponse => "OAuth token exchange returned an unexpected response.",
         error.MissingAccessToken => "OAuth token exchange succeeded but did not return an access token.",
         error.MissingRefreshToken => "OAuth token exchange succeeded but did not return a refresh token.",
+        error.InvalidJwt, error.InvalidJwtPayload, error.MissingAccountId => "OAuth token exchange succeeded but did not return a valid ChatGPT account token.",
         error.HttpRequestFailed => "OAuth token exchange failed. Verify the client credentials and try /login again.",
         error.Timeout => "OAuth token exchange timed out. Try /login again.",
         error.ConnectionRefused, error.ConnectionReset, error.NetworkUnreachable, error.UnknownHost, error.TlsFailure => "Could not reach the OAuth provider during token exchange.",
@@ -977,7 +1124,15 @@ fn loadOAuthClientCredentials(
     provider_id: []const u8,
     require_client_secret: bool,
 ) !OAuthClientCredentials {
-    const oauth_path = try resolveOAuthConfigPath(allocator, env_map);
+    if (defaultPublicOAuthClientId(provider_id)) |client_id| {
+        if (require_client_secret) return error.MissingOAuthClientSecret;
+        return .{
+            .client_id = try allocator.dupe(u8, client_id),
+            .client_secret = null,
+        };
+    }
+
+    const oauth_path = try resolveOAuthClientConfigPath(allocator, env_map);
     defer allocator.free(oauth_path);
 
     const content = std.Io.Dir.readFileAlloc(.cwd(), io, oauth_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
@@ -1006,14 +1161,21 @@ fn resolveOAuthClientId(
     provider_id: []const u8,
     configured_client_id: ?[]const u8,
 ) ![]u8 {
+    if (defaultPublicOAuthClientId(provider_id)) |client_id| {
+        return allocator.dupe(u8, client_id);
+    }
+
     const trimmed = std.mem.trim(u8, configured_client_id orelse "", &std.ascii.whitespace);
     if (trimmed.len == 0) return error.MissingOAuthClientId;
 
-    if (std.mem.eql(u8, provider_id, "anthropic") and !isValidAnthropicClientId(trimmed)) {
-        return allocator.dupe(u8, DEFAULT_ANTHROPIC_CLIENT_ID);
-    }
-
     return allocator.dupe(u8, trimmed);
+}
+
+fn defaultPublicOAuthClientId(provider_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_id, "anthropic")) return DEFAULT_ANTHROPIC_CLIENT_ID;
+    if (std.mem.eql(u8, provider_id, "github-copilot")) return DEFAULT_GITHUB_COPILOT_CLIENT_ID;
+    if (std.mem.eql(u8, provider_id, "openai-codex")) return DEFAULT_OPENAI_CODEX_CLIENT_ID;
+    return null;
 }
 
 fn isValidAnthropicClientId(value: []const u8) bool {
@@ -1034,10 +1196,10 @@ fn isValidAnthropicClientId(value: []const u8) bool {
     return true;
 }
 
-fn resolveOAuthConfigPath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
+fn resolveOAuthClientConfigPath(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
     const agent_dir = try resolveAgentDir(allocator, env_map);
     defer allocator.free(agent_dir);
-    return std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CONFIG_FILE_NAME });
+    return std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CLIENT_CONFIG_FILE_NAME });
 }
 
 fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
@@ -1121,7 +1283,7 @@ fn exchangeAnthropicAuthorizationCode(
     defer parsed.deinit(allocator);
 
     const state = parsed.state orelse return error.InvalidOAuthState;
-    if (!std.mem.eql(u8, state, session.verifier)) return error.InvalidOAuthState;
+    if (!std.mem.eql(u8, state, session.state)) return error.InvalidOAuthState;
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
 
@@ -1160,10 +1322,82 @@ fn exchangeAnthropicAuthorizationCode(
     };
 }
 
+fn exchangeOpenAICodexAuthorizationCode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const BrowserLoginSession,
+    input: []const u8,
+) !OAuthCredential {
+    return exchangeOpenAICodexAuthorizationCodeWithTokenUrl(allocator, io, session, input, OPENAI_CODEX_TOKEN_URL);
+}
+
+fn exchangeOpenAICodexAuthorizationCodeWithTokenUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const BrowserLoginSession,
+    input: []const u8,
+    token_url: []const u8,
+) !OAuthCredential {
+    if (session.kind != .openai_codex) return error.UnsupportedProvider;
+    const parsed = try parseAuthorizationInput(allocator, input);
+    defer parsed.deinit(allocator);
+
+    if (parsed.state) |state| {
+        if (!std.mem.eql(u8, state, session.state)) return error.InvalidOAuthState;
+    }
+
+    const code = parsed.code orelse return error.MissingAuthorizationCode;
+    const body = try buildOpenAICodexTokenExchangeBody(allocator, session, code);
+    defer allocator.free(body);
+
+    const response_body = try postForm(allocator, io, token_url, body, null);
+    defer allocator.free(response_body);
+
+    var parsed_response = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch return error.InvalidAuthResponse;
+    defer parsed_response.deinit();
+    if (parsed_response.value != .object) return error.InvalidAuthResponse;
+
+    const access_token = getObjectString(parsed_response.value.object, "access_token") orelse return error.MissingAccessToken;
+    const refresh_token = getObjectString(parsed_response.value.object, "refresh_token") orelse return error.MissingRefreshToken;
+    const expires_in = getObjectInt(parsed_response.value.object, "expires_in") orelse return error.InvalidAuthResponse;
+
+    const account_id = try extractOpenAICodexAccountId(allocator, access_token);
+    defer allocator.free(account_id);
+
+    return .{
+        .access = try allocator.dupe(u8, access_token),
+        .refresh = try allocator.dupe(u8, refresh_token),
+        .expires = computeExpiresAtMs(expires_in, io),
+    };
+}
+
+fn buildOpenAICodexTokenExchangeBody(
+    allocator: std.mem.Allocator,
+    session: *const BrowserLoginSession,
+    code: []const u8,
+) ![]u8 {
+    return buildFormBody(allocator, &.{
+        .{ .name = "grant_type", .value = "authorization_code" },
+        .{ .name = "client_id", .value = session.oauth_client.client_id },
+        .{ .name = "code", .value = code },
+        .{ .name = "code_verifier", .value = session.verifier },
+        .{ .name = "redirect_uri", .value = OPENAI_CODEX_REDIRECT_URI },
+    });
+}
+
 fn refreshGitHubCopilotToken(
     allocator: std.mem.Allocator,
     io: std.Io,
     github_access_token: []const u8,
+) !OAuthCredential {
+    return refreshGitHubCopilotTokenWithUrl(allocator, io, github_access_token, GITHUB_COPILOT_TOKEN_URL);
+}
+
+fn refreshGitHubCopilotTokenWithUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    github_access_token: []const u8,
+    token_url: []const u8,
 ) !OAuthCredential {
     const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{github_access_token});
     defer allocator.free(authorization);
@@ -1178,7 +1412,7 @@ fn refreshGitHubCopilotToken(
     });
     defer deinitHeaders(allocator, &headers);
 
-    const response_body = try getRequest(allocator, io, GITHUB_COPILOT_TOKEN_URL, &headers);
+    const response_body = try getRequest(allocator, io, token_url, &headers);
     defer allocator.free(response_body);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch return error.InvalidAuthResponse;
@@ -1195,9 +1429,146 @@ fn refreshGitHubCopilotToken(
     };
 }
 
+fn refreshOAuthCredentialWithEndpoints(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    provider_id: []const u8,
+    credential: *const OAuthCredential,
+    endpoints: OAuthRefreshEndpoints,
+) !OAuthCredential {
+    if (std.mem.eql(u8, provider_id, "anthropic")) {
+        return refreshAnthropicStoredTokenWithUrl(allocator, io, credential.refresh, endpoints.anthropic_token_url);
+    }
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        return refreshGitHubCopilotTokenWithUrl(allocator, io, credential.refresh, endpoints.github_copilot_token_url);
+    }
+    if (std.mem.eql(u8, provider_id, "openai-codex")) {
+        return refreshOpenAICodexStoredTokenWithUrl(allocator, io, credential.refresh, endpoints.openai_codex_token_url);
+    }
+    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
+        return refreshGoogleStoredTokenWithUrl(allocator, io, env_map, credential, endpoints.google_token_url);
+    }
+    return error.UnsupportedProvider;
+}
+
+fn refreshAnthropicStoredTokenWithUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    refresh_token: []const u8,
+    token_url: []const u8,
+) !OAuthCredential {
+    var payload = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    defer {
+        const cleanup_value: std.json.Value = .{ .object = payload };
+        common.deinitJsonValue(allocator, cleanup_value);
+    }
+
+    try payload.put(allocator, try allocator.dupe(u8, "grant_type"), .{ .string = try allocator.dupe(u8, "refresh_token") });
+    try payload.put(allocator, try allocator.dupe(u8, "client_id"), .{ .string = try allocator.dupe(u8, DEFAULT_ANTHROPIC_CLIENT_ID) });
+    try payload.put(allocator, try allocator.dupe(u8, "refresh_token"), .{ .string = try allocator.dupe(u8, refresh_token) });
+
+    const payload_value: std.json.Value = .{ .object = payload };
+    const json_body = try std.json.Stringify.valueAlloc(allocator, payload_value, .{});
+    defer allocator.free(json_body);
+
+    const response_body = try postJson(allocator, io, token_url, json_body, null);
+    defer allocator.free(response_body);
+    return parseOAuthRefreshResponse(allocator, io, response_body, .with_skew);
+}
+
+fn refreshOpenAICodexStoredTokenWithUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    refresh_token: []const u8,
+    token_url: []const u8,
+) !OAuthCredential {
+    const body = try buildFormBody(allocator, &.{
+        .{ .name = "grant_type", .value = "refresh_token" },
+        .{ .name = "refresh_token", .value = refresh_token },
+        .{ .name = "client_id", .value = DEFAULT_OPENAI_CODEX_CLIENT_ID },
+    });
+    defer allocator.free(body);
+
+    const response_body = try postForm(allocator, io, token_url, body, null);
+    defer allocator.free(response_body);
+    var credential = try parseOAuthRefreshResponse(allocator, io, response_body, .exact);
+    errdefer credential.deinit(allocator);
+
+    const account_id = try extractOpenAICodexAccountId(allocator, credential.access);
+    defer allocator.free(account_id);
+    return credential;
+}
+
+fn refreshGoogleStoredTokenWithUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    credential: *const OAuthCredential,
+    token_url: []const u8,
+) !OAuthCredential {
+    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, "google-gemini-cli", true);
+    defer oauth_client.deinit(allocator);
+
+    const body = try buildFormBody(allocator, &.{
+        .{ .name = "client_id", .value = oauth_client.client_id },
+        .{ .name = "client_secret", .value = oauth_client.client_secret orelse return error.MissingOAuthClientSecret },
+        .{ .name = "grant_type", .value = "refresh_token" },
+        .{ .name = "refresh_token", .value = credential.refresh },
+    });
+    defer allocator.free(body);
+
+    const response_body = try postForm(allocator, io, token_url, body, null);
+    defer allocator.free(response_body);
+    var refreshed = try parseOAuthRefreshResponse(allocator, io, response_body, .with_skew);
+    errdefer refreshed.deinit(allocator);
+    refreshed.project_id = if (credential.project_id) |project_id| try allocator.dupe(u8, project_id) else null;
+    return refreshed;
+}
+
+const RefreshExpiryMode = enum {
+    with_skew,
+    exact,
+};
+
+fn parseOAuthRefreshResponse(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    response_body: []const u8,
+    expiry_mode: RefreshExpiryMode,
+) !OAuthCredential {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch return error.InvalidAuthResponse;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidAuthResponse;
+
+    const access_token = getObjectString(parsed.value.object, "access_token") orelse return error.MissingAccessToken;
+    const refresh_token = getObjectString(parsed.value.object, "refresh_token") orelse return error.MissingRefreshToken;
+    const expires_in = getObjectInt(parsed.value.object, "expires_in") orelse return error.InvalidAuthResponse;
+
+    const expires = switch (expiry_mode) {
+        .with_skew => computeExpiresAtMs(expires_in, io),
+        .exact => currentTimeMs(io) + expires_in * std.time.ms_per_s,
+    };
+
+    return .{
+        .access = try allocator.dupe(u8, access_token),
+        .refresh = try allocator.dupe(u8, refresh_token),
+        .expires = expires,
+    };
+}
+
 fn parseAuthorizationInput(allocator: std.mem.Allocator, input: []const u8) !AuthorizationInput {
     const trimmed = std.mem.trim(u8, input, " \t\r\n\"'");
     if (trimmed.len == 0) return error.InvalidAuthorizationInput;
+
+    if (std.mem.indexOfScalar(u8, trimmed, '#')) |separator| {
+        if (std.mem.indexOfScalar(u8, trimmed, '?') == null and std.mem.indexOf(u8, trimmed, "code=") == null) {
+            return .{
+                .code = try allocator.dupe(u8, trimmed[0..separator]),
+                .state = try allocator.dupe(u8, trimmed[separator + 1 ..]),
+            };
+        }
+    }
 
     if (std.mem.indexOfScalar(u8, trimmed, '?')) |query_index| {
         return extractAuthorizationFromQuery(allocator, trimmed[query_index + 1 ..]);
@@ -1370,6 +1741,13 @@ fn generatePkceVerifier(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     return encoded;
 }
 
+fn generateOpenAICodexState(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    io.random(&bytes);
+    const encoded = std.fmt.bytesToHex(bytes, .lower);
+    return allocator.dupe(u8, encoded[0..]);
+}
+
 fn generatePkceChallenge(allocator: std.mem.Allocator, verifier: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
@@ -1386,6 +1764,39 @@ fn currentTimeMs(io: std.Io) i64 {
     return @intCast(@divFloor(std.Io.Clock.now(.awake, io).nanoseconds, std.time.ns_per_ms));
 }
 
+fn parseStoredOAuthCredential(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    object: std.json.ObjectMap,
+) !?OAuthCredential {
+    const access = getObjectStringAny(object, &[_][]const u8{ "access", "access_token" }) orelse return null;
+    const refresh = getObjectStringAny(object, &[_][]const u8{ "refresh", "refresh_token" }) orelse "";
+    const expires = getObjectInt(object, "expires") orelse 0;
+    const project_id = if (std.mem.eql(u8, provider_id, "google-gemini-cli"))
+        getObjectStringAny(object, &[_][]const u8{ "projectId", "project_id" }) orelse return null
+    else
+        null;
+
+    return .{
+        .access = try allocator.dupe(u8, access),
+        .refresh = try allocator.dupe(u8, refresh),
+        .expires = expires,
+        .project_id = if (project_id) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn buildApiKeyFromOAuthCredential(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    credential: *const OAuthCredential,
+) ![]u8 {
+    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
+        const project_id = credential.project_id orelse return error.MissingProjectId;
+        return try buildGoogleStoredApiKey(allocator, credential.access, project_id);
+    }
+    return try allocator.dupe(u8, credential.access);
+}
+
 fn buildGoogleStoredApiKey(allocator: std.mem.Allocator, access: []const u8, project_id: []const u8) ![]u8 {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     defer {
@@ -1397,6 +1808,28 @@ fn buildGoogleStoredApiKey(allocator: std.mem.Allocator, access: []const u8, pro
     try object.put(allocator, try allocator.dupe(u8, "projectId"), .{ .string = try allocator.dupe(u8, project_id) });
     const value: std.json.Value = .{ .object = object };
     return std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
+fn extractOpenAICodexAccountId(allocator: std.mem.Allocator, token: []const u8) ![]const u8 {
+    var parts = std.mem.splitScalar(u8, token, '.');
+    _ = parts.next() orelse return error.InvalidJwt;
+    const payload_segment = parts.next() orelse return error.InvalidJwt;
+    if (payload_segment.len == 0) return error.InvalidJwt;
+    _ = parts.next() orelse return error.InvalidJwt;
+
+    const decoded_len = try std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload_segment);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.url_safe_no_pad.Decoder.decode(decoded, payload_segment);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return error.InvalidJwtPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidJwtPayload;
+    const auth_value = parsed.value.object.get(OPENAI_CODEX_AUTH_CLAIM) orelse return error.MissingAccountId;
+    if (auth_value != .object) return error.MissingAccountId;
+    const account_id_value = auth_value.object.get("chatgpt_account_id") orelse return error.MissingAccountId;
+    if (account_id_value != .string or account_id_value.string.len == 0) return error.MissingAccountId;
+    return try allocator.dupe(u8, account_id_value.string);
 }
 
 fn getObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1494,19 +1927,6 @@ test "startAnthropicBrowserLogin builds a Claude OAuth URL" {
 
     const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
     defer allocator.free(agent_dir);
-    const oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
-    defer allocator.free(oauth_path);
-    try common.writeFileAbsolute(
-        std.testing.io,
-        oauth_path,
-        \\{
-        \\  "anthropic": {
-        \\    "client_id": "anthropic-client-id"
-        \\  }
-        \\}
-    ,
-        true,
-    );
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
@@ -1520,6 +1940,258 @@ test "startAnthropicBrowserLogin builds a Claude OAuth URL" {
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e") != null);
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge=") != null);
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback") != null);
+}
+
+test "startOpenAICodexBrowserLogin builds TS-equivalent OAuth URL" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startOpenAICodexBrowserLogin(allocator, std.testing.io, &env_map);
+    defer session.deinit(allocator);
+
+    try std.testing.expectEqual(BrowserLoginKind.openai_codex, session.kind);
+    try std.testing.expectEqualStrings("openai-codex", session.provider_id);
+    try std.testing.expectEqualStrings("ChatGPT Plus/Pro (Codex Subscription)", session.provider_name);
+    try std.testing.expectEqualStrings(DEFAULT_OPENAI_CODEX_CLIENT_ID, session.oauth_client.client_id);
+    try std.testing.expect(session.oauth_client.client_secret == null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, OPENAI_CODEX_AUTHORIZE_URL) != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "response_type=code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=app_EMoamEEZ73f0CkXaXp7hrann") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "scope=openid%20profile%20email%20offline_access") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "id_token_add_organizations=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "codex_cli_simplified_flow=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "originator=pi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, session.state) != null);
+}
+
+test "loadOAuthClientCredentials uses public built-in client ids without oauth config" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var anthropic = try loadOAuthClientCredentials(allocator, std.testing.io, &env_map, "anthropic", false);
+    defer anthropic.deinit(allocator);
+    try std.testing.expectEqualStrings(DEFAULT_ANTHROPIC_CLIENT_ID, anthropic.client_id);
+    try std.testing.expect(anthropic.client_secret == null);
+
+    var copilot = try loadOAuthClientCredentials(allocator, std.testing.io, &env_map, "github-copilot", false);
+    defer copilot.deinit(allocator);
+    try std.testing.expectEqualStrings("Iv1.b507a08c87ecfe98", copilot.client_id);
+    try std.testing.expect(copilot.client_secret == null);
+
+    var codex = try loadOAuthClientCredentials(allocator, std.testing.io, &env_map, "openai-codex", false);
+    defer codex.deinit(allocator);
+    try std.testing.expectEqualStrings(DEFAULT_OPENAI_CODEX_CLIENT_ID, codex.client_id);
+    try std.testing.expect(codex.client_secret == null);
+
+    const copilot_body = try buildFormBody(allocator, &.{
+        .{ .name = "client_id", .value = copilot.client_id },
+        .{ .name = "scope", .value = "read:user" },
+    });
+    defer allocator.free(copilot_body);
+    try std.testing.expectEqualStrings("client_id=Iv1.b507a08c87ecfe98&scope=read%3Auser", copilot_body);
+}
+
+test "startGoogleBrowserLogin loads client config from safe non-legacy file" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const legacy_oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
+    defer allocator.free(legacy_oauth_path);
+    const client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth-clients.json" });
+    defer allocator.free(client_config_path);
+
+    try common.writeFileAbsolute(
+        std.testing.io,
+        legacy_oauth_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "legacy-oauth-json-client",
+        \\    "client_secret": "legacy-oauth-json-secret"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+    try common.writeFileAbsolute(
+        std.testing.io,
+        client_config_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "safe-client-id",
+        \\    "client_secret": "safe-client-secret"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startGoogleBrowserLogin(allocator, std.testing.io, &env_map);
+    defer session.deinit(allocator);
+
+    try std.testing.expectEqual(BrowserLoginKind.google_gemini_cli, session.kind);
+    try std.testing.expectEqualStrings("google-gemini-cli", session.provider_id);
+    try std.testing.expectEqualStrings("safe-client-id", session.oauth_client.client_id);
+    try std.testing.expectEqualStrings("safe-client-secret", session.oauth_client.client_secret.?);
+    try std.testing.expect(std.mem.startsWith(u8, session.auth_url, GOOGLE_AUTHORIZE_URL));
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=safe-client-id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "legacy-oauth-json-client") == null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Foauth2callback") != null);
+}
+
+test "OpenAI Codex OAuth token exchange uses fake callback and local token endpoint" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startOpenAICodexBrowserLogin(allocator, io, &env_map);
+    defer session.deinit(allocator);
+
+    const body = try buildOpenAICodexTokenExchangeBody(allocator, &session, "code 123");
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "grant_type=authorization_code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "client_id=app_EMoamEEZ73f0CkXaXp7hrann") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "code=code%20123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "code_verifier=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") != null);
+
+    const access_token = try buildTestOpenAICodexAccessToken(allocator, "acc_test");
+    defer allocator.free(access_token);
+    const response = try std.fmt.allocPrint(
+        allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh-token\",\"expires_in\":3600}}",
+        .{access_token},
+    );
+    defer allocator.free(response);
+
+    var server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", response);
+    defer server.deinit();
+    try server.start();
+    const token_url = try server.url(allocator);
+    defer allocator.free(token_url);
+
+    const callback = try std.fmt.allocPrint(
+        allocator,
+        "http://localhost:1455/auth/callback?code=fake-code&state={s}",
+        .{session.state},
+    );
+    defer allocator.free(callback);
+
+    var credential = try exchangeOpenAICodexAuthorizationCodeWithTokenUrl(allocator, io, &session, callback, token_url);
+    defer credential.deinit(allocator);
+    try std.testing.expectEqualStrings(access_token, credential.access);
+    try std.testing.expectEqualStrings("refresh-token", credential.refresh);
+    try std.testing.expect(credential.expires > 0);
+
+    try std.testing.expectError(
+        error.InvalidOAuthState,
+        exchangeOpenAICodexAuthorizationCodeWithTokenUrl(
+            allocator,
+            io,
+            &session,
+            "http://localhost:1455/auth/callback?code=fake-code&state=wrong-state",
+            token_url,
+        ),
+    );
+}
+
+test "Google OAuth token exchange accepts fake loopback callback and local token endpoint" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CLIENT_CONFIG_FILE_NAME });
+    defer allocator.free(client_config_path);
+    try common.writeFileAbsolute(
+        io,
+        client_config_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "google-client-id",
+        \\    "client_secret": "google-client-secret"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startGoogleBrowserLogin(allocator, io, &env_map);
+    defer session.deinit(allocator);
+
+    var server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"google-access\",\"refresh_token\":\"google-refresh\",\"expires_in\":3600}");
+    defer server.deinit();
+    try server.start();
+    const token_url = try server.url(allocator);
+    defer allocator.free(token_url);
+
+    const callback = try std.fmt.allocPrint(
+        allocator,
+        "http://localhost:8085/oauth2callback?code=fake-code&state={s}",
+        .{session.state},
+    );
+    defer allocator.free(callback);
+
+    var exchange = try exchangeGoogleAuthorizationCodeWithTokenUrl(allocator, io, &session, callback, token_url);
+    defer exchange.deinit(allocator);
+    try std.testing.expectEqualStrings("google-access", exchange.access_token);
+    try std.testing.expectEqualStrings("google-refresh", exchange.refresh_token);
+    try std.testing.expect(exchange.expires > 0);
+
+    try std.testing.expectError(
+        error.InvalidOAuthState,
+        exchangeGoogleAuthorizationCodeWithTokenUrl(
+            allocator,
+            io,
+            &session,
+            "http://localhost:8085/oauth2callback?code=fake-code&state=wrong-state",
+            token_url,
+        ),
+    );
 }
 
 test "loadOAuthClientCredentials falls back to public Anthropic client id for invalid configured values" {
@@ -1567,7 +2239,7 @@ test "parseAuthorizationInput accepts full callback URLs with fragments and quot
     try std.testing.expectEqualStrings("9geviroXK7Sa3j6MjojixMzGOWHRCvszOAKSbWCulSg", parsed.state.?);
 }
 
-test "formatOAuthClientConfigError references oauth.json guidance" {
+test "formatOAuthClientConfigError references safe client config guidance" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1589,6 +2261,8 @@ test "formatOAuthClientConfigError references oauth.json guidance" {
     defer allocator.free(message);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "oauth.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "oauth-clients.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "auth.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "\"client_secret\"") != null);
 }
 
@@ -1609,6 +2283,197 @@ test "buildApiKeyFromStoredEntry encodes google oauth credentials as provider js
 
     try std.testing.expect(std.mem.indexOf(u8, api_key, "\"token\":\"access-token\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, api_key, "\"projectId\":\"project-123\"") != null);
+}
+
+test "valid stored OAuth credentials resolve without refresh for supported families" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const future_expires = currentTimeMs(io) + std.time.ms_per_hour;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var anthropic = try makeOAuthTestObject(allocator, "anthropic-access", "anthropic-refresh", future_expires, null);
+    defer deinitOAuthTestObject(allocator, &anthropic);
+    const anthropic_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        null,
+        "anthropic",
+        anthropic,
+        .{ .anthropic_token_url = "http://127.0.0.1:1" },
+    )).?;
+    defer allocator.free(anthropic_key);
+    try std.testing.expectEqualStrings("anthropic-access", anthropic_key);
+
+    var copilot = try makeOAuthTestObject(allocator, "copilot-access", "copilot-refresh", future_expires, null);
+    defer deinitOAuthTestObject(allocator, &copilot);
+    const copilot_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        null,
+        "github-copilot",
+        copilot,
+        .{ .github_copilot_token_url = "http://127.0.0.1:1" },
+    )).?;
+    defer allocator.free(copilot_key);
+    try std.testing.expectEqualStrings("copilot-access", copilot_key);
+
+    var codex = try makeOAuthTestObject(allocator, "codex-access", "codex-refresh", future_expires, null);
+    defer deinitOAuthTestObject(allocator, &codex);
+    const codex_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        null,
+        "openai-codex",
+        codex,
+        .{ .openai_codex_token_url = "http://127.0.0.1:1" },
+    )).?;
+    defer allocator.free(codex_key);
+    try std.testing.expectEqualStrings("codex-access", codex_key);
+
+    var google = try makeOAuthTestObject(allocator, "google-access", "google-refresh", future_expires, "project-123");
+    defer deinitOAuthTestObject(allocator, &google);
+    const google_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        null,
+        "google-gemini-cli",
+        google,
+        .{ .google_token_url = "http://127.0.0.1:1" },
+    )).?;
+    defer allocator.free(google_key);
+    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"token\":\"google-access\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"projectId\":\"project-123\"") != null);
+}
+
+test "expired stored OAuth credentials refresh before use and persist refreshed tokens" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const google_client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CLIENT_CONFIG_FILE_NAME });
+    defer allocator.free(google_client_config_path);
+    try common.writeFileAbsolute(
+        io,
+        google_client_config_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "google-client-id",
+        \\    "client_secret": "google-client-secret"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "auth.json" });
+    defer allocator.free(auth_path);
+
+    var anthropic_server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"anthropic-new\",\"refresh_token\":\"anthropic-refresh-new\",\"expires_in\":3600}");
+    defer anthropic_server.deinit();
+    try anthropic_server.start();
+    const anthropic_url = try anthropic_server.url(allocator);
+    defer allocator.free(anthropic_url);
+    var anthropic = try makeOAuthTestObject(allocator, "anthropic-old", "anthropic-refresh-old", 0, null);
+    defer deinitOAuthTestObject(allocator, &anthropic);
+    const anthropic_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        auth_path,
+        "anthropic",
+        anthropic,
+        .{ .anthropic_token_url = anthropic_url },
+    )).?;
+    defer allocator.free(anthropic_key);
+    try std.testing.expectEqualStrings("anthropic-new", anthropic_key);
+
+    var copilot_server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"token\":\"copilot-new\",\"expires_at\":4102444800}");
+    defer copilot_server.deinit();
+    try copilot_server.start();
+    const copilot_url = try copilot_server.url(allocator);
+    defer allocator.free(copilot_url);
+    var copilot = try makeOAuthTestObject(allocator, "copilot-old", "copilot-refresh-old", 0, null);
+    defer deinitOAuthTestObject(allocator, &copilot);
+    const copilot_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        auth_path,
+        "github-copilot",
+        copilot,
+        .{ .github_copilot_token_url = copilot_url },
+    )).?;
+    defer allocator.free(copilot_key);
+    try std.testing.expectEqualStrings("copilot-new", copilot_key);
+
+    const codex_access = try buildTestOpenAICodexAccessToken(allocator, "acc_refresh");
+    defer allocator.free(codex_access);
+    const codex_response = try std.fmt.allocPrint(
+        allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"codex-refresh-new\",\"expires_in\":3600}}",
+        .{codex_access},
+    );
+    defer allocator.free(codex_response);
+    var codex_server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", codex_response);
+    defer codex_server.deinit();
+    try codex_server.start();
+    const codex_url = try codex_server.url(allocator);
+    defer allocator.free(codex_url);
+    var codex = try makeOAuthTestObject(allocator, "codex-old", "codex-refresh-old", 0, null);
+    defer deinitOAuthTestObject(allocator, &codex);
+    const codex_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        auth_path,
+        "openai-codex",
+        codex,
+        .{ .openai_codex_token_url = codex_url },
+    )).?;
+    defer allocator.free(codex_key);
+    try std.testing.expectEqualStrings(codex_access, codex_key);
+
+    var google_server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"google-new\",\"refresh_token\":\"google-refresh-new\",\"expires_in\":3600}");
+    defer google_server.deinit();
+    try google_server.start();
+    const google_url = try google_server.url(allocator);
+    defer allocator.free(google_url);
+    var google = try makeOAuthTestObject(allocator, "google-old", "google-refresh-old", 0, "project-123");
+    defer deinitOAuthTestObject(allocator, &google);
+    const google_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        auth_path,
+        "google-gemini-cli",
+        google,
+        .{ .google_token_url = google_url },
+    )).?;
+    defer allocator.free(google_key);
+    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"token\":\"google-new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"projectId\":\"project-123\"") != null);
+
+    const persisted = try std.Io.Dir.readFileAlloc(.cwd(), io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "anthropic-new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "copilot-new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, codex_access) != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "google-new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "project-123") != null);
 }
 
 test "isApiKeyLoginProvider keeps built-in API key providers separate from OAuth-only providers" {
@@ -1663,6 +2528,58 @@ test "resolveApiKey falls back to stored then environment credentials" {
     try std.testing.expectEqual(CredentialSource.environment, env_only.source);
     try std.testing.expectEqualStrings("env-openai-key", env_only.api_key);
     try std.testing.expect(env_only.owned_api_key != null);
+}
+
+test "resolveApiKey matches TypeScript environment fallback order for auth families" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COPILOT_GITHUB_TOKEN", "copilot-token");
+    try env_map.put("GH_TOKEN", "gh-token");
+    try env_map.put("GITHUB_TOKEN", "github-token");
+    try env_map.put("ANTHROPIC_OAUTH_TOKEN", "anthropic-oauth-token");
+    try env_map.put("ANTHROPIC_API_KEY", "anthropic-api-key");
+    try env_map.put("OPENAI_API_KEY", "openai-key");
+    try env_map.put("GEMINI_API_KEY", "google-key");
+
+    const copilot = (try resolveApiKey(allocator, std.testing.io, &env_map, "github-copilot", null, null)).?;
+    defer if (copilot.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.environment, copilot.source);
+    try std.testing.expectEqualStrings("copilot-token", copilot.api_key);
+
+    const anthropic = (try resolveApiKey(allocator, std.testing.io, &env_map, "anthropic", null, null)).?;
+    defer if (anthropic.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.environment, anthropic.source);
+    try std.testing.expectEqualStrings("anthropic-oauth-token", anthropic.api_key);
+
+    const codex = (try resolveApiKey(allocator, std.testing.io, &env_map, "openai-codex", null, null)).?;
+    defer if (codex.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.environment, codex.source);
+    try std.testing.expectEqualStrings("openai-key", codex.api_key);
+
+    const google = (try resolveApiKey(allocator, std.testing.io, &env_map, "google", null, null)).?;
+    defer if (google.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.environment, google.source);
+    try std.testing.expectEqualStrings("google-key", google.api_key);
+
+    var expired = try makeOAuthTestObject(allocator, "expired-access", "expired-refresh", 0, null);
+    defer deinitOAuthTestObject(allocator, &expired);
+    const failed_stored = try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        std.testing.io,
+        &env_map,
+        null,
+        "anthropic",
+        expired,
+        .{ .anthropic_token_url = "http://127.0.0.1:1" },
+    );
+    try std.testing.expect(failed_stored == null);
+
+    const fallback = (try resolveApiKey(allocator, std.testing.io, &env_map, "anthropic", null, null)).?;
+    defer if (fallback.owned_api_key) |value| allocator.free(value);
+    try std.testing.expectEqual(CredentialSource.environment, fallback.source);
+    try std.testing.expectEqualStrings("anthropic-oauth-token", fallback.api_key);
 }
 
 test "upsertStoredCredential and listStoredProviders persist oauth state" {
@@ -1736,6 +2653,68 @@ test "listStoredProviders includes built-in API key credentials" {
     try std.testing.expectEqualStrings("openai", providers[0].id);
     try std.testing.expectEqualStrings("OpenAI", providers[0].name);
     try std.testing.expectEqual(ProviderAuthType.api_key, providers[0].auth_type);
+}
+
+test "stored OpenAI Codex OAuth credentials are distinct from OpenAI API key credentials" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const auth_path = try std.fs.path.resolve(allocator, &[_][]const u8{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "agent",
+        "auth.json",
+    });
+    defer allocator.free(auth_path);
+
+    var openai_key = StoredCredential{
+        .api_key = try allocator.dupe(u8, "openai-api-key"),
+    };
+    defer openai_key.deinit(allocator);
+    try upsertStoredCredential(allocator, std.testing.io, auth_path, "openai", &openai_key);
+
+    var codex_oauth = StoredCredential{
+        .oauth = .{
+            .access = try allocator.dupe(u8, "codex-access-token"),
+            .refresh = try allocator.dupe(u8, "codex-refresh-token"),
+            .expires = 1234,
+        },
+    };
+    defer codex_oauth.deinit(allocator);
+    try upsertStoredCredential(allocator, std.testing.io, auth_path, "openai-codex", &codex_oauth);
+
+    const providers = try listStoredProviders(allocator, std.testing.io, auth_path);
+    defer allocator.free(providers);
+
+    var saw_openai_api_key = false;
+    var saw_codex_oauth = false;
+    for (providers) |provider| {
+        if (std.mem.eql(u8, provider.id, "openai")) {
+            saw_openai_api_key = true;
+            try std.testing.expectEqual(ProviderAuthType.api_key, provider.auth_type);
+            try std.testing.expectEqualStrings("OpenAI", provider.name);
+        }
+        if (std.mem.eql(u8, provider.id, "openai-codex")) {
+            saw_codex_oauth = true;
+            try std.testing.expectEqual(ProviderAuthType.oauth, provider.auth_type);
+            try std.testing.expectEqualStrings("ChatGPT Plus/Pro (Codex Subscription)", provider.name);
+        }
+    }
+    try std.testing.expect(saw_openai_api_key);
+    try std.testing.expect(saw_codex_oauth);
+
+    const saved = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"openai-api-key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"openai-codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"codex-access-token\"") != null);
 }
 
 test "auth storage lock serializes concurrent writes" {
@@ -1824,6 +2803,55 @@ fn persistCredentialInThread(args: PersistCredentialThreadArgs) !void {
     defer credential.deinit(allocator);
 
     try upsertStoredCredential(allocator, std.testing.io, args.auth_path, "anthropic", &credential);
+}
+
+fn buildTestOpenAICodexAccessToken(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    const header = "{\"alg\":\"none\",\"typ\":\"JWT\"}";
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"{s}\":{{\"chatgpt_account_id\":\"{s}\"}}}}",
+        .{ OPENAI_CODEX_AUTH_CLAIM, account_id },
+    );
+    defer allocator.free(payload);
+
+    const encoded_header = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(header.len));
+    defer allocator.free(encoded_header);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded_header, header);
+
+    const encoded_payload = try allocator.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload.len));
+    defer allocator.free(encoded_payload);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded_payload, payload);
+
+    return std.fmt.allocPrint(allocator, "{s}.{s}.signature", .{ encoded_header, encoded_payload });
+}
+
+fn makeOAuthTestObject(
+    allocator: std.mem.Allocator,
+    access: []const u8,
+    refresh: []const u8,
+    expires: i64,
+    project_id: ?[]const u8,
+) !std.json.ObjectMap {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const cleanup_value: std.json.Value = .{ .object = object };
+        common.deinitJsonValue(allocator, cleanup_value);
+    }
+
+    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "oauth") });
+    try object.put(allocator, try allocator.dupe(u8, "access"), .{ .string = try allocator.dupe(u8, access) });
+    try object.put(allocator, try allocator.dupe(u8, "refresh"), .{ .string = try allocator.dupe(u8, refresh) });
+    try object.put(allocator, try allocator.dupe(u8, "expires"), .{ .integer = expires });
+    if (project_id) |value| {
+        try object.put(allocator, try allocator.dupe(u8, "projectId"), .{ .string = try allocator.dupe(u8, value) });
+    }
+    return object;
+}
+
+fn deinitOAuthTestObject(allocator: std.mem.Allocator, object: *std.json.ObjectMap) void {
+    const cleanup_value: std.json.Value = .{ .object = object.* };
+    common.deinitJsonValue(allocator, cleanup_value);
+    object.* = undefined;
 }
 
 fn makeAuthTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {

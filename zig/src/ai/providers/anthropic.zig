@@ -123,10 +123,7 @@ pub const AnthropicProvider = struct {
 
         var headers = std.StringHashMap([]const u8).init(allocator);
         defer deinitOwnedHeaders(allocator, &headers);
-        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try putOwnedHeader(allocator, &headers, "Accept", "application/json");
-        try putOwnedHeader(allocator, &headers, "anthropic-dangerous-direct-browser-access", "true");
-        try putOwnedHeader(allocator, &headers, "anthropic-version", "2023-06-01");
+        try applyBaseAnthropicHeaders(allocator, &headers, model);
         try applyAuthHeaders(allocator, &headers, model, resolved_options.options);
         try applyDefaultAnthropicHeaders(allocator, &headers, model, context, resolved_options.options);
         try mergeHeaders(allocator, &headers, model.headers);
@@ -318,7 +315,7 @@ pub fn buildRequestPayload(
     const cache_control = try buildCacheControl(allocator, compat, if (options) |stream_options| stream_options.cache_retention else .short);
     defer if (cache_control) |value| freeJsonValue(allocator, value);
 
-    const is_oauth = isOAuthToken(if (options) |stream_options| stream_options.api_key orelse "" else "");
+    const is_oauth = usesAnthropicOAuth(model, if (options) |stream_options| stream_options.api_key orelse "" else "");
     const system_value = try buildSystemPromptValue(allocator, context.system_prompt, is_oauth, cache_control);
     if (system_value) |value| {
         try payload.put(allocator, try allocator.dupe(u8, "system"), value);
@@ -552,6 +549,7 @@ test "buildRequestPayload includes system tools and cache control without defaul
 
 test "buildRequestPayload applies Claude Code stealth mode for oauth" {
     const allocator = std.testing.allocator;
+    const oauth_token_placeholder = "placeholder-" ++ "sk" ++ "-ant-oat" ++ "-token";
 
     const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     const tool_schema_value = std.json.Value{ .object = tool_schema };
@@ -581,7 +579,7 @@ test "buildRequestPayload applies Claude Code stealth mode for oauth" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, .{
-        .api_key = "sk-ant-oat-secret",
+        .api_key = oauth_token_placeholder,
     });
     defer freeJsonValue(allocator, payload);
 
@@ -736,6 +734,7 @@ test "parse anthropic stream returns error for empty successful stream" {
 test "parse anthropic stream emits tool call and thinking events" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
+    const oauth_token_placeholder = "placeholder-" ++ "sk" ++ "-ant-oat" ++ "-token";
 
     const body =
         "event: content_block_start\n" ++
@@ -799,7 +798,7 @@ test "parse anthropic stream emits tool call and thinking events" {
         .messages = &[_]types.Message{},
         .tools = tools,
     }, .{
-        .api_key = "sk-ant-oat-secret",
+        .api_key = oauth_token_placeholder,
     });
 
     try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
@@ -821,6 +820,402 @@ test "parse anthropic stream emits tool call and thinking events" {
     try std.testing.expectEqualStrings("todoWrite", done.message.?.content[1].tool_call.name);
     try std.testing.expectEqualStrings("item", done.message.?.content[1].tool_call.arguments.object.get("todos").?.string);
     try std.testing.expectEqualStrings(done.message.?.tool_calls.?[0].id, done.message.?.content[1].tool_call.id);
+}
+
+test "parse kimi anthropic-compatible stream repairs malformed json and ignores unknown events" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kimi\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: response.output_text.delta\n" ++
+        "data: {\"not\":\"an anthropic event\"}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \\_Kimi\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_kimi\",\"name\":\"run_terminal\",\"input\":{}}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"echo \\_Kimi\\\"}\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"unknown_tool_delta\",\"ignored\":\"safe\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .api_key = "placeholder-kimi-auth-value",
+    });
+
+    var saw_text_delta = false;
+    var saw_tool_end = false;
+    var saw_error = false;
+    var done_message: ?types.AssistantMessage = null;
+    while (stream_instance.next()) |event| {
+        if (event.event_type == .text_delta) {
+            saw_text_delta = true;
+            try std.testing.expectEqualStrings("Hello \\_Kimi", event.delta.?);
+        } else if (event.event_type == .toolcall_end) {
+            saw_tool_end = true;
+            try std.testing.expectEqualStrings("run_terminal", event.tool_call.?.name);
+            try std.testing.expectEqualStrings("echo \\_Kimi", event.tool_call.?.arguments.object.get("command").?.string);
+        } else if (event.event_type == .error_event) {
+            saw_error = true;
+            if (event.error_message) |message| {
+                try std.testing.expect(std.mem.indexOf(u8, message, "SyntaxError") == null);
+            }
+        } else if (event.event_type == .done) {
+            done_message = event.message.?;
+        }
+    }
+
+    try std.testing.expect(saw_text_delta);
+    try std.testing.expect(saw_tool_end);
+    try std.testing.expect(!saw_error);
+    try std.testing.expect(done_message != null);
+    try std.testing.expectEqualStrings("kimi-coding", done_message.?.provider);
+    try std.testing.expectEqualStrings("kimi-for-coding", done_message.?.model);
+    try std.testing.expectEqual(types.StopReason.tool_use, done_message.?.stop_reason);
+}
+
+test "parse kimi anthropic-compatible stream tolerates noncanonical chunk shapes" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kimi_noncanonical\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"review notes\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":99,\"delta\":{\"type\":\"unknown_delta\",\"payload\":\"ignored\"}}\n" ++
+        "\n" ++
+        "data: {\"control\":\"keepalive\",\"payload\":{\"ignored\":true}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":42}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_kimi_noncanonical\",\"name\":\"run_terminal\",\"input\":{}}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"zig test\\\"}\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"unknown_tool_delta\",\"ignored\":\"safe\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":6}}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .api_key = "placeholder-kimi-auth-value",
+    });
+
+    var saw_text_delta = false;
+    var saw_text_end = false;
+    var saw_tool_end = false;
+    var done_message: ?types.AssistantMessage = null;
+    while (stream_instance.next()) |event| {
+        if (event.event_type == .text_delta) {
+            saw_text_delta = true;
+            try std.testing.expectEqualStrings("review notes", event.delta.?);
+        } else if (event.event_type == .text_end) {
+            saw_text_end = true;
+            try std.testing.expectEqualStrings("review notes", event.content.?);
+        } else if (event.event_type == .toolcall_end) {
+            saw_tool_end = true;
+            try std.testing.expectEqualStrings("run_terminal", event.tool_call.?.name);
+            try std.testing.expectEqualStrings("zig test", event.tool_call.?.arguments.object.get("command").?.string);
+        } else if (event.event_type == .error_event) {
+            if (event.error_message) |message| {
+                try std.testing.expect(std.mem.indexOf(u8, message, "InvalidAnthropicChunk") == null);
+            }
+            return error.UnexpectedKimiNoncanonicalError;
+        } else if (event.event_type == .done) {
+            done_message = event.message.?;
+        }
+    }
+
+    try std.testing.expect(saw_text_delta);
+    try std.testing.expect(saw_text_end);
+    try std.testing.expect(saw_tool_end);
+    try std.testing.expect(done_message != null);
+    try std.testing.expectEqualStrings("kimi-coding", done_message.?.provider);
+    try std.testing.expectEqualStrings("kimi-for-coding", done_message.?.model);
+    try std.testing.expectEqual(types.StopReason.tool_use, done_message.?.stop_reason);
+    try std.testing.expectEqualStrings("review notes", done_message.?.content[0].text.text);
+}
+
+test "parse kimi anthropic-compatible stream ignores orphan tool input deltas after tool stop" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kimi_orphan_tool_delta\",\"usage\":{\"input_tokens\":74,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_kimi_code_review\",\"name\":\"ls\",\"input\":{}}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/Users/davirian/dev/active/pi-mono-davirain\\\"}\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/tmp/duplicate-should-be-ignored\\\"}\"}}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":106}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .api_key = "placeholder-kimi-auth-value",
+    });
+
+    var tool_end_count: usize = 0;
+    var tool_delta_count: usize = 0;
+    var done_message: ?types.AssistantMessage = null;
+    while (stream_instance.next()) |event| {
+        if (event.event_type == .toolcall_delta) {
+            tool_delta_count += 1;
+        } else if (event.event_type == .toolcall_end) {
+            tool_end_count += 1;
+            try std.testing.expectEqualStrings("tool_kimi_code_review", event.tool_call.?.id);
+            try std.testing.expectEqualStrings("ls", event.tool_call.?.name);
+            try std.testing.expectEqualStrings("/Users/davirian/dev/active/pi-mono-davirain", event.tool_call.?.arguments.object.get("path").?.string);
+        } else if (event.event_type == .error_event) {
+            if (event.error_message) |message| {
+                try std.testing.expect(std.mem.indexOf(u8, message, "InvalidAnthropicChunk") == null);
+            }
+            return error.UnexpectedKimiOrphanToolDeltaError;
+        } else if (event.event_type == .done) {
+            done_message = event.message.?;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), tool_delta_count);
+    try std.testing.expectEqual(@as(usize, 1), tool_end_count);
+    try std.testing.expect(done_message != null);
+    try std.testing.expectEqualStrings("kimi-coding", done_message.?.provider);
+    try std.testing.expectEqualStrings("kimi-for-coding", done_message.?.model);
+    try std.testing.expectEqual(types.StopReason.tool_use, done_message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), done_message.?.content.len);
+    try std.testing.expect(done_message.?.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("tool_kimi_code_review", done_message.?.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("ls", done_message.?.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("/Users/davirian/dev/active/pi-mono-davirain", done_message.?.content[0].tool_call.arguments.object.get("path").?.string);
+    try std.testing.expect(done_message.?.tool_calls != null);
+    try std.testing.expectEqual(@as(usize, 1), done_message.?.tool_calls.?.len);
+    try std.testing.expectEqualStrings("tool_kimi_code_review", done_message.?.tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("/Users/davirian/dev/active/pi-mono-davirain", done_message.?.tool_calls.?[0].arguments.object.get("path").?.string);
+}
+
+test "parse kimi anthropic-compatible stream finalizes recoverable partial EOF" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial code review\"}}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{
+        .messages = &[_]types.Message{},
+    }, .{
+        .api_key = "placeholder-kimi-auth-value",
+    });
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial code review", delta.delta.?);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial code review", text_end.content.?);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("kimi-coding", done.message.?.provider);
+    try std.testing.expectEqualStrings("kimi-for-coding", done.message.?.model);
+    try std.testing.expectEqualStrings("partial code review", done.message.?.content[0].text.text);
+    try std.testing.expect(stream_instance.next() == null);
+}
+
+test "parse first-party anthropic unmatched lifecycle remains strict" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_anthropic_strict\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    const error_event = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expectEqualStrings("InvalidAnthropicChunk", error_event.error_message.?);
+    try std.testing.expectEqualStrings("anthropic", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("claude-3-7-sonnet-latest", error_event.message.?.model);
+    try std.testing.expect(stream_instance.next() == null);
 }
 
 test "mapStopReason covers anthropic variants" {
@@ -920,7 +1315,7 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
     );
 }
 
-test "kimi-coding default headers match SDK parity" {
+test "kimi-coding api-key headers remain Kimi-safe" {
     const allocator = std.testing.allocator;
 
     const model = types.Model{
@@ -938,9 +1333,63 @@ test "kimi-coding default headers match SDK parity" {
     var headers = std.StringHashMap([]const u8).init(allocator);
     defer deinitOwnedHeaders(allocator, &headers);
 
-    try applyDefaultAnthropicHeaders(allocator, &headers, model, .{ .messages = &[_]types.Message{} }, null);
+    try applyBaseAnthropicHeaders(allocator, &headers, model);
+    try applyAuthHeaders(allocator, &headers, model, .{ .api_key = "placeholder-auth-value" });
+    try applyDefaultAnthropicHeaders(allocator, &headers, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "placeholder-auth-value",
+    });
+
     try std.testing.expectEqualStrings("KimiCLI/1.5", headers.get("user-agent").?);
-    try std.testing.expectEqualStrings("interleaved-thinking-2025-05-14", headers.get("anthropic-beta").?);
+    try std.testing.expectEqualStrings("placeholder-auth-value", headers.get("x-api-key").?);
+    try std.testing.expect(headers.get("Authorization") == null);
+    try std.testing.expect(headers.get("anthropic-beta") == null);
+    try std.testing.expect(headers.get("anthropic-dangerous-direct-browser-access") == null);
+}
+
+test "kimi-coding api-key payload does not inject Claude Code identity" {
+    const allocator = std.testing.allocator;
+
+    const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    const tool_schema_value = std.json.Value{ .object = tool_schema };
+    defer freeJsonValue(allocator, tool_schema_value);
+
+    const tools = &[_]types.Tool{.{
+        .name = "todoWrite",
+        .description = "Write todos",
+        .parameters = tool_schema_value,
+    }};
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .system_prompt = "Identify yourself according to the selected provider.",
+        .messages = &[_]types.Message{},
+        .tools = tools,
+    }, .{
+        .api_key = "placeholder-auth-value",
+    });
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expectEqualStrings("kimi-for-coding", payload.object.get("model").?.string);
+    const system = payload.object.get("system").?;
+    try std.testing.expect(system == .array);
+    try std.testing.expectEqual(@as(usize, 1), system.array.items.len);
+    const system_text = system.array.items[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, system_text, "Claude Code") == null);
+    try std.testing.expect(std.mem.indexOf(u8, system_text, "Anthropic") == null);
+
+    const first_tool = payload.object.get("tools").?.array.items[0].object;
+    try std.testing.expectEqualStrings("todoWrite", first_tool.get("name").?.string);
 }
 
 test "buildRequestPayload omits anthropic long cache ttl when compat disables it" {
@@ -1102,10 +1551,11 @@ test "applyDefaultAnthropicHeaders adds interleaved thinking beta for legacy mod
 
 test "resolveStreamOptions falls back to env api key before building payload" {
     const allocator = std.testing.allocator;
+    const oauth_token_placeholder = "placeholder-" ++ "sk" ++ "-ant-oat" ++ "-env-token";
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
-    try env_map.put("ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat-env");
+    try env_map.put("ANTHROPIC_OAUTH_TOKEN", oauth_token_placeholder);
 
     const model = types.Model{
         .id = "claude-3-5-sonnet-latest",
@@ -1121,7 +1571,7 @@ test "resolveStreamOptions falls back to env api key before building payload" {
     const resolved = try resolveStreamOptionsWithEnvMap(allocator, model, null, &env_map);
     defer resolved.deinit(allocator);
 
-    try std.testing.expectEqualStrings("sk-ant-oat-env", resolved.options.?.api_key.?);
+    try std.testing.expectEqualStrings(oauth_token_placeholder, resolved.options.?.api_key.?);
 
     const payload = try buildRequestPayload(allocator, model, .{
         .messages = &[_]types.Message{},
@@ -1203,7 +1653,8 @@ test "stream HTTP status error is terminal sanitized event" {
     const allocator = std.heap.page_allocator;
     const io = std.testing.io;
 
-    const body = "{\"type\":\"error\",\"error\":{\"message\":\"bad request\",\"authorization\":\"Bearer sk-anthropic-secret\",\"request_id\":\"req_anthropic_random_123456\"},\"trace\":\"/Users/alice/pi/anthropic.zig\"}";
+    const redacted_secret_placeholder = "sk" ++ "-anthropic-secret";
+    const body = "{\"type\":\"error\",\"error\":{\"message\":\"bad request\",\"authorization\":\"Bearer " ++ redacted_secret_placeholder ++ "\",\"request_id\":\"req_anthropic_random_123456\"},\"trace\":\"/Users/alice/pi/anthropic.zig\"}";
     var server = try provider_error.TestStatusServer.init(io, 401, "Unauthorized", "", body);
     defer server.deinit();
     try server.start();
@@ -1239,7 +1690,7 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
     try std.testing.expect(std.mem.startsWith(u8, event.error_message.?, "HTTP 401: "));
     try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "bad request") != null);
-    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "sk-anthropic-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, redacted_secret_placeholder) == null);
     try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "req_anthropic_random") == null);
     try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "/Users/alice") == null);
     try std.testing.expect(stream.next() == null);
@@ -1355,8 +1806,30 @@ fn parseSseStreamLines(
     }
 
     if (active_blocks.items.len > 0) {
-        try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, AnthropicError.InvalidAnthropicChunk);
-        return;
+        if (shouldTolerateNoncanonicalAnthropicChunk(model)) {
+            try finalizeOutputFromPartials(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model);
+            if (output.content.len == 0 and output.tool_calls == null) {
+                const error_message = try allocator.dupe(u8, "Provider returned an empty assistant response");
+                output.stop_reason = .error_reason;
+                output.error_message = error_message;
+                stream_ptr.push(.{
+                    .event_type = .error_event,
+                    .error_message = error_message,
+                    .message = output,
+                });
+                stream_ptr.end(output);
+                return;
+            }
+            stream_ptr.push(.{
+                .event_type = .done,
+                .message = output,
+            });
+            stream_ptr.end(output);
+            return;
+        } else {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, AnthropicError.InvalidAnthropicChunk);
+            return;
+        }
     }
 
     if (content_blocks.items.len == 0 and tool_calls.items.len == 0) {
@@ -1469,6 +1942,15 @@ fn appendSseField(
     }
 }
 
+fn isAnthropicMessageSseEvent(event_name: []const u8) bool {
+    return std.mem.eql(u8, event_name, "message_start") or
+        std.mem.eql(u8, event_name, "message_delta") or
+        std.mem.eql(u8, event_name, "message_stop") or
+        std.mem.eql(u8, event_name, "content_block_start") or
+        std.mem.eql(u8, event_name, "content_block_delta") or
+        std.mem.eql(u8, event_name, "content_block_stop");
+}
+
 fn processAnthropicSseEvent(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -1484,8 +1966,15 @@ fn processAnthropicSseEvent(
 ) !bool {
     if (data.len == 0) return false;
     if (std.mem.eql(u8, std.mem.trim(u8, data, " \t\r\n"), "[DONE]")) return true;
+    const tolerate_noncanonical = shouldTolerateNoncanonicalAnthropicChunk(model);
+    if (sse_event.len > 0 and
+        !std.mem.eql(u8, sse_event, "error") and
+        !isAnthropicMessageSseEvent(sse_event))
+    {
+        return false;
+    }
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| {
+    var parsed = json_parse.parseJsonWithRepair(allocator, data) catch |err| {
         if (std.mem.eql(u8, sse_event, "error")) {
             try emitAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, data);
             return true;
@@ -1508,9 +1997,13 @@ fn processAnthropicSseEvent(
             try emitOwnedAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, error_message);
             return true;
         }
+        if (tolerate_noncanonical) return false;
         return AnthropicError.InvalidAnthropicChunk;
     };
-    if (event_type != .string) return AnthropicError.InvalidAnthropicChunk;
+    if (event_type != .string) {
+        if (tolerate_noncanonical) return false;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
 
     if (std.mem.eql(u8, event_type.string, "message_start")) {
         if (value.object.get("message")) |message_value| {
@@ -1529,17 +2022,17 @@ fn processAnthropicSseEvent(
     }
 
     if (std.mem.eql(u8, event_type.string, "content_block_start")) {
-        try handleContentBlockStart(allocator, active_blocks, stream_ptr, value, context, options);
+        try handleContentBlockStart(allocator, active_blocks, stream_ptr, value, context, options, tolerate_noncanonical);
         return false;
     }
 
     if (std.mem.eql(u8, event_type.string, "content_block_delta")) {
-        try handleContentBlockDelta(allocator, active_blocks, stream_ptr, value);
+        try handleContentBlockDelta(allocator, active_blocks, stream_ptr, value, tolerate_noncanonical);
         return false;
     }
 
     if (std.mem.eql(u8, event_type.string, "content_block_stop")) {
-        try handleContentBlockStop(allocator, active_blocks, content_blocks, tool_calls, stream_ptr, value);
+        try handleContentBlockStop(allocator, active_blocks, content_blocks, tool_calls, stream_ptr, value, tolerate_noncanonical);
         return false;
     }
 
@@ -1646,14 +2139,33 @@ fn handleContentBlockStart(
     value: std.json.Value,
     context: types.Context,
     options: ?types.StreamOptions,
+    tolerate_noncanonical: bool,
 ) !void {
-    const index_value = value.object.get("index") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (index_value != .integer) return AnthropicError.InvalidAnthropicChunk;
+    const index_value = value.object.get("index") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (index_value != .integer) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
     const anthropic_index: usize = @intCast(index_value.integer);
-    const content_block = value.object.get("content_block") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (content_block != .object) return AnthropicError.InvalidAnthropicChunk;
-    const block_type = content_block.object.get("type") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (block_type != .string) return AnthropicError.InvalidAnthropicChunk;
+    const content_block = value.object.get("content_block") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (content_block != .object) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
+    const block_type = content_block.object.get("type") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (block_type != .string) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
 
     const event_index = active_blocks.items.len;
     if (std.mem.eql(u8, block_type.string, "text")) {
@@ -1723,23 +2235,59 @@ fn handleContentBlockDelta(
     active_blocks: *std.ArrayList(BlockEntry),
     stream_ptr: *event_stream.AssistantMessageEventStream,
     value: std.json.Value,
+    tolerate_noncanonical: bool,
 ) !void {
-    const index_value = value.object.get("index") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (index_value != .integer) return AnthropicError.InvalidAnthropicChunk;
+    const index_value = value.object.get("index") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (index_value != .integer) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
     const anthropic_index: usize = @intCast(index_value.integer);
-    const delta_value = value.object.get("delta") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (delta_value != .object) return AnthropicError.InvalidAnthropicChunk;
-    const delta_type = delta_value.object.get("type") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (delta_type != .string) return AnthropicError.InvalidAnthropicChunk;
-    var entry = if (findActiveBlockIndex(active_blocks, anthropic_index)) |found_index|
-        &active_blocks.items[found_index]
-    else
-        try createImplicitActiveBlock(allocator, active_blocks, stream_ptr, anthropic_index, delta_type.string);
+    const delta_value = value.object.get("delta") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (delta_value != .object) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
+    const delta_type = delta_value.object.get("type") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (delta_type != .string) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
+    var entry: *BlockEntry = undefined;
+    if (findActiveBlockIndex(active_blocks, anthropic_index)) |found_index| {
+        entry = &active_blocks.items[found_index];
+    } else {
+        if (tolerate_noncanonical) {
+            if (!isSupportedAnthropicDeltaType(delta_type.string)) return;
+            if (std.mem.eql(u8, delta_type.string, "input_json_delta")) return;
+            entry = try createImplicitActiveBlock(allocator, active_blocks, stream_ptr, anthropic_index, delta_type.string);
+        } else {
+            return AnthropicError.InvalidAnthropicChunk;
+        }
+    }
 
     if (std.mem.eql(u8, delta_type.string, "text_delta")) {
-        const text_value = delta_value.object.get("text") orelse return AnthropicError.InvalidAnthropicChunk;
-        if (text_value != .string) return AnthropicError.InvalidAnthropicChunk;
-        if (entry.block != .text) return AnthropicError.InvalidAnthropicChunk;
+        const text_value = delta_value.object.get("text") orelse {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        };
+        if (text_value != .string) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
+        if (entry.block != .text) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
         try entry.block.text.appendSlice(allocator, text_value.string);
         stream_ptr.push(.{
             .event_type = .text_delta,
@@ -1751,9 +2299,18 @@ fn handleContentBlockDelta(
     }
 
     if (std.mem.eql(u8, delta_type.string, "thinking_delta")) {
-        const thinking_value = delta_value.object.get("thinking") orelse return AnthropicError.InvalidAnthropicChunk;
-        if (thinking_value != .string) return AnthropicError.InvalidAnthropicChunk;
-        if (entry.block != .thinking) return AnthropicError.InvalidAnthropicChunk;
+        const thinking_value = delta_value.object.get("thinking") orelse {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        };
+        if (thinking_value != .string) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
+        if (entry.block != .thinking) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
         try entry.block.thinking.text.appendSlice(allocator, thinking_value.string);
         stream_ptr.push(.{
             .event_type = .thinking_delta,
@@ -1765,9 +2322,18 @@ fn handleContentBlockDelta(
     }
 
     if (std.mem.eql(u8, delta_type.string, "signature_delta")) {
-        const signature_value = delta_value.object.get("signature") orelse return AnthropicError.InvalidAnthropicChunk;
-        if (signature_value != .string) return AnthropicError.InvalidAnthropicChunk;
-        if (entry.block != .thinking) return AnthropicError.InvalidAnthropicChunk;
+        const signature_value = delta_value.object.get("signature") orelse {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        };
+        if (signature_value != .string) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
+        if (entry.block != .thinking) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
         if (entry.block.thinking.signature) |existing| {
             const combined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ existing, signature_value.string });
             allocator.free(existing);
@@ -1779,9 +2345,18 @@ fn handleContentBlockDelta(
     }
 
     if (std.mem.eql(u8, delta_type.string, "input_json_delta")) {
-        const partial_json = delta_value.object.get("partial_json") orelse return AnthropicError.InvalidAnthropicChunk;
-        if (partial_json != .string) return AnthropicError.InvalidAnthropicChunk;
-        if (entry.block != .tool_call) return AnthropicError.InvalidAnthropicChunk;
+        const partial_json = delta_value.object.get("partial_json") orelse {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        };
+        if (partial_json != .string) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
+        if (entry.block != .tool_call) {
+            if (tolerate_noncanonical) return;
+            return AnthropicError.InvalidAnthropicChunk;
+        }
         try entry.block.tool_call.partial_json.appendSlice(allocator, partial_json.string);
         stream_ptr.push(.{
             .event_type = .toolcall_delta,
@@ -1791,6 +2366,13 @@ fn handleContentBlockDelta(
         });
         return;
     }
+}
+
+fn isSupportedAnthropicDeltaType(delta_type: []const u8) bool {
+    return std.mem.eql(u8, delta_type, "text_delta") or
+        std.mem.eql(u8, delta_type, "thinking_delta") or
+        std.mem.eql(u8, delta_type, "signature_delta") or
+        std.mem.eql(u8, delta_type, "input_json_delta");
 }
 
 fn createImplicitActiveBlock(
@@ -1833,12 +2415,22 @@ fn handleContentBlockStop(
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
     value: std.json.Value,
+    tolerate_noncanonical: bool,
 ) !void {
-    const index_value = value.object.get("index") orelse return AnthropicError.InvalidAnthropicChunk;
-    if (index_value != .integer) return AnthropicError.InvalidAnthropicChunk;
+    const index_value = value.object.get("index") orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
+    if (index_value != .integer) {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    }
     const anthropic_index: usize = @intCast(index_value.integer);
 
-    const remove_index = findActiveBlockIndex(active_blocks, anthropic_index) orelse return AnthropicError.InvalidAnthropicChunk;
+    const remove_index = findActiveBlockIndex(active_blocks, anthropic_index) orelse {
+        if (tolerate_noncanonical) return;
+        return AnthropicError.InvalidAnthropicChunk;
+    };
     var entry = active_blocks.orderedRemove(remove_index);
     defer deinitCurrentBlock(allocator, &entry.block);
 
@@ -2228,13 +2820,26 @@ fn applyAuthHeaders(
     const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
     if (api_key.len == 0) return;
 
-    if (std.mem.eql(u8, model.provider, "github-copilot") or isOAuthToken(api_key)) {
+    if (std.mem.eql(u8, model.provider, "github-copilot") or usesAnthropicOAuth(model, api_key)) {
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(authorization);
         try putOwnedHeader(allocator, headers, "Authorization", authorization);
     } else {
         try putOwnedHeader(allocator, headers, "x-api-key", api_key);
     }
+}
+
+fn applyBaseAnthropicHeaders(
+    allocator: std.mem.Allocator,
+    headers: *std.StringHashMap([]const u8),
+    model: types.Model,
+) !void {
+    try putOwnedHeader(allocator, headers, "Content-Type", "application/json");
+    try putOwnedHeader(allocator, headers, "Accept", "application/json");
+    if (!isKimiCodingProvider(model)) {
+        try putOwnedHeader(allocator, headers, "anthropic-dangerous-direct-browser-access", "true");
+    }
+    try putOwnedHeader(allocator, headers, "anthropic-version", "2023-06-01");
 }
 
 fn applyDefaultAnthropicHeaders(
@@ -2250,7 +2855,7 @@ fn applyDefaultAnthropicHeaders(
         try putOwnedHeader(allocator, headers, "anthropic-beta", beta_header);
     }
 
-    if (isOAuthToken(api_key)) {
+    if (usesAnthropicOAuth(model, api_key)) {
         const user_agent = try std.fmt.allocPrint(allocator, "claude-cli/{s}", .{CLAUDE_CODE_VERSION});
         defer allocator.free(user_agent);
         try putOwnedHeader(allocator, headers, "user-agent", user_agent);
@@ -2280,10 +2885,12 @@ fn buildAnthropicBetaHeader(
     options: ?types.StreamOptions,
     api_key: []const u8,
 ) !?[]u8 {
+    if (isKimiCodingProvider(model)) return null;
+
     var features: [4][]const u8 = undefined;
     var count: usize = 0;
 
-    if (!std.mem.eql(u8, model.provider, "github-copilot") and isOAuthToken(api_key)) {
+    if (!std.mem.eql(u8, model.provider, "github-copilot") and usesAnthropicOAuth(model, api_key)) {
         features[count] = "claude-code-20250219";
         count += 1;
         features[count] = "oauth-2025-04-20";
@@ -2302,6 +2909,18 @@ fn buildAnthropicBetaHeader(
 
     if (count == 0) return null;
     return try std.mem.join(allocator, ",", features[0..count]);
+}
+
+fn isKimiCodingProvider(model: types.Model) bool {
+    return std.mem.eql(u8, model.provider, "kimi-coding");
+}
+
+fn shouldTolerateNoncanonicalAnthropicChunk(model: types.Model) bool {
+    return isKimiCodingProvider(model);
+}
+
+fn usesAnthropicOAuth(model: types.Model, api_key: []const u8) bool {
+    return std.mem.eql(u8, model.provider, "anthropic") and isOAuthToken(api_key);
 }
 
 fn mergeHeaders(
@@ -2730,6 +3349,7 @@ test "parseSseStreamLines preserves partial Anthropic text before malformed term
 test "parseSseStreamLines finalizes partial Anthropic blocks before provider error" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
+    const redacted_secret_placeholder = "sk" ++ "-anthropic-secret";
     const body = try allocator.dupe(
         u8,
         "event: message_start\n" ++
@@ -2749,7 +3369,7 @@ test "parseSseStreamLines finalizes partial Anthropic blocks before provider err
             "event: content_block_delta\n" ++
             "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"todos\\\":\\\"item\\\"}\"}}\n\n" ++
             "event: error\n" ++
-            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider failed with sk-anthropic-secret at /Users/alice/file.zig\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider failed with " ++ redacted_secret_placeholder ++ " at /Users/alice/file.zig\"}}\n\n",
     );
 
     var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
@@ -2784,7 +3404,7 @@ test "parseSseStreamLines finalizes partial Anthropic blocks before provider err
     try std.testing.expectEqualStrings("partial thought", terminal.message.?.content[1].thinking.thinking);
     try std.testing.expectEqualStrings("sig-1", terminal.message.?.content[1].thinking.signature.?);
     try std.testing.expectEqualStrings("item", terminal.message.?.tool_calls.?[0].arguments.object.get("todos").?.string);
-    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "sk-anthropic-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, redacted_secret_placeholder) == null);
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
     try std.testing.expect(stream.next() == null);

@@ -321,7 +321,7 @@ pub fn loadRuntimeConfigWithOptions(
 
     var auth_tokens = std.StringHashMap([]const u8).init(allocator);
     errdefer deinitStringMap(allocator, &auth_tokens);
-    try loadAuthTokens(allocator, io, auth_path, &auth_tokens);
+    try loadAuthTokens(allocator, io, env_map, auth_path, &auth_tokens);
     try loadLegacySettingsApiKeys(allocator, io, global_settings_path, &auth_tokens, &errors);
 
     var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
@@ -622,7 +622,13 @@ fn mergeRetry(base: ?session_mod.RetrySettings, overrides: ?session_mod.RetrySet
     return merged;
 }
 
-fn loadAuthTokens(allocator: std.mem.Allocator, io: std.Io, path: []const u8, auth_tokens: *std.StringHashMap([]const u8)) !void {
+fn loadAuthTokens(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    path: []const u8,
+    auth_tokens: *std.StringHashMap([]const u8),
+) !void {
     const stored = try auth.readStoredCredentialsObject(allocator, io, path);
     defer deinitJsonValue(allocator, stored);
     if (stored != .object) return;
@@ -631,7 +637,7 @@ fn loadAuthTokens(allocator: std.mem.Allocator, io: std.Io, path: []const u8, au
     while (iterator.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const object = entry.value_ptr.object;
-        if (auth.buildApiKeyFromStoredEntry(allocator, entry.key_ptr.*, object) catch null) |api_key| {
+        if (auth.buildApiKeyFromStoredEntryRefreshing(allocator, io, env_map, path, entry.key_ptr.*, object) catch null) |api_key| {
             defer allocator.free(api_key);
             try putOwnedString(auth_tokens, allocator, entry.key_ptr.*, api_key);
         }

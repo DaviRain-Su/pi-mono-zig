@@ -383,6 +383,29 @@ pub fn runInteractiveMode(
             now_ms,
         );
 
+        slash_commands.pollAuthFlowCallback(
+            allocator,
+            io,
+            env_map,
+            &bootstrap.session,
+            &bootstrap.current_provider,
+            options,
+            &app_state,
+            &editor,
+            &auth_flow,
+            &live_resources,
+        ) catch |err| {
+            const auth_message = try auth.formatAuthenticationError(allocator, err);
+            defer if (auth_message) |formatted| allocator.free(formatted);
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "Authentication failed: {s}",
+                .{if (auth_message) |formatted| formatted else @errorName(err)},
+            );
+            defer allocator.free(message);
+            try app_state.appendError(message);
+        };
+
         if (app_state.takeTerminalProgressUpdate()) |active| {
             if (showTerminalProgress(live_resources.runtime_config)) {
                 try writeTerminalProgress(&terminal, active);
@@ -2023,15 +2046,30 @@ test "handleLoginSlashCommand opens auth provider selector" {
     try std.testing.expectEqual(AuthOverlayMode.login, overlay.?.auth.mode);
     try std.testing.expect(overlay.?.auth.items.len > 3);
     try std.testing.expectEqualStrings("anthropic", overlay.?.auth.items[0].value);
+    try std.testing.expectEqualStrings("Anthropic (Claude Pro/Max)", overlay.?.auth.items[0].label);
+    try std.testing.expectEqualStrings("OAuth login", overlay.?.auth.items[0].description.?);
 
+    var saw_copilot = false;
+    var saw_codex_subscription = false;
     var saw_openai = false;
     for (overlay.?.auth.items) |item| {
+        if (std.mem.eql(u8, item.value, "github-copilot")) {
+            saw_copilot = true;
+            try std.testing.expectEqualStrings("GitHub Copilot", item.label);
+            try std.testing.expectEqualStrings("OAuth login", item.description.?);
+        }
+        if (std.mem.eql(u8, item.value, "openai-codex") and std.mem.eql(u8, item.description.?, "OAuth login")) {
+            saw_codex_subscription = true;
+            try std.testing.expectEqualStrings("ChatGPT Plus/Pro (Codex Subscription)", item.label);
+        }
         if (std.mem.eql(u8, item.value, "openai")) {
             saw_openai = true;
             try std.testing.expectEqualStrings("OpenAI", item.label);
             try std.testing.expectEqualStrings("API key login", item.description.?);
         }
     }
+    try std.testing.expect(saw_copilot);
+    try std.testing.expect(saw_codex_subscription);
     try std.testing.expect(saw_openai);
 }
 
@@ -2043,19 +2081,6 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
 
     const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
     defer allocator.free(agent_dir);
-    const oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
-    defer allocator.free(oauth_path);
-    try common.writeFileAbsolute(
-        std.testing.io,
-        oauth_path,
-        \\{
-        \\  "anthropic": {
-        \\    "client_id": "anthropic-client-id"
-        \\  }
-        \\}
-    ,
-        true,
-    );
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
@@ -2084,7 +2109,13 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
     try std.testing.expect(slash_commands.test_auth_flow != null);
     try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
     try std.testing.expectEqual(auth.BrowserLoginKind.anthropic, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expectEqualStrings(
+        "http://localhost:53692/callback",
+        slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+    );
     try std.testing.expect(browser_open_capture.called);
+    try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback") != null);
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
@@ -2092,7 +2123,119 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Anthropic (Claude Pro/Max) login started") != null);
 }
 
-test "beginLoginFlow shows oauth.json guidance when oauth client config is missing" {
+test "beginLoginFlow falls back to manual paste when OAuth callback listener bind fails" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var blocker: ?std.Io.net.Server = std.Io.net.IpAddress.listen(
+        &.{ .ip4 = .loopback(auth.defaultOAuthCallbackPort(.anthropic)) },
+        std.testing.io,
+        .{ .reuse_address = false },
+    ) catch |err| switch (err) {
+        error.AddressInUse => null,
+        else => return err,
+    };
+    defer if (blocker) |*server| server.deinit(std.testing.io);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    slash_commands.test_auth_flow = null;
+    defer if (slash_commands.test_auth_flow) |*value| {
+        value.deinit(allocator);
+        slash_commands.test_auth_flow = null;
+    };
+    var browser_open_capture = BrowserOpenCapture{};
+    const previous_browser_open_context = slash_commands.open_browser_context;
+    const previous_browser_open_fn = slash_commands.open_browser_fn;
+    slash_commands.open_browser_context = &browser_open_capture;
+    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    defer {
+        slash_commands.open_browser_context = previous_browser_open_context;
+        slash_commands.open_browser_fn = previous_browser_open_fn;
+    }
+
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
+
+    try std.testing.expect(slash_commands.test_auth_flow != null);
+    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
+    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener == null);
+    try std.testing.expect(browser_open_capture.called);
+    try std.testing.expectEqualStrings(
+        "Local callback listener unavailable. Paste the callback URL manually, or Esc to cancel",
+        state.status,
+    );
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Could not start the local callback listener") != null);
+}
+
+test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    slash_commands.test_auth_flow = null;
+    defer if (slash_commands.test_auth_flow) |*value| {
+        value.deinit(allocator);
+        slash_commands.test_auth_flow = null;
+    };
+    var browser_open_capture = BrowserOpenCapture{};
+    const previous_browser_open_context = slash_commands.open_browser_context;
+    const previous_browser_open_fn = slash_commands.open_browser_fn;
+    slash_commands.open_browser_context = &browser_open_capture;
+    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    defer {
+        slash_commands.open_browser_context = previous_browser_open_context;
+        slash_commands.open_browser_fn = previous_browser_open_fn;
+    }
+
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "openai-codex", .oauth, &state, &slash_commands.test_auth_flow);
+
+    try std.testing.expect(slash_commands.test_auth_flow != null);
+    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.openai_codex, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expectEqualStrings("openai-codex", slash_commands.test_auth_flow.?.browser_redirect.session.provider_id);
+    try std.testing.expectEqualStrings(
+        "ChatGPT Plus/Pro (Codex Subscription)",
+        slash_commands.test_auth_flow.?.browser_redirect.session.provider_name,
+    );
+    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expectEqualStrings(
+        "http://localhost:1455/auth/callback",
+        slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+    );
+    try std.testing.expect(browser_open_capture.called);
+    try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") != null);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "ChatGPT Plus/Pro (Codex Subscription) login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "auth.openai.com/oauth/authorize") != null);
+}
+
+test "beginLoginFlow gives google client config guidance without legacy oauth config path" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2114,14 +2257,84 @@ test "beginLoginFlow shows oauth.json guidance when oauth client config is missi
         slash_commands.test_auth_flow = null;
     };
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &slash_commands.test_auth_flow);
 
     try std.testing.expect(slash_commands.test_auth_flow == null);
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "oauth.json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "oauth-clients.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "auth.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "legacy oauth.json is ignored") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "\"google-gemini-cli\"") != null);
+}
+
+test "beginLoginFlow starts google oauth flow with fake safe client config" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+    const client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth-clients.json" });
+    defer allocator.free(client_config_path);
+    try common.writeFileAbsolute(
+        std.testing.io,
+        client_config_path,
+        \\{
+        \\  "google-gemini-cli": {
+        \\    "client_id": "fake-google-client",
+        \\    "client_secret": "fake-google-secret"
+        \\  }
+        \\}
+    ,
+        true,
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    slash_commands.test_auth_flow = null;
+    defer if (slash_commands.test_auth_flow) |*value| {
+        value.deinit(allocator);
+        slash_commands.test_auth_flow = null;
+    };
+    var browser_open_capture = BrowserOpenCapture{};
+    const previous_browser_open_context = slash_commands.open_browser_context;
+    const previous_browser_open_fn = slash_commands.open_browser_fn;
+    slash_commands.open_browser_context = &browser_open_capture;
+    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    defer {
+        slash_commands.open_browser_context = previous_browser_open_context;
+        slash_commands.open_browser_fn = previous_browser_open_fn;
+    }
+
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &slash_commands.test_auth_flow);
+
+    try std.testing.expect(slash_commands.test_auth_flow != null);
+    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.google_gemini_cli, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expectEqualStrings("google-gemini-cli", slash_commands.test_auth_flow.?.browser_redirect.session.provider_id);
+    try std.testing.expectEqualStrings("fake-google-client", slash_commands.test_auth_flow.?.browser_redirect.session.oauth_client.client_id);
+    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expectEqualStrings(
+        "http://localhost:8085/oauth2callback",
+        slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+    );
+    try std.testing.expect(browser_open_capture.called);
+    try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Foauth2callback") != null);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Google Cloud Code Assist (Gemini CLI) login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "accounts.google.com/o/oauth2/v2/auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "client_id=fake-google-client") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[3].text, "Google Cloud project ID") != null);
 }
 
 test "beginLoginFlow starts API key prompt state for built-in provider" {
@@ -2200,7 +2413,7 @@ test "persistLoginCredential writes auth.json for slash login flows" {
     var credential = auth.StoredCredential{ .oauth = .{
         .access = try allocator.dupe(u8, "oauth-access-token"),
         .refresh = try allocator.dupe(u8, "oauth-refresh-token"),
-        .expires = 1234,
+        .expires = 4102444800000,
     } };
     defer credential.deinit(allocator);
 

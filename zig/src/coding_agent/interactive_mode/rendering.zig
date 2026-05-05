@@ -97,6 +97,7 @@ pub const RenderStateSnapshot = struct {
     extension_footer_statuses: [][]u8 = &.{},
     working_message: ?[]u8 = null,
     working_visible: bool = true,
+    active_operation: ?ActiveOperationSnapshot = null,
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
         for (self.items) |*item| chat_items.deinit(allocator, item);
@@ -117,8 +118,41 @@ pub const RenderStateSnapshot = struct {
         if (self.extension_widgets.len > 0) allocator.free(self.extension_widgets);
         deinitOwnedStringList(allocator, self.extension_footer_statuses);
         if (self.working_message) |message| allocator.free(message);
+        if (self.active_operation) |operation| allocator.free(operation.label);
         self.* = undefined;
     }
+};
+
+pub const ActiveOperationKind = enum {
+    agent_wait,
+    tool_execution,
+    retry,
+    compaction,
+    bash_execution,
+};
+
+pub const ActiveOperationSnapshot = struct {
+    kind: ActiveOperationKind,
+    label: []u8,
+    start_ms: i64,
+    delay_ms: u64 = 0,
+    attempt: u32 = 0,
+    max_attempts: u32 = 0,
+};
+
+const ActiveOperationState = struct {
+    kind: ActiveOperationKind,
+    label: []u8,
+    start_ms: i64,
+    delay_ms: u64 = 0,
+    attempt: u32 = 0,
+    max_attempts: u32 = 0,
+};
+
+const ActiveOperationOptions = struct {
+    delay_ms: u64 = 0,
+    attempt: u32 = 0,
+    max_attempts: u32 = 0,
 };
 
 const ActiveToolUpdate = struct {
@@ -175,6 +209,7 @@ pub const AppState = struct {
     extension_footer_statuses: std.StringHashMap([]u8),
     working_message: []u8 = &.{},
     working_visible: bool = true,
+    active_operation: ?ActiveOperationState = null,
     terminal_progress_active: bool = false,
     terminal_progress_dirty: bool = false,
     clipboard_paste: clipboard_paste_task.ClipboardPasteTask,
@@ -208,6 +243,7 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         self.clearExtensionUiHooksLocked();
+        self.clearActiveOperationLocked();
         self.extension_widgets.deinit(self.allocator);
         extension_ui.clearFooterStatuses(self.allocator, &self.extension_footer_statuses);
         self.extension_footer_statuses.deinit();
@@ -439,6 +475,16 @@ pub const AppState = struct {
         snapshot.extension_footer_statuses = try extension_ui.cloneFooterStatusesSorted(allocator, &self.extension_footer_statuses);
         snapshot.working_message = if (self.working_message.len > 0) try allocator.dupe(u8, self.working_message) else null;
         snapshot.working_visible = self.working_visible;
+        if (self.active_operation) |operation| {
+            snapshot.active_operation = .{
+                .kind = operation.kind,
+                .label = try allocator.dupe(u8, operation.label),
+                .start_ms = operation.start_ms,
+                .delay_ms = operation.delay_ms,
+                .attempt = operation.attempt,
+                .max_attempts = operation.max_attempts,
+            };
+        }
         return snapshot;
     }
 
@@ -639,6 +685,35 @@ pub const AppState = struct {
         return extension_ui.setFooterStatus(self.allocator, &self.extension_footer_statuses, key, text);
     }
 
+    fn setActiveOperationLocked(
+        self: *AppState,
+        kind: ActiveOperationKind,
+        label: []const u8,
+        options: ActiveOperationOptions,
+    ) !void {
+        const owned_label = try self.allocator.dupe(u8, label);
+        const start_ms = if (self.active_operation) |operation|
+            if (operation.kind == kind and std.mem.eql(u8, operation.label, label)) operation.start_ms else self.currentNowMsLocked()
+        else
+            self.currentNowMsLocked();
+        self.clearActiveOperationLocked();
+        self.active_operation = .{
+            .kind = kind,
+            .label = owned_label,
+            .start_ms = start_ms,
+            .delay_ms = options.delay_ms,
+            .attempt = options.attempt,
+            .max_attempts = options.max_attempts,
+        };
+    }
+
+    fn clearActiveOperationLocked(self: *AppState) void {
+        if (self.active_operation) |operation| {
+            self.allocator.free(operation.label);
+            self.active_operation = null;
+        }
+    }
+
     pub fn setWorkingMessage(self: *AppState, message: ?[]const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -680,8 +755,14 @@ pub const AppState = struct {
                 );
                 defer self.allocator.free(status_text);
                 try self.replaceLabelLocked(&self.status, status_text);
+                try self.setActiveOperationLocked(.retry, "retry", .{
+                    .delay_ms = start.delay_ms,
+                    .attempt = start.attempt,
+                    .max_attempts = start.max_attempts,
+                });
             },
             .end => |end| {
+                self.clearActiveOperationLocked();
                 if (end.success) {
                     try self.replaceLabelLocked(&self.status, "retry succeeded");
                 } else {
@@ -710,9 +791,16 @@ pub const AppState = struct {
                     .overflow => "Context overflow detected, auto-compacting... (Ctrl+C to cancel)",
                 };
                 try self.replaceLabelLocked(&self.status, label);
+                const active_label = switch (start.reason) {
+                    .manual => "Compacting context...",
+                    .threshold => "Auto-compacting...",
+                    .overflow => "Context overflow detected, auto-compacting...",
+                };
+                try self.setActiveOperationLocked(.compaction, active_label, .{});
             },
             .end => |end| {
                 self.markTerminalProgressLocked(false);
+                self.clearActiveOperationLocked();
                 if (end.aborted) {
                     try self.replaceLabelLocked(&self.status, if (end.reason == .manual) "Compaction cancelled" else "Auto-compaction cancelled");
                 } else if (end.error_message) |message| {
@@ -796,6 +884,7 @@ pub const AppState = struct {
 
         try self.appendItemWithExpandedTextLocked(.bash_execution, text, null, null, null);
         try self.replaceLabelLocked(&self.status, "running bash");
+        try self.setActiveOperationLocked(.bash_execution, command, .{});
         return self.items.items.len - 1;
     }
 
@@ -839,6 +928,7 @@ pub const AppState = struct {
         const expanded_text: ?[]const u8 = if (std.mem.eql(u8, text, expanded)) null else expanded;
         try self.replaceItemExpandedTextLocked(index, text, expanded_text);
         try self.replaceLabelLocked(&self.status, "running bash");
+        try self.setActiveOperationLocked(.bash_execution, command, .{});
     }
 
     fn finishBashExecution(
@@ -887,6 +977,7 @@ pub const AppState = struct {
         } else {
             try self.appendItemWithExpandedTextLocked(.bash_execution, text, expanded_text, null, null);
         }
+        self.clearActiveOperationLocked();
         try self.replaceLabelLocked(&self.status, "idle");
     }
 
@@ -924,6 +1015,7 @@ pub const AppState = struct {
         self.clearStreamingToolCallsLocked();
         self.clearQueuedMessagesLocked();
         self.clearExtensionUiHooksLocked();
+        self.clearActiveOperationLocked();
         self.markTerminalProgressLocked(false);
 
         try self.replaceLabelLocked(&self.status, "idle");
@@ -986,9 +1078,11 @@ pub const AppState = struct {
             .agent_start => {
                 self.markTerminalProgressLocked(true);
                 try self.replaceLabelLocked(&self.status, "thinking");
+                try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
             },
             .agent_end => {
                 self.markTerminalProgressLocked(false);
+                self.clearActiveOperationLocked();
                 if (std.mem.eql(u8, self.status, "streaming") or
                     std.mem.eql(u8, self.status, "thinking") or
                     std.mem.eql(u8, self.status, "working") or
@@ -1130,6 +1224,7 @@ pub const AppState = struct {
                         const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
                         defer self.allocator.free(status_text);
                         try self.replaceLabelLocked(&self.status, status_text);
+                        try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
                         return;
                     }
                 }
@@ -1140,6 +1235,7 @@ pub const AppState = struct {
                 const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
                 defer self.allocator.free(status_text);
                 try self.replaceLabelLocked(&self.status, status_text);
+                try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
             },
             .tool_execution_update => {
                 const tool_name = event.tool_name orelse "tool";
@@ -1167,6 +1263,7 @@ pub const AppState = struct {
                     }
                 }
                 try self.replaceLabelLocked(&self.status, status_text);
+                try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
             },
             .tool_execution_end => {
                 const tool_name = event.tool_name orelse "tool";
@@ -1197,6 +1294,7 @@ pub const AppState = struct {
                     );
                 }
                 try self.replaceLabelLocked(&self.status, "thinking");
+                try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
             },
             else => {},
         }
@@ -1892,11 +1990,11 @@ pub const ScreenComponent = struct {
         try renderQueuedMessageLines(allocator, self.keybindings, self.theme, &snapshot, width, &queued_lines);
         var task_panel_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &task_panel_lines);
-        try renderTaskPanelLines(allocator, self.theme, &snapshot, width, &task_panel_lines);
+        try renderTaskPanelLines(allocator, self.keybindings, self.theme, &snapshot, width, self.now_ms, &task_panel_lines);
         const footer_line = if (snapshot.extension_footer_lines.len > 0)
             try formatExtensionFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width)
         else
-            try formatFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width);
+            try formatFooterLineWithTerminalForDisplay(allocator, self.keybindings, self.theme, &snapshot, self.terminal_name, width, self.now_ms);
         defer allocator.free(footer_line);
         const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
         defer allocator.free(hints_line);
@@ -1961,7 +2059,7 @@ pub const ScreenComponent = struct {
         const footer_text = if (snapshot.extension_footer_lines.len > 0)
             try formatExtensionFooterLineWithTerminal(ctx.arena, null, &snapshot, self.terminal_name, width)
         else
-            try formatFooterText(ctx.arena, &snapshot, width);
+            try formatFooterTextForDisplay(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
         const hints_text = try formatHintsText(ctx.arena, self.keybindings, width);
         const extension_above_height = extensionWidgetLineCount(snapshot.extension_widgets, .above_editor);
         const extension_editor_height: usize = if (snapshot.extension_editor_label != null) 1 else 0;
@@ -1992,7 +2090,7 @@ pub const ScreenComponent = struct {
                 .window = panel_window,
                 .arena = ctx.arena,
                 .theme = self.theme,
-            }, self.theme, &snapshot);
+            }, self.keybindings, self.theme, &snapshot, self.now_ms);
         }
         row += task_panel_height;
 
@@ -2203,8 +2301,10 @@ fn drawFooterWithTerminal(
 fn drawTaskPanel(
     window: tui.vaxis.Window,
     ctx: tui.DrawContext,
+    keybindings: ?*const keybindings_mod.Keybindings,
     theme: ?*const resources_mod.Theme,
     snapshot: *const RenderStateSnapshot,
+    now_ms: i64,
 ) !tui.DrawSize {
     const requested_height = taskPanelHeightForWidth(@as(usize, window.width));
     const panel_height = @min(requested_height, @as(usize, window.height));
@@ -2230,7 +2330,14 @@ fn drawTaskPanel(
     });
 
     if (panel_inner.height > 0) {
-        const content = try formatTaskHeaderTextForMode(ctx.arena, snapshot, @as(usize, panel_inner.width), layoutMode(@as(usize, window.width)));
+        const content = try formatTaskHeaderTextForDisplay(
+            ctx.arena,
+            keybindings,
+            snapshot,
+            @as(usize, panel_inner.width),
+            layoutMode(@as(usize, window.width)),
+            now_ms,
+        );
         _ = panel_inner.printSegment(.{
             .text = content,
             .style = content_style,
@@ -2914,6 +3021,40 @@ pub fn formatFooterLineWithTerminal(
     return render_text.formatFooterLineWithTerminal(allocator, theme, snapshot, terminal_name, width);
 }
 
+fn formatFooterLineWithTerminalForDisplay(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    terminal_name: []const u8,
+    width: usize,
+    now_ms: i64,
+) ![]u8 {
+    const active_status = try formatActiveOperationStatus(allocator, keybindings, snapshot, now_ms) orelse
+        return render_text.formatFooterLineWithTerminal(allocator, theme, snapshot, terminal_name, width);
+    defer allocator.free(active_status);
+
+    var display_snapshot = snapshot.*;
+    display_snapshot.status = active_status;
+    return render_text.formatFooterLineWithTerminal(allocator, theme, &display_snapshot, terminal_name, width);
+}
+
+fn formatFooterTextForDisplay(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    now_ms: i64,
+) ![]u8 {
+    const active_status = try formatActiveOperationStatus(allocator, keybindings, snapshot, now_ms) orelse
+        return render_text.formatFooterText(allocator, snapshot, width);
+    defer allocator.free(active_status);
+
+    var display_snapshot = snapshot.*;
+    display_snapshot.status = active_status;
+    return render_text.formatFooterText(allocator, &display_snapshot, width);
+}
+
 pub fn formatExtensionFooterLineWithTerminal(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -2954,6 +3095,82 @@ fn formatTaskHeaderTextForMode(
     mode: LayoutMode,
 ) ![]u8 {
     return render_text.formatTaskHeaderTextForMode(allocator, snapshot, width, mode);
+}
+
+fn formatTaskHeaderTextForDisplay(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    mode: LayoutMode,
+    now_ms: i64,
+) ![]u8 {
+    const active_status = try formatActiveOperationStatus(allocator, keybindings, snapshot, now_ms) orelse
+        return render_text.formatTaskHeaderTextForMode(allocator, snapshot, width, mode);
+    defer allocator.free(active_status);
+
+    var display_snapshot = snapshot.*;
+    display_snapshot.status = active_status;
+    return render_text.formatTaskHeaderTextForMode(allocator, &display_snapshot, width, mode);
+}
+
+fn formatActiveOperationStatus(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    snapshot: *const RenderStateSnapshot,
+    now_ms: i64,
+) !?[]u8 {
+    const operation = snapshot.active_operation orelse return null;
+    const interrupt_label = try actionLabel(allocator, keybindings, .interrupt, "Esc");
+    defer allocator.free(interrupt_label);
+    const elapsed_ms = activeOperationElapsedMs(operation.start_ms, now_ms);
+    const elapsed_seconds = elapsed_ms / 1000;
+    const frame = activeOperationFrame(operation.start_ms, now_ms);
+
+    return switch (operation.kind) {
+        .agent_wait => try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} {d}s elapsed ({s} to interrupt)",
+            .{ frame, operation.label, elapsed_seconds, interrupt_label },
+        ),
+        .tool_execution => try std.fmt.allocPrint(
+            allocator,
+            "{s} Running {s} {d}s elapsed ({s} to interrupt)",
+            .{ frame, operation.label, elapsed_seconds, interrupt_label },
+        ),
+        .bash_execution => try std.fmt.allocPrint(
+            allocator,
+            "{s} Running bash {d}s elapsed ({s} to interrupt)",
+            .{ frame, elapsed_seconds, interrupt_label },
+        ),
+        .compaction => try std.fmt.allocPrint(
+            allocator,
+            "{s} {s} {d}s elapsed ({s} to cancel)",
+            .{ frame, operation.label, elapsed_seconds, interrupt_label },
+        ),
+        .retry => {
+            const remaining_ms = operation.delay_ms -| elapsed_ms;
+            const remaining_seconds = (remaining_ms + 999) / 1000;
+            return try std.fmt.allocPrint(
+                allocator,
+                "{s} Retrying ({d}/{d}) in {d}s... ({s} to cancel)",
+                .{ frame, operation.attempt, operation.max_attempts, remaining_seconds, interrupt_label },
+            );
+        },
+    };
+}
+
+fn activeOperationElapsedMs(start_ms: i64, now_ms: i64) u64 {
+    if (now_ms <= start_ms) return 0;
+    return @intCast(now_ms - start_ms);
+}
+
+fn activeOperationFrame(start_ms: i64, now_ms: i64) []const u8 {
+    const elapsed_ms = activeOperationElapsedMs(start_ms, now_ms);
+    const frames = tui.components.loader.DEFAULT_SPINNER_FRAMES[0..];
+    if (frames.len == 0) return "";
+    const frame_index = @as(usize, @intCast(elapsed_ms / tui.components.loader.DEFAULT_INTERVAL_MS)) % frames.len;
+    return frames[frame_index];
 }
 
 pub fn formatFooterText(allocator: std.mem.Allocator, snapshot: *const RenderStateSnapshot, width: usize) ![]u8 {
@@ -3026,9 +3243,11 @@ fn formatTerminalBadge(allocator: std.mem.Allocator, terminal_name: []const u8) 
 }
 pub fn renderTaskPanelLines(
     allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
     theme: ?*const resources_mod.Theme,
     snapshot: *const RenderStateSnapshot,
     width: usize,
+    now_ms: i64,
     lines: *tui.LineList,
 ) !void {
     const panel_height = taskPanelHeightForWidth(width);
@@ -3052,7 +3271,7 @@ pub fn renderTaskPanelLines(
         .window = window,
         .arena = scratch_allocator,
         .theme = theme,
-    }, theme, snapshot);
+    }, keybindings, theme, snapshot, now_ms);
     try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
 }
 
@@ -4471,6 +4690,149 @@ test "compaction and retry lifecycle update status and terminal progress state" 
     state.mutex.lockUncancelable(state.io);
     try std.testing.expectEqualStrings("Retrying (1/2) in 2s... (Ctrl+C to cancel)", state.status);
     state.mutex.unlock(state.io);
+}
+
+test "active operation indicator animates agent wait and clears on agent end" {
+    const allocator = std.testing.allocator;
+
+    var clock = FixedClock{ .now_ms = 1_000 };
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    state.setClockForTesting(&clock, FixedClock.now);
+
+    try state.handleAgentEvent(.{ .event_type = .agent_start });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+        .now_ms = 1_000,
+    };
+
+    var first = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &first);
+    try screen.renderInto(allocator, 140, &first);
+    try std.testing.expect(renderedLinesContain(first.items, "Working... 0s elapsed"));
+    try std.testing.expect(renderedLinesContain(first.items, "Esc to interrupt"));
+    try std.testing.expect(renderedLinesContain(first.items, "⠋ Working"));
+
+    const item_count = state.items.items.len;
+    screen.now_ms = 1_000 + @as(i64, @intCast(tui.components.loader.DEFAULT_INTERVAL_MS));
+    var second = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &second);
+    try screen.renderInto(allocator, 140, &second);
+    try std.testing.expectEqual(item_count, state.items.items.len);
+    try std.testing.expect(renderedLinesContain(second.items, "⠙ Working"));
+
+    try state.handleAgentEvent(.{ .event_type = .agent_end });
+    var completed = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &completed);
+    try screen.renderInto(allocator, 140, &completed);
+    try std.testing.expect(!renderedLinesContain(completed.items, "Working..."));
+    try std.testing.expect(renderedLinesContain(completed.items, "Status: idle"));
+}
+
+test "active operation indicator identifies running tool without appending animation rows" {
+    const allocator = std.testing.allocator;
+
+    var clock = FixedClock{ .now_ms = 5_000 };
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    state.setClockForTesting(&clock, FixedClock.now);
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_start,
+        .tool_call_id = "tool-active",
+        .tool_name = "read",
+        .args = .null,
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+        .now_ms = 5_000,
+    };
+
+    var first = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &first);
+    try screen.renderInto(allocator, 140, &first);
+    try std.testing.expect(renderedLinesContain(first.items, "Running read 0s elapsed"));
+    try std.testing.expect(renderedLinesContain(first.items, "⠋ Running read"));
+
+    const item_count = state.items.items.len;
+    screen.now_ms = 5_000 + @as(i64, @intCast(tui.components.loader.DEFAULT_INTERVAL_MS));
+    var second = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &second);
+    try screen.renderInto(allocator, 140, &second);
+    try std.testing.expectEqual(item_count, state.items.items.len);
+    try std.testing.expect(renderedLinesContain(second.items, "⠙ Running read"));
+}
+
+test "active operation retry countdown and compaction elapsed render dynamically" {
+    const allocator = std.testing.allocator;
+
+    var clock = FixedClock{ .now_ms = 10_000 };
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    state.setClockForTesting(&clock, FixedClock.now);
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 8,
+        .now_ms = 10_000,
+    };
+
+    try state.handleRetryLifecycleEvent(.{ .start = .{
+        .attempt = 2,
+        .max_attempts = 4,
+        .delay_ms = 2500,
+        .error_message = "rate limit",
+    } });
+
+    var retry_first = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &retry_first);
+    try screen.renderInto(allocator, 140, &retry_first);
+    try std.testing.expect(renderedLinesContain(retry_first.items, "Retrying (2/4) in 3s..."));
+    try std.testing.expect(renderedLinesContain(retry_first.items, "Esc to cancel"));
+
+    screen.now_ms = 11_100;
+    var retry_second = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &retry_second);
+    try screen.renderInto(allocator, 140, &retry_second);
+    try std.testing.expect(renderedLinesContain(retry_second.items, "Retrying (2/4) in 2s..."));
+
+    try state.handleRetryLifecycleEvent(.{ .end = .{
+        .success = true,
+        .attempt = 2,
+        .final_error = null,
+    } });
+    var retry_end = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &retry_end);
+    try screen.renderInto(allocator, 140, &retry_end);
+    try std.testing.expect(!renderedLinesContain(retry_end.items, "Retrying (2/4)"));
+
+    clock.now_ms = 20_000;
+    try state.handleCompactionLifecycleEvent(.{ .start = .{ .reason = .threshold } });
+    screen.now_ms = 20_000;
+    var compact_first = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &compact_first);
+    try screen.renderInto(allocator, 140, &compact_first);
+    try std.testing.expect(renderedLinesContain(compact_first.items, "Auto-compacting... 0s elapsed"));
+    try std.testing.expect(renderedLinesContain(compact_first.items, "Esc to cancel"));
+
+    screen.now_ms = 21_000;
+    var compact_second = tui.LineList.empty;
+    defer freeLinesSafe(allocator, &compact_second);
+    try screen.renderInto(allocator, 140, &compact_second);
+    try std.testing.expect(renderedLinesContain(compact_second.items, "Auto-compacting... 1s elapsed"));
 }
 
 test "extension widgets replace by key and truncate after ten lines" {
