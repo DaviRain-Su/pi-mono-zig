@@ -26,6 +26,7 @@ function writeWasmPackage(
 	options: {
 		artifactPath?: string;
 		artifactBytes?: Buffer | string;
+		capabilities?: string[];
 		toolId?: string;
 	} = {},
 ): void {
@@ -50,7 +51,7 @@ function writeWasmPackage(
 				inputSchema: {},
 				outputSchema: {},
 			},
-			capabilities: [],
+			capabilities: options.capabilities ?? [],
 		}),
 	);
 }
@@ -371,6 +372,25 @@ Content`,
 			);
 			await expect(packageManager.installAndPersist(invalidArtifactPackage)).rejects.toThrow(
 				"$.artifact.path: artifact file is not a valid Wasm binary",
+			);
+			expect(events.some((event) => event.type === "complete")).toBe(false);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+		});
+
+		it("should deny local Wasm capabilities before artifact validation or persistence", async () => {
+			const deniedCapabilityPackage = join(tempDir, "denied-capability-package");
+			mkdirSync(deniedCapabilityPackage, { recursive: true });
+			writeWasmPackage(deniedCapabilityPackage, {
+				artifactPath: "wasm/missing.wasm",
+				capabilities: ["file.read"],
+			});
+			rmSync(join(deniedCapabilityPackage, "wasm", "missing.wasm"));
+
+			const events: ProgressEvent[] = [];
+			packageManager.setProgressCallback((event) => events.push(event));
+
+			await expect(packageManager.installAndPersist(deniedCapabilityPackage)).rejects.toThrow(
+				'$.capabilities[0]: denied_capability: capability "file.read" is not approved for manifest-request',
 			);
 			expect(events.some((event) => event.type === "complete")).toBe(false);
 			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);

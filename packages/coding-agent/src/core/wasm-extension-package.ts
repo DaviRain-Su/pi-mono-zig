@@ -4,8 +4,19 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 
 export const WASM_EXTENSION_MANIFEST_NAME = "pi-extension.json";
 export const WASM_EXTENSION_SCHEMA_VERSION = "pi-extension.v0";
+export const WASM_DENIED_CAPABILITY_CATEGORY = "denied_capability";
+export const WASM_CANONICAL_CAPABILITIES = [
+	"file.read",
+	"file.write",
+	"network",
+	"shell",
+	"env",
+	"model",
+	"session",
+	"ui.notify",
+] as const;
 
-const CAPABILITIES = new Set(["file.read", "file.write", "network", "shell", "env", "model", "session", "ui.notify"]);
+const CAPABILITIES = new Set<string>(WASM_CANONICAL_CAPABILITIES);
 const UNSUPPORTED_SURFACE_FIELDS = [
 	"commands",
 	"widgets",
@@ -90,6 +101,7 @@ export function validateWasmExtensionPackage(packageRoot: string): WasmExtension
 	}
 
 	const capabilities = readCapabilities(root);
+	denyRequestedCapabilities(capabilities);
 	const artifactAbsolutePath = validateArtifactPath(packageRoot, artifactPath);
 	const artifactSha256 = createHash("sha256").update(readFileSync(artifactAbsolutePath)).digest("hex");
 
@@ -158,6 +170,14 @@ function readCapabilities(root: JsonObject): string[] {
 		}
 		return capability;
 	});
+}
+
+function denyRequestedCapabilities(capabilities: string[]): void {
+	for (const [index, capability] of capabilities.entries()) {
+		throw new Error(
+			`$.capabilities[${index}]: ${WASM_DENIED_CAPABILITY_CATEGORY}: capability "${capability}" is not approved for manifest-request`,
+		);
+	}
 }
 
 function validateArtifactPath(packageRoot: string, artifactPath: string): string {

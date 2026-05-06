@@ -293,8 +293,18 @@ fn parseTypeSection(
 
 fn parseImportSection(section: *Cursor) !usize {
     const count = try section.readUleb32();
-    if (count != 0) return error.DeniedWasmImportCapability;
+    if (count != 0) {
+        const module_name = try readName(section);
+        const field_name = try readName(section);
+        _ = wasm_manifest.denyRuntimeImport(module_name, field_name, .load, "runtime/import");
+        return error.DeniedWasmImportCapability;
+    }
     return 0;
+}
+
+fn readName(cursor: *Cursor) ![]const u8 {
+    const name_len = try cursor.readUleb32();
+    return cursor.readSlice(name_len);
 }
 
 fn parseFunctionSection(

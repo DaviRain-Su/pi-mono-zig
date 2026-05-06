@@ -70,6 +70,17 @@ pub const Capability = enum {
     }
 };
 
+pub const CANONICAL_CAPABILITIES = [_]Capability{
+    .file_read,
+    .file_write,
+    .network,
+    .shell,
+    .env,
+    .model,
+    .session,
+    .ui_notify,
+};
+
 pub const CapabilityEnforcementBranch = enum {
     filesystem_read,
     filesystem_write,
@@ -127,6 +138,28 @@ pub fn denyRuntimeCapability(
     return denyCapability(capability, phase, mode);
 }
 
+pub fn runtimeImportCapability(module_name: []const u8, field_name: []const u8) ?Capability {
+    if (std.mem.eql(u8, module_name, "pi:filesystem") and std.mem.eql(u8, field_name, "read")) return .file_read;
+    if (std.mem.eql(u8, module_name, "pi:filesystem") and std.mem.eql(u8, field_name, "write")) return .file_write;
+    if (std.mem.eql(u8, module_name, "pi:network") and std.mem.eql(u8, field_name, "fetch")) return .network;
+    if (std.mem.eql(u8, module_name, "pi:shell") and std.mem.eql(u8, field_name, "run")) return .shell;
+    if (std.mem.eql(u8, module_name, "pi:environment") and std.mem.eql(u8, field_name, "get")) return .env;
+    if (std.mem.eql(u8, module_name, "pi:model") and std.mem.eql(u8, field_name, "call")) return .model;
+    if (std.mem.eql(u8, module_name, "pi:session") and std.mem.eql(u8, field_name, "get")) return .session;
+    if (std.mem.eql(u8, module_name, "pi:ui") and std.mem.eql(u8, field_name, "notify")) return .ui_notify;
+    return null;
+}
+
+pub fn denyRuntimeImport(
+    module_name: []const u8,
+    field_name: []const u8,
+    phase: LifecyclePhase,
+    mode: []const u8,
+) ?CapabilityDenialDiagnostic {
+    const capability = runtimeImportCapability(module_name, field_name) orelse return null;
+    return denyRuntimeCapability(capability, phase, mode);
+}
+
 fn denyCapability(capability: Capability, phase: LifecyclePhase, mode: []const u8) CapabilityDenialDiagnostic {
     return .{
         .capability = capability,
@@ -144,8 +177,10 @@ fn hasCapability(capabilities: []const Capability, needle: Capability) bool {
 }
 
 pub const Diagnostic = struct {
+    category: []const u8 = "validation_error",
     phase: LifecyclePhase,
     path: []u8,
+    capability: ?Capability = null,
     message: []u8,
 
     pub fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
@@ -287,7 +322,8 @@ pub fn validateManifestText(
                 defer allocator.free(message);
                 return invalidOne(allocator, .validate, path, message);
             };
-            try capabilities.append(allocator, capability);
+            const denial = denyRuntimeCapability(capability, .validate, "manifest-request");
+            return invalidCapabilityDenial(allocator, path, denial);
         }
     }
 
@@ -376,6 +412,29 @@ fn invalidOne(
     diagnostics[0] = .{
         .phase = phase,
         .path = try allocator.dupe(u8, path),
+        .message = try allocator.dupe(u8, message),
+    };
+    return .{ .invalid = diagnostics };
+}
+
+fn invalidCapabilityDenial(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    denial: CapabilityDenialDiagnostic,
+) !ValidationResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "{s}: capability \"{s}\" is not approved for {s}",
+        .{ denial.category, denial.capability.jsonName(), denial.mode },
+    );
+    defer allocator.free(message);
+    const diagnostics = try allocator.alloc(Diagnostic, 1);
+    errdefer allocator.free(diagnostics);
+    diagnostics[0] = .{
+        .category = denial.category,
+        .phase = denial.phase,
+        .path = try allocator.dupe(u8, path),
+        .capability = denial.capability,
         .message = try allocator.dupe(u8, message),
     };
     return .{ .invalid = diagnostics };
@@ -575,6 +634,22 @@ fn expectInvalid(result: *ValidationResult, expected_path: []const u8, expected_
     try std.testing.expectEqualStrings(expected_message, diagnostics[0].message);
 }
 
+fn expectDeniedCapability(
+    result: *ValidationResult,
+    expected_path: []const u8,
+    expected_capability: Capability,
+    expected_phase: LifecyclePhase,
+) !void {
+    try std.testing.expect(result.* == .invalid);
+    const diagnostics = result.invalid;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqualStrings("denied_capability", diagnostics[0].category);
+    try std.testing.expectEqual(expected_phase, diagnostics[0].phase);
+    try std.testing.expectEqualStrings(expected_path, diagnostics[0].path);
+    try std.testing.expectEqual(expected_capability, diagnostics[0].capability.?);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message, expected_capability.jsonName()) != null);
+}
+
 test "wasm manifest valid one-tool pi-extension validates successfully" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -649,6 +724,27 @@ test "wasm manifest omitted capabilities are default-deny and unknown capabiliti
     );
     defer unknown.deinit(allocator);
     try expectInvalid(&unknown, "$.capabilities[0]", "unknown capability \"database\"");
+}
+
+test "wasm manifest denies requested capabilities before artifact validation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "package", .default_dir);
+    const package_root = try makeAbsoluteTestPath(allocator, tmp, "package");
+    defer allocator.free(package_root);
+
+    for (CANONICAL_CAPABILITIES) |capability| {
+        const manifest_text = try std.fmt.allocPrint(allocator,
+            \\{{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Requested capability","artifact":{{"kind":"wasm-component","path":"wasm/missing.wasm"}},"tool":{{"id":"example.tool","description":"Tool","inputSchema":{{}},"outputSchema":{{}}}},"capabilities":["{s}"]}}
+        , .{capability.jsonName()});
+        defer allocator.free(manifest_text);
+
+        var result = try validateManifestText(allocator, package_root, manifest_text);
+        defer result.deinit(allocator);
+        try expectDeniedCapability(&result, "$.capabilities[0]", capability, .validate);
+        try std.testing.expect(std.mem.indexOf(u8, result.invalid[0].message, "artifact file was not found") == null);
+    }
 }
 
 test "wasm manifest rejects zero multiple and non-tool declarations" {
@@ -776,6 +872,7 @@ test "wasm capability canonical ids map to explicit enforcement branches" {
         .{ .capability = .ui_notify, .id = "ui.notify", .branch = .ui_notification },
     };
 
+    try std.testing.expectEqual(CANONICAL_CAPABILITIES.len, expected.len);
     try std.testing.expectEqual(@typeInfo(Capability).@"enum".fields.len, expected.len);
     for (expected) |entry| {
         try std.testing.expectEqualStrings(entry.id, entry.capability.jsonName());
@@ -786,9 +883,7 @@ test "wasm capability canonical ids map to explicit enforcement branches" {
 }
 
 test "wasm capability requested but unapproved declarations are denied deterministically" {
-    const requested = [_]Capability{ .shell, .file_read, .file_write, .env, .network, .model, .session, .ui_notify };
-
-    for (requested) |capability| {
+    for (CANONICAL_CAPABILITIES) |capability| {
         const diagnostic = denyFirstUnapprovedCapability(&.{capability}, &.{}, .initialize, "manifest-request").?;
         try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
         try std.testing.expectEqual(capability, diagnostic.capability);
@@ -803,14 +898,12 @@ test "wasm capability requested but unapproved declarations are denied determini
     );
     try std.testing.expectEqual(
         Capability.shell,
-        denyFirstUnapprovedCapability(&.{ .shell }, &.{ .network }, .initialize, "manifest-request").?.capability,
+        denyFirstUnapprovedCapability(&.{.shell}, &.{.network}, .initialize, "manifest-request").?.capability,
     );
 }
 
 test "wasm capability runtime denials use same ids and category as manifest requests" {
-    const requested = [_]Capability{ .file_read, .file_write, .network, .shell, .env, .model, .session, .ui_notify };
-
-    for (requested) |capability| {
+    for (CANONICAL_CAPABILITIES) |capability| {
         const diagnostic = denyRuntimeCapability(capability, .call, "runtime/import");
         try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
         try std.testing.expectEqualStrings(capability.jsonName(), diagnostic.capability.jsonName());
@@ -818,4 +911,32 @@ test "wasm capability runtime denials use same ids and category as manifest requ
         try std.testing.expectEqual(.call, diagnostic.phase);
         try std.testing.expectEqualStrings("runtime/import", diagnostic.mode);
     }
+}
+
+test "wasm capability runtime import mappings share canonical denial vocabulary" {
+    const expected = [_]struct {
+        module_name: []const u8,
+        field_name: []const u8,
+        capability: Capability,
+    }{
+        .{ .module_name = "pi:filesystem", .field_name = "read", .capability = .file_read },
+        .{ .module_name = "pi:filesystem", .field_name = "write", .capability = .file_write },
+        .{ .module_name = "pi:network", .field_name = "fetch", .capability = .network },
+        .{ .module_name = "pi:shell", .field_name = "run", .capability = .shell },
+        .{ .module_name = "pi:environment", .field_name = "get", .capability = .env },
+        .{ .module_name = "pi:model", .field_name = "call", .capability = .model },
+        .{ .module_name = "pi:session", .field_name = "get", .capability = .session },
+        .{ .module_name = "pi:ui", .field_name = "notify", .capability = .ui_notify },
+    };
+
+    for (expected) |entry| {
+        const diagnostic = denyRuntimeImport(entry.module_name, entry.field_name, .load, "runtime/import").?;
+        try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
+        try std.testing.expectEqual(entry.capability, diagnostic.capability);
+        try std.testing.expectEqualStrings(entry.capability.jsonName(), diagnostic.capabilityId());
+        try std.testing.expectEqual(entry.capability.enforcementBranch(), diagnostic.branch);
+        try std.testing.expectEqual(.load, diagnostic.phase);
+        try std.testing.expectEqualStrings("runtime/import", diagnostic.mode);
+    }
+    try std.testing.expectEqual(@as(?CapabilityDenialDiagnostic, null), denyRuntimeImport("pi:unknown", "call", .load, "runtime/import"));
 }
