@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Pi Browser Wasm Host Spike</title>
+		<style>
+			body {
+				font-family: system-ui, sans-serif;
+				margin: 2rem;
+				max-width: 960px;
+				line-height: 1.4;
+			}
+
+			button {
+				margin: 0.25rem;
+				padding: 0.5rem 0.75rem;
+			}
+
+			pre {
+				background: #f6f8fa;
+				border: 1px solid #d0d7de;
+				border-radius: 6px;
+				overflow-x: auto;
+				padding: 1rem;
+				white-space: pre-wrap;
+			}
+
+			.status {
+				border-left: 4px solid #0969da;
+				padding-left: 0.75rem;
+			}
+		</style>
+	</head>
+	<body>
+		<h1>Pi Browser Wasm Host Spike</h1>
+		<p class="status">
+			Host status:
+			<strong id="host-status" aria-live="polite">initializing</strong>
+		</p>
+		<section aria-label="Browser Wasm host actions">
+			<button id="run-fixture" type="button">Run valid fixture</button>
+			<button id="run-pure-truncate" type="button">Run pure truncate fixture</button>
+			<button id="deny-shell-manifest" type="button">Deny shell manifest request</button>
+			<button id="deny-filesystem-manifest" type="button">Deny filesystem manifest request</button>
+			<button id="deny-shell-runtime" type="button">Deny shell runtime import</button>
+			<button id="deny-filesystem-runtime" type="button">Deny filesystem runtime import</button>
+			<button id="run-capability-denial-matrix" type="button">Run capability denial matrix</button>
+		</section>
+		<h2>Output</h2>
+		<pre id="output" aria-live="polite">Waiting for host initialization.</pre>
+		<h2>Client-side execution evidence</h2>
+		<pre id="network-evidence" aria-live="polite">No actions run yet.</pre>
+		<script type="module" src="./browser-wasm-host.js"></script>
+	</body>
+</html>

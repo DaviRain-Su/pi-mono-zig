@@ -1,7 +1,7 @@
 const std = @import("std");
 const tui = @import("tui");
 const session_mod = @import("../session.zig");
-const extension_host = @import("../extension_host.zig");
+const extension_runtime = @import("../extension_runtime.zig");
 const shared = @import("shared.zig");
 const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
@@ -13,7 +13,7 @@ const ExtensionDialog = extension_dialog.ExtensionDialog;
 pub const Bridge = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    host: ?*extension_host.HostProcess = null,
+    host: ?extension_runtime.RuntimeAdapter = null,
     queued_dialogs: std.ArrayList(ExtensionDialog) = .empty,
     last_registry_frames: usize = 0,
 
@@ -44,9 +44,9 @@ pub const Bridge = struct {
         if (isEnabledEnv(env_map, "PI_M6_EXTENSION_HOST_DISABLED")) return;
         const runtime = env_map.get("PI_M6_EXTENSION_HOST_RUNTIME") orelse "bun";
         const fixture = env_map.get("PI_M6_EXTENSION_HOST_FIXTURE") orelse "interactive-extension-ui";
-        const marker = env_map.get(extension_host.HOST_MARKER_ENV) orelse "pi-interactive-extension-host";
+        const marker = env_map.get(extension_runtime.HOST_MARKER_ENV) orelse "pi-interactive-extension-host";
         const argv = [_][]const u8{ runtime, entry, marker };
-        const host = try extension_host.HostProcess.start(self.allocator, self.io, .{
+        const host = try extension_runtime.startRuntime(self.allocator, self.io, .{ .process_jsonl = .{
             .argv = &argv,
             .cwd = cwd,
             .initialize = .{
@@ -54,7 +54,7 @@ pub const Bridge = struct {
                 .cwd = cwd,
                 .fixture = fixture,
             },
-        });
+        } });
         errdefer host.deinit();
         try host.waitForReady(2000);
         self.host = host;
@@ -91,9 +91,7 @@ pub const Bridge = struct {
 
     fn applyHostUiHooks(self: *Bridge, app_state: *rendering.AppState) !void {
         const host = self.host orelse return;
-        host.mutex.lockUncancelable(self.io);
-        defer host.mutex.unlock(self.io);
-        try app_state.applyExtensionRegistryUi(&host.state.registry);
+        try host.withRegistry(app_state, applyRegistryUiCallback);
     }
 
     fn drainHostRequests(
@@ -124,7 +122,7 @@ pub const Bridge = struct {
 
     fn handleHostRequest(
         self: *Bridge,
-        request: extension_host.ExtensionUiRequest,
+        request: extension_runtime.ExtensionUiRequest,
         env_map: *const std.process.Environ.Map,
         cwd: []const u8,
         terminal: *tui.Terminal,
@@ -259,7 +257,7 @@ pub const Bridge = struct {
         try self.respondIfRequired(request, "{\"cancelled\":true}");
     }
 
-    fn respondIfRequired(self: *Bridge, request: extension_host.ExtensionUiRequest, payload_json: []const u8) !void {
+    fn respondIfRequired(self: *Bridge, request: extension_runtime.ExtensionUiRequest, payload_json: []const u8) !void {
         if (!request.response_required) return;
         if (self.host) |host| try host.sendExtensionUiResponse(request.id, payload_json);
     }
@@ -307,7 +305,12 @@ pub const Bridge = struct {
     }
 };
 
-fn dialogFromRequest(allocator: std.mem.Allocator, request: extension_host.ExtensionUiRequest, now_ms: i64) !?ExtensionDialog {
+fn applyRegistryUiCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const app_state: *rendering.AppState = @ptrCast(@alignCast(context.?));
+    try app_state.applyExtensionRegistryUi(registry);
+}
+
+fn dialogFromRequest(allocator: std.mem.Allocator, request: extension_runtime.ExtensionUiRequest, now_ms: i64) !?ExtensionDialog {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, request.payload_json, .{}) catch return null;
     defer parsed.deinit();
     const payload = switch (parsed.value) {
@@ -560,7 +563,7 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
 
 test "extension dialog resolves select confirm input editor and cancel payloads" {
     const allocator = std.testing.allocator;
-    var request = extension_host.ExtensionUiRequest{
+    var request = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "select-1"),
         .method = try allocator.dupe(u8, "select"),
         .response_required = true,
@@ -632,7 +635,7 @@ test "extension bridge editor APIs mutate editor and hidden thinking label" {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
 
-    var request = extension_host.ExtensionUiRequest{
+    var request = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "set-text"),
         .method = try allocator.dupe(u8, "set_editor_text"),
         .response_required = false,
@@ -642,7 +645,7 @@ test "extension bridge editor APIs mutate editor and hidden thinking label" {
     try bridge.handleHostRequest(request, &env_map, tmp_path, &terminal, &editor, &overlay, &state, &live, &session, 0);
     try std.testing.expectEqualStrings("from extension", editor.text());
 
-    var label_request = extension_host.ExtensionUiRequest{
+    var label_request = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "label"),
         .method = try allocator.dupe(u8, "setHiddenThinkingLabel"),
         .response_required = false,

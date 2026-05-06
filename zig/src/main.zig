@@ -10,7 +10,7 @@ const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 const config_mod = @import("coding_agent/config.zig");
 const json_event_wire = @import("coding_agent/json_event_wire.zig");
-const extension_host_mod = @import("coding_agent/extension_host.zig");
+const extension_runtime_mod = @import("coding_agent/extension_runtime.zig");
 const extension_flags_mod = @import("coding_agent/extension_flags.zig");
 const extension_registry_mod = @import("coding_agent/extension_registry.zig");
 const builtin = @import("builtin");
@@ -570,7 +570,7 @@ fn tsRpcExtensionHostOptions(
     }
     const runtime = env_map.get("PI_M6_EXTENSION_HOST_RUNTIME") orelse "bun";
     const fixture = env_map.get("PI_M6_EXTENSION_HOST_FIXTURE") orelse "m6-fixture";
-    const marker = env_map.get(extension_host_mod.HOST_MARKER_ENV) orelse "pi-m6-extension-host";
+    const marker = env_map.get(extension_runtime_mod.HOST_MARKER_ENV) orelse "pi-m6-extension-host";
     var argv = try allocator.alloc([]const u8, 3);
     argv[0] = runtime;
     argv[1] = entry;
@@ -630,7 +630,7 @@ fn runExtensionRegistryDump(
     for (extension_paths) |p| try argv.append(allocator, p);
     try argv.append(allocator, marker);
 
-    const host = extension_host_mod.HostProcess.start(allocator, io, .{
+    const host = extension_runtime_mod.startRuntime(allocator, io, .{ .process_jsonl = .{
         .argv = argv.items,
         .cwd = cwd,
         .initialize = .{
@@ -639,7 +639,7 @@ fn runExtensionRegistryDump(
             .fixture = fixture,
         },
         .shutdown_timeout_ms = shutdown_timeout_ms,
-    }) catch |err| {
+    } }) catch |err| {
         try stderr.print("Error: failed to start extension host: {s}\n", .{@errorName(err)});
         return 1;
     };

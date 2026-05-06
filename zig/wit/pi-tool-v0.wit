@@ -1,0 +1,21 @@
+package pi:extension@0.1.0;
+
+/// Pi Wasm tool contract v0.
+///
+/// All strings are JSON payloads. The host validates pi-extension.json before
+/// loading this interface and exposes no v0 host functions to the plugin.
+interface tool {
+    /// Return tool metadata as a JSON string.
+    metadata: func() -> string;
+
+    /// Return input/output JSON Schemas as a JSON string.
+    schema: func() -> string;
+
+    /// Execute the tool with a JSON string input and return a JSON string
+    /// output or error object.
+    execute: func(input-json: string) -> string;
+}
+
+world tool-v0 {
+    export tool;
+}

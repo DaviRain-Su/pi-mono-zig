@@ -16,6 +16,8 @@ copy every rule, but to make the refactor measurable, testable, and harder to re
 
 ### 1. Tidy Guardrail
 
+Status: Completed/currently covered.
+
 - Add a Zig tidy step that scans Zig source files.
 - Report long functions with file and line locations.
 - Start as warning-only to avoid blocking unrelated work.
@@ -30,6 +32,8 @@ Acceptance criteria:
 
 ### 2. Test Root Coverage
 
+Status: Completed/currently covered.
+
 - Extend tidy to find Zig files that contain `test` blocks but are unreachable from known test roots.
 - Keep explicit test roots for focused areas such as interactive rendering.
 - Add a workflow note: every new split module with tests must be imported by a test root.
@@ -40,6 +44,8 @@ Acceptance criteria:
 - Rendering-only modules stay covered by `test-tui`.
 
 ### 3. Provider Contract Matrix
+
+Status: Completed/currently covered.
 
 - Add a provider stream-contract matrix.
 - Assert non-OOM setup/runtime failures become terminal `error_event`.
@@ -53,6 +59,10 @@ Acceptance criteria:
 
 ### 4. Wire and Parser Fuzz Smoke
 
+Status: Completed/currently covered. The guardrails are fixed-seed, bounded, and
+non-mutating. They currently cover SSE parser chunks, JSON event wire, session
+JSONL replay, keybinding parse/match, and extension UI protocol boundaries.
+
 - Add small deterministic fuzz smoke tests for:
   - SSE parser chunks.
   - JSON event wire.
@@ -64,6 +74,12 @@ Acceptance criteria:
 
 - Each fuzzer has a fixed seed smoke mode for CI.
 - Failure output includes seed and minimized input where feasible.
+
+## Next Suggested Refactor Step
+
+Start Task 5/6 decomposition only after the completed guardrails above remain in
+place. Provider internals and session/RPC decomposition remain later refactor
+steps.
 
 ### 5. Interactive Mode Decomposition
 

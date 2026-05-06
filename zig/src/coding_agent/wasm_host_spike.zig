@@ -1,0 +1,603 @@
+const std = @import("std");
+const extension_registry = @import("extension_registry.zig");
+const truncate_tool = @import("tools/truncate.zig");
+const wasm_manifest = @import("wasm_manifest.zig");
+
+const PLUGIN_FIXTURE_PATH = "test/fixtures/wasm/native-tool-v0/plugin.wasm";
+const EVIDENCE_PATH = "docs/wasm-host-spike-evidence.md";
+const EXECUTE_INPUT_JSON = "{\"operation\":\"echo\",\"value\":\"native-wasm\"}";
+const EXPECTED_EXECUTE_OUTPUT_JSON = "{\"ok\":true,\"tool\":\"fixture.echo\",\"echo\":\"native-wasm\"}";
+const PURE_TOOL_EXISTING_API = "zig/src/coding_agent/tools/truncate.zig::truncateHead";
+const PURE_TOOL_PACKAGE_ROOT = "test/fixtures/wasm/pure-truncate-head-v0";
+const PURE_TOOL_MANIFEST_PATH = PURE_TOOL_PACKAGE_ROOT ++ "/pi-extension.json";
+const PURE_TOOL_ARTIFACT_PATH = PURE_TOOL_PACKAGE_ROOT ++ "/wasm/plugin.wasm";
+const PURE_TOOL_SUCCESS_INPUT_JSON = "{\"content\":\"alpha\\nbravo\\ncharlie\\ndelta\",\"maxLines\":2,\"maxBytes\":1024}";
+const PURE_TOOL_MALFORMED_INPUT_JSON = "[]";
+const INVALID_INPUT_DIAGNOSTIC_JSON = "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}";
+
+pub const Host = struct {
+    allocator: std.mem.Allocator,
+    memory: []u8,
+    function_returns: []?u32,
+    function_exports: std.StringHashMap(u32),
+
+    pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Host {
+        const bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(512 * 1024));
+        defer allocator.free(bytes);
+        return parseFixture(allocator, bytes);
+    }
+
+    pub fn deinit(self: *Host) void {
+        self.releaseRuntimeResources();
+        self.* = undefined;
+    }
+
+    pub fn unload(self: *Host, registry: ?*extension_registry.Registry, tool_id: ?[]const u8) void {
+        if (registry) |runtime_registry| {
+            if (tool_id) |name| _ = runtime_registry.unregisterTool(name);
+        }
+        self.releaseRuntimeResources();
+        self.function_exports = std.StringHashMap(u32).init(self.allocator);
+        self.function_returns = &.{};
+        self.memory = &.{};
+    }
+
+    pub fn resourceCounts(self: *const Host) HostResourceCounts {
+        return .{
+            .memory_bytes = self.memory.len,
+            .function_returns = self.function_returns.len,
+            .function_exports = self.function_exports.count(),
+        };
+    }
+
+    fn releaseRuntimeResources(self: *Host) void {
+        freeStringHashMapKeys(&self.function_exports, self.allocator);
+        self.function_exports.deinit();
+        self.allocator.free(self.function_returns);
+        self.allocator.free(self.memory);
+    }
+
+    pub fn callMetadata(self: *const Host) ![]u8 {
+        return self.callStringExport("metadata", "metadata_len");
+    }
+
+    pub fn callSchema(self: *const Host) ![]u8 {
+        return self.callStringExport("schema", "schema_len");
+    }
+
+    pub fn callExecute(self: *const Host, input_json: []const u8) ![]u8 {
+        try expectJsonObject(self.allocator, input_json);
+        return self.callStringExport("execute", "execute_len");
+    }
+
+    fn callStringExport(self: *const Host, export_name: []const u8, len_export_name: []const u8) ![]u8 {
+        const ptr = try self.invokeConstI32(export_name);
+        const len = try self.invokeConstI32(len_export_name);
+        const start: usize = @intCast(ptr);
+        const byte_len: usize = @intCast(len);
+        if (start > self.memory.len or byte_len > self.memory.len - start) return error.WasmStringOutOfBounds;
+        return self.allocator.dupe(u8, self.memory[start .. start + byte_len]);
+    }
+
+    fn invokeConstI32(self: *const Host, export_name: []const u8) !u32 {
+        const function_index = self.function_exports.get(export_name) orelse return error.MissingWasmExport;
+        const index: usize = @intCast(function_index);
+        if (index >= self.function_returns.len) return error.InvalidWasmFunctionIndex;
+        return self.function_returns[index] orelse error.UnsupportedWasmFunctionBody;
+    }
+};
+
+pub const HostResourceCounts = struct {
+    memory_bytes: usize,
+    function_returns: usize,
+    function_exports: usize,
+};
+
+const Cursor = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn remaining(self: *const Cursor) usize {
+        return self.bytes.len - self.index;
+    }
+
+    fn readByte(self: *Cursor) !u8 {
+        if (self.index >= self.bytes.len) return error.MalformedWasm;
+        const byte = self.bytes[self.index];
+        self.index += 1;
+        return byte;
+    }
+
+    fn readSlice(self: *Cursor, len_u32: u32) ![]const u8 {
+        const len: usize = @intCast(len_u32);
+        if (len > self.remaining()) return error.MalformedWasm;
+        const slice = self.bytes[self.index .. self.index + len];
+        self.index += len;
+        return slice;
+    }
+
+    fn readUleb32(self: *Cursor) !u32 {
+        var result: u32 = 0;
+        var shift: usize = 0;
+        while (true) {
+            if (shift >= 32) return error.MalformedWasm;
+            const byte = try self.readByte();
+            result |= @as(u32, byte & 0x7f) << @intCast(shift);
+            if ((byte & 0x80) == 0) return result;
+            shift += 7;
+        }
+    }
+
+    fn readI32Leb(self: *Cursor) !i32 {
+        const value = try self.readUleb32();
+        if (value > std.math.maxInt(i32)) return error.UnsupportedWasmFixture;
+        return @intCast(value);
+    }
+};
+
+fn parseFixture(allocator: std.mem.Allocator, bytes: []const u8) !Host {
+    if (bytes.len < 8 or
+        !std.mem.eql(u8, bytes[0..4], "\x00asm") or
+        !std.mem.eql(u8, bytes[4..8], "\x01\x00\x00\x00"))
+    {
+        return error.MalformedWasm;
+    }
+
+    var memory = try allocator.alloc(u8, 0);
+    errdefer allocator.free(memory);
+    var function_returns = std.ArrayList(?u32).empty;
+    defer function_returns.deinit(allocator);
+    var function_exports = std.StringHashMap(u32).init(allocator);
+    errdefer {
+        freeStringHashMapKeys(&function_exports, allocator);
+        function_exports.deinit();
+    }
+
+    var cursor = Cursor{ .bytes = bytes[8..] };
+    while (cursor.remaining() > 0) {
+        const section_id = try cursor.readByte();
+        const payload_len = try cursor.readUleb32();
+        const payload = try cursor.readSlice(payload_len);
+        var section = Cursor{ .bytes = payload };
+        switch (section_id) {
+            1 => try parseTypeSection(&section),
+            2 => try parseImportSection(&section),
+            3 => try parseFunctionSection(allocator, &section, &function_returns),
+            5 => try parseMemorySection(allocator, &section, &memory),
+            7 => try parseExportSection(allocator, &section, &function_exports),
+            10 => try parseCodeSection(&section, &function_returns),
+            11 => try parseDataSection(&section, memory),
+            else => {},
+        }
+    }
+
+    const owned_returns = try function_returns.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_returns);
+    const host = Host{
+        .allocator = allocator,
+        .memory = memory,
+        .function_returns = owned_returns,
+        .function_exports = function_exports,
+    };
+    try validateRequiredExports(&host);
+    return host;
+}
+
+fn parseTypeSection(section: *Cursor) !void {
+    const count = try section.readUleb32();
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const form = try section.readByte();
+        if (form != 0x60) return error.UnsupportedWasmFixture;
+        const param_count = try section.readUleb32();
+        var param_index: u32 = 0;
+        while (param_index < param_count) : (param_index += 1) {
+            const value_type = try section.readByte();
+            if (value_type != 0x7f) return error.UnsupportedWasmFixture;
+        }
+        const result_count = try section.readUleb32();
+        if (result_count != 1) return error.UnsupportedWasmFixture;
+        const result_type = try section.readByte();
+        if (result_type != 0x7f) return error.UnsupportedWasmFixture;
+    }
+}
+
+fn parseImportSection(section: *Cursor) !void {
+    const count = try section.readUleb32();
+    if (count != 0) return error.UnsupportedWasmFixture;
+}
+
+fn parseFunctionSection(
+    allocator: std.mem.Allocator,
+    section: *Cursor,
+    function_returns: *std.ArrayList(?u32),
+) !void {
+    const count = try section.readUleb32();
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        _ = try section.readUleb32();
+        try function_returns.append(allocator, null);
+    }
+}
+
+fn parseMemorySection(allocator: std.mem.Allocator, section: *Cursor, memory: *[]u8) !void {
+    const count = try section.readUleb32();
+    if (count != 1) return error.UnsupportedWasmFixture;
+    const flags = try section.readUleb32();
+    const min_pages = try section.readUleb32();
+    if ((flags & 0x01) != 0) _ = try section.readUleb32();
+    if (min_pages == 0) return error.UnsupportedWasmFixture;
+    const pages: usize = @intCast(min_pages);
+    const bytes = try std.math.mul(usize, pages, 64 * 1024);
+    const new_memory = try allocator.alloc(u8, bytes);
+    @memset(new_memory, 0);
+    allocator.free(memory.*);
+    memory.* = new_memory;
+}
+
+fn parseExportSection(
+    allocator: std.mem.Allocator,
+    section: *Cursor,
+    function_exports: *std.StringHashMap(u32),
+) !void {
+    const count = try section.readUleb32();
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const name_len = try section.readUleb32();
+        const name = try section.readSlice(name_len);
+        const kind = try section.readByte();
+        const item_index = try section.readUleb32();
+        if (kind != 0) continue;
+        if (function_exports.contains(name)) return error.DuplicateWasmExport;
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        try function_exports.put(owned_name, item_index);
+    }
+}
+
+fn parseCodeSection(section: *Cursor, function_returns: *std.ArrayList(?u32)) !void {
+    const count = try section.readUleb32();
+    if (count != function_returns.items.len) return error.MalformedWasm;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const body_len = try section.readUleb32();
+        const body_bytes = try section.readSlice(body_len);
+        var body = Cursor{ .bytes = body_bytes };
+        const local_decl_count = try body.readUleb32();
+        var local_index: u32 = 0;
+        while (local_index < local_decl_count) : (local_index += 1) {
+            _ = try body.readUleb32();
+            _ = try body.readByte();
+        }
+        const opcode = try body.readByte();
+        if (opcode != 0x41) return error.UnsupportedWasmFunctionBody;
+        const value = try body.readI32Leb();
+        if (value < 0) return error.UnsupportedWasmFunctionBody;
+        const end_opcode = try body.readByte();
+        if (end_opcode != 0x0b or body.remaining() != 0) return error.UnsupportedWasmFunctionBody;
+        function_returns.items[@intCast(index)] = @intCast(value);
+    }
+}
+
+fn parseDataSection(section: *Cursor, memory: []u8) !void {
+    if (memory.len == 0) return error.MissingWasmMemory;
+    const count = try section.readUleb32();
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const mode = try section.readUleb32();
+        if (mode != 0) return error.UnsupportedWasmFixture;
+        const offset_opcode = try section.readByte();
+        if (offset_opcode != 0x41) return error.UnsupportedWasmFixture;
+        const offset_value = try section.readI32Leb();
+        if (offset_value < 0) return error.UnsupportedWasmFixture;
+        const end_opcode = try section.readByte();
+        if (end_opcode != 0x0b) return error.UnsupportedWasmFixture;
+        const data_len = try section.readUleb32();
+        const data = try section.readSlice(data_len);
+        const start: usize = @intCast(offset_value);
+        const len: usize = @intCast(data_len);
+        if (start > memory.len or len > memory.len - start) return error.WasmDataOutOfBounds;
+        @memcpy(memory[start .. start + len], data);
+    }
+}
+
+fn validateRequiredExports(host: *const Host) !void {
+    const required_exports = [_][]const u8{
+        "metadata",
+        "metadata_len",
+        "schema",
+        "schema_len",
+        "execute",
+        "execute_len",
+    };
+    inline for (required_exports) |name| {
+        _ = try host.invokeConstI32(name);
+    }
+}
+
+fn expectJsonObject(allocator: std.mem.Allocator, text: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return error.InvalidJsonInput;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidJsonInput;
+}
+
+fn freeStringHashMapKeys(map: *std.StringHashMap(u32), allocator: std.mem.Allocator) void {
+    var iterator = map.keyIterator();
+    while (iterator.next()) |key| allocator.free(key.*);
+}
+
+fn readRepoFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .limited(512 * 1024));
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
+}
+
+fn expectStringField(object: std.json.ObjectMap, field: []const u8, expected: []const u8) !void {
+    const value = object.get(field) orelse return error.MissingJsonField;
+    try std.testing.expect(value == .string);
+    try std.testing.expectEqualStrings(expected, value.string);
+}
+
+test "wasm host loads repository-local plugin fixture and calls metadata schema execute" {
+    const allocator = std.testing.allocator;
+    var host = try Host.loadFromFile(allocator, std.testing.io, PLUGIN_FIXTURE_PATH);
+    defer host.deinit();
+
+    const metadata_json = try host.callMetadata();
+    defer allocator.free(metadata_json);
+    var metadata = try std.json.parseFromSlice(std.json.Value, allocator, metadata_json, .{});
+    defer metadata.deinit();
+    try std.testing.expect(metadata.value == .object);
+    try expectStringField(metadata.value.object, "id", "fixture.echo");
+    try expectStringField(metadata.value.object, "name", "Native Wasm Host Fixture");
+    try expectStringField(metadata.value.object, "version", "0.1.0");
+    try expectStringField(metadata.value.object, "description", "Deterministic repository-local Wasm fixture for the Zig host spike.");
+
+    const schema_json = try host.callSchema();
+    defer allocator.free(schema_json);
+    var schema = try std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{});
+    defer schema.deinit();
+    try std.testing.expect(schema.value == .object);
+    try std.testing.expect(schema.value.object.get("inputSchema").? == .object);
+    try std.testing.expect(schema.value.object.get("outputSchema").? == .object);
+
+    const execute_json = try host.callExecute(EXECUTE_INPUT_JSON);
+    defer allocator.free(execute_json);
+    try std.testing.expectEqualStrings(EXPECTED_EXECUTE_OUTPUT_JSON, execute_json);
+    var execute = try std.json.parseFromSlice(std.json.Value, allocator, execute_json, .{});
+    defer execute.deinit();
+    try std.testing.expect(execute.value == .object);
+    try std.testing.expect(execute.value.object.get("ok").? == .bool);
+    try std.testing.expect(execute.value.object.get("ok").?.bool);
+    try expectStringField(execute.value.object, "tool", "fixture.echo");
+    try expectStringField(execute.value.object, "echo", "native-wasm");
+}
+
+test "extism project-local blocker evidence is recorded for wasm host spike" {
+    const allocator = std.testing.allocator;
+    const evidence = try readRepoFile(allocator, EVIDENCE_PATH);
+    defer allocator.free(evidence);
+
+    try expectContains(evidence, "WASM-004");
+    try expectContains(evidence, "Extism");
+    try expectContains(evidence, "npm ls @extism/extism extism --depth=0");
+    try expectContains(evidence, "zig/vendor/extism missing");
+    try expectContains(evidence, "pkg-config extism exit=1");
+    try expectContains(evidence, "project-local");
+    try expectContains(evidence, "native Wasm substitute");
+    try expectContains(evidence, "No agent/session runtime integration");
+}
+
+test "wasm host spike stays isolated from agent session and provider runtime" {
+    const allocator = std.testing.allocator;
+    const source = try readRepoFile(allocator, "src/coding_agent/wasm_host_spike.zig");
+    defer allocator.free(source);
+
+    try expectNotContains(source, "@import(\"extension_host.zig\")");
+    try expectNotContains(source, "@import(\"session.zig\")");
+    try expectNotContains(source, "@import(\"session_manager.zig\")");
+    try expectNotContains(source, "@import(\"provider_config.zig\")");
+}
+
+test "wasm unload cleanup releases host resources and unregisters tool" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    var registry = extension_registry.Registry.init(allocator);
+    defer registry.deinit();
+
+    var host = try Host.loadFromFile(allocator, std.testing.io, manifest_result.valid.artifact_absolute_path);
+    defer host.deinit();
+
+    try registry.registerTool(
+        manifest_result.valid.tool_id,
+        manifest_result.valid.tool_id,
+        manifest_result.valid.description,
+        manifest_result.valid.artifact_absolute_path,
+    );
+
+    const before = host.resourceCounts();
+    try std.testing.expect(before.memory_bytes > 0);
+    try std.testing.expect(before.function_returns > 0);
+    try std.testing.expect(before.function_exports > 0);
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings(manifest_result.valid.tool_id, registry.tools.items[0].name);
+    try std.testing.expect(!@hasField(Host, "child"));
+    try std.testing.expect(!@hasField(Host, "server"));
+    try std.testing.expect(!@hasField(Host, "listener"));
+
+    host.unload(&registry, manifest_result.valid.tool_id);
+
+    const after = host.resourceCounts();
+    try std.testing.expectEqual(@as(usize, 0), after.memory_bytes);
+    try std.testing.expectEqual(@as(usize, 0), after.function_returns);
+    try std.testing.expectEqual(@as(usize, 0), after.function_exports);
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expect(!registry.unregisterTool(manifest_result.valid.tool_id));
+    try std.testing.expectError(error.MissingWasmExport, host.callMetadata());
+}
+
+test "wasm pure tool selection names existing implementation manifest and artifact" {
+    try std.testing.expectEqualStrings("zig/src/coding_agent/tools/truncate.zig::truncateHead", PURE_TOOL_EXISTING_API);
+    try std.testing.expectEqualStrings("test/fixtures/wasm/pure-truncate-head-v0/pi-extension.json", PURE_TOOL_MANIFEST_PATH);
+    try std.testing.expectEqualStrings("test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm", PURE_TOOL_ARTIFACT_PATH);
+}
+
+test "wasm package manifest handoff keeps normalized artifact path and tool id" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+
+    try std.testing.expect(manifest_result == .valid);
+    try std.testing.expectEqualStrings("com.pi.pure-truncate-head", manifest_result.valid.id);
+    try std.testing.expectEqualStrings("builtin.truncateHead", manifest_result.valid.tool_id);
+    try std.testing.expectEqualStrings("wasm/plugin.wasm", manifest_result.valid.artifact_path);
+    try std.testing.expect(std.fs.path.isAbsolute(manifest_result.valid.artifact_absolute_path));
+    try std.testing.expect(std.mem.endsWith(u8, manifest_result.valid.artifact_absolute_path, "test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm"));
+    try std.testing.expectEqual(@as(usize, 0), manifest_result.valid.requested_capabilities.len);
+}
+
+test "wasm package invalid artifact rejects before load success" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestText(allocator, PURE_TOOL_PACKAGE_ROOT,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Missing artifact","artifact":{"kind":"wasm-component","path":"wasm/missing.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[]}
+    );
+    defer manifest_result.deinit(allocator);
+
+    try std.testing.expect(manifest_result == .invalid);
+    try std.testing.expectEqual(@as(usize, 1), manifest_result.invalid.len);
+    try std.testing.expectEqual(.validate, manifest_result.invalid[0].phase);
+    try std.testing.expectEqualStrings("$.artifact.path", manifest_result.invalid[0].path);
+    try std.testing.expectEqualStrings("artifact file was not found", manifest_result.invalid[0].message);
+}
+
+test "wasm pure tool truncateHead success matches existing implementation under default deny" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    try std.testing.expectEqualStrings("builtin.truncateHead", manifest_result.valid.tool_id);
+    try std.testing.expectEqualStrings("wasm/plugin.wasm", manifest_result.valid.artifact_path);
+    try std.testing.expectEqual(@as(usize, 0), manifest_result.valid.requested_capabilities.len);
+
+    const existing_json = try normalizedExistingPureToolCall(allocator, PURE_TOOL_SUCCESS_INPUT_JSON);
+    defer allocator.free(existing_json);
+    const wasm_json = try normalizedWasmPureToolCall(allocator, PURE_TOOL_SUCCESS_INPUT_JSON);
+    defer allocator.free(wasm_json);
+    try std.testing.expectEqualStrings(existing_json, wasm_json);
+
+    const artifact_hash = try sha256FileHex(allocator, PURE_TOOL_ARTIFACT_PATH);
+    defer allocator.free(artifact_hash);
+    try std.testing.expectEqual(@as(usize, 64), artifact_hash.len);
+}
+
+test "wasm pure tool truncateHead malformed input diagnostic matches existing implementation" {
+    const allocator = std.testing.allocator;
+
+    const existing_json = try normalizedExistingPureToolCall(allocator, PURE_TOOL_MALFORMED_INPUT_JSON);
+    defer allocator.free(existing_json);
+    const wasm_json = try normalizedWasmPureToolCall(allocator, PURE_TOOL_MALFORMED_INPUT_JSON);
+    defer allocator.free(wasm_json);
+    try std.testing.expectEqualStrings(INVALID_INPUT_DIAGNOSTIC_JSON, existing_json);
+    try std.testing.expectEqualStrings(existing_json, wasm_json);
+}
+
+fn normalizedExistingPureToolCall(allocator: std.mem.Allocator, input_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input_json, .{}) catch {
+        return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    const object = parsed.value.object;
+    const content = stringField(object, "content") orelse return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    const max_lines = usizeField(object, "maxLines") orelse return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    const max_bytes = usizeField(object, "maxBytes") orelse return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+
+    var result = try truncate_tool.truncateHead(allocator, content, .{
+        .max_lines = max_lines,
+        .max_bytes = max_bytes,
+    });
+    defer result.deinit(allocator);
+    return truncationResultJson(allocator, result);
+}
+
+fn normalizedWasmPureToolCall(allocator: std.mem.Allocator, input_json: []const u8) ![]u8 {
+    var host = try Host.loadFromFile(allocator, std.testing.io, PURE_TOOL_ARTIFACT_PATH);
+    defer host.deinit();
+    const output = host.callExecute(input_json) catch |err| switch (err) {
+        error.InvalidJsonInput => return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON),
+        else => return err,
+    };
+    defer allocator.free(output);
+    return allocator.dupe(u8, output);
+}
+
+fn stringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn usizeField(object: std.json.ObjectMap, field: []const u8) ?usize {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn truncationResultJson(allocator: std.mem.Allocator, result: truncate_tool.TruncationResult) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll("{\"content\":");
+    try std.json.Stringify.value(result.content, .{}, &writer.writer);
+    try writer.writer.print(",\"truncated\":{},\"truncatedBy\":", .{result.truncated});
+    if (result.truncated_by) |truncated_by| {
+        try std.json.Stringify.value(switch (truncated_by) {
+            .lines => "lines",
+            .bytes => "bytes",
+        }, .{}, &writer.writer);
+    } else {
+        try writer.writer.writeAll("null");
+    }
+    try writer.writer.print(
+        ",\"totalLines\":{},\"totalBytes\":{},\"outputLines\":{},\"outputBytes\":{},\"lastLinePartial\":{},\"firstLineExceedsLimit\":{},\"maxLines\":{},\"maxBytes\":{}",
+        .{
+            result.total_lines,
+            result.total_bytes,
+            result.output_lines,
+            result.output_bytes,
+            result.last_line_partial,
+            result.first_line_exceeds_limit,
+            result.max_lines,
+            result.max_bytes,
+        },
+    );
+    try writer.writer.writeAll("}");
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn sha256FileHex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const bytes = try readRepoFile(allocator, path);
+    defer allocator.free(bytes);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "{s}", .{hex[0..]});
+}

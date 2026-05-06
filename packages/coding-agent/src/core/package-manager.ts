@@ -33,6 +33,11 @@ import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
+import {
+	hasWasmExtensionManifest,
+	validateWasmExtensionPackage,
+	type WasmExtensionPackageManifest,
+} from "./wasm-extension-package.js";
 
 const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
@@ -57,8 +62,15 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
+export interface ResolvedWasmExtensionPackage extends WasmExtensionPackageManifest {
+	path: string;
+	enabled: boolean;
+	metadata: PathMetadata;
+}
+
 export interface ResolvedPaths {
 	extensions: ResolvedResource[];
+	wasmExtensions: ResolvedWasmExtensionPackage[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
@@ -153,6 +165,7 @@ interface PiManifest {
 
 interface ResourceAccumulator {
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
+	wasmExtensions: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
@@ -957,6 +970,9 @@ export class DefaultPackageManager implements PackageManager {
 				const resolved = this.resolvePath(parsed.path);
 				if (!existsSync(resolved)) {
 					throw new Error(`Path does not exist: ${resolved}`);
+				}
+				if (statSync(resolved).isDirectory() && hasWasmExtensionManifest(resolved)) {
+					validateWasmExtensionPackage(resolved);
 				}
 				return;
 			}
@@ -1922,6 +1938,8 @@ export class DefaultPackageManager implements PackageManager {
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
 	): boolean {
+		const hasWasmExtension = this.collectWasmExtensionPackage(packageRoot, accumulator, metadata);
+
 		if (filter) {
 			for (const resourceType of RESOURCE_TYPES) {
 				const patterns = filter[resourceType as keyof PackageFilter];
@@ -1950,7 +1968,7 @@ export class DefaultPackageManager implements PackageManager {
 			return true;
 		}
 
-		let hasAnyDir = false;
+		let hasAnyDir = hasWasmExtension;
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
 			if (existsSync(dir)) {
@@ -1963,6 +1981,19 @@ export class DefaultPackageManager implements PackageManager {
 			}
 		}
 		return hasAnyDir;
+	}
+
+	private collectWasmExtensionPackage(
+		packageRoot: string,
+		accumulator: ResourceAccumulator,
+		metadata: PathMetadata,
+	): boolean {
+		if (!hasWasmExtensionManifest(packageRoot)) {
+			return false;
+		}
+		const manifest = validateWasmExtensionPackage(packageRoot);
+		this.addWasmExtensionPackage(accumulator.wasmExtensions, manifest, metadata, true);
+		return true;
 	}
 
 	private collectDefaultResources(
@@ -2290,9 +2321,21 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
+	private addWasmExtensionPackage(
+		map: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>,
+		manifest: WasmExtensionPackageManifest,
+		metadata: PathMetadata,
+		enabled: boolean,
+	): void {
+		if (!map.has(manifest.manifestPath)) {
+			map.set(manifest.manifestPath, { metadata, manifest, enabled });
+		}
+	}
+
 	private createAccumulator(): ResourceAccumulator {
 		return {
 			extensions: new Map(),
+			wasmExtensions: new Map(),
 			skills: new Map(),
 			prompts: new Map(),
 			themes: new Map(),
@@ -2321,10 +2364,31 @@ export class DefaultPackageManager implements PackageManager {
 
 		return {
 			extensions: mapToResolved(accumulator.extensions),
+			wasmExtensions: this.mapWasmExtensionsToResolved(accumulator.wasmExtensions),
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),
 		};
+	}
+
+	private mapWasmExtensionsToResolved(
+		entries: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>,
+	): ResolvedWasmExtensionPackage[] {
+		const resolved = Array.from(entries.values()).map(({ metadata, manifest, enabled }) => ({
+			...manifest,
+			path: manifest.manifestPath,
+			enabled,
+			metadata,
+		}));
+		resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
+
+		const seen = new Set<string>();
+		return resolved.filter((entry) => {
+			const canonicalPath = canonicalizePath(entry.manifestPath);
+			if (seen.has(canonicalPath)) return false;
+			seen.add(canonicalPath);
+			return true;
+		});
 	}
 
 	private spawnCommand(command: string, args: string[], options?: { cwd?: string }): ChildProcess {

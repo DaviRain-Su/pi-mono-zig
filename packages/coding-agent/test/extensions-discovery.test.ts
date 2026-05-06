@@ -200,6 +200,38 @@ describe("extensions discovery", () => {
 		expect(result.extensions).toHaveLength(0);
 	});
 
+	it("ignores pi-extension.json Wasm package directories in Bun extension discovery", async () => {
+		const subdir = path.join(extensionsDir, "wasm-package");
+		fs.mkdirSync(path.join(subdir, "wasm"), { recursive: true });
+		fs.writeFileSync(path.join(subdir, "wasm", "plugin.wasm"), Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+		fs.writeFileSync(
+			path.join(subdir, "pi-extension.json"),
+			JSON.stringify({
+				schemaVersion: "pi-extension.v0",
+				id: "com.example.discovery-wasm",
+				name: "Discovery Wasm Fixture",
+				version: "0.1.0",
+				description: "A Wasm package fixture that should not be loaded through the Bun path.",
+				artifact: {
+					kind: "wasm-component",
+					path: "wasm/plugin.wasm",
+				},
+				tool: {
+					id: "fixture.discovery",
+					description: "Discovery fixture",
+					inputSchema: {},
+					outputSchema: {},
+				},
+				capabilities: [],
+			}),
+		);
+
+		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions).toHaveLength(0);
+	});
+
 	it("does not recurse beyond one level", async () => {
 		const subdir = path.join(extensionsDir, "container");
 		const nested = path.join(subdir, "nested");

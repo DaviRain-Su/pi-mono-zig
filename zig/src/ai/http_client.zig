@@ -46,7 +46,7 @@ pub const StreamingResponse = struct {
     owns_body: bool = true,
     request: ?*std.http.Client.Request = null,
     reader: ?*std.Io.Reader = null,
-    transfer_buffer: [64]u8 = undefined,
+    transfer_buffer: []u8 = &.{},
     decompress: std.http.Decompress = undefined,
     decompress_buffer: []u8 = &.{},
     redirect_buffer: []u8 = &.{},
@@ -76,6 +76,7 @@ pub const StreamingResponse = struct {
         }
         if (self.owns_body) self.allocator.free(self.body);
         if (self.response_headers) |*headers| deinitOwnedHeaders(self.allocator, headers);
+        if (self.transfer_buffer.len > 0) self.allocator.free(self.transfer_buffer);
         if (self.decompress_buffer.len > 0) self.allocator.free(self.decompress_buffer);
         if (self.redirect_buffer.len > 0) self.allocator.free(self.redirect_buffer);
         if (self.extra_headers.len > 0) self.allocator.free(self.extra_headers);
@@ -433,6 +434,7 @@ pub const HttpClient = struct {
             .response_headers = response_headers,
             .owns_body = false,
             .request = request_ptr,
+            .transfer_buffer = try self.allocator.alloc(u8, 64),
             .redirect_buffer = redirect_buffer,
             .extra_headers = extra_headers_owned,
             .aborted = req.aborted,
@@ -446,11 +448,11 @@ pub const HttpClient = struct {
         owns_redirect_buffer = false;
 
         streaming.reader = switch (response.head.content_encoding) {
-            .identity => response.reader(&streaming.transfer_buffer),
+            .identity => response.reader(streaming.transfer_buffer),
             .zstd => blk: {
                 streaming.decompress_buffer = try self.allocator.alloc(u8, std.compress.zstd.default_window_len);
                 break :blk response.readerDecompressing(
-                    &streaming.transfer_buffer,
+                    streaming.transfer_buffer,
                     &streaming.decompress,
                     streaming.decompress_buffer,
                 );
@@ -458,7 +460,7 @@ pub const HttpClient = struct {
             .deflate, .gzip => blk: {
                 streaming.decompress_buffer = try self.allocator.alloc(u8, std.compress.flate.max_window_len);
                 break :blk response.readerDecompressing(
-                    &streaming.transfer_buffer,
+                    streaming.transfer_buffer,
                     &streaming.decompress,
                     streaming.decompress_buffer,
                 );

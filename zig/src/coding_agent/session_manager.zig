@@ -3585,3 +3585,178 @@ test "session search scans all session files and ranks name and content matches 
     try std.testing.expectEqual(@as(usize, 1), named_only.len);
     try std.testing.expectEqualStrings(night_shift_path, all_sessions[named_only[0].session_index].path);
 }
+
+const SESSION_JSONL_REPLAY_FUZZ_SMOKE_SEED: u64 = 0x5eed_5e55_10ab_0004;
+
+const SessionJsonlFuzzExpectation = enum {
+    valid_branch_context,
+    invalid_parent_context_error,
+};
+
+test "VAL-REFACTOR-010 deterministic session JSONL replay fuzz smoke" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(SESSION_JSONL_REPLAY_FUZZ_SMOKE_SEED);
+    const random = prng.random();
+
+    const malformed_lines = [_][]const u8{
+        "not-json",
+        "{\"type\":\"message\",\"id\":\"partial\"",
+        "{\"type\":\"message\",\"id\":7,\"parentId\":null,\"timestamp\":\"2026-05-06T00:00:03.000Z\",\"message\":{}}",
+        "{\"type\":\"unknown\",\"id\":\"ignored\",\"parentId\":null,\"timestamp\":\"2026-05-06T00:00:04.000Z\"}",
+    };
+
+    var valid_body_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer valid_body_writer.deinit();
+    try valid_body_writer.writer.writeAll(sessionFuzzHeaderLine());
+    try valid_body_writer.writer.writeAll(sessionFuzzUserLine("u1", "null", "root prompt", 1));
+    try valid_body_writer.writer.writeAll(sessionFuzzAssistantLine("a1", "\"u1\"", "root answer", 2));
+    try valid_body_writer.writer.writeAll(malformed_lines[random.intRangeLessThan(usize, 0, malformed_lines.len)]);
+    try valid_body_writer.writer.writeByte('\n');
+    try valid_body_writer.writer.writeAll(sessionFuzzModelLine("m1", "\"a1\"", 3));
+    try valid_body_writer.writer.writeAll(sessionFuzzBranchSummaryLine("b1", "\"m1\"", "a1", "alternate branch summary", 4));
+    try valid_body_writer.writer.writeAll(malformed_lines[random.intRangeLessThan(usize, 0, malformed_lines.len)]);
+    try valid_body_writer.writer.writeByte('\n');
+    try valid_body_writer.writer.writeAll(sessionFuzzLabelLine("l1", "\"b1\"", "u1", "bookmark", 5));
+
+    runSessionJsonlFuzzCase(
+        allocator,
+        "valid-with-malformed-partial-and-branch-summary",
+        valid_body_writer.written(),
+        .valid_branch_context,
+    ) catch |err| {
+        reportSessionJsonlFuzzFailure(SESSION_JSONL_REPLAY_FUZZ_SMOKE_SEED, "valid-with-malformed-partial-and-branch-summary", valid_body_writer.written());
+        return err;
+    };
+
+    var invalid_parent_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer invalid_parent_writer.deinit();
+    try invalid_parent_writer.writer.writeAll(sessionFuzzHeaderLine());
+    try invalid_parent_writer.writer.writeAll(sessionFuzzUserLine("root", "null", "root prompt", 1));
+    try invalid_parent_writer.writer.writeAll(sessionFuzzUserLine("orphan", "\"missing-parent\"", "orphan prompt", 2));
+
+    runSessionJsonlFuzzCase(
+        allocator,
+        "invalid-parent-context-rebuild",
+        invalid_parent_writer.written(),
+        .invalid_parent_context_error,
+    ) catch |err| {
+        reportSessionJsonlFuzzFailure(SESSION_JSONL_REPLAY_FUZZ_SMOKE_SEED, "invalid-parent-context-rebuild", invalid_parent_writer.written());
+        return err;
+    };
+}
+
+fn runSessionJsonlFuzzCase(
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    body: []const u8,
+    expectation: SessionJsonlFuzzExpectation,
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "session-replay-fuzz.jsonl",
+    });
+    defer allocator.free(relative_path);
+    const session_file = try makeAbsoluteTestPath(allocator, relative_path);
+    defer allocator.free(session_file);
+    try common.writeFileAbsolute(std.testing.io, session_file, body, true);
+
+    var warnings: std.Io.Writer.Allocating = .init(allocator);
+    defer warnings.deinit();
+
+    var manager = try SessionManager.openWithWarningWriter(
+        allocator,
+        std.testing.io,
+        session_file,
+        null,
+        &warnings.writer,
+    );
+    defer manager.deinit();
+
+    switch (expectation) {
+        .valid_branch_context => {
+            var context = try manager.buildSessionContext(allocator);
+            defer context.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+            try std.testing.expectEqualStrings("root prompt", context.messages[0].user.content[0].text.text);
+            try std.testing.expectEqualStrings("root answer", context.messages[1].assistant.content[0].text.text);
+            try std.testing.expect(std.mem.indexOf(u8, context.messages[2].user.content[0].text.text, "alternate branch summary") != null);
+            try std.testing.expect(context.model != null);
+            try std.testing.expectEqualStrings("faux-session-fuzz", context.model.?.model_id);
+            try std.testing.expectEqualStrings("bookmark", manager.getLabel("u1").?);
+            try std.testing.expect(std.mem.indexOf(u8, warnings.writer.buffered(), "corrupted line") != null);
+        },
+        .invalid_parent_context_error => {
+            try std.testing.expectError(error.InvalidSessionTree, manager.buildSessionContext(allocator));
+            try std.testing.expectError(error.InvalidSessionTree, manager.getBranch(allocator, null));
+        },
+    }
+
+    _ = label;
+}
+
+fn sessionFuzzHeaderLine() []const u8 {
+    return "{\"type\":\"session\",\"id\":\"session-fuzz\",\"timestamp\":\"2026-05-06T00:00:00.000Z\",\"cwd\":\"/tmp/session-fuzz\",\"parentSession\":\"/tmp/parent-session.jsonl\"}\n";
+}
+
+fn sessionFuzzUserLine(id: []const u8, parent_id_json: []const u8, text: []const u8, timestamp: i64) []const u8 {
+    _ = timestamp;
+    if (std.mem.eql(u8, id, "u1")) {
+        _ = parent_id_json;
+        _ = text;
+        return "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-05-06T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"root prompt\",\"timestamp\":1}}\n";
+    }
+    if (std.mem.eql(u8, id, "root")) {
+        _ = parent_id_json;
+        _ = text;
+        return "{\"type\":\"message\",\"id\":\"root\",\"parentId\":null,\"timestamp\":\"2026-05-06T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"root prompt\",\"timestamp\":1}}\n";
+    }
+    _ = parent_id_json;
+    _ = text;
+    return "{\"type\":\"message\",\"id\":\"orphan\",\"parentId\":\"missing-parent\",\"timestamp\":\"2026-05-06T00:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":\"orphan prompt\",\"timestamp\":2}}\n";
+}
+
+fn sessionFuzzAssistantLine(id: []const u8, parent_id_json: []const u8, text: []const u8, timestamp: i64) []const u8 {
+    _ = id;
+    _ = parent_id_json;
+    _ = text;
+    _ = timestamp;
+    return "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-05-06T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"root answer\"}],\"api\":\"faux\",\"provider\":\"faux\",\"model\":\"faux-session-fuzz\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0},\"stopReason\":\"stop\",\"timestamp\":2}}\n";
+}
+
+fn sessionFuzzModelLine(id: []const u8, parent_id_json: []const u8, timestamp: i64) []const u8 {
+    _ = id;
+    _ = parent_id_json;
+    _ = timestamp;
+    return "{\"type\":\"model_change\",\"id\":\"m1\",\"parentId\":\"a1\",\"timestamp\":\"2026-05-06T00:00:03.000Z\",\"provider\":\"faux\",\"modelId\":\"faux-session-fuzz\"}\n";
+}
+
+fn sessionFuzzBranchSummaryLine(id: []const u8, parent_id_json: []const u8, from_id: []const u8, summary: []const u8, timestamp: i64) []const u8 {
+    _ = id;
+    _ = parent_id_json;
+    _ = from_id;
+    _ = summary;
+    _ = timestamp;
+    return "{\"type\":\"branch_summary\",\"id\":\"b1\",\"parentId\":\"m1\",\"timestamp\":\"2026-05-06T00:00:04.000Z\",\"fromId\":\"a1\",\"summary\":\"alternate branch summary\",\"fromHook\":true}\n";
+}
+
+fn sessionFuzzLabelLine(id: []const u8, parent_id_json: []const u8, target_id: []const u8, label: []const u8, timestamp: i64) []const u8 {
+    _ = id;
+    _ = parent_id_json;
+    _ = target_id;
+    _ = label;
+    _ = timestamp;
+    return "{\"type\":\"label\",\"id\":\"l1\",\"parentId\":\"b1\",\"timestamp\":\"2026-05-06T00:00:05.000Z\",\"targetId\":\"u1\",\"label\":\"bookmark\"}\n";
+}
+
+fn reportSessionJsonlFuzzFailure(seed: u64, label: []const u8, input: []const u8) void {
+    std.debug.print("Session JSONL fuzz smoke failure seed=0x{x} case={s} smallest_repro_jsonl={s}", .{
+        seed,
+        label,
+        input,
+    });
+}

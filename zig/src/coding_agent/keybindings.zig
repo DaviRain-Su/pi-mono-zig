@@ -1094,3 +1094,87 @@ test "keybinding setBinding replaces all keys for action" {
     try std.testing.expectEqual(Action.clear, kb.actionForKey(.{ .ctrl = '9' }).?);
     try std.testing.expect(kb.actionForKey(.{ .ctrl = '0' }) == null);
 }
+
+const KEYBINDING_FUZZ_SMOKE_SEED: u64 = 0x5eed_6b64_0000_0003;
+
+test "VAL-REFACTOR-011 deterministic keybinding parse match fuzz smoke" {
+    const allocator = std.testing.allocator;
+
+    const fixed_cases = [_]struct {
+        label: []const u8,
+        raw: []const u8,
+        expected: ?KeySpec,
+    }{
+        .{ .label = "trimmed-ctrl-normalized", .raw = "  CTRL+C  ", .expected = .{ .ctrl = 'c' } },
+        .{ .label = "shift-ctrl-normalized", .raw = "Shift+Ctrl+P", .expected = .{ .shift_ctrl_char = 'p' } },
+        .{ .label = "alt-delete-alias", .raw = "Alt+Del", .expected = .alt_delete },
+        .{ .label = "page-down-alias", .raw = "page_down", .expected = .page_down },
+        .{ .label = "invalid-unknown-modifier", .raw = "meta+x", .expected = null },
+        .{ .label = "invalid-combo-order", .raw = "ctrl+shift+p", .expected = null },
+        .{ .label = "invalid-empty", .raw = " \t\r\n", .expected = null },
+    };
+
+    for (fixed_cases) |case| {
+        expectKeybindingFuzzParse(case.raw, case.expected) catch |err| {
+            reportKeybindingFuzzFailure(KEYBINDING_FUZZ_SMOKE_SEED, case.label, case.raw);
+            return err;
+        };
+    }
+
+    var prng = std.Random.DefaultPrng.init(KEYBINDING_FUZZ_SMOKE_SEED);
+    const random = prng.random();
+    const prefixes = [_][]const u8{ "ctrl+", "alt+", "shift+", "shift+ctrl+", "ctrl+alt+" };
+    var generated_index: usize = 0;
+    while (generated_index < 24) : (generated_index += 1) {
+        const prefix = prefixes[random.intRangeLessThan(usize, 0, prefixes.len)];
+        const letter: u8 = 'a' + random.intRangeLessThan(u8, 0, 26);
+        const raw = try std.fmt.allocPrint(allocator, "{s}{c}", .{ prefix, std.ascii.toUpper(letter) });
+        defer allocator.free(raw);
+
+        const expected: ?KeySpec = if (std.mem.eql(u8, prefix, "ctrl+"))
+            KeySpec{ .ctrl = letter }
+        else if (std.mem.eql(u8, prefix, "alt+"))
+            KeySpec{ .alt = letter }
+        else if (std.mem.eql(u8, prefix, "shift+"))
+            KeySpec{ .shift_char = letter }
+        else if (std.mem.eql(u8, prefix, "shift+ctrl+"))
+            KeySpec{ .shift_ctrl_char = letter }
+        else if (std.mem.eql(u8, prefix, "ctrl+alt+"))
+            KeySpec{ .ctrl_alt = letter }
+        else
+            null;
+
+        expectKeybindingFuzzParse(raw, expected) catch |err| {
+            reportKeybindingFuzzFailure(KEYBINDING_FUZZ_SMOKE_SEED, "generated-parse", raw);
+            return err;
+        };
+    }
+
+    var kb = try Keybindings.initDefaults(allocator);
+    defer kb.deinit();
+    try kb.setBinding(.clear, &.{.{ .ctrl = '0' }});
+    try kb.setBinding(.exit, &.{.{ .ctrl = '0' }});
+    try std.testing.expectEqual(Action.clear, kb.actionForKey(.{ .ctrl = '0' }).?);
+    try std.testing.expect(kb.matchesAction(.clear, .{ .ctrl = '0' }, .{}));
+    try std.testing.expect(kb.matchesAction(.exit, .{ .ctrl = '0' }, .{}));
+    try std.testing.expectEqual(Action.model_cycleBackward, kb.actionForKeyWithModifiers(.{ .ctrl = 'p' }, .{ .shift = true }).?);
+    try std.testing.expectEqual(Action.tree_filter_cycleBackward, kb.actionForKeyWithModifiers(.{ .ctrl = 'o' }, .{ .shift = true }).?);
+}
+
+fn expectKeybindingFuzzParse(raw: []const u8, expected: ?KeySpec) !void {
+    const actual = parseKeySpec(raw);
+    if (expected) |expected_spec| {
+        try std.testing.expect(actual != null);
+        try std.testing.expectEqualDeep(expected_spec, actual.?);
+    } else {
+        try std.testing.expectEqual(@as(?KeySpec, null), actual);
+    }
+}
+
+fn reportKeybindingFuzzFailure(seed: u64, label: []const u8, input: []const u8) void {
+    std.debug.print("Keybinding fuzz smoke failure seed=0x{x} case={s} minimized_input={s}", .{
+        seed,
+        label,
+        input,
+    });
+}

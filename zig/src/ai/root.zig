@@ -82,6 +82,7 @@ test {
     _ = @import("json_parse.zig");
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
+    _ = @import("oauth/types.zig");
     _ = @import("shared/abort_signal.zig");
     _ = @import("shared/provider_error.zig");
     _ = @import("providers/faux.zig");
