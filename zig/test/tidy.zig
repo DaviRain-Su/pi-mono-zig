@@ -24,6 +24,12 @@ const LongFunctionWarning = struct {
     function_name: []u8,
 };
 
+const AllowlistedLongFunction = struct {
+    path: []const u8,
+    function_name: []const u8,
+    reason: []const u8,
+};
+
 const TestRootWarning = struct {
     path: []const u8,
 };
@@ -48,7 +54,38 @@ const known_test_roots = [_][]const u8{
     "test/tidy.zig",
 };
 
-const test_root_coverage_allowlist = [_]AllowlistedTestFile{};
+const long_function_allowlist = [_]AllowlistedLongFunction{
+    .{ .path = "src/ai/providers/azure_openai_responses.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/google.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/google_gemini_cli.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/kimi.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/mistral.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/openai.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/openai.zig", .function_name = "buildRequestPayloadWithCacheRetentionEnv", .reason = "pre-existing OpenAI payload construction debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/openai.zig", .function_name = "buildAssistantMessage", .reason = "pre-existing OpenAI response conversion debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/openai_codex_responses.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/ai/providers/openai_responses.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/cli/args.zig", .function_name = "parseArgs", .reason = "pre-existing CLI argument parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/config.zig", .function_name = "loadModelsConfig", .reason = "pre-existing config loader debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/extension_registry.zig", .function_name = "applyHostFrame", .reason = "pre-existing registry frame dispatcher debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/interactive_mode.zig", .function_name = "runInteractiveMode", .reason = "pre-existing interactive mode orchestration debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/interactive_mode/input_dispatch.zig", .function_name = "handleInputKeyWithModifiers", .reason = "pre-existing key dispatch debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/interactive_mode/rendering.zig", .function_name = "handleAgentEvent", .reason = "pre-existing rendering event dispatcher debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/interactive_mode/slash_commands.zig", .function_name = "handleSlashCommand", .reason = "pre-existing slash command dispatcher debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/package_manager.zig", .function_name = "parsePackageCommand", .reason = "pre-existing package command parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/session_advanced.zig", .function_name = "renderSessionHtml", .reason = "pre-existing session HTML renderer debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/session_manager.zig", .function_name = "parseEntryLine", .reason = "pre-existing session entry parser debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/tools/bash.zig", .function_name = "executeWithUpdates", .reason = "pre-existing bash execution orchestration debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/tools/grep.zig", .function_name = "execute", .reason = "pre-existing grep tool orchestration debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/ts_rpc_mode.zig", .function_name = "handleCommand", .reason = "pre-existing TS-RPC command dispatcher debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/ts_rpc_mode.zig", .function_name = "writeExtensionUIRequestFromHost", .reason = "pre-existing TS-RPC UI bridge serialization debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/coding_agent/ts_rpc_mode.zig", .function_name = "emitExtensionTurnEndFrame", .reason = "pre-existing TS-RPC turn-end emission debt tracked by exact function allowlist so new long functions still fail tidy" },
+    .{ .path = "src/main.zig", .function_name = "runCliWithInput", .reason = "pre-existing CLI orchestration debt tracked by exact function allowlist so new long functions still fail tidy" },
+};
+
+const test_root_coverage_allowlist = [_]AllowlistedTestFile{
+    .{ .path = "src/ai/oauth/pkce.zig", .reason = "pre-existing standalone OAuth PKCE scaffold is not reachable from current build roots; keep explicit until OAuth module wiring is updated" },
+};
 
 const Tidy = struct {
     allocator: std.mem.Allocator,
@@ -331,19 +368,28 @@ fn scanLongFunctionsInFile(
             if (active.saw_open_brace and active.brace_depth <= 0) {
                 const line_count = line_number - active.start_line + 1;
                 if (line_count > threshold) {
-                    try tidy.emitLongFunctionWarning(
-                        path,
-                        active.start_line,
-                        line_count,
-                        active.function_name,
-                    );
-                    warning_count += 1;
+                    if (!isAllowedLongFunction(path, active.function_name, &long_function_allowlist)) {
+                        try tidy.emitLongFunctionWarning(
+                            path,
+                            active.start_line,
+                            line_count,
+                            active.function_name,
+                        );
+                        warning_count += 1;
+                    }
                 }
                 span = null;
             }
         }
     }
     return warning_count;
+}
+
+fn isAllowedLongFunction(path: []const u8, function_name: []const u8, allowlist: []const AllowlistedLongFunction) bool {
+    for (allowlist) |entry| {
+        if (std.mem.eql(u8, entry.path, path) and std.mem.eql(u8, entry.function_name, function_name)) return true;
+    }
+    return false;
 }
 
 fn functionName(line: []const u8) ?[]const u8 {
@@ -376,8 +422,12 @@ fn braceDelta(line: []const u8) i32 {
 }
 
 fn hasTestBlock(bytes: []const u8) bool {
-    return std.mem.indexOf(u8, bytes, "test \"") != null or
-        std.mem.indexOf(u8, bytes, "test {") != null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "test \"") or std.mem.startsWith(u8, trimmed, "test {")) return true;
+    }
+    return false;
 }
 
 fn resolveImportPath(allocator: std.mem.Allocator, importer_path: []const u8, import_spec: []const u8) ![]u8 {
@@ -462,6 +512,27 @@ test "scanLongFunctions reports only functions above threshold" {
     try std.testing.expectEqualStrings("long", tidy.long_function_warnings.items[0].function_name);
 }
 
+test "scanLongFunctions suppresses exact allowlisted legacy functions" {
+    const source =
+        \\fn parseSseStreamLines() void {
+        \\    if (true) {
+        \\    }
+        \\}
+    ;
+    var tidy = Tidy{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .config = .{ .long_function_warning_lines = 3 },
+        .emit_warnings = false,
+        .reachable_files = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer tidy.deinit();
+    const warnings = try scanLongFunctionsInFile("src/ai/providers/openai.zig", source, 3, &tidy);
+    try std.testing.expectEqual(@as(usize, 0), warnings);
+    try std.testing.expectEqual(@as(usize, 0), tidy.warnings);
+    try std.testing.expectEqual(@as(usize, 0), tidy.long_function_warnings.items.len);
+}
+
 test "resolveImportPath normalizes relative Zig imports" {
     const allocator = std.testing.allocator;
     const resolved = try resolveImportPath(allocator, "src/coding_agent/root.zig", "../ai/types.zig");
@@ -501,4 +572,5 @@ test "hasTestBlock detects named and anonymous Zig tests" {
     try std.testing.expect(hasTestBlock("test \"named\" {}"));
     try std.testing.expect(hasTestBlock("test { _ = 1; }"));
     try std.testing.expect(!hasTestBlock("pub fn main() void {}"));
+    try std.testing.expect(!hasTestBlock("std.debug.print(\"Comparator negative self-test {s}\", .{name});"));
 }

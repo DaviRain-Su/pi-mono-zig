@@ -2076,6 +2076,9 @@ test "handleLoginSlashCommand opens auth provider selector" {
 test "beginLoginFlow starts anthropic oauth prompt state" {
     const allocator = std.testing.allocator;
 
+    var oauth_callback_lock = try OAuthCallbackTestLock.acquire(std.testing.io);
+    defer oauth_callback_lock.release(std.testing.io);
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2125,6 +2128,9 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
 
 test "beginLoginFlow falls back to manual paste when OAuth callback listener bind fails" {
     const allocator = std.testing.allocator;
+
+    var oauth_callback_lock = try OAuthCallbackTestLock.acquire(std.testing.io);
+    defer oauth_callback_lock.release(std.testing.io);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2182,6 +2188,9 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
 
 test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
     const allocator = std.testing.allocator;
+
+    var oauth_callback_lock = try OAuthCallbackTestLock.acquire(std.testing.io);
+    defer oauth_callback_lock.release(std.testing.io);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2271,6 +2280,9 @@ test "beginLoginFlow gives google client config guidance without legacy oauth co
 
 test "beginLoginFlow starts google oauth flow with fake safe client config" {
     const allocator = std.testing.allocator;
+
+    var oauth_callback_lock = try OAuthCallbackTestLock.acquire(std.testing.io);
+    defer oauth_callback_lock.release(std.testing.io);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6147,6 +6159,32 @@ fn makeInteractiveTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []c
     defer allocator.free(relative_path);
     return makeInteractiveAbsolutePath(allocator, relative_path);
 }
+
+const OAuthCallbackTestLock = struct {
+    const path = ".zig-cache/oauth-callback-tests.lock";
+    const max_attempts = 1200;
+    const retry_delay_ms = 25;
+
+    fn acquire(io: std.Io) !OAuthCallbackTestLock {
+        try std.Io.Dir.createDirPath(.cwd(), io, ".zig-cache");
+        var attempt: usize = 0;
+        while (attempt < max_attempts) : (attempt += 1) {
+            std.Io.Dir.createDir(.cwd(), io, path, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    _ = io.sleep(.fromMilliseconds(retry_delay_ms), .awake) catch {};
+                    continue;
+                },
+                else => return err,
+            };
+            return .{};
+        }
+        return error.OAuthCallbackTestLockTimeout;
+    }
+
+    fn release(_: *OAuthCallbackTestLock, io: std.Io) void {
+        std.Io.Dir.deleteDir(.cwd(), io, path) catch {};
+    }
+};
 
 fn makeInteractiveAbsolutePath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
