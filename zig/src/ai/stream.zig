@@ -190,7 +190,7 @@ fn mapThinkingLevelToAnthropicEffort(
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     const stream_options = options orelse return false;
     const signal = stream_options.signal orelse return false;
-    return signal.load(.monotonic);
+    return signal.load(types.abort_signal_load_order);
 }
 
 fn createProviderContractErrorStream(

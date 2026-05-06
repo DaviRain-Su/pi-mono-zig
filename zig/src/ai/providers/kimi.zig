@@ -866,7 +866,7 @@ fn finishCurrentBlock(
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     if (options) |stream_options| {
         if (stream_options.signal) |signal| {
-            return signal.load(.monotonic);
+            return signal.load(types.abort_signal_load_order);
         }
     }
     return false;

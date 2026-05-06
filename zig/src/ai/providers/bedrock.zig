@@ -2712,7 +2712,7 @@ fn standardEndpointRegion(base_url: []const u8) ?[]const u8 {
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(.seq_cst);
+        if (stream_options.signal) |signal| return signal.load(types.abort_signal_load_order);
     }
     return false;
 }

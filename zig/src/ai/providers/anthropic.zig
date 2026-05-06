@@ -3265,7 +3265,7 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     if (options) |stream_options| {
         if (stream_options.signal) |signal| {
-            return signal.load(.seq_cst);
+            return signal.load(types.abort_signal_load_order);
         }
     }
     return false;

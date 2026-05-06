@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// Canonical ordering for caller abort-signal classification across AI
+/// stream entry points, provider setup paths, and HTTP streaming setup.
+pub const abort_signal_load_order = .seq_cst;
+
 /// Known API identifiers
 pub const KnownApi = enum {
     openai_completions,

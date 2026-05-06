@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("types.zig");
 
 pub const HttpMethod = enum {
     GET,
@@ -233,7 +234,7 @@ pub const StreamingResponse = struct {
 
         while (!self.watchdog_done.load(.acquire)) {
             if (self.aborted) |aborted| {
-                if (aborted.load(.seq_cst)) {
+                if (aborted.load(types.abort_signal_load_order)) {
                     self.triggerTermination(.aborted);
                     return;
                 }
@@ -366,7 +367,7 @@ pub const HttpClient = struct {
     pub fn requestStreaming(self: *HttpClient, req: HttpRequest) anyerror!StreamingResponse {
         // Check abort signal before starting
         if (req.aborted) |aborted| {
-            if (aborted.load(.monotonic)) return HttpError.RequestAborted;
+            if (aborted.load(types.abort_signal_load_order)) return HttpError.RequestAborted;
         }
 
         const method: std.http.Method = switch (req.method) {
@@ -589,7 +590,7 @@ test "HttpRequest timeout and abort fields" {
 
     try std.testing.expectEqual(@as(u32, 5000), req.timeout_ms);
     try std.testing.expect(req.aborted != null);
-    try std.testing.expect(!req.aborted.?.load(.monotonic));
+    try std.testing.expect(!req.aborted.?.load(types.abort_signal_load_order));
 }
 
 test "StreamingResponse readAll" {

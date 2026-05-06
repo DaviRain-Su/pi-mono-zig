@@ -76,6 +76,11 @@ pub const OpenAIResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
+        if (provider_error.isAbortRequested(options)) {
+            emitSetupRuntimeFailure(&stream_instance, model, options, error.RequestAborted);
+            return stream_instance;
+        }
+
         streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
@@ -2064,7 +2069,7 @@ fn normalizedResponseHeaders(
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(.seq_cst);
+        if (stream_options.signal) |signal| return signal.load(types.abort_signal_load_order);
     }
     return false;
 }
@@ -3370,6 +3375,22 @@ test "VAL-M9-STREAM-004 stream on_payload failure returns one terminal error eve
     try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesPayloadFailure", .error_reason);
 }
 
+test "VAL-RUNTIME-002 streamSimple on_payload failure returns one terminal error event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var stream = try OpenAIResponsesProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .on_payload = failingResponsesOnPayload },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesPayloadFailure", .error_reason);
+}
+
 test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error event" {
     const allocator = std.heap.page_allocator;
     const io = std.testing.io;
@@ -3385,6 +3406,32 @@ test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error ev
     defer allocator.free(url);
 
     var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel(url),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .on_response = &failingResponsesOnResponse },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesResponseFailure", .error_reason);
+}
+
+test "VAL-RUNTIME-002 streamSimple on_response failure returns one terminal error event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body =
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_unread\"}}\n" ++
+        "data: [DONE]\n";
+    var server = try provider_error.TestStatusServer.init(io, 200, "OK", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try OpenAIResponsesProvider.streamSimple(
         allocator,
         io,
         streamErrorContractTestModel(url),
@@ -3510,6 +3557,34 @@ test "VAL-M9-STREAM-010 streamSimple pre-aborted signal matches stream terminal 
         streamErrorContractTestModel("http://127.0.0.1:1"),
         streamErrorContractTestContext(),
         .{ .api_key = "test-key", .signal = &aborted },
+    );
+    defer simple_stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&simple_stream, "Request was aborted", .aborted);
+}
+
+test "VAL-RUNTIME-003 pre-aborted signal takes precedence over missing api key setup errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var aborted = std.atomic.Value(bool).init(true);
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "", .signal = &aborted },
+    );
+    defer stream.deinit();
+
+    try expectOnlyTerminalErrorResponses(&stream, "Request was aborted", .aborted);
+
+    var simple_stream = try OpenAIResponsesProvider.streamSimple(
+        allocator,
+        io,
+        streamErrorContractTestModel("https://api.openai.com/v1"),
+        streamErrorContractTestContext(),
+        .{ .api_key = "", .signal = &aborted },
     );
     defer simple_stream.deinit();
 
