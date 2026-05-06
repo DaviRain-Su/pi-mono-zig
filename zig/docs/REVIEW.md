@@ -26,6 +26,15 @@ The Zig implementation is now usable for the main coding-agent workflows:
   Gemini CLI, Bedrock, Azure Responses, Codex Responses, GitHub Copilot,
   MiniMax, Hugging Face, Fireworks, OpenRouter, Vercel AI Gateway, Z.AI,
   Groq, Cerebras, xAI, OpenCode, and faux
+- shared provider stream setup-error/header/canonical SSE data-line support has
+  started, with Google Generative AI and Mistral using common non-OOM setup
+  failure conversion, owned request-header insertion/merge/deinit helpers,
+  normalized `on_response` header lookup, and canonical `data: ` extraction
+  while keeping provider-specific auth headers and stream state machines
+  provider-owned
+- provider-owned JSON value lifecycle support now has shared clone/free/empty
+  object helpers used by provider payload and replay helpers without moving
+  provider-specific request or response mapping
 - extension host process boundary and registration surface for tools,
   commands, shortcuts, flags, providers, widgets, editor hooks, header/footer
   hooks, terminal input hooks, and package-management commands
@@ -124,6 +133,23 @@ provider work is ongoing smoke coverage, not env key mappings.
 
 Resolved. Azure Responses and Codex Responses now use the stream wrapper pattern
 and have setup-failure tests. OpenAI Responses uses the wrapper pattern and has direct setup-failure smoke coverage.
+
+### Provider Support Helpers
+
+Started. The first provider-internal-shape slices introduced
+`zig/src/ai/shared/provider_stream.zig` for common setup failure conversion,
+owned request-header insertion/merge/deinit helpers, and normalized response
+header callback lookup. The SSE line-support slice added only minimal canonical
+`data: ` extraction there, with deterministic helper coverage. The low-risk
+Google Generative AI and Mistral stream entrypoints use the shared stream,
+header, and data-line helpers with local capture/on-response/partial-before-error
+coverage. The JSON lifecycle slice added `shared/provider_json.zig` for
+provider-owned JSON object initialization, deep clone, and recursive free
+support, then routed provider-local lifecycle helpers through it. Provider-
+specific request/response mapping and stream state machines remain in provider
+files, and Responses reasoning parsers, Anthropic/Kimi-compatible tolerance
+paths, Bedrock binary event-stream parsing, Cloudflare routing, GitHub Copilot
+dynamic headers, and extension protocols remain unchanged.
 
 ## Recommended Next Work Order
 

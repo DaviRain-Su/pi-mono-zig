@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const event_stream = @import("../event_stream.zig");
 const api_registry = @import("../api_registry.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
+const provider_json = @import("../shared/provider_json.zig");
 
 pub const DEFAULT_API = "faux";
 pub const DEFAULT_PROVIDER = "faux";
@@ -469,55 +470,11 @@ fn estimatePromptUsage(
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |v| return .{ .bool = v },
-        .integer => |v| return .{ .integer = v },
-        .float => |v| return .{ .float = v },
-        .number_string => |v| return .{ .number_string = try allocator.dupe(u8, v) },
-        .string => |v| return .{ .string = try allocator.dupe(u8, v) },
-        .array => |v| {
-            var array = std.json.Array.init(allocator);
-            for (v.items) |item| {
-                try array.append(try cloneJsonValue(allocator, item));
-            }
-            return .{ .array = array };
-        },
-        .object => |v| {
-            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            var iterator = v.iterator();
-            while (iterator.next()) |entry| {
-                try object.put(
-                    allocator,
-                    try allocator.dupe(u8, entry.key_ptr.*),
-                    try cloneJsonValue(allocator, entry.value_ptr.*),
-                );
-            }
-            return .{ .object = object };
-        },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string => |owned| allocator.free(owned),
-        .string => |owned| allocator.free(owned),
-        .array => |array| {
-            for (array.items) |item| deinitJsonValue(allocator, item);
-            var mutable = array;
-            mutable.deinit();
-        },
-        .object => |object| {
-            var mutable = object;
-            var iterator = mutable.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                deinitJsonValue(allocator, entry.value_ptr.*);
-            }
-            mutable.deinit(allocator);
-        },
-    }
+    provider_json.freeValue(allocator, value);
 }
 
 fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const types.ContentBlock) void {

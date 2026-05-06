@@ -5,6 +5,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_json = @import("../shared/provider_json.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const simple_options = @import("../shared/simple_options.zig");
 const openai = @import("openai.zig");
@@ -2731,27 +2732,7 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |boolean| return .{ .bool = boolean },
-        .integer => |integer| return .{ .integer = integer },
-        .float => |float| return .{ .float = float },
-        .number_string => |number_string| return .{ .number_string = try allocator.dupe(u8, number_string) },
-        .string => |string| return .{ .string = try allocator.dupe(u8, string) },
-        .array => |array| {
-            var clone = std.json.Array.init(allocator);
-            for (array.items) |item| try clone.append(try cloneJsonValue(allocator, item));
-            return .{ .array = clone };
-        },
-        .object => |object| {
-            var clone = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try clone.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            return .{ .object = clone };
-        },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn putStringField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
@@ -2898,25 +2879,7 @@ pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) v
 }
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |s| allocator.free(s),
-        .number_string => |s| allocator.free(s),
-        .array => |arr| {
-            for (arr.items) |item| freeJsonValue(allocator, item);
-            var owned = arr;
-            owned.deinit();
-        },
-        .object => |obj| {
-            var iterator = obj.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var owned = obj;
-            owned.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, value);
 }
 
 const BedrockOnResponseCapture = struct {

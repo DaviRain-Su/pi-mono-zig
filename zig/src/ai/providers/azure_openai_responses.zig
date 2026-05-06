@@ -6,6 +6,7 @@ const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_json = @import("../shared/provider_json.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 
@@ -1323,57 +1324,15 @@ fn removeObjectField(allocator: std.mem.Allocator, payload: *std.json.Value, fie
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    return provider_json.initObject(allocator);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |boolean| return .{ .bool = boolean },
-        .integer => |integer| return .{ .integer = integer },
-        .float => |float| return .{ .float = float },
-        .number_string => |number_string| return .{ .number_string = try allocator.dupe(u8, number_string) },
-        .string => |string| return .{ .string = try allocator.dupe(u8, string) },
-        .array => |array| {
-            var cloned = std.json.Array.init(allocator);
-            errdefer cloned.deinit();
-            for (array.items) |item| {
-                try cloned.append(try cloneJsonValue(allocator, item));
-            }
-            return .{ .array = cloned };
-        },
-        .object => |object| {
-            var cloned = try initObject(allocator);
-            errdefer cloned.deinit(allocator);
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try cloned.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            return .{ .object = cloned };
-        },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |string| allocator.free(string),
-        .number_string => |number_string| allocator.free(number_string),
-        .array => |array| {
-            for (array.items) |item| freeJsonValue(allocator, item);
-            var mutable = array;
-            mutable.deinit();
-        },
-        .object => |object| {
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var mutable = object;
-            mutable.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, value);
 }
 
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {

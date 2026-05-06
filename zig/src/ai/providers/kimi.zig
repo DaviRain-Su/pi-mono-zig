@@ -5,6 +5,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_json = @import("../shared/provider_json.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const openai = @import("openai.zig");
 
@@ -941,64 +942,20 @@ fn mapStopReason(reason: []const u8) struct { stop_reason: types.StopReason, err
 }
 
 fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !std.json.Value {
-    if (input.len == 0) return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    if (input.len == 0) return provider_json.emptyObjectValue(allocator);
     var parsed = json_parse.parseStreamingJson(allocator, input) catch {
-        return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+        return provider_json.emptyObjectValue(allocator);
     };
     defer parsed.deinit();
     return try cloneJsonValue(allocator, parsed.value);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |bool_value| return .{ .bool = bool_value },
-        .integer => |integer_value| return .{ .integer = integer_value },
-        .float => |float_value| return .{ .float = float_value },
-        .string => |string_value| return .{ .string = try allocator.dupe(u8, string_value) },
-        .number_string => |number_string| return .{ .number_string = try allocator.dupe(u8, number_string) },
-        .array => |array_value| {
-            var cloned = std.json.Array.init(allocator);
-            errdefer cloned.deinit();
-            for (array_value.items) |item| {
-                try cloned.append(try cloneJsonValue(allocator, item));
-            }
-            return .{ .array = cloned };
-        },
-        .object => |object_value| {
-            var cloned = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer cloned.deinit(allocator);
-            var iterator = object_value.iterator();
-            while (iterator.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key);
-                try cloned.put(allocator, key, try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            return .{ .object = cloned };
-        },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |string_value| allocator.free(string_value),
-        .number_string => |number_string| allocator.free(number_string),
-        .array => |array_value| {
-            for (array_value.items) |item| freeJsonValue(allocator, item);
-            var array_copy = array_value;
-            array_copy.deinit();
-        },
-        .object => |object_value| {
-            var iterator = object_value.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var object_copy = object_value;
-            object_copy.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, value);
 }
 
 fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {

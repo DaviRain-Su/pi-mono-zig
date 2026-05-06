@@ -6,6 +6,8 @@ const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
+const provider_json = @import("../shared/provider_json.zig");
 
 const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
 const IMAGE_OMITTED_TEXT = "(image omitted: model does not support images)";
@@ -99,10 +101,7 @@ pub const MistralProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
-        };
+        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance }, &stream_instance, model, options);
         return stream_instance;
     }
 
@@ -164,16 +163,18 @@ pub const MistralProvider = struct {
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
-        defer headers.deinit();
-        try headers.put("Content-Type", "application/json");
-        try headers.put("Accept", "text/event-stream");
-        try headers.put("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?}));
-        try mergeHeaders(allocator, &headers, model.headers);
+        defer provider_stream.deinitOwnedHeaders(allocator, &headers);
+        try provider_stream.putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+        try provider_stream.putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?});
+        defer allocator.free(auth_header);
+        try provider_stream.putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+        try provider_stream.mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
+            try provider_stream.mergeHeaders(allocator, &headers, stream_options.headers);
             if (stream_options.session_id) |session_id| {
-                if (!headerExists(&headers, "x-affinity")) {
-                    try headers.put("x-affinity", try allocator.dupe(u8, session_id));
+                if (!provider_stream.containsHeaderCaseInsensitive(&headers, "x-affinity")) {
+                    try provider_stream.putOwnedHeader(allocator, &headers, "x-affinity", session_id);
                 }
             }
         }
@@ -192,13 +193,7 @@ pub const MistralProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                if (response.response_headers) |response_headers| {
-                    try callback(response.status, response_headers, model);
-                } else {
-                    var response_headers = std.StringHashMap([]const u8).init(allocator);
-                    defer response_headers.deinit();
-                    try callback(response.status, response_headers, model);
-                }
+                try provider_stream.invokeOnResponse(allocator, callback, response.status, response.response_headers, model);
             }
         }
 
@@ -326,7 +321,7 @@ fn parseSseStreamLines(
             return;
         }
 
-        const data = parseSseLine(std.mem.trim(u8, line, " \t\r")) orelse continue;
+        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
@@ -1116,102 +1111,20 @@ fn getJsonUsize(value: ?std.json.Value) usize {
     return 0;
 }
 
-fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-    return null;
-}
-
-fn mergeHeaders(
-    allocator: std.mem.Allocator,
-    target: *std.StringHashMap([]const u8),
-    source: ?std.StringHashMap([]const u8),
-) !void {
-    if (source) |headers| {
-        var iterator = headers.iterator();
-        while (iterator.next()) |entry| {
-            try target.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
-        }
-    }
-}
-
-fn headerExists(headers: *const std.StringHashMap([]const u8), key: []const u8) bool {
-    return headers.contains(key);
-}
-
 fn isAbortRequested(options: ?types.StreamOptions) bool {
     return abort_helper.isRequestedFromOptions(options);
 }
 
 fn emptyJsonObject(allocator: std.mem.Allocator) !std.json.Value {
-    return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    return provider_json.emptyObjectValue(allocator);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |boolean| return .{ .bool = boolean },
-        .integer => |integer| return .{ .integer = integer },
-        .float => |float| return .{ .float = float },
-        .number_string => |number_string| return .{ .number_string = try allocator.dupe(u8, number_string) },
-        .string => |string| return .{ .string = try allocator.dupe(u8, string) },
-        .array => |array| {
-            var clone = std.json.Array.init(allocator);
-            for (array.items) |item| try clone.append(try cloneJsonValue(allocator, item));
-            return .{ .array = clone };
-        },
-        .object => |object| {
-            var clone = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try clone.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            return .{ .object = clone };
-        },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |s| allocator.free(s),
-        .number_string => |s| allocator.free(s),
-        .array => |arr| {
-            for (arr.items) |item| freeJsonValue(allocator, item);
-            var owned = arr;
-            owned.deinit();
-        },
-        .object => |obj| {
-            var iterator = obj.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var owned = obj;
-            owned.deinit(allocator);
-        },
-        else => {},
-    }
-}
-
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
+    provider_json.freeValue(allocator, value);
 }
 
 test "VAL-MSG-010 Mistral skips failed assistants" {
@@ -1586,6 +1499,136 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("mistral-conversations", result.api);
+}
+
+test "stream preserves Mistral request headers and body through shared header helpers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var server = try provider_error.TestCaptureServer.init(
+        io,
+        401,
+        "Unauthorized",
+        "",
+        "{\"error\":{\"message\":\"provider smoke capture\"}}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var model_headers = std.StringHashMap([]const u8).init(allocator);
+    defer model_headers.deinit();
+    try model_headers.put("X-Model-Header", "model-value");
+
+    var option_headers = std.StringHashMap([]const u8).init(allocator);
+    defer option_headers.deinit();
+    try option_headers.put("X-Option-Header", "option-value");
+
+    const model = types.Model{
+        .id = "mistral-small-latest",
+        .name = "Mistral Small",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+        .headers = model_headers,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "mistral capture prompt" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try MistralProvider.stream(allocator, io, model, context, .{
+        .api_key = "mistral-smoke-key",
+        .session_id = "mistral-session",
+        .headers = option_headers,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(stream.next() == null);
+
+    try std.testing.expect(!server.request_head_truncated);
+    try std.testing.expect(!server.request_body_truncated);
+    const lower_head = try std.ascii.allocLowerString(allocator, server.requestHead());
+    defer allocator.free(lower_head);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "post /chat/completions http/1.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\ncontent-type: application/json\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\naccept: text/event-stream\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nauthorization: bearer mistral-smoke-key\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-affinity: mistral-session\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-model-header: model-value\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-option-header: option-value\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server.requestBody(), "\"mistral capture prompt\"") != null);
+}
+
+const MistralOnResponseCapture = struct {
+    var called: bool = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(response_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+        called = true;
+        status = response_status;
+        try std.testing.expectEqualStrings("mistral-conversations", model.api);
+        try std.testing.expect(headers.get("X-Fixture-Response") == null);
+        try std.testing.expectEqualStrings("callback-fixture", headers.get("x-fixture-response").?);
+    }
+};
+
+test "stream on_response receives normalized Mistral response headers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    MistralOnResponseCapture.reset();
+
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        429,
+        "Too Many Requests",
+        "X-Fixture-Response: callback-fixture\r\n",
+        "{\"error\":{\"message\":\"rate limited\"}}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "mistral-small-latest",
+        .name = "Mistral Small",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+
+    var stream = try MistralProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "test-key",
+        .on_response = &MistralOnResponseCapture.callback,
+    });
+    defer stream.deinit();
+
+    try std.testing.expect(MistralOnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 429), MistralOnResponseCapture.status);
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(stream.next() == null);
 }
 
 fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {

@@ -328,6 +328,9 @@ pub const TestCaptureServer = struct {
     request_head: [8192]u8 = undefined,
     request_head_len: usize = 0,
     request_head_truncated: bool = false,
+    request_body: [65536]u8 = undefined,
+    request_body_len: usize = 0,
+    request_body_truncated: bool = false,
     thread: ?std.Thread = null,
 
     pub fn init(
@@ -362,6 +365,10 @@ pub const TestCaptureServer = struct {
 
     pub fn requestHead(self: *const TestCaptureServer) []const u8 {
         return self.request_head[0..self.request_head_len];
+    }
+
+    pub fn requestBody(self: *const TestCaptureServer) []const u8 {
+        return self.request_body[0..self.request_body_len];
     }
 
     fn run(self: *TestCaptureServer) void {
@@ -402,6 +409,29 @@ pub const TestCaptureServer = struct {
                 if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
             }
         }
+
+        const content_length = parseContentLength(self.requestHead()) orelse 0;
+        for (0..content_length) |index| {
+            const byte = try reader.interface.takeByte();
+            if (index < self.request_body.len) {
+                self.request_body[index] = byte;
+                self.request_body_len = index + 1;
+            } else {
+                self.request_body_truncated = true;
+            }
+        }
+    }
+
+    fn parseContentLength(request_head: []const u8) ?usize {
+        var lines = std.mem.splitSequence(u8, request_head, "\r\n");
+        while (lines.next()) |line| {
+            const colon_index = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon_index], " \t");
+            if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
+            const value = std.mem.trim(u8, line[colon_index + 1 ..], " \t");
+            return std.fmt.parseInt(usize, value, 10) catch null;
+        }
+        return null;
     }
 
     fn writeResponse(self: *TestCaptureServer, stream: std.Io.net.Stream) !void {

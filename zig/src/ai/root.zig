@@ -11,6 +11,8 @@ pub const stream_module = @import("stream.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
 pub const abort_signal = @import("shared/abort_signal.zig");
 pub const provider_error = @import("shared/provider_error.zig");
+pub const provider_json = @import("shared/provider_json.zig");
+pub const provider_stream = @import("shared/provider_stream.zig");
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
     pub const openai_responses = @import("providers/openai_responses.zig");
@@ -85,5 +87,7 @@ test {
     _ = @import("oauth/types.zig");
     _ = @import("shared/abort_signal.zig");
     _ = @import("shared/provider_error.zig");
+    _ = @import("shared/provider_json.zig");
+    _ = @import("shared/provider_stream.zig");
     _ = @import("providers/faux.zig");
 }

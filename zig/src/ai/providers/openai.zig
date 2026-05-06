@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_json = @import("../shared/provider_json.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const cloudflare = @import("cloudflare.zig");
@@ -865,33 +866,7 @@ fn isFalseyJsonValue(value: std.json.Value) bool {
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |b| return .{ .bool = b },
-        .integer => |i| return .{ .integer = i },
-        .float => |f| return .{ .float = f },
-        .string => |s| return .{ .string = try allocator.dupe(u8, s) },
-        .array => |arr| {
-            var new_arr = std.json.Array.init(allocator);
-            errdefer new_arr.deinit();
-            for (arr.items) |item| {
-                try new_arr.append(try cloneJsonValue(allocator, item));
-            }
-            return .{ .array = new_arr };
-        },
-        .object => |obj| {
-            var new_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer new_obj.deinit(allocator);
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key_copy);
-                try new_obj.put(allocator, key_copy, try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            return .{ .object = new_obj };
-        },
-        .number_string => |ns| return .{ .number_string = try allocator.dupe(u8, ns) },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn parseChunkUsage(
@@ -1039,27 +1014,7 @@ pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]con
 /// Recursively free a JSON value and all its children, including ObjectMap keys.
 /// Use this only for values where ALL keys and strings were allocated by the same allocator.
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |s| allocator.free(s),
-        .number_string => |ns| allocator.free(ns),
-        .array => |arr| {
-            for (arr.items) |item| {
-                freeJsonValue(allocator, item);
-            }
-            var arr_mut = arr;
-            arr_mut.deinit();
-        },
-        .object => |obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var obj_mut = obj;
-            obj_mut.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, value);
 }
 
 pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
@@ -1742,7 +1697,7 @@ fn putObjectValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key
 }
 
 fn emptyObjectValue(allocator: std.mem.Allocator) !std.json.Value {
-    return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    return provider_json.emptyObjectValue(allocator);
 }
 
 pub fn buildRequestSnapshotValue(

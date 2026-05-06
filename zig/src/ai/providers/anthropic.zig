@@ -6,6 +6,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_json = @import("../shared/provider_json.zig");
 const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
 
@@ -3243,27 +3244,7 @@ fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.Assist
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => |boolean| return .{ .bool = boolean },
-        .integer => |integer| return .{ .integer = integer },
-        .float => |float| return .{ .float = float },
-        .number_string => |number_string| return .{ .number_string = try allocator.dupe(u8, number_string) },
-        .string => |string| return .{ .string = try allocator.dupe(u8, string) },
-        .array => |array| {
-            var clone = std.json.Array.init(allocator);
-            for (array.items) |item| try clone.append(try cloneJsonValue(allocator, item));
-            return .{ .array = clone };
-        },
-        .object => |object| {
-            var clone = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try clone.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            return .{ .object = clone };
-        },
-    }
+    return provider_json.cloneValue(allocator, value);
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
@@ -3271,25 +3252,7 @@ fn isAbortRequested(options: ?types.StreamOptions) bool {
 }
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |s| allocator.free(s),
-        .number_string => |s| allocator.free(s),
-        .array => |arr| {
-            for (arr.items) |item| freeJsonValue(allocator, item);
-            var owned = arr;
-            owned.deinit();
-        },
-        .object => |obj| {
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var owned = obj;
-            owned.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, value);
 }
 
 fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {
@@ -3747,8 +3710,7 @@ test "VAL-REFACTOR-008 deterministic SSE parser chunk fuzz smoke" {
     }{
         .{
             .label = "repairable-stream-with-unknown-fields",
-            .body =
-                ": ignored comment\n" ++
+            .body = ": ignored comment\n" ++
                 "event: vendor_debug\n" ++
                 "data: {\"ignored\":true}\n" ++
                 "\n" ++
@@ -3775,8 +3737,7 @@ test "VAL-REFACTOR-008 deterministic SSE parser chunk fuzz smoke" {
         },
         .{
             .label = "truncated-repairable-kimi-stream",
-            .body =
-                "event: content_block_start\n" ++
+            .body = "event: content_block_start\n" ++
                 "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
                 "\n" ++
                 "event: content_block_delta\n" ++
@@ -3787,8 +3748,7 @@ test "VAL-REFACTOR-008 deterministic SSE parser chunk fuzz smoke" {
         },
         .{
             .label = "malformed-frame-preserves-partial-text",
-            .body =
-                "event: content_block_start\n" ++
+            .body = "event: content_block_start\n" ++
                 "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
                 "\n" ++
                 "event: content_block_delta\n" ++

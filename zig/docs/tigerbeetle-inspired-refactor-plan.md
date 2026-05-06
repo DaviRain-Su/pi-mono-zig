@@ -77,9 +77,9 @@ Acceptance criteria:
 
 ## Next Suggested Refactor Step
 
-Start Task 5/6 decomposition only after the completed guardrails above remain in
-place. Provider internals and session/RPC decomposition remain later refactor
-steps.
+Continue the Task 7 provider-internal-shape slices now that the guardrails and
+Task 5/6 decomposition are in place. Session/RPC decomposition remains a later
+refactor step.
 
 ### 5. Interactive Mode Decomposition
 
@@ -137,14 +137,38 @@ Acceptance criteria:
 
 ### 7. Provider Internal Shape
 
+Status: Started/current stream setup-error, owned-header, canonical SSE
+data-line, and JSON value lifecycle helper slices complete for low-risk
+local-fixture provider paths. `shared/provider_stream.zig` now owns the common
+non-OOM setup failure to terminal `error_event` conversion, owned request-header
+insertion/merge/deinit helpers, and normalized response header callback lookup
+support, plus minimal canonical `data: ` SSE line extraction. Google Generative
+AI and Mistral stream entrypoints use these shared helpers. The current JSON
+slice added `shared/provider_json.zig` for provider-owned object
+initialization, deep clone, and recursive free support, with provider-local
+lifecycle wrappers routed through the shared helper while keeping request
+payloads, provider/auth headers, stream state machines, JSON event mapping, and
+response mapping provider-local. Responses reasoning parsers,
+Anthropic/Kimi-compatible tolerance paths, Bedrock binary event-stream parsing,
+Cloudflare routing, GitHub Copilot dynamic headers, and extension ABI/protocols
+were intentionally left untouched in these slices.
+
 - Move shared HTTP, payload, SSE, and error-conversion helpers into provider support modules.
 - Keep provider-specific files focused on API-specific request/response mapping.
-- Use the common stream-contract wrapper everywhere.
+- Use the common stream-contract/header/canonical SSE data-line helpers where
+  behavior is mechanical. Started with Google Generative AI and Mistral; later
+  slices should convert additional providers only with local request/response
+  fixture coverage.
+- Use the common provider JSON lifecycle helpers for mechanical clone/free/empty
+  object ownership only; keep buildRequestPayload and response mapping logic in
+  provider files.
 
 Acceptance criteria:
 
 - Provider setup paths are contract-uniform.
 - Shared helpers have direct unit tests.
+- Current slice verification: `cd zig && zig build test-ai`,
+  `cd zig && zig build test-openai-responses-parity`, and `npm run check`.
 
 ### 8. Session and RPC Decomposition
 
