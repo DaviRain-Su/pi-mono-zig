@@ -3724,3 +3724,240 @@ test "anthropic stream cloudflare provider resolves base_url placeholders via en
     try std.testing.expectEqualStrings("EnvironmentVariableNotFound", event.error_message.?);
     try std.testing.expect(stream.next() == null);
 }
+
+const SSE_FUZZ_SMOKE_SEED: u64 = 0x5eed_55e5_0000_0001;
+
+const SseFuzzExpectation = union(enum) {
+    text_done: []const u8,
+    text_error: []const u8,
+    empty_error,
+};
+
+test "VAL-REFACTOR-008 deterministic SSE parser chunk fuzz smoke" {
+    const allocator = std.heap.page_allocator;
+    const cases = [_]struct {
+        label: []const u8,
+        body: []const u8,
+        model: types.Model,
+        expected: SseFuzzExpectation,
+    }{
+        .{
+            .label = "repairable-stream-with-unknown-fields",
+            .body =
+                ": ignored comment\n" ++
+                "event: vendor_debug\n" ++
+                "data: {\"ignored\":true}\n" ++
+                "\n" ++
+                "event: message_start\n" ++
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fuzz\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}},\"unknown\":true}\n" ++
+                "\n" ++
+                "event: content_block_start\n" ++
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"},\"extra\":\"ok\"}\n" ++
+                "\n" ++
+                "event: content_block_delta\n" ++
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"repair\\\\q\"}}\n" ++
+                "\n" ++
+                "event: content_block_stop\n" ++
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+                "\n" ++
+                "event: message_delta\n" ++
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n" ++
+                "\n" ++
+                "event: message_stop\n" ++
+                "data: {\"type\":\"message_stop\"}\n" ++
+                "\n",
+            .model = sseFuzzModel("claude-fuzz", "anthropic"),
+            .expected = .{ .text_done = "repair\\q" },
+        },
+        .{
+            .label = "truncated-repairable-kimi-stream",
+            .body =
+                "event: content_block_start\n" ++
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+                "\n" ++
+                "event: content_block_delta\n" ++
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n" ++
+                "\n",
+            .model = sseFuzzModel("kimi-for-coding", "kimi-coding"),
+            .expected = .{ .text_done = "partial" },
+        },
+        .{
+            .label = "malformed-frame-preserves-partial-text",
+            .body =
+                "event: content_block_start\n" ++
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+                "\n" ++
+                "event: content_block_delta\n" ++
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"before\"}}\n" ++
+                "\n" ++
+                "event: content_block_delta\n" ++
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":123}}\n" ++
+                "\n",
+            .model = sseFuzzModel("claude-fuzz", "anthropic"),
+            .expected = .{ .text_error = "before" },
+        },
+        .{
+            .label = "boundary-size-repairable-text",
+            .body = try sseFuzzBoundaryBody(allocator),
+            .model = sseFuzzModel("kimi-for-coding", "kimi-coding"),
+            .expected = .{ .text_done = "boundary-" },
+        },
+        .{
+            .label = "malformed-truncated-empty-frame",
+            .body = "event: content_block_delta\n" ++
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"unterminated",
+            .model = sseFuzzModel("claude-fuzz", "anthropic"),
+            .expected = .empty_error,
+        },
+    };
+
+    for (cases) |case| {
+        var chunk_lengths = std.ArrayList(usize).empty;
+        defer chunk_lengths.deinit(allocator);
+        const chunked_body = try deterministicChunkedCopy(allocator, case.body, SSE_FUZZ_SMOKE_SEED, case.label, &chunk_lengths);
+        defer allocator.free(chunked_body);
+
+        sseFuzzSmokeCase(allocator, case.label, chunked_body, chunk_lengths.items, case.model, case.expected) catch |err| {
+            reportSseFuzzFailure(SSE_FUZZ_SMOKE_SEED, case.label, chunked_body, chunk_lengths.items);
+            return err;
+        };
+    }
+}
+
+fn sseFuzzModel(id: []const u8, provider: []const u8) types.Model {
+    return .{
+        .id = id,
+        .name = id,
+        .api = "anthropic-messages",
+        .provider = provider,
+        .base_url = "https://example.invalid/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+}
+
+fn sseFuzzBoundaryBody(allocator: std.mem.Allocator) ![]const u8 {
+    const text = try allocator.alloc(u8, 8192);
+    @memset(text, 'x');
+    defer allocator.free(text);
+    return std.fmt.allocPrint(
+        allocator,
+        "event: content_block_start\n" ++
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n" ++
+            "\n" ++
+            "event: content_block_delta\n" ++
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"boundary-{s}\"}}}}\n" ++
+            "\n",
+        .{text},
+    );
+}
+
+fn deterministicChunkedCopy(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    seed: u64,
+    label: []const u8,
+    chunk_lengths: *std.ArrayList(usize),
+) ![]u8 {
+    var prng = std.Random.DefaultPrng.init(seed ^ std.hash.Wyhash.hash(seed, label));
+    const random = prng.random();
+    var out = try std.ArrayList(u8).initCapacity(allocator, input.len);
+    errdefer out.deinit(allocator);
+    var index: usize = 0;
+    while (index < input.len) {
+        const remaining = input.len - index;
+        const max_chunk = @min(remaining, @as(usize, 31));
+        const len = random.intRangeAtMost(usize, 1, max_chunk);
+        try out.appendSlice(allocator, input[index .. index + len]);
+        try chunk_lengths.append(allocator, len);
+        index += len;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn sseFuzzSmokeCase(
+    allocator: std.mem.Allocator,
+    label: []const u8,
+    body: []const u8,
+    chunk_lengths: []const usize,
+    model: types.Model,
+    expected: SseFuzzExpectation,
+) !void {
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, std.Io.failing);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    switch (expected) {
+        .text_done => |prefix| try expectSseFuzzTerminal(label, chunk_lengths, &stream_instance, .done, prefix),
+        .text_error => |prefix| try expectSseFuzzTerminal(label, chunk_lengths, &stream_instance, .error_event, prefix),
+        .empty_error => try expectSseFuzzTerminal(label, chunk_lengths, &stream_instance, .error_event, null),
+    }
+}
+
+fn expectSseFuzzTerminal(
+    label: []const u8,
+    chunk_lengths: []const usize,
+    stream_instance: *event_stream.AssistantMessageEventStream,
+    expected_terminal: types.EventType,
+    expected_text_prefix: ?[]const u8,
+) !void {
+    var saw_terminal = false;
+    while (stream_instance.next()) |event| {
+        if (event.event_type == .done or event.event_type == .error_event) {
+            saw_terminal = true;
+            if (event.event_type != expected_terminal) {
+                reportSseFuzzTerminalMismatch(label, chunk_lengths, expected_terminal, event.event_type);
+                return error.TestExpectedEqual;
+            }
+            if (expected_text_prefix) |prefix| {
+                if (event.message == null or event.message.?.content.len == 0 or event.message.?.content[0] != .text or
+                    !std.mem.startsWith(u8, event.message.?.content[0].text.text, prefix))
+                {
+                    reportSseFuzzTerminalMismatch(label, chunk_lengths, expected_terminal, event.event_type);
+                    return error.TestExpectedEqual;
+                }
+            }
+        }
+    }
+    if (!saw_terminal) {
+        reportSseFuzzTerminalMismatch(label, chunk_lengths, expected_terminal, .start);
+        return error.TestExpectedEqual;
+    }
+}
+
+fn reportSseFuzzFailure(seed: u64, label: []const u8, body: []const u8, chunk_lengths: []const usize) void {
+    std.debug.print("SSE fuzz smoke failure seed=0x{x} case={s} input={s} chunks=", .{ seed, label, body });
+    for (chunk_lengths, 0..) |len, index| {
+        if (index > 0) std.debug.print(",", .{});
+        std.debug.print("{d}", .{len});
+    }
+    std.debug.print("\n", .{});
+}
+
+fn reportSseFuzzTerminalMismatch(
+    label: []const u8,
+    chunk_lengths: []const usize,
+    expected_terminal: types.EventType,
+    actual_terminal: types.EventType,
+) void {
+    std.debug.print("SSE fuzz smoke assertion case={s} expected={s} actual={s} smallest_chunks=", .{
+        label,
+        @tagName(expected_terminal),
+        @tagName(actual_terminal),
+    });
+    for (chunk_lengths, 0..) |len, index| {
+        if (index > 0) std.debug.print(",", .{});
+        std.debug.print("{d}", .{len});
+    }
+    std.debug.print("\n", .{});
+}

@@ -1468,3 +1468,149 @@ test "assistant event error reason must match nested message stopReason" {
     // Now validation passes because we allow error/aborted mismatch
     try validateAssistantEventValue(allocator, parsed.value, "$");
 }
+
+const JSON_WIRE_FUZZ_SMOKE_SEED: u64 = 0x5eed_1500_0000_0002;
+
+test "VAL-REFACTOR-009 deterministic JSON event wire fuzz smoke" {
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(JSON_WIRE_FUZZ_SMOKE_SEED);
+    const random = prng.random();
+
+    const text_len = random.intRangeAtMost(usize, 4096, 8192);
+    const boundary_text = try allocator.alloc(u8, text_len);
+    defer allocator.free(boundary_text);
+    @memset(boundary_text, 'j');
+
+    const assistant_message = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "hello-wire" } }},
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-1",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 10,
+    };
+    const user_message = ai.UserMessage{
+        .content = &[_]ai.ContentBlock{.{ .text = .{ .text = boundary_text } }},
+        .timestamp = 11,
+    };
+
+    const valid_events = [_]struct {
+        label: []const u8,
+        event: agent.AgentEvent,
+    }{
+        .{
+            .label = "encode-decode-start",
+            .event = .{ .event_type = .agent_start },
+        },
+        .{
+            .label = "encode-decode-boundary-message",
+            .event = .{
+                .event_type = .message_start,
+                .message = .{ .user = user_message },
+            },
+        },
+        .{
+            .label = "encode-decode-assistant-delta",
+            .event = .{
+                .event_type = .message_update,
+                .message = .{ .assistant = assistant_message },
+                .assistant_message_event = .{
+                    .event_type = .text_delta,
+                    .content_index = 0,
+                    .delta = "delta-wire",
+                    .message = assistant_message,
+                },
+            },
+        },
+        .{
+            .label = "encode-decode-assistant-done",
+            .event = .{
+                .event_type = .message_end,
+                .message = .{ .assistant = assistant_message },
+            },
+        },
+    };
+
+    for (valid_events) |case| {
+        const line = stringifyAgentEventLine(allocator, case.event) catch |err| {
+            reportJsonWireFuzzFailure(JSON_WIRE_FUZZ_SMOKE_SEED, case.label, "<event stringify failed>");
+            return err;
+        };
+        defer allocator.free(line);
+        try expectJsonWireFuzzValid(allocator, case.label, line);
+    }
+
+    const unknown_field_json =
+        \\{"type":"message_update","unknownTopLevel":true,"message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello","partial":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10},"unknownNested":"ignored"}}
+    ;
+    try expectJsonWireFuzzValid(allocator, "unknown-fields", unknown_field_json);
+
+    const malformed_values = [_]struct {
+        label: []const u8,
+        json: []const u8,
+    }{
+        .{
+            .label = "malformed-top-level-type",
+            .json = \\{"type":123}
+            ,
+        },
+        .{
+            .label = "malformed-assistant-content-index",
+            .json = \\{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10},"assistantMessageEvent":{"type":"text_delta","contentIndex":"zero","delta":"hello","partial":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10}}}
+            ,
+        },
+        .{
+            .label = "malformed-stop-reason",
+            .json = \\{"type":"done","reason":"toolUse","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10}}
+            ,
+        },
+        .{
+            .label = "truncated-json",
+            .json = \\{"type":"turn_start"
+            ,
+        },
+    };
+
+    for (malformed_values) |case| {
+        try expectJsonWireFuzzInvalid(allocator, case.label, case.json);
+    }
+}
+
+fn expectJsonWireFuzzValid(allocator: std.mem.Allocator, label: []const u8, json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch |err| {
+        reportJsonWireFuzzFailure(JSON_WIRE_FUZZ_SMOKE_SEED, label, json);
+        return err;
+    };
+    defer parsed.deinit();
+    validateAgentEventJson(allocator, parsed.value) catch |err| {
+        reportJsonWireFuzzFailure(JSON_WIRE_FUZZ_SMOKE_SEED, label, json);
+        return err;
+    };
+}
+
+fn expectJsonWireFuzzInvalid(allocator: std.mem.Allocator, label: []const u8, json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch {
+        return;
+    };
+    defer parsed.deinit();
+    validateAgentEventJson(allocator, parsed.value) catch {
+        return;
+    };
+    reportJsonWireFuzzFailure(JSON_WIRE_FUZZ_SMOKE_SEED, label, json);
+    return error.TestExpectedError;
+}
+
+fn reportJsonWireFuzzFailure(seed: u64, label: []const u8, input: []const u8) void {
+    const max_len = @min(input.len, @as(usize, 512));
+    std.debug.print("JSON wire fuzz smoke failure seed=0x{x} case={s} minimized_input={s}", .{
+        seed,
+        label,
+        input[0..max_len],
+    });
+    if (input.len > max_len) {
+        std.debug.print("...({d} bytes total)", .{input.len});
+    }
+    std.debug.print("\n", .{});
+}

@@ -130,6 +130,9 @@ and have setup-failure tests. OpenAI Responses uses the wrapper pattern and has 
 
 ## Verification Assets
 
+Deterministic fixed-seed fuzz smoke guardrails now cover parser, wire, session,
+keybinding, and extension protocol boundaries.
+
 Useful existing harnesses:
 
 - `zig build test`

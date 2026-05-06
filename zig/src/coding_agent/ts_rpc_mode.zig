@@ -6456,6 +6456,88 @@ test "TS RPC extension UI timeout and cancel resolve deterministic defaults" {
     try std.testing.expect(!try server.cancelPendingExtensionUIRequest("ui_select"));
 }
 
+const TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED: u64 = 0x5eed_7570_4350_0006;
+
+test "VAL-REFACTOR-012 deterministic TS RPC extension UI protocol fuzz smoke" {
+    const allocator = std.testing.allocator;
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, null, &stdout_capture.writer, &stderr_capture.writer);
+    defer server.finish() catch {};
+
+    const select_options = [_][]const u8{ "alpha", "beta" };
+    server.writeExtensionUISelectRequest("req-select", "Pick", &select_options, 7) catch |err| {
+        reportTsRpcExtensionUiFuzzFailure(TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED, "request-select-timeout", "req-select");
+        return err;
+    };
+    server.writeExtensionUIConfirmRequest("req-confirm", "Confirm", "Continue?", null) catch |err| {
+        reportTsRpcExtensionUiFuzzFailure(TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED, "request-confirm-no-timeout", "req-confirm");
+        return err;
+    };
+
+    try server.registerPendingExtensionUIRequest("req-select", .select, 10);
+    try server.registerPendingExtensionUIRequest("req-confirm", .confirm, null);
+    try server.registerPendingExtensionUIRequest("req-input-timeout", .input, 5);
+    try server.registerPendingExtensionUIRequest("req-editor-cancel", .editor, null);
+
+    const response_frames = [_][]const u8{
+        "{\"type\":\"extension_ui_response\",\"id\":\"req-select\",\"value\":\"alpha\"}",
+        "{\"type\":\"extension_ui_response\",\"id\":\"missing\",\"value\":\"ignored\"}",
+        "{\"type\":\"extension_ui_response\",\"id\":\"req-confirm\",\"cancelled\":true}",
+        "{\"type\":\"extension_ui_response\",\"id\":\"req-editor-cancel\",\"cancelled\":true}",
+        "{\"type\":\"extension_ui_response\",\"id\":\"req-select\",\"value\":\"duplicate-ignored\"}",
+        "{\"type\":\"extension_ui_response\",\"id\":\"malformed-value\",\"value\":42}",
+    };
+
+    for (response_frames) |frame| {
+        server.handleLine(frame) catch |err| {
+            reportTsRpcExtensionUiFuzzFailure(TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED, "response-correlation-cancel-malformed", frame);
+            return err;
+        };
+    }
+
+    server.advanceExtensionUITime(5) catch |err| {
+        reportTsRpcExtensionUiFuzzFailure(TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED, "timeout-default-resolution", "req-input-timeout");
+        return err;
+    };
+    server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"req-input-timeout\",\"cancelled\":true}") catch |err| {
+        reportTsRpcExtensionUiFuzzFailure(TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED, "post-timeout-duplicate-cancel", "req-input-timeout");
+        return err;
+    };
+    server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"partial\"") catch |err| {
+        reportTsRpcExtensionUiFuzzFailure(TS_RPC_EXTENSION_UI_PROTOCOL_FUZZ_SMOKE_SEED, "malformed-json-frame", "{\"type\":\"extension_ui_response\",\"id\":\"partial\"");
+        return err;
+    };
+
+    try std.testing.expectEqual(@as(usize, 4), server.completed_extension_requests.items.len);
+    try std.testing.expectEqual(@as(u32, 0), server.pending_extension_requests.count());
+    try std.testing.expectEqualStrings("req-select", server.completed_extension_requests.items[0].id);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.select, server.completed_extension_requests.items[0].method);
+    try std.testing.expectEqualStrings("alpha", server.completed_extension_requests.items[0].resolution.value);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.confirm, server.completed_extension_requests.items[1].method);
+    try std.testing.expect(!server.completed_extension_requests.items[1].resolution.confirmed);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.editor, server.completed_extension_requests.items[2].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[2].resolution);
+    try std.testing.expectEqual(ExtensionUIDialogMethod.input, server.completed_extension_requests.items[3].method);
+    try std.testing.expectEqual(ExtensionUIResolution.none, server.completed_extension_requests.items[3].resolution);
+
+    const stdout = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "\"type\":\"extension_ui_request\",\"id\":\"req-select\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "\"timeout\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "\"type\":\"response\",\"command\":\"parse\",\"success\":false") != null);
+}
+
+fn reportTsRpcExtensionUiFuzzFailure(seed: u64, label: []const u8, input: []const u8) void {
+    std.debug.print("TS RPC extension UI protocol fuzz smoke failure seed=0x{x} case={s} minimized_input={s}", .{
+        seed,
+        label,
+        input,
+    });
+}
+
 test "M6 extension UI bridge serializes host requests and forwards responses exactly once" {
     const allocator = std.testing.allocator;
     const capture_path = "/tmp/pi-m6-extension-ui-bridge-capture.jsonl";

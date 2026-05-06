@@ -1398,3 +1398,79 @@ test "event_emission: sendExtensionEventFrame is non-blocking when pipe buffer i
     // Shut down the host (which will kill the slow-reading process).
     try host.shutdown();
 }
+
+const EXTENSION_HOST_PROTOCOL_FUZZ_SMOKE_SEED: u64 = 0x5eed_4578_0000_0005;
+
+test "VAL-REFACTOR-012 deterministic extension host UI protocol fuzz smoke" {
+    const allocator = std.testing.allocator;
+
+    const body =
+        "{\"type\":\"extension_ui_request\",\"id\":\"before-ready\",\"method\":\"input\",\"responseRequired\":true}\n" ++
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"select-1\",\"method\":\"select\",\"responseRequired\":true,\"payload\":{\"title\":\"Pick\",\"options\":[\"a\",\"b\"],\"timeout\":25}}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"unknown-ui\",\"method\":\"unknownUi\",\"payload\":{\"unknown\":{\"nested\":true}}}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"top-level-payload\",\"method\":\"setStatus\",\"statusKey\":\"guard\",\"statusText\":\"ok\",\"unexpected\":42}\n" ++
+        "not-json\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"partial\"";
+
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    feedExtensionHostFuzzChunks(allocator, &parser, body, &state) catch |err| {
+        reportExtensionHostProtocolFuzzFailure(EXTENSION_HOST_PROTOCOL_FUZZ_SMOKE_SEED, "chunked-request-malformed-unknown-payload", body);
+        return err;
+    };
+    parser.finish(allocator, &state) catch |err| {
+        reportExtensionHostProtocolFuzzFailure(EXTENSION_HOST_PROTOCOL_FUZZ_SMOKE_SEED, "finish-incomplete-frame", body);
+        return err;
+    };
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 3), state.ui_requests.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.pendingCount());
+    try std.testing.expectEqualStrings("select-1", state.ui_requests.items[0].id);
+    try std.testing.expectEqualStrings("unknownUi", state.ui_requests.items[1].method);
+    try std.testing.expect(std.mem.indexOf(u8, state.ui_requests.items[2].payload_json, "\"unexpected\":42") != null);
+    try std.testing.expectEqual(@as(usize, 3), state.diagnostics.items.len);
+    try std.testing.expectEqual(DiagnosticCategory.host_error, state.diagnostics.items[0].category);
+    try std.testing.expectEqual(DiagnosticCategory.malformed_json, state.diagnostics.items[1].category);
+    try std.testing.expectEqual(DiagnosticCategory.incomplete_frame, state.diagnostics.items[2].category);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    writeExtensionUiResponseFrame(allocator, &out.writer, "select-1", "{\"cancelled\":true}") catch |err| {
+        reportExtensionHostProtocolFuzzFailure(EXTENSION_HOST_PROTOCOL_FUZZ_SMOKE_SEED, "response-cancel-envelope", "{\"cancelled\":true}");
+        return err;
+    };
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"extension_ui_response\",\"id\":\"select-1\",\"payload\":{\"cancelled\":true}}\n",
+        out.written(),
+    );
+}
+
+fn feedExtensionHostFuzzChunks(
+    allocator: std.mem.Allocator,
+    parser: *JsonlFrameParser,
+    body: []const u8,
+    state: *ProtocolState,
+) !void {
+    var prng = std.Random.DefaultPrng.init(EXTENSION_HOST_PROTOCOL_FUZZ_SMOKE_SEED);
+    const random = prng.random();
+    var offset: usize = 0;
+    while (offset < body.len) {
+        const remaining = body.len - offset;
+        const len = @min(remaining, random.intRangeAtMost(usize, 1, 17));
+        try parser.feed(allocator, body[offset .. offset + len], state);
+        offset += len;
+    }
+}
+
+fn reportExtensionHostProtocolFuzzFailure(seed: u64, label: []const u8, input: []const u8) void {
+    std.debug.print("Extension host UI protocol fuzz smoke failure seed=0x{x} case={s} minimized_input={s}", .{
+        seed,
+        label,
+        input,
+    });
+}
