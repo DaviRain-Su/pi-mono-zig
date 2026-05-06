@@ -1,0 +1,18 @@
+{
+	"schemaVersion": "pi-extension.v0",
+	"id": "com.pi.browser-fixture.shell-request",
+	"name": "Browser Shell Request Fixture",
+	"version": "0.1.0",
+	"description": "Fixture that requests shell capability for browser host denial validation.",
+	"artifact": {
+		"kind": "wasm-component",
+		"path": "wasm/plugin.wasm"
+	},
+	"tool": {
+		"id": "fixture.shell-request",
+		"description": "Requests shell access that the browser host must deny.",
+		"inputSchema": {},
+		"outputSchema": {}
+	},
+	"capabilities": ["shell"]
+}

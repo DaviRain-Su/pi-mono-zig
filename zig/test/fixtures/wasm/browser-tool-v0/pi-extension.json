@@ -1,0 +1,32 @@
+{
+	"schemaVersion": "pi-extension.v0",
+	"id": "com.pi.browser-fixture",
+	"name": "Browser Wasm Fixture",
+	"version": "0.1.0",
+	"description": "Capability-free Wasm tool fixture for browser host validation.",
+	"artifact": {
+		"kind": "wasm-component",
+		"path": "wasm/plugin.wasm"
+	},
+	"tool": {
+		"id": "fixture.echo",
+		"description": "Echoes deterministic JSON from a repository-local Wasm fixture.",
+		"inputSchema": {
+			"type": "object",
+			"required": ["operation", "value"],
+			"properties": {
+				"operation": { "const": "echo" },
+				"value": { "type": "string" }
+			}
+		},
+		"outputSchema": {
+			"type": "object",
+			"required": ["ok", "tool", "echo"],
+			"properties": {
+				"ok": { "type": "boolean" },
+				"tool": { "const": "fixture.echo" },
+				"echo": { "type": "string" }
+			}
+		}
+	}
+}
