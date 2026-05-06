@@ -188,7 +188,7 @@ Acceptance criteria:
 
 ### WASM-003: Define Tool WIT v0
 
-Status: planned
+Status: complete
 
 Scope:
 
@@ -200,6 +200,14 @@ Acceptance criteria:
 - WIT lives in a stable path under `zig/` or a future shared package.
 - The document explains which functions are exported by the plugin.
 - The document explains which host functions are intentionally absent in v0.
+
+Evidence:
+
+- [`../wit/pi-tool-v0.wit`](../wit/pi-tool-v0.wit) defines the stable
+  `pi:extension@0.1.0` / `tool-v0` WIT contract.
+- [`wasm-tool-wit-v0.md`](wasm-tool-wit-v0.md) explains the JSON string
+  `metadata`, `schema`, and `execute` exports, absent host functions, deferred
+  non-tool surfaces, and manifest cross-checks.
 
 ### WASM-004: Extism Host Spike
 
