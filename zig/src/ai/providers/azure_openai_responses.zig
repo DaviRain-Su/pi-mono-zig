@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
@@ -690,6 +691,26 @@ fn parseSseStreamLines(
             continue;
         }
 
+        if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
+            const delta_value = value.object.get("delta") orelse continue;
+            if (delta_value != .string) continue;
+            if (current_block) |*block| {
+                switch (block.*) {
+                    .thinking => |*thinking| {
+                        try thinking.text.appendSlice(allocator, delta_value.string);
+                        stream_ptr.push(.{
+                            .event_type = .thinking_delta,
+                            .content_index = @intCast(thinking.event_index),
+                            .delta = try allocator.dupe(u8, delta_value.string),
+                            .owns_delta = true,
+                        });
+                    },
+                    else => {},
+                }
+            }
+            continue;
+        }
+
         if (std.mem.eql(u8, event_type, "response.content_part.added")) {
             const part_value = value.object.get("part") orelse continue;
             updateCurrentMessagePart(part_value, &current_block);
@@ -1095,16 +1116,42 @@ fn extractMessageText(allocator: std.mem.Allocator, maybe_item_value: ?std.json.
 fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
     const item_value = maybe_item_value orelse return null;
     if (item_value != .object) return null;
-    const summary_value = item_value.object.get("summary") orelse return null;
-    if (summary_value != .array or summary_value.array.items.len == 0) return null;
+
+    if (item_value.object.get("summary")) |summary_value| {
+        if (summary_value == .array and summary_value.array.items.len > 0) {
+            if (try extractJoinedTextFields(allocator, summary_value)) |summary_text| {
+                return summary_text;
+            }
+        }
+    }
+
+    if (item_value.object.get("content")) |content_value| {
+        if (content_value == .array and content_value.array.items.len > 0) {
+            if (try extractJoinedTextFields(allocator, content_value)) |content_text| {
+                return content_text;
+            }
+        }
+    }
+
+    return null;
+}
+
+fn extractJoinedTextFields(allocator: std.mem.Allocator, array_value: std.json.Value) !?[]const u8 {
+    if (array_value != .array) return null;
 
     var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
-    for (summary_value.array.items, 0..) |part, index| {
+    var appended: usize = 0;
+    for (array_value.array.items) |part| {
         if (part != .object) continue;
         const text = extractStringField(part, "text") orelse continue;
-        if (buffer.items.len > 0 and index > 0) try buffer.appendSlice(allocator, "\n\n");
+        if (appended > 0) try buffer.appendSlice(allocator, "\n\n");
         try buffer.appendSlice(allocator, text);
+        appended += 1;
+    }
+    if (buffer.items.len == 0) {
+        buffer.deinit(allocator);
+        return null;
     }
     return try buffer.toOwnedSlice(allocator);
 }
@@ -1251,10 +1298,7 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(.seq_cst);
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn removeObjectField(allocator: std.mem.Allocator, payload: *std.json.Value, field_name: []const u8) !void {
@@ -1497,6 +1541,22 @@ test "extractReasoningSummary uses caller allocator" {
     try std.testing.expectEqualStrings("first\n\nsecond", text);
 }
 
+test "extractReasoningSummary falls back to content text" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"azure content\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractReasoningSummary(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("azure content", text);
+}
+
 test "parseSseStreamLines emits Azure text events" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1631,6 +1691,74 @@ test "parseSseStreamLines emits Azure reasoning events without leaks" {
     try std.testing.expectEqualStrings("first\n\nsecond", event7.message.?.content[0].thinking.thinking);
 
     freeAssistantMessageOwned(allocator, event7.message.?);
+}
+
+test "parseSseStreamLines emits Azure reasoning_text deltas with final content fallback" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_azure_reasoning_text\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n" ++
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"azure \"}\n" ++
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"delta\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"azure final content\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure_reasoning_text\",\"status\":\"completed\"}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "https://example.openai.azure.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream.next().?.event_type);
+
+    const first_delta = stream.next().?;
+    defer freeEventOwned(allocator, first_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, first_delta.event_type);
+    try std.testing.expectEqualStrings("azure ", first_delta.delta.?);
+
+    const second_delta = stream.next().?;
+    defer freeEventOwned(allocator, second_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, second_delta.event_type);
+    try std.testing.expectEqualStrings("delta", second_delta.delta.?);
+
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqualStrings("azure final content", thinking_end.content.?);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("azure-openai-responses", done.message.?.api);
+    try std.testing.expectEqualStrings("azure-openai-responses", done.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-4.1", done.message.?.model);
+    try std.testing.expectEqualStrings("azure final content", done.message.?.content[0].thinking.thinking);
+    try std.testing.expect(stream.next() == null);
+
+    freeAssistantMessageOwned(allocator, done.message.?);
 }
 
 test "stream forwards timeout_ms to HTTP streaming request" {

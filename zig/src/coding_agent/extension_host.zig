@@ -567,6 +567,44 @@ test "M11 host process drains live register_* frames into observable runtime reg
     try std.testing.expect(host.hasShutdownComplete());
 }
 
+test "live host dynamic provider re-registration and unregister ordering has no stale model" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_provider\",\"name\":\"dynamic-provider\",\"displayName\":\"Dynamic\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"first\",\"name\":\"First\"}],\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "printf '{\"type\":\"unregister_provider\",\"name\":\"dynamic-provider\"}\\n'; " ++
+        "printf '{\"type\":\"register_provider\",\"name\":\"dynamic-provider\",\"displayName\":\"Dynamic\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"second\",\"name\":\"Second\"}],\"extensionPath\":\"fixture/extension.ts\"}\\n'; " ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m11-reregister-fixture" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-m11-reregister-fixture",
+            .cwd = "/tmp",
+            .fixture = "registration-reregister-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var elapsed: u64 = 0;
+    while (host.registryFramesApplied() < 3 and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 3), host.registryFramesApplied());
+
+    const snapshot = try host.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"dynamic-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"id\":\"second\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"id\":\"first\"") == null);
+
+    try host.shutdown();
+    try std.testing.expect(host.hasShutdownComplete());
+}
+
 test "event_emission: sendExtensionEventFrame writes JSONL frames to host stdin" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

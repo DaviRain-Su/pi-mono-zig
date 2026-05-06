@@ -25,6 +25,7 @@
             "role": "user"
           }
         ],
+        "instructions": "You are a helpful assistant.",
         "model": "gpt-5.1-codex-tier-flex",
         "parallel_tool_calls": true,
         "service_tier": "flex",

@@ -9,6 +9,7 @@ pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
 pub const stream_module = @import("stream.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
+pub const abort_signal = @import("shared/abort_signal.zig");
 pub const provider_error = @import("shared/provider_error.zig");
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
@@ -29,6 +30,9 @@ pub const providers = struct {
 // Re-export commonly used types
 pub const Model = types.Model;
 pub const ModelCost = types.ModelCost;
+pub const ModelThinkingLevel = types.ModelThinkingLevel;
+pub const ModelThinkingLevelMap = types.ModelThinkingLevelMap;
+pub const ThinkingLevelMapping = types.ThinkingLevelMapping;
 pub const Message = types.Message;
 pub const Context = types.Context;
 pub const StreamOptions = types.StreamOptions;
@@ -76,6 +80,7 @@ test {
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
     _ = @import("oauth/types.zig");
+    _ = @import("shared/abort_signal.zig");
     _ = @import("shared/provider_error.zig");
     _ = @import("providers/faux.zig");
 }

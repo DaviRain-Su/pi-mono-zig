@@ -4,11 +4,13 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+const DEFAULT_CODEX_SYSTEM_PROMPT = "You are a helpful assistant.";
 const CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
 const MessagePartKind = enum {
@@ -247,11 +249,13 @@ pub fn buildRequestPayload(
     try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
     try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
 
-    if (context.system_prompt) |system_prompt| {
-        const instructions = try openai.sanitizeSurrogates(allocator, system_prompt);
-        defer allocator.free(instructions);
-        try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
-    }
+    const raw_instructions = if (context.system_prompt) |system_prompt|
+        if (system_prompt.len > 0) system_prompt else DEFAULT_CODEX_SYSTEM_PROMPT
+    else
+        DEFAULT_CODEX_SYSTEM_PROMPT;
+    const instructions = try openai.sanitizeSurrogates(allocator, raw_instructions);
+    defer allocator.free(instructions);
+    try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
 
     if (options) |stream_options| {
         if (stream_options.temperature) |temperature| {
@@ -690,6 +694,26 @@ fn parseSseStreamLines(
             continue;
         }
 
+        if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
+            const delta_value = value.object.get("delta") orelse continue;
+            if (delta_value != .string) continue;
+            if (current_block) |*block| {
+                switch (block.*) {
+                    .thinking => |*thinking| {
+                        try thinking.text.appendSlice(allocator, delta_value.string);
+                        stream_ptr.push(.{
+                            .event_type = .thinking_delta,
+                            .content_index = @intCast(thinking.event_index),
+                            .delta = try allocator.dupe(u8, delta_value.string),
+                            .owns_delta = true,
+                        });
+                    },
+                    else => {},
+                }
+            }
+            continue;
+        }
+
         if (std.mem.eql(u8, event_type, "response.content_part.added")) {
             const part_value = value.object.get("part") orelse continue;
             updateCurrentMessagePart(part_value, &current_block);
@@ -955,7 +979,12 @@ fn finalizeCurrentBlock(
                 });
             },
             .thinking => |*thinking| {
-                const owned = try allocator.dupe(u8, thinking.text.items);
+                const extracted_text = try extractReasoningSummary(allocator, maybe_item_value);
+                defer if (extracted_text) |final_text| allocator.free(final_text);
+                const owned = if (extracted_text) |final_text|
+                    try allocator.dupe(u8, final_text)
+                else
+                    try allocator.dupe(u8, thinking.text.items);
                 const signature = if (maybe_item_value) |item_value| blk: {
                     if (item_value == .object) {
                         if (item_value.object.get("encrypted_content")) |encrypted| {
@@ -1205,6 +1234,49 @@ fn extractFinalTextFromItem(maybe_item_value: ?std.json.Value, part_kind: Messag
     return null;
 }
 
+fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
+    const item_value = maybe_item_value orelse return null;
+    if (item_value != .object) return null;
+
+    if (item_value.object.get("summary")) |summary_value| {
+        if (summary_value == .array and summary_value.array.items.len > 0) {
+            if (try extractJoinedTextFields(allocator, summary_value)) |summary_text| {
+                return summary_text;
+            }
+        }
+    }
+
+    if (item_value.object.get("content")) |content_value| {
+        if (content_value == .array and content_value.array.items.len > 0) {
+            if (try extractJoinedTextFields(allocator, content_value)) |content_text| {
+                return content_text;
+            }
+        }
+    }
+
+    return null;
+}
+
+fn extractJoinedTextFields(allocator: std.mem.Allocator, array_value: std.json.Value) !?[]const u8 {
+    if (array_value != .array) return null;
+
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var appended: usize = 0;
+    for (array_value.array.items) |part| {
+        if (part != .object) continue;
+        const text = extractStringField(part, "text") orelse continue;
+        if (appended > 0) try buffer.appendSlice(allocator, "\n\n");
+        try buffer.appendSlice(allocator, text);
+        appended += 1;
+    }
+    if (buffer.items.len == 0) {
+        buffer.deinit(allocator);
+        return null;
+    }
+    return try buffer.toOwnedSlice(allocator);
+}
+
 fn extractCombinedToolCallId(allocator: std.mem.Allocator, item_value: std.json.Value) !?[]const u8 {
     if (item_value != .object) return null;
     const call_id = extractStringField(item_value, "call_id") orelse return null;
@@ -1347,10 +1419,7 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(.seq_cst);
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
@@ -1537,6 +1606,33 @@ test "buildRequestPayload uses Codex-specific request shape" {
     try std.testing.expectEqualStrings("user", input.array.items[0].object.get("role").?.string);
 }
 
+test "extractReasoningSummary prefers summary and falls back to content text" {
+    const allocator = std.testing.allocator;
+    const fallback_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"content fallback\"}]}",
+        .{},
+    );
+    defer fallback_parsed.deinit();
+
+    const fallback_text = (try extractReasoningSummary(allocator, fallback_parsed.value)).?;
+    defer allocator.free(fallback_text);
+    try std.testing.expectEqualStrings("content fallback", fallback_text);
+
+    const summary_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[{\"text\":\"summary wins\"}],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"content loses\"}]}",
+        .{},
+    );
+    defer summary_parsed.deinit();
+
+    const summary_text = (try extractReasoningSummary(allocator, summary_parsed.value)).?;
+    defer allocator.free(summary_text);
+    try std.testing.expectEqualStrings("summary wins", summary_text);
+}
+
 test "parseSseStreamLines handles response.done terminal events" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1593,6 +1689,72 @@ test "parseSseStreamLines handles response.done terminal events" {
     try std.testing.expectEqualStrings("resp_codex", done.message.?.response_id.?);
     try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
     try std.testing.expectEqualStrings("Hello Codex", done.message.?.content[0].text.text);
+    freeAssistantMessageOwned(allocator, done.message.?);
+}
+
+test "parseSseStreamLines emits Codex reasoning_text deltas with final content fallback" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex_reasoning_text\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n" ++
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"codex \"}\n" ++
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"delta\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"codex final content\"}]}}\n" ++
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_codex_reasoning_text\",\"status\":\"completed\"}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
+
+    const first_delta = stream_instance.next().?;
+    defer freeEventOwned(allocator, first_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, first_delta.event_type);
+    try std.testing.expectEqualStrings("codex ", first_delta.delta.?);
+
+    const second_delta = stream_instance.next().?;
+    defer freeEventOwned(allocator, second_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, second_delta.event_type);
+    try std.testing.expectEqualStrings("delta", second_delta.delta.?);
+
+    const thinking_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqualStrings("codex final content", thinking_end.content.?);
+
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("openai-codex-responses", done.message.?.api);
+    try std.testing.expectEqualStrings("openai-codex", done.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-5.1-codex", done.message.?.model);
+    try std.testing.expectEqualStrings("codex final content", done.message.?.content[0].thinking.thinking);
+    try std.testing.expect(stream_instance.next() == null);
     freeAssistantMessageOwned(allocator, done.message.?);
 }
 
@@ -1989,7 +2151,7 @@ test "stream onResponse failure is terminal error event" {
     try std.testing.expect(stream.next() == null);
 }
 
-test "buildRequestPayload omits instructions when no system prompt is provided" {
+test "buildRequestPayload uses default instructions when no system prompt is provided" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "gpt-5.5",
@@ -2006,7 +2168,7 @@ test "buildRequestPayload omits instructions when no system prompt is provided" 
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, null);
     defer freeJsonValue(allocator, payload);
 
-    try std.testing.expect(payload.object.get("instructions") == null);
+    try std.testing.expectEqualStrings(DEFAULT_CODEX_SYSTEM_PROMPT, payload.object.get("instructions").?.string);
 }
 
 test "buildRequestPayload preserves requested Codex reasoning effort" {

@@ -3,6 +3,7 @@ const api_registry = @import("api_registry.zig");
 const event_stream = @import("event_stream.zig");
 const model_registry = @import("model_registry.zig");
 const register_builtins = @import("providers/register_builtins.zig");
+const abort_helper = @import("shared/abort_signal.zig");
 const simple_options_mod = @import("shared/simple_options.zig");
 const types = @import("types.zig");
 
@@ -188,9 +189,7 @@ fn mapThinkingLevelToAnthropicEffort(
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    const stream_options = options orelse return false;
-    const signal = stream_options.signal orelse return false;
-    return signal.load(.monotonic);
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn createProviderContractErrorStream(
@@ -514,9 +513,17 @@ test "phase4 provider expansion models route through shared api streams" {
         .{ .provider = "vercel-ai-gateway", .expected_api = "anthropic-messages" },
         .{ .provider = "zai", .expected_api = "openai-completions" },
         .{ .provider = "minimax", .expected_api = "anthropic-messages" },
+        .{ .provider = "moonshotai", .expected_api = "openai-completions" },
+        .{ .provider = "moonshotai-cn", .expected_api = "openai-completions" },
         .{ .provider = "huggingface", .expected_api = "openai-completions" },
         .{ .provider = "fireworks", .expected_api = "anthropic-messages" },
         .{ .provider = "opencode", .expected_api = "openai-completions" },
+        .{ .provider = "cloudflare-workers-ai", .expected_api = "openai-completions" },
+        .{ .provider = "cloudflare-ai-gateway", .expected_api = "openai-completions" },
+        .{ .provider = "xiaomi", .expected_api = "anthropic-messages" },
+        .{ .provider = "xiaomi-token-plan-cn", .expected_api = "anthropic-messages" },
+        .{ .provider = "xiaomi-token-plan-ams", .expected_api = "anthropic-messages" },
+        .{ .provider = "xiaomi-token-plan-sgp", .expected_api = "anthropic-messages" },
     };
 
     for (cases) |case| {

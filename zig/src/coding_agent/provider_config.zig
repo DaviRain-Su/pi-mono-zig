@@ -264,7 +264,7 @@ fn availableModelAlreadyIncluded(models: []const AvailableModel, candidate: Avai
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
     return switch (err) {
         error.MissingApiKey => missingApiKeyMessage(provider),
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, faux.",
+        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, moonshotai, moonshotai-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, cloudflare-workers-ai, cloudflare-ai-gateway, xiaomi, xiaomi-token-plan-cn, xiaomi-token-plan-ams, xiaomi-token-plan-sgp, faux.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
         error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
@@ -684,6 +684,12 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "minimax-cn")) {
         return "MiniMax (China) credentials required.\nSet MINIMAX_CN_API_KEY, pass --api-key, or run /login minimax-cn.";
     }
+    if (std.mem.eql(u8, provider, "moonshotai")) {
+        return "Moonshot AI credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login moonshotai.";
+    }
+    if (std.mem.eql(u8, provider, "moonshotai-cn")) {
+        return "Moonshot AI (China) credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login moonshotai-cn.";
+    }
     if (std.mem.eql(u8, provider, "huggingface")) {
         return "Hugging Face credentials required.\nSet HF_TOKEN, pass --api-key, or run /login huggingface.";
     }
@@ -701,6 +707,24 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     }
     if (std.mem.eql(u8, provider, "kimi")) {
         return "Kimi credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login kimi.";
+    }
+    if (std.mem.eql(u8, provider, "cloudflare-workers-ai")) {
+        return "Cloudflare Workers AI credentials required.\nSet CLOUDFLARE_API_KEY and CLOUDFLARE_ACCOUNT_ID, pass --api-key, or run /login cloudflare-workers-ai.";
+    }
+    if (std.mem.eql(u8, provider, "cloudflare-ai-gateway")) {
+        return "Cloudflare AI Gateway credentials required.\nSet CLOUDFLARE_API_KEY, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_GATEWAY_ID, pass --api-key, or run /login cloudflare-ai-gateway.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi")) {
+        return "Xiaomi MiMo credentials required.\nSet XIAOMI_API_KEY, pass --api-key, or run /login xiaomi.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi-token-plan-cn")) {
+        return "Xiaomi MiMo Token Plan (China) credentials required.\nSet XIAOMI_TOKEN_PLAN_CN_API_KEY, pass --api-key, or run /login xiaomi-token-plan-cn.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi-token-plan-ams")) {
+        return "Xiaomi MiMo Token Plan (Amsterdam) credentials required.\nSet XIAOMI_TOKEN_PLAN_AMS_API_KEY, pass --api-key, or run /login xiaomi-token-plan-ams.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi-token-plan-sgp")) {
+        return "Xiaomi MiMo Token Plan (Singapore) credentials required.\nSet XIAOMI_TOKEN_PLAN_SGP_API_KEY, pass --api-key, or run /login xiaomi-token-plan-sgp.";
     }
     return "Provider credentials required.\nPass --api-key, run /login <provider>, or configure the provider environment variables.";
 }

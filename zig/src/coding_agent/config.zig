@@ -816,6 +816,7 @@ fn loadModelsConfig(
                             model.reasoning
                         else
                             false,
+                        .thinking_level_map = parseThinkingLevelMap(model_object.get("thinkingLevelMap"), existing_model),
                         .tool_calling = parseBoolField(model_object.get("toolCalling") orelse model_object.get("tool_calling"), if (existing_model) |model| model.tool_calling else true),
                         .loaded = parseBoolField(model_object.get("loaded"), if (existing_model) |model| model.loaded else false),
                         .input_types = input_types,
@@ -961,6 +962,29 @@ fn parseInputTypes(allocator: std.mem.Allocator, value: ?std.json.Value, existin
     }
 
     return allocator.dupe([]const u8, &.{"text"});
+}
+
+fn parseThinkingLevelMap(value: ?std.json.Value, existing_model: ?ai.Model) ?ai.types.ModelThinkingLevelMap {
+    const map_value = value orelse return if (existing_model) |model| model.thinking_level_map else null;
+    if (map_value != .object) return if (existing_model) |model| model.thinking_level_map else null;
+
+    var map = if (existing_model) |model| model.thinking_level_map orelse ai.types.ModelThinkingLevelMap{} else ai.types.ModelThinkingLevelMap{};
+    if (parseThinkingLevelMapping(map_value.object.get("off"))) |mapping| map.off = mapping;
+    if (parseThinkingLevelMapping(map_value.object.get("minimal"))) |mapping| map.minimal = mapping;
+    if (parseThinkingLevelMapping(map_value.object.get("low"))) |mapping| map.low = mapping;
+    if (parseThinkingLevelMapping(map_value.object.get("medium"))) |mapping| map.medium = mapping;
+    if (parseThinkingLevelMapping(map_value.object.get("high"))) |mapping| map.high = mapping;
+    if (parseThinkingLevelMapping(map_value.object.get("xhigh"))) |mapping| map.xhigh = mapping;
+    return map;
+}
+
+fn parseThinkingLevelMapping(value: ?std.json.Value) ?ai.types.ThinkingLevelMapping {
+    const mapping = value orelse return null;
+    return switch (mapping) {
+        .null => .unsupported,
+        .string => |text| .{ .mapped = text },
+        else => null,
+    };
 }
 
 fn parseHeaders(allocator: std.mem.Allocator, value: ?std.json.Value) !?std.StringHashMap([]const u8) {

@@ -4,6 +4,8 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const model_registry = @import("../model_registry.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
@@ -272,7 +274,10 @@ pub fn buildRequestPayload(
             if (stream_options.responses_reasoning_effort != null or stream_options.responses_reasoning_summary != null) {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                const effort = if (stream_options.responses_reasoning_effort) |reasoning_effort| thinkingLevelString(reasoning_effort) else "medium";
+                const effort = if (stream_options.responses_reasoning_effort) |reasoning_effort|
+                    model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(reasoning_effort)) orelse thinkingLevelString(reasoning_effort)
+                else
+                    "medium";
                 const summary = stream_options.responses_reasoning_summary orelse "auto";
                 try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, effort) });
                 try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, summary) });
@@ -282,18 +287,18 @@ pub fn buildRequestPayload(
                 errdefer include.deinit();
                 try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
                 try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
-            } else if (!std.mem.eql(u8, model.provider, "github-copilot")) {
+            } else if (!std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, "none") });
+                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, model_registry.mappedThinkingLevelValue(model, .off) orelse "none") });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
             }
         }
     }
-    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot")) {
+    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
         var reasoning = try initObject(allocator);
         errdefer reasoning.deinit(allocator);
-        try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, "none") });
+        try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, model_registry.mappedThinkingLevelValue(model, .off) orelse "none") });
         try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
     }
 
@@ -480,6 +485,26 @@ fn parseSseStreamLines(
                                 .owns_delta = true,
                             });
                         }
+                    },
+                    else => {},
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
+            const delta_value = value.object.get("delta") orelse continue;
+            if (delta_value != .string) continue;
+            if (current_block) |*block| {
+                switch (block.*) {
+                    .thinking => |*thinking| {
+                        try thinking.text.appendSlice(allocator, delta_value.string);
+                        stream_ptr.push(.{
+                            .event_type = .thinking_delta,
+                            .content_index = @intCast(thinking.event_index),
+                            .delta = try allocator.dupe(u8, delta_value.string),
+                            .owns_delta = true,
+                        });
                     },
                     else => {},
                 }
@@ -1795,16 +1820,42 @@ fn extractMessageText(allocator: std.mem.Allocator, maybe_item_value: ?std.json.
 fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
     const item_value = maybe_item_value orelse return null;
     if (item_value != .object) return null;
-    const summary_value = item_value.object.get("summary") orelse return null;
-    if (summary_value != .array or summary_value.array.items.len == 0) return null;
+
+    if (item_value.object.get("summary")) |summary_value| {
+        if (summary_value == .array and summary_value.array.items.len > 0) {
+            if (try extractJoinedTextFields(allocator, summary_value)) |summary_text| {
+                return summary_text;
+            }
+        }
+    }
+
+    if (item_value.object.get("content")) |content_value| {
+        if (content_value == .array and content_value.array.items.len > 0) {
+            if (try extractJoinedTextFields(allocator, content_value)) |content_text| {
+                return content_text;
+            }
+        }
+    }
+
+    return null;
+}
+
+fn extractJoinedTextFields(allocator: std.mem.Allocator, array_value: std.json.Value) !?[]const u8 {
+    if (array_value != .array) return null;
 
     var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
-    for (summary_value.array.items, 0..) |part, index| {
+    var appended: usize = 0;
+    for (array_value.array.items) |part| {
         if (part != .object) continue;
         const text = extractStringField(part, "text") orelse continue;
-        if (buffer.items.len > 0 and index > 0) try buffer.appendSlice(allocator, "\n\n");
+        if (appended > 0) try buffer.appendSlice(allocator, "\n\n");
         try buffer.appendSlice(allocator, text);
+        appended += 1;
+    }
+    if (buffer.items.len == 0) {
+        buffer.deinit(allocator);
+        return null;
     }
     return try buffer.toOwnedSlice(allocator);
 }
@@ -1994,6 +2045,16 @@ fn thinkingLevelString(level: types.ThinkingLevel) []const u8 {
     };
 }
 
+fn modelThinkingLevel(level: types.ThinkingLevel) types.ModelThinkingLevel {
+    return switch (level) {
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+}
+
 fn putOwnedHeader(
     allocator: std.mem.Allocator,
     headers: *std.StringHashMap([]const u8),
@@ -2063,10 +2124,7 @@ fn normalizedResponseHeaders(
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(.seq_cst);
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
@@ -2357,6 +2415,38 @@ test "extractReasoningSummary uses caller allocator" {
     defer allocator.free(text);
 
     try std.testing.expectEqualStrings("first\n\nsecond", text);
+}
+
+test "extractReasoningSummary falls back to content text" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"content first\"},{\"type\":\"reasoning_text\",\"text\":\"content second\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractReasoningSummary(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("content first\n\ncontent second", text);
+}
+
+test "extractReasoningSummary prefers summary over content text" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"summary\":[{\"text\":\"summary wins\"}],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"content loses\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const text = (try extractReasoningSummary(allocator, parsed.value)).?;
+    defer allocator.free(text);
+
+    try std.testing.expectEqualStrings("summary wins", text);
 }
 
 test "stream on_response receives actual response headers" {
@@ -2725,6 +2815,76 @@ test "parseSseStreamLines streams text and captures response_id" {
     try std.testing.expectEqualStrings("Hello", event5.message.?.content[0].text.text);
 
     freeAssistantMessageOwned(allocator, event5.message.?);
+}
+
+test "parseSseStreamLines streams reasoning_text deltas and final content fallback" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning_text\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n" ++
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"plan \"}\n" ++
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"steps\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"final content reasoning\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning_text\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2,\"total_tokens\":4}}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream.next().?.event_type);
+
+    const first_delta = stream.next().?;
+    defer freeEventOwned(allocator, first_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, first_delta.event_type);
+    try std.testing.expectEqualStrings("plan ", first_delta.delta.?);
+
+    const second_delta = stream.next().?;
+    defer freeEventOwned(allocator, second_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, second_delta.event_type);
+    try std.testing.expectEqualStrings("steps", second_delta.delta.?);
+
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqualStrings("final content reasoning", thinking_end.content.?);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("openai-responses", done.message.?.api);
+    try std.testing.expectEqualStrings("openai", done.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-5-mini", done.message.?.model);
+    try std.testing.expectEqualStrings("final content reasoning", done.message.?.content[0].thinking.thinking);
+    try std.testing.expectEqualStrings("resp_reasoning_text", done.message.?.response_id.?);
+    try std.testing.expect(stream.next() == null);
+
+    freeAssistantMessageOwned(allocator, done.message.?);
 }
 
 test "parseSseStreamLines streams tool calls and finalizes arguments" {
@@ -3394,6 +3554,27 @@ test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error ev
     defer stream.deinit();
 
     try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesResponseFailure", .error_reason);
+}
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const model = streamErrorContractTestModel("http://127.0.0.1:1");
+    const context = streamErrorContractTestContext();
+
+    var stream = try OpenAIResponsesProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("openai-responses", event.message.?.api);
+    try std.testing.expectEqualStrings("openai", event.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-5-mini", event.message.?.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(event.message.?.error_message.?.len > 0);
+    try std.testing.expect(stream.next() == null);
 }
 
 fn expectMissingApiKeyTerminalErrorResponses(

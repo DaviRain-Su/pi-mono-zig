@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const event_stream = @import("../event_stream.zig");
 const api_registry = @import("../api_registry.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 
 pub const DEFAULT_API = "faux";
 pub const DEFAULT_PROVIDER = "faux";
@@ -279,7 +280,7 @@ fn sleepForChunk(io: std.Io, chunk: []const u8, tokens_per_second: u32) void {
 }
 
 fn isAbortRequested(signal: ?*const std.atomic.Value(bool)) bool {
-    return if (signal) |abort_signal| abort_signal.load(.seq_cst) else false;
+    return abort_helper.isRequested(signal);
 }
 
 fn writeJsonString(writer: anytype, value: std.json.Value) !void {

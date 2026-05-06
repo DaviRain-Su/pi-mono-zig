@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_registry = @import("model_registry.zig");
 const http_client = @import("http_client.zig");
+const types = @import("types.zig");
 
 const DEFAULT_CONTEXT_WINDOW: u32 = 128000;
 const DEFAULT_MAX_TOKENS: u32 = 16384;
@@ -284,6 +285,7 @@ fn registerModelObject(
         .provider = provider.provider,
         .base_url = provider.base_url,
         .reasoning = reasoning,
+        .thinking_level_map = parseThinkingLevelMap(object),
         .tool_calling = tool_calling,
         .loaded = loaded,
         .input_types = input_types.items,
@@ -321,6 +323,7 @@ fn registerOllamaShowObject(
         .provider = provider.provider,
         .base_url = provider.base_url,
         .reasoning = reasoning,
+        .thinking_level_map = parseThinkingLevelMap(object),
         .tool_calling = tool_calling,
         .loaded = loaded,
         .input_types = input_types.items,
@@ -572,6 +575,29 @@ fn parseBoolText(text: []const u8) ?bool {
         return false;
     }
     return null;
+}
+
+fn parseThinkingLevelMap(object: std.json.ObjectMap) ?types.ModelThinkingLevelMap {
+    const value = object.get("thinkingLevelMap") orelse object.get("thinking_level_map") orelse return null;
+    if (value != .object) return null;
+
+    var map = types.ModelThinkingLevelMap{};
+    if (parseThinkingLevelMapping(value.object.get("off"))) |mapping| map.off = mapping;
+    if (parseThinkingLevelMapping(value.object.get("minimal"))) |mapping| map.minimal = mapping;
+    if (parseThinkingLevelMapping(value.object.get("low"))) |mapping| map.low = mapping;
+    if (parseThinkingLevelMapping(value.object.get("medium"))) |mapping| map.medium = mapping;
+    if (parseThinkingLevelMapping(value.object.get("high"))) |mapping| map.high = mapping;
+    if (parseThinkingLevelMapping(value.object.get("xhigh"))) |mapping| map.xhigh = mapping;
+    return map;
+}
+
+fn parseThinkingLevelMapping(value: ?std.json.Value) ?types.ThinkingLevelMapping {
+    const mapping = value orelse return null;
+    return switch (mapping) {
+        .null => .unsupported,
+        .string => |text| .{ .mapped = text },
+        else => null,
+    };
 }
 
 fn capabilitiesPresentAndLacksTools(capabilities_present: bool, object: std.json.ObjectMap) bool {

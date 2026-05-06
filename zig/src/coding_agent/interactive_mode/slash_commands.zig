@@ -1352,7 +1352,7 @@ pub fn beginLoginFlow(
         };
         errdefer browser_session.deinit(allocator);
 
-        var callback_listener: ?*auth.OAuthCallbackListener = startCallbackListenerForSession(
+        var callback_listener: ?*auth.OAuthCallbackListener = start_callback_listener_for_session_fn(
             allocator,
             io,
             &browser_session,
@@ -1432,6 +1432,14 @@ fn startCallbackListenerForSession(
     }
     return error.AddressInUse;
 }
+
+pub const StartCallbackListenerForSessionFn = *const fn (
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    browser_session: *const auth.BrowserLoginSession,
+) anyerror!*auth.OAuthCallbackListener;
+
+pub var start_callback_listener_for_session_fn: StartCallbackListenerForSessionFn = startCallbackListenerForSession;
 
 pub fn cancelAuthFlow(
     allocator: std.mem.Allocator,

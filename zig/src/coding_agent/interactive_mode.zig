@@ -2106,17 +2106,22 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
         slash_commands.open_browser_context = previous_browser_open_context;
         slash_commands.open_browser_fn = previous_browser_open_fn;
     }
+    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
+    slash_commands.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
+    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try std.testing.expect(slash_commands.test_auth_flow != null);
     try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
     try std.testing.expectEqual(auth.BrowserLoginKind.anthropic, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
     try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
-    try std.testing.expectEqualStrings(
-        "http://localhost:53692/callback",
+    try std.testing.expect(std.mem.endsWith(
+        u8,
         slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
-    );
+        "/callback",
+    ));
     try std.testing.expect(browser_open_capture.called);
     try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback") != null);
 
@@ -2142,16 +2147,6 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
     defer env_map.deinit();
     try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
 
-    var blocker: ?std.Io.net.Server = std.Io.net.IpAddress.listen(
-        &.{ .ip4 = .loopback(auth.defaultOAuthCallbackPort(.anthropic)) },
-        std.testing.io,
-        .{ .reuse_address = false },
-    ) catch |err| switch (err) {
-        error.AddressInUse => null,
-        else => return err,
-    };
-    defer if (blocker) |*server| server.deinit(std.testing.io);
-
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
@@ -2169,8 +2164,24 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
         slash_commands.open_browser_context = previous_browser_open_context;
         slash_commands.open_browser_fn = previous_browser_open_fn;
     }
+    const FailingCallbackListener = struct {
+        fn start(
+            listener_allocator: std.mem.Allocator,
+            listener_io: std.Io,
+            browser_session: *const auth.BrowserLoginSession,
+        ) anyerror!*auth.OAuthCallbackListener {
+            _ = listener_allocator;
+            _ = listener_io;
+            _ = browser_session;
+            return error.AddressInUse;
+        }
+    };
+    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
+    slash_commands.start_callback_listener_for_session_fn = FailingCallbackListener.start;
+    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
+    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try std.testing.expect(slash_commands.test_auth_flow != null);
     try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
@@ -2181,9 +2192,15 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
         state.status,
     );
 
-    state.mutex.lockUncancelable(state.io);
-    defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Could not start the local callback listener") != null);
+    {
+        state.mutex.lockUncancelable(state.io);
+        defer state.mutex.unlock(state.io);
+        try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Could not start the local callback listener") != null);
+    }
+
+    try cancelAuthFlow(allocator, &slash_commands.test_auth_flow, &state);
+    try std.testing.expect(slash_commands.test_auth_flow == null);
+    try std.testing.expectEqualStrings("login cancelled", state.status);
 }
 
 test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
@@ -2219,8 +2236,12 @@ test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
         slash_commands.open_browser_context = previous_browser_open_context;
         slash_commands.open_browser_fn = previous_browser_open_fn;
     }
+    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
+    slash_commands.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try beginLoginFlow(allocator, std.testing.io, &env_map, "openai-codex", .oauth, &state, &slash_commands.test_auth_flow);
+    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try std.testing.expect(slash_commands.test_auth_flow != null);
     try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
@@ -2231,10 +2252,11 @@ test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
         slash_commands.test_auth_flow.?.browser_redirect.session.provider_name,
     );
     try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
-    try std.testing.expectEqualStrings(
-        "http://localhost:1455/auth/callback",
+    try std.testing.expect(std.mem.endsWith(
+        u8,
         slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
-    );
+        "/auth/callback",
+    ));
     try std.testing.expect(browser_open_capture.called);
     try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback") != null);
 
@@ -2325,8 +2347,12 @@ test "beginLoginFlow starts google oauth flow with fake safe client config" {
         slash_commands.open_browser_context = previous_browser_open_context;
         slash_commands.open_browser_fn = previous_browser_open_fn;
     }
+    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
+    slash_commands.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &slash_commands.test_auth_flow);
+    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
     try std.testing.expect(slash_commands.test_auth_flow != null);
     try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
@@ -2334,10 +2360,11 @@ test "beginLoginFlow starts google oauth flow with fake safe client config" {
     try std.testing.expectEqualStrings("google-gemini-cli", slash_commands.test_auth_flow.?.browser_redirect.session.provider_id);
     try std.testing.expectEqualStrings("fake-google-client", slash_commands.test_auth_flow.?.browser_redirect.session.oauth_client.client_id);
     try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
-    try std.testing.expectEqualStrings(
-        "http://localhost:8085/oauth2callback",
+    try std.testing.expect(std.mem.endsWith(
+        u8,
         slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
-    );
+        "/oauth2callback",
+    ));
     try std.testing.expect(browser_open_capture.called);
     try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Foauth2callback") != null);
 
@@ -6190,6 +6217,31 @@ fn makeInteractiveAbsolutePath(allocator: std.mem.Allocator, relative_path: []co
     const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
     defer allocator.free(cwd);
     return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
+}
+
+fn callbackProviderKindForTest(kind: auth.BrowserLoginKind) auth.OAuthCallbackProviderKind {
+    return switch (kind) {
+        .anthropic => .anthropic,
+        .openai_codex => .openai_codex,
+        .google_gemini_cli => .google_gemini_cli,
+    };
+}
+
+fn startEphemeralCallbackListenerForTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    browser_session: *const auth.BrowserLoginSession,
+) anyerror!*auth.OAuthCallbackListener {
+    const listener = try auth.OAuthCallbackListener.createForTesting(
+        allocator,
+        io,
+        callbackProviderKindForTest(browser_session.kind),
+        browser_session.state,
+        0,
+    );
+    errdefer listener.destroy();
+    try listener.start();
+    return listener;
 }
 
 fn makeInteractiveTestUserMessage(text: []const u8, timestamp: i64) !agent.AgentMessage {

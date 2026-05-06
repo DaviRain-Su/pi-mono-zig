@@ -2079,6 +2079,46 @@ test "registration fixture refresh updates tools and removes provider" {
     try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
 }
 
+test "provider unregister and re-register ordering keeps only latest models" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "name": "dynamic-provider", "displayName": "Dynamic", "api": "openai-completions", "baseUrl": "http://localhost:0", "models": [{ "id": "first", "name": "First" }], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "unregister_provider", "name": "dynamic-provider" }
+        \\{ "type": "register_provider", "name": "dynamic-provider", "displayName": "Dynamic", "api": "openai-completions", "baseUrl": "http://localhost:0", "models": [{ "id": "second", "name": "Second" }], "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 3), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("dynamic-provider", registry.providers.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items[0].models.len);
+    try std.testing.expectEqualStrings("second", registry.providers.items[0].models[0].id);
+}
+
+test "malformed provider registration is isolated from subsequent valid refresh frames" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "displayName": "Missing name", "models": [{ "id": "bad", "name": "Bad" }], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_tool", "name": "good-tool", "label": "Good Tool", "description": "ok", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_provider", "name": "good-provider", "displayName": "Good", "api": "openai-completions", "models": [{ "id": "good", "name": "Good" }], "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 2), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings("good-tool", registry.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("good-provider", registry.providers.items[0].name);
+}
+
 test "applyHostFrame records ui request ids for bridge correlation" {
     const allocator = std.testing.allocator;
     var registry = Registry.init(allocator);
