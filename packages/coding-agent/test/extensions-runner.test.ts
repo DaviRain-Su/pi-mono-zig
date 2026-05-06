@@ -10,6 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createExtensionRuntime, discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
+import {
+	validateSubAgentReadinessEnvelope,
+	validateSubAgentTaskInvocationEnvelope,
+	validateSubAgentTaskResultEnvelope,
+} from "../src/core/extensions/subagent-readiness.js";
 import type {
 	ExtensionActions,
 	ExtensionContextActions,
@@ -284,6 +289,89 @@ describe("subscriber event contract parity", () => {
 			"turn_end",
 			"agent_end",
 		]);
+	});
+});
+
+describe("sub-agent readiness envelope validation", () => {
+	const invocation = {
+		type: "sub_agent_task_invocation",
+		agentId: "agent-opaque",
+		runId: "run-opaque",
+		taskId: "task-opaque",
+		sessionId: "session-opaque",
+		toolCallId: "tool-call-opaque",
+		parentAgentId: "parent-agent",
+		parentRunId: "parent-run",
+		parentTaskId: "parent-task",
+		parentSessionId: "parent-session",
+		parentId: "parent-record",
+		route: "delegate",
+		input: { text: "summarize" },
+		limits: {
+			maxChildren: 0,
+			depth: 1,
+			turns: 3,
+			timeoutMs: 2500,
+			outputBytes: 4096,
+			outputLines: 80,
+			toolScopes: ["read-only"],
+		},
+		cancellation: {
+			signalId: "cancel-1",
+			state: "pending",
+			parentRunId: "parent-run",
+			parentTaskId: "parent-task",
+		},
+		metadata: { substrateOnly: true },
+	};
+
+	const result = {
+		type: "sub_agent_task_result",
+		agentId: "agent-opaque",
+		runId: "run-opaque",
+		taskId: "task-opaque",
+		sessionId: "session-opaque",
+		parentAgentId: "parent-agent",
+		parentRunId: "parent-run",
+		parentTaskId: "parent-task",
+		parentSessionId: "parent-session",
+		status: "completed",
+		content: [{ type: "text", text: "done" }],
+		details: { replaySafe: true },
+		startedAt: 10,
+		completedAt: 20,
+		usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3, toolCalls: 0 },
+		resourceSummary: { turns: 1, outputBytes: 128, outputLines: 2, childrenStarted: 0 },
+	};
+
+	it("accepts substrate-only invocation and result envelopes with opaque identity lineage", () => {
+		expect(validateSubAgentTaskInvocationEnvelope(invocation)).toBe(invocation);
+		expect(validateSubAgentTaskResultEnvelope(result)).toBe(result);
+		expect(validateSubAgentReadinessEnvelope(invocation).type).toBe("sub_agent_task_invocation");
+		expect(validateSubAgentReadinessEnvelope(result).type).toBe("sub_agent_task_result");
+	});
+
+	it("rejects missing or invalid correlation identifiers with deterministic paths", () => {
+		expect(() => validateSubAgentReadinessEnvelope({ ...invocation, agentId: "" })).toThrow(
+			"$.agentId: must not be empty",
+		);
+		expect(() => {
+			const { taskId: _taskId, ...withoutTaskId } = invocation;
+			validateSubAgentReadinessEnvelope(withoutTaskId);
+		}).toThrow("$.taskId: missing required field");
+		expect(() => validateSubAgentReadinessEnvelope({ ...result, runId: 42 })).toThrow("$.runId: expected string");
+	});
+
+	it("rejects product UX, automatic spawning policy, and invalid wire fields", () => {
+		expect(() => validateSubAgentTaskInvocationEnvelope({ ...invocation, spawnPolicy: { automatic: true } })).toThrow(
+			"$.spawnPolicy: product UX/spawn policy is not allowed",
+		);
+		expect(() => validateSubAgentTaskInvocationEnvelope({ ...invocation, limits: { toolScopes: [""] } })).toThrow(
+			"$.limits.toolScopes[0]: must not be empty",
+		);
+		expect(() => validateSubAgentTaskResultEnvelope({ ...result, status: "complete" })).toThrow(
+			'$.status: unsupported task status "complete"',
+		);
 	});
 });
 

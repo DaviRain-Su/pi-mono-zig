@@ -20,6 +20,25 @@ export type {
 } from "./runner.js";
 export { ExtensionRunner } from "./runner.js";
 export type {
+	SubAgentCancellationMetadata,
+	SubAgentCancellationState,
+	SubAgentCorrelationIds,
+	SubAgentLineage,
+	SubAgentReadinessEnvelope,
+	SubAgentResourceLimits,
+	SubAgentResourceSummary,
+	SubAgentTaskError,
+	SubAgentTaskInvocationEnvelope,
+	SubAgentTaskResultEnvelope,
+	SubAgentTaskStatus,
+	SubAgentUsageSummary,
+} from "./subagent-readiness.js";
+export {
+	validateSubAgentReadinessEnvelope,
+	validateSubAgentTaskInvocationEnvelope,
+	validateSubAgentTaskResultEnvelope,
+} from "./subagent-readiness.js";
+export type {
 	AfterProviderResponseEvent,
 	AgentEndEvent,
 	AgentStartEvent,

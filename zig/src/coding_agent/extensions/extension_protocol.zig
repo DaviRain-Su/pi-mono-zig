@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
+const extension_events = @import("extension_events.zig");
 const extension_registry = @import("extension_registry.zig");
 
 pub const DiagnosticCategory = enum {
@@ -763,6 +764,35 @@ test "process_jsonl protocol rejects invalid subscriber readiness frames without
     try std.testing.expectEqual(DiagnosticCategory.unsupported_message_type, state.diagnostics.items[1].category);
     try std.testing.expectEqual(DiagnosticCategory.malformed_json, state.diagnostics.items[2].category);
     try std.testing.expectEqual(DiagnosticCategory.non_object_frame, state.diagnostics.items[3].category);
+}
+
+test "sub-agent readiness JSON wire validation accepts valid envelopes and rejects missing identifiers" {
+    const allocator = std.testing.allocator;
+    const valid_lines =
+        "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"input\":{\"text\":\"delegate\"},\"limits\":{\"maxChildren\":0},\"cancellation\":{\"state\":\"pending\"}}\n" ++
+        "{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"status\":\"completed\",\"startedAt\":1,\"completedAt\":2,\"content\":{\"text\":\"done\"}}\n";
+
+    var valid_parser = JsonlFrameParser{};
+    defer valid_parser.deinit(allocator);
+    var valid_state = ProtocolState.init(allocator);
+    defer valid_state.deinit();
+    try valid_parser.feed(allocator, valid_lines, &valid_state);
+    try std.testing.expectEqual(@as(usize, 2), valid_state.diagnosticCategoryCount(.unsupported_message_type));
+
+    var invocation = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"input\":{\"text\":\"delegate\"},\"limits\":{\"maxChildren\":0},\"cancellation\":{\"state\":\"pending\"}}", .{});
+    defer invocation.deinit();
+    var invocation_validation = try extension_events.validateSubAgentReadinessEnvelope(allocator, invocation.value);
+    defer invocation_validation.deinit(allocator);
+    try std.testing.expect(invocation_validation == .valid);
+    try std.testing.expectEqual(extension_events.SubAgentReadinessEnvelopeKind.task_invocation, invocation_validation.valid);
+
+    var invalid_missing_id = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"sessionId\":\"session-opaque\",\"input\":{}}", .{});
+    defer invalid_missing_id.deinit();
+    var invalid_validation = try extension_events.validateSubAgentReadinessEnvelope(allocator, invalid_missing_id.value);
+    defer invalid_validation.deinit(allocator);
+    try std.testing.expect(invalid_validation == .invalid);
+    try std.testing.expectEqualStrings("$.taskId", invalid_validation.invalid.path);
+    try std.testing.expectEqualStrings("missing required field", invalid_validation.invalid.message);
 }
 
 test "extension protocol ABI conformance helper covers diagnostics registry frames and UI lifecycle" {
