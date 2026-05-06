@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("agent");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
+const native_runtime = @import("native_runtime.zig");
 const tools_common = @import("../tools/common.zig");
 const wasm_host = @import("wasm/wasm_host_spike.zig");
 const wasm_manifest = @import("wasm/wasm_manifest.zig");
@@ -13,6 +14,10 @@ pub const InitializeFrame = extension_host.InitializeFrame;
 pub const ProcessJsonlOptions = extension_host.HostProcessOptions;
 pub const Registry = extension_registry.Registry;
 pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const Registry) anyerror!void;
+pub const NativeDescriptor = native_runtime.NativeDescriptor;
+pub const NativeHostApi = native_runtime.NativeHostApi;
+pub const NativeOptions = native_runtime.NativeOptions;
+pub const NativeToolDefinition = native_runtime.NativeToolDefinition;
 
 pub const RuntimeKind = enum {
     process_jsonl,
@@ -100,7 +105,7 @@ pub const WasmOptions = struct {
 pub const RuntimeOptions = union(RuntimeKind) {
     process_jsonl: ProcessJsonlOptions,
     wasm: WasmOptions,
-    native: UnsupportedRuntimeOptions,
+    native: NativeOptions,
     remote: UnsupportedRuntimeOptions,
 };
 
@@ -202,7 +207,8 @@ pub fn startRuntime(allocator: std.mem.Allocator, io: std.Io, options: RuntimeOp
     return switch (options) {
         .process_jsonl => |process_options| try startProcessJsonl(allocator, io, process_options),
         .wasm => |wasm_options| try startWasm(allocator, io, wasm_options),
-        .native, .remote => error.UnsupportedRuntime,
+        .native => |native_options| try startNative(allocator, io, native_options),
+        .remote => error.UnsupportedRuntime,
     };
 }
 
@@ -728,6 +734,102 @@ const wasm_vtable: RuntimeAdapter.VTable = .{
     .deinit = wasmDeinit,
 };
 
+pub fn startNative(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !RuntimeAdapter {
+    const runtime = try native_runtime.NativeRuntime.start(allocator, io, options);
+    return .{
+        .ptr = @ptrCast(runtime),
+        .vtable = &native_vtable,
+        .kind = .native,
+    };
+}
+
+fn nativeRuntime(ptr: *anyopaque) *native_runtime.NativeRuntime {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn nativeWaitForReady(ptr: *anyopaque, timeout_ms: u64) !void {
+    try nativeRuntime(ptr).waitForReady(timeout_ms);
+}
+
+fn nativePendingCount(ptr: *anyopaque) usize {
+    return nativeRuntime(ptr).pendingCount();
+}
+
+fn nativeDiagnosticCount(ptr: *anyopaque) usize {
+    return nativeRuntime(ptr).diagnosticCount();
+}
+
+fn nativeDiagnosticCategoryCount(ptr: *anyopaque, category: DiagnosticCategory) usize {
+    return nativeRuntime(ptr).diagnosticCategoryCount(category);
+}
+
+fn nativeHasShutdownComplete(ptr: *anyopaque) bool {
+    return nativeRuntime(ptr).hasShutdownComplete();
+}
+
+fn nativeRegistryFramesApplied(ptr: *anyopaque) usize {
+    return nativeRuntime(ptr).registryFramesApplied();
+}
+
+fn nativeHasRegisteredCommand(ptr: *anyopaque, name: []const u8) bool {
+    return nativeRuntime(ptr).hasRegisteredCommand(name);
+}
+
+fn nativeSnapshotRegistryJson(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    return try nativeRuntime(ptr).snapshotRegistryJson(allocator);
+}
+
+fn nativeWithRegistry(ptr: *anyopaque, context: ?*anyopaque, callback: RegistryCallback) !void {
+    try nativeRuntime(ptr).withRegistry(context, callback);
+}
+
+fn nativeApplyCliFlagValues(ptr: *anyopaque, entries: []const extension_registry.ParsedCliFlag) !void {
+    try nativeRuntime(ptr).applyCliFlagValues(entries);
+}
+
+fn nativeAgentTool(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+    return try nativeRuntime(ptr).agentTool(allocator, name);
+}
+
+fn nativeTakeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
+    return try nativeRuntime(ptr).takeUiRequests(allocator);
+}
+
+fn nativeSendExtensionUiResponse(ptr: *anyopaque, id: []const u8, payload_json: []const u8) !void {
+    try nativeRuntime(ptr).sendExtensionUiResponse(id, payload_json);
+}
+
+fn nativeSendExtensionEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
+    nativeRuntime(ptr).sendExtensionEventFrame(frame_json);
+}
+
+fn nativeShutdown(ptr: *anyopaque) !void {
+    try nativeRuntime(ptr).shutdown();
+}
+
+fn nativeDeinit(ptr: *anyopaque) void {
+    nativeRuntime(ptr).deinit();
+}
+
+const native_vtable: RuntimeAdapter.VTable = .{
+    .wait_for_ready = nativeWaitForReady,
+    .pending_count = nativePendingCount,
+    .diagnostic_count = nativeDiagnosticCount,
+    .diagnostic_category_count = nativeDiagnosticCategoryCount,
+    .has_shutdown_complete = nativeHasShutdownComplete,
+    .registry_frames_applied = nativeRegistryFramesApplied,
+    .has_registered_command = nativeHasRegisteredCommand,
+    .snapshot_registry_json = nativeSnapshotRegistryJson,
+    .with_registry = nativeWithRegistry,
+    .apply_cli_flag_values = nativeApplyCliFlagValues,
+    .agent_tool = nativeAgentTool,
+    .take_ui_requests = nativeTakeUiRequests,
+    .send_extension_ui_response = nativeSendExtensionUiResponse,
+    .send_extension_event_frame = nativeSendExtensionEventFrame,
+    .shutdown = nativeShutdown,
+    .deinit = nativeDeinit,
+};
+
 fn absoluteTmpPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []const u8) ![]u8 {
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(cwd);
@@ -859,10 +961,9 @@ fn expectAdapterRegistryUiEventShutdownConformance(allocator: std.mem.Allocator,
     adapter.sendExtensionEventFrame("{\"type\":\"agent_end\",\"messages\":[]}");
 }
 
-test "extension runtime factory rejects reserved runtime kinds deterministically" {
+test "extension runtime factory rejects remote runtime deterministically" {
     const allocator = std.testing.allocator;
     const unsupported = [_]RuntimeOptions{
-        .{ .native = .{} },
         .{ .remote = .{} },
     };
 
@@ -896,8 +997,129 @@ test "extension runtime factory constructs wasm adapter and keeps native remote 
     try adapter.shutdown();
     try std.testing.expect(adapter.hasShutdownComplete());
 
-    try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .native = .{} }));
     try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .remote = .{} }));
+}
+
+const native_static_tool: NativeToolDefinition = .{
+    .name = "native.fixture.echo",
+    .label = "Native Fixture Echo",
+    .description = "Static native fixture tool metadata",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}}}",
+    .extension_path = "native://fixture/static-v0",
+};
+
+const native_static_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-static-fixture",
+    .name = "Native Static Fixture",
+    .version = "0.1.0",
+    .description = "Statically linked native runtime fixture",
+    .tools = &.{native_static_tool},
+};
+
+const native_partial_failure_tool: NativeToolDefinition = .{
+    .name = "native.fixture.partial",
+    .label = "Native Partial Fixture",
+    .description = "Native fixture registered before injected setup failure",
+    .input_schema_json = "{\"type\":\"object\"}",
+    .extension_path = "native://fixture/partial-failure",
+};
+
+fn nativeFailAfterReadyRegistryAndUi(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_partial_failure_tool);
+    try api.requestUi("native-partial-pending", "input", true, "{\"prompt\":\"partial\"}");
+    return error.NativeFixtureInjectedFailure;
+}
+
+const native_partial_failure_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-partial-failure",
+    .name = "Native Partial Failure Fixture",
+    .version = "0.1.0",
+    .description = "Native fixture that fails after partial setup",
+    .tools = &.{native_partial_failure_tool},
+    .start = nativeFailAfterReadyRegistryAndUi,
+};
+
+fn expectNativeStaticRegistry(context: ?*anyopaque, registry: *const Registry) !void {
+    _ = context;
+    const counts = extension_registry.registrySurfaceCounts(registry);
+    try std.testing.expectEqual(@as(usize, 1), counts.tools);
+    try std.testing.expectEqual(@as(usize, 0), counts.commands);
+    try std.testing.expectEqualStrings("native.fixture.echo", registry.tools.items[0].name);
+    try std.testing.expectEqualStrings("Native Fixture Echo", registry.tools.items[0].label);
+    try std.testing.expectEqualStrings("Static native fixture tool metadata", registry.tools.items[0].description);
+    try std.testing.expectEqualStrings("native://fixture/static-v0", registry.tools.items[0].extension_path);
+    try std.testing.expectEqualStrings("object", registry.tools.items[0].parameters.object.get("type").?.string);
+}
+
+test "native runtime factory starts static module and remote stays unsupported" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try std.testing.expectEqual(RuntimeKind.native, adapter.kind);
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+
+    const snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"native.fixture.echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"extensionPath\":\"native://fixture/static-v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "dynamic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "library") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "executable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "remote") == null);
+
+    try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
+    try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .remote = .{} }));
+}
+
+test "native runtime shutdown is idempotent and final" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    const maybe_tool = try adapter.agentTool(allocator, "native.fixture.echo");
+    try std.testing.expect(maybe_tool != null);
+    var tool = maybe_tool.?;
+    defer deinitAgentTool(allocator, &tool);
+
+    try adapter.shutdown();
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "native.fixture.echo"));
+
+    const snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"tools\":[]") != null);
+}
+
+test "native runtime partial setup failure cleans registry tool and UI state" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.NativeFixtureInjectedFailure, startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_partial_failure_descriptor,
+    } }));
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "native.fixture.partial"));
 }
 
 test "wasm manifest handoff starts runtime without capability execution" {
