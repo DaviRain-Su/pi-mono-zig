@@ -264,7 +264,7 @@ fn availableModelAlreadyIncluded(models: []const AvailableModel, candidate: Avai
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
     return switch (err) {
         error.MissingApiKey => missingApiKeyMessage(provider),
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, faux.",
+        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, moonshotai, moonshotai-cn, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, cloudflare-workers-ai, cloudflare-ai-gateway, huggingface, fireworks, opencode, opencode-go, kimi-coding, xiaomi, xiaomi-token-plan-cn, xiaomi-token-plan-ams, xiaomi-token-plan-sgp, faux.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
         error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
@@ -684,6 +684,18 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "minimax-cn")) {
         return "MiniMax (China) credentials required.\nSet MINIMAX_CN_API_KEY, pass --api-key, or run /login minimax-cn.";
     }
+    if (std.mem.eql(u8, provider, "moonshotai")) {
+        return "Moonshot AI credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login moonshotai.";
+    }
+    if (std.mem.eql(u8, provider, "moonshotai-cn")) {
+        return "Moonshot AI (China) credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login moonshotai-cn.";
+    }
+    if (std.mem.eql(u8, provider, "cloudflare-workers-ai")) {
+        return "Cloudflare Workers AI credentials required.\nSet CLOUDFLARE_API_KEY, pass --api-key, or run /login cloudflare-workers-ai.";
+    }
+    if (std.mem.eql(u8, provider, "cloudflare-ai-gateway")) {
+        return "Cloudflare AI Gateway credentials required.\nSet CLOUDFLARE_API_KEY, pass --api-key, or run /login cloudflare-ai-gateway.";
+    }
     if (std.mem.eql(u8, provider, "huggingface")) {
         return "Hugging Face credentials required.\nSet HF_TOKEN, pass --api-key, or run /login huggingface.";
     }
@@ -701,6 +713,18 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     }
     if (std.mem.eql(u8, provider, "kimi")) {
         return "Kimi credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login kimi.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi")) {
+        return "Xiaomi MiMo credentials required.\nSet XIAOMI_API_KEY, pass --api-key, or run /login xiaomi.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi-token-plan-cn")) {
+        return "Xiaomi MiMo Token Plan (China) credentials required.\nSet XIAOMI_TOKEN_PLAN_CN_API_KEY, pass --api-key, or run /login xiaomi-token-plan-cn.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi-token-plan-ams")) {
+        return "Xiaomi MiMo Token Plan (Amsterdam) credentials required.\nSet XIAOMI_TOKEN_PLAN_AMS_API_KEY, pass --api-key, or run /login xiaomi-token-plan-ams.";
+    }
+    if (std.mem.eql(u8, provider, "xiaomi-token-plan-sgp")) {
+        return "Xiaomi MiMo Token Plan (Singapore) credentials required.\nSet XIAOMI_TOKEN_PLAN_SGP_API_KEY, pass --api-key, or run /login xiaomi-token-plan-sgp.";
     }
     return "Provider credentials required.\nPass --api-key, run /login <provider>, or configure the provider environment variables.";
 }
@@ -806,6 +830,51 @@ test "resolveProviderConfig supports non-legacy built-in providers" {
     try std.testing.expectEqualStrings("Devstral Medium Latest", resolved.model.name);
     try std.testing.expectEqualStrings("mistral-conversations", resolved.model.api);
     try std.testing.expectEqualStrings("mistral", resolved.model.provider);
+}
+
+test "resolveProviderConfig accepts provider catalog parity providers" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("MOONSHOT_API_KEY", "moonshot-key");
+    try env_map.put("CLOUDFLARE_API_KEY", "cloudflare-key");
+    try env_map.put("XIAOMI_API_KEY", "xiaomi-key");
+    try env_map.put("XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-cn-key");
+    try env_map.put("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-ams-key");
+    try env_map.put("XIAOMI_TOKEN_PLAN_SGP_API_KEY", "xiaomi-sgp-key");
+
+    const cases = [_]struct {
+        provider: []const u8,
+        expected_key: []const u8,
+        model_id: []const u8,
+        api: []const u8,
+        base_url: []const u8,
+        display_name: []const u8,
+    }{
+        .{ .provider = "moonshotai", .expected_key = "moonshot-key", .model_id = "kimi-k2.6", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .display_name = "Moonshot AI" },
+        .{ .provider = "moonshotai-cn", .expected_key = "moonshot-key", .model_id = "kimi-k2.6", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .display_name = "Moonshot AI (China)" },
+        .{ .provider = "cloudflare-workers-ai", .expected_key = "cloudflare-key", .model_id = "@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .display_name = "Cloudflare Workers AI" },
+        .{ .provider = "cloudflare-ai-gateway", .expected_key = "cloudflare-key", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .display_name = "Cloudflare AI Gateway" },
+        .{ .provider = "xiaomi", .expected_key = "xiaomi-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo" },
+        .{ .provider = "xiaomi-token-plan-cn", .expected_key = "xiaomi-cn-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo Token Plan (China)" },
+        .{ .provider = "xiaomi-token-plan-ams", .expected_key = "xiaomi-ams-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo Token Plan (Amsterdam)" },
+        .{ .provider = "xiaomi-token-plan-sgp", .expected_key = "xiaomi-sgp-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo Token Plan (Singapore)" },
+    };
+
+    for (cases) |case| {
+        var resolved = try resolveProviderConfig(allocator, std.testing.io, &env_map, case.provider, null, null, null);
+        defer resolved.deinit(allocator);
+
+        try std.testing.expectEqualStrings(case.expected_key, resolved.api_key.?);
+        try std.testing.expectEqual(ProviderAuthStatus.environment, resolved.auth_status);
+        try std.testing.expectEqualStrings(case.provider, resolved.model.provider);
+        try std.testing.expectEqualStrings(case.model_id, resolved.model.id);
+        try std.testing.expectEqualStrings(case.api, resolved.model.api);
+        try std.testing.expectEqualStrings(case.base_url, resolved.model.base_url);
+        try std.testing.expectEqualStrings(case.display_name, providerDisplayName(case.provider));
+    }
 }
 
 test "resolveProviderConfig uses configured api key when env is missing" {
@@ -961,6 +1030,54 @@ test "listAvailableModels enumerates all built-in providers" {
     try std.testing.expect(found_faux);
     try std.testing.expect(openai_count >= 3);
     try std.testing.expect(models.len >= 20);
+}
+
+test "listAvailableModels surfaces provider catalog parity auth states" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct {
+        provider: []const u8,
+        model_id: []const u8,
+        env_var: []const u8,
+    }{
+        .{ .provider = "moonshotai", .model_id = "kimi-k2.6", .env_var = "MOONSHOT_API_KEY" },
+        .{ .provider = "moonshotai-cn", .model_id = "kimi-k2.6", .env_var = "MOONSHOT_API_KEY" },
+        .{ .provider = "cloudflare-workers-ai", .model_id = "@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
+        .{ .provider = "cloudflare-ai-gateway", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
+        .{ .provider = "xiaomi", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_API_KEY" },
+        .{ .provider = "xiaomi-token-plan-cn", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_TOKEN_PLAN_CN_API_KEY" },
+        .{ .provider = "xiaomi-token-plan-ams", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_TOKEN_PLAN_AMS_API_KEY" },
+        .{ .provider = "xiaomi-token-plan-sgp", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_TOKEN_PLAN_SGP_API_KEY" },
+    };
+
+    var env_map_all = std.process.Environ.Map.init(allocator);
+    defer env_map_all.deinit();
+    for (cases) |case| try env_map_all.put(case.env_var, "env-key");
+
+    const env_models = try listAvailableModels(allocator, &env_map_all, null, .{});
+    defer allocator.free(env_models);
+    for (cases) |case| {
+        try expectAvailableModel(env_models, case.provider, case.model_id, .environment, true);
+    }
+
+    var env_map_empty = std.process.Environ.Map.init(allocator);
+    defer env_map_empty.deinit();
+
+    var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
+    defer provider_api_keys.deinit();
+    for (cases) |case| try provider_api_keys.put(case.provider, "stored-key");
+
+    const stored_models = try listAvailableModels(allocator, &env_map_empty, null, .{ .provider_api_keys = &provider_api_keys });
+    defer allocator.free(stored_models);
+    for (cases) |case| {
+        try expectAvailableModel(stored_models, case.provider, case.model_id, .stored, true);
+    }
+
+    const missing_models = try listAvailableModels(allocator, &env_map_empty, null, .{});
+    defer allocator.free(missing_models);
+    for (cases) |case| {
+        try expectAvailableModel(missing_models, case.provider, case.model_id, .missing, false);
+    }
 }
 
 test "listAvailableModels does not treat GEMINI_API_KEY as google-gemini-cli auth" {
@@ -1163,6 +1280,23 @@ test "resolveProviderErrorMessage includes provider-specific env and login guida
     const copilot = resolveProviderErrorMessage(error.MissingApiKey, "github-copilot");
     try std.testing.expect(std.mem.indexOf(u8, copilot, "COPILOT_GITHUB_TOKEN") != null);
     try std.testing.expect(std.mem.indexOf(u8, copilot, "/login github-copilot") != null);
+
+    const moonshot = resolveProviderErrorMessage(error.MissingApiKey, "moonshotai");
+    try std.testing.expect(std.mem.indexOf(u8, moonshot, "MOONSHOT_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, moonshot, "/login moonshotai") != null);
+
+    const cloudflare_gateway = resolveProviderErrorMessage(error.MissingApiKey, "cloudflare-ai-gateway");
+    try std.testing.expect(std.mem.indexOf(u8, cloudflare_gateway, "CLOUDFLARE_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cloudflare_gateway, "/login cloudflare-ai-gateway") != null);
+
+    const xiaomi_sgp = resolveProviderErrorMessage(error.MissingApiKey, "xiaomi-token-plan-sgp");
+    try std.testing.expect(std.mem.indexOf(u8, xiaomi_sgp, "XIAOMI_TOKEN_PLAN_SGP_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xiaomi_sgp, "/login xiaomi-token-plan-sgp") != null);
+
+    const unsupported = resolveProviderErrorMessage(error.UnknownProvider, "unknown");
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "moonshotai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "cloudflare-ai-gateway") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "xiaomi-token-plan-sgp") != null);
 }
 
 test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patterns" {
@@ -1191,4 +1325,21 @@ test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patte
     const with_thinking = try filterAvailableModels(allocator, available, &.{"claude-sonnet:high"});
     defer allocator.free(with_thinking);
     try std.testing.expect(with_thinking.len > 0);
+}
+
+fn expectAvailableModel(
+    models: []const AvailableModel,
+    provider: []const u8,
+    model_id: []const u8,
+    auth_status: ProviderAuthStatus,
+    available: bool,
+) !void {
+    for (models) |entry| {
+        if (std.mem.eql(u8, entry.provider, provider) and std.mem.eql(u8, entry.model_id, model_id)) {
+            try std.testing.expectEqual(auth_status, entry.auth_status);
+            try std.testing.expectEqual(available, entry.available);
+            return;
+        }
+    }
+    return error.TestExpectedEqual;
 }

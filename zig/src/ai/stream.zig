@@ -514,9 +514,17 @@ test "phase4 provider expansion models route through shared api streams" {
         .{ .provider = "vercel-ai-gateway", .expected_api = "anthropic-messages" },
         .{ .provider = "zai", .expected_api = "openai-completions" },
         .{ .provider = "minimax", .expected_api = "anthropic-messages" },
+        .{ .provider = "moonshotai", .expected_api = "openai-completions" },
+        .{ .provider = "moonshotai-cn", .expected_api = "openai-completions" },
+        .{ .provider = "cloudflare-workers-ai", .expected_api = "openai-completions" },
+        .{ .provider = "cloudflare-ai-gateway", .expected_api = "openai-completions" },
         .{ .provider = "huggingface", .expected_api = "openai-completions" },
         .{ .provider = "fireworks", .expected_api = "anthropic-messages" },
         .{ .provider = "opencode", .expected_api = "openai-completions" },
+        .{ .provider = "xiaomi", .expected_api = "anthropic-messages" },
+        .{ .provider = "xiaomi-token-plan-cn", .expected_api = "anthropic-messages" },
+        .{ .provider = "xiaomi-token-plan-ams", .expected_api = "anthropic-messages" },
+        .{ .provider = "xiaomi-token-plan-sgp", .expected_api = "anthropic-messages" },
     };
 
     for (cases) |case| {

@@ -12,6 +12,8 @@ pub const ModelDefinition = struct {
     provider: []const u8,
     id: []const u8,
     name: []const u8,
+    api: ?types.Api = null,
+    base_url: ?[]const u8 = null,
     reasoning: bool = false,
     thinking_level_map: ?types.ThinkingLevelMap = null,
     tool_calling: bool = true,
@@ -22,6 +24,16 @@ pub const ModelDefinition = struct {
     max_tokens: u32,
     headers: ?std.StringHashMap([]const u8) = null,
     compat: ?std.json.Value = null,
+    openai_compat: ?OpenAICompatDefinition = null,
+};
+
+pub const OpenAICompatDefinition = struct {
+    supports_store: ?bool = null,
+    supports_developer_role: ?bool = null,
+    supports_reasoning_effort: ?bool = null,
+    max_tokens_field: ?[]const u8 = null,
+    supports_strict_mode: ?bool = null,
+    send_session_affinity_headers: ?bool = null,
 };
 
 pub const RegisterError = std.mem.Allocator.Error || error{
@@ -134,13 +146,20 @@ pub const ModelRegistry = struct {
 
     pub fn registerModelDefinition(self: *ModelRegistry, definition: ModelDefinition) RegisterError!void {
         const provider = self.getProviderConfig(definition.provider) orelse return error.UnknownProvider;
+        const compat = if (definition.openai_compat) |openai_compat|
+            try buildOpenAICompatValue(self.allocator, openai_compat)
+        else
+            definition.compat;
+        defer if (definition.openai_compat != null) {
+            if (compat) |value| deinitJsonValue(self.allocator, value);
+        };
 
         try self.registerModel(.{
             .id = definition.id,
             .name = definition.name,
-            .api = provider.api,
+            .api = definition.api orelse provider.api,
             .provider = provider.provider,
-            .base_url = provider.base_url,
+            .base_url = definition.base_url orelse provider.base_url,
             .reasoning = definition.reasoning,
             .thinking_level_map = definition.thinking_level_map,
             .tool_calling = definition.tool_calling,
@@ -150,7 +169,7 @@ pub const ModelRegistry = struct {
             .context_window = definition.context_window,
             .max_tokens = definition.max_tokens,
             .headers = definition.headers,
-            .compat = definition.compat,
+            .compat = compat,
         });
     }
 
@@ -658,6 +677,52 @@ fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
+fn buildOpenAICompatValue(allocator: std.mem.Allocator, compat: OpenAICompatDefinition) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        var object_mut = object;
+        var iterator = object_mut.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            deinitJsonValue(allocator, entry.value_ptr.*);
+        }
+        object_mut.deinit(allocator);
+    }
+
+    try putOptionalCompatBool(allocator, &object, "supportsStore", compat.supports_store);
+    try putOptionalCompatBool(allocator, &object, "supportsDeveloperRole", compat.supports_developer_role);
+    try putOptionalCompatBool(allocator, &object, "supportsReasoningEffort", compat.supports_reasoning_effort);
+    try putOptionalCompatString(allocator, &object, "maxTokensField", compat.max_tokens_field);
+    try putOptionalCompatBool(allocator, &object, "supportsStrictMode", compat.supports_strict_mode);
+    try putOptionalCompatBool(allocator, &object, "sendSessionAffinityHeaders", compat.send_session_affinity_headers);
+
+    return .{ .object = object };
+}
+
+fn putOptionalCompatBool(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: ?bool,
+) !void {
+    const resolved = value orelse return;
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .bool = resolved });
+}
+
+fn putOptionalCompatString(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    const resolved = value orelse return;
+    try object.put(
+        allocator,
+        try allocator.dupe(u8, key),
+        .{ .string = try allocator.dupe(u8, resolved) },
+    );
+}
+
 fn allocatorFreeReplace(allocator: std.mem.Allocator, target: *[]const u8, value: []const u8) !void {
     const replacement = try allocator.dupe(u8, value);
     allocator.free(target.*);
@@ -804,6 +869,8 @@ const TEXT_AND_IMAGE_INPUTS = [_][]const u8{ "text", "image" };
 const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "openai", .api = "openai-completions", .base_url = "https://api.openai.com/v1", .default_model_id = "gpt-5.4" },
     .{ .provider = "kimi", .api = "kimi-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
+    .{ .provider = "moonshotai", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .default_model_id = "kimi-k2.6" },
+    .{ .provider = "moonshotai-cn", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
     .{ .provider = "anthropic", .api = "anthropic-messages", .base_url = "https://api.anthropic.com/v1", .default_model_id = "claude-opus-4-7" },
     .{ .provider = "mistral", .api = "mistral-conversations", .base_url = "https://api.mistral.ai/v1", .default_model_id = "devstral-medium-latest" },
     .{ .provider = "openai-responses", .api = "openai-responses", .base_url = "https://api.openai.com/v1", .default_model_id = "gpt-5-mini" },
@@ -822,11 +889,17 @@ const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/paas/v4", .default_model_id = "glm-5.1" },
     .{ .provider = "minimax", .api = "anthropic-messages", .base_url = "https://api.minimax.io/anthropic", .default_model_id = "MiniMax-M2.7" },
     .{ .provider = "minimax-cn", .api = "anthropic-messages", .base_url = "https://api.minimaxi.com/anthropic", .default_model_id = "MiniMax-M2.7" },
+    .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .default_model_id = "@cf/moonshotai/kimi-k2.6" },
+    .{ .provider = "cloudflare-ai-gateway", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .default_model_id = "workers-ai/@cf/moonshotai/kimi-k2.6" },
     .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
     .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
     .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
     .{ .provider = "opencode-go", .api = "openai-completions", .base_url = "https://opencode.ai/zen/go/v1", .default_model_id = "kimi-k2.6" },
     .{ .provider = "kimi-coding", .api = "anthropic-messages", .base_url = "https://api.kimi.com/coding", .default_model_id = "kimi-for-coding" },
+    .{ .provider = "xiaomi", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+    .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+    .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+    .{ .provider = "xiaomi-token-plan-sgp", .api = "anthropic-messages", .base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "faux", .api = "faux", .base_url = "http://localhost:0", .default_model_id = "faux-1" },
 };
 
@@ -835,6 +908,16 @@ const THINKING_MAP_XHIGH_MAX = types.ThinkingLevelMap{ .xhigh = .{ .mapped = "ma
 const THINKING_MAP_XHIGH_XHIGH = types.ThinkingLevelMap{ .xhigh = .{ .mapped = "xhigh" } };
 const THINKING_MAP_OFF_UNSUPPORTED_XHIGH = types.ThinkingLevelMap{ .off = .unsupported, .xhigh = .{ .mapped = "xhigh" } };
 const THINKING_MAP_CODEX_XHIGH = types.ThinkingLevelMap{ .minimal = .{ .mapped = "low" }, .xhigh = .{ .mapped = "xhigh" } };
+const OPENAI_COMPAT_MOONSHOT = OpenAICompatDefinition{
+    .supports_store = false,
+    .supports_developer_role = false,
+    .supports_reasoning_effort = false,
+    .max_tokens_field = "max_tokens",
+    .supports_strict_mode = false,
+};
+const OPENAI_COMPAT_CLOUDFLARE_SESSION = OpenAICompatDefinition{
+    .send_session_affinity_headers = true,
+};
 
 const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "openai", .id = "gpt-4.1-mini", .name = "GPT-4.1 Mini", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 128000, .max_tokens = 16384 },
@@ -843,6 +926,8 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
 
     .{ .provider = "kimi", .id = "moonshot-v1-8k", .name = "Moonshot v1 8K", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 8192, .max_tokens = 8192 },
     .{ .provider = "kimi", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
+    .{ .provider = "moonshotai", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 262144, .openai_compat = OPENAI_COMPAT_MOONSHOT },
+    .{ .provider = "moonshotai-cn", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 262144, .openai_compat = OPENAI_COMPAT_MOONSHOT },
 
     .{ .provider = "anthropic", .id = "claude-sonnet-4-5", .name = "Claude Sonnet 4.5", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 64000 },
     .{ .provider = "anthropic", .id = "claude-sonnet-4-5-20250929", .name = "Claude Sonnet 4.5 (2025-09-29)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 64000 },
@@ -878,11 +963,19 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "zai", .id = "glm-5.1", .name = "GLM-5.1", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
     .{ .provider = "minimax", .id = "MiniMax-M2.7", .name = "MiniMax-M2.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072 },
     .{ .provider = "minimax-cn", .id = "MiniMax-M2.7", .name = "MiniMax-M2.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072 },
+    .{ .provider = "cloudflare-workers-ai", .id = "@cf/moonshotai/kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 256000, .openai_compat = OPENAI_COMPAT_CLOUDFLARE_SESSION },
+    .{ .provider = "cloudflare-ai-gateway", .id = "workers-ai/@cf/moonshotai/kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 256000, .openai_compat = OPENAI_COMPAT_CLOUDFLARE_SESSION },
+    .{ .provider = "cloudflare-ai-gateway", .id = "gpt-5.4", .name = "GPT-5.4", .api = "openai-responses", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1050000, .max_tokens = 128000 },
+    .{ .provider = "cloudflare-ai-gateway", .id = "claude-opus-4-7", .name = "Claude Opus 4.7", .api = "anthropic-messages", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/anthropic", .reasoning = true, .thinking_level_map = THINKING_MAP_XHIGH_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
     .{ .provider = "huggingface", .id = "moonshotai/Kimi-K2.6", .name = "Kimi-K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 262144 },
     .{ .provider = "fireworks", .id = "accounts/fireworks/models/kimi-k2p6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262000, .max_tokens = 262000 },
     .{ .provider = "opencode", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
     .{ .provider = "opencode-go", .id = "kimi-k2.6", .name = "Kimi K2.6 (3x limits)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
     .{ .provider = "kimi-coding", .id = "kimi-for-coding", .name = "Kimi For Coding", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768 },
+    .{ .provider = "xiaomi", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
+    .{ .provider = "xiaomi-token-plan-cn", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
+    .{ .provider = "xiaomi-token-plan-ams", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
+    .{ .provider = "xiaomi-token-plan-sgp", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
 
     .{ .provider = "faux", .id = "faux-1", .name = "Faux 1", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 8192, .max_tokens = 4096 },
 };
@@ -950,6 +1043,71 @@ test "phase4 provider expansion registers configs and default models" {
         try std.testing.expectEqualStrings(case.api, model.api);
         try std.testing.expectEqualStrings(case.base_url, model.base_url);
     }
+
+    for (&[_][]const u8{ "moonshotai", "moonshotai-cn" }) |provider| {
+        const model = find(provider, "kimi-k2.6").?;
+        try expectCompatBool(model, "supportsStore", false);
+        try expectCompatBool(model, "supportsDeveloperRole", false);
+        try expectCompatBool(model, "supportsReasoningEffort", false);
+        try expectCompatString(model, "maxTokensField", "max_tokens");
+        try expectCompatBool(model, "supportsStrictMode", false);
+    }
+}
+
+test "provider catalog config parity registers Moonshot Cloudflare and Xiaomi providers" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const cases = [_]struct {
+        provider: []const u8,
+        api: []const u8,
+        base_url: []const u8,
+        default_model_id: []const u8,
+    }{
+        .{ .provider = "moonshotai", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .default_model_id = "kimi-k2.6" },
+        .{ .provider = "moonshotai-cn", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
+        .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .default_model_id = "@cf/moonshotai/kimi-k2.6" },
+        .{ .provider = "cloudflare-ai-gateway", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .default_model_id = "workers-ai/@cf/moonshotai/kimi-k2.6" },
+        .{ .provider = "xiaomi", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+        .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+        .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+        .{ .provider = "xiaomi-token-plan-sgp", .api = "anthropic-messages", .base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+    };
+
+    for (cases) |case| {
+        const provider = getProviderConfig(case.provider).?;
+        try std.testing.expectEqualStrings(case.api, provider.api);
+        try std.testing.expectEqualStrings(case.base_url, provider.base_url);
+        try std.testing.expectEqualStrings(case.default_model_id, provider.default_model_id.?);
+
+        const model = find(case.provider, case.default_model_id).?;
+        try std.testing.expectEqualStrings(case.provider, model.provider);
+        try std.testing.expectEqualStrings(case.api, model.api);
+        try std.testing.expectEqualStrings(case.base_url, model.base_url);
+    }
+}
+
+test "Cloudflare gateway models expose compat openai and anthropic surfaces" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const compat_model = find("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6").?;
+    try std.testing.expectEqualStrings("openai-completions", compat_model.api);
+    try std.testing.expectEqualStrings("https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", compat_model.base_url);
+    try expectCompatBool(compat_model, "sendSessionAffinityHeaders", true);
+
+    const workers_model = find("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6").?;
+    try std.testing.expectEqualStrings("openai-completions", workers_model.api);
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", workers_model.base_url);
+    try expectCompatBool(workers_model, "sendSessionAffinityHeaders", true);
+
+    const openai_model = find("cloudflare-ai-gateway", "gpt-5.4").?;
+    try std.testing.expectEqualStrings("openai-responses", openai_model.api);
+    try std.testing.expectEqualStrings("https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai", openai_model.base_url);
+
+    const anthropic_model = find("cloudflare-ai-gateway", "claude-opus-4-7").?;
+    try std.testing.expectEqualStrings("anthropic-messages", anthropic_model.api);
+    try std.testing.expectEqualStrings("https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/anthropic", anthropic_model.base_url);
 }
 
 test "model lookup by id returns unique built-in model" {
@@ -1046,6 +1204,22 @@ test "custom models can be registered at runtime" {
     try std.testing.expectEqualStrings("Local Llama 3.3 70B", model.name);
     try std.testing.expectEqualStrings("openai-completions", model.api);
     try std.testing.expectEqualStrings("http://localhost:11434/v1", model.base_url);
+}
+
+fn expectCompatBool(model: types.Model, key: []const u8, expected: bool) !void {
+    const compat = model.compat orelse return error.TestExpectedEqual;
+    try std.testing.expect(compat == .object);
+    const value = compat.object.get(key) orelse return error.TestExpectedEqual;
+    try std.testing.expect(value == .bool);
+    try std.testing.expectEqual(expected, value.bool);
+}
+
+fn expectCompatString(model: types.Model, key: []const u8, expected: []const u8) !void {
+    const compat = model.compat orelse return error.TestExpectedEqual;
+    try std.testing.expect(compat == .object);
+    const value = compat.object.get(key) orelse return error.TestExpectedEqual;
+    try std.testing.expect(value == .string);
+    try std.testing.expectEqualStrings(expected, value.string);
 }
 
 test "supportsXhigh requires explicit non-null xhigh metadata" {

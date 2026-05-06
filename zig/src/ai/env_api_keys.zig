@@ -273,6 +273,12 @@ test "getEnvApiKey ignores blank credential values" {
     defer env_map.deinit();
 
     try env_map.put("OPENAI_API_KEY", "");
+    try env_map.put("MOONSHOT_API_KEY", "\t ");
+    try env_map.put("CLOUDFLARE_API_KEY", "\n");
+    try env_map.put("XIAOMI_API_KEY", " ");
+    try env_map.put("XIAOMI_TOKEN_PLAN_CN_API_KEY", "\r\n");
+    try env_map.put("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "\t");
+    try env_map.put("XIAOMI_TOKEN_PLAN_SGP_API_KEY", "  ");
     try env_map.put("KIMI_API_KEY", "   ");
     try env_map.put("ANTHROPIC_OAUTH_TOKEN", "");
     try env_map.put("ANTHROPIC_API_KEY", "anthropic-key");
@@ -288,6 +294,22 @@ test "getEnvApiKey ignores blank credential values" {
     const kimi_coding = try getEnvApiKeyFromMap(allocator, &env_map, "kimi-coding");
     defer if (kimi_coding) |value| allocator.free(value);
     try std.testing.expect(kimi_coding == null);
+
+    const blank_provider_cases = [_][]const u8{
+        "moonshotai",
+        "moonshotai-cn",
+        "cloudflare-workers-ai",
+        "cloudflare-ai-gateway",
+        "xiaomi",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-sgp",
+    };
+    for (blank_provider_cases) |provider| {
+        const value = try getEnvApiKeyFromMap(allocator, &env_map, provider);
+        defer if (value) |resolved| allocator.free(resolved);
+        try std.testing.expect(value == null);
+    }
 
     const anthropic = try getEnvApiKeyFromMap(allocator, &env_map, "anthropic");
     defer if (anthropic) |value| allocator.free(value);

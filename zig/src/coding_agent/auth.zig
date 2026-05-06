@@ -92,6 +92,8 @@ pub const API_KEY_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "amazon-bedrock", .name = "Amazon Bedrock", .auth_type = .api_key },
     .{ .id = "azure-openai-responses", .name = "Azure OpenAI Responses", .auth_type = .api_key },
     .{ .id = "cerebras", .name = "Cerebras", .auth_type = .api_key },
+    .{ .id = "cloudflare-ai-gateway", .name = "Cloudflare AI Gateway", .auth_type = .api_key },
+    .{ .id = "cloudflare-workers-ai", .name = "Cloudflare Workers AI", .auth_type = .api_key },
     .{ .id = "fireworks", .name = "Fireworks", .auth_type = .api_key },
     .{ .id = "google", .name = "Google Gemini", .auth_type = .api_key },
     .{ .id = "google-vertex", .name = "Google Vertex AI", .auth_type = .api_key },
@@ -102,6 +104,8 @@ pub const API_KEY_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "mistral", .name = "Mistral", .auth_type = .api_key },
     .{ .id = "minimax", .name = "MiniMax", .auth_type = .api_key },
     .{ .id = "minimax-cn", .name = "MiniMax (China)", .auth_type = .api_key },
+    .{ .id = "moonshotai", .name = "Moonshot AI", .auth_type = .api_key },
+    .{ .id = "moonshotai-cn", .name = "Moonshot AI (China)", .auth_type = .api_key },
     .{ .id = "opencode", .name = "OpenCode Zen", .auth_type = .api_key },
     .{ .id = "opencode-go", .name = "OpenCode Go", .auth_type = .api_key },
     .{ .id = "openai", .name = "OpenAI", .auth_type = .api_key },
@@ -110,6 +114,10 @@ pub const API_KEY_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "openrouter", .name = "OpenRouter", .auth_type = .api_key },
     .{ .id = "vercel-ai-gateway", .name = "Vercel AI Gateway", .auth_type = .api_key },
     .{ .id = "xai", .name = "xAI", .auth_type = .api_key },
+    .{ .id = "xiaomi", .name = "Xiaomi MiMo", .auth_type = .api_key },
+    .{ .id = "xiaomi-token-plan-cn", .name = "Xiaomi MiMo Token Plan (China)", .auth_type = .api_key },
+    .{ .id = "xiaomi-token-plan-ams", .name = "Xiaomi MiMo Token Plan (Amsterdam)", .auth_type = .api_key },
+    .{ .id = "xiaomi-token-plan-sgp", .name = "Xiaomi MiMo Token Plan (Singapore)", .auth_type = .api_key },
     .{ .id = "zai", .name = "ZAI", .auth_type = .api_key },
 };
 
@@ -2487,6 +2495,30 @@ test "isApiKeyLoginProvider keeps built-in API key providers separate from OAuth
     try std.testing.expect(isApiKeyLoginProvider("amazon-bedrock", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expect(!isApiKeyLoginProvider("custom-oauth", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expect(isApiKeyLoginProvider("custom-api", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+}
+
+test "API key login metadata includes provider catalog parity providers" {
+    const cases = [_]struct {
+        provider: []const u8,
+        display_name: []const u8,
+    }{
+        .{ .provider = "moonshotai", .display_name = "Moonshot AI" },
+        .{ .provider = "moonshotai-cn", .display_name = "Moonshot AI (China)" },
+        .{ .provider = "cloudflare-workers-ai", .display_name = "Cloudflare Workers AI" },
+        .{ .provider = "cloudflare-ai-gateway", .display_name = "Cloudflare AI Gateway" },
+        .{ .provider = "xiaomi", .display_name = "Xiaomi MiMo" },
+        .{ .provider = "xiaomi-token-plan-cn", .display_name = "Xiaomi MiMo Token Plan (China)" },
+        .{ .provider = "xiaomi-token-plan-ams", .display_name = "Xiaomi MiMo Token Plan (Amsterdam)" },
+        .{ .provider = "xiaomi-token-plan-sgp", .display_name = "Xiaomi MiMo Token Plan (Singapore)" },
+    };
+
+    const oauth_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "google-gemini-cli" };
+    for (cases) |case| {
+        try std.testing.expect(isApiKeyLoginProvider(case.provider, oauth_provider_ids[0..], null));
+        try std.testing.expectEqualStrings(case.display_name, getApiKeyProviderDisplayName(case.provider));
+        const provider = findSupportedProviderByAuthType(case.provider, .api_key).?;
+        try std.testing.expectEqualStrings(case.display_name, provider.name);
+    }
 }
 
 test "resolveApiKey prefers runtime overrides over stored and environment credentials" {
