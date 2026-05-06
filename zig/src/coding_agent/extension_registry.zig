@@ -152,6 +152,50 @@ pub const ExtensionShortcut = struct {
     }
 };
 
+pub const ResolvedCommand = struct {
+    name: []const u8,
+    invocation_name: []u8,
+    description: ?[]const u8,
+    extension_path: []const u8,
+};
+
+pub const ResolvedShortcut = struct {
+    shortcut: []const u8,
+    description: ?[]const u8,
+    command: ?[]const u8,
+    extension_path: []const u8,
+};
+
+pub const ShortcutDiagnostic = struct {
+    type_name: []const u8 = "warning",
+    message: []u8,
+    path: []u8,
+
+    pub fn deinit(self: *ShortcutDiagnostic, allocator: std.mem.Allocator) void {
+        allocator.free(self.message);
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+pub const BuiltinShortcutBinding = struct {
+    shortcut: []const u8,
+    keybinding: []const u8,
+    restrict_override: bool,
+};
+
+pub const ShortcutResolution = struct {
+    shortcuts: []ResolvedShortcut,
+    diagnostics: []ShortcutDiagnostic,
+
+    pub fn deinit(self: *ShortcutResolution, allocator: std.mem.Allocator) void {
+        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
+        allocator.free(self.diagnostics);
+        allocator.free(self.shortcuts);
+        self.* = undefined;
+    }
+};
+
 pub const ExtensionCapability = struct {
     id: []u8,
     kind: []u8,
@@ -435,9 +479,23 @@ pub const Registry = struct {
         return null;
     }
 
+    fn findCommandForExtensionIndex(self: *const Registry, name: []const u8, extension_path: []const u8) ?usize {
+        for (self.commands.items, 0..) |cmd, idx| {
+            if (std.mem.eql(u8, cmd.name, name) and std.mem.eql(u8, cmd.extension_path, extension_path)) return idx;
+        }
+        return null;
+    }
+
     fn findShortcutIndex(self: *const Registry, shortcut: []const u8) ?usize {
         for (self.shortcuts.items, 0..) |sc, idx| {
-            if (std.mem.eql(u8, sc.shortcut, shortcut)) return idx;
+            if (asciiEqlIgnoreCase(sc.shortcut, shortcut)) return idx;
+        }
+        return null;
+    }
+
+    fn findShortcutForExtensionIndex(self: *const Registry, shortcut: []const u8, extension_path: []const u8) ?usize {
+        for (self.shortcuts.items, 0..) |sc, idx| {
+            if (asciiEqlIgnoreCase(sc.shortcut, shortcut) and std.mem.eql(u8, sc.extension_path, extension_path)) return idx;
         }
         return null;
     }
@@ -549,7 +607,11 @@ pub const Registry = struct {
         description: ?[]const u8,
         extension_path: []const u8,
     ) !void {
-        if (self.findCommandIndex(name)) |idx| {
+        // TypeScript stores commands in a per-extension map. A repeated
+        // command in the same extension refreshes that entry, while the
+        // same command name from another extension remains registered and
+        // is resolved later with a deterministic invocation suffix.
+        if (self.findCommandForExtensionIndex(name, extension_path)) |idx| {
             self.commands.items[idx].deinit(self.allocator);
             self.commands.items[idx] = try makeCommand(self.allocator, name, description, extension_path);
             return;
@@ -565,13 +627,147 @@ pub const Registry = struct {
         command: ?[]const u8,
         extension_path: []const u8,
     ) !void {
-        if (self.findShortcutIndex(shortcut)) |idx| {
+        // TypeScript stores shortcuts in a per-extension map keyed by
+        // shortcut. Cross-extension conflicts are diagnosed and resolved
+        // only when shortcuts are listed; last extension wins there.
+        if (self.findShortcutForExtensionIndex(shortcut, extension_path)) |idx| {
             self.shortcuts.items[idx].deinit(self.allocator);
             self.shortcuts.items[idx] = try makeShortcut(self.allocator, shortcut, description, command, extension_path);
             return;
         }
         const sc = try makeShortcut(self.allocator, shortcut, description, command, extension_path);
         try self.shortcuts.append(self.allocator, sc);
+    }
+
+    pub fn resolveCommands(self: *const Registry, allocator: std.mem.Allocator) ![]ResolvedCommand {
+        var resolved = std.ArrayList(ResolvedCommand).empty;
+        errdefer {
+            for (resolved.items) |command| allocator.free(command.invocation_name);
+            resolved.deinit(allocator);
+        }
+
+        for (self.commands.items, 0..) |cmd, idx| {
+            const occurrence = self.commandOccurrenceThroughIndex(idx);
+            const total = self.commandNameCount(cmd.name);
+            var invocation_name = if (total > 1)
+                try std.fmt.allocPrint(allocator, "{s}:{d}", .{ cmd.name, occurrence })
+            else
+                try allocator.dupe(u8, cmd.name);
+            errdefer allocator.free(invocation_name);
+
+            if (resolvedInvocationTaken(resolved.items, invocation_name)) {
+                var suffix = occurrence;
+                while (true) {
+                    suffix += 1;
+                    allocator.free(invocation_name);
+                    invocation_name = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ cmd.name, suffix });
+                    if (!resolvedInvocationTaken(resolved.items, invocation_name)) break;
+                }
+            }
+
+            try resolved.append(allocator, .{
+                .name = cmd.name,
+                .invocation_name = invocation_name,
+                .description = cmd.description,
+                .extension_path = cmd.extension_path,
+            });
+        }
+
+        return try resolved.toOwnedSlice(allocator);
+    }
+
+    pub fn hasCommandInvocation(self: *const Registry, invocation_name: []const u8) bool {
+        const allocator = self.allocator;
+        const resolved = self.resolveCommands(allocator) catch return false;
+        defer deinitResolvedCommands(allocator, resolved);
+        for (resolved) |command| {
+            if (std.mem.eql(u8, command.invocation_name, invocation_name)) return true;
+        }
+        return false;
+    }
+
+    fn commandNameCount(self: *const Registry, name: []const u8) usize {
+        var count: usize = 0;
+        for (self.commands.items) |cmd| {
+            if (std.mem.eql(u8, cmd.name, name)) count += 1;
+        }
+        return count;
+    }
+
+    fn commandOccurrenceThroughIndex(self: *const Registry, index: usize) usize {
+        const name = self.commands.items[index].name;
+        var occurrence: usize = 0;
+        for (self.commands.items[0 .. index + 1]) |cmd| {
+            if (std.mem.eql(u8, cmd.name, name)) occurrence += 1;
+        }
+        return occurrence;
+    }
+
+    pub fn resolveShortcuts(
+        self: *const Registry,
+        allocator: std.mem.Allocator,
+        builtin_keybindings: []const BuiltinShortcutBinding,
+    ) !ShortcutResolution {
+        var shortcuts = std.ArrayList(ResolvedShortcut).empty;
+        errdefer shortcuts.deinit(allocator);
+        var diagnostics = std.ArrayList(ShortcutDiagnostic).empty;
+        errdefer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+
+        for (self.shortcuts.items) |shortcut| {
+            if (findBuiltinShortcut(builtin_keybindings, shortcut.shortcut)) |builtin| {
+                if (builtin.restrict_override) {
+                    try appendShortcutDiagnostic(
+                        allocator,
+                        &diagnostics,
+                        shortcut.extension_path,
+                        "Extension shortcut '{s}' from {s} conflicts with built-in shortcut. Skipping.",
+                        .{ shortcut.shortcut, shortcut.extension_path },
+                    );
+                    continue;
+                }
+
+                try appendShortcutDiagnostic(
+                    allocator,
+                    &diagnostics,
+                    shortcut.extension_path,
+                    "Extension shortcut conflict: '{s}' is built-in shortcut for {s} and {s}. Using {s}.",
+                    .{ shortcut.shortcut, builtin.keybinding, shortcut.extension_path, shortcut.extension_path },
+                );
+            }
+
+            if (findResolvedShortcutIndex(shortcuts.items, shortcut.shortcut)) |idx| {
+                const previous = shortcuts.items[idx];
+                try appendShortcutDiagnostic(
+                    allocator,
+                    &diagnostics,
+                    shortcut.extension_path,
+                    "Extension shortcut conflict: '{s}' registered by both {s} and {s}. Using {s}.",
+                    .{ shortcut.shortcut, previous.extension_path, shortcut.extension_path, shortcut.extension_path },
+                );
+                shortcuts.items[idx] = .{
+                    .shortcut = shortcut.shortcut,
+                    .description = shortcut.description,
+                    .command = shortcut.command,
+                    .extension_path = shortcut.extension_path,
+                };
+                continue;
+            }
+
+            try shortcuts.append(allocator, .{
+                .shortcut = shortcut.shortcut,
+                .description = shortcut.description,
+                .command = shortcut.command,
+                .extension_path = shortcut.extension_path,
+            });
+        }
+
+        return .{
+            .shortcuts = try shortcuts.toOwnedSlice(allocator),
+            .diagnostics = try diagnostics.toOwnedSlice(allocator),
+        };
     }
 
     pub fn registerCapability(
@@ -1254,9 +1450,12 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
     try root.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tools_array });
 
     var commands_array = std.json.Array.init(allocator);
-    for (registry.commands.items) |cmd| {
+    const resolved_commands = try registry.resolveCommands(allocator);
+    defer deinitResolvedCommands(allocator, resolved_commands);
+    for (resolved_commands) |cmd| {
         var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         try entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, cmd.name) });
+        try entry.put(allocator, try allocator.dupe(u8, "invocationName"), .{ .string = try allocator.dupe(u8, cmd.invocation_name) });
         try entry.put(allocator, try allocator.dupe(u8, "description"), try optionalStringJson(allocator, cmd.description));
         try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, cmd.extension_path) });
         try commands_array.append(.{ .object = entry });
@@ -1827,6 +2026,57 @@ fn parseFlagKind(name: []const u8) ?FlagKind {
     return null;
 }
 
+pub fn deinitResolvedCommands(allocator: std.mem.Allocator, commands: []ResolvedCommand) void {
+    for (commands) |command| allocator.free(command.invocation_name);
+    allocator.free(commands);
+}
+
+fn resolvedInvocationTaken(commands: []const ResolvedCommand, invocation_name: []const u8) bool {
+    for (commands) |command| {
+        if (std.mem.eql(u8, command.invocation_name, invocation_name)) return true;
+    }
+    return false;
+}
+
+fn appendShortcutDiagnostic(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(ShortcutDiagnostic),
+    path: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(message);
+    const path_dup = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_dup);
+    try diagnostics.append(allocator, .{
+        .message = message,
+        .path = path_dup,
+    });
+}
+
+fn findBuiltinShortcut(builtins: []const BuiltinShortcutBinding, shortcut: []const u8) ?BuiltinShortcutBinding {
+    for (builtins) |builtin| {
+        if (asciiEqlIgnoreCase(builtin.shortcut, shortcut)) return builtin;
+    }
+    return null;
+}
+
+fn findResolvedShortcutIndex(shortcuts: []const ResolvedShortcut, shortcut: []const u8) ?usize {
+    for (shortcuts, 0..) |existing, idx| {
+        if (asciiEqlIgnoreCase(existing.shortcut, shortcut)) return idx;
+    }
+    return null;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
 // --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
@@ -1900,6 +2150,95 @@ test "registry registers tools/commands/shortcuts/flags/providers and round-trip
     try std.testing.expect(registry.unregisterProvider("fake-provider"));
     try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
     try std.testing.expect(!registry.unregisterProvider("fake-provider"));
+}
+
+test "extension command conflict parity suffixes duplicate commands in insertion order" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerCommand("shared-cmd", "First command", "/tmp/cmd-a.ts");
+    try registry.registerCommand("solo-cmd", "Solo command", "/tmp/cmd-c.ts");
+    try registry.registerCommand("shared-cmd", "Second command", "/tmp/cmd-b.ts");
+    try registry.registerCommand("same-extension", "old", "/tmp/cmd-a.ts");
+    try registry.registerCommand("same-extension", "new", "/tmp/cmd-a.ts");
+
+    try std.testing.expectEqual(@as(usize, 4), registry.commands.items.len);
+
+    const commands = try registry.resolveCommands(allocator);
+    defer deinitResolvedCommands(allocator, commands);
+
+    try std.testing.expectEqual(@as(usize, 4), commands.len);
+    try std.testing.expectEqualStrings("shared-cmd", commands[0].name);
+    try std.testing.expectEqualStrings("shared-cmd:1", commands[0].invocation_name);
+    try std.testing.expectEqualStrings("First command", commands[0].description.?);
+    try std.testing.expectEqualStrings("solo-cmd", commands[1].invocation_name);
+    try std.testing.expectEqualStrings("shared-cmd:2", commands[2].invocation_name);
+    try std.testing.expectEqualStrings("Second command", commands[2].description.?);
+    try std.testing.expectEqualStrings("same-extension", commands[3].invocation_name);
+    try std.testing.expectEqualStrings("new", commands[3].description.?);
+
+    try std.testing.expect(registry.hasCommandInvocation("shared-cmd:1"));
+    try std.testing.expect(registry.hasCommandInvocation("shared-cmd:2"));
+    try std.testing.expect(!registry.hasCommandInvocation("shared-cmd"));
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+    const first_idx = std.mem.indexOf(u8, snapshot, "\"invocationName\":\"shared-cmd:1\"") orelse return error.MissingFirstCommandInvocation;
+    const second_idx = std.mem.indexOf(u8, snapshot, "\"invocationName\":\"shared-cmd:2\"") orelse return error.MissingSecondCommandInvocation;
+    try std.testing.expect(first_idx < second_idx);
+}
+
+test "extension shortcut conflict parity resolves built-in and extension collisions" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const builtins = [_]BuiltinShortcutBinding{
+        .{ .shortcut = "ctrl+c", .keybinding = "app.clear", .restrict_override = true },
+        .{ .shortcut = "ctrl+v", .keybinding = "app.clipboard.pasteImage", .restrict_override = false },
+    };
+
+    try registry.registerShortcut("ctrl+c", "Reserved conflict", "reserved", "/tmp/reserved.ts");
+    try registry.registerShortcut("ctrl+v", "Allowed built-in override", "paste", "/tmp/non-reserved.ts");
+    try registry.registerShortcut("ctrl+shift+x", "First extension", "first", "/tmp/ext1.ts");
+    try registry.registerShortcut("Ctrl+Shift+X", "Second extension", "second", "/tmp/ext2.ts");
+    try registry.registerShortcut("ctrl+k", "Original same extension", "old", "/tmp/same.ts");
+    try registry.registerShortcut("CTRL+K", "Replacement same extension", "new", "/tmp/same.ts");
+    try registry.registerShortcut("ctrl+y", "No conflict", "free", "/tmp/free.ts");
+
+    const resolution = try registry.resolveShortcuts(allocator, &builtins);
+    defer {
+        var mutable = resolution;
+        mutable.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), resolution.shortcuts.len);
+    try std.testing.expectEqualStrings("ctrl+v", resolution.shortcuts[0].shortcut);
+    try std.testing.expectEqualStrings("/tmp/non-reserved.ts", resolution.shortcuts[0].extension_path);
+    try std.testing.expectEqualStrings("Ctrl+Shift+X", resolution.shortcuts[1].shortcut);
+    try std.testing.expectEqualStrings("second", resolution.shortcuts[1].command.?);
+    try std.testing.expectEqualStrings("CTRL+K", resolution.shortcuts[2].shortcut);
+    try std.testing.expectEqualStrings("new", resolution.shortcuts[2].command.?);
+    try std.testing.expectEqualStrings("ctrl+y", resolution.shortcuts[3].shortcut);
+
+    try std.testing.expectEqual(@as(usize, 3), resolution.diagnostics.len);
+    try std.testing.expectEqualStrings("warning", resolution.diagnostics[0].type_name);
+    try std.testing.expectEqualStrings("/tmp/reserved.ts", resolution.diagnostics[0].path);
+    try std.testing.expectEqualStrings(
+        "Extension shortcut 'ctrl+c' from /tmp/reserved.ts conflicts with built-in shortcut. Skipping.",
+        resolution.diagnostics[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "Extension shortcut conflict: 'ctrl+v' is built-in shortcut for app.clipboard.pasteImage and /tmp/non-reserved.ts. Using /tmp/non-reserved.ts.",
+        resolution.diagnostics[1].message,
+    );
+    try std.testing.expectEqualStrings(
+        "Extension shortcut conflict: 'Ctrl+Shift+X' registered by both /tmp/ext1.ts and /tmp/ext2.ts. Using /tmp/ext2.ts.",
+        resolution.diagnostics[2].message,
+    );
 }
 
 test "applyHostFrame supports register and unregister surfaces with malformed frame fallback" {

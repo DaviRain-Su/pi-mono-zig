@@ -594,10 +594,7 @@ pub const HostProcess = struct {
     pub fn hasRegisteredCommand(self: *HostProcess, name: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (self.state.registry.commands.items) |command| {
-            if (std.mem.eql(u8, command.name, name)) return true;
-        }
-        return false;
+        return self.state.registry.hasCommandInvocation(name);
     }
 
     /// Render a deterministic JSON snapshot of the runtime registry
