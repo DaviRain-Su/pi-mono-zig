@@ -4,8 +4,11 @@ const extension_registry = @import("extension_registry.zig");
 
 pub const DiagnosticCategory = extension_host.DiagnosticCategory;
 pub const ExtensionUiRequest = extension_host.ExtensionUiRequest;
+pub const HOST_MARKER_ENV = extension_host.HOST_MARKER_ENV;
 pub const InitializeFrame = extension_host.InitializeFrame;
 pub const ProcessJsonlOptions = extension_host.HostProcessOptions;
+pub const Registry = extension_registry.Registry;
+pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const Registry) anyerror!void;
 
 pub const RuntimeKind = enum {
     process_jsonl,
@@ -48,6 +51,7 @@ pub const RuntimeAdapter = struct {
         registry_frames_applied: *const fn (*anyopaque) usize,
         has_registered_command: *const fn (*anyopaque, []const u8) bool,
         snapshot_registry_json: *const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
+        with_registry: *const fn (*anyopaque, ?*anyopaque, RegistryCallback) anyerror!void,
         apply_cli_flag_values: *const fn (*anyopaque, []const extension_registry.ParsedCliFlag) anyerror!void,
         take_ui_requests: *const fn (*anyopaque, std.mem.Allocator) anyerror![]ExtensionUiRequest,
         send_extension_ui_response: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
@@ -86,6 +90,10 @@ pub const RuntimeAdapter = struct {
 
     pub fn snapshotRegistryJson(self: RuntimeAdapter, allocator: std.mem.Allocator) ![]u8 {
         return try self.vtable.snapshot_registry_json(self.ptr, allocator);
+    }
+
+    pub fn withRegistry(self: RuntimeAdapter, context: ?*anyopaque, callback: RegistryCallback) !void {
+        try self.vtable.with_registry(self.ptr, context, callback);
     }
 
     pub fn applyCliFlagValues(self: RuntimeAdapter, entries: []const extension_registry.ParsedCliFlag) !void {
@@ -165,6 +173,10 @@ fn processSnapshotRegistryJson(ptr: *anyopaque, allocator: std.mem.Allocator) ![
     return try processHost(ptr).snapshotRegistryJson(allocator);
 }
 
+fn processWithRegistry(ptr: *anyopaque, context: ?*anyopaque, callback: RegistryCallback) !void {
+    try processHost(ptr).withRegistry(context, callback);
+}
+
 fn processApplyCliFlagValues(ptr: *anyopaque, entries: []const extension_registry.ParsedCliFlag) !void {
     try processHost(ptr).applyCliFlagValues(entries);
 }
@@ -198,6 +210,7 @@ const process_jsonl_vtable: RuntimeAdapter.VTable = .{
     .registry_frames_applied = processRegistryFramesApplied,
     .has_registered_command = processHasRegisteredCommand,
     .snapshot_registry_json = processSnapshotRegistryJson,
+    .with_registry = processWithRegistry,
     .apply_cli_flag_values = processApplyCliFlagValues,
     .take_ui_requests = processTakeUiRequests,
     .send_extension_ui_response = processSendExtensionUiResponse,
@@ -215,6 +228,66 @@ fn absoluteTmpPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []c
 fn freeUiRequests(allocator: std.mem.Allocator, requests: []ExtensionUiRequest) void {
     for (requests) |*request| request.deinit(allocator);
     allocator.free(requests);
+}
+
+const RegistryExpectContext = struct {
+    command_seen: bool = false,
+    flag_seen: bool = false,
+};
+
+fn expectRegistryEntriesCallback(context: ?*anyopaque, registry: *const Registry) !void {
+    const result: *RegistryExpectContext = @ptrCast(@alignCast(context.?));
+    for (registry.commands.items) |command| {
+        if (std.mem.eql(u8, command.name, "adapter-command")) result.command_seen = true;
+    }
+    for (registry.flags.items) |flag| {
+        if (std.mem.eql(u8, flag.name, "adapter-flag")) result.flag_seen = true;
+    }
+}
+
+fn expectAdapterRegistryUiEventShutdownConformance(allocator: std.mem.Allocator, adapter: RuntimeAdapter) !void {
+    try adapter.waitForReady(500);
+    var elapsed: u64 = 0;
+    while ((adapter.pendingCount() < 1 or adapter.registryFramesApplied() < 2) and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 2), adapter.registryFramesApplied());
+    try std.testing.expect(adapter.hasRegisteredCommand("adapter-command"));
+
+    var registry_context = RegistryExpectContext{};
+    try adapter.withRegistry(&registry_context, expectRegistryEntriesCallback);
+    try std.testing.expect(registry_context.command_seen);
+    try std.testing.expect(registry_context.flag_seen);
+
+    const requests = try adapter.takeUiRequests(allocator);
+    defer freeUiRequests(allocator, requests);
+    try std.testing.expectEqual(@as(usize, 2), requests.len);
+    try std.testing.expectEqualStrings("notify", requests[0].id);
+    try std.testing.expect(!requests[0].response_required);
+    try std.testing.expectEqualStrings("pending", requests[1].id);
+    try std.testing.expect(requests[1].response_required);
+
+    const empty_requests = try adapter.takeUiRequests(allocator);
+    defer freeUiRequests(allocator, empty_requests);
+    try std.testing.expectEqual(@as(usize, 0), empty_requests.len);
+
+    try adapter.applyCliFlagValues(&.{
+        .{ .name = "adapter-flag", .value = .{ .string = "from-cli" } },
+    });
+    const snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"adapter-command\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"value\":\"from-cli\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"default\":\"default\"") != null);
+
+    try adapter.sendExtensionUiResponse("unknown", "{\"ignored\":true}");
+    try adapter.sendExtensionUiResponse("pending", "{\"accepted\":true}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    adapter.sendExtensionEventFrame("{\"type\":\"agent_start\"}");
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    adapter.sendExtensionEventFrame("{\"type\":\"agent_end\",\"messages\":[]}");
 }
 
 test "extension runtime factory rejects reserved runtime kinds deterministically" {
@@ -274,43 +347,7 @@ test "process_jsonl runtime adapter preserves registry UI response event and shu
     defer adapter.deinit();
     try std.testing.expectEqual(RuntimeKind.process_jsonl, adapter.kind);
 
-    try adapter.waitForReady(500);
-    var elapsed: u64 = 0;
-    while ((adapter.pendingCount() < 1 or adapter.registryFramesApplied() < 2) and elapsed <= 1000) : (elapsed += 10) {
-        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-    }
-    try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
-    try std.testing.expectEqual(@as(usize, 2), adapter.registryFramesApplied());
-    try std.testing.expect(adapter.hasRegisteredCommand("adapter-command"));
-
-    const requests = try adapter.takeUiRequests(allocator);
-    defer freeUiRequests(allocator, requests);
-    try std.testing.expectEqual(@as(usize, 2), requests.len);
-    try std.testing.expectEqualStrings("notify", requests[0].id);
-    try std.testing.expect(!requests[0].response_required);
-    try std.testing.expectEqualStrings("pending", requests[1].id);
-    try std.testing.expect(requests[1].response_required);
-
-    const empty_requests = try adapter.takeUiRequests(allocator);
-    defer freeUiRequests(allocator, empty_requests);
-    try std.testing.expectEqual(@as(usize, 0), empty_requests.len);
-
-    try adapter.applyCliFlagValues(&.{
-        .{ .name = "adapter-flag", .value = .{ .string = "from-cli" } },
-    });
-    const snapshot = try adapter.snapshotRegistryJson(allocator);
-    defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"adapter-command\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"value\":\"from-cli\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"default\":\"default\"") != null);
-
-    try adapter.sendExtensionUiResponse("unknown", "{\"ignored\":true}");
-    try adapter.sendExtensionUiResponse("pending", "{\"accepted\":true}");
-    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
-    adapter.sendExtensionEventFrame("{\"type\":\"agent_start\"}");
-    try adapter.shutdown();
-    try std.testing.expect(adapter.hasShutdownComplete());
-    adapter.sendExtensionEventFrame("{\"type\":\"agent_end\",\"messages\":[]}");
+    try expectAdapterRegistryUiEventShutdownConformance(allocator, adapter);
 
     const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
     defer allocator.free(capture);

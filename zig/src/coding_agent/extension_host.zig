@@ -205,6 +205,16 @@ pub const HostProcess = struct {
         return try allocator.dupe(u8, out.written());
     }
 
+    pub fn withRegistry(
+        self: *HostProcess,
+        context: ?*anyopaque,
+        callback: *const fn (context: ?*anyopaque, registry: *const extension_registry.Registry) anyerror!void,
+    ) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try callback(context, &self.state.registry);
+    }
+
     /// Apply parsed CLI flag values into the live host registry so
     /// extension code can observe `--<flag>` values via `getFlag()`.
     /// Mirrors the TS runtime step that writes parsed CLI flag values
