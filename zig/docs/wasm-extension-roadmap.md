@@ -32,6 +32,8 @@ References:
   https://extism.org/docs/concepts/host-sdk/
 - Wassette as an AI-tools reference:
   https://github.com/microsoft/wassette
+- Architecture RFC for `WASM-001`:
+  [wasm-extension-architecture-rfc.md](wasm-extension-architecture-rfc.md)
 
 ## Non-Goals
 
@@ -147,13 +149,20 @@ Each capability needs:
 
 ### WASM-001: Write Extension Architecture RFC
 
-Status: planned
+Status: complete
 
 Scope:
 
 - Document Bun compatibility plus Wasm native extension host.
 - Define lifecycle states: discover, validate, load, initialize, call, unload.
 - Define where manifests live and how package installation resolves artifacts.
+
+Evidence:
+
+- [`wasm-extension-architecture-rfc.md`](wasm-extension-architecture-rfc.md)
+  records the architecture decisions for lifecycle stages, Bun compatibility,
+  v1 artifact direction, package manifest location, artifact resolution,
+  tools-only v0, and default-deny capabilities.
 
 Acceptance criteria:
 
