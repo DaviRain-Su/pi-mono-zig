@@ -1,6 +1,7 @@
 const std = @import("std");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
+const wasm_manifest = @import("wasm_manifest.zig");
 
 pub const DiagnosticCategory = extension_host.DiagnosticCategory;
 pub const ExtensionUiRequest = extension_host.ExtensionUiRequest;
@@ -30,9 +31,58 @@ pub const UnsupportedRuntimeOptions = struct {
     label: ?[]const u8 = null,
 };
 
+pub const WasmManifestHandoff = struct {
+    schema_version: []const u8,
+    id: []const u8,
+    name: []const u8,
+    version: []const u8,
+    description: []const u8,
+    artifact_kind: wasm_manifest.ArtifactKind,
+    artifact_path: []const u8,
+    artifact_absolute_path: []const u8,
+    tool_id: []const u8,
+    tool_description: []const u8,
+    requested_capabilities: []const wasm_manifest.Capability = &.{},
+
+    pub fn fromManifest(manifest: *const wasm_manifest.Manifest) WasmManifestHandoff {
+        return .{
+            .schema_version = manifest.schema_version,
+            .id = manifest.id,
+            .name = manifest.name,
+            .version = manifest.version,
+            .description = manifest.description,
+            .artifact_kind = manifest.artifact_kind,
+            .artifact_path = manifest.artifact_path,
+            .artifact_absolute_path = manifest.artifact_absolute_path,
+            .tool_id = manifest.tool_id,
+            .tool_description = manifest.tool_description,
+            .requested_capabilities = manifest.requested_capabilities,
+        };
+    }
+
+    pub fn validate(self: WasmManifestHandoff) !void {
+        if (!std.mem.eql(u8, self.schema_version, wasm_manifest.SCHEMA_VERSION)) return error.InvalidRuntimeOptions;
+        if (self.id.len == 0) return error.InvalidRuntimeOptions;
+        if (self.name.len == 0) return error.InvalidRuntimeOptions;
+        if (self.version.len == 0) return error.InvalidRuntimeOptions;
+        if (self.description.len == 0) return error.InvalidRuntimeOptions;
+        if (self.artifact_kind != .wasm_component) return error.InvalidRuntimeOptions;
+        if (self.artifact_path.len == 0) return error.InvalidRuntimeOptions;
+        if (self.artifact_absolute_path.len == 0) return error.InvalidRuntimeOptions;
+        if (!std.fs.path.isAbsolute(self.artifact_absolute_path)) return error.InvalidRuntimeOptions;
+        if (self.tool_id.len == 0) return error.InvalidRuntimeOptions;
+        if (self.tool_description.len == 0) return error.InvalidRuntimeOptions;
+        if (self.requested_capabilities.len != 0) return error.UnsupportedRuntimeCapability;
+    }
+};
+
+pub const WasmOptions = struct {
+    manifest: WasmManifestHandoff,
+};
+
 pub const RuntimeOptions = union(RuntimeKind) {
     process_jsonl: ProcessJsonlOptions,
-    wasm: UnsupportedRuntimeOptions,
+    wasm: WasmOptions,
     native: UnsupportedRuntimeOptions,
     remote: UnsupportedRuntimeOptions,
 };
@@ -124,7 +174,8 @@ pub const RuntimeAdapter = struct {
 pub fn startRuntime(allocator: std.mem.Allocator, io: std.Io, options: RuntimeOptions) !RuntimeAdapter {
     return switch (options) {
         .process_jsonl => |process_options| try startProcessJsonl(allocator, io, process_options),
-        .wasm, .native, .remote => error.UnsupportedRuntime,
+        .wasm => |wasm_options| try startWasm(allocator, io, wasm_options),
+        .native, .remote => error.UnsupportedRuntime,
     };
 }
 
@@ -217,6 +268,247 @@ const process_jsonl_vtable: RuntimeAdapter.VTable = .{
     .send_extension_event_frame = processSendExtensionEventFrame,
     .shutdown = processShutdown,
     .deinit = processDeinit,
+};
+
+const OwnedWasmManifest = struct {
+    schema_version: []u8,
+    id: []u8,
+    name: []u8,
+    version: []u8,
+    description: []u8,
+    artifact_kind: wasm_manifest.ArtifactKind,
+    artifact_path: []u8,
+    artifact_absolute_path: []u8,
+    tool_id: []u8,
+    tool_description: []u8,
+    requested_capabilities: []wasm_manifest.Capability,
+
+    fn clone(allocator: std.mem.Allocator, handoff: WasmManifestHandoff) !OwnedWasmManifest {
+        const schema_version = try allocator.dupe(u8, handoff.schema_version);
+        errdefer allocator.free(schema_version);
+        const id = try allocator.dupe(u8, handoff.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, handoff.name);
+        errdefer allocator.free(name);
+        const version = try allocator.dupe(u8, handoff.version);
+        errdefer allocator.free(version);
+        const description = try allocator.dupe(u8, handoff.description);
+        errdefer allocator.free(description);
+        const artifact_path = try allocator.dupe(u8, handoff.artifact_path);
+        errdefer allocator.free(artifact_path);
+        const artifact_absolute_path = try allocator.dupe(u8, handoff.artifact_absolute_path);
+        errdefer allocator.free(artifact_absolute_path);
+        const tool_id = try allocator.dupe(u8, handoff.tool_id);
+        errdefer allocator.free(tool_id);
+        const tool_description = try allocator.dupe(u8, handoff.tool_description);
+        errdefer allocator.free(tool_description);
+        const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, handoff.requested_capabilities);
+        errdefer allocator.free(requested_capabilities);
+        return .{
+            .schema_version = schema_version,
+            .id = id,
+            .name = name,
+            .version = version,
+            .description = description,
+            .artifact_kind = handoff.artifact_kind,
+            .artifact_path = artifact_path,
+            .artifact_absolute_path = artifact_absolute_path,
+            .tool_id = tool_id,
+            .tool_description = tool_description,
+            .requested_capabilities = requested_capabilities,
+        };
+    }
+
+    fn deinit(self: *OwnedWasmManifest, allocator: std.mem.Allocator) void {
+        allocator.free(self.schema_version);
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.version);
+        allocator.free(self.description);
+        allocator.free(self.artifact_path);
+        allocator.free(self.artifact_absolute_path);
+        allocator.free(self.tool_id);
+        allocator.free(self.tool_description);
+        allocator.free(self.requested_capabilities);
+        self.* = undefined;
+    }
+};
+
+const WasmRuntime = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    state: extension_host.ProtocolState,
+    mutex: std.Io.Mutex = .init,
+    manifest: OwnedWasmManifest,
+
+    fn start(allocator: std.mem.Allocator, io: std.Io, options: WasmOptions) !*WasmRuntime {
+        try options.manifest.validate();
+        var owned_manifest = try OwnedWasmManifest.clone(allocator, options.manifest);
+        errdefer owned_manifest.deinit(allocator);
+        const runtime = try allocator.create(WasmRuntime);
+        errdefer allocator.destroy(runtime);
+        runtime.* = .{
+            .allocator = allocator,
+            .io = io,
+            .state = extension_host.ProtocolState.init(allocator),
+            .manifest = owned_manifest,
+        };
+        runtime.state.ready_seen = true;
+        return runtime;
+    }
+
+    fn deinit(self: *WasmRuntime) void {
+        self.state.deinit();
+        self.manifest.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
+pub fn startWasm(allocator: std.mem.Allocator, io: std.Io, options: WasmOptions) !RuntimeAdapter {
+    const runtime = try WasmRuntime.start(allocator, io, options);
+    return .{
+        .ptr = @ptrCast(runtime),
+        .vtable = &wasm_vtable,
+        .kind = .wasm,
+    };
+}
+
+fn wasmRuntime(ptr: *anyopaque) *WasmRuntime {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn wasmWaitForReady(ptr: *anyopaque, timeout_ms: u64) !void {
+    _ = timeout_ms;
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    if (runtime.state.ready_seen) return;
+    return error.HostNotReady;
+}
+
+fn wasmPendingCount(ptr: *anyopaque) usize {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.pendingCount();
+}
+
+fn wasmDiagnosticCount(ptr: *anyopaque) usize {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.diagnostics.items.len;
+}
+
+fn wasmDiagnosticCategoryCount(ptr: *anyopaque, category: DiagnosticCategory) usize {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.diagnosticCategoryCount(category);
+}
+
+fn wasmHasShutdownComplete(ptr: *anyopaque) bool {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.shutdown_complete_seen;
+}
+
+fn wasmRegistryFramesApplied(ptr: *anyopaque) usize {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.registry_frames_applied;
+}
+
+fn wasmHasRegisteredCommand(ptr: *anyopaque, name: []const u8) bool {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.registry.hasCommandInvocation(name);
+}
+
+fn wasmSnapshotRegistryJson(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try extension_registry.writeRegistrySnapshotJson(allocator, &runtime.state.registry, &out.writer);
+    return try allocator.dupe(u8, out.written());
+}
+
+fn wasmWithRegistry(ptr: *anyopaque, context: ?*anyopaque, callback: RegistryCallback) !void {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    try callback(context, &runtime.state.registry);
+}
+
+fn wasmApplyCliFlagValues(ptr: *anyopaque, entries: []const extension_registry.ParsedCliFlag) !void {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    for (entries) |entry| {
+        _ = try runtime.state.registry.setFlagValue(entry.name, entry.value);
+    }
+}
+
+fn wasmTakeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    const requests = try allocator.alloc(ExtensionUiRequest, runtime.state.ui_requests.items.len);
+    errdefer allocator.free(requests);
+    for (runtime.state.ui_requests.items, 0..) |request, index| {
+        requests[index] = try ExtensionUiRequest.clone(allocator, request);
+    }
+    for (runtime.state.ui_requests.items) |*request| request.deinit(runtime.allocator);
+    runtime.state.ui_requests.clearRetainingCapacity();
+    return requests;
+}
+
+fn wasmSendExtensionUiResponse(ptr: *anyopaque, id: []const u8, payload_json: []const u8) !void {
+    _ = payload_json;
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    _ = runtime.state.resolvePendingRequest(id);
+}
+
+fn wasmSendExtensionEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
+    _ = ptr;
+    _ = frame_json;
+}
+
+fn wasmShutdown(ptr: *anyopaque) !void {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    runtime.state.clearPendingRequests();
+    runtime.state.shutdown_complete_seen = true;
+}
+
+fn wasmDeinit(ptr: *anyopaque) void {
+    wasmRuntime(ptr).deinit();
+}
+
+const wasm_vtable: RuntimeAdapter.VTable = .{
+    .wait_for_ready = wasmWaitForReady,
+    .pending_count = wasmPendingCount,
+    .diagnostic_count = wasmDiagnosticCount,
+    .diagnostic_category_count = wasmDiagnosticCategoryCount,
+    .has_shutdown_complete = wasmHasShutdownComplete,
+    .registry_frames_applied = wasmRegistryFramesApplied,
+    .has_registered_command = wasmHasRegisteredCommand,
+    .snapshot_registry_json = wasmSnapshotRegistryJson,
+    .with_registry = wasmWithRegistry,
+    .apply_cli_flag_values = wasmApplyCliFlagValues,
+    .take_ui_requests = wasmTakeUiRequests,
+    .send_extension_ui_response = wasmSendExtensionUiResponse,
+    .send_extension_event_frame = wasmSendExtensionEventFrame,
+    .shutdown = wasmShutdown,
+    .deinit = wasmDeinit,
 };
 
 fn absoluteTmpPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []const u8) ![]u8 {
@@ -353,7 +645,6 @@ fn expectAdapterRegistryUiEventShutdownConformance(allocator: std.mem.Allocator,
 test "extension runtime factory rejects reserved runtime kinds deterministically" {
     const allocator = std.testing.allocator;
     const unsupported = [_]RuntimeOptions{
-        .{ .wasm = .{} },
         .{ .native = .{} },
         .{ .remote = .{} },
     };
@@ -365,6 +656,55 @@ test "extension runtime factory rejects reserved runtime kinds deterministically
     try std.testing.expectEqualStrings("wasm", RuntimeKind.wasm.jsonName());
     try std.testing.expectEqualStrings("native", RuntimeKind.native.jsonName());
     try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
+}
+
+test "extension runtime factory constructs wasm adapter and keeps native remote unsupported" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer adapter.deinit();
+
+    try std.testing.expectEqual(RuntimeKind.wasm, adapter.kind);
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.registryFramesApplied());
+    try std.testing.expect(!adapter.hasRegisteredCommand("truncateHead"));
+
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+
+    try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .native = .{} }));
+    try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .remote = .{} }));
+}
+
+test "wasm manifest handoff starts runtime without capability execution" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    try std.testing.expectEqual(@as(usize, 0), manifest_result.valid.requested_capabilities.len);
+
+    const options = WasmOptions{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    };
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = options });
+    defer adapter.deinit();
+
+    try std.testing.expectEqual(RuntimeKind.wasm, adapter.kind);
+    const requests = try adapter.takeUiRequests(allocator);
+    defer freeUiRequests(allocator, requests);
+    try std.testing.expectEqual(@as(usize, 0), requests.len);
+
+    const snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"tools\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "truncateHead") == null);
 }
 
 test "process_jsonl runtime adapter preserves registry UI response event and shutdown semantics" {
