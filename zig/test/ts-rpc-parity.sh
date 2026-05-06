@@ -142,6 +142,54 @@ def normalize_usage_jsonl(text):
 		lines.append(json.dumps(normalize_usage(value), separators=(",", ":"), ensure_ascii=False))
 	return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
+def wait_for_stdout_evidence(proc, stdout_lines, label, evidence, timeout_seconds):
+	assert proc.stdout is not None
+	lines = queue.Queue()
+
+	def read_stdout():
+		for line in proc.stdout:
+			lines.put(line)
+
+	reader = threading.Thread(target=read_stdout, daemon=True)
+	reader.start()
+	deadline = time.monotonic() + timeout_seconds
+	while True:
+		if any(evidence in line for line in stdout_lines):
+			return reader, lines
+		remaining = deadline - time.monotonic()
+		if remaining <= 0:
+			proc.kill()
+			stderr = proc.stderr.read() if proc.stderr is not None else ""
+			partial_stdout = "".join(stdout_lines)
+			actual_path = Path(f"/tmp/pi-ts-rpc-{label}-partial.jsonl")
+			actual_path.write_text(partial_stdout)
+			print(f"{label} timed out waiting for Zig ts-rpc retry completion evidence before closing stdin", file=sys.stderr)
+			print(f"expected evidence: {evidence}", file=sys.stderr)
+			print(f"partial stdout written to {actual_path}", file=sys.stderr)
+			if partial_stdout:
+				print("partial stdout:", file=sys.stderr)
+				print(partial_stdout, file=sys.stderr)
+			else:
+				print("partial stdout was empty", file=sys.stderr)
+			if stderr:
+				print("partial stderr:", file=sys.stderr)
+				print(stderr, file=sys.stderr)
+			sys.exit(1)
+		try:
+			line = lines.get(timeout=remaining)
+		except queue.Empty:
+			continue
+		stdout_lines.append(line)
+	return reader, lines
+
+def drain_stdout_reader(reader, stdout_lines, lines):
+	reader.join(timeout=1)
+	while True:
+		try:
+			stdout_lines.append(lines.get_nowait())
+		except queue.Empty:
+			break
+
 def emit_ts_fixture(name):
 	proc = subprocess.run(
 		["npx", "tsx", "test/generate-ts-rpc-fixtures.ts", f"--emit-fixture={name}"],
@@ -174,11 +222,30 @@ for name, env_extra, settle_seconds, label in SCENARIOS:
 	assert proc.stdin is not None
 	proc.stdin.write(input_bytes)
 	proc.stdin.flush()
-	time.sleep(settle_seconds)
+	stdout_lines = []
+	reader = None
+	reader_lines = None
+	if name == "m5-retry":
+		retry_terminal_evidence = ts_stdout.splitlines()[-1]
+		reader, reader_lines = wait_for_stdout_evidence(
+			proc,
+			stdout_lines,
+			name,
+			retry_terminal_evidence,
+			max(settle_seconds, 30.0),
+		)
+	else:
+		time.sleep(settle_seconds)
 	proc.stdin.close()
-	stdout = proc.stdout.read() if proc.stdout is not None else ""
-	stderr = proc.stderr.read() if proc.stderr is not None else ""
-	status = proc.wait(timeout=10)
+	if reader is not None and reader_lines is not None:
+		status = proc.wait(timeout=10)
+		drain_stdout_reader(reader, stdout_lines, reader_lines)
+		stdout = "".join(stdout_lines)
+		stderr = proc.stderr.read() if proc.stderr is not None else ""
+	else:
+		stdout = proc.stdout.read() if proc.stdout is not None else ""
+		stderr = proc.stderr.read() if proc.stderr is not None else ""
+		status = proc.wait(timeout=10)
 	if status != 0:
 		print(stderr, file=sys.stderr)
 		print(f"{name} Zig ts-rpc exited {status}", file=sys.stderr)
