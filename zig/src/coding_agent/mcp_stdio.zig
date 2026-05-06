@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("ai");
 const agent = @import("agent");
 const common = @import("tools/common.zig");
 
@@ -12,7 +13,10 @@ pub const ProtocolError = error{
     UnsupportedMcpServer,
     InvalidJsonRpcResponse,
     McpJsonRpcError,
+    McpToolError,
     McpTransportEof,
+    McpTransportTimeout,
+    McpChildExited,
 };
 
 pub const TransportKind = enum {
@@ -309,9 +313,26 @@ pub const JsonRpcTransport = struct {
     recv: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator) anyerror![]u8,
 };
 
+const ToolCallState = struct {
+    transport: JsonRpcTransport,
+    next_id: i64 = 3,
+};
+
+const McpToolContext = struct {
+    state: *ToolCallState,
+    tool_name: []u8,
+
+    fn deinit(self: *McpToolContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_name);
+        self.* = undefined;
+    }
+};
+
 pub const AgentToolSet = struct {
     allocator: std.mem.Allocator,
     items: []agent.AgentTool,
+    call_state: ?*ToolCallState = null,
+    tool_contexts: []?*McpToolContext,
 
     pub fn deinit(self: *AgentToolSet) void {
         for (self.items) |tool| {
@@ -320,10 +341,194 @@ pub const AgentToolSet = struct {
             self.allocator.free(tool.label);
             common.deinitJsonValue(self.allocator, tool.parameters);
         }
+        for (self.tool_contexts) |context| {
+            if (context) |tool_context| {
+                tool_context.deinit(self.allocator);
+                self.allocator.destroy(tool_context);
+            }
+        }
+        self.allocator.free(self.tool_contexts);
+        if (self.call_state) |state| self.allocator.destroy(state);
         self.allocator.free(self.items);
         self.* = undefined;
     }
 };
+
+pub const StdioClientOptions = struct {
+    response_timeout_ms: u64 = 1000,
+    shutdown_timeout_ms: u64 = 1000,
+};
+
+pub const StdioClient = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: std.process.Child,
+    stdin_file: ?std.Io.File,
+    stdout_file: ?std.Io.File,
+    wait_thread: ?std.Thread = null,
+    wait_done: std.atomic.Value(bool) = .init(false),
+    term: ?std.process.Child.Term = null,
+    wait_err: ?anyerror = null,
+    response_timeout_ms: u64,
+    shutdown_timeout_ms: u64,
+
+    pub fn start(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        server: *const ServerDefinition,
+        options: StdioClientOptions,
+    ) !*StdioClient {
+        if (!server.isOperational()) return ProtocolError.UnsupportedMcpServer;
+        const command = server.command.?;
+        var argv = try allocator.alloc([]const u8, server.args.len + 1);
+        defer allocator.free(argv);
+        argv[0] = command;
+        for (server.args, 0..) |arg, index| argv[index + 1] = arg;
+        return startArgv(allocator, io, argv, options);
+    }
+
+    fn startArgv(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        argv: []const []const u8,
+        options: StdioClientOptions,
+    ) !*StdioClient {
+        const client = try allocator.create(StdioClient);
+        errdefer allocator.destroy(client);
+
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+            .pgid = 0,
+        });
+        errdefer if (child.id != null) child.kill(io);
+
+        const stdin_file = child.stdin.?;
+        child.stdin = null;
+        const stdout_file = child.stdout.?;
+        child.stdout = null;
+
+        client.* = .{
+            .allocator = allocator,
+            .io = io,
+            .child = child,
+            .stdin_file = stdin_file,
+            .stdout_file = stdout_file,
+            .response_timeout_ms = options.response_timeout_ms,
+            .shutdown_timeout_ms = options.shutdown_timeout_ms,
+        };
+        client.wait_thread = try std.Thread.spawn(.{}, stdioWaitMain, .{client});
+        return client;
+    }
+
+    pub fn deinit(self: *StdioClient) void {
+        self.shutdown() catch {};
+        self.allocator.destroy(self);
+    }
+
+    pub fn shutdown(self: *StdioClient) !void {
+        if (self.stdin_file) |file| {
+            file.close(self.io);
+            self.stdin_file = null;
+        }
+
+        var elapsed: u64 = 0;
+        while (!self.wait_done.load(.seq_cst) and elapsed <= self.shutdown_timeout_ms) : (elapsed += 10) {
+            std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+        }
+        if (!self.wait_done.load(.seq_cst)) self.killProcessGroup();
+        if (self.wait_thread) |thread| {
+            thread.join();
+            self.wait_thread = null;
+        }
+        if (self.stdout_file) |file| {
+            file.close(self.io);
+            self.stdout_file = null;
+        }
+    }
+
+    pub fn hasExited(self: *const StdioClient) bool {
+        return self.wait_done.load(.seq_cst);
+    }
+
+    pub fn transport(self: *StdioClient) JsonRpcTransport {
+        return .{
+            .context = self,
+            .send = stdioSend,
+            .recv = stdioRecv,
+        };
+    }
+
+    fn killProcessGroup(self: *StdioClient) void {
+        if (self.child.id) |pid| {
+            std.posix.kill(-pid, .TERM) catch {};
+            std.posix.kill(-pid, .KILL) catch {};
+        }
+    }
+
+    fn sendMessage(self: *StdioClient, message: []const u8) !void {
+        const file = self.stdin_file orelse return ProtocolError.McpChildExited;
+        try file.writeStreamingAll(self.io, message);
+        try file.writeStreamingAll(self.io, "\n");
+    }
+
+    fn recvMessage(self: *StdioClient, allocator: std.mem.Allocator) ![]u8 {
+        const file = self.stdout_file orelse return ProtocolError.McpTransportEof;
+        const fd = file.handle;
+        const previous_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+        if (previous_flags == -1) return ProtocolError.McpTransportEof;
+        const nonblock_mask: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+        _ = std.c.fcntl(fd, std.c.F.SETFL, previous_flags | @as(c_int, @intCast(nonblock_mask)));
+        defer _ = std.c.fcntl(fd, std.c.F.SETFL, previous_flags);
+
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(allocator);
+        var elapsed: u64 = 0;
+        while (elapsed <= self.response_timeout_ms) : (elapsed += 10) {
+            var buffer: [1024]u8 = undefined;
+            const bytes_read = std.posix.read(fd, &buffer) catch |err| switch (err) {
+                error.WouldBlock => {
+                    if (self.wait_done.load(.seq_cst)) return if (line.items.len == 0) ProtocolError.McpChildExited else ProtocolError.McpTransportEof;
+                    std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+                    continue;
+                },
+                else => return err,
+            };
+            if (bytes_read == 0) {
+                return if (line.items.len == 0) ProtocolError.McpTransportEof else ProtocolError.InvalidJsonRpcResponse;
+            }
+            if (std.mem.indexOfScalar(u8, buffer[0..bytes_read], '\n')) |newline_index| {
+                try line.appendSlice(allocator, buffer[0..newline_index]);
+                const raw = line.items;
+                const trimmed = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+                return try allocator.dupe(u8, trimmed);
+            }
+            try line.appendSlice(allocator, buffer[0..bytes_read]);
+        }
+        return ProtocolError.McpTransportTimeout;
+    }
+};
+
+fn stdioWaitMain(client: *StdioClient) void {
+    client.term = client.child.wait(client.io) catch |err| {
+        client.wait_err = err;
+        client.wait_done.store(true, .seq_cst);
+        return;
+    };
+    client.wait_done.store(true, .seq_cst);
+}
+
+fn stdioSend(context: ?*anyopaque, message: []const u8) !void {
+    const client: *StdioClient = @ptrCast(@alignCast(context.?));
+    try client.sendMessage(message);
+}
+
+fn stdioRecv(context: ?*anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    const client: *StdioClient = @ptrCast(@alignCast(context.?));
+    return try client.recvMessage(allocator);
+}
 
 pub fn discoverAgentTools(
     allocator: std.mem.Allocator,
@@ -342,7 +547,7 @@ pub fn discoverAgentTools(
     try transport.send(transport.context, tools_list_request);
     const tools_response = try transport.recv(transport.context, allocator);
     defer allocator.free(tools_response);
-    return parseToolsListResponse(allocator, tools_response);
+    return parseToolsListResponse(allocator, tools_response, transport);
 }
 
 pub const initialize_request =
@@ -353,6 +558,95 @@ pub const initialized_notification =
 
 pub const tools_list_request =
     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}";
+
+fn buildToolsCallRequest(allocator: std.mem.Allocator, request_id: i64, tool_name: []const u8, args: std.json.Value) ![]u8 {
+    const encoded_name = try std.json.Stringify.valueAlloc(allocator, tool_name, .{});
+    defer allocator.free(encoded_name);
+    const encoded_args = try std.json.Stringify.valueAlloc(allocator, args, .{});
+    defer allocator.free(encoded_args);
+    return try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"tools/call\",\"params\":{{\"name\":{s},\"arguments\":{s}}}}}",
+        .{ request_id, encoded_name, encoded_args },
+    );
+}
+
+fn executeMcpTool(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    if (signal) |abort_signal| {
+        if (abort_signal.load(.seq_cst)) return error.RequestAborted;
+    }
+
+    const context: *McpToolContext = @ptrCast(@alignCast(tool_context.?));
+    const request_id = context.state.next_id;
+    context.state.next_id += 1;
+    const request = try buildToolsCallRequest(allocator, request_id, context.tool_name, params);
+    defer allocator.free(request);
+    try context.state.transport.send(context.state.transport.context, request);
+    const response = try context.state.transport.recv(context.state.transport.context, allocator);
+    defer allocator.free(response);
+    return try parseToolCallResponse(allocator, response, request_id);
+}
+
+fn parseToolCallResponse(allocator: std.mem.Allocator, message: []const u8, expected_id: i64) !agent.AgentToolResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch return ProtocolError.InvalidJsonRpcResponse;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return ProtocolError.InvalidJsonRpcResponse,
+    };
+    try validateJsonRpcResponseObject(object, expected_id);
+
+    const result = object.get("result") orelse return ProtocolError.InvalidJsonRpcResponse;
+    if (result != .object) return ProtocolError.InvalidJsonRpcResponse;
+    if (result.object.get("isError")) |is_error| {
+        if (is_error == .bool and is_error.bool) return ProtocolError.McpToolError;
+    }
+    const content_value = result.object.get("content") orelse return ProtocolError.InvalidJsonRpcResponse;
+    if (content_value != .array) return ProtocolError.InvalidJsonRpcResponse;
+
+    var blocks = std.ArrayList(ai.ContentBlock).empty;
+    errdefer {
+        for (blocks.items) |block| {
+            switch (block) {
+                .text => |text| allocator.free(text.text),
+                else => {},
+            }
+        }
+        blocks.deinit(allocator);
+    }
+
+    for (content_value.array.items) |item| {
+        const text = try textForMcpContentItem(allocator, item);
+        errdefer allocator.free(text);
+        try blocks.append(allocator, .{ .text = .{ .text = text } });
+    }
+
+    return .{
+        .content = try blocks.toOwnedSlice(allocator),
+        .details = null,
+    };
+}
+
+fn textForMcpContentItem(allocator: std.mem.Allocator, item: std.json.Value) ![]u8 {
+    if (item == .object) {
+        if (getStringField(item.object, "type")) |content_type| {
+            if (std.mem.eql(u8, content_type, "text")) {
+                const text = getStringField(item.object, "text") orelse "";
+                return try allocator.dupe(u8, text);
+            }
+            return try std.fmt.allocPrint(allocator, "[Unsupported MCP content type: {s}]", .{content_type});
+        }
+    }
+    return try allocator.dupe(u8, "[Unsupported MCP content item]");
+}
 
 fn expectResponseEnvelope(allocator: std.mem.Allocator, message: []const u8, expected_id: i64) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch return ProtocolError.InvalidJsonRpcResponse;
@@ -365,7 +659,7 @@ fn expectResponseEnvelope(allocator: std.mem.Allocator, message: []const u8, exp
     if (object.get("result") == null) return ProtocolError.InvalidJsonRpcResponse;
 }
 
-fn parseToolsListResponse(allocator: std.mem.Allocator, message: []const u8) !AgentToolSet {
+fn parseToolsListResponse(allocator: std.mem.Allocator, message: []const u8, transport: *JsonRpcTransport) !AgentToolSet {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, message, .{}) catch return ProtocolError.InvalidJsonRpcResponse;
     defer parsed.deinit();
     const object = switch (parsed.value) {
@@ -380,6 +674,9 @@ fn parseToolsListResponse(allocator: std.mem.Allocator, message: []const u8) !Ag
     if (tools_value != .array) return ProtocolError.InvalidJsonRpcResponse;
 
     var tools = std.ArrayList(agent.AgentTool).empty;
+    var tool_contexts = std.ArrayList(?*McpToolContext).empty;
+    const call_state = try allocator.create(ToolCallState);
+    call_state.* = .{ .transport = transport.* };
     errdefer {
         for (tools.items) |tool| {
             allocator.free(tool.name);
@@ -388,6 +685,14 @@ fn parseToolsListResponse(allocator: std.mem.Allocator, message: []const u8) !Ag
             common.deinitJsonValue(allocator, tool.parameters);
         }
         tools.deinit(allocator);
+        for (tool_contexts.items) |context| {
+            if (context) |tool_context| {
+                tool_context.deinit(allocator);
+                allocator.destroy(tool_context);
+            }
+        }
+        tool_contexts.deinit(allocator);
+        allocator.destroy(call_state);
     }
 
     for (tools_value.array.items) |tool_value| {
@@ -399,18 +704,30 @@ fn parseToolsListResponse(allocator: std.mem.Allocator, message: []const u8) !Ag
         else
             try defaultInputSchema(allocator);
         errdefer common.deinitJsonValue(allocator, schema);
+        const context = try allocator.create(McpToolContext);
+        errdefer allocator.destroy(context);
+        context.* = .{
+            .state = call_state,
+            .tool_name = try allocator.dupe(u8, name),
+        };
+        errdefer context.deinit(allocator);
         try tools.append(allocator, .{
             .name = try allocator.dupe(u8, name),
             .description = try allocator.dupe(u8, description),
             .label = try allocator.dupe(u8, name),
             .parameters = schema,
-            .execute = null,
+            .execute = executeMcpTool,
+            .execute_context = context,
+            .execution_mode = .sequential,
         });
+        try tool_contexts.append(allocator, context);
     }
 
     return .{
         .allocator = allocator,
         .items = try tools.toOwnedSlice(allocator),
+        .call_state = call_state,
+        .tool_contexts = try tool_contexts.toOwnedSlice(allocator),
     };
 }
 
@@ -496,6 +813,72 @@ const FakeTransport = struct {
         return allocator.dupe(u8, self.responses[self.response_index]);
     }
 };
+
+fn expectTextBlock(blocks: []const ai.ContentBlock, index: usize, expected: []const u8) !void {
+    try std.testing.expect(index < blocks.len);
+    switch (blocks[index]) {
+        .text => |text| try std.testing.expectEqualStrings(expected, text.text),
+        else => return error.UnexpectedContentBlock,
+    }
+}
+
+fn testOperationalServer(allocator: std.mem.Allocator) !ServerDefinition {
+    return .{
+        .name = try allocator.dupe(u8, "fixture"),
+        .transport = .stdio,
+        .status = .operational,
+        .command = try allocator.dupe(u8, "fake-mcp-server"),
+        .args = try allocator.alloc([]u8, 0),
+        .env = try allocator.alloc(EnvEntry, 0),
+        .unsupported_detail = null,
+    };
+}
+
+const stdio_fixture_script =
+    \\import json, sys, time
+    \\mode = sys.argv[1]
+    \\def send(value):
+    \\    print(json.dumps(value, separators=(",", ":")), flush=True)
+    \\line = sys.stdin.readline()
+    \\if not line:
+    \\    sys.exit(0)
+    \\if mode == "eof-init":
+    \\    sys.exit(0)
+    \\if mode == "timeout":
+    \\    time.sleep(30)
+    \\    sys.exit(0)
+    \\if mode == "malformed":
+    \\    print("not-json", flush=True)
+    \\    sys.exit(0)
+    \\json.loads(line)
+    \\send({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "fake", "version": "1.0.0"}}})
+    \\line = sys.stdin.readline()
+    \\if not line:
+    \\    sys.exit(0)
+    \\line = sys.stdin.readline()
+    \\if not line:
+    \\    sys.exit(0)
+    \\json.loads(line)
+    \\send({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "child_echo", "description": "Echo from child", "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}}]}})
+    \\line = sys.stdin.readline()
+    \\if not line:
+    \\    sys.exit(0)
+    \\if mode == "eof-call":
+    \\    sys.exit(0)
+    \\call = json.loads(line)
+    \\send({"jsonrpc": "2.0", "id": call["id"], "result": {"content": [{"type": "text", "text": call["params"]["name"]}, {"type": "image", "data": "redacted"}, {"type": "text", "text": json.dumps(call["params"]["arguments"], sort_keys=True, separators=(",", ":"))}]}})
+    \\for line in sys.stdin:
+    \\    pass
+;
+
+fn startFixtureClient(allocator: std.mem.Allocator, mode: []const u8, options: StdioClientOptions) !*StdioClient {
+    return try StdioClient.startArgv(
+        allocator,
+        std.testing.io,
+        &.{ "python3", "-u", "-c", stdio_fixture_script, mode },
+        options,
+    );
+}
 
 test "parseConfigContent loads stdio servers and marks unsupported MCP declarations" {
     const allocator = std.testing.allocator;
@@ -583,7 +966,8 @@ test "discoverAgentTools performs MCP initialize initialized tools list and pres
     try std.testing.expectEqual(@as(usize, 2), tool_set.items.len);
     const read_tool = findTool(&tool_set, "read_fixture").?;
     try std.testing.expectEqualStrings("Read deterministic fixture data", read_tool.description);
-    try std.testing.expect(read_tool.execute == null);
+    try std.testing.expect(read_tool.execute != null);
+    try std.testing.expectEqual(agent.ToolExecutionMode.sequential, read_tool.execution_mode.?);
     const read_schema = read_tool.parameters.object;
     try std.testing.expectEqualStrings("object", read_schema.get("type").?.string);
     const properties = read_schema.get("properties").?.object;
@@ -597,9 +981,178 @@ test "discoverAgentTools performs MCP initialize initialized tools list and pres
 
     const echo_tool = findTool(&tool_set, "echo_fixture").?;
     try std.testing.expectEqualStrings("Echo deterministic input", echo_tool.description);
+    try std.testing.expect(echo_tool.execute != null);
     const echo_schema = echo_tool.parameters.object;
     const echo_required = echo_schema.get("required").?.array;
     try std.testing.expectEqualStrings("message", echo_required.items[0].string);
+}
+
+test "execute MCP tools call preserves text order and safe unsupported fallbacks" {
+    const allocator = std.testing.allocator;
+    var server = try testOperationalServer(allocator);
+    defer server.deinit(allocator);
+
+    var fake = FakeTransport.init(allocator, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1.0.0\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo_fixture\",\"description\":\"Echo deterministic input\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"]}}]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"image\",\"data\":\"redacted\"},{\"type\":\"text\",\"text\":\"second\"}]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"resource\",\"uri\":\"file:///redacted\"}]}}",
+    });
+    defer fake.deinit();
+    var transport = fake.transport();
+    var tool_set = try discoverAgentTools(allocator, &server, &transport);
+    defer tool_set.deinit();
+
+    const echo_tool = findTool(&tool_set, "echo_fixture").?;
+    var args_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"message\":\"hello\"}", .{});
+    defer args_parsed.deinit();
+    const result = try echo_tool.execute.?(
+        allocator,
+        "tool-call-1",
+        args_parsed.value,
+        echo_tool.execute_context,
+        null,
+        null,
+        null,
+    );
+    defer common.deinitContentBlocks(allocator, result.content);
+
+    try std.testing.expectEqual(@as(usize, 3), result.content.len);
+    try expectTextBlock(result.content, 0, "first");
+    try expectTextBlock(result.content, 1, "[Unsupported MCP content type: image]");
+    try expectTextBlock(result.content, 2, "second");
+
+    try std.testing.expectEqual(@as(usize, 4), fake.sent_methods.items.len);
+    try std.testing.expectEqualStrings("tools/call", fake.sent_methods.items[3]);
+    try std.testing.expect(std.mem.indexOf(u8, fake.sent_messages.items[3], "\"id\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.sent_messages.items[3], "\"method\":\"tools/call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.sent_messages.items[3], "\"name\":\"echo_fixture\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.sent_messages.items[3], "\"arguments\":{\"message\":\"hello\"}") != null);
+
+    const unsupported_only = try echo_tool.execute.?(
+        allocator,
+        "tool-call-2",
+        args_parsed.value,
+        echo_tool.execute_context,
+        null,
+        null,
+        null,
+    );
+    defer common.deinitContentBlocks(allocator, unsupported_only.content);
+    try std.testing.expectEqual(@as(usize, 1), unsupported_only.content.len);
+    try expectTextBlock(unsupported_only.content, 0, "[Unsupported MCP content type: resource]");
+    try std.testing.expect(std.mem.indexOf(u8, fake.sent_messages.items[4], "\"id\":4") != null);
+}
+
+test "execute MCP tools call reports MCP tool errors distinctly" {
+    const allocator = std.testing.allocator;
+    var server = try testOperationalServer(allocator);
+    defer server.deinit(allocator);
+
+    var fake = FakeTransport.init(allocator, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1.0.0\"}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"failing_fixture\",\"description\":\"Fail deterministically\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"fixture failure\"}]}}",
+    });
+    defer fake.deinit();
+    var transport = fake.transport();
+    var tool_set = try discoverAgentTools(allocator, &server, &transport);
+    defer tool_set.deinit();
+
+    const failing_tool = findTool(&tool_set, "failing_fixture").?;
+    var args_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer args_parsed.deinit();
+    try std.testing.expectError(ProtocolError.McpToolError, failing_tool.execute.?(
+        allocator,
+        "tool-call-error",
+        args_parsed.value,
+        failing_tool.execute_context,
+        null,
+        null,
+        null,
+    ));
+    try std.testing.expectEqualStrings("tools/call", fake.sent_methods.items[3]);
+}
+
+test "stdio MCP child transport executes tools call and shuts down without leaking fixture process" {
+    const allocator = std.testing.allocator;
+    var server = try testOperationalServer(allocator);
+    defer server.deinit(allocator);
+    var client = try startFixtureClient(allocator, "normal", .{ .response_timeout_ms = 1000, .shutdown_timeout_ms = 500 });
+    defer client.deinit();
+    var transport = client.transport();
+
+    var tool_set = try discoverAgentTools(allocator, &server, &transport);
+    defer tool_set.deinit();
+    const child_tool = findTool(&tool_set, "child_echo").?;
+
+    var args_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"message\":\"from-child\"}", .{});
+    defer args_parsed.deinit();
+    const result = try child_tool.execute.?(
+        allocator,
+        "tool-call-child",
+        args_parsed.value,
+        child_tool.execute_context,
+        null,
+        null,
+        null,
+    );
+    defer common.deinitContentBlocks(allocator, result.content);
+
+    try std.testing.expectEqual(@as(usize, 3), result.content.len);
+    try expectTextBlock(result.content, 0, "child_echo");
+    try expectTextBlock(result.content, 1, "[Unsupported MCP content type: image]");
+    try expectTextBlock(result.content, 2, "{\"message\":\"from-child\"}");
+
+    try client.shutdown();
+    try std.testing.expect(client.hasExited());
+}
+
+test "stdio MCP child lifecycle handles timeout malformed EOF and call exit without leaks" {
+    const allocator = std.testing.allocator;
+    var server = try testOperationalServer(allocator);
+    defer server.deinit(allocator);
+
+    var timeout_client = try startFixtureClient(allocator, "timeout", .{ .response_timeout_ms = 50, .shutdown_timeout_ms = 100 });
+    var timeout_transport = timeout_client.transport();
+    try std.testing.expectError(ProtocolError.McpTransportTimeout, discoverAgentTools(allocator, &server, &timeout_transport));
+    try timeout_client.shutdown();
+    try std.testing.expect(timeout_client.hasExited());
+    timeout_client.deinit();
+
+    var malformed_client = try startFixtureClient(allocator, "malformed", .{ .response_timeout_ms = 500, .shutdown_timeout_ms = 100 });
+    var malformed_transport = malformed_client.transport();
+    try std.testing.expectError(ProtocolError.InvalidJsonRpcResponse, discoverAgentTools(allocator, &server, &malformed_transport));
+    try malformed_client.shutdown();
+    try std.testing.expect(malformed_client.hasExited());
+    malformed_client.deinit();
+
+    var eof_client = try startFixtureClient(allocator, "eof-init", .{ .response_timeout_ms = 500, .shutdown_timeout_ms = 100 });
+    var eof_transport = eof_client.transport();
+    try std.testing.expectError(ProtocolError.McpTransportEof, discoverAgentTools(allocator, &server, &eof_transport));
+    try eof_client.shutdown();
+    try std.testing.expect(eof_client.hasExited());
+    eof_client.deinit();
+
+    var call_exit_client = try startFixtureClient(allocator, "eof-call", .{ .response_timeout_ms = 500, .shutdown_timeout_ms = 100 });
+    var call_exit_transport = call_exit_client.transport();
+    var tool_set = try discoverAgentTools(allocator, &server, &call_exit_transport);
+    defer tool_set.deinit();
+    const child_tool = findTool(&tool_set, "child_echo").?;
+    var args_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer args_parsed.deinit();
+    try std.testing.expectError(ProtocolError.McpTransportEof, child_tool.execute.?(
+        allocator,
+        "tool-call-eof",
+        args_parsed.value,
+        child_tool.execute_context,
+        null,
+        null,
+        null,
+    ));
+    try call_exit_client.shutdown();
+    try std.testing.expect(call_exit_client.hasExited());
+    call_exit_client.deinit();
 }
 
 test "discoverAgentTools refuses unsupported transports before sending protocol messages" {
