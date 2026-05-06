@@ -429,6 +429,34 @@ const WasmRuntime = struct {
         _ = self.state.registry.unregisterTool(self.manifest.tool_id);
     }
 
+    fn addObservableDiagnostic(
+        self: *WasmRuntime,
+        phase: wasm_manifest.LifecyclePhase,
+        category: []const u8,
+        path: []const u8,
+        capability: ?wasm_manifest.Capability,
+        message: []const u8,
+    ) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"phase\":");
+        try std.json.Stringify.value(phase.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"category\":");
+        try std.json.Stringify.value(category, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"path\":");
+        try std.json.Stringify.value(path, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"capability\":");
+        if (capability) |capability_value| {
+            try std.json.Stringify.value(capability_value.jsonName(), .{}, &envelope.writer);
+        } else {
+            try envelope.writer.writeAll("null");
+        }
+        try envelope.writer.writeAll(",\"message\":");
+        try std.json.Stringify.value(message, .{}, &envelope.writer);
+        try envelope.writer.writeAll("}");
+        try self.state.addDiagnostic(.host_error, .@"error", envelope.written());
+    }
+
     fn deinit(self: *WasmRuntime) void {
         self.cleanupForUnload();
         self.host.deinit();
@@ -611,7 +639,16 @@ fn wasmAgentToolExecute(
     if (!registered) return error.WasmToolNotRegistered;
 
     const output_json = runtime.host.callExecute(input_json) catch |err| switch (err) {
-        error.InvalidJsonInput => return invalidInputAgentToolResult(allocator),
+        error.InvalidJsonInput => {
+            try runtime.addObservableDiagnostic(
+                .call,
+                "invalid_input",
+                "$.execute",
+                null,
+                "execute input must be a JSON object",
+            );
+            return invalidInputAgentToolResult(allocator);
+        },
         else => return err,
     };
     defer runtime.allocator.free(output_json);
@@ -910,6 +947,44 @@ fn expectWasmToolOnlyRegistry(context: ?*anyopaque, registry: *const Registry) !
     try std.testing.expect(parameters.get("properties").?.object.get("maxBytes").? == .object);
 }
 
+fn expectWasmToolSubsetConformance(allocator: std.mem.Allocator, adapter: RuntimeAdapter, expected_artifact_path: []const u8) !void {
+    try std.testing.expectEqual(RuntimeKind.wasm, adapter.kind);
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expect(!adapter.hasRegisteredCommand("builtin.truncateHead"));
+
+    var registry_expect = WasmToolRegistryExpectContext{ .expected_artifact_path = expected_artifact_path };
+    try adapter.withRegistry(&registry_expect, expectWasmToolOnlyRegistry);
+
+    var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\\nbravo\\ncharlie\",\"maxLines\":2,\"maxBytes\":1024}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "wasm-subset-success", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqual(@as(usize, 1), success.content.len);
+    try std.testing.expect(std.mem.indexOf(u8, success.content[0].text.text, "\"content\":\"alpha\\nbravo\"") != null);
+
+    var invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "[]", .{});
+    defer invalid_params.deinit();
+    const invalid = try agent_tool.execute.?(allocator, "wasm-subset-invalid", invalid_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, invalid.content);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}",
+        invalid.content[0].text.text,
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCategoryCount(.host_error));
+    const diagnostic = wasmRuntime(adapter.ptr).state.diagnostics.items[0];
+    try std.testing.expectEqual(DiagnosticCategory.host_error, diagnostic.category);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"phase\":\"call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"category\":\"invalid_input\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"path\":\"$.execute\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"capability\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"message\":\"execute input must be a JSON object\"") != null);
+}
+
 test "wasm runtime registers schema preserving tool and executes through agent tool api" {
     const allocator = std.testing.allocator;
     var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
@@ -1075,6 +1150,92 @@ test "wasm runtime rejects metadata schema mismatch before registration" {
     try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntime(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } }));
+}
+
+test "extension runtime mixed process_jsonl and wasm adapters isolate interleaved lifecycle state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "mixed-process-jsonl-capture.jsonl");
+    defer allocator.free(capture_path);
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"process-pending\",\"method\":\"input\",\"responseRequired\":true,\"payload\":{{\"text\":\"process\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"register_command\",\"name\":\"process-command\",\"description\":\"Process command\",\"extensionPath\":\"fixture/process.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_flag\",\"name\":\"process-flag\",\"valueType\":\"string\",\"default\":\"process-default\",\"extensionPath\":\"fixture/process.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "mixed-process-jsonl-runtime" };
+
+    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "mixed-process-marker",
+            .cwd = "/mixed-process-cwd",
+            .fixture = "mixed-process-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter.deinit();
+    try std.testing.expectEqual(RuntimeKind.process_jsonl, process_adapter.kind);
+    try process_adapter.waitForReady(500);
+    var elapsed: u64 = 0;
+    while ((process_adapter.pendingCount() < 1 or process_adapter.registryFramesApplied() < 2) and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), process_adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 2), process_adapter.registryFramesApplied());
+    try std.testing.expect(process_adapter.hasRegisteredCommand("process-command"));
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer wasm_adapter.deinit();
+    try expectWasmToolSubsetConformance(allocator, wasm_adapter, manifest_result.valid.artifact_absolute_path);
+
+    const process_snapshot_before_wasm_shutdown = try process_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(process_snapshot_before_wasm_shutdown);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot_before_wasm_shutdown, "\"name\":\"process-command\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot_before_wasm_shutdown, "\"name\":\"builtin.truncateHead\"") == null);
+    const wasm_snapshot_before_shutdown = try wasm_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(wasm_snapshot_before_shutdown);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot_before_shutdown, "\"name\":\"builtin.truncateHead\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot_before_shutdown, "\"name\":\"process-command\"") == null);
+
+    try wasm_adapter.shutdown();
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+    const wasm_counts_after_shutdown = wasmRuntime(wasm_adapter.ptr).host.resourceCounts();
+    try std.testing.expectEqual(@as(usize, 0), wasm_counts_after_shutdown.memory_bytes);
+    try std.testing.expectEqual(@as(usize, 0), wasm_counts_after_shutdown.function_returns);
+    try std.testing.expectEqual(@as(usize, 0), wasm_counts_after_shutdown.function_exports);
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try wasm_adapter.agentTool(allocator, "builtin.truncateHead"));
+    try std.testing.expect(process_adapter.hasRegisteredCommand("process-command"));
+    try std.testing.expectEqual(@as(usize, 1), process_adapter.pendingCount());
+
+    try process_adapter.sendExtensionUiResponse("process-pending", "{\"ok\":true}");
+    try std.testing.expectEqual(@as(usize, 0), process_adapter.pendingCount());
+    try process_adapter.shutdown();
+    try std.testing.expect(process_adapter.hasShutdownComplete());
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"initialize\",\"marker\":\"mixed-process-marker\",\"cwd\":\"/mixed-process-cwd\",\"fixture\":\"mixed-process-fixture\"}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"process-pending\",\"payload\":{\"ok\":true}}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "builtin.truncateHead") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"shutdown\"}\n") != null);
 }
 
 test "process_jsonl runtime adapter preserves registry UI response event and shutdown semantics" {
