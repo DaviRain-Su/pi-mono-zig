@@ -34,6 +34,8 @@ References:
   https://github.com/microsoft/wassette
 - Architecture RFC for `WASM-001`:
   [wasm-extension-architecture-rfc.md](wasm-extension-architecture-rfc.md)
+- Final authoritative status for `WASM-001` through `WASM-009`:
+  [wasm-extension-final-closure.md](wasm-extension-final-closure.md)
 
 ## Non-Goals
 
@@ -172,7 +174,7 @@ Acceptance criteria:
 
 ### WASM-002: Define Tool Manifest v0
 
-Status: planned
+Status: complete
 
 Scope:
 
@@ -185,6 +187,19 @@ Acceptance criteria:
 - A fixture manifest validates successfully.
 - Invalid missing fields produce deterministic diagnostics.
 - Manifest parsing has unit tests.
+
+Evidence:
+
+- [`../src/coding_agent/wasm_manifest.zig`](../src/coding_agent/wasm_manifest.zig)
+  validates `pi-extension.json` v0 for exactly one Wasm-backed tool, including
+  required fields, wrong types, malformed JSON, unsupported versions,
+  zero/multiple/non-tool declarations, default-deny capabilities, unknown
+  capabilities, artifact kind/path checks, and symlink escapes.
+- [`../../packages/coding-agent/src/core/wasm-extension-package.ts`](../../packages/coding-agent/src/core/wasm-extension-package.ts)
+  provides the TypeScript package-side Wasm manifest classification and handoff.
+- Focused evidence includes `wasm manifest`, `pi-extension`, and
+  `extensions-discovery.test.ts` validation, plus repository check success after
+  the web-ui source-resolution blocker was fixed.
 
 ### WASM-003: Define Tool WIT v0
 
@@ -211,7 +226,7 @@ Evidence:
 
 ### WASM-004: Extism Host Spike
 
-Status: planned
+Status: closed by spike evidence
 
 Scope:
 
@@ -225,9 +240,20 @@ Acceptance criteria:
 - No agent/session integration yet.
 - Records integration cost and runtime dependency requirements.
 
+Evidence:
+
+- [`wasm-host-spike-evidence.md`](wasm-host-spike-evidence.md) records the
+  Extism project-local attempts, blocker output, runtime dependency constraints,
+  and native Wasm substitute rationale.
+- [`../src/coding_agent/wasm_host_spike.zig`](../src/coding_agent/wasm_host_spike.zig)
+  and [`../test/fixtures/wasm/native-tool-v0/plugin.wasm`](../test/fixtures/wasm/native-tool-v0/plugin.wasm)
+  provide the standalone host spike and repository-local plugin fixture.
+- Focused evidence includes `extism` and `wasm host` Zig filters and repository
+  check success.
+
 ### WASM-005: Component Model Host Spike
 
-Status: planned
+Status: closed by decision
 
 Scope:
 
@@ -241,9 +267,19 @@ Acceptance criteria:
 - Output recommends either Extism for v1, direct Component Model for v1, or a
   staged path.
 
+Evidence:
+
+- [`wasm-component-model-decision.md`](wasm-component-model-decision.md)
+  documents project-local Component Model tooling attempts, output
+  comparability, required comparison axes, footprint evidence, and the staged
+  v1 recommendation.
+- The staged recommendation keeps the authoring direction pointed at WIT plus
+  `artifact.kind: "wasm-component"` while using core-Wasm fixture evidence for
+  near-term host and browser validation.
+
 ### WASM-006: Browser Host Spike
 
-Status: planned
+Status: complete
 
 Scope:
 
@@ -256,9 +292,20 @@ Acceptance criteria:
   is documented.
 - Browser host denies unavailable capabilities such as shell and local FS.
 
+Evidence:
+
+- [`../test/fixtures/wasm/browser-host-v0/index.html`](../test/fixtures/wasm/browser-host-v0/index.html),
+  [`../test/fixtures/wasm/browser-host-v0/browser-wasm-host.js`](../test/fixtures/wasm/browser-host-v0/browser-wasm-host.js),
+  and [`../test/fixtures/wasm/browser-host-v0/harness-smoke.mjs`](../test/fixtures/wasm/browser-host-v0/harness-smoke.mjs)
+  implement and smoke-test the browser host harness.
+- Agent-browser evidence validated client-side `WebAssembly.instantiate`
+  execution, valid fixture output, shell/filesystem denial in manifest-request
+  and runtime/import modes, zero execution API requests, and cleanup across
+  ports `3120-3129`.
+
 ### WASM-007: Migrate One Pure Tool
 
-Status: planned
+Status: complete
 
 Scope:
 
@@ -271,9 +318,20 @@ Acceptance criteria:
 - Fixture tests cover success and malformed input.
 - The package demonstrates the intended authoring workflow.
 
+Evidence:
+
+- The selected existing implementation is
+  [`../src/coding_agent/tools/truncate.zig`](../src/coding_agent/tools/truncate.zig)
+  `truncateHead`.
+- The migrated package fixture is
+  [`../test/fixtures/wasm/pure-truncate-head-v0/pi-extension.json`](../test/fixtures/wasm/pure-truncate-head-v0/pi-extension.json)
+  plus [`../test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm`](../test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm).
+- Focused evidence includes the `wasm pure tool` Zig filter, browser harness
+  parity, artifact hash evidence, and repository check success.
+
 ### WASM-008: Package Manager Integration Plan
 
-Status: planned
+Status: complete
 
 Scope:
 
@@ -286,9 +344,21 @@ Acceptance criteria:
 - Artifact validation happens before install is considered successful.
 - Existing Bun package install behavior is unchanged.
 
+Evidence:
+
+- [`../../packages/coding-agent/src/core/wasm-extension-package.ts`](../../packages/coding-agent/src/core/wasm-extension-package.ts)
+  classifies local `pi-extension.json` packages, validates artifacts before
+  install success, and exposes normalized artifact/tool handoff data.
+- [`../../packages/coding-agent/test/package-manager.test.ts`](../../packages/coding-agent/test/package-manager.test.ts)
+  covers local Wasm package discovery, invalid artifact rejection before
+  persistence/success, valid repository fixtures, and unchanged Bun package
+  behavior.
+- [`../../packages/coding-agent/test/extensions-discovery.test.ts`](../../packages/coding-agent/test/extensions-discovery.test.ts)
+  covers Bun discovery isolation for Wasm package directories.
+
 ### WASM-009: Native Shared Library Research
 
-Status: planned
+Status: closed by research decision
 
 Scope:
 
@@ -300,6 +370,25 @@ Acceptance criteria:
 
 - Result is a recommendation, not implementation.
 - Third-party default remains Wasm unless the research proves otherwise.
+
+Evidence:
+
+- [`wasm-native-library-research.md`](wasm-native-library-research.md)
+  compares native shared libraries against Wasm across dynamic loading, ABI
+  stability, signing, crash isolation, platform packaging, trust boundaries, and
+  failure modes.
+- The research keeps Wasm/Wasm Component as the default third-party extension
+  format and scopes native shared libraries separately for trusted first-party
+  or performance-critical code.
+
+## Final Closure
+
+All roadmap items are complete or closed with evidence. The final synthesis,
+cross-milestone decisions, validation evidence summary, Bun compatibility
+confirmation, default-deny capability confirmation, project-local dependency
+audit, lifecycle diagnostic consistency notes, and README/public-docs gate are
+recorded in
+[`wasm-extension-final-closure.md`](wasm-extension-final-closure.md).
 
 ## Suggested Execution Order
 
