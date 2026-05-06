@@ -16,6 +16,7 @@
             "role": "user"
           }
         ],
+        "instructions": "You are a helpful assistant.",
         "model": "gpt-5.1-codex-payload-pass-through",
         "parallel_tool_calls": true,
         "store": false,
@@ -51,6 +52,7 @@
             "role": "user"
           }
         ],
+        "instructions": "You are a helpful assistant.",
         "model": "gpt-5.1-codex-payload-pass-through",
         "parallel_tool_calls": true,
         "store": false,

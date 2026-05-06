@@ -25,6 +25,7 @@
             "role": "user"
           }
         ],
+        "instructions": "You are a helpful assistant.",
         "model": "gpt-5.1-codex-url-proxy",
         "parallel_tool_calls": true,
         "store": false,

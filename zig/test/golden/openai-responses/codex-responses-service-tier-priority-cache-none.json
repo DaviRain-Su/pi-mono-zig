@@ -27,6 +27,7 @@
             "role": "user"
           }
         ],
+        "instructions": "You are a helpful assistant.",
         "model": "gpt-5.1-codex-tier-priority",
         "parallel_tool_calls": true,
         "prompt_cache_key": "fixture-codex-cache-none-session",
