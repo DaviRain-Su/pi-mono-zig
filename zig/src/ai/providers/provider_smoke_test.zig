@@ -137,6 +137,43 @@ fn runOpenAICompatCapture(expectation: CaptureExpectation) !void {
     );
 }
 
+fn runAnthropicCapture(expectation: CaptureExpectation) !void {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    var server = try provider_error.TestCaptureServer.init(
+        io,
+        401,
+        "Unauthorized",
+        "",
+        "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"provider smoke capture\"}}",
+    );
+    try server.start();
+    errdefer server.deinit();
+
+    const base_url = try loopbackBaseUrl(allocator, &server, expectation.base_path);
+    defer allocator.free(base_url);
+
+    var stream = try anthropic.AnthropicProvider.stream(
+        allocator,
+        io,
+        smokeModel(expectation, base_url),
+        smokeContext(),
+        .{ .api_key = "provider-smoke-key" },
+    );
+    defer stream.deinit();
+    try expectOnlyTerminalErrorMetadata(&stream, expectation.api, expectation.provider, expectation.model_id);
+
+    server.deinit();
+    try std.testing.expect(!server.request_head_truncated);
+    try assertCapturedRequest(
+        allocator,
+        server.requestHead(),
+        expectation.expected_request_line,
+        expectation.expected_auth_header,
+        expectation.forbidden_auth_header,
+    );
+}
+
 test "provider smoke Moonshot standalone captures OpenAI routing auth and metadata" {
     const cases = [_]CaptureExpectation{
         .{
@@ -165,6 +202,75 @@ test "provider smoke Moonshot standalone captures OpenAI routing auth and metada
         try std.testing.expectEqualStrings(case.provider, registered_model.provider);
         try std.testing.expectEqualStrings(case.api, registered_model.api);
         try runOpenAICompatCapture(case);
+    }
+}
+
+test "provider smoke Xiaomi standalone captures Anthropic routing auth and metadata" {
+    const cases = [_]struct {
+        expectation: CaptureExpectation,
+        expected_base_url: []const u8,
+    }{
+        .{
+            .expectation = .{
+                .provider = "xiaomi",
+                .api = "anthropic-messages",
+                .model_id = "mimo-v2.5-pro",
+                .base_path = "/anthropic",
+                .expected_request_line = "POST /anthropic/v1/messages HTTP/1.1",
+                .expected_auth_header = "\r\nx-api-key: provider-smoke-key\r\n",
+                .forbidden_auth_header = "\r\nauthorization:",
+            },
+            .expected_base_url = "https://api.xiaomimimo.com/anthropic",
+        },
+        .{
+            .expectation = .{
+                .provider = "xiaomi-token-plan-cn",
+                .api = "anthropic-messages",
+                .model_id = "mimo-v2.5-pro",
+                .base_path = "/anthropic",
+                .expected_request_line = "POST /anthropic/v1/messages HTTP/1.1",
+                .expected_auth_header = "\r\nx-api-key: provider-smoke-key\r\n",
+                .forbidden_auth_header = "\r\nauthorization:",
+            },
+            .expected_base_url = "https://token-plan-cn.xiaomimimo.com/anthropic",
+        },
+        .{
+            .expectation = .{
+                .provider = "xiaomi-token-plan-ams",
+                .api = "anthropic-messages",
+                .model_id = "mimo-v2.5-pro",
+                .base_path = "/anthropic",
+                .expected_request_line = "POST /anthropic/v1/messages HTTP/1.1",
+                .expected_auth_header = "\r\nx-api-key: provider-smoke-key\r\n",
+                .forbidden_auth_header = "\r\nauthorization:",
+            },
+            .expected_base_url = "https://token-plan-ams.xiaomimimo.com/anthropic",
+        },
+        .{
+            .expectation = .{
+                .provider = "xiaomi-token-plan-sgp",
+                .api = "anthropic-messages",
+                .model_id = "mimo-v2.5-pro",
+                .base_path = "/anthropic",
+                .expected_request_line = "POST /anthropic/v1/messages HTTP/1.1",
+                .expected_auth_header = "\r\nx-api-key: provider-smoke-key\r\n",
+                .forbidden_auth_header = "\r\nauthorization:",
+            },
+            .expected_base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic",
+        },
+    };
+
+    for (cases) |case| {
+        const expectation = case.expectation;
+        const provider_config = model_registry.getProviderConfig(expectation.provider).?;
+        try std.testing.expectEqualStrings(expectation.api, provider_config.api);
+        try std.testing.expectEqualStrings(expectation.model_id, provider_config.default_model_id.?);
+        try std.testing.expectEqualStrings(case.expected_base_url, provider_config.base_url);
+        const registered_model = model_registry.find(expectation.provider, expectation.model_id).?;
+        try std.testing.expectEqualStrings(expectation.provider, registered_model.provider);
+        try std.testing.expectEqualStrings(expectation.api, registered_model.api);
+        try std.testing.expectEqualStrings(case.expected_base_url, registered_model.base_url);
+        try runAnthropicCapture(expectation);
     }
 }
 
@@ -340,6 +446,20 @@ fn expectOpenAICompatSetupFailure(expectation: CaptureExpectation) !void {
     try expectOnlyTerminalErrorMetadata(&stream, expectation.api, expectation.provider, expectation.model_id);
 }
 
+fn expectAnthropicSetupFailure(expectation: CaptureExpectation) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var stream = try anthropic.AnthropicProvider.stream(
+        allocator,
+        io,
+        smokeModel(expectation, "http://127.0.0.1:1"),
+        smokeContext(),
+        .{ .api_key = "provider-smoke-key" },
+    );
+    defer stream.deinit();
+    try expectOnlyTerminalErrorMetadata(&stream, expectation.api, expectation.provider, expectation.model_id);
+}
+
 test "provider smoke Moonshot and Cloudflare setup failures are terminal error events" {
     const openai_cases = [_]CaptureExpectation{
         .{ .provider = "moonshotai", .api = "openai-completions", .model_id = "kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
@@ -371,6 +491,16 @@ test "provider smoke Moonshot and Cloudflare setup failures are terminal error e
     );
     defer anthropic_stream.deinit();
     try expectOnlyTerminalErrorMetadata(&anthropic_stream, "anthropic-messages", "cloudflare-ai-gateway", "claude-opus-4-7");
+}
+
+test "provider smoke Xiaomi setup failures are terminal error events" {
+    const cases = [_]CaptureExpectation{
+        .{ .provider = "xiaomi", .api = "anthropic-messages", .model_id = "mimo-v2.5-pro", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
+        .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .model_id = "mimo-v2.5-pro", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
+        .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .model_id = "mimo-v2.5-pro", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
+        .{ .provider = "xiaomi-token-plan-sgp", .api = "anthropic-messages", .model_id = "mimo-v2.5-pro", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
+    };
+    for (cases) |case| try expectAnthropicSetupFailure(case);
 }
 
 test "provider smoke Cloudflare Responses placeholder failure is terminal error event" {
