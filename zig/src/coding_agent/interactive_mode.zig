@@ -20,7 +20,10 @@ const formatting = @import("interactive_mode/formatting.zig");
 const overlays = @import("interactive_mode/overlays.zig");
 const rendering = @import("interactive_mode/rendering.zig");
 const prompt_worker_mod = @import("interactive_mode/prompt_worker.zig");
+const command_router = @import("interactive_mode/command_router.zig");
 const slash_commands = @import("interactive_mode/slash_commands.zig");
+const auth_flow_mod = @import("interactive_mode/auth_flow.zig");
+const session_lifecycle = @import("interactive_mode/session_lifecycle.zig");
 const input_dispatch = @import("interactive_mode/input_dispatch.zig");
 const clipboard_image = @import("interactive_mode/clipboard_image.zig");
 const tool_adapters = @import("interactive_mode/tool_adapters.zig");
@@ -136,14 +139,14 @@ pub const openInitialSessionWithMissingCwd = session_bootstrap.openInitialSessio
 pub const OwnedMissingSessionCwdIssue = session_bootstrap.OwnedMissingSessionCwdIssue;
 pub const resolveResumeSessionPath = session_bootstrap.resolveResumeSessionPath;
 pub const preflightInteractiveMissingCwd = session_bootstrap.preflightInteractiveMissingCwd;
-pub const SlashCommandKind = slash_commands.SlashCommandKind;
-pub const SlashCommand = slash_commands.SlashCommand;
-pub const BuiltinSlashCommand = slash_commands.BuiltinSlashCommand;
-pub const BUILTIN_SLASH_COMMANDS = slash_commands.BUILTIN_SLASH_COMMANDS;
-pub const createSeededSession = slash_commands.createSeededSession;
-pub const parseSlashCommand = slash_commands.parseSlashCommand;
-pub const handleSlashCommand = slash_commands.handleSlashCommand;
-pub const switchSession = slash_commands.switchSession;
+pub const SlashCommandKind = command_router.SlashCommandKind;
+pub const SlashCommand = command_router.SlashCommand;
+pub const BuiltinSlashCommand = command_router.BuiltinSlashCommand;
+pub const BUILTIN_SLASH_COMMANDS = command_router.BUILTIN_SLASH_COMMANDS;
+pub const createSeededSession = session_lifecycle.createSeededSession;
+pub const parseSlashCommand = command_router.parseSlashCommand;
+pub const handleSlashCommand = command_router.handleSlashCommand;
+pub const switchSession = session_lifecycle.switchSession;
 pub const switchModel = slash_commands.switchModel;
 pub const handleModelSlashCommand = slash_commands.handleModelSlashCommand;
 pub const handleScopedModelsSlashCommand = slash_commands.handleScopedModelsSlashCommand;
@@ -158,24 +161,24 @@ pub const handleNameSlashCommand = slash_commands.handleNameSlashCommand;
 pub const handleLabelSlashCommand = slash_commands.handleLabelSlashCommand;
 pub const resolveCurrentLabelTargetId = slash_commands.resolveCurrentLabelTargetId;
 pub const handleCompactSlashCommand = slash_commands.handleCompactSlashCommand;
-pub const handleLoginSlashCommand = slash_commands.handleLoginSlashCommand;
-pub const beginLoginFlow = slash_commands.beginLoginFlow;
-pub const cancelAuthFlow = slash_commands.cancelAuthFlow;
-pub const submitAuthFlowInput = slash_commands.submitAuthFlowInput;
-pub const persistLoginCredential = slash_commands.persistLoginCredential;
-pub const OpenBrowserFn = slash_commands.OpenBrowserFn;
-pub const openBrowserBestEffort = slash_commands.openBrowserBestEffort;
-pub const defaultOpenBrowserBestEffort = slash_commands.defaultOpenBrowserBestEffort;
+pub const handleLoginSlashCommand = auth_flow_mod.handleLoginSlashCommand;
+pub const beginLoginFlow = auth_flow_mod.beginLoginFlow;
+pub const cancelAuthFlow = auth_flow_mod.cancelAuthFlow;
+pub const submitAuthFlowInput = auth_flow_mod.submitAuthFlowInput;
+pub const persistLoginCredential = auth_flow_mod.persistLoginCredential;
+pub const OpenBrowserFn = auth_flow_mod.OpenBrowserFn;
+pub const openBrowserBestEffort = auth_flow_mod.openBrowserBestEffort;
+pub const defaultOpenBrowserBestEffort = auth_flow_mod.defaultOpenBrowserBestEffort;
 pub const ClipboardCopyFn = slash_commands.ClipboardCopyFn;
-pub const BrowserOpenCapture = slash_commands.BrowserOpenCapture;
+pub const BrowserOpenCapture = auth_flow_mod.BrowserOpenCapture;
 pub const handleSettingsSlashCommand = slash_commands.handleSettingsSlashCommand;
 pub const handleImportSlashCommand = slash_commands.handleImportSlashCommand;
 pub const handleCopySlashCommand = slash_commands.handleCopySlashCommand;
 pub const handleShareSlashCommand = slash_commands.handleShareSlashCommand;
-pub const handleLogoutSlashCommand = slash_commands.handleLogoutSlashCommand;
-pub const logoutProviderById = slash_commands.logoutProviderById;
-pub const handleNewSlashCommand = slash_commands.handleNewSlashCommand;
-pub const clearResolvedProviderApiKey = slash_commands.clearResolvedProviderApiKey;
+pub const handleLogoutSlashCommand = auth_flow_mod.handleLogoutSlashCommand;
+pub const logoutProviderById = auth_flow_mod.logoutProviderById;
+pub const handleNewSlashCommand = session_lifecycle.handleNewSlashCommand;
+pub const clearResolvedProviderApiKey = auth_flow_mod.clearResolvedProviderApiKey;
 pub const copyTextToClipboard = slash_commands.copyTextToClipboard;
 pub const defaultCopyTextToClipboard = slash_commands.defaultCopyTextToClipboard;
 pub const runClipboardCommand = slash_commands.runClipboardCommand;
@@ -185,20 +188,20 @@ pub const assistantBlocksToTextAlloc = slash_commands.assistantBlocksToTextAlloc
 pub const buildShareText = slash_commands.buildShareText;
 pub const messageToShareMarkdown = slash_commands.messageToShareMarkdown;
 pub const blocksToShareText = slash_commands.blocksToShareText;
-pub const removeStoredAuthToken = slash_commands.removeStoredAuthToken;
+pub const removeStoredAuthToken = auth_flow_mod.removeStoredAuthToken;
 pub const handleReloadSlashCommand = slash_commands.handleReloadSlashCommand;
 pub const configurePrimaryEditor = slash_commands.configurePrimaryEditor;
 pub const appendResourceDiagnostics = slash_commands.appendResourceDiagnostics;
 pub const saveSettingsEditorOverlay = slash_commands.saveSettingsEditorOverlay;
 pub const handleExportSlashCommand = slash_commands.handleExportSlashCommand;
-pub const formatSessionInfo = slash_commands.formatSessionInfo;
-pub const cloneCurrentSession = slash_commands.cloneCurrentSession;
-pub const forkCurrentSession = slash_commands.forkCurrentSession;
-pub const createDerivedSession = slash_commands.createDerivedSession;
-pub const replaceCurrentSession = slash_commands.replaceCurrentSession;
-pub const navigateTree = slash_commands.navigateTree;
-pub const findLastUserMessageIndex = slash_commands.findLastUserMessageIndex;
-pub const resolveSessionPath = slash_commands.resolveSessionPath;
+pub const formatSessionInfo = session_lifecycle.formatSessionInfo;
+pub const cloneCurrentSession = session_lifecycle.cloneCurrentSession;
+pub const forkCurrentSession = session_lifecycle.forkCurrentSession;
+pub const createDerivedSession = session_lifecycle.createDerivedSession;
+pub const replaceCurrentSession = session_lifecycle.replaceCurrentSession;
+pub const navigateTree = session_lifecycle.navigateTree;
+pub const findLastUserMessageIndex = session_lifecycle.findLastUserMessageIndex;
+pub const resolveSessionPath = session_lifecycle.resolveSessionPath;
 pub const handleInputKey = input_dispatch.handleInputKey;
 pub const handleInputKeyWithModifiers = input_dispatch.handleInputKeyWithModifiers;
 pub const submitEditorText = input_dispatch.submitEditorText;
@@ -383,7 +386,7 @@ pub fn runInteractiveMode(
             now_ms,
         );
 
-        slash_commands.pollAuthFlowCallback(
+        auth_flow_mod.pollAuthFlowCallback(
             allocator,
             io,
             env_map,
@@ -1556,7 +1559,7 @@ test "handleInputKey respects configured exit binding" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1579,7 +1582,7 @@ test "handleInputKey respects configured exit binding" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1656,7 +1659,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1682,7 +1685,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1718,7 +1721,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1819,7 +1822,7 @@ test "submitEditorText queues steering messages while streaming" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1906,7 +1909,7 @@ test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued d
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -1953,7 +1956,7 @@ test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued d
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -2038,8 +2041,8 @@ test "handleLoginSlashCommand opens auth provider selector" {
     var overlay: ?SelectorOverlay = null;
     defer if (overlay) |*value| value.deinit(allocator);
 
-    slash_commands.test_auth_flow = null;
-    try handleLoginSlashCommand(allocator, std.testing.io, &env_map, null, &state, &overlay, &slash_commands.test_auth_flow);
+    auth_flow_mod.test_auth_flow = null;
+    try handleLoginSlashCommand(allocator, std.testing.io, &env_map, null, &state, &overlay, &auth_flow_mod.test_auth_flow);
 
     try std.testing.expect(overlay != null);
     try std.testing.expect(overlay.? == .auth);
@@ -2092,34 +2095,34 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    slash_commands.test_auth_flow = null;
-    defer if (slash_commands.test_auth_flow) |*value| {
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
         value.deinit(allocator);
-        slash_commands.test_auth_flow = null;
+        auth_flow_mod.test_auth_flow = null;
     };
     var browser_open_capture = BrowserOpenCapture{};
-    const previous_browser_open_context = slash_commands.open_browser_context;
-    const previous_browser_open_fn = slash_commands.open_browser_fn;
-    slash_commands.open_browser_context = &browser_open_capture;
-    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    const previous_browser_open_context = auth_flow_mod.open_browser_context;
+    const previous_browser_open_fn = auth_flow_mod.open_browser_fn;
+    auth_flow_mod.open_browser_context = &browser_open_capture;
+    auth_flow_mod.open_browser_fn = BrowserOpenCapture.capture;
     defer {
-        slash_commands.open_browser_context = previous_browser_open_context;
-        slash_commands.open_browser_fn = previous_browser_open_fn;
+        auth_flow_mod.open_browser_context = previous_browser_open_context;
+        auth_flow_mod.open_browser_fn = previous_browser_open_fn;
     }
-    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
-    slash_commands.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
-    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    const previous_start_callback_listener_fn = auth_flow_mod.start_callback_listener_for_session_fn;
+    auth_flow_mod.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
-    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &auth_flow_mod.test_auth_flow);
+    auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try std.testing.expect(slash_commands.test_auth_flow != null);
-    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
-    try std.testing.expectEqual(auth.BrowserLoginKind.anthropic, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
-    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.anthropic, auth_flow_mod.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener != null);
     try std.testing.expect(std.mem.endsWith(
         u8,
-        slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+        auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
         "/callback",
     ));
     try std.testing.expect(browser_open_capture.called);
@@ -2150,19 +2153,19 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    slash_commands.test_auth_flow = null;
-    defer if (slash_commands.test_auth_flow) |*value| {
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
         value.deinit(allocator);
-        slash_commands.test_auth_flow = null;
+        auth_flow_mod.test_auth_flow = null;
     };
     var browser_open_capture = BrowserOpenCapture{};
-    const previous_browser_open_context = slash_commands.open_browser_context;
-    const previous_browser_open_fn = slash_commands.open_browser_fn;
-    slash_commands.open_browser_context = &browser_open_capture;
-    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    const previous_browser_open_context = auth_flow_mod.open_browser_context;
+    const previous_browser_open_fn = auth_flow_mod.open_browser_fn;
+    auth_flow_mod.open_browser_context = &browser_open_capture;
+    auth_flow_mod.open_browser_fn = BrowserOpenCapture.capture;
     defer {
-        slash_commands.open_browser_context = previous_browser_open_context;
-        slash_commands.open_browser_fn = previous_browser_open_fn;
+        auth_flow_mod.open_browser_context = previous_browser_open_context;
+        auth_flow_mod.open_browser_fn = previous_browser_open_fn;
     }
     const FailingCallbackListener = struct {
         fn start(
@@ -2176,16 +2179,16 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
             return error.AddressInUse;
         }
     };
-    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
-    slash_commands.start_callback_listener_for_session_fn = FailingCallbackListener.start;
-    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    const previous_start_callback_listener_fn = auth_flow_mod.start_callback_listener_for_session_fn;
+    auth_flow_mod.start_callback_listener_for_session_fn = FailingCallbackListener.start;
+    defer auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &slash_commands.test_auth_flow);
-    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "anthropic", null, &state, &auth_flow_mod.test_auth_flow);
+    auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try std.testing.expect(slash_commands.test_auth_flow != null);
-    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
-    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener == null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .browser_redirect);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener == null);
     try std.testing.expect(browser_open_capture.called);
     try std.testing.expectEqualStrings(
         "Local callback listener unavailable. Paste the callback URL manually, or Esc to cancel",
@@ -2198,8 +2201,8 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
         try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Could not start the local callback listener") != null);
     }
 
-    try cancelAuthFlow(allocator, &slash_commands.test_auth_flow, &state);
-    try std.testing.expect(slash_commands.test_auth_flow == null);
+    try cancelAuthFlow(allocator, &auth_flow_mod.test_auth_flow, &state);
+    try std.testing.expect(auth_flow_mod.test_auth_flow == null);
     try std.testing.expectEqualStrings("login cancelled", state.status);
 }
 
@@ -2222,39 +2225,39 @@ test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    slash_commands.test_auth_flow = null;
-    defer if (slash_commands.test_auth_flow) |*value| {
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
         value.deinit(allocator);
-        slash_commands.test_auth_flow = null;
+        auth_flow_mod.test_auth_flow = null;
     };
     var browser_open_capture = BrowserOpenCapture{};
-    const previous_browser_open_context = slash_commands.open_browser_context;
-    const previous_browser_open_fn = slash_commands.open_browser_fn;
-    slash_commands.open_browser_context = &browser_open_capture;
-    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    const previous_browser_open_context = auth_flow_mod.open_browser_context;
+    const previous_browser_open_fn = auth_flow_mod.open_browser_fn;
+    auth_flow_mod.open_browser_context = &browser_open_capture;
+    auth_flow_mod.open_browser_fn = BrowserOpenCapture.capture;
     defer {
-        slash_commands.open_browser_context = previous_browser_open_context;
-        slash_commands.open_browser_fn = previous_browser_open_fn;
+        auth_flow_mod.open_browser_context = previous_browser_open_context;
+        auth_flow_mod.open_browser_fn = previous_browser_open_fn;
     }
-    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
-    slash_commands.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
-    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    const previous_start_callback_listener_fn = auth_flow_mod.start_callback_listener_for_session_fn;
+    auth_flow_mod.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "openai-codex", .oauth, &state, &slash_commands.test_auth_flow);
-    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "openai-codex", .oauth, &state, &auth_flow_mod.test_auth_flow);
+    auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try std.testing.expect(slash_commands.test_auth_flow != null);
-    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
-    try std.testing.expectEqual(auth.BrowserLoginKind.openai_codex, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
-    try std.testing.expectEqualStrings("openai-codex", slash_commands.test_auth_flow.?.browser_redirect.session.provider_id);
+    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.openai_codex, auth_flow_mod.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expectEqualStrings("openai-codex", auth_flow_mod.test_auth_flow.?.browser_redirect.session.provider_id);
     try std.testing.expectEqualStrings(
         "ChatGPT Plus/Pro (Codex Subscription)",
-        slash_commands.test_auth_flow.?.browser_redirect.session.provider_name,
+        auth_flow_mod.test_auth_flow.?.browser_redirect.session.provider_name,
     );
-    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener != null);
     try std.testing.expect(std.mem.endsWith(
         u8,
-        slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+        auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
         "/auth/callback",
     ));
     try std.testing.expect(browser_open_capture.called);
@@ -2282,15 +2285,15 @@ test "beginLoginFlow gives google client config guidance without legacy oauth co
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    slash_commands.test_auth_flow = null;
-    defer if (slash_commands.test_auth_flow) |*value| {
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
         value.deinit(allocator);
-        slash_commands.test_auth_flow = null;
+        auth_flow_mod.test_auth_flow = null;
     };
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &slash_commands.test_auth_flow);
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &auth_flow_mod.test_auth_flow);
 
-    try std.testing.expect(slash_commands.test_auth_flow == null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow == null);
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
@@ -2333,36 +2336,36 @@ test "beginLoginFlow starts google oauth flow with fake safe client config" {
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    slash_commands.test_auth_flow = null;
-    defer if (slash_commands.test_auth_flow) |*value| {
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
         value.deinit(allocator);
-        slash_commands.test_auth_flow = null;
+        auth_flow_mod.test_auth_flow = null;
     };
     var browser_open_capture = BrowserOpenCapture{};
-    const previous_browser_open_context = slash_commands.open_browser_context;
-    const previous_browser_open_fn = slash_commands.open_browser_fn;
-    slash_commands.open_browser_context = &browser_open_capture;
-    slash_commands.open_browser_fn = BrowserOpenCapture.capture;
+    const previous_browser_open_context = auth_flow_mod.open_browser_context;
+    const previous_browser_open_fn = auth_flow_mod.open_browser_fn;
+    auth_flow_mod.open_browser_context = &browser_open_capture;
+    auth_flow_mod.open_browser_fn = BrowserOpenCapture.capture;
     defer {
-        slash_commands.open_browser_context = previous_browser_open_context;
-        slash_commands.open_browser_fn = previous_browser_open_fn;
+        auth_flow_mod.open_browser_context = previous_browser_open_context;
+        auth_flow_mod.open_browser_fn = previous_browser_open_fn;
     }
-    const previous_start_callback_listener_fn = slash_commands.start_callback_listener_for_session_fn;
-    slash_commands.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
-    defer slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    const previous_start_callback_listener_fn = auth_flow_mod.start_callback_listener_for_session_fn;
+    auth_flow_mod.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &slash_commands.test_auth_flow);
-    slash_commands.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &auth_flow_mod.test_auth_flow);
+    auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
 
-    try std.testing.expect(slash_commands.test_auth_flow != null);
-    try std.testing.expect(slash_commands.test_auth_flow.? == .browser_redirect);
-    try std.testing.expectEqual(auth.BrowserLoginKind.google_gemini_cli, slash_commands.test_auth_flow.?.browser_redirect.session.kind);
-    try std.testing.expectEqualStrings("google-gemini-cli", slash_commands.test_auth_flow.?.browser_redirect.session.provider_id);
-    try std.testing.expectEqualStrings("fake-google-client", slash_commands.test_auth_flow.?.browser_redirect.session.oauth_client.client_id);
-    try std.testing.expect(slash_commands.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.google_gemini_cli, auth_flow_mod.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expectEqualStrings("google-gemini-cli", auth_flow_mod.test_auth_flow.?.browser_redirect.session.provider_id);
+    try std.testing.expectEqualStrings("fake-google-client", auth_flow_mod.test_auth_flow.?.browser_redirect.session.oauth_client.client_id);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener != null);
     try std.testing.expect(std.mem.endsWith(
         u8,
-        slash_commands.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+        auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
         "/oauth2callback",
     ));
     try std.testing.expect(browser_open_capture.called);
@@ -2385,17 +2388,17 @@ test "beginLoginFlow starts API key prompt state for built-in provider" {
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
 
-    slash_commands.test_auth_flow = null;
-    defer if (slash_commands.test_auth_flow) |*value| {
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
         value.deinit(allocator);
-        slash_commands.test_auth_flow = null;
+        auth_flow_mod.test_auth_flow = null;
     };
 
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "openai", null, &state, &slash_commands.test_auth_flow);
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "openai", null, &state, &auth_flow_mod.test_auth_flow);
 
-    try std.testing.expect(slash_commands.test_auth_flow != null);
-    try std.testing.expect(slash_commands.test_auth_flow.? == .api_key);
-    try std.testing.expectEqualStrings("openai", slash_commands.test_auth_flow.?.api_key.provider_id);
+    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .api_key);
+    try std.testing.expectEqualStrings("openai", auth_flow_mod.test_auth_flow.?.api_key.provider_id);
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
@@ -2668,7 +2671,7 @@ test "handleInputKey opens structured settings overlay and explicit raw settings
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -2710,7 +2713,7 @@ test "handleInputKey opens structured settings overlay and explicit raw settings
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -2738,7 +2741,7 @@ test "handleInputKey opens structured settings overlay and explicit raw settings
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -2920,8 +2923,8 @@ test "theme slash command is registered switches immediately and persists select
     var live_resources = LiveResources.init(options);
     defer live_resources.deinit(allocator);
 
-    const parsed = slash_commands.parseSlashCommand("/theme codex") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(slash_commands.SlashCommandKind.theme, parsed.kind);
+    const parsed = command_router.parseSlashCommand("/theme codex") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(command_router.SlashCommandKind.theme, parsed.kind);
     try std.testing.expectEqualStrings("codex", parsed.argument.?);
 
     var overlay: ?SelectorOverlay = null;
@@ -3128,7 +3131,7 @@ test "handleInputKey appends hotkeys markdown for slash hotkeys command" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3212,7 +3215,7 @@ test "handleInputKey opens model overlay for slash model command" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3423,7 +3426,7 @@ test "handleInputKey opens scoped model overlay for slash scoped-models command"
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3508,7 +3511,7 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3532,7 +3535,7 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3555,7 +3558,7 @@ test "handleInputKey scoped model overlay supports navigation and selection" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3627,7 +3630,7 @@ test "handleInputKey reports when scoped models are not configured" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3699,7 +3702,7 @@ test "handleInputKey reports unknown slash commands" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3773,7 +3776,7 @@ test "handleInputKey updates session name for slash name command" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3857,7 +3860,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3887,7 +3890,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3930,7 +3933,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -3960,7 +3963,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4039,7 +4042,7 @@ test "submitEditorText resets editor autocomplete state after submit" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4137,7 +4140,7 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4241,7 +4244,7 @@ test "submitEditorText includes pending clipboard images and clears the draft at
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4449,7 +4452,7 @@ test "handleInputKey shows session stats for slash session command" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4580,7 +4583,7 @@ test "handleInputKey appends condensed changelog markdown for slash changelog co
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4741,7 +4744,7 @@ test "handleInputKey imports a session from an explicit jsonl path" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4833,7 +4836,7 @@ test "handleInputKey starts a fresh session for slash new command" {
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4935,7 +4938,7 @@ test "handleInputKey exports session transcript to explicit html and jsonl paths
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,
@@ -4966,7 +4969,7 @@ test "handleInputKey exports session transcript to explicit html and jsonl paths
         &state,
         &editor,
         &overlay,
-        &slash_commands.test_auth_flow,
+        &auth_flow_mod.test_auth_flow,
         &prompt_worker,
         &prompt_worker_active,
         subscriber,

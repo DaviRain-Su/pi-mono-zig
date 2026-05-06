@@ -13,6 +13,10 @@ extension compatibility layer.
 The Zig implementation is now usable for the main coding-agent workflows:
 
 - interactive mode and print mode
+- interactive-mode login/auth, session lifecycle, and slash command routing
+  are split into focused Zig helper modules while preserving current behavior
+- interactive input dispatch has a distinct key-resolution module and an
+  exhaustive app-action executor, preserving configurable keybinding behavior
 - JSON event output
 - TS-RPC mode with golden parity coverage
 - session create / continue / resume / fork / clone
@@ -137,8 +141,10 @@ Useful existing harnesses:
 
 - `zig build test`
 - `zig build test-coding-agent`
+- `zig build test-tui`
 - `zig build test-cross-area`
 - `zig build test-ts-rpc-parity`
+- `zig build test-tidy`
 - `zig/test/openai-chat-parity.sh`
 - `zig/test/openai-responses-parity.sh`
 - `zig/test/bedrock-parity.sh`

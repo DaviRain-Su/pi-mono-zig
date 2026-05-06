@@ -83,29 +83,57 @@ steps.
 
 ### 5. Interactive Mode Decomposition
 
+Status: Started/current slice complete. Login/auth flow, session lifecycle, and
+slash command routing now live in focused interactive-mode helper modules:
+`auth_flow.zig`, `session_lifecycle.zig`, and `command_router.zig`. The parent
+interactive loop remains responsible for orchestration, while the extracted
+helpers preserve the existing login/logout, session, and command matrix
+behavior. Extension bridge coordination remains intentionally deferred because
+extension ABI/protocol work is active separately.
+
 - Continue splitting `interactive_mode.zig` by domain:
-  - login/auth flow.
-  - session lifecycle.
-  - command routing.
+  - login/auth flow. Completed for the current behavior-preserving slice.
+  - session lifecycle. Completed for the current behavior-preserving slice.
+  - command routing. Completed for the current behavior-preserving slice.
   - event loop orchestration.
   - extension bridge coordination.
 - Keep orchestration functions near the top and push helper logic down or out.
 
 Acceptance criteria:
 
-- New modules have focused tests.
-- Event-loop behavior remains covered by existing integration scripts.
+- New modules have focused tests or are covered by existing focused
+  login/logout/session/command fixtures through `zig build test-coding-agent`.
+- Event-loop behavior remains covered by existing integration scripts, including
+  `test-tui`, `test-vaxis-m8-e2e`, and missing-cwd selector validation.
 
 ### 6. Input Dispatch Decomposition
 
-- Split key-to-action resolution from action execution.
-- Keep configurable keybindings as the only source of key matching.
-- Add compile-time or tidy checks for `Action` coverage where practical.
+Status: Completed/currently covered for the Task 6 slice. Key-to-action
+resolution now lives behind the focused `input_resolution.zig` resolver, while
+`input_dispatch.zig` remains the executor/dispatcher for resolved app/editor
+actions and input-event message actions. Configured keybindings remain the only
+source of non-legacy matching, and legacy defaults are suppressed when an
+effective keybinding map rebinds those actions.
+
+- Split key-to-action resolution from action execution. Completed for main
+  editor, autocomplete, parsed input-event follow-up/dequeue, and app/editor
+  dispatch paths.
+- Keep configurable keybindings as the only source of key matching. Covered by
+  resolver tests plus existing input-dispatch configured/rebound behavior tests.
+- Add compile-time or tidy checks for `Action` coverage where practical. The
+  main app-action executor now uses an exhaustive `Action` switch with explicit
+  no-op coverage for overlay-scoped actions, so adding an action requires
+  dispatch review at compile time.
+- Leave overlay-internal selector key execution behavior-preserving in this
+  slice; broader extension bridge coordination and extension ABI/protocol
+  refactors remain deferred to their own follow-up work.
 
 Acceptance criteria:
 
 - No hardcoded key checks are introduced.
 - Adding an `Action` forces review of dispatch coverage.
+- Focused validation: `zig build test-coding-agent` covers resolver behavior,
+  configured bindings, rebound old defaults, and dispatch-event message actions.
 
 ### 7. Provider Internal Shape
 

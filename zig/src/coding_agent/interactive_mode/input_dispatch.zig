@@ -13,6 +13,10 @@ const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
 const prompt_worker_mod = @import("prompt_worker.zig");
 const slash_commands = @import("slash_commands.zig");
+const command_router = @import("command_router.zig");
+const input_resolution = @import("input_resolution.zig");
+const auth_flow_mod = @import("auth_flow.zig");
+const session_lifecycle = @import("session_lifecycle.zig");
 const tree_overlay_mod = @import("tree_overlay.zig");
 const extension_dialog = @import("extension_dialog.zig");
 const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
@@ -46,24 +50,25 @@ const reorderScopedModel = overlays.reorderScopedModel;
 const loadTreeOverlay = overlays.loadTreeOverlay;
 const AppState = rendering.AppState;
 const PromptWorker = prompt_worker_mod.PromptWorker;
-const parseSlashCommand = slash_commands.parseSlashCommand;
-const handleSlashCommand = slash_commands.handleSlashCommand;
+const parseSlashCommand = command_router.parseSlashCommand;
+const handleSlashCommand = command_router.handleSlashCommand;
 const saveSettingsEditorOverlay = slash_commands.saveSettingsEditorOverlay;
 const handleSettingsOverlayKey = slash_commands.handleSettingsOverlayKey;
 const persistEnabledModelSelection = slash_commands.persistEnabledModelSelection;
-const switchSession = slash_commands.switchSession;
+const switchSession = session_lifecycle.switchSession;
 const switchModel = slash_commands.switchModel;
-const handleNewSlashCommand = slash_commands.handleNewSlashCommand;
-const loadForkOverlayOrStatus = slash_commands.loadForkOverlayOrStatus;
-const forkCurrentSessionBeforeUserMessage = slash_commands.forkCurrentSessionBeforeUserMessage;
+const handleNewSlashCommand = session_lifecycle.handleNewSlashCommand;
+const loadForkOverlayOrStatus = session_lifecycle.loadForkOverlayOrStatus;
+const forkCurrentSessionBeforeUserMessage = session_lifecycle.forkCurrentSessionBeforeUserMessage;
 const applyThemeByName = slash_commands.applyThemeByName;
-const navigateTree = slash_commands.navigateTree;
-const beginLoginFlow = slash_commands.beginLoginFlow;
-const logoutProviderById = slash_commands.logoutProviderById;
-const cancelAuthFlow = slash_commands.cancelAuthFlow;
-const submitAuthFlowInput = slash_commands.submitAuthFlowInput;
-const BUILTIN_SLASH_COMMANDS = slash_commands.BUILTIN_SLASH_COMMANDS;
+const navigateTree = session_lifecycle.navigateTree;
+const beginLoginFlow = auth_flow_mod.beginLoginFlow;
+const logoutProviderById = auth_flow_mod.logoutProviderById;
+const cancelAuthFlow = auth_flow_mod.cancelAuthFlow;
+const submitAuthFlowInput = auth_flow_mod.submitAuthFlowInput;
+const BUILTIN_SLASH_COMMANDS = command_router.BUILTIN_SLASH_COMMANDS;
 const AppContext = shared.AppContext;
+const ResolvedInputKey = input_resolution.ResolvedInputKey;
 
 pub fn handleInputKey(
     allocator: std.mem.Allocator,
@@ -455,31 +460,33 @@ pub fn handleInputKeyWithModifiers(
     }
 
     if (editor.isShowingAutocomplete()) {
-        if (resolveEditorAction(live_resources.keybindings, key, modifiers)) |editor_action| {
-            try handleEditorAction(
-                allocator,
-                io,
-                env_map,
-                editor_action,
-                session,
-                current_provider,
-                session_dir,
-                options,
-                tool_items,
-                app_state,
-                editor,
-                overlay,
-                auth_flow,
-                prompt_worker,
-                prompt_worker_active,
-                subscriber,
-                should_exit,
-                live_resources,
-            );
-            return;
-        }
-        if (live_resources.keybindings != null and keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) != null) {
-            return;
+        switch (input_resolution.resolveInputKey(live_resources.keybindings, key, modifiers, .autocomplete)) {
+            .editor_action => |editor_action| {
+                try handleEditorAction(
+                    allocator,
+                    io,
+                    env_map,
+                    editor_action,
+                    session,
+                    current_provider,
+                    session_dir,
+                    options,
+                    tool_items,
+                    app_state,
+                    editor,
+                    overlay,
+                    auth_flow,
+                    prompt_worker,
+                    prompt_worker_active,
+                    subscriber,
+                    should_exit,
+                    live_resources,
+                );
+                return;
+            },
+            .suppress_legacy_editor_default => return,
+            .pass_to_editor => {},
+            .app_action, .submit_enter, .suppress_legacy_app_default => unreachable,
         }
     }
 
@@ -488,38 +495,79 @@ pub fn handleInputKeyWithModifiers(
         return;
     }
 
-    if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
-        if (action == .clipboard_pasteImage) {
-            try handlePasteImageAction(allocator, io, env_map, app_state);
-            return;
-        }
-        try handleAppAction(
-            allocator,
-            io,
-            env_map,
-            action,
-            session,
-            current_provider,
-            session_dir,
-            options,
-            live_resources.runtime_config,
-            app_state,
-            overlay,
-            editor,
-            prompt_worker_active,
-            tool_items,
-            subscriber,
-            should_exit,
-            app_context,
-        );
-        return;
-    }
-    if (live_resources.keybindings != null and isLegacyParsedAppActionKey(key, modifiers)) {
-        return;
-    }
+    try executeResolvedInputKey(
+        allocator,
+        io,
+        env_map,
+        input_resolution.resolveInputKey(live_resources.keybindings, key, modifiers, .normal),
+        key,
+        session,
+        current_provider,
+        session_dir,
+        options,
+        tool_items,
+        app_state,
+        editor,
+        overlay,
+        auth_flow,
+        prompt_worker,
+        prompt_worker_active,
+        subscriber,
+        should_exit,
+        app_context,
+        live_resources,
+    );
+}
 
-    if (resolveEditorAction(live_resources.keybindings, key, modifiers)) |editor_action| {
-        try handleEditorAction(
+fn executeResolvedInputKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    resolved: ResolvedInputKey,
+    key: tui.Key,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    app_context: *AppContext,
+    live_resources: *LiveResources,
+) !void {
+    switch (resolved) {
+        .app_action => |action| {
+            if (action == .clipboard_pasteImage) {
+                try handlePasteImageAction(allocator, io, env_map, app_state);
+                return;
+            }
+            try handleAppAction(
+                allocator,
+                io,
+                env_map,
+                action,
+                session,
+                current_provider,
+                session_dir,
+                options,
+                live_resources.runtime_config,
+                app_state,
+                overlay,
+                editor,
+                prompt_worker_active,
+                tool_items,
+                subscriber,
+                should_exit,
+                app_context,
+            );
+        },
+        .editor_action => |editor_action| try handleEditorAction(
             allocator,
             io,
             env_map,
@@ -538,57 +586,48 @@ pub fn handleInputKeyWithModifiers(
             subscriber,
             should_exit,
             live_resources,
-        );
-        return;
-    }
-    if (live_resources.keybindings != null and keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) != null) {
-        return;
-    }
-
-    switch (key) {
-        .enter => {
-            if (!modifiers.hasAny()) {
-                try submitEditorIfNotEmpty(
-                    allocator,
-                    io,
-                    env_map,
-                    session,
-                    current_provider,
-                    session_dir,
-                    options,
-                    tool_items,
-                    app_state,
-                    editor,
-                    overlay,
-                    auth_flow,
-                    prompt_worker,
-                    prompt_worker_active,
-                    subscriber,
-                    should_exit,
-                    live_resources,
-                );
-                return;
-            }
-        },
-        else => {},
-    }
-
-    const handled = try editor.handleKey(key);
-    switch (handled) {
-        .interrupt => try handleInterruptAction(
+        ),
+        .submit_enter => try submitEditorIfNotEmpty(
             allocator,
+            io,
+            env_map,
             session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
             app_state,
             editor,
             overlay,
+            auth_flow,
+            prompt_worker,
             prompt_worker_active,
-            live_resources.runtime_config,
+            subscriber,
+            should_exit,
+            live_resources,
         ),
-        .exit => {
-            should_exit.* = true;
-            if (prompt_worker_active.*) session.agent.abort();
+        .suppress_legacy_app_default,
+        .suppress_legacy_editor_default,
+        => return,
+        .pass_to_editor => {
+            const handled = try editor.handleKey(key);
+            switch (handled) {
+                .interrupt => try handleInterruptAction(
+                    allocator,
+                    session,
+                    app_state,
+                    editor,
+                    overlay,
+                    prompt_worker_active,
+                    live_resources.runtime_config,
+                ),
+                .exit => {
+                    should_exit.* = true;
+                    if (prompt_worker_active.*) session.agent.abort();
+                },
+                else => {},
+            }
         },
-        else => {},
     }
 }
 
@@ -1152,7 +1191,7 @@ fn selectorInteractionBlocked(session: *const session_mod.AgentSession, prompt_w
     return prompt_worker_active.* or session.isStreaming() or session.isCompacting() or session.isRetrying();
 }
 
-fn selectorSlashBlockStatus(kind: slash_commands.SlashCommandKind) ?[]const u8 {
+fn selectorSlashBlockStatus(kind: command_router.SlashCommandKind) ?[]const u8 {
     return switch (kind) {
         .settings => "wait for the current response to finish before opening settings",
         .model => "wait for the current response to finish before switching models",
@@ -1637,15 +1676,6 @@ pub fn consumeInputBytes(buffer: *std.ArrayList(u8), consumed: usize) void {
     buffer.items.len -= consumed;
 }
 
-fn resolveEditorAction(
-    keybindings: ?*const keybindings_mod.Keybindings,
-    key: tui.Key,
-    modifiers: tui.keys.KeyModifiers,
-) ?keybindings_mod.EditorAction {
-    if (keybindings) |bindings| return bindings.editorActionForKeyWithModifiers(key, modifiers);
-    return keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers);
-}
-
 fn toTuiEditorAction(action: keybindings_mod.EditorAction) ?tui.components.editor.EditorAction {
     return switch (action) {
         .cursor_up => .cursor_up,
@@ -1809,8 +1839,7 @@ fn handleEditorAction(
 }
 
 pub fn resolveAppAction(keybindings: ?*const keybindings_mod.Keybindings, key: tui.Key) ?keybindings_mod.Action {
-    if (keybindings) |bindings| return bindings.actionForKey(key);
-    return legacyAppActionForKey(key);
+    return input_resolution.resolveAppAction(keybindings, key);
 }
 
 pub fn resolveParsedAppAction(
@@ -1818,71 +1847,26 @@ pub fn resolveParsedAppAction(
     key: tui.Key,
     modifiers: tui.keys.KeyModifiers,
 ) ?keybindings_mod.Action {
-    if (keybindings) |bindings| return bindings.actionForKeyWithModifiers(key, modifiers);
-    return legacyParsedAppActionForKey(key, modifiers);
+    return input_resolution.resolveParsedAppAction(keybindings, key, modifiers);
 }
 
 pub fn legacyAppActionForKey(key: tui.Key) ?keybindings_mod.Action {
-    return legacyParsedAppActionForKey(key, .{});
+    return input_resolution.legacyAppActionForKey(key);
 }
 
 pub fn legacyParsedAppActionForKey(
     key: tui.Key,
     modifiers: tui.keys.KeyModifiers,
 ) ?keybindings_mod.Action {
-    if (modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super) {
-        return switch (key) {
-            .enter => .message_followUp,
-            .up => .message_dequeue,
-            else => null,
-        };
-    }
-
-    if (modifiers.shift and !modifiers.alt and !modifiers.ctrl and !modifiers.super) {
-        return switch (key) {
-            .shift_tab => .thinking_cycle,
-            else => null,
-        };
-    }
-
-    if (modifiers.shift and modifiers.ctrl and !modifiers.alt and !modifiers.super) {
-        return switch (key) {
-            .ctrl => |ctrl| switch (ctrl) {
-                'p' => .model_cycleBackward,
-                else => null,
-            },
-            else => null,
-        };
-    }
-
-    if (modifiers.hasAny()) return null;
-
-    return switch (key) {
-        .ctrl => |ctrl| switch (ctrl) {
-            'c' => .clear,
-            'd' => .exit,
-            'l' => .model_select,
-            'o' => .tools_expand,
-            't' => .thinking_toggle,
-            'n' => .session_toggleNamedFilter,
-            'g' => .editor_external,
-            'v' => .clipboard_pasteImage,
-            'z' => .app_suspend,
-            'p' => .model_cycleForward,
-            else => null,
-        },
-        .escape => .interrupt,
-        .shift_tab => .thinking_cycle,
-        else => null,
-    };
+    return input_resolution.legacyParsedAppActionForKey(key, modifiers);
 }
 
 pub fn isLegacyAppActionKey(key: tui.Key) bool {
-    return legacyAppActionForKey(key) != null;
+    return input_resolution.isLegacyAppActionKey(key);
 }
 
 pub fn isLegacyParsedAppActionKey(key: tui.Key, modifiers: tui.keys.KeyModifiers) bool {
-    return legacyParsedAppActionForKey(key, modifiers) != null;
+    return input_resolution.isLegacyParsedAppActionKey(key, modifiers);
 }
 
 const CLEAR_DOUBLE_PRESS_WINDOW_MS: i64 = 500;
@@ -2262,9 +2246,40 @@ pub fn handleAppAction(
             }
             overlay.* = try loadModelOverlay(allocator, env_map, session.agent.getModel(), current_provider, effectiveScopedModelPatterns(app_state, options, runtime_config), runtime_config);
         },
+        // These actions are executed by dispatchInputEvent so they can consume the exact
+        // parsed byte sequence. They remain explicit here to keep Action dispatch
+        // coverage exhaustive when the enum changes.
         .message_followUp, .message_dequeue => {},
+        // Clipboard image paste is handled before the app dispatcher because it
+        // depends only on environment/clipboard state, not session execution state.
         .clipboard_pasteImage => {},
-        else => {},
+        // Overlay-scoped actions are resolved and executed only by their overlay
+        // dispatchers. Listing each action here makes new Action variants require
+        // deliberate main-editor dispatch coverage at compile time.
+        .session_toggleNamedFilter,
+        .tree_foldOrUp,
+        .tree_unfoldOrDown,
+        .tree_editLabel,
+        .tree_toggleLabelTimestamp,
+        .session_togglePath,
+        .session_toggleSort,
+        .session_rename,
+        .session_delete,
+        .session_deleteNoninvasive,
+        .models_save,
+        .models_enableAll,
+        .models_clearAll,
+        .models_toggleProvider,
+        .models_reorderUp,
+        .models_reorderDown,
+        .tree_filter_default,
+        .tree_filter_noTools,
+        .tree_filter_userOnly,
+        .tree_filter_labeledOnly,
+        .tree_filter_all,
+        .tree_filter_cycleForward,
+        .tree_filter_cycleBackward,
+        => {},
     }
 }
 
@@ -2774,6 +2789,138 @@ test "configured editor keybindings drive movement and submit while old defaults
     try harness.press(.{ .ctrl = 'j' }, .{});
     try std.testing.expectEqualStrings("", harness.editor.text());
     try std.testing.expect(harness.state.items.items.len > 0);
+}
+
+test "dispatch input event resolves message actions from configured bindings only" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setBinding(.message_followUp, &.{.{ .ctrl = 'r' }});
+    try custom_keybindings.setBinding(.message_dequeue, &.{.{ .ctrl = 'e' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    var input_buffer = std.ArrayList(u8).empty;
+    defer input_buffer.deinit(allocator);
+    var app_context = AppContext.init(cwd, std.testing.io);
+
+    _ = try harness.editor.handlePaste("/hotkeys");
+    const items_before_old_default = harness.state.items.items.len;
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .event = .{ .key = .enter }, .consumed = 0, .modifiers = .{ .alt = true } },
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &input_buffer,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("/hotkeys", harness.editor.text());
+    try std.testing.expectEqual(items_before_old_default, harness.state.items.items.len);
+
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .event = .{ .key = .{ .ctrl = 'r' } }, .consumed = 0 },
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &input_buffer,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("", harness.editor.text());
+    try std.testing.expect(harness.state.items.items.len > 0);
+
+    try harness.session.followUp("queued", &.{});
+    try harness.state.appendQueuedMessage(.follow_up, "queued");
+    _ = try harness.editor.handlePaste("draft");
+
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .event = .{ .key = .up }, .consumed = 0, .modifiers = .{ .alt = true } },
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &input_buffer,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("draft", harness.editor.text());
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_follow_up.items.len);
+
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .event = .{ .key = .{ .ctrl = 'e' } }, .consumed = 0 },
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &input_buffer,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqualStrings("queued\n\ndraft", harness.editor.text());
+    try std.testing.expectEqual(@as(usize, 0), harness.state.queued_follow_up.items.len);
 }
 
 test "enter inserts newline after trailing backslash and shift enter inserts newline" {

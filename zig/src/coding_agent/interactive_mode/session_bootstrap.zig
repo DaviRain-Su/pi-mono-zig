@@ -6,7 +6,7 @@ const session_cwd = @import("../session_cwd.zig");
 const session_manager_mod = @import("../session_manager.zig");
 const session_mod = @import("../session.zig");
 const shared = @import("shared.zig");
-const slash_commands = @import("slash_commands.zig");
+const session_lifecycle = @import("session_lifecycle.zig");
 const tool_adapters = @import("tool_adapters.zig");
 
 const AppContext = shared.AppContext;
@@ -15,8 +15,8 @@ const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 const configuredApiKeyForProvider = shared.configuredApiKeyForProvider;
 const configuredCompactionSettings = shared.configuredCompactionSettings;
 const configuredRetrySettings = shared.configuredRetrySettings;
-const createSeededSession = slash_commands.createSeededSession;
-const resolveSessionPath = slash_commands.resolveSessionPath;
+const createSeededSession = session_lifecycle.createSeededSession;
+const resolveSessionPath = session_lifecycle.resolveSessionPath;
 
 /// Computes the session file path that `openInitialSessionWithMissingCwd`
 /// would open for `options`, without resolving providers, models, or tools.
