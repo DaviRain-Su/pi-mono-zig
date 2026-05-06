@@ -1019,6 +1019,15 @@ const native_static_descriptor: NativeDescriptor = .{
     .tools = &.{native_static_tool},
 };
 
+const native_preready_tool: NativeToolDefinition = .{
+    .name = "native.fixture.preready",
+    .label = "Native Preready Tool",
+    .description = "Attempts to register before readiness.",
+    .input_schema_json = "{\"type\":\"object\"}",
+    .extension_path = "native://fixture/preready",
+    .execute = nativeFixtureEchoExecute,
+};
+
 const native_partial_failure_tool: NativeToolDefinition = .{
     .name = "native.fixture.partial",
     .label = "Native Partial Fixture",
@@ -1049,6 +1058,22 @@ fn nativeFailAfterReadyRegistryAndUi(api: *NativeHostApi) !void {
     try api.requestUi("native-partial-pending", "input", true, "{\"prompt\":\"partial\"}");
     return error.NativeFixtureInjectedFailure;
 }
+
+fn nativeReadyBoundaryStart(api: *NativeHostApi) !void {
+    try api.registerTool(native_preready_tool);
+    try api.ready();
+    try api.ready();
+    try api.registerTool(native_static_tool);
+}
+
+const native_ready_boundary_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-ready-boundary",
+    .name = "Native Ready Boundary Fixture",
+    .version = "0.1.0",
+    .description = "Native fixture that attempts pre-ready and duplicate-ready registration",
+    .tools = &.{ native_preready_tool, native_static_tool },
+    .start = nativeReadyBoundaryStart,
+};
 
 const native_partial_failure_descriptor: NativeDescriptor = .{
     .id = "com.pi.native-partial-failure",
@@ -1084,6 +1109,21 @@ const native_host_api_boundary_descriptor: NativeDescriptor = .{
     .description = "Native fixture that exercises declared host API boundaries",
     .tools = &.{native_static_tool},
     .start = nativeHostApiBoundaryStart,
+};
+
+fn nativeInstanceIsolationStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_static_tool);
+    try api.requestUi("native-shared-pending", "input", true, "{\"prompt\":\"native-instance\"}");
+}
+
+const native_instance_isolation_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-instance-isolation",
+    .name = "Native Instance Isolation Fixture",
+    .version = "0.1.0",
+    .description = "Native fixture used to prove same-module adapter instance isolation",
+    .tools = &.{native_static_tool},
+    .start = nativeInstanceIsolationStart,
 };
 
 fn expectNativeStaticRegistry(context: ?*anyopaque, registry: *const Registry) !void {
@@ -1334,6 +1374,32 @@ test "native descriptor capability and resource metadata remains default deny" {
     try adapter.withRegistry(null, expectNativeStaticRegistry);
 }
 
+test "native runtime preserves ready boundary duplicate readiness and deterministic snapshots" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_ready_boundary_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try std.testing.expectEqual(RuntimeKind.native, adapter.kind);
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 2), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCategoryCount(.host_error));
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCategoryCount(.duplicate_ready));
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "native.fixture.preready"));
+
+    const snapshot_one = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_one);
+    const snapshot_two = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_two);
+    try std.testing.expectEqualStrings(snapshot_one, snapshot_two);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "\"name\":\"native.fixture.echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "native.fixture.preready") == null);
+}
+
 test "native descriptor rejects dynamic runtime and product policy fields" {
     const allocator = std.testing.allocator;
     const forbidden_descriptors = [_]NativeDescriptor{
@@ -1478,6 +1544,67 @@ test "native host API privileged operations are explicit default-deny boundaries
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"native.fixture.echo\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "native-denied") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "blocked") == null);
+}
+
+test "native runtime same descriptor instances isolate registry pending diagnostics and shutdown" {
+    const allocator = std.testing.allocator;
+    const first = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_instance_isolation_descriptor,
+    } });
+    defer first.deinit();
+    const second = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_instance_isolation_descriptor,
+    } });
+    defer second.deinit();
+
+    try first.waitForReady(0);
+    try second.waitForReady(0);
+    try std.testing.expectEqual(RuntimeKind.native, first.kind);
+    try std.testing.expectEqual(RuntimeKind.native, second.kind);
+    try std.testing.expectEqual(@as(usize, 1), first.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 1), second.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 1), first.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), second.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), first.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 0), second.diagnosticCount());
+
+    try first.sendExtensionUiResponse("native-shared-pending", "{\"ok\":true}");
+    try std.testing.expectEqual(@as(usize, 0), first.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), second.pendingCount());
+
+    var first_tool = (try first.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &first_tool);
+    var invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":false}", .{});
+    defer invalid_params.deinit();
+    const invalid = try first_tool.execute.?(allocator, "native-first-invalid", invalid_params.value, first_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, invalid.content);
+    try std.testing.expectEqual(@as(usize, 1), first.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 0), second.diagnosticCount());
+
+    const second_snapshot_before_first_shutdown = try second.snapshotRegistryJson(allocator);
+    defer allocator.free(second_snapshot_before_first_shutdown);
+    try first.shutdown();
+    try std.testing.expect(first.hasShutdownComplete());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try first.agentTool(allocator, "native.fixture.echo"));
+    try std.testing.expectEqual(@as(usize, 1), second.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), second.registryFramesApplied());
+    try second.withRegistry(null, expectNativeStaticRegistry);
+    const second_snapshot_after_first_shutdown = try second.snapshotRegistryJson(allocator);
+    defer allocator.free(second_snapshot_after_first_shutdown);
+    try std.testing.expectEqualStrings(second_snapshot_before_first_shutdown, second_snapshot_after_first_shutdown);
+
+    var second_tool = (try second.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &second_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"second\"}", .{});
+    defer success_params.deinit();
+    const success = try second_tool.execute.?(allocator, "native-second-success", success_params.value, second_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"second\"}", success.content[0].text.text);
+
+    try second.sendExtensionUiResponse("native-shared-pending", "{\"ok\":true}");
+    try std.testing.expectEqual(@as(usize, 0), second.pendingCount());
+    try second.shutdown();
+    try std.testing.expect(second.hasShutdownComplete());
 }
 
 test "wasm manifest handoff starts runtime without capability execution" {
@@ -1944,6 +2071,57 @@ test "process_jsonl runtime adapter preserves registry UI response event and shu
     const child_cwd = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, cwd_path, allocator, .unlimited);
     defer allocator.free(child_cwd);
     try std.testing.expect(std.mem.eql(u8, "/tmp\n", child_cwd) or std.mem.eql(u8, "/private/tmp\n", child_cwd));
+}
+
+test "process_jsonl runtime adapter applies duplicate and unregister registry frames deterministically" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_tool\",\"name\":\"duplicate-tool\",\"label\":\"Tool One\",\"description\":\"first\",\"parameters\":{\"type\":\"object\",\"properties\":{\"first\":{\"type\":\"string\"}}},\"extensionPath\":\"fixture/duplicate.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_tool\",\"name\":\"duplicate-tool\",\"label\":\"Tool Two\",\"description\":\"second\",\"parameters\":{\"type\":\"object\",\"properties\":{\"second\":{\"type\":\"string\"}}},\"extensionPath\":\"fixture/duplicate.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_provider\",\"name\":\"duplicate-provider\",\"displayName\":\"Duplicate Provider\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"first\",\"name\":\"First\"}],\"extensionPath\":\"fixture/duplicate.ts\"}\\n'; " ++
+        "printf '{\"type\":\"unregister_provider\",\"name\":\"missing-provider\"}\\n'; " ++
+        "printf '{\"type\":\"unregister_provider\",\"name\":\"duplicate-provider\"}\\n'; " ++
+        "printf '{\"type\":\"clear_extension_registrations\",\"extensionPath\":\"fixture/missing.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_tool\",\"label\":\"missing name\",\"extensionPath\":\"fixture/duplicate.ts\"}\\n'; " ++
+        "printf '{\"type\":\"unsupported_registry_frame\"}\\n'; " ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-runtime-duplicate-registry" };
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "duplicate-registry-marker",
+            .cwd = "/duplicate-registry-cwd",
+            .fixture = "duplicate-registry",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(500);
+    var elapsed: u64 = 0;
+    while (adapter.registryFramesApplied() < 6 and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 6), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+
+    const snapshot_one = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_one);
+    const snapshot_two = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_two);
+    try std.testing.expectEqualStrings(snapshot_one, snapshot_two);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "\"name\":\"duplicate-tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "\"label\":\"Tool Two\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "\"description\":\"second\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "\"second\":{\"type\":\"string\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "\"label\":\"Tool One\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "duplicate-provider") == null);
+
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
 }
 
 test "process_jsonl runtime adapter carries subscriber readiness envelopes byte stably" {

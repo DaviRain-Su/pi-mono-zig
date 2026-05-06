@@ -143,6 +143,10 @@ pub const NativeHostApi = struct {
     }
 
     pub fn registerTool(self: *NativeHostApi, tool: NativeToolDefinition) !void {
+        if (!self.runtime.state.ready_seen) {
+            try self.runtime.state.addDiagnostic(.host_error, .@"error", "native module registered tool before readiness");
+            return;
+        }
         var parsed_parameters = std.json.parseFromSlice(std.json.Value, self.runtime.allocator, tool.input_schema_json, .{}) catch return error.InvalidRuntimeOptions;
         defer parsed_parameters.deinit();
         try self.runtime.state.registry.registerToolFull(
