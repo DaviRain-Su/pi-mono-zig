@@ -11,6 +11,7 @@ pub const rpc_mode = @import("rpc_mode.zig");
 pub const ts_rpc_mode = @import("ts_rpc_mode.zig");
 pub const extension_protocol = @import("extension_protocol.zig");
 pub const extension_host = @import("extension_host.zig");
+pub const extension_runtime = @import("extension_runtime.zig");
 pub const extension_flags = @import("extension_flags.zig");
 pub const extension_registry = @import("extension_registry.zig");
 pub const package_manager = @import("package_manager.zig");
@@ -76,6 +77,7 @@ test {
     _ = @import("ts_rpc_mode.zig");
     _ = @import("extension_protocol.zig");
     _ = @import("extension_host.zig");
+    _ = @import("extension_runtime.zig");
     _ = @import("extension_flags.zig");
     _ = @import("extension_registry.zig");
     _ = @import("package_manager.zig");
