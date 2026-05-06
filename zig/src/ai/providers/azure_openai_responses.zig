@@ -7,6 +7,7 @@ const env_api_keys = @import("../env_api_keys.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 
@@ -63,10 +64,7 @@ pub const AzureOpenAIResponsesProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
-        };
+        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance }, &stream_instance, model, options);
         return stream_instance;
     }
 
@@ -109,7 +107,7 @@ pub const AzureOpenAIResponsesProvider = struct {
         defer allocator.free(url);
 
         var headers = try buildRequestHeaders(allocator, model, options);
-        defer deinitOwnedHeaders(allocator, &headers);
+        defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -126,13 +124,7 @@ pub const AzureOpenAIResponsesProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                if (response.response_headers) |response_headers| {
-                    try callback(response.status, response_headers, model);
-                } else {
-                    var response_headers = std.StringHashMap([]const u8).init(allocator);
-                    defer response_headers.deinit();
-                    try callback(response.status, response_headers, model);
-                }
+                try provider_stream.invokeOnResponse(allocator, callback, response.status, response.response_headers, model);
             }
         }
 
@@ -156,27 +148,6 @@ pub const AzureOpenAIResponsesProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
-
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
-}
 
 pub fn buildAzureRequestPayload(
     allocator: std.mem.Allocator,
@@ -250,7 +221,7 @@ pub fn buildRequestSnapshotValueWithEnv(
     defer allocator.free(url);
 
     var headers = try buildRequestHeaders(allocator, model, options);
-    defer deinitOwnedHeaders(allocator, &headers);
+    defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
     var snapshot = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer snapshot.deinit(allocator);
@@ -464,18 +435,18 @@ fn buildRequestHeaders(
     options: ?types.StreamOptions,
 ) !std.StringHashMap([]const u8) {
     var headers = std.StringHashMap([]const u8).init(allocator);
-    errdefer deinitOwnedHeaders(allocator, &headers);
+    errdefer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
-    try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-    try putOwnedHeader(allocator, &headers, "Accept", "application/json");
-    try mergeHeaders(allocator, &headers, model.headers);
+    try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Content-Type", "application/json");
+    try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Accept", "application/json");
+    try provider_stream.mergeHeadersCaseInsensitive(allocator, &headers, model.headers);
     if (options) |stream_options| {
-        try mergeHeaders(allocator, &headers, stream_options.headers);
+        try provider_stream.mergeHeadersCaseInsensitive(allocator, &headers, stream_options.headers);
     }
 
     const auth = try resolveAzureAuthHeader(allocator, options);
     defer auth.deinit(allocator);
-    try putOwnedHeader(allocator, &headers, auth.name, auth.value);
+    try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, auth.name, auth.value);
 
     return headers;
 }
@@ -528,51 +499,6 @@ fn loadEnvOptional(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     return try allocator.dupe(u8, std.mem.span(value));
 }
 
-fn putOwnedHeader(
-    allocator: std.mem.Allocator,
-    headers: *std.StringHashMap([]const u8),
-    name: []const u8,
-    value: []const u8,
-) !void {
-    var existing_name: ?[]const u8 = null;
-    var iterator = headers.iterator();
-    while (iterator.next()) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
-            existing_name = entry.key_ptr.*;
-            break;
-        }
-    }
-    if (existing_name) |key| {
-        if (headers.fetchRemove(key)) |removed| {
-            allocator.free(removed.key);
-            allocator.free(removed.value);
-        }
-    }
-    try headers.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
-}
-
-fn mergeHeaders(
-    allocator: std.mem.Allocator,
-    target: *std.StringHashMap([]const u8),
-    source: ?std.StringHashMap([]const u8),
-) !void {
-    if (source) |headers| {
-        var iterator = headers.iterator();
-        while (iterator.next()) |entry| {
-            try putOwnedHeader(allocator, target, entry.key_ptr.*, entry.value_ptr.*);
-        }
-    }
-}
-
-fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap([]const u8)) void {
-    var iterator = headers.iterator();
-    while (iterator.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        allocator.free(entry.value_ptr.*);
-    }
-    headers.deinit();
-}
-
 fn parseSseStreamLines(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -615,9 +541,7 @@ fn parseSseStreamLines(
             return;
         }
 
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "event:")) continue;
-        const data = parseSseLine(trimmed) orelse continue;
+        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
@@ -1277,12 +1201,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-    return null;
-}
-
 fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
     switch (block.*) {
         .text => |*text| text.text.deinit(allocator),
@@ -1428,6 +1346,24 @@ const DelayedBodyServer = struct {
     }
 };
 
+const AzureOnResponseCapture = struct {
+    var called = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(callback_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+        called = true;
+        status = callback_status;
+        try std.testing.expectEqualStrings("azure-openai-responses", model.api);
+        try std.testing.expectEqualStrings("text/event-stream", headers.get("content-type").?);
+        try std.testing.expect(headers.get("Content-Type") == null);
+    }
+};
+
 test "buildRequestUrl normalizes Azure resource endpoints" {
     const allocator = std.testing.allocator;
     const url = try buildRequestUrl(allocator, "https://example.openai.azure.com/", "v1");
@@ -1514,6 +1450,55 @@ test "extractReasoningSummary falls back to content text" {
     defer allocator.free(text);
 
     try std.testing.expectEqualStrings("azure content", text);
+}
+
+test "stream on_response normalizes Azure response headers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure_headers\",\"status\":\"completed\"}}\n";
+    var server = try DelayedBodyServer.init(io, body, 0);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    AzureOnResponseCapture.reset();
+
+    var stream = try AzureOpenAIResponsesProvider.stream(allocator, io, model, context, .{
+        .api_key = "test-key",
+        .on_response = &AzureOnResponseCapture.callback,
+    });
+    defer stream.deinit();
+
+    while (stream.next()) |event| {
+        if (event.message) |message| {
+            if (event.event_type == .done) freeAssistantMessageOwned(allocator, message);
+        }
+    }
+
+    try std.testing.expect(AzureOnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 200), AzureOnResponseCapture.status);
 }
 
 test "parseSseStreamLines emits Azure text events" {

@@ -27,11 +27,12 @@ The Zig implementation is now usable for the main coding-agent workflows:
   MiniMax, Hugging Face, Fireworks, OpenRouter, Vercel AI Gateway, Z.AI,
   Groq, Cerebras, xAI, OpenCode, and faux
 - shared provider stream setup-error/header/canonical SSE data-line support has
-  started, with Google Generative AI and Mistral using common non-OOM setup
-  failure conversion, owned request-header insertion/merge/deinit helpers,
+  started, with Google Generative AI, Google Vertex, Google Gemini CLI, and
+  Mistral, OpenAI Responses, and Azure OpenAI Responses using common non-OOM
+  setup failure conversion, owned request-header insertion/merge/deinit helpers,
   normalized `on_response` header lookup, and canonical `data: ` extraction
-  while keeping provider-specific auth headers and stream state machines
-  provider-owned
+  while keeping provider-specific auth headers, request/payload mapping, and
+  stream state machines provider-owned
 - provider-owned JSON value lifecycle support now has shared clone/free/empty
   object helpers used by provider payload and replay helpers without moving
   provider-specific request or response mapping
@@ -141,15 +142,28 @@ Started. The first provider-internal-shape slices introduced
 owned request-header insertion/merge/deinit helpers, and normalized response
 header callback lookup. The SSE line-support slice added only minimal canonical
 `data: ` extraction there, with deterministic helper coverage. The low-risk
-Google Generative AI and Mistral stream entrypoints use the shared stream,
+Google Generative AI, Google Vertex, Google Gemini CLI, Mistral, OpenAI
+Responses, and Azure OpenAI Responses stream entrypoints use the shared stream,
 header, and data-line helpers with local capture/on-response/partial-before-error
-coverage. The JSON lifecycle slice added `shared/provider_json.zig` for
+coverage and Responses request parity coverage. The JSON lifecycle slice added
+`shared/provider_json.zig` for
 provider-owned JSON object initialization, deep clone, and recursive free
 support, then routed provider-local lifecycle helpers through it. Provider-
 specific request/response mapping and stream state machines remain in provider
-files, and Responses reasoning parsers, Anthropic/Kimi-compatible tolerance
-paths, Bedrock binary event-stream parsing, Cloudflare routing, GitHub Copilot
-dynamic headers, and extension protocols remain unchanged.
+files, and Responses reasoning parsers/finalization fallback, Codex Responses,
+Cloudflare/proxy URL behavior, Anthropic/Kimi-compatible tolerance paths,
+Bedrock binary event-stream parsing, GitHub Copilot dynamic headers, and
+extension protocols remain provider-owned or deferred.
+
+Current provider helper/deferred-path matrix:
+
+| Provider group/path | Helper status | Required local evidence |
+| --- | --- | --- |
+| Google Generative AI, Google Vertex, Google Gemini CLI, Mistral | Shared setup-error, owned-header, normalized response-header, and canonical SSE `data: ` helpers are adopted for mechanical paths only. | `zig build test-ai` covers local request/header/setup-failure/stream fixtures. |
+| OpenAI Responses and Azure OpenAI Responses | Shared setup-error, owned-header, normalized `on_response`, and canonical SSE data-line helpers are adopted. Request/payload mapping, response event mapping, reasoning streaming, and finalization fallback remain provider-owned. | `zig build test-ai` plus `zig build test-openai-responses-parity`. |
+| Kimi and Anthropic/Kimi-compatible tolerance | Deferred/provider-owned. Kimi noncanonical `data:` tolerance, malformed JSON repair, unknown/control envelopes, orphan tool deltas, partial EOF finalization, and first-party Anthropic strictness are guarded by focused tests. | `zig build test-ai`, especially the Anthropic/Kimi-compatible parser fixtures in `anthropic.zig`. |
+| Bedrock Converse Stream | Deferred/provider-owned. Binary event-stream parsing, partial-block finalization, provider exceptions, and SigV4 signing stay on the Bedrock path. | `zig build test-ai` plus `zig build test-bedrock-parity`. |
+| Cloudflare routing and GitHub Copilot dynamic headers | Deferred/provider-owned. Cloudflare base URL/proxy resolution and Copilot initiator/vision headers remain in boundary helpers and request builders. | `zig build test-ai` plus `zig build test-openai-responses-parity` for Responses Copilot scenarios. |
 
 ## Recommended Next Work Order
 
@@ -171,6 +185,9 @@ Useful existing harnesses:
 - `zig build test-cross-area`
 - `zig build test-ts-rpc-parity`
 - `zig build test-tidy`
+- `zig build test-ai`
+- `zig build test-openai-responses-parity`
+- `zig build test-bedrock-parity`
 - `zig/test/openai-chat-parity.sh`
 - `zig/test/openai-responses-parity.sh`
 - `zig/test/bedrock-parity.sh`

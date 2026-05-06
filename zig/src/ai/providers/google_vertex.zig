@@ -6,6 +6,7 @@ const env_api_keys = @import("../env_api_keys.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const asn1 = std.crypto.codecs.asn1;
 
@@ -122,10 +123,7 @@ pub const GoogleVertexProvider = struct {
         };
         defer auth_header.deinit(allocator);
 
-        streamProduction(allocator, io, model, context, options, &stream_instance, auth_header) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
-        };
+        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance, auth_header }, &stream_instance, model, options);
         return stream_instance;
     }
 
@@ -157,13 +155,13 @@ pub const GoogleVertexProvider = struct {
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
-        defer headers.deinit();
-        try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-        try putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
-        try headers.put(try allocator.dupe(u8, auth_header.name), try allocator.dupe(u8, auth_header.value));
-        try mergeHeaders(allocator, &headers, model.headers);
+        defer provider_stream.deinitOwnedHeaders(allocator, &headers);
+        try provider_stream.putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+        try provider_stream.putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        try provider_stream.putOwnedHeader(allocator, &headers, auth_header.name, auth_header.value);
+        try provider_stream.mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
+            try provider_stream.mergeHeaders(allocator, &headers, stream_options.headers);
         }
 
         var client = try http_client.HttpClient.init(allocator, io);
@@ -180,13 +178,7 @@ pub const GoogleVertexProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                if (response.response_headers) |response_headers| {
-                    try callback(response.status, response_headers, model);
-                } else {
-                    var response_headers = std.StringHashMap([]const u8).init(allocator);
-                    defer response_headers.deinit();
-                    try callback(response.status, response_headers, model);
-                }
+                try provider_stream.invokeOnResponse(allocator, callback, response.status, response.response_headers, model);
             }
         }
 
@@ -482,9 +474,9 @@ fn fetchOAuthAccessToken(
     body: []const u8,
 ) ![]const u8 {
     var headers = std.StringHashMap([]const u8).init(allocator);
-    defer headers.deinit();
-    try putOwnedHeader(allocator, &headers, "Content-Type", "application/x-www-form-urlencoded");
-    try putOwnedHeader(allocator, &headers, "Accept", "application/json");
+    defer provider_stream.deinitOwnedHeaders(allocator, &headers);
+    try provider_stream.putOwnedHeader(allocator, &headers, "Content-Type", "application/x-www-form-urlencoded");
+    try provider_stream.putOwnedHeader(allocator, &headers, "Accept", "application/json");
 
     var client = try http_client.HttpClient.init(allocator, io);
     defer client.deinit();
@@ -857,7 +849,7 @@ fn parseSseStreamLines(
             return;
         }
 
-        const data = parseSseLine(std.mem.trim(u8, line, " \t\r")) orelse continue;
+        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
@@ -1067,28 +1059,6 @@ fn authErrorMessage(err: anyerror) []const u8 {
         error.OAuthTokenRequestFailed, error.InvalidTokenResponse, error.MissingAccessToken => "Vertex AI OAuth token exchange failed.",
         else => "Vertex AI authentication failed.",
     };
-}
-
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .role = "assistant",
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 
 fn buildContentsValue(
@@ -1520,12 +1490,6 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
     }
 }
 
-fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-    return null;
-}
-
 fn mapToolChoice(tool_choice: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(tool_choice, "none")) return "NONE";
     if (std.ascii.eqlIgnoreCase(tool_choice, "any")) return "ANY";
@@ -1585,28 +1549,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
     usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
-}
-
-fn putOwnedHeader(
-    allocator: std.mem.Allocator,
-    headers: *std.StringHashMap([]const u8),
-    name: []const u8,
-    value: []const u8,
-) !void {
-    try headers.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
-}
-
-fn mergeHeaders(
-    allocator: std.mem.Allocator,
-    target: *std.StringHashMap([]const u8),
-    source: ?std.StringHashMap([]const u8),
-) !void {
-    if (source) |headers| {
-        var iterator = headers.iterator();
-        while (iterator.next()) |entry| {
-            try putOwnedHeader(allocator, target, entry.key_ptr.*, entry.value_ptr.*);
-        }
-    }
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
@@ -1897,6 +1839,139 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("google-vertex", result.api);
+}
+
+test "stream preserves Vertex request headers and body through shared header helpers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var server = try provider_error.TestCaptureServer.init(
+        io,
+        403,
+        "Forbidden",
+        "",
+        "{\"error\":{\"message\":\"vertex capture\"}}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const server_url = try server.url(allocator);
+    defer allocator.free(server_url);
+    const base_url = try std.fmt.allocPrint(allocator, "{s}/v1/projects/test-project/locations/us-central1/publishers/google", .{server_url});
+    defer allocator.free(base_url);
+
+    var model_headers = std.StringHashMap([]const u8).init(allocator);
+    defer model_headers.deinit();
+    try model_headers.put("X-Model-Header", "model-value");
+
+    var option_headers = std.StringHashMap([]const u8).init(allocator);
+    defer option_headers.deinit();
+    try option_headers.put("X-Option-Header", "option-value");
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Vertex Gemini 2.5 Pro",
+        .api = "google-vertex",
+        .provider = "google-vertex",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+        .headers = model_headers,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "vertex capture prompt" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try GoogleVertexProvider.stream(allocator, io, model, context, .{
+        .api_key = "vertex-smoke-key",
+        .headers = option_headers,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(stream.next() == null);
+
+    try std.testing.expect(!server.request_head_truncated);
+    try std.testing.expect(!server.request_body_truncated);
+    const lower_head = try std.ascii.allocLowerString(allocator, server.requestHead());
+    defer allocator.free(lower_head);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "post /v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:streamgeneratecontent?alt=sse http/1.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\ncontent-type: application/json\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\naccept: text/event-stream\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-goog-api-key: vertex-smoke-key\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-model-header: model-value\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-option-header: option-value\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nauthorization:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, server.requestBody(), "\"vertex capture prompt\"") != null);
+}
+
+const VertexOnResponseCapture = struct {
+    var called: bool = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(response_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+        called = true;
+        status = response_status;
+        try std.testing.expectEqualStrings("google-vertex", model.api);
+        try std.testing.expect(headers.get("X-Fixture-Response") == null);
+        try std.testing.expectEqualStrings("vertex-callback", headers.get("x-fixture-response").?);
+    }
+};
+
+test "stream on_response receives normalized Vertex response headers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    VertexOnResponseCapture.reset();
+
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        429,
+        "Too Many Requests",
+        "X-Fixture-Response: vertex-callback\r\n",
+        "{\"error\":{\"message\":\"rate limited\"}}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const server_url = try server.url(allocator);
+    defer allocator.free(server_url);
+    const base_url = try std.fmt.allocPrint(allocator, "{s}/v1/projects/test-project/locations/us-central1/publishers/google", .{server_url});
+    defer allocator.free(base_url);
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Vertex Gemini 2.5 Pro",
+        .api = "google-vertex",
+        .provider = "google-vertex",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    var stream = try GoogleVertexProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "vertex-smoke-key",
+        .on_response = &VertexOnResponseCapture.callback,
+    });
+    defer stream.deinit();
+
+    try std.testing.expect(VertexOnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 429), VertexOnResponseCapture.status);
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(stream.next() == null);
 }
 
 fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {

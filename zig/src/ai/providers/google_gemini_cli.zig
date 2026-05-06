@@ -5,6 +5,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
 
 const DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com";
@@ -39,10 +40,7 @@ pub const GoogleGeminiCliProvider = struct {
             allocator.free(auth.project_id);
         }
 
-        streamProduction(allocator, io, model, context, options, &stream_instance, auth.token, auth.project_id) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
-        };
+        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance, auth.token, auth.project_id }, &stream_instance, model, options);
         return stream_instance;
     }
 
@@ -75,16 +73,18 @@ pub const GoogleGeminiCliProvider = struct {
         defer allocator.free(url);
 
         var headers = std.StringHashMap([]const u8).init(allocator);
-        defer headers.deinit();
-        try headers.put("Authorization", try std.fmt.allocPrint(allocator, "Bearer {s}", .{auth_token}));
-        try headers.put("Content-Type", "application/json");
-        try headers.put("Accept", "text/event-stream");
-        try headers.put("User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
-        try headers.put("X-Goog-Api-Client", "gl-node/22.17.0");
-        try headers.put("Client-Metadata", GEMINI_CLI_CLIENT_METADATA);
-        try mergeHeaders(allocator, &headers, model.headers);
+        defer provider_stream.deinitOwnedHeaders(allocator, &headers);
+        const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{auth_token});
+        defer allocator.free(authorization);
+        try provider_stream.putOwnedHeader(allocator, &headers, "Authorization", authorization);
+        try provider_stream.putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
+        try provider_stream.putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
+        try provider_stream.putOwnedHeader(allocator, &headers, "User-Agent", "google-cloud-sdk vscode_cloudshelleditor/0.1");
+        try provider_stream.putOwnedHeader(allocator, &headers, "X-Goog-Api-Client", "gl-node/22.17.0");
+        try provider_stream.putOwnedHeader(allocator, &headers, "Client-Metadata", GEMINI_CLI_CLIENT_METADATA);
+        try provider_stream.mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
-            try mergeHeaders(allocator, &headers, stream_options.headers);
+            try provider_stream.mergeHeaders(allocator, &headers, stream_options.headers);
         }
 
         var client = try http_client.HttpClient.init(allocator, io);
@@ -101,13 +101,7 @@ pub const GoogleGeminiCliProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                if (response.response_headers) |response_headers| {
-                    try callback(response.status, response_headers, model);
-                } else {
-                    var response_headers = std.StringHashMap([]const u8).init(allocator);
-                    defer response_headers.deinit();
-                    try callback(response.status, response_headers, model);
-                }
+                try provider_stream.invokeOnResponse(allocator, callback, response.status, response.response_headers, model);
             }
         }
 
@@ -275,28 +269,6 @@ fn emitAuthError(
     stream_ptr.end(message);
 }
 
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .role = "assistant",
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
-}
-
 fn parseSseStreamLines(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -341,7 +313,7 @@ fn parseSseStreamLines(
             return;
         }
 
-        const data = parseSseLine(std.mem.trim(u8, line, " \t\r")) orelse continue;
+        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
@@ -944,12 +916,6 @@ fn buildToolResultImageParts(allocator: std.mem.Allocator, content: []const type
     return parts;
 }
 
-fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-    return null;
-}
-
 fn mapToolChoice(tool_choice: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(tool_choice, "none")) return "NONE";
     if (std.ascii.eqlIgnoreCase(tool_choice, "any")) return "ANY";
@@ -1009,19 +975,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
     usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
-}
-
-fn mergeHeaders(
-    allocator: std.mem.Allocator,
-    target: *std.StringHashMap([]const u8),
-    source: ?std.StringHashMap([]const u8),
-) !void {
-    if (source) |headers| {
-        var iterator = headers.iterator();
-        while (iterator.next()) |entry| {
-            try target.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
-        }
-    }
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
@@ -1262,6 +1215,138 @@ test "stream HTTP status error is terminal sanitized event" {
     try std.testing.expectEqualStrings(event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
     try std.testing.expectEqualStrings("google-gemini-cli", result.api);
+}
+
+test "stream preserves Gemini CLI request headers and body through shared header helpers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var server = try provider_error.TestCaptureServer.init(
+        io,
+        403,
+        "Forbidden",
+        "",
+        "{\"error\":{\"message\":\"gemini cli capture\"}}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var model_headers = std.StringHashMap([]const u8).init(allocator);
+    defer model_headers.deinit();
+    try model_headers.put("X-Model-Header", "model-value");
+
+    var option_headers = std.StringHashMap([]const u8).init(allocator);
+    defer option_headers.deinit();
+    try option_headers.put("X-Option-Header", "option-value");
+
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-gemini-cli",
+        .provider = "google-gemini-cli",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+        .headers = model_headers,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "gemini cli capture prompt" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    var stream = try GoogleGeminiCliProvider.stream(allocator, io, model, context, .{
+        .api_key = "{\"token\":\"cli-token\",\"projectId\":\"test-project\"}",
+        .headers = option_headers,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(stream.next() == null);
+
+    try std.testing.expect(!server.request_head_truncated);
+    try std.testing.expect(!server.request_body_truncated);
+    const lower_head = try std.ascii.allocLowerString(allocator, server.requestHead());
+    defer allocator.free(lower_head);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "post /v1internal:streamgeneratecontent?alt=sse http/1.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nauthorization: bearer cli-token\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\ncontent-type: application/json\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\naccept: text/event-stream\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nuser-agent: google-cloud-sdk vscode_cloudshelleditor/0.1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-goog-api-client: gl-node/22.17.0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nclient-metadata: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-model-header: model-value\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lower_head, "\r\nx-option-header: option-value\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server.requestBody(), "\"project\":\"test-project\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server.requestBody(), "\"gemini cli capture prompt\"") != null);
+}
+
+const GeminiCliOnResponseCapture = struct {
+    var called: bool = false;
+    var status: u16 = 0;
+
+    fn reset() void {
+        called = false;
+        status = 0;
+    }
+
+    fn callback(response_status: u16, headers: std.StringHashMap([]const u8), model: types.Model) !void {
+        called = true;
+        status = response_status;
+        try std.testing.expectEqualStrings("google-gemini-cli", model.api);
+        try std.testing.expect(headers.get("X-Fixture-Response") == null);
+        try std.testing.expectEqualStrings("gemini-cli-callback", headers.get("x-fixture-response").?);
+    }
+};
+
+test "stream on_response receives normalized Gemini CLI response headers" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    GeminiCliOnResponseCapture.reset();
+
+    var server = try provider_error.TestStatusServer.init(
+        io,
+        429,
+        "Too Many Requests",
+        "X-Fixture-Response: gemini-cli-callback\r\n",
+        "{\"error\":{\"message\":\"rate limited\"}}",
+    );
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-gemini-cli",
+        .provider = "google-gemini-cli",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    var stream = try GoogleGeminiCliProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "{\"token\":\"cli-token\",\"projectId\":\"test-project\"}",
+        .on_response = &GeminiCliOnResponseCapture.callback,
+    });
+    defer stream.deinit();
+
+    try std.testing.expect(GeminiCliOnResponseCapture.called);
+    try std.testing.expectEqual(@as(u16, 429), GeminiCliOnResponseCapture.status);
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(stream.next() == null);
 }
 
 fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {

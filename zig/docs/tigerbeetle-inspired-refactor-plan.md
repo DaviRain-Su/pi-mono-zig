@@ -143,32 +143,56 @@ local-fixture provider paths. `shared/provider_stream.zig` now owns the common
 non-OOM setup failure to terminal `error_event` conversion, owned request-header
 insertion/merge/deinit helpers, and normalized response header callback lookup
 support, plus minimal canonical `data: ` SSE line extraction. Google Generative
-AI and Mistral stream entrypoints use these shared helpers. The current JSON
+AI, Google Vertex, Google Gemini CLI, Mistral, OpenAI Responses, and Azure
+OpenAI Responses stream entrypoints use these shared helpers. The current JSON
 slice added `shared/provider_json.zig` for provider-owned object
 initialization, deep clone, and recursive free support, with provider-local
 lifecycle wrappers routed through the shared helper while keeping request
 payloads, provider/auth headers, stream state machines, JSON event mapping, and
-response mapping provider-local. Responses reasoning parsers,
-Anthropic/Kimi-compatible tolerance paths, Bedrock binary event-stream parsing,
-Cloudflare routing, GitHub Copilot dynamic headers, and extension ABI/protocols
-were intentionally left untouched in these slices.
+response mapping provider-local. Responses request/payload mapping, response
+event mapping, reasoning parsers and finalization fallbacks, Cloudflare/proxy URL
+behavior, Codex Responses, Anthropic/Kimi-compatible tolerance paths, Bedrock
+binary event-stream parsing, GitHub Copilot dynamic headers, and extension
+ABI/protocols were intentionally left provider-owned or deferred in these slices.
 
 - Move shared HTTP, payload, SSE, and error-conversion helpers into provider support modules.
 - Keep provider-specific files focused on API-specific request/response mapping.
 - Use the common stream-contract/header/canonical SSE data-line helpers where
-  behavior is mechanical. Started with Google Generative AI and Mistral; later
-  slices should convert additional providers only with local request/response
-  fixture coverage.
+  behavior is mechanical. Started with Google Generative AI and Mistral, then
+  extended to Google Vertex and Google Gemini CLI with local request,
+  normalized-response-header, setup-failure, and partial-before-error coverage.
+  The Responses-family mechanical slice then extended OpenAI Responses and Azure
+  OpenAI Responses to shared setup-error, owned-header, normalized `on_response`,
+  and canonical SSE data-line helpers while preserving the 53-scenario local
+  Responses request parity fixtures and provider-owned reasoning/event mapping.
+  Later slices should convert additional providers only with local
+  request/response fixture coverage.
 - Use the common provider JSON lifecycle helpers for mechanical clone/free/empty
   object ownership only; keep buildRequestPayload and response mapping logic in
   provider files.
+
+Converted/deferred provider matrix:
+
+| Provider group/path | Current status | Guardrail evidence |
+| --- | --- | --- |
+| Google Generative AI, Google Vertex, Google Gemini CLI | Converted to shared setup-error, owned-header, normalized response-header, and canonical SSE `data: ` helpers where behavior is mechanical. Provider auth, request payload, and response mapping stay provider-local. | `cd zig && zig build test-ai`; Google-family request, on-response, setup-failure, and partial-before-error fixtures. |
+| Mistral | Converted to shared setup-error, owned-header, normalized response-header, and canonical SSE `data: ` helpers. Provider-specific stream mapping stays in `mistral.zig`. | `cd zig && zig build test-ai`; Mistral local stream/helper fixtures. |
+| OpenAI Responses and Azure OpenAI Responses | Converted only for mechanical setup-error, owned-header, normalized `on_response`, and canonical SSE data-line helpers. Request/payload mapping, response event mapping, reasoning parsers, and finalization fallback remain provider-owned. | `cd zig && zig build test-ai`; `cd zig && zig build test-openai-responses-parity`. |
+| Kimi and Anthropic/Kimi-compatible tolerance | Deferred/provider-owned. Do not replace Kimi noncanonical SSE tolerance or Anthropic-compatible repair behavior with generic canonical SSE handling without a separate assignment and local fixtures. | `cd zig && zig build test-ai`; Kimi repair, noncanonical chunk, orphan tool delta, partial EOF, and first-party Anthropic strictness tests in `anthropic.zig`. |
+| Bedrock Converse Stream | Deferred/provider-owned. Do not extract binary event-stream parsing/signing into generic stream helpers in this phase. | `cd zig && zig build test-ai`; `cd zig && zig build test-bedrock-parity`; Bedrock binary event-stream and SigV4 fixtures. |
+| Cloudflare routing and GitHub Copilot dynamic headers | Deferred/provider-owned. Cloudflare/proxy URL resolution and Copilot dynamic header inference stay in provider boundary helpers and provider request builders. | `cd zig && zig build test-ai`; `cd zig && zig build test-openai-responses-parity`; Cloudflare provider smoke and Copilot dynamic-header fixtures. |
 
 Acceptance criteria:
 
 - Provider setup paths are contract-uniform.
 - Shared helpers have direct unit tests.
-- Current slice verification: `cd zig && zig build test-ai`,
+- Current Google-family slice verification: `cd zig && zig build test-ai`,
+  `cd zig && zig build test-coding-agent`, and `npm run check`.
+- Current Responses-family slice verification: `cd zig && zig build test-ai`,
   `cd zig && zig build test-openai-responses-parity`, and `npm run check`.
+- Deferred-path guardrail slice verification: `cd zig && zig build test-ai`,
+  `cd zig && zig build test-openai-responses-parity`,
+  `cd zig && zig build test-bedrock-parity`, and `npm run check`.
 
 ### 8. Session and RPC Decomposition
 

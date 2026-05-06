@@ -8,6 +8,7 @@ const model_registry = @import("../model_registry.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
 const cloudflare = @import("cloudflare.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
@@ -81,14 +82,11 @@ pub const OpenAIResponsesProvider = struct {
         errdefer stream_instance.deinit();
 
         if (provider_error.isAbortRequested(options)) {
-            emitSetupRuntimeFailure(&stream_instance, model, options, error.RequestAborted);
+            provider_stream.emitSetupRuntimeFailure(&stream_instance, model, options, error.RequestAborted);
             return stream_instance;
         }
 
-        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
-        };
+        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance }, &stream_instance, model, options);
         return stream_instance;
     }
 
@@ -159,7 +157,7 @@ pub const OpenAIResponsesProvider = struct {
         resolved_options.api_key = api_key.?;
 
         var headers = try buildRequestHeaders(allocator, model, context, resolved_options);
-        defer deinitOwnedHeaders(allocator, &headers);
+        defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
@@ -176,9 +174,7 @@ pub const OpenAIResponsesProvider = struct {
 
         if (options) |stream_options| {
             if (stream_options.on_response) |callback| {
-                var response_headers = try normalizedResponseHeaders(allocator, response.response_headers);
-                defer deinitOwnedHeaders(allocator, &response_headers);
-                try callback(response.status, response_headers, model);
+                try provider_stream.invokeOnResponse(allocator, callback, response.status, response.response_headers, model);
             }
         }
 
@@ -202,27 +198,6 @@ pub const OpenAIResponsesProvider = struct {
         return stream(allocator, io, model, context, options);
     }
 };
-
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
-}
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
@@ -340,36 +315,36 @@ fn buildRequestHeaders(
     const cache_retention = resolveCacheRetention(options.cache_retention, processCacheRetentionEnv());
 
     var headers = std.StringHashMap([]const u8).init(allocator);
-    errdefer deinitOwnedHeaders(allocator, &headers);
+    errdefer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
-    try putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
-    try putOwnedHeader(allocator, &headers, "Accept", "application/json");
+    try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Content-Type", "application/json");
+    try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Accept", "application/json");
     const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(authorization);
     if (std.mem.eql(u8, model.provider, "cloudflare-ai-gateway")) {
-        try putOwnedHeader(allocator, &headers, "cf-aig-authorization", authorization);
+        try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "cf-aig-authorization", authorization);
     } else {
-        try putOwnedHeader(allocator, &headers, "Authorization", authorization);
+        try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Authorization", authorization);
     }
-    try mergeHeaders(allocator, &headers, model.headers);
+    try provider_stream.mergeHeadersCaseInsensitive(allocator, &headers, model.headers);
 
     if (std.mem.eql(u8, model.provider, "github-copilot")) {
-        try putOwnedHeader(allocator, &headers, "X-Initiator", copilot_headers.inferCopilotInitiator(context.messages));
-        try putOwnedHeader(allocator, &headers, "Openai-Intent", "conversation-edits");
+        try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "X-Initiator", copilot_headers.inferCopilotInitiator(context.messages));
+        try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Openai-Intent", "conversation-edits");
         if (copilot_headers.hasCopilotVisionInput(context.messages)) {
-            try putOwnedHeader(allocator, &headers, "Copilot-Vision-Request", "true");
+            try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "Copilot-Vision-Request", "true");
         }
     }
 
     if (options.session_id) |session_id| {
         if (cache_retention != .none) {
-            try putOwnedHeader(allocator, &headers, "x-client-request-id", session_id);
+            try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "x-client-request-id", session_id);
             if (compat.send_session_id_header) {
-                try putOwnedHeader(allocator, &headers, "session_id", session_id);
+                try provider_stream.putOwnedHeaderCaseInsensitive(allocator, &headers, "session_id", session_id);
             }
         }
     }
-    try mergeHeaders(allocator, &headers, options.headers);
+    try provider_stream.mergeHeadersCaseInsensitive(allocator, &headers, options.headers);
 
     return headers;
 }
@@ -432,9 +407,7 @@ fn parseSseStreamLines(
             return;
         }
 
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "event:")) continue;
-        const data = parseSseLine(trimmed) orelse continue;
+        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
         if (std.mem.eql(u8, data, "[DONE]")) break;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
@@ -1457,7 +1430,7 @@ pub fn buildRequestSnapshotValue(
     if (resolved_options.api_key == null) resolved_options.api_key = "fixture-api-key-redacted";
 
     var headers = try buildRequestHeaders(allocator, model, context, resolved_options);
-    defer deinitOwnedHeaders(allocator, &headers);
+    defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
     const url = try buildRequestUrl(allocator, model.base_url);
     defer allocator.free(url);
@@ -1997,12 +1970,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) return line[prefix.len..];
-    return null;
-}
-
 fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
     switch (block.*) {
         .text => |*text| text.text.deinit(allocator),
@@ -2070,74 +2037,6 @@ fn modelThinkingLevel(level: types.ThinkingLevel) types.ModelThinkingLevel {
         .high => .high,
         .xhigh => .xhigh,
     };
-}
-
-fn putOwnedHeader(
-    allocator: std.mem.Allocator,
-    headers: *std.StringHashMap([]const u8),
-    name: []const u8,
-    value: []const u8,
-) !void {
-    var existing_name: ?[]const u8 = null;
-    var iterator = headers.iterator();
-    while (iterator.next()) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
-            existing_name = entry.key_ptr.*;
-            break;
-        }
-    }
-    if (existing_name) |key| {
-        if (headers.fetchRemove(key)) |removed| {
-            allocator.free(removed.key);
-            allocator.free(removed.value);
-        }
-    }
-    try headers.put(try allocator.dupe(u8, name), try allocator.dupe(u8, value));
-}
-
-fn mergeHeaders(
-    allocator: std.mem.Allocator,
-    target: *std.StringHashMap([]const u8),
-    source: ?std.StringHashMap([]const u8),
-) !void {
-    if (source) |headers| {
-        var iterator = headers.iterator();
-        while (iterator.next()) |entry| {
-            try putOwnedHeader(allocator, target, entry.key_ptr.*, entry.value_ptr.*);
-        }
-    }
-}
-
-fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap([]const u8)) void {
-    var iterator = headers.iterator();
-    while (iterator.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        allocator.free(entry.value_ptr.*);
-    }
-    headers.deinit();
-}
-
-/// Normalize response header names to TypeScript-compatible lowercase keys
-/// before invoking `on_response` callbacks. Mirrors the OpenAI Chat path so
-/// callbacks can rely on consistent lookup semantics regardless of the
-/// on-the-wire casing emitted by the upstream server.
-fn normalizedResponseHeaders(
-    allocator: std.mem.Allocator,
-    maybe_headers: ?std.StringHashMap([]const u8),
-) !std.StringHashMap([]const u8) {
-    var normalized = std.StringHashMap([]const u8).init(allocator);
-    errdefer deinitOwnedHeaders(allocator, &normalized);
-
-    if (maybe_headers) |headers| {
-        var iterator = headers.iterator();
-        while (iterator.next()) |entry| {
-            const lower = try asciiLowerAlloc(allocator, entry.key_ptr.*);
-            defer allocator.free(lower);
-            try putOwnedHeader(allocator, &normalized, lower, entry.value_ptr.*);
-        }
-    }
-
-    return normalized;
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
@@ -3232,7 +3131,7 @@ test "buildRequestHeaders omits session_id when compat disables it" {
         .session_id = "sess-1",
         .cache_retention = .short,
     });
-    defer deinitOwnedHeaders(allocator, &headers);
+    defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
     try std.testing.expectEqualStrings("Bearer test-key", headers.get("Authorization").?);
     try std.testing.expectEqualStrings("sess-1", headers.get("x-client-request-id").?);
@@ -3288,7 +3187,7 @@ test "buildRequestHeaders applies Copilot dynamic headers before session and opt
         .cache_retention = .short,
         .headers = option_headers,
     });
-    defer deinitOwnedHeaders(allocator, &headers);
+    defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
     try std.testing.expectEqualStrings("GitHubCopilotChat/override", headers.get("user-agent").?);
     try std.testing.expect(headers.get("User-Agent") == null);
