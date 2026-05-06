@@ -14,6 +14,36 @@ export const EXPECTED_FIXTURE_OUTPUT = {
 	echo: "native-wasm",
 };
 
+export const PURE_TRUNCATE_MANIFEST = "../pure-truncate-head-v0/pi-extension.json";
+
+export const VALID_PURE_TRUNCATE_INPUT = {
+	content: "alpha\nbravo\ncharlie\ndelta",
+	maxLines: 2,
+	maxBytes: 1024,
+};
+
+export const EXPECTED_PURE_TRUNCATE_OUTPUT = {
+	content: "alpha\nbravo",
+	truncated: true,
+	truncatedBy: "lines",
+	totalLines: 4,
+	totalBytes: 25,
+	outputLines: 2,
+	outputBytes: 11,
+	lastLinePartial: false,
+	firstLineExceedsLimit: false,
+	maxLines: 2,
+	maxBytes: 1024,
+};
+
+export const EXPECTED_PURE_TRUNCATE_ERROR = {
+	ok: false,
+	error: {
+		category: "invalid_input",
+		message: "execute input must be a JSON object",
+	},
+};
+
 export class DeniedCapabilityError extends Error {
 	constructor({ capability, mode, message }) {
 		super(message);
@@ -109,6 +139,23 @@ export function validateFixtureOutput(output) {
 		output.tool === EXPECTED_FIXTURE_OUTPUT.tool &&
 		output.echo === EXPECTED_FIXTURE_OUTPUT.echo
 	);
+}
+
+export function validatePureTruncateOutput(output) {
+	return JSON.stringify(output) === JSON.stringify(EXPECTED_PURE_TRUNCATE_OUTPUT);
+}
+
+export function normalizePureToolError(error) {
+	if (error instanceof Error && error.message === EXPECTED_PURE_TRUNCATE_ERROR.error.message) {
+		return EXPECTED_PURE_TRUNCATE_ERROR;
+	}
+	return {
+		ok: false,
+		error: {
+			category: "unexpected_error",
+			message: error instanceof Error ? error.message : String(error),
+		},
+	};
 }
 
 export async function attemptRuntimeImport(capability) {
@@ -346,6 +393,46 @@ function wireBrowserHarness() {
 		}
 	};
 
+	const runPureTruncate = async () => {
+		const beforeCount = networkLog.length;
+		const pureHost = new BrowserWasmToolHost({
+			baseUrl: globalThis.location.href,
+			fetchJson: async (url) => {
+				const response = await tracedFetch(url);
+				if (!response.ok) throw new Error(`failed to fetch ${url}: ${response.status}`);
+				return response.json();
+			},
+			fetchBytes: async (url) => {
+				const response = await tracedFetch(url);
+				if (!response.ok) throw new Error(`failed to fetch ${url}: ${response.status}`);
+				return new Uint8Array(await response.arrayBuffer());
+			},
+		});
+		await pureHost.initialize(PURE_TRUNCATE_MANIFEST);
+		const outputValue = pureHost.execute(VALID_PURE_TRUNCATE_INPUT);
+		let malformed;
+		try {
+			pureHost.execute([]);
+			malformed = { ok: false, error: { category: "unexpected_success" } };
+		} catch (error) {
+			malformed = normalizePureToolError(error);
+		}
+		const networkEvidence = renderNetwork(beforeCount);
+		print({
+			ok:
+				validatePureTruncateOutput(outputValue) &&
+				JSON.stringify(malformed) === JSON.stringify(EXPECTED_PURE_TRUNCATE_ERROR) &&
+				networkEvidence.executionApiRequests.length === 0,
+			manifest: PURE_TRUNCATE_MANIFEST,
+			artifact: pureHost.artifactUrl,
+			input: VALID_PURE_TRUNCATE_INPUT,
+			output: outputValue,
+			expected: EXPECTED_PURE_TRUNCATE_OUTPUT,
+			malformed,
+			clientSide: networkEvidence.executionApiRequests.length === 0,
+		});
+	};
+
 	document.querySelector("#run-fixture").addEventListener("click", () => {
 		const beforeCount = networkLog.length;
 		const result = host.execute(VALID_FIXTURE_INPUT);
@@ -358,6 +445,7 @@ function wireBrowserHarness() {
 			clientSide: networkEvidence.newRequests.length === 0 && networkEvidence.executionApiRequests.length === 0,
 		});
 	});
+	document.querySelector("#run-pure-truncate").addEventListener("click", runPureTruncate);
 	document.querySelector("#deny-shell-manifest").addEventListener("click", async () => {
 		const beforeCount = networkLog.length;
 		await runManifestDenial("../browser-tool-v0/shell-request.pi-extension.json");

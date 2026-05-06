@@ -1,9 +1,18 @@
 const std = @import("std");
+const truncate_tool = @import("tools/truncate.zig");
+const wasm_manifest = @import("wasm_manifest.zig");
 
 const PLUGIN_FIXTURE_PATH = "test/fixtures/wasm/native-tool-v0/plugin.wasm";
 const EVIDENCE_PATH = "docs/wasm-host-spike-evidence.md";
 const EXECUTE_INPUT_JSON = "{\"operation\":\"echo\",\"value\":\"native-wasm\"}";
 const EXPECTED_EXECUTE_OUTPUT_JSON = "{\"ok\":true,\"tool\":\"fixture.echo\",\"echo\":\"native-wasm\"}";
+const PURE_TOOL_EXISTING_API = "zig/src/coding_agent/tools/truncate.zig::truncateHead";
+const PURE_TOOL_PACKAGE_ROOT = "test/fixtures/wasm/pure-truncate-head-v0";
+const PURE_TOOL_MANIFEST_PATH = PURE_TOOL_PACKAGE_ROOT ++ "/pi-extension.json";
+const PURE_TOOL_ARTIFACT_PATH = PURE_TOOL_PACKAGE_ROOT ++ "/wasm/plugin.wasm";
+const PURE_TOOL_SUCCESS_INPUT_JSON = "{\"content\":\"alpha\\nbravo\\ncharlie\\ndelta\",\"maxLines\":2,\"maxBytes\":1024}";
+const PURE_TOOL_MALFORMED_INPUT_JSON = "[]";
+const INVALID_INPUT_DIAGNOSTIC_JSON = "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}";
 
 pub const Host = struct {
     allocator: std.mem.Allocator,
@@ -366,4 +375,128 @@ test "wasm host spike stays isolated from agent session and provider runtime" {
     try expectNotContains(source, "@import(\"session.zig\")");
     try expectNotContains(source, "@import(\"session_manager.zig\")");
     try expectNotContains(source, "@import(\"provider_config.zig\")");
+}
+
+test "wasm pure tool selection names existing implementation manifest and artifact" {
+    try std.testing.expectEqualStrings("zig/src/coding_agent/tools/truncate.zig::truncateHead", PURE_TOOL_EXISTING_API);
+    try std.testing.expectEqualStrings("test/fixtures/wasm/pure-truncate-head-v0/pi-extension.json", PURE_TOOL_MANIFEST_PATH);
+    try std.testing.expectEqualStrings("test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm", PURE_TOOL_ARTIFACT_PATH);
+}
+
+test "wasm pure tool truncateHead success matches existing implementation under default deny" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    try std.testing.expectEqualStrings("builtin.truncateHead", manifest_result.valid.tool_id);
+    try std.testing.expectEqualStrings("wasm/plugin.wasm", manifest_result.valid.artifact_path);
+    try std.testing.expectEqual(@as(usize, 0), manifest_result.valid.requested_capabilities.len);
+
+    const existing_json = try normalizedExistingPureToolCall(allocator, PURE_TOOL_SUCCESS_INPUT_JSON);
+    defer allocator.free(existing_json);
+    const wasm_json = try normalizedWasmPureToolCall(allocator, PURE_TOOL_SUCCESS_INPUT_JSON);
+    defer allocator.free(wasm_json);
+    try std.testing.expectEqualStrings(existing_json, wasm_json);
+
+    const artifact_hash = try sha256FileHex(allocator, PURE_TOOL_ARTIFACT_PATH);
+    defer allocator.free(artifact_hash);
+    try std.testing.expectEqual(@as(usize, 64), artifact_hash.len);
+}
+
+test "wasm pure tool truncateHead malformed input diagnostic matches existing implementation" {
+    const allocator = std.testing.allocator;
+
+    const existing_json = try normalizedExistingPureToolCall(allocator, PURE_TOOL_MALFORMED_INPUT_JSON);
+    defer allocator.free(existing_json);
+    const wasm_json = try normalizedWasmPureToolCall(allocator, PURE_TOOL_MALFORMED_INPUT_JSON);
+    defer allocator.free(wasm_json);
+    try std.testing.expectEqualStrings(INVALID_INPUT_DIAGNOSTIC_JSON, existing_json);
+    try std.testing.expectEqualStrings(existing_json, wasm_json);
+}
+
+fn normalizedExistingPureToolCall(allocator: std.mem.Allocator, input_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input_json, .{}) catch {
+        return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    const object = parsed.value.object;
+    const content = stringField(object, "content") orelse return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    const max_lines = usizeField(object, "maxLines") orelse return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+    const max_bytes = usizeField(object, "maxBytes") orelse return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON);
+
+    var result = try truncate_tool.truncateHead(allocator, content, .{
+        .max_lines = max_lines,
+        .max_bytes = max_bytes,
+    });
+    defer result.deinit(allocator);
+    return truncationResultJson(allocator, result);
+}
+
+fn normalizedWasmPureToolCall(allocator: std.mem.Allocator, input_json: []const u8) ![]u8 {
+    var host = try Host.loadFromFile(allocator, std.testing.io, PURE_TOOL_ARTIFACT_PATH);
+    defer host.deinit();
+    const output = host.callExecute(input_json) catch |err| switch (err) {
+        error.InvalidJsonInput => return allocator.dupe(u8, INVALID_INPUT_DIAGNOSTIC_JSON),
+        else => return err,
+    };
+    defer allocator.free(output);
+    return allocator.dupe(u8, output);
+}
+
+fn stringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn usizeField(object: std.json.ObjectMap, field: []const u8) ?usize {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn truncationResultJson(allocator: std.mem.Allocator, result: truncate_tool.TruncationResult) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll("{\"content\":");
+    try std.json.Stringify.value(result.content, .{}, &writer.writer);
+    try writer.writer.print(",\"truncated\":{},\"truncatedBy\":", .{result.truncated});
+    if (result.truncated_by) |truncated_by| {
+        try std.json.Stringify.value(switch (truncated_by) {
+            .lines => "lines",
+            .bytes => "bytes",
+        }, .{}, &writer.writer);
+    } else {
+        try writer.writer.writeAll("null");
+    }
+    try writer.writer.print(
+        ",\"totalLines\":{},\"totalBytes\":{},\"outputLines\":{},\"outputBytes\":{},\"lastLinePartial\":{},\"firstLineExceedsLimit\":{},\"maxLines\":{},\"maxBytes\":{}",
+        .{
+            result.total_lines,
+            result.total_bytes,
+            result.output_lines,
+            result.output_bytes,
+            result.last_line_partial,
+            result.first_line_exceeds_limit,
+            result.max_lines,
+            result.max_bytes,
+        },
+    );
+    try writer.writer.writeAll("}");
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn sha256FileHex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const bytes = try readRepoFile(allocator, path);
+    defer allocator.free(bytes);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "{s}", .{hex[0..]});
 }

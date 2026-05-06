@@ -1,0 +1,5 @@
+{
+	"content": "alpha\nbravo\ncharlie\ndelta",
+	"maxLines": 2,
+	"maxBytes": 1024
+}

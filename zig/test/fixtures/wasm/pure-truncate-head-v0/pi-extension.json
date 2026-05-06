@@ -1,0 +1,54 @@
+{
+	"schemaVersion": "pi-extension.v0",
+	"id": "com.pi.pure-truncate-head",
+	"name": "Pure Truncate Head Fixture",
+	"version": "0.1.0",
+	"description": "Capability-free Wasm migration fixture for the existing truncateHead pure tool implementation.",
+	"artifact": {
+		"kind": "wasm-component",
+		"path": "wasm/plugin.wasm"
+	},
+	"tool": {
+		"id": "builtin.truncateHead",
+		"description": "Keeps the beginning of content within line and byte limits.",
+		"inputSchema": {
+			"type": "object",
+			"required": ["content", "maxLines", "maxBytes"],
+			"properties": {
+				"content": { "type": "string" },
+				"maxLines": { "type": "number" },
+				"maxBytes": { "type": "number" }
+			}
+		},
+		"outputSchema": {
+			"type": "object",
+			"required": [
+				"content",
+				"truncated",
+				"truncatedBy",
+				"totalLines",
+				"totalBytes",
+				"outputLines",
+				"outputBytes",
+				"lastLinePartial",
+				"firstLineExceedsLimit",
+				"maxLines",
+				"maxBytes"
+			],
+			"properties": {
+				"content": { "type": "string" },
+				"truncated": { "type": "boolean" },
+				"truncatedBy": { "type": ["string", "null"] },
+				"totalLines": { "type": "number" },
+				"totalBytes": { "type": "number" },
+				"outputLines": { "type": "number" },
+				"outputBytes": { "type": "number" },
+				"lastLinePartial": { "type": "boolean" },
+				"firstLineExceedsLimit": { "type": "boolean" },
+				"maxLines": { "type": "number" },
+				"maxBytes": { "type": "number" }
+			}
+		}
+	},
+	"capabilities": []
+}

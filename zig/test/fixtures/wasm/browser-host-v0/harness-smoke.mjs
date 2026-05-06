@@ -3,8 +3,13 @@ import { fileURLToPath } from "node:url";
 import {
 	BrowserWasmToolHost,
 	DeniedCapabilityError,
+	EXPECTED_PURE_TRUNCATE_ERROR,
+	PURE_TRUNCATE_MANIFEST,
 	VALID_FIXTURE_INPUT,
+	VALID_PURE_TRUNCATE_INPUT,
 	attemptRuntimeImport,
+	normalizePureToolError,
+	validatePureTruncateOutput,
 	validateFixtureOutput,
 } from "./browser-wasm-host.js";
 
@@ -21,6 +26,26 @@ await host.initialize("../browser-tool-v0/pi-extension.json");
 const output = host.execute(VALID_FIXTURE_INPUT);
 if (!validateFixtureOutput(output)) {
 	throw new Error(`valid fixture output mismatch: ${JSON.stringify(output)}`);
+}
+
+const pureHost = new BrowserWasmToolHost({
+	baseUrl: import.meta.url,
+	fetchJson: readJson,
+	fetchBytes: readBytes,
+});
+await pureHost.initialize(PURE_TRUNCATE_MANIFEST);
+const pureOutput = pureHost.execute(VALID_PURE_TRUNCATE_INPUT);
+if (!validatePureTruncateOutput(pureOutput)) {
+	throw new Error(`pure truncate output mismatch: ${JSON.stringify(pureOutput)}`);
+}
+try {
+	pureHost.execute([]);
+	throw new Error("pure truncate malformed input unexpectedly succeeded");
+} catch (error) {
+	const diagnostic = normalizePureToolError(error);
+	if (JSON.stringify(diagnostic) !== JSON.stringify(EXPECTED_PURE_TRUNCATE_ERROR)) {
+		throw new Error(`pure truncate malformed diagnostic mismatch: ${JSON.stringify(diagnostic)}`);
+	}
 }
 
 for (const [capability, manifest] of [
