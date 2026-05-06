@@ -216,6 +216,7 @@ pub fn build(b: *std.Build) void {
     const coding_agent_test_step = b.step("test-coding-agent", "Run coding-agent unit tests only");
     coding_agent_test_step.dependOn(external_tool_check_step);
     coding_agent_test_step.dependOn(&run_coding_agent_tests.step);
+    agent_test_step.dependOn(&run_coding_agent_tests.step);
 
     const main_test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

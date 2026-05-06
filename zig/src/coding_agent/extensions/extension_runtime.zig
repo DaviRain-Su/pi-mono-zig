@@ -1059,6 +1059,33 @@ const native_partial_failure_descriptor: NativeDescriptor = .{
     .start = nativeFailAfterReadyRegistryAndUi,
 };
 
+fn nativeHostApiBoundaryStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_static_tool);
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.readFile("/tmp/native-denied"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.writeFile("/tmp/native-denied", "blocked"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.requestNetwork("https://example.invalid/native-denied"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.runShell("echo blocked"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.readEnv("PI_NATIVE_DENIED"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.callModel("fake-model", "{\"prompt\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.readSession("session-denied"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.writeSession("session-denied", "{\"blocked\":true}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.notifyUi("{\"message\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.useTool("native.fixture.echo", "{\"value\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.spawnAgent("{\"task\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.delegateAgent("{\"task\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedNativeHostOperation, api.emitEvent("{\"type\":\"native_event\"}"));
+}
+
+const native_host_api_boundary_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-host-api-boundary",
+    .name = "Native Host API Boundary Fixture",
+    .version = "0.1.0",
+    .description = "Native fixture that exercises declared host API boundaries",
+    .tools = &.{native_static_tool},
+    .start = nativeHostApiBoundaryStart,
+};
+
 fn expectNativeStaticRegistry(context: ?*anyopaque, registry: *const Registry) !void {
     _ = context;
     const counts = extension_registry.registrySurfaceCounts(registry);
@@ -1349,6 +1376,108 @@ test "native runtime partial setup failure cleans registry tool and UI state" {
     try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
     try adapter.withRegistry(null, expectNativeStaticRegistry);
     try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "native.fixture.partial"));
+}
+
+test "native runtime participates in adapter conformance and event frames are stable no-op" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try std.testing.expectEqual(RuntimeKind.native, adapter.kind);
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+    try std.testing.expect(!adapter.hasRegisteredCommand("native.fixture.echo"));
+
+    const empty_requests = try adapter.takeUiRequests(allocator);
+    defer freeUiRequests(allocator, empty_requests);
+    try std.testing.expectEqual(@as(usize, 0), empty_requests.len);
+    try adapter.sendExtensionUiResponse("unknown", "{\"ignored\":true}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+
+    const snapshot_before_events = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_before_events);
+    adapter.sendExtensionEventFrame("{\"type\":\"before_agent_start\",\"agentId\":\"agent\",\"runId\":\"run\"}");
+    adapter.sendExtensionEventFrame("{\"type\":\"unsupported_native_event\",\"payload\":{\"x\":1}}");
+    adapter.sendExtensionEventFrame("{");
+    adapter.sendExtensionEventFrame("[]");
+    const snapshot_after_events = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_after_events);
+    try std.testing.expectEqualStrings(snapshot_before_events, snapshot_after_events);
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+
+    var agent_tool = (try adapter.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"event-stable\"}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "native-event-stable", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"event-stable\"}", success.content[0].text.text);
+
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    adapter.sendExtensionEventFrame("{\"type\":\"after_shutdown\"}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "native.fixture.echo"));
+    const snapshot_after_shutdown_event = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot_after_shutdown_event);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_after_shutdown_event, "\"tools\":[]") != null);
+}
+
+test "native host API privileged operations are explicit default-deny boundaries" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_host_api_boundary_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 13), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 13), adapter.diagnosticCategoryCount(.host_error));
+    const native_boundary_runtime = nativeRuntime(adapter.ptr);
+    const expected_capabilities = [_][]const u8{
+        "file.read",
+        "file.write",
+        "network.request",
+        "shell.run",
+        "env.read",
+        "model.call",
+        "session.read",
+        "session.write",
+        "ui.notify",
+        "tool.use",
+        "agent.spawn",
+        "agent.delegate",
+    };
+    for (expected_capabilities) |capability| {
+        var found = false;
+        for (native_boundary_runtime.state.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, capability) != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"mode\":\"native/host-api\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"category\":\"denied_capability\"") != null)
+            {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, native_boundary_runtime.state.diagnostics.items[12].message, "unsupported_native_host_event") != null);
+
+    const snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"native.fixture.echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "native-denied") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "blocked") == null);
 }
 
 test "wasm manifest handoff starts runtime without capability execution" {
@@ -1690,14 +1819,39 @@ test "extension runtime mixed process_jsonl and wasm adapters isolate interleave
     defer wasm_adapter.deinit();
     try expectWasmToolSubsetConformance(allocator, wasm_adapter, manifest_result.valid.artifact_absolute_path);
 
+    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer native_adapter.deinit();
+    try native_adapter.waitForReady(0);
+    try std.testing.expectEqual(RuntimeKind.native, native_adapter.kind);
+    try std.testing.expectEqual(@as(usize, 0), native_adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), native_adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), native_adapter.registryFramesApplied());
+    try native_adapter.withRegistry(null, expectNativeStaticRegistry);
+
     const process_snapshot_before_wasm_shutdown = try process_adapter.snapshotRegistryJson(allocator);
     defer allocator.free(process_snapshot_before_wasm_shutdown);
     try std.testing.expect(std.mem.indexOf(u8, process_snapshot_before_wasm_shutdown, "\"name\":\"process-command\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, process_snapshot_before_wasm_shutdown, "\"name\":\"builtin.truncateHead\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot_before_wasm_shutdown, "\"name\":\"native.fixture.echo\"") == null);
     const wasm_snapshot_before_shutdown = try wasm_adapter.snapshotRegistryJson(allocator);
     defer allocator.free(wasm_snapshot_before_shutdown);
     try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot_before_shutdown, "\"name\":\"builtin.truncateHead\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot_before_shutdown, "\"name\":\"process-command\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot_before_shutdown, "\"name\":\"native.fixture.echo\"") == null);
+    const native_snapshot_before_shutdown = try native_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(native_snapshot_before_shutdown);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot_before_shutdown, "\"name\":\"native.fixture.echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot_before_shutdown, "\"name\":\"process-command\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot_before_shutdown, "\"name\":\"builtin.truncateHead\"") == null);
+
+    try native_adapter.shutdown();
+    try std.testing.expect(native_adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try native_adapter.agentTool(allocator, "native.fixture.echo"));
+    try std.testing.expect(process_adapter.hasRegisteredCommand("process-command"));
+    try std.testing.expectEqual(@as(usize, 1), process_adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), wasm_adapter.registryFramesApplied());
 
     try wasm_adapter.shutdown();
     try std.testing.expect(wasm_adapter.hasShutdownComplete());
@@ -1714,12 +1868,14 @@ test "extension runtime mixed process_jsonl and wasm adapters isolate interleave
     try process_adapter.shutdown();
     try std.testing.expect(process_adapter.hasShutdownComplete());
     try std.testing.expect(wasm_adapter.hasShutdownComplete());
+    try std.testing.expect(native_adapter.hasShutdownComplete());
 
     const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
     defer allocator.free(capture);
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"initialize\",\"marker\":\"mixed-process-marker\",\"cwd\":\"/mixed-process-cwd\",\"fixture\":\"mixed-process-fixture\"}\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"process-pending\",\"payload\":{\"ok\":true}}\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "builtin.truncateHead") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "native.fixture.echo") == null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"shutdown\"}\n") != null);
 }
 

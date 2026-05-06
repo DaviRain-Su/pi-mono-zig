@@ -190,6 +190,106 @@ pub const NativeHostApi = struct {
             .payload_json = owned_payload,
         });
     }
+
+    pub fn readFile(self: *NativeHostApi, path: []const u8) !void {
+        _ = path;
+        return self.denyCapability(.file_read, .initialize, "file.read");
+    }
+
+    pub fn writeFile(self: *NativeHostApi, path: []const u8, contents: []const u8) !void {
+        _ = path;
+        _ = contents;
+        return self.denyCapability(.file_write, .initialize, "file.write");
+    }
+
+    pub fn requestNetwork(self: *NativeHostApi, url: []const u8) !void {
+        _ = url;
+        return self.denyCapability(.network_request, .initialize, "network.request");
+    }
+
+    pub fn runShell(self: *NativeHostApi, command: []const u8) !void {
+        _ = command;
+        return self.denyCapability(.shell_run, .initialize, "shell.run");
+    }
+
+    pub fn readEnv(self: *NativeHostApi, name: []const u8) !void {
+        _ = name;
+        return self.denyCapability(.env_read, .initialize, "env.read");
+    }
+
+    pub fn callModel(self: *NativeHostApi, model: []const u8, payload_json: []const u8) !void {
+        _ = model;
+        _ = payload_json;
+        return self.denyCapability(.model_call, .initialize, "model.call");
+    }
+
+    pub fn readSession(self: *NativeHostApi, session_id: []const u8) !void {
+        _ = session_id;
+        return self.denyCapability(.session_read, .initialize, "session.read");
+    }
+
+    pub fn writeSession(self: *NativeHostApi, session_id: []const u8, payload_json: []const u8) !void {
+        _ = session_id;
+        _ = payload_json;
+        return self.denyCapability(.session_write, .initialize, "session.write");
+    }
+
+    pub fn notifyUi(self: *NativeHostApi, payload_json: []const u8) !void {
+        _ = payload_json;
+        return self.denyCapability(.ui_notify, .initialize, "ui.notify");
+    }
+
+    pub fn useTool(self: *NativeHostApi, name: []const u8, payload_json: []const u8) !void {
+        _ = name;
+        _ = payload_json;
+        return self.denyCapability(.tool_use, .call, "tool.use");
+    }
+
+    pub fn spawnAgent(self: *NativeHostApi, task_json: []const u8) !void {
+        _ = task_json;
+        return self.denyCapability(.agent_spawn, .call, "agent.spawn");
+    }
+
+    pub fn delegateAgent(self: *NativeHostApi, task_json: []const u8) !void {
+        _ = task_json;
+        return self.denyCapability(.agent_delegate, .call, "agent.delegate");
+    }
+
+    pub fn emitEvent(self: *NativeHostApi, frame_json: []const u8) !void {
+        _ = frame_json;
+        try self.runtime.state.addDiagnostic(
+            .host_error,
+            .@"error",
+            "{\"phase\":\"initialize\",\"category\":\"unsupported_native_host_event\",\"operation\":\"event.emit\",\"message\":\"native host API event emission is not supported in v0\"}",
+        );
+        return error.UnsupportedNativeHostOperation;
+    }
+
+    fn denyCapability(
+        self: *NativeHostApi,
+        capability: wasm_manifest.Capability,
+        phase: wasm_manifest.LifecyclePhase,
+        operation: []const u8,
+    ) !void {
+        const denial = wasm_manifest.denyRuntimeCapability(capability, phase, "native/host-api");
+        var envelope: std.Io.Writer.Allocating = .init(self.runtime.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"category\":");
+        try std.json.Stringify.value(denial.category, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"capability\":");
+        try std.json.Stringify.value(denial.capability.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"branch\":");
+        try std.json.Stringify.value(denial.branch.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"phase\":");
+        try std.json.Stringify.value(denial.phase.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"mode\":");
+        try std.json.Stringify.value(denial.mode, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"operation\":");
+        try std.json.Stringify.value(operation, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"message\":\"native host API operation denied by default\"}");
+        try self.runtime.state.addDiagnostic(.host_error, .@"error", envelope.written());
+        return error.UnsupportedRuntimeCapability;
+    }
 };
 
 pub const NativeRuntime = struct {
