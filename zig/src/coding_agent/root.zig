@@ -9,6 +9,7 @@ pub const system_prompt = @import("system_prompt.zig");
 pub const print_mode = @import("print_mode.zig");
 pub const rpc_mode = @import("rpc_mode.zig");
 pub const ts_rpc_mode = @import("ts_rpc_mode.zig");
+pub const extension_protocol = @import("extension_protocol.zig");
 pub const extension_host = @import("extension_host.zig");
 pub const extension_flags = @import("extension_flags.zig");
 pub const extension_registry = @import("extension_registry.zig");
@@ -73,6 +74,7 @@ test {
     _ = @import("print_mode.zig");
     _ = @import("rpc_mode.zig");
     _ = @import("ts_rpc_mode.zig");
+    _ = @import("extension_protocol.zig");
     _ = @import("extension_host.zig");
     _ = @import("extension_flags.zig");
     _ = @import("extension_registry.zig");
