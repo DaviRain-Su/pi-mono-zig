@@ -43,7 +43,7 @@ mostly native MCP scope and continued extension/provider edge-case verification.
 | Providers / auth | Good coverage for major providers, including standalone Moonshot, Cloudflare, Xiaomi, Kimi, and compatible-provider catalog entries. | Low |
 | TS extensions | Core compatibility layer is implemented. Dynamic refresh, malformed registration isolation, and reload cleanup now have targeted regression coverage. | Low |
 | MCP | Not native-complete; expected to flow through extension compatibility for now. | Medium |
-| Linux CI | Ubuntu and macOS both run `zig build` and `zig build test` in CI. | Low |
+| Linux CI | `ubuntu-latest` installs Zig/tools and runs build-graph/tool smoke checks, but full `zig build`/`zig build test` stays on macOS until the Zig 0.16.0 Linux `build-exe` SEGV is fixed upstream. | Medium |
 
 ## Confirmed Resolved Since Earlier Reviews
 
@@ -83,6 +83,22 @@ coverage for dynamic refresh, unregister/re-register ordering, malformed
 registration isolation, flag help fallback, and reload cleanup. Remaining work is
 ongoing parity hardening as new TypeScript extension behaviors are added.
 
+### P2: Linux CI Full Build/Test Blocked by Zig 0.16.0
+
+`ubuntu-latest` currently keeps the Zig toolchain and external-tool checks in
+CI, but skips full `zig build` and `zig build test`.
+
+Reason:
+
+- Zig 0.16.0 terminates with `signal SEGV` while compiling the `pi` executable
+  in Debug mode on GitHub-hosted Ubuntu.
+- macOS remains the blocking full build/test lane with the same Zig version.
+
+Recommended follow-up:
+
+- Re-enable Linux full build/test after upgrading to a stable Zig release that
+  fixes the upstream Linux `build-exe` crash.
+
 ## Not Currently Blocking
 
 ### Bedrock Stream Contract
@@ -110,6 +126,7 @@ and have setup-failure tests. OpenAI Responses uses the wrapper pattern and has 
 1. Continue native MCP design/implementation planning.
 2. Keep adding extension/provider parity regressions as TypeScript behavior evolves.
 3. Expand provider smoke matrices for newly registered standalone providers without using real credentials.
+4. Re-enable Linux full build/test once a stable Zig compiler release fixes the Ubuntu `build-exe` SEGV.
 
 ## Verification Assets
 
@@ -135,6 +152,7 @@ The remaining work is narrower than before:
 
 - keep native MCP as future scope
 - continue extension/provider parity hardening as TypeScript behavior evolves
+- restore Linux full build/test after the Zig Linux compiler crash is fixed
 
 Forward-looking extension architecture work is tracked separately in
 `zig/docs/wasm-extension-roadmap.md`. That roadmap covers the language-neutral

@@ -21,6 +21,10 @@ jobs:
   build-test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # ubuntu-latest currently SIGSEGVs in `zig build-exe pi` with Zig 0.16.0
+    # due to upstream bug https://github.com/ziglang/zig/issues/26028.
+    # Keep Linux in the matrix for setup/build-graph/tool smoke coverage, but
+    # skip the Zig build/test steps there until a stable Zig release fixes it.
     strategy:
       fail-fast: false
       matrix:
@@ -44,8 +48,7 @@ jobs:
 
       # mlugg/setup-zig@v1 still uses the pre-0.16 tarball naming
       # (zig-<os>-<arch>-<ver>) and 404s on 0.16.0 which switched to
-      # zig-<arch>-<os>-<ver>. Install Zig directly from ziglang.org
-      # using the official index.json instead.
+      # zig-<arch>-<os>-<ver>. Install Zig directly from ziglang.org.
       - name: Setup Zig 0.16.0
         shell: bash
         run: |
@@ -86,8 +89,18 @@ jobs:
           fd --version
           zig version
 
+      - name: Linux Zig smoke
+        if: runner.os == 'Linux'
+        run: |
+          zig env
+          zig build check-external-tools --summary all
+          echo "Skipping Linux zig build/test because Zig 0.16.0 SIGSEGVs in build-exe on ubuntu-latest."
+          echo "Re-enable after upgrading to a stable Zig release with ziglang/zig#26028 fixed."
+
       - name: Build
+        if: runner.os != 'Linux'
         run: zig build
 
       - name: Test
+        if: runner.os != 'Linux'
         run: zig build test
