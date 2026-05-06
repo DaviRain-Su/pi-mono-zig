@@ -101,7 +101,11 @@ The RFC, roadmap, manifest validator, native host spike, and browser harness use
 the same lifecycle terms: `discover`, `validate`, `load`, `initialize`, `call`,
 and `unload`. Representative discovery, validation, initialization, call, and
 capability-denial failures are user-visible deterministic diagnostics rather
-than uncaught stack traces.
+than uncaught stack traces. Native unload cleanup evidence is covered by
+`wasm_host_spike.zig` test `wasm unload cleanup releases host resources and
+unregisters tool`, which deinitializes the host runtime, removes the registered
+Wasm tool, and confirms no process/server handle is part of the native host
+state.
 
 ### README and Public-Docs Gate
 
@@ -118,7 +122,7 @@ The completed handoffs record these validation surfaces:
 | Surface | Representative evidence |
 | --- | --- |
 | Focused Zig foundation tests | `cd zig && zig build test-coding-agent -- --test-filter "wasm manifest"`; `cd zig && zig build test-coding-agent -- --test-filter "pi-extension"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm wit"` |
-| Focused Zig host/package/capability tests | `cd zig && zig build test-coding-agent -- --test-filter "extism"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm host"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm pure tool"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm package"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm capability"` |
+| Focused Zig host/package/capability tests | `cd zig && zig build test-coding-agent -- --test-filter "extism"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm host"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm unload"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm pure tool"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm package"`; `cd zig && zig build test-coding-agent -- --test-filter "wasm capability"` |
 | Focused TypeScript package tests | `cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/package-manager.test.ts`; `cd packages/coding-agent && npx tsx ../../node_modules/vitest/dist/cli.js --run test/extensions-discovery.test.ts` |
 | Browser validation | `node zig/test/fixtures/wasm/browser-host-v0/harness-smoke.mjs`; agent-browser sessions on `http://127.0.0.1:3120/zig/test/fixtures/wasm/browser-host-v0/index.html`; pre/post `lsof -nP -iTCP:3120-3129 -sTCP:LISTEN` checks showing cleanup. |
 | Repository check after code changes | `npm run check` passed in the final successful handoffs for the implementation features after the web-ui source-resolution blocker was fixed. |

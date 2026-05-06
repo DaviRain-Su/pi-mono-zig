@@ -1,4 +1,5 @@
 const std = @import("std");
+const extension_registry = @import("extension_registry.zig");
 const truncate_tool = @import("tools/truncate.zig");
 const wasm_manifest = @import("wasm_manifest.zig");
 
@@ -27,11 +28,33 @@ pub const Host = struct {
     }
 
     pub fn deinit(self: *Host) void {
+        self.releaseRuntimeResources();
+        self.* = undefined;
+    }
+
+    pub fn unload(self: *Host, registry: ?*extension_registry.Registry, tool_id: ?[]const u8) void {
+        if (registry) |runtime_registry| {
+            if (tool_id) |name| _ = runtime_registry.unregisterTool(name);
+        }
+        self.releaseRuntimeResources();
+        self.function_exports = std.StringHashMap(u32).init(self.allocator);
+        self.function_returns = &.{};
+        self.memory = &.{};
+    }
+
+    pub fn resourceCounts(self: *const Host) HostResourceCounts {
+        return .{
+            .memory_bytes = self.memory.len,
+            .function_returns = self.function_returns.len,
+            .function_exports = self.function_exports.count(),
+        };
+    }
+
+    fn releaseRuntimeResources(self: *Host) void {
         freeStringHashMapKeys(&self.function_exports, self.allocator);
         self.function_exports.deinit();
         self.allocator.free(self.function_returns);
         self.allocator.free(self.memory);
-        self.* = undefined;
     }
 
     pub fn callMetadata(self: *const Host) ![]u8 {
@@ -62,6 +85,12 @@ pub const Host = struct {
         if (index >= self.function_returns.len) return error.InvalidWasmFunctionIndex;
         return self.function_returns[index] orelse error.UnsupportedWasmFunctionBody;
     }
+};
+
+pub const HostResourceCounts = struct {
+    memory_bytes: usize,
+    function_returns: usize,
+    function_exports: usize,
 };
 
 const Cursor = struct {
@@ -371,10 +400,52 @@ test "wasm host spike stays isolated from agent session and provider runtime" {
     defer allocator.free(source);
 
     try expectNotContains(source, "@import(\"extension_host.zig\")");
-    try expectNotContains(source, "@import(\"extension_registry.zig\")");
     try expectNotContains(source, "@import(\"session.zig\")");
     try expectNotContains(source, "@import(\"session_manager.zig\")");
     try expectNotContains(source, "@import(\"provider_config.zig\")");
+}
+
+test "wasm unload cleanup releases host resources and unregisters tool" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    var registry = extension_registry.Registry.init(allocator);
+    defer registry.deinit();
+
+    var host = try Host.loadFromFile(allocator, std.testing.io, manifest_result.valid.artifact_absolute_path);
+    defer host.deinit();
+
+    try registry.registerTool(
+        manifest_result.valid.tool_id,
+        manifest_result.valid.tool_id,
+        manifest_result.valid.description,
+        manifest_result.valid.artifact_absolute_path,
+    );
+
+    const before = host.resourceCounts();
+    try std.testing.expect(before.memory_bytes > 0);
+    try std.testing.expect(before.function_returns > 0);
+    try std.testing.expect(before.function_exports > 0);
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings(manifest_result.valid.tool_id, registry.tools.items[0].name);
+    try std.testing.expect(!@hasField(Host, "child"));
+    try std.testing.expect(!@hasField(Host, "server"));
+    try std.testing.expect(!@hasField(Host, "listener"));
+
+    host.unload(&registry, manifest_result.valid.tool_id);
+
+    const after = host.resourceCounts();
+    try std.testing.expectEqual(@as(usize, 0), after.memory_bytes);
+    try std.testing.expectEqual(@as(usize, 0), after.function_returns);
+    try std.testing.expectEqual(@as(usize, 0), after.function_exports);
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expect(!registry.unregisterTool(manifest_result.valid.tool_id));
+    try std.testing.expectError(error.MissingWasmExport, host.callMetadata());
 }
 
 test "wasm pure tool selection names existing implementation manifest and artifact" {
