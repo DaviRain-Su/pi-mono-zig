@@ -119,7 +119,10 @@ pub const SessionTreeEvent = struct {
 
 // Agent events
 pub const BeforeAgentStartEvent = struct {
-    messages: []const []const u8,
+    prompt: []const u8 = "",
+    images: []const []const u8 = &.{},
+    system_prompt: []const u8 = "",
+    messages: []const []const u8 = &.{},
 };
 
 pub const AgentStartEvent = struct {};
@@ -147,6 +150,7 @@ pub const MessageUpdateEvent = struct {
 
 pub const MessageEndEvent = struct {
     message_id: []const u8,
+    role: []const u8 = "",
     final_message: []const u8,
 };
 
@@ -186,6 +190,8 @@ pub const ToolResultEvent = struct {
 
 pub const UserBashEvent = struct {
     command: []const u8,
+    exclude_from_context: bool = false,
+    cwd: []const u8 = "",
 };
 
 // Context/Provider events
@@ -196,6 +202,7 @@ pub const ContextEvent = struct {
 pub const BeforeProviderRequestEvent = struct {
     model: []const u8,
     messages: []const []const u8,
+    payload: []const u8 = "",
 };
 
 pub const AfterProviderResponseEvent = struct {
@@ -217,6 +224,7 @@ pub const ThinkingLevelSelectEvent = struct {
 // Input events
 pub const InputEvent = struct {
     data: []const u8,
+    images: []const []const u8 = &.{},
 };
 
 /// Event handler function type
@@ -264,11 +272,13 @@ pub const InputAction = enum {
 pub const InputEventResult = struct {
     action: InputAction,
     text: ?[]const u8 = null,
+    images: ?[]const []const u8 = null,
 };
 
 pub const OwnedInputEventResult = struct {
     action: InputAction,
     text: ?[]u8 = null,
+    images: ?[]const []const u8 = null,
 
     pub fn deinit(self: *OwnedInputEventResult, allocator: std.mem.Allocator) void {
         if (self.text) |text| allocator.free(text);
@@ -288,11 +298,72 @@ pub const ToolResultCombinedResult = struct {
     is_error: bool,
 };
 
+pub const SessionBeforeResult = struct {
+    cancel: bool = false,
+};
+
+pub const MessageEndResult = struct {
+    role: ?[]const u8 = null,
+    message: ?[]const u8 = null,
+};
+
+pub const MessageEndCombinedResult = struct {
+    role: []const u8,
+    message: []const u8,
+};
+
+pub const ContextEventResult = struct {
+    messages: ?[]const []const u8 = null,
+};
+
+pub const BeforeProviderRequestEventResult = struct {
+    payload: ?[]const u8 = null,
+};
+
+pub const BeforeAgentStartEventResult = struct {
+    message: ?[]const u8 = null,
+    system_prompt: ?[]const u8 = null,
+};
+
+pub const BeforeAgentStartCombinedResult = struct {
+    messages: []const []const u8,
+    system_prompt: ?[]const u8,
+
+    pub fn deinit(self: *BeforeAgentStartCombinedResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.messages);
+        self.* = undefined;
+    }
+};
+
+pub const ToolCallEventResult = struct {
+    input: ?[]const u8 = null,
+    block: bool = false,
+    reason: ?[]const u8 = null,
+};
+
+pub const ToolCallCombinedResult = struct {
+    input: []const u8,
+    block: bool = false,
+    reason: ?[]const u8 = null,
+};
+
+pub const UserBashEventResult = struct {
+    operations: ?[]const u8 = null,
+    result: ?[]const u8 = null,
+};
+
 pub const EventHandlerResult = union(enum) {
     none,
     resources_discover: ResourcesDiscoverResult,
     input: InputEventResult,
     tool_result: ToolResultPatch,
+    session_before: SessionBeforeResult,
+    message_end: MessageEndResult,
+    context: ContextEventResult,
+    before_provider_request: BeforeProviderRequestEventResult,
+    before_agent_start: BeforeAgentStartEventResult,
+    tool_call: ToolCallEventResult,
+    user_bash: UserBashEventResult,
 };
 
 pub const ExtensionError = struct {
@@ -418,6 +489,42 @@ pub const ResultEventBus = struct {
         });
     }
 
+    pub fn emitLifecycle(self: *ResultEventBus, event: ExtensionEvent) !void {
+        const event_type = std.meta.activeTag(event);
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != event_type) continue;
+            _ = entry.handler(event) catch |err| {
+                try self.recordError(entry.extension_path, event_type, err);
+                continue;
+            };
+        }
+    }
+
+    pub fn emitSessionBefore(self: *ResultEventBus, event: ExtensionEvent) !?SessionBeforeResult {
+        const event_type = std.meta.activeTag(event);
+        switch (event_type) {
+            .session_before_switch, .session_before_fork, .session_before_compact, .session_before_tree => {},
+            else => return null,
+        }
+
+        var result: ?SessionBeforeResult = null;
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != event_type) continue;
+            const handler_result = entry.handler(event) catch |err| {
+                try self.recordError(entry.extension_path, event_type, err);
+                continue;
+            };
+            switch (handler_result) {
+                .session_before => |session_result| {
+                    result = session_result;
+                    if (session_result.cancel) return session_result;
+                },
+                else => {},
+            }
+        }
+        return result;
+    }
+
     pub fn emitResourcesDiscover(self: *ResultEventBus, cwd: []const u8, reason: []const u8) !ResourcesDiscoverCombinedResult {
         var skill_paths = std.ArrayList(ResourcePathResult).empty;
         errdefer deinitResourcePathList(self.allocator, &skill_paths);
@@ -439,7 +546,7 @@ pub const ResultEventBus = struct {
                     try appendResourcePaths(self.allocator, &prompt_paths, result.prompt_paths, entry.extension_path);
                     try appendResourcePaths(self.allocator, &theme_paths, result.theme_paths, entry.extension_path);
                 },
-                .none, .input, .tool_result => {},
+                else => {},
             }
         }
 
@@ -451,13 +558,18 @@ pub const ResultEventBus = struct {
     }
 
     pub fn emitInput(self: *ResultEventBus, data: []const u8) !OwnedInputEventResult {
+        return self.emitInputWithImages(data, &.{});
+    }
+
+    pub fn emitInputWithImages(self: *ResultEventBus, data: []const u8, images: []const []const u8) !OwnedInputEventResult {
         var current = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(current);
+        var current_images = images;
         var modified = false;
 
         for (self.handlers.items) |entry| {
             if (entry.event_type != .input) continue;
-            const event = ExtensionEvent{ .input = .{ .data = current } };
+            const event = ExtensionEvent{ .input = .{ .data = current, .images = current_images } };
             const handler_result = entry.handler(event) catch |err| {
                 try self.recordError(entry.extension_path, .input, err);
                 continue;
@@ -475,18 +587,187 @@ pub const ResultEventBus = struct {
                             current = next;
                             modified = true;
                         }
+                        if (result.images) |next_images| {
+                            current_images = next_images;
+                            modified = true;
+                        }
                     },
                     .@"continue" => {},
                 },
-                .none, .resources_discover, .tool_result => {},
+                else => {},
             }
         }
 
         if (modified) {
-            return .{ .action = .transform, .text = current };
+            return .{ .action = .transform, .text = current, .images = current_images };
         }
         self.allocator.free(current);
         return .{ .action = .@"continue" };
+    }
+
+    pub fn emitMessageEnd(self: *ResultEventBus, event: MessageEndEvent) !?MessageEndCombinedResult {
+        var current_role = event.role;
+        var current_message = event.final_message;
+        var modified = false;
+
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != .message_end) continue;
+            const current_event = ExtensionEvent{ .message_end = .{
+                .message_id = event.message_id,
+                .role = current_role,
+                .final_message = current_message,
+            } };
+            const handler_result = entry.handler(current_event) catch |err| {
+                try self.recordError(entry.extension_path, .message_end, err);
+                continue;
+            };
+            switch (handler_result) {
+                .message_end => |replacement| {
+                    if (replacement.message) |message| {
+                        const replacement_role = replacement.role orelse current_role;
+                        if (!std.mem.eql(u8, replacement_role, current_role)) {
+                            try self.recordErrorMessage(entry.extension_path, .message_end, "message_end handlers must return a message with the same role");
+                            continue;
+                        }
+                        current_role = replacement_role;
+                        current_message = message;
+                        modified = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (!modified) return null;
+        return .{ .role = current_role, .message = current_message };
+    }
+
+    pub fn emitContext(self: *ResultEventBus, messages: []const []const u8) ![]const []const u8 {
+        var current_messages = messages;
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != .context) continue;
+            const event = ExtensionEvent{ .context = .{ .messages = current_messages } };
+            const handler_result = entry.handler(event) catch |err| {
+                try self.recordError(entry.extension_path, .context, err);
+                continue;
+            };
+            switch (handler_result) {
+                .context => |result| {
+                    if (result.messages) |next| current_messages = next;
+                },
+                else => {},
+            }
+        }
+        return current_messages;
+    }
+
+    pub fn emitBeforeProviderRequest(self: *ResultEventBus, payload: []const u8) ![]const u8 {
+        var current_payload = payload;
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != .before_provider_request) continue;
+            const event = ExtensionEvent{ .before_provider_request = .{
+                .model = "",
+                .messages = &.{},
+                .payload = current_payload,
+            } };
+            const handler_result = entry.handler(event) catch |err| {
+                try self.recordError(entry.extension_path, .before_provider_request, err);
+                continue;
+            };
+            switch (handler_result) {
+                .before_provider_request => |result| {
+                    if (result.payload) |next| current_payload = next;
+                },
+                else => {},
+            }
+        }
+        return current_payload;
+    }
+
+    pub fn emitBeforeAgentStart(
+        self: *ResultEventBus,
+        prompt: []const u8,
+        images: []const []const u8,
+        system_prompt: []const u8,
+    ) !?BeforeAgentStartCombinedResult {
+        var current_system_prompt = system_prompt;
+        var messages = std.ArrayList([]const u8).empty;
+        errdefer messages.deinit(self.allocator);
+        var system_prompt_modified = false;
+
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != .before_agent_start) continue;
+            const event = ExtensionEvent{ .before_agent_start = .{
+                .prompt = prompt,
+                .images = images,
+                .system_prompt = current_system_prompt,
+                .messages = messages.items,
+            } };
+            const handler_result = entry.handler(event) catch |err| {
+                try self.recordError(entry.extension_path, .before_agent_start, err);
+                continue;
+            };
+            switch (handler_result) {
+                .before_agent_start => |result| {
+                    if (result.message) |message| try messages.append(self.allocator, message);
+                    if (result.system_prompt) |next| {
+                        current_system_prompt = next;
+                        system_prompt_modified = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (messages.items.len == 0 and !system_prompt_modified) {
+            messages.deinit(self.allocator);
+            return null;
+        }
+        return .{
+            .messages = try messages.toOwnedSlice(self.allocator),
+            .system_prompt = if (system_prompt_modified) current_system_prompt else null,
+        };
+    }
+
+    pub fn emitToolCall(self: *ResultEventBus, event: ToolCallEvent) !?ToolCallCombinedResult {
+        var current_input = event.input;
+        var modified = false;
+        var result_seen = false;
+        var last_reason: ?[]const u8 = null;
+
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != .tool_call) continue;
+            const current_event = ExtensionEvent{ .tool_call = .{
+                .tool_name = event.tool_name,
+                .tool_call_id = event.tool_call_id,
+                .input = current_input,
+            } };
+            const handler_result = entry.handler(current_event) catch |err| {
+                try self.recordError(entry.extension_path, .tool_call, err);
+                continue;
+            };
+            switch (handler_result) {
+                .tool_call => |result| {
+                    result_seen = true;
+                    if (result.input) |next_input| {
+                        current_input = next_input;
+                        modified = true;
+                    }
+                    last_reason = result.reason;
+                    if (result.block) {
+                        return .{
+                            .input = current_input,
+                            .block = true,
+                            .reason = result.reason,
+                        };
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (!modified and !result_seen) return null;
+        return .{ .input = current_input, .reason = last_reason };
     }
 
     pub fn emitToolResult(self: *ResultEventBus, event: ToolResultEvent) !?ToolResultCombinedResult {
@@ -524,7 +805,7 @@ pub const ResultEventBus = struct {
                         modified = true;
                     }
                 },
-                .none, .resources_discover, .input => {},
+                else => {},
             }
         }
 
@@ -536,13 +817,32 @@ pub const ResultEventBus = struct {
         };
     }
 
+    pub fn emitUserBash(self: *ResultEventBus, event: UserBashEvent) !?UserBashEventResult {
+        for (self.handlers.items) |entry| {
+            if (entry.event_type != .user_bash) continue;
+            const handler_result = entry.handler(.{ .user_bash = event }) catch |err| {
+                try self.recordError(entry.extension_path, .user_bash, err);
+                continue;
+            };
+            switch (handler_result) {
+                .user_bash => |result| return result,
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn recordError(self: *ResultEventBus, extension_path: []const u8, event_type: ExtensionEventType, err: anyerror) !void {
+        try self.recordErrorMessage(extension_path, event_type, @errorName(err));
+    }
+
+    fn recordErrorMessage(self: *ResultEventBus, extension_path: []const u8, event_type: ExtensionEventType, message: []const u8) !void {
         const path_dup = try self.allocator.dupe(u8, extension_path);
         errdefer self.allocator.free(path_dup);
         const event_name_value = eventName(event_type);
         const event_dup = try self.allocator.dupe(u8, event_name_value);
         errdefer self.allocator.free(event_dup);
-        const error_dup = try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
+        const error_dup = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(error_dup);
         try self.errors.append(self.allocator, .{
             .extension_path = path_dup,
@@ -863,6 +1163,305 @@ test "ResultEventBus tool_result returns undefined empty and chains partial patc
     try std.testing.expectEqualStrings("first", patched.content[0]);
     try std.testing.expectEqualStrings("{\"source\":\"ext1\"}", patched.details.?);
     try std.testing.expect(patched.is_error);
+}
+
+var lifecycle_order: u32 = 0;
+
+fn lifecycleHandlerOne(_: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqual(@as(u32, 0), lifecycle_order);
+    lifecycle_order += 1;
+    return .none;
+}
+
+fn lifecycleHandlerFailure(_: ExtensionEvent) !EventHandlerResult {
+    return error.LifecycleFixtureFailure;
+}
+
+fn lifecycleHandlerTwo(_: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqual(@as(u32, 1), lifecycle_order);
+    lifecycle_order += 1;
+    return .none;
+}
+
+var session_after_cancel_called = false;
+
+fn sessionBeforeContinue(_: ExtensionEvent) !EventHandlerResult {
+    return .none;
+}
+
+fn sessionBeforeCancel(_: ExtensionEvent) !EventHandlerResult {
+    return .{ .session_before = .{ .cancel = true } };
+}
+
+fn sessionBeforeAfterCancel(_: ExtensionEvent) !EventHandlerResult {
+    session_after_cancel_called = true;
+    return .none;
+}
+
+test "ResultEventBus lifecycle isolates errors and session_before first cancel short-circuits" {
+    const allocator = std.testing.allocator;
+
+    var lifecycle_bus = ResultEventBus.init(allocator);
+    defer lifecycle_bus.deinit();
+    lifecycle_order = 0;
+    try lifecycle_bus.on(.session_start, lifecycleHandlerOne, "/tmp/lifecycle-one.ts");
+    try lifecycle_bus.on(.session_start, lifecycleHandlerFailure, "/tmp/lifecycle-fail.ts");
+    try lifecycle_bus.on(.session_start, lifecycleHandlerTwo, "/tmp/lifecycle-two.ts");
+    try lifecycle_bus.emitLifecycle(.{ .session_start = .{ .reason = "startup" } });
+    try std.testing.expectEqual(@as(u32, 2), lifecycle_order);
+    try std.testing.expectEqual(@as(usize, 1), lifecycle_bus.errors.items.len);
+    try std.testing.expectEqualStrings("session_start", lifecycle_bus.errors.items[0].event);
+
+    var cancel_bus = ResultEventBus.init(allocator);
+    defer cancel_bus.deinit();
+    session_after_cancel_called = false;
+    try cancel_bus.on(.session_before_switch, sessionBeforeContinue, "/tmp/session-one.ts");
+    try cancel_bus.on(.session_before_switch, sessionBeforeCancel, "/tmp/session-cancel.ts");
+    try cancel_bus.on(.session_before_switch, sessionBeforeAfterCancel, "/tmp/session-after.ts");
+    const cancel = (try cancel_bus.emitSessionBefore(.{ .session_before_switch = .{ .reason = "new" } })).?;
+    try std.testing.expect(cancel.cancel);
+    try std.testing.expect(!session_after_cancel_called);
+}
+
+fn inputImageTransformOne(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("base", event.input.data);
+    try std.testing.expectEqualStrings("orig-img", event.input.images[0]);
+    return .{ .input = .{ .action = .transform, .text = "with-image" } };
+}
+
+const replacement_images = [_][]const u8{"new-img"};
+
+fn inputImageTransformTwo(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("with-image", event.input.data);
+    try std.testing.expectEqualStrings("orig-img", event.input.images[0]);
+    return .{ .input = .{ .action = .transform, .text = "done", .images = &replacement_images } };
+}
+
+test "ResultEventBus input preserves and replaces images through transform chaining" {
+    const allocator = std.testing.allocator;
+    const original_images = [_][]const u8{"orig-img"};
+
+    var bus = ResultEventBus.init(allocator);
+    defer bus.deinit();
+    try bus.on(.input, inputImageTransformOne, "/tmp/input-image-one.ts");
+    try bus.on(.input, inputImageTransformTwo, "/tmp/input-image-two.ts");
+    var transformed = try bus.emitInputWithImages("base", &original_images);
+    defer transformed.deinit(allocator);
+    try std.testing.expect(transformed.action == .transform);
+    try std.testing.expectEqualStrings("done", transformed.text.?);
+    try std.testing.expectEqualStrings("new-img", transformed.images.?[0]);
+}
+
+fn messageEndReplaceOne(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("user", event.message_end.role);
+    try std.testing.expectEqualStrings("base", event.message_end.final_message);
+    return .{ .message_end = .{ .role = "user", .message = "first" } };
+}
+
+fn messageEndInvalidRole(_: ExtensionEvent) !EventHandlerResult {
+    return .{ .message_end = .{ .role = "assistant", .message = "invalid" } };
+}
+
+fn messageEndReplaceTwo(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("first", event.message_end.final_message);
+    return .{ .message_end = .{ .message = "second" } };
+}
+
+test "ResultEventBus message_end chains same role and reports invalid replacements" {
+    const allocator = std.testing.allocator;
+
+    var bus = ResultEventBus.init(allocator);
+    defer bus.deinit();
+    try bus.on(.message_end, messageEndReplaceOne, "/tmp/message-one.ts");
+    try bus.on(.message_end, messageEndInvalidRole, "/tmp/message-invalid.ts");
+    try bus.on(.message_end, messageEndReplaceTwo, "/tmp/message-two.ts");
+
+    const result = (try bus.emitMessageEnd(.{
+        .message_id = "m1",
+        .role = "user",
+        .final_message = "base",
+    })).?;
+    try std.testing.expectEqualStrings("user", result.role);
+    try std.testing.expectEqualStrings("second", result.message);
+    try std.testing.expectEqual(@as(usize, 1), bus.errors.items.len);
+    try std.testing.expectEqualStrings("message_end handlers must return a message with the same role", bus.errors.items[0].@"error");
+}
+
+const context_base = [_][]const u8{"base"};
+const context_first = [_][]const u8{ "base", "first" };
+const context_second = [_][]const u8{ "base", "first", "second" };
+
+fn contextReplaceOne(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqual(@as(usize, 1), event.context.messages.len);
+    return .{ .context = .{ .messages = &context_first } };
+}
+
+fn contextFailure(_: ExtensionEvent) !EventHandlerResult {
+    return error.ContextFixtureFailure;
+}
+
+fn contextReplaceTwo(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqual(@as(usize, 2), event.context.messages.len);
+    return .{ .context = .{ .messages = &context_second } };
+}
+
+fn providerReplaceOne(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("base", event.before_provider_request.payload);
+    return .{ .before_provider_request = .{ .payload = "first" } };
+}
+
+fn providerFailure(_: ExtensionEvent) !EventHandlerResult {
+    return error.ProviderFixtureFailure;
+}
+
+fn providerReplaceTwo(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("first", event.before_provider_request.payload);
+    return .{ .before_provider_request = .{ .payload = "second" } };
+}
+
+test "ResultEventBus context and provider replacements chain through errors" {
+    const allocator = std.testing.allocator;
+
+    var bus = ResultEventBus.init(allocator);
+    defer bus.deinit();
+    try bus.on(.context, contextReplaceOne, "/tmp/context-one.ts");
+    try bus.on(.context, contextFailure, "/tmp/context-fail.ts");
+    try bus.on(.context, contextReplaceTwo, "/tmp/context-two.ts");
+    try bus.on(.before_provider_request, providerReplaceOne, "/tmp/provider-one.ts");
+    try bus.on(.before_provider_request, providerFailure, "/tmp/provider-fail.ts");
+    try bus.on(.before_provider_request, providerReplaceTwo, "/tmp/provider-two.ts");
+
+    const messages = try bus.emitContext(&context_base);
+    const payload = try bus.emitBeforeProviderRequest("base");
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("second", messages[2]);
+    try std.testing.expectEqualStrings("second", payload);
+    try std.testing.expectEqual(@as(usize, 2), bus.errors.items.len);
+    try std.testing.expectEqualStrings("ContextFixtureFailure", bus.errors.items[0].@"error");
+    try std.testing.expectEqualStrings("ProviderFixtureFailure", bus.errors.items[1].@"error");
+}
+
+fn beforeAgentStartOne(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("base prompt", event.before_agent_start.system_prompt);
+    return .{ .before_agent_start = .{
+        .message = "first-message",
+        .system_prompt = "first prompt",
+    } };
+}
+
+fn beforeAgentStartFailure(_: ExtensionEvent) !EventHandlerResult {
+    return error.BeforeAgentStartFixtureFailure;
+}
+
+fn beforeAgentStartTwo(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("first prompt", event.before_agent_start.system_prompt);
+    try std.testing.expectEqual(@as(usize, 1), event.before_agent_start.messages.len);
+    return .{ .before_agent_start = .{
+        .message = "second-message",
+        .system_prompt = "second prompt",
+    } };
+}
+
+test "ResultEventBus before_agent_start aggregates messages and chains system prompt" {
+    const allocator = std.testing.allocator;
+
+    var bus = ResultEventBus.init(allocator);
+    defer bus.deinit();
+    try bus.on(.before_agent_start, beforeAgentStartOne, "/tmp/before-one.ts");
+    try bus.on(.before_agent_start, beforeAgentStartFailure, "/tmp/before-fail.ts");
+    try bus.on(.before_agent_start, beforeAgentStartTwo, "/tmp/before-two.ts");
+
+    var result = (try bus.emitBeforeAgentStart("hello", &.{}, "base prompt")).?;
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.messages.len);
+    try std.testing.expectEqualStrings("first-message", result.messages[0]);
+    try std.testing.expectEqualStrings("second-message", result.messages[1]);
+    try std.testing.expectEqualStrings("second prompt", result.system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 1), bus.errors.items.len);
+    try std.testing.expectEqualStrings("BeforeAgentStartFixtureFailure", bus.errors.items[0].@"error");
+}
+
+fn toolCallMutateOne(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("base", event.tool_call.input);
+    return .{ .tool_call = .{ .input = "first" } };
+}
+
+fn toolCallFailure(_: ExtensionEvent) !EventHandlerResult {
+    return error.ToolCallFixtureFailure;
+}
+
+fn toolCallBlock(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("first", event.tool_call.input);
+    return .{ .tool_call = .{ .block = true, .reason = "blocked" } };
+}
+
+var tool_call_after_block_called = false;
+
+fn toolCallAfterBlock(_: ExtensionEvent) !EventHandlerResult {
+    tool_call_after_block_called = true;
+    return .none;
+}
+
+test "ResultEventBus tool_call exposes mutations, isolates errors, and first block wins" {
+    const allocator = std.testing.allocator;
+
+    var bus = ResultEventBus.init(allocator);
+    defer bus.deinit();
+    tool_call_after_block_called = false;
+    try bus.on(.tool_call, toolCallMutateOne, "/tmp/tool-call-one.ts");
+    try bus.on(.tool_call, toolCallFailure, "/tmp/tool-call-fail.ts");
+    try bus.on(.tool_call, toolCallBlock, "/tmp/tool-call-block.ts");
+    try bus.on(.tool_call, toolCallAfterBlock, "/tmp/tool-call-after.ts");
+
+    const result = (try bus.emitToolCall(.{
+        .tool_name = "bash",
+        .tool_call_id = "call-1",
+        .input = "base",
+    })).?;
+    try std.testing.expect(result.block);
+    try std.testing.expectEqualStrings("first", result.input);
+    try std.testing.expectEqualStrings("blocked", result.reason.?);
+    try std.testing.expect(!tool_call_after_block_called);
+    try std.testing.expectEqual(@as(usize, 1), bus.errors.items.len);
+    try std.testing.expectEqualStrings("ToolCallFixtureFailure", bus.errors.items[0].@"error");
+}
+
+fn userBashUndefined(_: ExtensionEvent) !EventHandlerResult {
+    return .none;
+}
+
+fn userBashFailure(_: ExtensionEvent) !EventHandlerResult {
+    return error.UserBashFixtureFailure;
+}
+
+fn userBashResult(event: ExtensionEvent) !EventHandlerResult {
+    try std.testing.expectEqualStrings("echo hi", event.user_bash.command);
+    return .{ .user_bash = .{ .result = "handled" } };
+}
+
+var user_bash_after_result_called = false;
+
+fn userBashAfterResult(_: ExtensionEvent) !EventHandlerResult {
+    user_bash_after_result_called = true;
+    return .{ .user_bash = .{ .result = "skipped" } };
+}
+
+test "ResultEventBus user_bash returns first result after undefined and errors" {
+    const allocator = std.testing.allocator;
+
+    var bus = ResultEventBus.init(allocator);
+    defer bus.deinit();
+    user_bash_after_result_called = false;
+    try bus.on(.user_bash, userBashUndefined, "/tmp/user-bash-undefined.ts");
+    try bus.on(.user_bash, userBashFailure, "/tmp/user-bash-fail.ts");
+    try bus.on(.user_bash, userBashResult, "/tmp/user-bash-result.ts");
+    try bus.on(.user_bash, userBashAfterResult, "/tmp/user-bash-after.ts");
+
+    const result = (try bus.emitUserBash(.{ .command = "echo hi", .cwd = "/work" })).?;
+    try std.testing.expectEqualStrings("handled", result.result.?);
+    try std.testing.expect(!user_bash_after_result_called);
+    try std.testing.expectEqual(@as(usize, 1), bus.errors.items.len);
+    try std.testing.expectEqualStrings("UserBashFixtureFailure", bus.errors.items[0].@"error");
 }
 
 test "extension event conformance helper covers every supported event surface" {

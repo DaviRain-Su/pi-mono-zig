@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentEvent } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createExtensionRuntime, discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
@@ -877,6 +877,52 @@ describe("ExtensionRunner", () => {
 				systemPrompt: "base\nfirst\nsecond",
 			});
 		});
+
+		it("aggregates injected messages and isolates thrown handlers", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("before_agent_start", async () => ({
+						message: { customType: "note", content: "first" },
+						systemPrompt: "first prompt",
+					}));
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("before_agent_start", async () => {
+						throw new Error("before boom");
+					});
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("before_agent_start", async (event) => ({
+						message: { customType: "note", content: event.systemPrompt },
+						systemPrompt: event.systemPrompt + " + third",
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "before-agent-start-message-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "before-agent-start-message-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "before-agent-start-message-3.ts"), extCode3);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			const chained = await runner.emitBeforeAgentStart("hello", undefined, "base", { cwd: tempDir });
+
+			expect(errors).toEqual(["before boom"]);
+			expect(chained).toEqual({
+				messages: [
+					{ customType: "note", content: "first" },
+					{ customType: "note", content: "first prompt" },
+				],
+				systemPrompt: "first prompt + third",
+			});
+		});
 	});
 
 	describe("tool_result chaining", () => {
@@ -968,6 +1014,316 @@ describe("ExtensionRunner", () => {
 				details: { source: "ext1" },
 				isError: true,
 			});
+		});
+
+		it("reports thrown handlers and continues later patches", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("tool_result", async () => {
+						throw new Error("tool result boom");
+					});
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("tool_result", async () => ({
+						content: [{ type: "text", text: "after" }],
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-error-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-error-2.ts"), extCode2);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const chained = await runner.emitToolResult({
+				type: "tool_result",
+				toolName: "my_tool",
+				toolCallId: "call-3",
+				input: {},
+				content: [{ type: "text", text: "base" }],
+				details: undefined,
+				isError: false,
+			});
+
+			expect(errors).toEqual(["tool result boom"]);
+			expect(chained?.content).toEqual([{ type: "text", text: "after" }]);
+		});
+	});
+
+	describe("result-bearing subscriber aggregation", () => {
+		it("aggregates resources with provenance and error isolation", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("resources_discover", async () => ({
+						skillPaths: ["/skills/one"],
+						promptPaths: ["/prompts/one"],
+					}));
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("resources_discover", async () => {
+						throw new Error("resources boom");
+					});
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("resources_discover", async () => ({
+						themePaths: ["/themes/three"],
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "resources-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "resources-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "resources-3.ts"), extCode3);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const resources = await runner.emitResourcesDiscover(tempDir, "startup");
+
+			expect(errors).toEqual(["resources boom"]);
+			expect(resources.skillPaths).toEqual([
+				{ path: "/skills/one", extensionPath: path.join(extensionsDir, "resources-1.ts") },
+			]);
+			expect(resources.promptPaths).toEqual([
+				{ path: "/prompts/one", extensionPath: path.join(extensionsDir, "resources-1.ts") },
+			]);
+			expect(resources.themePaths).toEqual([
+				{ path: "/themes/three", extensionPath: path.join(extensionsDir, "resources-3.ts") },
+			]);
+		});
+
+		it("short-circuits cancellable lifecycle events at the first cancellation", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("session_before_switch", async () => undefined);
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("session_before_switch", async () => ({ cancel: true }));
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("session_before_switch", async () => {
+						globalThis.afterCancel = true;
+					});
+				}
+			`;
+			delete (globalThis as { afterCancel?: boolean }).afterCancel;
+			fs.writeFileSync(path.join(extensionsDir, "session-before-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "session-before-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "session-before-3.ts"), extCode3);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+
+			const cancellation = await runner.emit({ type: "session_before_switch", reason: "new" });
+
+			expect(cancellation).toEqual({ cancel: true });
+			expect((globalThis as { afterCancel?: boolean }).afterCancel).toBeUndefined();
+		});
+
+		it("chains same-role message_end replacements and rejects invalid roles", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("message_end", async (event) => ({
+						message: { ...event.message, content: "first" },
+					}));
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("message_end", async (event) => ({
+						message: { ...event.message, role: "assistant", content: [] },
+					}));
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("message_end", async (event) => ({
+						message: { ...event.message, content: event.message.content + " third" },
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "message-end-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "message-end-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "message-end-3.ts"), extCode3);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+			const message: AgentMessage = { role: "user", content: "base", timestamp: 1 };
+
+			const replacement = await runner.emitMessageEnd({ type: "message_end", message });
+
+			expect(errors).toEqual(["message_end handlers must return a message with the same role"]);
+			expect(replacement).toEqual({ role: "user", content: "first third", timestamp: 1 });
+		});
+
+		it("chains context and provider request replacements through thrown handlers", async () => {
+			const contextMessage: AgentMessage = { role: "user", content: "base", timestamp: 1 };
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("context", async (event) => ({
+						messages: [...event.messages, { role: "user", content: "first", timestamp: 2 }],
+					}));
+					pi.on("before_provider_request", async (event) => ({
+						...event.payload,
+						first: true,
+					}));
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("context", async () => {
+						throw new Error("context boom");
+					});
+					pi.on("before_provider_request", async () => {
+						throw new Error("provider boom");
+					});
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("context", async (event) => ({
+						messages: [...event.messages, { role: "user", content: String(event.messages.length), timestamp: 3 }],
+					}));
+					pi.on("before_provider_request", async (event) => ({
+						...event.payload,
+						count: Object.keys(event.payload).length,
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "context-provider-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "context-provider-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "context-provider-3.ts"), extCode3);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const context = await runner.emitContext([contextMessage]);
+			const payload = await runner.emitBeforeProviderRequest({ base: true });
+			const contextContents = context.map((message) => {
+				if (!("content" in message)) throw new Error(`unexpected message role: ${message.role}`);
+				return message.content;
+			});
+
+			expect(errors).toEqual(["context boom", "provider boom"]);
+			expect(contextContents).toEqual(["base", "first", "2"]);
+			expect(payload).toEqual({ base: true, first: true, count: 2 });
+		});
+
+		it("keeps tool_call mutation visibility, first block, and error isolation", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						event.input.command += " first";
+					});
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("tool_call", async () => {
+						throw new Error("tool call boom");
+					});
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.input.command === "base first") return { block: true, reason: "blocked" };
+					});
+				}
+			`;
+			const extCode4 = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						event.input.command += " skipped";
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-3.ts"), extCode3);
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-4.ts"), extCode4);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+			const input = { command: "base" };
+
+			const block = await runner.emitToolCall({
+				type: "tool_call",
+				toolName: "bash",
+				toolCallId: "call-1",
+				input,
+			});
+
+			expect(errors).toEqual(["tool call boom"]);
+			expect(block).toEqual({ block: true, reason: "blocked" });
+			expect(input.command).toBe("base first");
+		});
+
+		it("returns the first user_bash result after undefined and thrown handlers", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("user_bash", async () => undefined);
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("user_bash", async () => {
+						throw new Error("bash boom");
+					});
+				}
+			`;
+			const extCode3 = `
+				export default function(pi) {
+					pi.on("user_bash", async () => ({
+						result: { output: "handled", exitCode: 0, cancelled: false, truncated: false },
+					}));
+				}
+			`;
+			const extCode4 = `
+				export default function(pi) {
+					pi.on("user_bash", async () => ({
+						result: { output: "skipped", exitCode: 0, cancelled: false, truncated: false },
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "user-bash-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "user-bash-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "user-bash-3.ts"), extCode3);
+			fs.writeFileSync(path.join(extensionsDir, "user-bash-4.ts"), extCode4);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const userBash = await runner.emitUserBash({
+				type: "user_bash",
+				command: "echo hi",
+				excludeFromContext: false,
+				cwd: tempDir,
+			});
+
+			expect(errors).toEqual(["bash boom"]);
+			expect(userBash?.result?.output).toBe("handled");
 		});
 	});
 
