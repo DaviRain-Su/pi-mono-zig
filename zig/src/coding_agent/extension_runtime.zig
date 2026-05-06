@@ -1,6 +1,9 @@
 const std = @import("std");
+const agent = @import("agent");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
+const tools_common = @import("tools/common.zig");
+const wasm_host = @import("wasm_host_spike.zig");
 const wasm_manifest = @import("wasm_manifest.zig");
 
 pub const DiagnosticCategory = extension_host.DiagnosticCategory;
@@ -42,6 +45,8 @@ pub const WasmManifestHandoff = struct {
     artifact_absolute_path: []const u8,
     tool_id: []const u8,
     tool_description: []const u8,
+    input_schema_json: []const u8,
+    output_schema_json: []const u8,
     requested_capabilities: []const wasm_manifest.Capability = &.{},
 
     pub fn fromManifest(manifest: *const wasm_manifest.Manifest) WasmManifestHandoff {
@@ -56,6 +61,8 @@ pub const WasmManifestHandoff = struct {
             .artifact_absolute_path = manifest.artifact_absolute_path,
             .tool_id = manifest.tool_id,
             .tool_description = manifest.tool_description,
+            .input_schema_json = manifest.input_schema_json,
+            .output_schema_json = manifest.output_schema_json,
             .requested_capabilities = manifest.requested_capabilities,
         };
     }
@@ -72,6 +79,8 @@ pub const WasmManifestHandoff = struct {
         if (!std.fs.path.isAbsolute(self.artifact_absolute_path)) return error.InvalidRuntimeOptions;
         if (self.tool_id.len == 0) return error.InvalidRuntimeOptions;
         if (self.tool_description.len == 0) return error.InvalidRuntimeOptions;
+        if (self.input_schema_json.len == 0) return error.InvalidRuntimeOptions;
+        if (self.output_schema_json.len == 0) return error.InvalidRuntimeOptions;
         if (self.requested_capabilities.len != 0) return error.UnsupportedRuntimeCapability;
     }
 };
@@ -103,6 +112,7 @@ pub const RuntimeAdapter = struct {
         snapshot_registry_json: *const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
         with_registry: *const fn (*anyopaque, ?*anyopaque, RegistryCallback) anyerror!void,
         apply_cli_flag_values: *const fn (*anyopaque, []const extension_registry.ParsedCliFlag) anyerror!void,
+        agent_tool: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?agent.AgentTool,
         take_ui_requests: *const fn (*anyopaque, std.mem.Allocator) anyerror![]ExtensionUiRequest,
         send_extension_ui_response: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         send_extension_event_frame: *const fn (*anyopaque, []const u8) void,
@@ -150,6 +160,10 @@ pub const RuntimeAdapter = struct {
         try self.vtable.apply_cli_flag_values(self.ptr, entries);
     }
 
+    pub fn agentTool(self: RuntimeAdapter, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+        return try self.vtable.agent_tool(self.ptr, allocator, name);
+    }
+
     pub fn takeUiRequests(self: RuntimeAdapter, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
         return try self.vtable.take_ui_requests(self.ptr, allocator);
     }
@@ -170,6 +184,11 @@ pub const RuntimeAdapter = struct {
         self.vtable.deinit(self.ptr);
     }
 };
+
+pub fn deinitAgentTool(allocator: std.mem.Allocator, tool: *agent.AgentTool) void {
+    tools_common.deinitJsonValue(allocator, tool.parameters);
+    tool.* = undefined;
+}
 
 pub fn startRuntime(allocator: std.mem.Allocator, io: std.Io, options: RuntimeOptions) !RuntimeAdapter {
     return switch (options) {
@@ -232,6 +251,13 @@ fn processApplyCliFlagValues(ptr: *anyopaque, entries: []const extension_registr
     try processHost(ptr).applyCliFlagValues(entries);
 }
 
+fn processAgentTool(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+    _ = ptr;
+    _ = allocator;
+    _ = name;
+    return null;
+}
+
 fn processTakeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
     return try processHost(ptr).takeUiRequests(allocator);
 }
@@ -263,6 +289,7 @@ const process_jsonl_vtable: RuntimeAdapter.VTable = .{
     .snapshot_registry_json = processSnapshotRegistryJson,
     .with_registry = processWithRegistry,
     .apply_cli_flag_values = processApplyCliFlagValues,
+    .agent_tool = processAgentTool,
     .take_ui_requests = processTakeUiRequests,
     .send_extension_ui_response = processSendExtensionUiResponse,
     .send_extension_event_frame = processSendExtensionEventFrame,
@@ -281,6 +308,8 @@ const OwnedWasmManifest = struct {
     artifact_absolute_path: []u8,
     tool_id: []u8,
     tool_description: []u8,
+    input_schema_json: []u8,
+    output_schema_json: []u8,
     requested_capabilities: []wasm_manifest.Capability,
 
     fn clone(allocator: std.mem.Allocator, handoff: WasmManifestHandoff) !OwnedWasmManifest {
@@ -302,6 +331,10 @@ const OwnedWasmManifest = struct {
         errdefer allocator.free(tool_id);
         const tool_description = try allocator.dupe(u8, handoff.tool_description);
         errdefer allocator.free(tool_description);
+        const input_schema_json = try allocator.dupe(u8, handoff.input_schema_json);
+        errdefer allocator.free(input_schema_json);
+        const output_schema_json = try allocator.dupe(u8, handoff.output_schema_json);
+        errdefer allocator.free(output_schema_json);
         const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, handoff.requested_capabilities);
         errdefer allocator.free(requested_capabilities);
         return .{
@@ -315,6 +348,8 @@ const OwnedWasmManifest = struct {
             .artifact_absolute_path = artifact_absolute_path,
             .tool_id = tool_id,
             .tool_description = tool_description,
+            .input_schema_json = input_schema_json,
+            .output_schema_json = output_schema_json,
             .requested_capabilities = requested_capabilities,
         };
     }
@@ -329,6 +364,8 @@ const OwnedWasmManifest = struct {
         allocator.free(self.artifact_absolute_path);
         allocator.free(self.tool_id);
         allocator.free(self.tool_description);
+        allocator.free(self.input_schema_json);
+        allocator.free(self.output_schema_json);
         allocator.free(self.requested_capabilities);
         self.* = undefined;
     }
@@ -340,11 +377,16 @@ const WasmRuntime = struct {
     state: extension_host.ProtocolState,
     mutex: std.Io.Mutex = .init,
     manifest: OwnedWasmManifest,
+    host: wasm_host.Host,
 
     fn start(allocator: std.mem.Allocator, io: std.Io, options: WasmOptions) !*WasmRuntime {
         try options.manifest.validate();
         var owned_manifest = try OwnedWasmManifest.clone(allocator, options.manifest);
         errdefer owned_manifest.deinit(allocator);
+        var host = try wasm_host.Host.loadFromFile(allocator, io, options.manifest.artifact_absolute_path);
+        errdefer host.deinit();
+        try validateWasmArtifactHandoff(allocator, &host, options.manifest);
+
         const runtime = try allocator.create(WasmRuntime);
         errdefer allocator.destroy(runtime);
         runtime.* = .{
@@ -352,17 +394,72 @@ const WasmRuntime = struct {
             .io = io,
             .state = extension_host.ProtocolState.init(allocator),
             .manifest = owned_manifest,
+            .host = host,
         };
+        errdefer runtime.state.deinit();
         runtime.state.ready_seen = true;
+        try runtime.registerManifestTool();
         return runtime;
     }
 
+    fn registerManifestTool(self: *WasmRuntime) !void {
+        var parsed_parameters = try std.json.parseFromSlice(std.json.Value, self.allocator, self.manifest.input_schema_json, .{});
+        defer parsed_parameters.deinit();
+        try self.state.registry.registerToolFull(
+            self.manifest.tool_id,
+            self.manifest.tool_id,
+            self.manifest.tool_description,
+            parsed_parameters.value,
+            null,
+            null,
+            self.manifest.artifact_absolute_path,
+        );
+        self.state.registry_frames_applied += 1;
+    }
+
     fn deinit(self: *WasmRuntime) void {
+        self.host.deinit();
         self.state.deinit();
         self.manifest.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
+
+fn validateWasmArtifactHandoff(
+    allocator: std.mem.Allocator,
+    host: *const wasm_host.Host,
+    manifest: WasmManifestHandoff,
+) !void {
+    const metadata_json = try host.callMetadata();
+    defer allocator.free(metadata_json);
+    var metadata = std.json.parseFromSlice(std.json.Value, allocator, metadata_json, .{}) catch return error.WasmManifestMetadataMismatch;
+    defer metadata.deinit();
+    if (metadata.value != .object) return error.WasmManifestMetadataMismatch;
+    const metadata_id = jsonStringField(metadata.value.object, "id") orelse return error.WasmManifestMetadataMismatch;
+    if (!std.mem.eql(u8, metadata_id, manifest.tool_id)) return error.WasmManifestMetadataMismatch;
+
+    const schema_json = try host.callSchema();
+    defer allocator.free(schema_json);
+    var schema = std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{}) catch return error.WasmManifestSchemaMismatch;
+    defer schema.deinit();
+    if (schema.value != .object) return error.WasmManifestSchemaMismatch;
+    const input_schema = schema.value.object.get("inputSchema") orelse return error.WasmManifestSchemaMismatch;
+    const output_schema = schema.value.object.get("outputSchema") orelse return error.WasmManifestSchemaMismatch;
+    const input_schema_json = try std.json.Stringify.valueAlloc(allocator, input_schema, .{});
+    defer allocator.free(input_schema_json);
+    const output_schema_json = try std.json.Stringify.valueAlloc(allocator, output_schema, .{});
+    defer allocator.free(output_schema_json);
+    if (!std.mem.eql(u8, input_schema_json, manifest.input_schema_json)) return error.WasmManifestSchemaMismatch;
+    if (!std.mem.eql(u8, output_schema_json, manifest.output_schema_json)) return error.WasmManifestSchemaMismatch;
+}
+
+fn jsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
 
 pub fn startWasm(allocator: std.mem.Allocator, io: std.Io, options: WasmOptions) !RuntimeAdapter {
     const runtime = try WasmRuntime.start(allocator, io, options);
@@ -454,6 +551,67 @@ fn wasmApplyCliFlagValues(ptr: *anyopaque, entries: []const extension_registry.P
     }
 }
 
+fn wasmAgentTool(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    for (runtime.state.registry.tools.items) |tool| {
+        if (!std.mem.eql(u8, tool.name, name)) continue;
+        return .{
+            .name = tool.name,
+            .description = tool.description,
+            .label = tool.label,
+            .parameters = try tools_common.cloneJsonValue(allocator, tool.parameters),
+            .execute = wasmAgentToolExecute,
+            .execute_context = runtime,
+        };
+    }
+    return null;
+}
+
+fn wasmAgentToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    _ = tool_call_id;
+    _ = signal;
+    _ = on_update_context;
+    _ = on_update;
+    const runtime: *WasmRuntime = @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
+    const input_json = try std.json.Stringify.valueAlloc(allocator, params, .{});
+    defer allocator.free(input_json);
+
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    var registered = false;
+    for (runtime.state.registry.tools.items) |tool| {
+        if (std.mem.eql(u8, tool.name, runtime.manifest.tool_id)) {
+            registered = true;
+            break;
+        }
+    }
+    if (!registered) return error.WasmToolNotRegistered;
+
+    const output_json = runtime.host.callExecute(input_json) catch |err| switch (err) {
+        error.InvalidJsonInput => return invalidInputAgentToolResult(allocator),
+        else => return err,
+    };
+    defer runtime.allocator.free(output_json);
+    return .{ .content = try tools_common.makeTextContent(allocator, output_json) };
+}
+
+fn invalidInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentToolResult {
+    return .{ .content = try tools_common.makeTextContent(
+        allocator,
+        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}",
+    ) };
+}
+
 fn wasmTakeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
     const runtime = wasmRuntime(ptr);
     runtime.mutex.lockUncancelable(runtime.io);
@@ -486,6 +644,7 @@ fn wasmShutdown(ptr: *anyopaque) !void {
     runtime.mutex.lockUncancelable(runtime.io);
     defer runtime.mutex.unlock(runtime.io);
     runtime.state.clearPendingRequests();
+    runtime.host.unload(&runtime.state.registry, runtime.manifest.tool_id);
     runtime.state.shutdown_complete_seen = true;
 }
 
@@ -504,6 +663,7 @@ const wasm_vtable: RuntimeAdapter.VTable = .{
     .snapshot_registry_json = wasmSnapshotRegistryJson,
     .with_registry = wasmWithRegistry,
     .apply_cli_flag_values = wasmApplyCliFlagValues,
+    .agent_tool = wasmAgentTool,
     .take_ui_requests = wasmTakeUiRequests,
     .send_extension_ui_response = wasmSendExtensionUiResponse,
     .send_extension_event_frame = wasmSendExtensionEventFrame,
@@ -673,7 +833,7 @@ test "extension runtime factory constructs wasm adapter and keeps native remote 
     try adapter.waitForReady(0);
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
     try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
-    try std.testing.expectEqual(@as(usize, 0), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
     try std.testing.expect(!adapter.hasRegisteredCommand("truncateHead"));
 
     try adapter.shutdown();
@@ -703,8 +863,108 @@ test "wasm manifest handoff starts runtime without capability execution" {
 
     const snapshot = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"tools\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "truncateHead") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"builtin.truncateHead\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"parameters\":{\"type\":\"object\"") != null);
+}
+
+const WasmToolRegistryExpectContext = struct {
+    expected_artifact_path: []const u8,
+};
+
+fn expectWasmToolOnlyRegistry(context: ?*anyopaque, registry: *const Registry) !void {
+    const expected: *WasmToolRegistryExpectContext = @ptrCast(@alignCast(context.?));
+    const counts = extension_registry.registrySurfaceCounts(registry);
+    try std.testing.expectEqual(@as(usize, 1), counts.tools);
+    try std.testing.expectEqual(@as(usize, 0), counts.commands);
+    try std.testing.expectEqual(@as(usize, 0), counts.shortcuts);
+    try std.testing.expectEqual(@as(usize, 0), counts.flags);
+    try std.testing.expectEqual(@as(usize, 0), counts.providers);
+    try std.testing.expectEqual(@as(usize, 0), counts.capabilities);
+    try std.testing.expectEqual(@as(usize, 0), counts.resource_discoveries);
+    try std.testing.expectEqual(@as(usize, 0), counts.header_hooks);
+    try std.testing.expectEqual(@as(usize, 0), counts.footer_hooks);
+    try std.testing.expectEqual(@as(usize, 0), counts.terminal_input_subscriptions);
+    try std.testing.expectEqual(@as(usize, 0), counts.editor_component_hooks);
+    try std.testing.expectEqual(@as(usize, 0), counts.widgets);
+    try std.testing.expectEqual(@as(usize, 0), counts.message_renderers);
+    try std.testing.expectEqual(@as(usize, 0), counts.ui_request_ids);
+    try std.testing.expectEqualStrings("builtin.truncateHead", registry.tools.items[0].name);
+    try std.testing.expectEqualStrings("Keeps the beginning of content within line and byte limits.", registry.tools.items[0].description);
+    try std.testing.expectEqualStrings(expected.expected_artifact_path, registry.tools.items[0].extension_path);
+    const parameters = registry.tools.items[0].parameters.object;
+    try std.testing.expectEqualStrings("object", parameters.get("type").?.string);
+    try std.testing.expect(parameters.get("properties").?.object.get("content").? == .object);
+    try std.testing.expect(parameters.get("properties").?.object.get("maxLines").? == .object);
+    try std.testing.expect(parameters.get("properties").?.object.get("maxBytes").? == .object);
+}
+
+test "wasm runtime registers schema preserving tool and executes through agent tool api" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer adapter.deinit();
+
+    try std.testing.expectEqual(RuntimeKind.wasm, adapter.kind);
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    var registry_expect = WasmToolRegistryExpectContext{ .expected_artifact_path = manifest_result.valid.artifact_absolute_path };
+    try adapter.withRegistry(&registry_expect, expectWasmToolOnlyRegistry);
+
+    var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    try std.testing.expect(agent_tool.execute != null);
+    try std.testing.expectEqualStrings("builtin.truncateHead", agent_tool.name);
+    try std.testing.expectEqualStrings("Keeps the beginning of content within line and byte limits.", agent_tool.description);
+
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\\nbravo\\ncharlie\\ndelta\",\"maxLines\":2,\"maxBytes\":1024}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "wasm-call-success", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqual(@as(usize, 1), success.content.len);
+    try std.testing.expectEqualStrings(
+        "{\"content\":\"alpha\\nbravo\",\"truncated\":true,\"truncatedBy\":\"lines\",\"totalLines\":4,\"totalBytes\":25,\"outputLines\":2,\"outputBytes\":11,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2,\"maxBytes\":1024}",
+        success.content[0].text.text,
+    );
+
+    var invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "[]", .{});
+    defer invalid_params.deinit();
+    const invalid = try agent_tool.execute.?(allocator, "wasm-call-invalid", invalid_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, invalid.content);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}",
+        invalid.content[0].text.text,
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+
+    const recovered = try agent_tool.execute.?(allocator, "wasm-call-recovered", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, recovered.content);
+    try std.testing.expectEqualStrings(success.content[0].text.text, recovered.content[0].text.text);
+
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "builtin.truncateHead"));
+    const unloaded_snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(unloaded_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unloaded_snapshot, "\"tools\":[]") != null);
+}
+
+test "wasm runtime rejects metadata schema mismatch before registration" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestText(allocator, "test/fixtures/wasm/pure-truncate-head-v0",
+        \\{"schemaVersion":"pi-extension.v0","id":"com.pi.pure-truncate-head","name":"Pure Truncate Head Fixture","version":"0.1.0","description":"Capability-free Wasm migration fixture for the existing truncateHead pure tool implementation.","artifact":{"kind":"wasm-component","path":"wasm/plugin.wasm"},"tool":{"id":"wrong.truncateHead","description":"Keeps the beginning of content within line and byte limits.","inputSchema":{"type":"object","required":["content","maxLines","maxBytes"],"properties":{"content":{"type":"string"},"maxLines":{"type":"number"},"maxBytes":{"type":"number"}}},"outputSchema":{"type":"object"}},"capabilities":[]}
+    );
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } }));
 }
 
 test "process_jsonl runtime adapter preserves registry UI response event and shutdown semantics" {

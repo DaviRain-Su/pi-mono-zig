@@ -201,6 +201,8 @@ pub const Manifest = struct {
     artifact_absolute_path: []u8,
     tool_id: []u8,
     tool_description: []u8,
+    input_schema_json: []u8,
+    output_schema_json: []u8,
     requested_capabilities: []Capability,
 
     pub fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
@@ -213,6 +215,8 @@ pub const Manifest = struct {
         allocator.free(self.artifact_absolute_path);
         allocator.free(self.tool_id);
         allocator.free(self.tool_description);
+        allocator.free(self.input_schema_json);
+        allocator.free(self.output_schema_json);
         allocator.free(self.requested_capabilities);
         self.* = undefined;
     }
@@ -295,7 +299,9 @@ pub fn validateManifestText(
     if (try requiredString(allocator, tool_object, "$.tool", "description")) |diagnostic| return diagnostic;
     const tool_description = requiredStringValue(tool_object, "description");
     if (try requiredObject(allocator, tool_object, "$.tool", "inputSchema")) |diagnostic| return diagnostic;
+    const input_schema = requiredObjectValue(tool_object, "inputSchema");
     if (try requiredObject(allocator, tool_object, "$.tool", "outputSchema")) |diagnostic| return diagnostic;
+    const output_schema = requiredObjectValue(tool_object, "outputSchema");
 
     inline for (unsupported_surface_fields) |field| {
         if (root.get(field) != null) {
@@ -349,6 +355,10 @@ pub fn validateManifestText(
     errdefer allocator.free(owned_tool_id);
     const owned_tool_description = try allocator.dupe(u8, tool_description);
     errdefer allocator.free(owned_tool_description);
+    const owned_input_schema_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = input_schema }, .{});
+    errdefer allocator.free(owned_input_schema_json);
+    const owned_output_schema_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = output_schema }, .{});
+    errdefer allocator.free(owned_output_schema_json);
     const owned_capabilities = try capabilities.toOwnedSlice(allocator);
     errdefer allocator.free(owned_capabilities);
 
@@ -364,6 +374,8 @@ pub fn validateManifestText(
             .artifact_absolute_path = artifact_absolute_path,
             .tool_id = owned_tool_id,
             .tool_description = owned_tool_description,
+            .input_schema_json = owned_input_schema_json,
+            .output_schema_json = owned_output_schema_json,
             .requested_capabilities = owned_capabilities,
         },
     };
