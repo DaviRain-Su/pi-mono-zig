@@ -55,7 +55,93 @@ pub const Capability = enum {
             .ui_notify => "ui.notify",
         };
     }
+
+    pub fn enforcementBranch(self: Capability) CapabilityEnforcementBranch {
+        return switch (self) {
+            .file_read => .filesystem_read,
+            .file_write => .filesystem_write,
+            .network => .network_request,
+            .shell => .shell_process,
+            .env => .environment_variable,
+            .model => .model_call,
+            .session => .session_state,
+            .ui_notify => .ui_notification,
+        };
+    }
 };
+
+pub const CapabilityEnforcementBranch = enum {
+    filesystem_read,
+    filesystem_write,
+    network_request,
+    shell_process,
+    environment_variable,
+    model_call,
+    session_state,
+    ui_notification,
+
+    pub fn jsonName(self: CapabilityEnforcementBranch) []const u8 {
+        return switch (self) {
+            .filesystem_read => "filesystem.read",
+            .filesystem_write => "filesystem.write",
+            .network_request => "network.request",
+            .shell_process => "shell.process",
+            .environment_variable => "environment.variable",
+            .model_call => "model.call",
+            .session_state => "session.state",
+            .ui_notification => "ui.notification",
+        };
+    }
+};
+
+pub const CapabilityDenialDiagnostic = struct {
+    category: []const u8 = "denied_capability",
+    capability: Capability,
+    branch: CapabilityEnforcementBranch,
+    phase: LifecyclePhase,
+    mode: []const u8,
+
+    pub fn capabilityId(self: CapabilityDenialDiagnostic) []const u8 {
+        return self.capability.jsonName();
+    }
+};
+
+pub fn denyFirstUnapprovedCapability(
+    requested_capabilities: []const Capability,
+    approved_capabilities: []const Capability,
+    phase: LifecyclePhase,
+    mode: []const u8,
+) ?CapabilityDenialDiagnostic {
+    for (requested_capabilities) |capability| {
+        if (hasCapability(approved_capabilities, capability)) continue;
+        return denyCapability(capability, phase, mode);
+    }
+    return null;
+}
+
+pub fn denyRuntimeCapability(
+    capability: Capability,
+    phase: LifecyclePhase,
+    mode: []const u8,
+) CapabilityDenialDiagnostic {
+    return denyCapability(capability, phase, mode);
+}
+
+fn denyCapability(capability: Capability, phase: LifecyclePhase, mode: []const u8) CapabilityDenialDiagnostic {
+    return .{
+        .capability = capability,
+        .branch = capability.enforcementBranch(),
+        .phase = phase,
+        .mode = mode,
+    };
+}
+
+fn hasCapability(capabilities: []const Capability, needle: Capability) bool {
+    for (capabilities) |capability| {
+        if (capability == needle) return true;
+    }
+    return false;
+}
 
 pub const Diagnostic = struct {
     phase: LifecyclePhase,
@@ -672,4 +758,64 @@ test "pi-extension manifest rejects unsupported schema versions deterministicall
     );
     defer result.deinit(allocator);
     try expectInvalid(&result, "$.schemaVersion", "unsupported schema version \"pi-extension.v1\"; expected pi-extension.v0");
+}
+
+test "wasm capability canonical ids map to explicit enforcement branches" {
+    const expected = [_]struct {
+        capability: Capability,
+        id: []const u8,
+        branch: CapabilityEnforcementBranch,
+    }{
+        .{ .capability = .file_read, .id = "file.read", .branch = .filesystem_read },
+        .{ .capability = .file_write, .id = "file.write", .branch = .filesystem_write },
+        .{ .capability = .network, .id = "network", .branch = .network_request },
+        .{ .capability = .shell, .id = "shell", .branch = .shell_process },
+        .{ .capability = .env, .id = "env", .branch = .environment_variable },
+        .{ .capability = .model, .id = "model", .branch = .model_call },
+        .{ .capability = .session, .id = "session", .branch = .session_state },
+        .{ .capability = .ui_notify, .id = "ui.notify", .branch = .ui_notification },
+    };
+
+    try std.testing.expectEqual(@typeInfo(Capability).@"enum".fields.len, expected.len);
+    for (expected) |entry| {
+        try std.testing.expectEqualStrings(entry.id, entry.capability.jsonName());
+        try std.testing.expectEqual(entry.capability, parseCapability(entry.id).?);
+        try std.testing.expectEqual(entry.branch, entry.capability.enforcementBranch());
+    }
+    try std.testing.expectEqual(@as(?Capability, null), parseCapability("filesystem"));
+}
+
+test "wasm capability requested but unapproved declarations are denied deterministically" {
+    const requested = [_]Capability{ .shell, .file_read, .file_write, .env, .network, .model, .session, .ui_notify };
+
+    for (requested) |capability| {
+        const diagnostic = denyFirstUnapprovedCapability(&.{capability}, &.{}, .initialize, "manifest-request").?;
+        try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
+        try std.testing.expectEqual(capability, diagnostic.capability);
+        try std.testing.expectEqual(capability.enforcementBranch(), diagnostic.branch);
+        try std.testing.expectEqual(.initialize, diagnostic.phase);
+        try std.testing.expectEqualStrings("manifest-request", diagnostic.mode);
+    }
+
+    try std.testing.expectEqual(
+        @as(?CapabilityDenialDiagnostic, null),
+        denyFirstUnapprovedCapability(&.{ .shell, .network }, &.{ .shell, .network }, .initialize, "manifest-request"),
+    );
+    try std.testing.expectEqual(
+        Capability.shell,
+        denyFirstUnapprovedCapability(&.{ .shell }, &.{ .network }, .initialize, "manifest-request").?.capability,
+    );
+}
+
+test "wasm capability runtime denials use same ids and category as manifest requests" {
+    const requested = [_]Capability{ .file_read, .file_write, .network, .shell, .env, .model, .session, .ui_notify };
+
+    for (requested) |capability| {
+        const diagnostic = denyRuntimeCapability(capability, .call, "runtime/import");
+        try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
+        try std.testing.expectEqualStrings(capability.jsonName(), diagnostic.capability.jsonName());
+        try std.testing.expectEqual(capability.enforcementBranch(), diagnostic.branch);
+        try std.testing.expectEqual(.call, diagnostic.phase);
+        try std.testing.expectEqualStrings("runtime/import", diagnostic.mode);
+    }
 }

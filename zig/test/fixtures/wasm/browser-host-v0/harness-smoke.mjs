@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
 	BrowserWasmToolHost,
+	CANONICAL_CAPABILITIES,
 	DeniedCapabilityError,
 	EXPECTED_PURE_TRUNCATE_ERROR,
 	PURE_TRUNCATE_MANIFEST,
@@ -48,30 +49,40 @@ try {
 	}
 }
 
-for (const [capability, manifest] of [
-	["shell", "../browser-tool-v0/shell-request.pi-extension.json"],
-	["file.read", "../browser-tool-v0/filesystem-request.pi-extension.json"],
-]) {
+for (const capability of CANONICAL_CAPABILITIES) {
 	const denialHost = new BrowserWasmToolHost({
 		baseUrl: import.meta.url,
-		fetchJson: readJson,
+		fetchJson: async () => ({
+			schemaVersion: "pi-extension.v0",
+			artifact: {
+				kind: "wasm-component",
+				path: "wasm/plugin.wasm",
+			},
+			tool: {
+				id: "fixture.echo",
+			},
+			capabilities: [capability],
+		}),
 		fetchBytes: readBytes,
 	});
 	try {
-		await denialHost.initialize(manifest);
+		await denialHost.initialize("../browser-tool-v0/pi-extension.json");
 		throw new Error(`manifest request for ${capability} was unexpectedly granted`);
 	} catch (error) {
 		if (!(error instanceof DeniedCapabilityError)) throw error;
-		if (error.capability !== capability || error.mode !== "manifest-request") {
+		if (error.category !== "denied_capability" || error.capability !== capability || error.mode !== "manifest-request") {
 			throw new Error(`unexpected manifest denial diagnostic: ${JSON.stringify(error.toDiagnostic())}`);
 		}
 	}
 }
 
-for (const capability of ["shell", "file.read"]) {
+for (const capability of CANONICAL_CAPABILITIES) {
 	const result = await attemptRuntimeImport(capability);
 	if (!result.ok || result.error.category !== "denied_capability" || result.error.mode !== "runtime/import") {
 		throw new Error(`unexpected runtime denial diagnostic: ${JSON.stringify(result)}`);
+	}
+	if (result.error.capability !== capability) {
+		throw new Error(`runtime denial capability mismatch: ${JSON.stringify(result)}`);
 	}
 }
 

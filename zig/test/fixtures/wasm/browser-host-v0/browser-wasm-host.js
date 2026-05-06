@@ -1,4 +1,14 @@
-const CAPABILITIES = new Set(["file.read", "file.write", "network", "shell", "env", "model", "session", "ui.notify"]);
+export const CANONICAL_CAPABILITIES = [
+	"file.read",
+	"file.write",
+	"network",
+	"shell",
+	"env",
+	"model",
+	"session",
+	"ui.notify",
+];
+const CAPABILITIES = new Set(CANONICAL_CAPABILITIES);
 const UNAVAILABLE_BROWSER_CAPABILITIES = new Set(CAPABILITIES);
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -217,10 +227,22 @@ export function createImportAttemptModule(moduleName, fieldName) {
 
 function runtimeImportSpec(capability) {
 	switch (capability) {
-		case "shell":
-			return { capability, moduleName: "pi:shell", fieldName: "run" };
 		case "file.read":
 			return { capability, moduleName: "pi:filesystem", fieldName: "read" };
+		case "file.write":
+			return { capability, moduleName: "pi:filesystem", fieldName: "write" };
+		case "network":
+			return { capability, moduleName: "pi:network", fieldName: "fetch" };
+		case "shell":
+			return { capability, moduleName: "pi:shell", fieldName: "run" };
+		case "env":
+			return { capability, moduleName: "pi:environment", fieldName: "get" };
+		case "model":
+			return { capability, moduleName: "pi:model", fieldName: "call" };
+		case "session":
+			return { capability, moduleName: "pi:session", fieldName: "get" };
+		case "ui.notify":
+			return { capability, moduleName: "pi:ui", fieldName: "notify" };
 		default:
 			throw new Error(`unsupported runtime import fixture capability: ${capability}`);
 	}
@@ -393,6 +415,58 @@ function wireBrowserHarness() {
 		}
 	};
 
+	const runCapabilityDenialMatrix = async () => {
+		const manifestRequests = [];
+		for (const capability of CANONICAL_CAPABILITIES) {
+			const denialHost = new BrowserWasmToolHost({
+				baseUrl: globalThis.location.href,
+				fetchJson: async () => ({
+					schemaVersion: "pi-extension.v0",
+					artifact: {
+						kind: "wasm-component",
+						path: "wasm/plugin.wasm",
+					},
+					tool: {
+						id: "fixture.echo",
+					},
+					capabilities: [capability],
+				}),
+				fetchBytes: host.fetchBytes,
+			});
+			try {
+				await denialHost.initialize("../browser-tool-v0/pi-extension.json");
+				manifestRequests.push({
+					ok: false,
+					error: {
+						category: "unexpected_capability_grant",
+						capability,
+						mode: "manifest-request",
+						message: `Capability ${capability} was unexpectedly granted.`,
+					},
+				});
+			} catch (error) {
+				if (error instanceof DeniedCapabilityError) {
+					manifestRequests.push({ ok: true, error: error.toDiagnostic() });
+				} else {
+					throw error;
+				}
+			}
+		}
+		const runtimeImports = [];
+		for (const capability of CANONICAL_CAPABILITIES) {
+			runtimeImports.push(await attemptRuntimeImport(capability));
+		}
+		const allDenied = [...manifestRequests, ...runtimeImports].every(
+			(result) => result.ok && result.error.category === "denied_capability",
+		);
+		print({
+			ok: allDenied,
+			capabilities: CANONICAL_CAPABILITIES,
+			manifestRequests,
+			runtimeImports,
+		});
+	};
+
 	const runPureTruncate = async () => {
 		const beforeCount = networkLog.length;
 		const pureHost = new BrowserWasmToolHost({
@@ -467,6 +541,11 @@ function wireBrowserHarness() {
 		const result = await attemptRuntimeImport("file.read");
 		renderNetwork(beforeCount);
 		print(result);
+	});
+	document.querySelector("#run-capability-denial-matrix").addEventListener("click", async () => {
+		const beforeCount = networkLog.length;
+		await runCapabilityDenialMatrix();
+		renderNetwork(beforeCount);
 	});
 
 	host

@@ -168,6 +168,21 @@ For v0, no host functions are exposed to Wasm plugins, so the only accepted
 capability set for executable tools is empty unless a later host feature adds a
 specific enforcement branch and tests for approvals and denials.
 
+Canonical capability ids map one-to-one to host enforcement branches. Native
+and browser hosts must use the same `denied_capability` category for
+requested-but-unapproved declarations and runtime/import attempts:
+
+| Capability id | Enforcement branch | Browser runtime/import fixture |
+| --- | --- | --- |
+| `file.read` | `filesystem.read` | `pi:filesystem/read` |
+| `file.write` | `filesystem.write` | `pi:filesystem/write` |
+| `network` | `network.request` | `pi:network/fetch` |
+| `shell` | `shell.process` | `pi:shell/run` |
+| `env` | `environment.variable` | `pi:environment/get` |
+| `model` | `model.call` | `pi:model/call` |
+| `session` | `session.state` | `pi:session/get` |
+| `ui.notify` | `ui.notification` | `pi:ui/notify` |
+
 ## Validation and Dependency Policy
 
 All Wasm architecture, spike, and validation work must use project-local
