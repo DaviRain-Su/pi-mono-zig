@@ -1,8 +1,9 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -14,6 +15,44 @@ function normalizeForMatch(value: string): string {
 
 function pathEndsWith(actualPath: string, suffix: string): boolean {
 	return normalizeForMatch(actualPath).endsWith(normalizeForMatch(suffix));
+}
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const pureWasmFixtureRoot = join(repoRoot, "zig/test/fixtures/wasm/pure-truncate-head-v0");
+const browserWasmFixtureRoot = join(repoRoot, "zig/test/fixtures/wasm/browser-tool-v0");
+
+function writeWasmPackage(
+	packageRoot: string,
+	options: {
+		artifactPath?: string;
+		artifactBytes?: Buffer | string;
+		toolId?: string;
+	} = {},
+): void {
+	const artifactPath = options.artifactPath ?? "wasm/plugin.wasm";
+	mkdirSync(join(packageRoot, dirname(artifactPath)), { recursive: true });
+	writeFileSync(join(packageRoot, artifactPath), options.artifactBytes ?? Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+	writeFileSync(
+		join(packageRoot, "pi-extension.json"),
+		JSON.stringify({
+			schemaVersion: "pi-extension.v0",
+			id: "com.example.local-wasm",
+			name: "Local Wasm Fixture",
+			version: "0.1.0",
+			description: "Local Wasm package fixture.",
+			artifact: {
+				kind: "wasm-component",
+				path: artifactPath,
+			},
+			tool: {
+				id: options.toolId ?? "fixture.echo",
+				description: "Echoes deterministic JSON from a local Wasm fixture.",
+				inputSchema: {},
+				outputSchema: {},
+			},
+			capabilities: [],
+		}),
+	);
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -281,6 +320,97 @@ Content`,
 			const result = await packageManager.resolve();
 
 			expect(result.extensions.some((r) => r.path === pkgDir)).toBe(false);
+		});
+
+		it("should discover and classify local pi-extension.json Wasm packages", async () => {
+			const pkgDir = join(tempDir, "local-wasm-package");
+			mkdirSync(pkgDir, { recursive: true });
+			writeWasmPackage(pkgDir, { toolId: "fixture.local" });
+			settingsManager.setPackages([pkgDir]);
+
+			const result = await packageManager.resolve();
+
+			expect(result.extensions).toHaveLength(0);
+			expect(result.wasmExtensions).toHaveLength(1);
+			expect(result.wasmExtensions[0]).toMatchObject({
+				enabled: true,
+				path: join(pkgDir, "pi-extension.json"),
+				packageRoot: realpathSync(pkgDir),
+				manifestPath: join(pkgDir, "pi-extension.json"),
+				artifactPath: "wasm/plugin.wasm",
+				artifactAbsolutePath: realpathSync(resolve(pkgDir, "wasm/plugin.wasm")),
+				artifactKind: "wasm-component",
+				toolId: "fixture.local",
+			});
+			expect(result.wasmExtensions[0].metadata.origin).toBe("package");
+			expect(result.wasmExtensions[0].metadata.baseDir).toBe(pkgDir);
+			expect(result.wasmExtensions[0].artifactSha256).toHaveLength(64);
+		});
+
+		it("should validate local Wasm artifacts before install success or persistence", async () => {
+			const missingArtifactPackage = join(tempDir, "missing-artifact-package");
+			mkdirSync(missingArtifactPackage, { recursive: true });
+			writeWasmPackage(missingArtifactPackage);
+			writeFileSync(
+				join(missingArtifactPackage, "pi-extension.json"),
+				readFileSync(join(missingArtifactPackage, "pi-extension.json"), "utf-8").replace(
+					"wasm/plugin.wasm",
+					"wasm/missing.wasm",
+				),
+			);
+
+			const invalidArtifactPackage = join(tempDir, "invalid-artifact-package");
+			mkdirSync(invalidArtifactPackage, { recursive: true });
+			writeWasmPackage(invalidArtifactPackage, { artifactBytes: "not wasm" });
+
+			const events: ProgressEvent[] = [];
+			packageManager.setProgressCallback((event) => events.push(event));
+
+			await expect(packageManager.installAndPersist(missingArtifactPackage)).rejects.toThrow(
+				"$.artifact.path: artifact file was not found",
+			);
+			await expect(packageManager.installAndPersist(invalidArtifactPackage)).rejects.toThrow(
+				"$.artifact.path: artifact file is not a valid Wasm binary",
+			);
+			expect(events.some((event) => event.type === "complete")).toBe(false);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+		});
+
+		it("should accept repository Wasm fixtures with normalized handoff identities", async () => {
+			const result = await packageManager.resolveExtensionSources([pureWasmFixtureRoot, browserWasmFixtureRoot]);
+
+			expect(result.extensions).toHaveLength(0);
+			expect(result.wasmExtensions.map((extension) => extension.toolId).sort()).toEqual([
+				"builtin.truncateHead",
+				"fixture.echo",
+			]);
+
+			const pureFixture = result.wasmExtensions.find((extension) => extension.toolId === "builtin.truncateHead");
+			expect(pureFixture).toBeDefined();
+			expect(pureFixture?.manifestPath).toBe(join(pureWasmFixtureRoot, "pi-extension.json"));
+			expect(pureFixture?.artifactPath).toBe("wasm/plugin.wasm");
+			expect(pureFixture?.artifactAbsolutePath).toBe(resolve(pureWasmFixtureRoot, "wasm/plugin.wasm"));
+		});
+
+		it("should preserve package.json pi.extensions Bun package behavior without pi-extension.json", async () => {
+			const pkgDir = join(tempDir, "bun-package");
+			mkdirSync(join(pkgDir, "src"), { recursive: true });
+			writeFileSync(join(pkgDir, "src", "index.ts"), "export default function() {}");
+			writeFileSync(
+				join(pkgDir, "package.json"),
+				JSON.stringify({
+					name: "bun-package",
+					pi: {
+						extensions: ["./src/index.ts"],
+					},
+				}),
+			);
+
+			const result = await packageManager.resolveExtensionSources([pkgDir]);
+
+			expect(result.extensions).toHaveLength(1);
+			expect(result.extensions[0].path).toBe(join(pkgDir, "src", "index.ts"));
+			expect(result.wasmExtensions).toEqual([]);
 		});
 	});
 

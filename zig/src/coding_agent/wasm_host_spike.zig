@@ -383,6 +383,36 @@ test "wasm pure tool selection names existing implementation manifest and artifa
     try std.testing.expectEqualStrings("test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm", PURE_TOOL_ARTIFACT_PATH);
 }
 
+test "wasm package manifest handoff keeps normalized artifact path and tool id" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+
+    try std.testing.expect(manifest_result == .valid);
+    try std.testing.expectEqualStrings("com.pi.pure-truncate-head", manifest_result.valid.id);
+    try std.testing.expectEqualStrings("builtin.truncateHead", manifest_result.valid.tool_id);
+    try std.testing.expectEqualStrings("wasm/plugin.wasm", manifest_result.valid.artifact_path);
+    try std.testing.expect(std.fs.path.isAbsolute(manifest_result.valid.artifact_absolute_path));
+    try std.testing.expect(std.mem.endsWith(u8, manifest_result.valid.artifact_absolute_path, "test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm"));
+    try std.testing.expectEqual(@as(usize, 0), manifest_result.valid.requested_capabilities.len);
+}
+
+test "wasm package invalid artifact rejects before load success" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestText(allocator, PURE_TOOL_PACKAGE_ROOT,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Missing artifact","artifact":{"kind":"wasm-component","path":"wasm/missing.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[]}
+    );
+    defer manifest_result.deinit(allocator);
+
+    try std.testing.expect(manifest_result == .invalid);
+    try std.testing.expectEqual(@as(usize, 1), manifest_result.invalid.len);
+    try std.testing.expectEqual(.validate, manifest_result.invalid[0].phase);
+    try std.testing.expectEqualStrings("$.artifact.path", manifest_result.invalid[0].path);
+    try std.testing.expectEqualStrings("artifact file was not found", manifest_result.invalid[0].message);
+}
+
 test "wasm pure tool truncateHead success matches existing implementation under default deny" {
     const allocator = std.testing.allocator;
 
