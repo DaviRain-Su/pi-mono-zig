@@ -17,6 +17,7 @@ pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const R
 pub const NativeDescriptor = native_runtime.NativeDescriptor;
 pub const NativeHostApi = native_runtime.NativeHostApi;
 pub const NativeOptions = native_runtime.NativeOptions;
+pub const NativeResourceLimits = native_runtime.NativeResourceLimits;
 pub const NativeToolDefinition = native_runtime.NativeToolDefinition;
 
 pub const RuntimeKind = enum {
@@ -1003,9 +1004,11 @@ test "extension runtime factory constructs wasm adapter and keeps native remote 
 const native_static_tool: NativeToolDefinition = .{
     .name = "native.fixture.echo",
     .label = "Native Fixture Echo",
-    .description = "Static native fixture tool metadata",
-    .input_schema_json = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}}}",
-    .extension_path = "native://fixture/static-v0",
+    .description = "Echoes a string through the static native fixture.",
+    .input_schema_json = "{\"type\":\"object\",\"required\":[\"value\"],\"properties\":{\"value\":{\"type\":\"string\",\"description\":\"Value to echo\"}},\"additionalProperties\":false}",
+    .output_schema_json = "{\"type\":\"object\",\"required\":[\"ok\",\"tool\",\"echo\"],\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"type\":\"string\"},\"echo\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+    .extension_path = "native://template/pure-tool-v0",
+    .execute = nativeFixtureEchoExecute,
 };
 
 const native_static_descriptor: NativeDescriptor = .{
@@ -1023,6 +1026,22 @@ const native_partial_failure_tool: NativeToolDefinition = .{
     .input_schema_json = "{\"type\":\"object\"}",
     .extension_path = "native://fixture/partial-failure",
 };
+
+fn nativeFixtureEchoExecute(allocator: std.mem.Allocator, params: std.json.Value) !agent.AgentToolResult {
+    if (params != .object) return error.InvalidNativeToolInput;
+    const value = params.object.get("value") orelse return error.InvalidNativeToolInput;
+    if (value != .string) return error.InvalidNativeToolInput;
+
+    const quoted_value = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value.string }, .{});
+    defer allocator.free(quoted_value);
+    const output_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":{s}}}",
+        .{quoted_value},
+    );
+    defer allocator.free(output_json);
+    return .{ .content = try tools_common.makeTextContent(allocator, output_json) };
+}
 
 fn nativeFailAfterReadyRegistryAndUi(api: *NativeHostApi) !void {
     try api.ready();
@@ -1047,9 +1066,10 @@ fn expectNativeStaticRegistry(context: ?*anyopaque, registry: *const Registry) !
     try std.testing.expectEqual(@as(usize, 0), counts.commands);
     try std.testing.expectEqualStrings("native.fixture.echo", registry.tools.items[0].name);
     try std.testing.expectEqualStrings("Native Fixture Echo", registry.tools.items[0].label);
-    try std.testing.expectEqualStrings("Static native fixture tool metadata", registry.tools.items[0].description);
-    try std.testing.expectEqualStrings("native://fixture/static-v0", registry.tools.items[0].extension_path);
+    try std.testing.expectEqualStrings("Echoes a string through the static native fixture.", registry.tools.items[0].description);
+    try std.testing.expectEqualStrings("native://template/pure-tool-v0", registry.tools.items[0].extension_path);
     try std.testing.expectEqualStrings("object", registry.tools.items[0].parameters.object.get("type").?.string);
+    try std.testing.expectEqualStrings("value", registry.tools.items[0].parameters.object.get("required").?.array.items[0].string);
 }
 
 test "native runtime factory starts static module and remote stays unsupported" {
@@ -1069,7 +1089,14 @@ test "native runtime factory starts static module and remote stays unsupported" 
     const snapshot = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"native.fixture.echo\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"extensionPath\":\"native://fixture/static-v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"label\":\"Native Fixture Echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"description\":\"Echoes a string through the static native fixture.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"parameters\":{\"type\":\"object\",\"required\":[\"value\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"extensionPath\":\"native://template/pure-tool-v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Workflow") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Wiki") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "QA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "Review") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "dynamic") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "library") == null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "executable") == null);
@@ -1077,6 +1104,55 @@ test "native runtime factory starts static module and remote stays unsupported" 
 
     try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
     try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .remote = .{} }));
+}
+
+test "native descriptor template executes pure tool and recovers after invalid input" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    var agent_tool = (try adapter.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    try std.testing.expect(agent_tool.execute != null);
+    try std.testing.expectEqualStrings("native.fixture.echo", agent_tool.name);
+    try std.testing.expectEqualStrings("Native Fixture Echo", agent_tool.label);
+    try std.testing.expectEqualStrings("Echoes a string through the static native fixture.", agent_tool.description);
+    try std.testing.expectEqualStrings("object", agent_tool.parameters.object.get("type").?.string);
+
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"alpha\"}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "native-success", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqual(@as(usize, 1), success.content.len);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"alpha\"}", success.content[0].text.text);
+
+    var repeated_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"alpha\"}", .{});
+    defer repeated_params.deinit();
+    const repeated = try agent_tool.execute.?(allocator, "native-repeat", repeated_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, repeated.content);
+    try std.testing.expectEqualStrings(success.content[0].text.text, repeated.content[0].text.text);
+
+    var invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":42}", .{});
+    defer invalid_params.deinit();
+    const invalid = try agent_tool.execute.?(allocator, "native-invalid", invalid_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, invalid.content);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object with string field value\"}}",
+        invalid.content[0].text.text,
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCategoryCount(.host_error));
+
+    var recovered_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"omega\"}", .{});
+    defer recovered_params.deinit();
+    const recovered = try agent_tool.execute.?(allocator, "native-recovered", recovered_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, recovered.content);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"omega\"}", recovered.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
 }
 
 test "native runtime shutdown is idempotent and final" {
@@ -1102,6 +1178,159 @@ test "native runtime shutdown is idempotent and final" {
     const snapshot = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"tools\":[]") != null);
+}
+
+test "native descriptor validation rejects invalid shapes before registry registration" {
+    const allocator = std.testing.allocator;
+    const invalid_schema_tool: NativeToolDefinition = .{
+        .name = "native.fixture.invalid-schema",
+        .label = "Invalid Schema",
+        .description = "Invalid schema fixture",
+        .input_schema_json = "{\"type\":\"object\"",
+        .extension_path = "native://template/invalid-schema",
+    };
+    const missing_tool_identity: NativeToolDefinition = .{
+        .name = "",
+        .label = "Missing Identity",
+        .description = "Missing identity fixture",
+        .input_schema_json = "{\"type\":\"object\"}",
+        .extension_path = "native://template/missing-identity",
+    };
+    const duplicate_tool_a: NativeToolDefinition = .{
+        .name = "native.fixture.duplicate",
+        .label = "Duplicate A",
+        .description = "Duplicate fixture A",
+        .input_schema_json = "{\"type\":\"object\"}",
+        .extension_path = "native://template/duplicate-a",
+    };
+    const duplicate_tool_b: NativeToolDefinition = .{
+        .name = "native.fixture.duplicate",
+        .label = "Duplicate B",
+        .description = "Duplicate fixture B",
+        .input_schema_json = "{\"type\":\"object\"}",
+        .extension_path = "native://template/duplicate-b",
+    };
+
+    const invalid_descriptors = [_]NativeDescriptor{
+        .{
+            .id = "",
+            .name = "Missing Id",
+            .version = "0.1.0",
+            .description = "Missing id fixture",
+            .tools = &.{native_static_tool},
+        },
+        .{
+            .id = "com.pi.native-invalid-schema",
+            .name = "Invalid Schema",
+            .version = "0.1.0",
+            .description = "Invalid schema fixture",
+            .tools = &.{invalid_schema_tool},
+        },
+        .{
+            .id = "com.pi.native-missing-tool-identity",
+            .name = "Missing Tool Identity",
+            .version = "0.1.0",
+            .description = "Missing tool identity fixture",
+            .tools = &.{missing_tool_identity},
+        },
+        .{
+            .id = "com.pi.native-duplicate-tool",
+            .name = "Duplicate Tool",
+            .version = "0.1.0",
+            .description = "Duplicate tool fixture",
+            .tools = &.{ duplicate_tool_a, duplicate_tool_b },
+        },
+    };
+
+    for (invalid_descriptors) |descriptor| {
+        try std.testing.expectError(error.InvalidRuntimeOptions, startRuntime(allocator, std.testing.io, .{ .native = .{
+            .descriptor = &descriptor,
+        } }));
+    }
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(0);
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+}
+
+test "native descriptor capability and resource metadata remains default deny" {
+    const allocator = std.testing.allocator;
+    const resource_only_descriptor: NativeDescriptor = .{
+        .id = "com.pi.native-resource-only",
+        .name = "Native Resource Only",
+        .version = "0.1.0",
+        .description = "Resource limits constrain without granting capabilities",
+        .tools = &.{native_static_tool},
+        .resource_limits = .{
+            .turns = 1,
+            .output_bytes = 64,
+            .tool_scopes = &.{"native.fixture.echo"},
+        },
+    };
+    const resource_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &resource_only_descriptor,
+    } });
+    defer resource_adapter.deinit();
+    try resource_adapter.waitForReady(0);
+    try resource_adapter.withRegistry(null, expectNativeStaticRegistry);
+
+    const capability_descriptor: NativeDescriptor = .{
+        .id = "com.pi.native-capability-request",
+        .name = "Native Capability Request",
+        .version = "0.1.0",
+        .description = "Requested capabilities are denied by default",
+        .tools = &.{native_static_tool},
+        .requested_capabilities = &.{.tool_use},
+        .resource_limits = .{
+            .turns = 1,
+            .tool_scopes = &.{"native.fixture.echo"},
+        },
+    };
+    const denial = capability_descriptor.deniedCapability(.initialize, "native/descriptor").?;
+    try std.testing.expectEqualStrings("denied_capability", denial.category);
+    try std.testing.expectEqual(wasm_manifest.Capability.tool_use, denial.capability);
+    try std.testing.expectEqual(wasm_manifest.CapabilityEnforcementBranch.tool_execution, denial.branch);
+    try std.testing.expectEqual(wasm_manifest.LifecyclePhase.initialize, denial.phase);
+    try std.testing.expectEqualStrings("native/descriptor", denial.mode);
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &capability_descriptor,
+    } }));
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(0);
+    try adapter.withRegistry(null, expectNativeStaticRegistry);
+}
+
+test "native descriptor rejects dynamic runtime and product policy fields" {
+    const allocator = std.testing.allocator;
+    const forbidden_descriptors = [_]NativeDescriptor{
+        .{ .id = "com.pi.native-library", .name = "Library", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .library_path = "/tmp/libnative.dylib" },
+        .{ .id = "com.pi.native-dynamic-library", .name = "Dynamic Library", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .dynamic_library_path = "/tmp/libnative.dylib" },
+        .{ .id = "com.pi.native-process", .name = "Process", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .executable_command = "node extension.js" },
+        .{ .id = "com.pi.native-process-command", .name = "Process Command", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .process_command = "bun extension.ts" },
+        .{ .id = "com.pi.native-remote", .name = "Remote", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .remote_url = "https://example.invalid/plugin.wasm" },
+        .{ .id = "com.pi.native-workflow", .name = "Workflow", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .workflow_preset = "workflow" },
+        .{ .id = "com.pi.native-wiki", .name = "Wiki", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .wiki_preset = "wiki" },
+        .{ .id = "com.pi.native-qa", .name = "QA", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .qa_preset = "qa" },
+        .{ .id = "com.pi.native-review", .name = "Review", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .review_preset = "review" },
+        .{ .id = "com.pi.native-spawn-policy", .name = "Spawn Policy", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .spawn_policy = "automatic" },
+        .{ .id = "com.pi.native-automatic-spawn", .name = "Automatic Spawn", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .automatic_spawn = "true" },
+        .{ .id = "com.pi.native-orchestration", .name = "Orchestration", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .orchestration_policy = "preset" },
+        .{ .id = "com.pi.native-model-ui", .name = "Model UI", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .model_selection_ui = "picker" },
+        .{ .id = "com.pi.native-approval-ui", .name = "Approval UI", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .approval_ui = "prompt" },
+    };
+
+    for (forbidden_descriptors) |descriptor| {
+        try std.testing.expectError(error.ForbiddenNativeDescriptorField, startRuntime(allocator, std.testing.io, .{ .native = .{
+            .descriptor = &descriptor,
+        } }));
+    }
 }
 
 test "native runtime partial setup failure cleans registry tool and UI state" {

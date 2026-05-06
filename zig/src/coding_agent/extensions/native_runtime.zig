@@ -3,6 +3,7 @@ const agent = @import("agent");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
 const tools_common = @import("../tools/common.zig");
+const wasm_manifest = @import("wasm/wasm_manifest.zig");
 
 pub const Registry = extension_registry.Registry;
 pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const Registry) anyerror!void;
@@ -17,11 +18,34 @@ pub const NativeToolDefinition = struct {
     label: []const u8,
     description: []const u8,
     input_schema_json: []const u8,
+    output_schema_json: ?[]const u8 = null,
     extension_path: []const u8,
     execute: ?NativeToolExecute = null,
 };
 
 pub const NativeStartFn = *const fn (api: *NativeHostApi) anyerror!void;
+
+pub const NativeResourceLimits = struct {
+    max_children: ?u64 = null,
+    depth: ?u64 = null,
+    turns: ?u64 = null,
+    timeout_ms: ?u64 = null,
+    output_bytes: ?u64 = null,
+    output_lines: ?u64 = null,
+    tool_scopes: []const []const u8 = &.{},
+
+    pub fn validate(self: NativeResourceLimits) !void {
+        _ = self.max_children;
+        _ = self.depth;
+        _ = self.turns;
+        _ = self.timeout_ms;
+        _ = self.output_bytes;
+        _ = self.output_lines;
+        for (self.tool_scopes) |scope| {
+            if (scope.len == 0) return error.InvalidRuntimeOptions;
+        }
+    }
+};
 
 pub const NativeDescriptor = struct {
     id: []const u8,
@@ -29,14 +53,32 @@ pub const NativeDescriptor = struct {
     version: []const u8,
     description: []const u8,
     tools: []const NativeToolDefinition = &.{},
+    requested_capabilities: []const wasm_manifest.Capability = &.{},
+    resource_limits: NativeResourceLimits = .{},
+    library_path: ?[]const u8 = null,
+    dynamic_library_path: ?[]const u8 = null,
+    executable_command: ?[]const u8 = null,
+    process_command: ?[]const u8 = null,
+    remote_url: ?[]const u8 = null,
+    workflow_preset: ?[]const u8 = null,
+    wiki_preset: ?[]const u8 = null,
+    qa_preset: ?[]const u8 = null,
+    review_preset: ?[]const u8 = null,
+    spawn_policy: ?[]const u8 = null,
+    automatic_spawn: ?[]const u8 = null,
+    orchestration_policy: ?[]const u8 = null,
+    model_selection_ui: ?[]const u8 = null,
+    approval_ui: ?[]const u8 = null,
     start: NativeStartFn = defaultNativeStart,
 
     pub fn validate(self: NativeDescriptor, allocator: std.mem.Allocator) !void {
+        if (self.firstForbiddenField() != null) return error.ForbiddenNativeDescriptorField;
         if (self.id.len == 0) return error.InvalidRuntimeOptions;
         if (self.name.len == 0) return error.InvalidRuntimeOptions;
         if (self.version.len == 0) return error.InvalidRuntimeOptions;
         if (self.description.len == 0) return error.InvalidRuntimeOptions;
-        for (self.tools) |tool| {
+        try self.resource_limits.validate();
+        for (self.tools, 0..) |tool, index| {
             if (tool.name.len == 0) return error.InvalidRuntimeOptions;
             if (tool.label.len == 0) return error.InvalidRuntimeOptions;
             if (tool.description.len == 0) return error.InvalidRuntimeOptions;
@@ -45,7 +87,42 @@ pub const NativeDescriptor = struct {
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, tool.input_schema_json, .{}) catch return error.InvalidRuntimeOptions;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidRuntimeOptions;
+            if (tool.output_schema_json) |output_schema_json| {
+                if (output_schema_json.len == 0) return error.InvalidRuntimeOptions;
+                var parsed_output = std.json.parseFromSlice(std.json.Value, allocator, output_schema_json, .{}) catch return error.InvalidRuntimeOptions;
+                defer parsed_output.deinit();
+                if (parsed_output.value != .object) return error.InvalidRuntimeOptions;
+            }
+            for (self.tools[index + 1 ..]) |candidate| {
+                if (std.mem.eql(u8, tool.name, candidate.name)) return error.InvalidRuntimeOptions;
+            }
         }
+    }
+
+    pub fn deniedCapability(
+        self: NativeDescriptor,
+        phase: wasm_manifest.LifecyclePhase,
+        mode: []const u8,
+    ) ?wasm_manifest.CapabilityDenialDiagnostic {
+        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, &.{}, phase, mode);
+    }
+
+    pub fn firstForbiddenField(self: NativeDescriptor) ?[]const u8 {
+        if (self.library_path != null) return "library_path";
+        if (self.dynamic_library_path != null) return "dynamic_library_path";
+        if (self.executable_command != null) return "executable_command";
+        if (self.process_command != null) return "process_command";
+        if (self.remote_url != null) return "remote_url";
+        if (self.workflow_preset != null) return "workflow_preset";
+        if (self.wiki_preset != null) return "wiki_preset";
+        if (self.qa_preset != null) return "qa_preset";
+        if (self.review_preset != null) return "review_preset";
+        if (self.spawn_policy != null) return "spawn_policy";
+        if (self.automatic_spawn != null) return "automatic_spawn";
+        if (self.orchestration_policy != null) return "orchestration_policy";
+        if (self.model_selection_ui != null) return "model_selection_ui";
+        if (self.approval_ui != null) return "approval_ui";
+        return null;
     }
 };
 
@@ -126,6 +203,7 @@ pub const NativeRuntime = struct {
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);
+        if (options.descriptor.deniedCapability(.initialize, "native/descriptor") != null) return error.UnsupportedRuntimeCapability;
 
         const tool_bindings = try allocator.alloc(NativeToolBinding, options.descriptor.tools.len);
         var runtime_initialized = false;
@@ -325,5 +403,22 @@ fn nativeAgentToolExecute(
     }
     if (!registered) return error.NativeToolNotRegistered;
     const execute = binding.definition.execute orelse return error.NativeToolNotExecutable;
-    return try execute(allocator, params);
+    return execute(allocator, params) catch |err| switch (err) {
+        error.InvalidNativeToolInput => {
+            try binding.runtime.state.addDiagnostic(
+                .host_error,
+                .@"error",
+                "{\"phase\":\"call\",\"category\":\"invalid_input\",\"path\":\"$.execute\",\"capability\":null,\"message\":\"execute input must be a JSON object with string field value\"}",
+            );
+            return invalidNativeInputAgentToolResult(allocator);
+        },
+        else => return err,
+    };
+}
+
+fn invalidNativeInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentToolResult {
+    return .{ .content = try tools_common.makeTextContent(
+        allocator,
+        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object with string field value\"}}",
+    ) };
 }
