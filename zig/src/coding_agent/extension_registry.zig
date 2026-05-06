@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("tools/common.zig");
 const extension_events = @import("extension_events.zig");
 
 /// In-memory mirrors of the registration surfaces a Bun-hosted
@@ -101,7 +102,10 @@ pub const ExtensionTool = struct {
     name: []u8,
     label: []u8,
     description: []u8,
+    parameters: std.json.Value,
     extension_path: []u8,
+    /// Optional per-tool execution capability ("sequential" or "parallel")
+    execution_mode: ?[]u8 = null,
     /// Optional render shell mode ("default" or "self")
     render_shell: ?[]u8 = null,
     /// Optional render hook configuration
@@ -111,7 +115,9 @@ pub const ExtensionTool = struct {
         allocator.free(self.name);
         allocator.free(self.label);
         allocator.free(self.description);
+        common.deinitJsonValue(allocator, self.parameters);
         allocator.free(self.extension_path);
+        if (self.execution_mode) |mode| allocator.free(mode);
         if (self.render_shell) |rs| allocator.free(rs);
         if (self.render_hook) |*rh| rh.deinit(allocator);
         self.* = undefined;
@@ -203,6 +209,8 @@ pub const ExtensionProvider = struct {
     headers: ?std.StringHashMap([]u8) = null,
     /// If true, adds Authorization: Bearer header with resolved API key
     auth_header: bool = false,
+    /// True when extension-provided provider config includes an API key source
+    api_key_configured: bool = false,
 
     pub fn deinit(self: *ExtensionProvider, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -502,14 +510,27 @@ pub const Registry = struct {
         description: []const u8,
         extension_path: []const u8,
     ) !void {
+        try self.registerToolFull(name, label, description, .null, null, null, extension_path);
+    }
+
+    pub fn registerToolFull(
+        self: *Registry,
+        name: []const u8,
+        label: []const u8,
+        description: []const u8,
+        parameters: std.json.Value,
+        execution_mode: ?[]const u8,
+        render_shell: ?[]const u8,
+        extension_path: []const u8,
+    ) !void {
         // TS behavior: re-registering the same tool replaces the existing
         // entry. Mirrors the loader+runner overwrite contract.
         if (self.findToolIndex(name)) |idx| {
             self.tools.items[idx].deinit(self.allocator);
-            self.tools.items[idx] = try makeTool(self.allocator, name, label, description, extension_path);
+            self.tools.items[idx] = try makeTool(self.allocator, name, label, description, parameters, execution_mode, render_shell, extension_path);
             return;
         }
-        const tool = try makeTool(self.allocator, name, label, description, extension_path);
+        const tool = try makeTool(self.allocator, name, label, description, parameters, execution_mode, render_shell, extension_path);
         try self.tools.append(self.allocator, tool);
     }
 
@@ -624,6 +645,22 @@ pub const Registry = struct {
         headers: ?std.StringHashMap([]u8),
         auth_header: bool,
     ) !void {
+        try self.registerProviderFullWithAuthState(name, display_name, base_url, api, models, extension_path, oauth, headers, auth_header, false);
+    }
+
+    pub fn registerProviderFullWithAuthState(
+        self: *Registry,
+        name: []const u8,
+        display_name: ?[]const u8,
+        base_url: ?[]const u8,
+        api: ?[]const u8,
+        models: []const ProviderModelInput,
+        extension_path: []const u8,
+        oauth: ?ProviderOAuth,
+        headers: ?std.StringHashMap([]u8),
+        auth_header: bool,
+        api_key_configured: bool,
+    ) !void {
         // Mirror TS: re-registering replaces all existing models.
         if (self.findProviderIndex(name)) |idx| {
             var removed = self.providers.orderedRemove(idx);
@@ -669,6 +706,7 @@ pub const Registry = struct {
             .oauth = oauth_dup,
             .headers = headers,
             .auth_header = auth_header,
+            .api_key_configured = api_key_configured,
         };
         try self.providers.append(self.allocator, provider);
     }
@@ -1047,6 +1085,9 @@ fn makeTool(
     name: []const u8,
     label: []const u8,
     description: []const u8,
+    parameters: std.json.Value,
+    execution_mode: ?[]const u8,
+    render_shell: ?[]const u8,
     extension_path: []const u8,
 ) !ExtensionTool {
     const name_dup = try allocator.dupe(u8, name);
@@ -1055,12 +1096,21 @@ fn makeTool(
     errdefer allocator.free(label_dup);
     const desc_dup = try allocator.dupe(u8, description);
     errdefer allocator.free(desc_dup);
+    const parameters_dup = try common.cloneJsonValue(allocator, parameters);
+    errdefer common.deinitJsonValue(allocator, parameters_dup);
+    const execution_mode_dup = if (execution_mode) |mode| try allocator.dupe(u8, mode) else null;
+    errdefer if (execution_mode_dup) |mode| allocator.free(mode);
+    const render_shell_dup = if (render_shell) |mode| try allocator.dupe(u8, mode) else null;
+    errdefer if (render_shell_dup) |mode| allocator.free(mode);
     const path_dup = try allocator.dupe(u8, extension_path);
     return .{
         .name = name_dup,
         .label = label_dup,
         .description = desc_dup,
+        .parameters = parameters_dup,
         .extension_path = path_dup,
+        .execution_mode = execution_mode_dup,
+        .render_shell = render_shell_dup,
     };
 }
 
@@ -1195,6 +1245,9 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
         try entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try entry.put(allocator, try allocator.dupe(u8, "label"), .{ .string = try allocator.dupe(u8, tool.label) });
         try entry.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
+        try entry.put(allocator, try allocator.dupe(u8, "parameters"), try common.cloneJsonValue(allocator, tool.parameters));
+        try entry.put(allocator, try allocator.dupe(u8, "executionMode"), try optionalStringJson(allocator, tool.execution_mode));
+        try entry.put(allocator, try allocator.dupe(u8, "renderShell"), try optionalStringJson(allocator, tool.render_shell));
         try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, tool.extension_path) });
         try tools_array.append(.{ .object = entry });
     }
@@ -1259,6 +1312,20 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
         try entry.put(allocator, try allocator.dupe(u8, "displayName"), try optionalStringJson(allocator, p.display_name));
         try entry.put(allocator, try allocator.dupe(u8, "baseUrl"), try optionalStringJson(allocator, p.base_url));
         try entry.put(allocator, try allocator.dupe(u8, "api"), try optionalStringJson(allocator, p.api));
+        try entry.put(allocator, try allocator.dupe(u8, "defaultModelId"), try optionalStringJson(allocator, if (p.models.len > 0) p.models[0].id else null));
+        try entry.put(allocator, try allocator.dupe(u8, "authHeader"), .{ .bool = p.auth_header });
+        try entry.put(allocator, try allocator.dupe(u8, "apiKeyConfigured"), .{ .bool = p.api_key_configured });
+        const credential_required = p.auth_header or p.oauth != null;
+        try entry.put(allocator, try allocator.dupe(u8, "credentialRequired"), .{ .bool = credential_required });
+        try entry.put(allocator, try allocator.dupe(u8, "authType"), .{ .string = try allocator.dupe(u8, if (p.oauth != null) "oauth" else if (p.auth_header) "api_key" else "none") });
+        try entry.put(allocator, try allocator.dupe(u8, "available"), .{ .bool = !credential_required or p.api_key_configured });
+        if (p.oauth) |oauth| {
+            var oauth_entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+            try oauth_entry.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, oauth.name) });
+            try entry.put(allocator, try allocator.dupe(u8, "oauth"), .{ .object = oauth_entry });
+        } else {
+            try entry.put(allocator, try allocator.dupe(u8, "oauth"), .null);
+        }
         var models_array = std.json.Array.init(allocator);
         for (p.models) |m| {
             var m_entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
@@ -1421,15 +1488,13 @@ pub fn applyHostFrame(
         const name = optionalString(object, "name") orelse return .ignored_malformed;
         const label = optionalString(object, "label") orelse name;
         const description = optionalString(object, "description") orelse "";
+        const parameters = object.get("parameters") orelse .null;
+        const execution_mode = optionalString(object, "executionMode");
         const render_shell = optionalString(object, "renderShell");
-        try registry.registerTool(name, label, description, extension_path);
+        try registry.registerToolFull(name, label, description, parameters, execution_mode, render_shell, extension_path);
 
         // Apply render shell and render hook if present
         if (registry.findToolIndex(name)) |idx| {
-            if (render_shell) |rs| {
-                registry.tools.items[idx].render_shell = try registry.allocator.dupe(u8, rs);
-            }
-
             if (object.get("renderHook")) |render_hook_val| {
                 if (render_hook_val == .object) {
                     var render_config_buf: std.Io.Writer.Allocating = .init(registry.allocator);
@@ -1500,8 +1565,9 @@ pub fn applyHostFrame(
 
         // Parse auth_header
         const auth_header = optionalBool(object, "authHeader") orelse false;
+        const api_key_configured = (optionalBool(object, "apiKeyConfigured") orelse false) or object.get("apiKey") != null;
 
-        try registry.registerProviderFull(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header);
+        try registry.registerProviderFullWithAuthState(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header, api_key_configured);
 
         // Apply OAuth after provider is registered to avoid memory leak on failure
         if (object.get("oauth")) |oauth_val| {
@@ -2068,6 +2134,106 @@ test "applyHostFrame parses OAuth provider registration" {
     try std.testing.expect(registry.providers.items[0].oauth != null);
     try std.testing.expectEqualStrings("OAuth Login", registry.providers.items[0].oauth.?.name);
     try std.testing.expect(registry.providers.items[0].auth_header);
+}
+
+test "extension provider metadata parity preserves auth availability and default model shape" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "name": "api-provider", "displayName": "API Provider", "api": "openai-completions", "baseUrl": "https://api.provider.test/v1", "authHeader": true, "apiKeyConfigured": true, "models": [{ "id": "first-model", "name": "First Model" }, { "id": "second-model", "name": "Second Model" }], "extensionPath": "/tmp/api-provider.ts" }
+        \\{ "type": "register_provider", "name": "oauth-provider", "displayName": "OAuth Provider", "api": "anthropic-messages", "baseUrl": "https://oauth.provider.test", "oauth": { "name": "OAuth Login" }, "models": [{ "id": "oauth-model", "name": "OAuth Model" }], "extensionPath": "/tmp/oauth-provider.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 2), applied);
+    try std.testing.expectEqual(@as(usize, 2), registry.providers.items.len);
+
+    const api_provider = registry.providers.items[0];
+    try std.testing.expectEqualStrings("api-provider", api_provider.name);
+    try std.testing.expectEqualStrings("API Provider", api_provider.display_name.?);
+    try std.testing.expectEqualStrings("openai-completions", api_provider.api.?);
+    try std.testing.expectEqualStrings("https://api.provider.test/v1", api_provider.base_url.?);
+    try std.testing.expect(api_provider.auth_header);
+    try std.testing.expect(api_provider.api_key_configured);
+    try std.testing.expectEqual(@as(usize, 2), api_provider.models.len);
+    try std.testing.expectEqualStrings("first-model", api_provider.models[0].id);
+    try std.testing.expectEqualStrings("second-model", api_provider.models[1].id);
+
+    const oauth_provider = registry.providers.items[1];
+    try std.testing.expectEqualStrings("oauth-provider", oauth_provider.name);
+    try std.testing.expect(oauth_provider.oauth != null);
+    try std.testing.expectEqualStrings("OAuth Login", oauth_provider.oauth.?.name);
+    try std.testing.expect(!oauth_provider.api_key_configured);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"providers\":[{\"name\":\"api-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"displayName\":\"API Provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"defaultModelId\":\"first-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"authHeader\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"apiKeyConfigured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"credentialRequired\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"authType\":\"api_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"oauth-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"authType\":\"oauth\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"available\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"oauth\":{\"name\":\"OAuth Login\"}") != null);
+}
+
+test "extension tool metadata parity preserves schema capability flags and registration order" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_tool", "name": "alpha", "label": "Alpha", "description": "Alpha tool", "parameters": { "type": "object", "properties": { "path": { "type": "string", "description": "Path to inspect" }, "force": { "type": "boolean" } }, "required": ["path"], "additionalProperties": false }, "executionMode": "sequential", "renderShell": "self", "extensionPath": "/tmp/tools.ts" }
+        \\{ "type": "register_tool", "name": "beta", "label": "Beta", "description": "Beta tool", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }, "executionMode": "parallel", "extensionPath": "/tmp/tools.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 2), applied);
+    try std.testing.expectEqual(@as(usize, 2), registry.tools.items.len);
+    try std.testing.expectEqualStrings("alpha", registry.tools.items[0].name);
+    try std.testing.expectEqualStrings("beta", registry.tools.items[1].name);
+
+    const alpha = registry.tools.items[0];
+    try std.testing.expectEqualStrings("Alpha tool", alpha.description);
+    try std.testing.expectEqualStrings("sequential", alpha.execution_mode.?);
+    try std.testing.expectEqualStrings("self", alpha.render_shell.?);
+    const alpha_schema = alpha.parameters.object;
+    try std.testing.expectEqualStrings("object", alpha_schema.get("type").?.string);
+    try std.testing.expect(!alpha_schema.get("additionalProperties").?.bool);
+    const alpha_properties = alpha_schema.get("properties").?.object;
+    try std.testing.expectEqualStrings("string", alpha_properties.get("path").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("Path to inspect", alpha_properties.get("path").?.object.get("description").?.string);
+    try std.testing.expectEqualStrings("boolean", alpha_properties.get("force").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("path", alpha_schema.get("required").?.array.items[0].string);
+
+    const beta = registry.tools.items[1];
+    try std.testing.expectEqualStrings("parallel", beta.execution_mode.?);
+    try std.testing.expect(beta.render_shell == null);
+    try std.testing.expectEqualStrings("query", beta.parameters.object.get("required").?.array.items[0].string);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+    const alpha_index = std.mem.indexOf(u8, snapshot, "\"name\":\"alpha\"") orelse return error.MissingAlphaTool;
+    const beta_index = std.mem.indexOf(u8, snapshot, "\"name\":\"beta\"") orelse return error.MissingBetaTool;
+    try std.testing.expect(alpha_index < beta_index);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"required\":[\"path\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"executionMode\":\"sequential\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"renderShell\":\"self\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"executionMode\":\"parallel\"") != null);
 }
 
 test "applyHostFrame handles resources_discover with skill/prompt/theme paths" {
