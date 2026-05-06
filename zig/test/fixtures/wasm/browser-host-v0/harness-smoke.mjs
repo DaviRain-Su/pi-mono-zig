@@ -6,10 +6,12 @@ import {
 	DeniedCapabilityError,
 	EXPECTED_PURE_TRUNCATE_ERROR,
 	PURE_TRUNCATE_MANIFEST,
+	SECOND_VALID_PURE_TRUNCATE_INPUT,
 	VALID_FIXTURE_INPUT,
 	VALID_PURE_TRUNCATE_INPUT,
 	attemptRuntimeImport,
 	normalizePureToolError,
+	validateSecondPureTruncateOutput,
 	validatePureTruncateOutput,
 	validateFixtureOutput,
 } from "./browser-wasm-host.js";
@@ -38,6 +40,13 @@ await pureHost.initialize(PURE_TRUNCATE_MANIFEST);
 const pureOutput = pureHost.execute(VALID_PURE_TRUNCATE_INPUT);
 if (!validatePureTruncateOutput(pureOutput)) {
 	throw new Error(`pure truncate output mismatch: ${JSON.stringify(pureOutput)}`);
+}
+const secondPureOutput = pureHost.execute(SECOND_VALID_PURE_TRUNCATE_INPUT);
+if (!validateSecondPureTruncateOutput(secondPureOutput)) {
+	throw new Error(`second pure truncate output mismatch: ${JSON.stringify(secondPureOutput)}`);
+}
+if (JSON.stringify(pureOutput) === JSON.stringify(secondPureOutput)) {
+	throw new Error("pure truncate outputs did not vary across distinct valid inputs");
 }
 try {
 	pureHost.execute([]);

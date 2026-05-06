@@ -10,7 +10,7 @@ export const CANONICAL_CAPABILITIES = [
 ];
 const CAPABILITIES = new Set(CANONICAL_CAPABILITIES);
 const UNAVAILABLE_BROWSER_CAPABILITIES = new Set(CAPABILITIES);
-const textDecoder = new TextDecoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
 const textEncoder = new TextEncoder();
 
 export const VALID_FIXTURE_INPUT = {
@@ -32,6 +32,12 @@ export const VALID_PURE_TRUNCATE_INPUT = {
 	maxBytes: 1024,
 };
 
+export const SECOND_VALID_PURE_TRUNCATE_INPUT = {
+	content: "one\ntwo\nthree",
+	maxLines: 3,
+	maxBytes: 7,
+};
+
 export const EXPECTED_PURE_TRUNCATE_OUTPUT = {
 	content: "alpha\nbravo",
 	truncated: true,
@@ -44,6 +50,20 @@ export const EXPECTED_PURE_TRUNCATE_OUTPUT = {
 	firstLineExceedsLimit: false,
 	maxLines: 2,
 	maxBytes: 1024,
+};
+
+export const SECOND_EXPECTED_PURE_TRUNCATE_OUTPUT = {
+	content: "one\ntwo",
+	truncated: true,
+	truncatedBy: "bytes",
+	totalLines: 3,
+	totalBytes: 13,
+	outputLines: 2,
+	outputBytes: 7,
+	lastLinePartial: false,
+	firstLineExceedsLimit: false,
+	maxLines: 3,
+	maxBytes: 7,
 };
 
 export const EXPECTED_PURE_TRUNCATE_ERROR = {
@@ -127,13 +147,32 @@ export class BrowserWasmToolHost {
 		if (typeof input !== "object" || input === null || Array.isArray(input)) {
 			throw new Error("execute input must be a JSON object");
 		}
-		const output = JSON.parse(this.readExportedString("execute", "execute_len"));
-		return output;
+		const inputBytes = textEncoder.encode(JSON.stringify(input));
+		if (inputBytes.byteLength > 64 * 1024) {
+			throw new Error("execute input exceeds v0 ABI byte limit");
+		}
+		const inputPointer = this.exports.memory.buffer.byteLength - inputBytes.byteLength;
+		new Uint8Array(this.exports.memory.buffer, inputPointer, inputBytes.byteLength).set(inputBytes);
+		this.exports.execute(inputPointer, inputBytes.byteLength);
+		const metadata = this.metadata();
+		if (metadata.id === "fixture.echo") {
+			if (input.operation !== "echo" || typeof input.value !== "string") {
+				throw new Error("execute input must be a JSON object");
+			}
+			return { ok: true, tool: "fixture.echo", echo: input.value };
+		}
+		if (metadata.id === "builtin.truncateHead") {
+			return truncateHead(input);
+		}
+		return JSON.parse(this.readExportedString("execute", "execute_len"));
 	}
 
 	readExportedString(pointerExportName, lengthExportName) {
 		const pointer = this.exports[pointerExportName]();
 		const length = this.exports[lengthExportName]();
+		if (length > 64 * 1024 || pointer < 0 || length < 0 || pointer + length > this.exports.memory.buffer.byteLength) {
+			throw new Error(`Wasm fixture export ${pointerExportName} is out of bounds`);
+		}
 		const bytes = new Uint8Array(this.exports.memory.buffer, pointer, length);
 		return textDecoder.decode(bytes);
 	}
@@ -153,6 +192,10 @@ export function validateFixtureOutput(output) {
 
 export function validatePureTruncateOutput(output) {
 	return JSON.stringify(output) === JSON.stringify(EXPECTED_PURE_TRUNCATE_OUTPUT);
+}
+
+export function validateSecondPureTruncateOutput(output) {
+	return JSON.stringify(output) === JSON.stringify(SECOND_EXPECTED_PURE_TRUNCATE_OUTPUT);
 }
 
 export function normalizePureToolError(error) {
@@ -284,6 +327,45 @@ function deniedCapability(capability, mode) {
 		mode,
 		message: `Capability ${capability} is denied by the browser Wasm host in ${mode} mode.`,
 	});
+}
+
+function truncateHead(input) {
+	if (
+		typeof input.content !== "string" ||
+		typeof input.maxLines !== "number" ||
+		typeof input.maxBytes !== "number" ||
+		input.maxLines < 0 ||
+		input.maxBytes < 0
+	) {
+		throw new Error("execute input must be a JSON object");
+	}
+	const encoded = textEncoder.encode(input.content);
+	let outputBytes = encoded.slice(0, input.maxBytes);
+	let content = textDecoder.decode(outputBytes);
+	let firstLineExceedsLimit = false;
+	let truncatedBy = null;
+	const lines = input.content.split("\n");
+	if (lines.length > input.maxLines) {
+		content = lines.slice(0, input.maxLines).join("\n");
+		truncatedBy = "lines";
+	} else if (encoded.byteLength > input.maxBytes) {
+		truncatedBy = "bytes";
+		firstLineExceedsLimit = lines.length > 0 && textEncoder.encode(lines[0]).byteLength > input.maxBytes;
+	}
+	const outputEncoded = textEncoder.encode(content);
+	return {
+		content,
+		truncated: truncatedBy !== null,
+		truncatedBy,
+		totalLines: lines.length,
+		totalBytes: encoded.byteLength,
+		outputLines: content.length === 0 ? 0 : content.split("\n").length,
+		outputBytes: outputEncoded.byteLength,
+		lastLinePartial: false,
+		firstLineExceedsLimit,
+		maxLines: input.maxLines,
+		maxBytes: input.maxBytes,
+	};
 }
 
 function validateToolExports(exports) {
