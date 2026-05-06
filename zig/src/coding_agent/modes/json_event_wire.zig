@@ -16,7 +16,7 @@ pub fn stringifyAgentEventLineWithConfigErrors(
     var value = try agentEventToJsonValue(allocator, event);
     defer common.deinitJsonValue(allocator, value);
     if (event.event_type == .agent_start) {
-        try putField(&value.object, allocator, "config_errors", try configErrorsToJsonValue(allocator, errors));
+        try putField(&value.object, allocator, "configErrors", try configErrorsToJsonValue(allocator, errors));
     }
     try validateAgentEventJson(allocator, value);
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -157,7 +157,7 @@ fn validateAgentEventValue(allocator: std.mem.Allocator, value: std.json.Value, 
     const event_type = try requireStringField(allocator, object, path, "type");
 
     if (std.mem.eql(u8, event_type, "agent_start")) {
-        if (object.get("config_errors")) |errors| try validateConfigErrors(allocator, errors, path);
+        if (object.get("configErrors")) |errors| try validateConfigErrors(allocator, errors, path);
         return;
     }
     if (std.mem.eql(u8, event_type, "turn_start")) return;
@@ -508,7 +508,7 @@ fn validateAgentToolResultField(allocator: std.mem.Allocator, object: std.json.O
 }
 
 fn validateConfigErrors(allocator: std.mem.Allocator, value: std.json.Value, parent_path: []const u8) !void {
-    const path = try fieldPath(allocator, parent_path, "config_errors");
+    const path = try fieldPath(allocator, parent_path, "configErrors");
     defer allocator.free(path);
     const array = try asArray(allocator, value, path);
     for (array.items, 0..) |item, index| {

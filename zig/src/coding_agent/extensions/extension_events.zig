@@ -875,3 +875,22 @@ test "extension event conformance helper covers every supported event surface" {
         try std.testing.expectEqualStrings(eventName(event_type), names[index]);
     }
 }
+
+test "extension event surface matches TypeScript parity fixture" {
+    const fixture_path = "../packages/coding-agent/test/fixtures/extension-event-surface-names.json";
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, fixture_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .array);
+    const fixture_names = parsed.value.array.items;
+    const names = eventSurfaceNames();
+    try std.testing.expectEqual(names.len, fixture_names.len);
+
+    for (names, fixture_names) |zig_name, fixture_name| {
+        try std.testing.expect(fixture_name == .string);
+        try std.testing.expectEqualStrings(zig_name, fixture_name.string);
+    }
+}

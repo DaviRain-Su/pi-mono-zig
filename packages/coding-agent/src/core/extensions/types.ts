@@ -971,6 +971,46 @@ export type ExtensionEvent =
 	| ToolCallEvent
 	| ToolResultEvent;
 
+export const EXTENSION_EVENT_NAMES = [
+	"resources_discover",
+	"session_start",
+	"session_before_switch",
+	"session_before_fork",
+	"session_before_compact",
+	"session_compact",
+	"session_shutdown",
+	"session_before_tree",
+	"session_tree",
+	"before_agent_start",
+	"agent_start",
+	"agent_end",
+	"turn_start",
+	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+	"tool_call",
+	"tool_result",
+	"user_bash",
+	"context",
+	"before_provider_request",
+	"after_provider_response",
+	"model_select",
+	"thinking_level_select",
+	"input",
+] as const satisfies readonly ExtensionEvent["type"][];
+
+export type ExtensionEventName = (typeof EXTENSION_EVENT_NAMES)[number];
+
+type AssertNoExtensionEventDrift<T extends never> = T;
+type ExtensionEventNameMissing = Exclude<ExtensionEvent["type"], ExtensionEventName>;
+type ExtensionEventNameExtra = Exclude<ExtensionEventName, ExtensionEvent["type"]>;
+type _ExtensionEventNamesCoverAllEvents = AssertNoExtensionEventDrift<ExtensionEventNameMissing>;
+type _ExtensionEventNamesContainOnlyEvents = AssertNoExtensionEventDrift<ExtensionEventNameExtra>;
+
 // ============================================================================
 // Event Results
 // ============================================================================

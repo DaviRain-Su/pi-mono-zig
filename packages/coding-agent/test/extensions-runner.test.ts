@@ -5,14 +5,287 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createExtensionRuntime, discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
-import type { ExtensionActions, ExtensionContextActions, ProviderConfig } from "../src/core/extensions/types.js";
+import type {
+	ExtensionActions,
+	ExtensionContextActions,
+	ExtensionEventName,
+	ProviderConfig,
+} from "../src/core/extensions/types.js";
+import { EXTENSION_EVENT_NAMES } from "../src/core/extensions/types.js";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
+
+const AGENT_EVENT_GOLDEN_FIXTURES = [
+	"agent_start",
+	"turn_start",
+	"message_start_user",
+	"message_start_assistant",
+	"message_update_text_delta",
+	"message_update_thinking_delta",
+	"message_update_toolcall_delta",
+	"message_update_abort_error",
+	"message_end_assistant",
+	"message_end_tool_result",
+	"tool_execution_start",
+	"tool_execution_update_partial",
+	"tool_execution_end_success",
+	"tool_execution_end_error",
+	"turn_end",
+	"agent_end",
+] as const;
+
+function readJsonFixture(relativePath: string): unknown {
+	return JSON.parse(fs.readFileSync(new URL(relativePath, import.meta.url), "utf8")) as unknown;
+}
+
+function expectRecord(value: unknown, path: string): Record<string, unknown> {
+	expect(value, `${path} should be an object`).toBeTypeOf("object");
+	expect(value, `${path} should not be null`).not.toBeNull();
+	expect(Array.isArray(value), `${path} should not be an array`).toBe(false);
+	return value as Record<string, unknown>;
+}
+
+function expectString(value: unknown, path: string): string {
+	expect(value, `${path} should be a string`).toBeTypeOf("string");
+	return value as string;
+}
+
+function expectNumber(value: unknown, path: string): number {
+	expect(value, `${path} should be a number`).toBeTypeOf("number");
+	return value as number;
+}
+
+function expectBoolean(value: unknown, path: string): boolean {
+	expect(value, `${path} should be a boolean`).toBeTypeOf("boolean");
+	return value as boolean;
+}
+
+function expectArray(value: unknown, path: string): unknown[] {
+	expect(Array.isArray(value), `${path} should be an array`).toBe(true);
+	return value as unknown[];
+}
+
+function expectNoSnakeCasePayloadFields(value: unknown, path = "$"): void {
+	if (Array.isArray(value)) {
+		value.forEach((item, index) => {
+			expectNoSnakeCasePayloadFields(item, `${path}[${index}]`);
+		});
+		return;
+	}
+	if (!value || typeof value !== "object") return;
+	for (const [key, child] of Object.entries(value)) {
+		expect(key, `${path}.${key} should use TS-compatible camelCase`).not.toContain("_");
+		expectNoSnakeCasePayloadFields(child, `${path}.${key}`);
+	}
+}
+
+function expectContentBlocks(value: unknown, path: string): void {
+	const blocks = expectArray(value, path);
+	for (const [index, blockValue] of blocks.entries()) {
+		const block = expectRecord(blockValue, `${path}[${index}]`);
+		const type = expectString(block.type, `${path}[${index}].type`);
+		if (type === "text") {
+			expectString(block.text, `${path}[${index}].text`);
+		} else if (type === "image") {
+			expectString(block.data, `${path}[${index}].data`);
+			expectString(block.mimeType, `${path}[${index}].mimeType`);
+		} else if (type === "thinking") {
+			expectString(block.thinking, `${path}[${index}].thinking`);
+		} else if (type === "toolCall") {
+			expectString(block.id, `${path}[${index}].id`);
+			expectString(block.name, `${path}[${index}].name`);
+			expectRecord(block.arguments, `${path}[${index}].arguments`);
+		} else {
+			throw new Error(`${path}[${index}].type: invalid content block type '${type}'`);
+		}
+	}
+}
+
+function expectUsage(value: unknown, path: string): void {
+	const usage = expectRecord(value, path);
+	for (const field of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
+		expectNumber(usage[field], `${path}.${field}`);
+	}
+	const cost = expectRecord(usage.cost, `${path}.cost`);
+	for (const field of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+		expectNumber(cost[field], `${path}.cost.${field}`);
+	}
+}
+
+function expectAgentMessage(value: unknown, path: string): void {
+	const message = expectRecord(value, path);
+	const role = expectString(message.role, `${path}.role`);
+	if (role === "user") {
+		if (typeof message.content !== "string") expectContentBlocks(message.content, `${path}.content`);
+		expectNumber(message.timestamp, `${path}.timestamp`);
+		return;
+	}
+	if (role === "assistant") {
+		expectContentBlocks(message.content, `${path}.content`);
+		expectString(message.api, `${path}.api`);
+		expectString(message.provider, `${path}.provider`);
+		expectString(message.model, `${path}.model`);
+		expectUsage(message.usage, `${path}.usage`);
+		expect(["stop", "length", "toolUse", "error", "aborted"]).toContain(
+			expectString(message.stopReason, `${path}.stopReason`),
+		);
+		expectNumber(message.timestamp, `${path}.timestamp`);
+		return;
+	}
+	if (role === "toolResult") {
+		expectToolResultMessage(value, path);
+		return;
+	}
+	throw new Error(`${path}.role: invalid message role '${role}'`);
+}
+
+function expectToolResultMessage(value: unknown, path: string): void {
+	const message = expectRecord(value, path);
+	expectString(message.toolCallId, `${path}.toolCallId`);
+	expectString(message.toolName, `${path}.toolName`);
+	expectContentBlocks(message.content, `${path}.content`);
+	expectBoolean(message.isError, `${path}.isError`);
+	expectNumber(message.timestamp, `${path}.timestamp`);
+}
+
+function expectAssistantMessageEvent(value: unknown, path: string): void {
+	const event = expectRecord(value, path);
+	const type = expectString(event.type, `${path}.type`);
+	if (type === "start") {
+		expectAgentMessage(event.partial, `${path}.partial`);
+		return;
+	}
+	if (
+		type.endsWith("_start") ||
+		type.endsWith("_delta") ||
+		type === "text_end" ||
+		type === "thinking_end" ||
+		type === "toolcall_end"
+	) {
+		expectNumber(event.contentIndex, `${path}.contentIndex`);
+		if (type.endsWith("_delta")) expectString(event.delta, `${path}.delta`);
+		if (type === "text_end" || type === "thinking_end") expectString(event.content, `${path}.content`);
+		if (type === "toolcall_end") {
+			const toolCall = expectRecord(event.toolCall, `${path}.toolCall`);
+			expectString(toolCall.id ?? toolCall.toolCallId, `${path}.toolCall.id`);
+			expectString(toolCall.name, `${path}.toolCall.name`);
+			expectRecord(toolCall.arguments, `${path}.toolCall.arguments`);
+		}
+		expectAgentMessage(event.partial, `${path}.partial`);
+		return;
+	}
+	if (type === "done") {
+		expect(["stop", "length", "toolUse"]).toContain(expectString(event.reason, `${path}.reason`));
+		expectAgentMessage(event.message, `${path}.message`);
+		return;
+	}
+	if (type === "error") {
+		expect(["error", "aborted"]).toContain(expectString(event.reason, `${path}.reason`));
+		expectAgentMessage(event.error, `${path}.error`);
+		return;
+	}
+	throw new Error(`${path}.type: invalid assistant message event type '${type}'`);
+}
+
+function expectAgentToolResult(value: unknown, path: string): void {
+	const result = expectRecord(value, path);
+	expectContentBlocks(result.content, `${path}.content`);
+}
+
+function expectAgentEventWirePayload(value: unknown): asserts value is AgentEvent {
+	expectNoSnakeCasePayloadFields(value);
+	const event = expectRecord(value, "$");
+	const type = expectString(event.type, "$.type");
+	if (type === "agent_start" || type === "turn_start") return;
+	if (type === "agent_end") {
+		expectArray(event.messages, "$.messages").forEach((message, index) => {
+			expectAgentMessage(message, `$.messages[${index}]`);
+		});
+		return;
+	}
+	if (type === "turn_end") {
+		expectAgentMessage(event.message, "$.message");
+		expectArray(event.toolResults, "$.toolResults").forEach((result, index) => {
+			expectToolResultMessage(result, `$.toolResults[${index}]`);
+		});
+		return;
+	}
+	if (type === "message_start" || type === "message_end") {
+		expectAgentMessage(event.message, "$.message");
+		return;
+	}
+	if (type === "message_update") {
+		expectAgentMessage(event.message, "$.message");
+		expectAssistantMessageEvent(event.assistantMessageEvent, "$.assistantMessageEvent");
+		return;
+	}
+	if (type === "tool_execution_start") {
+		expectString(event.toolCallId, "$.toolCallId");
+		expectString(event.toolName, "$.toolName");
+		expectRecord(event.args, "$.args");
+		return;
+	}
+	if (type === "tool_execution_update") {
+		expectString(event.toolCallId, "$.toolCallId");
+		expectString(event.toolName, "$.toolName");
+		expectRecord(event.args, "$.args");
+		expectAgentToolResult(event.partialResult, "$.partialResult");
+		return;
+	}
+	if (type === "tool_execution_end") {
+		expectString(event.toolCallId, "$.toolCallId");
+		expectString(event.toolName, "$.toolName");
+		expectAgentToolResult(event.result, "$.result");
+		expectBoolean(event.isError, "$.isError");
+		return;
+	}
+	throw new Error(`$.type: invalid agent event type '${type}'`);
+}
+
+describe("subscriber event contract parity", () => {
+	it("keeps the TS event surface fixture in sync with ExtensionEvent names", () => {
+		const fixture = readJsonFixture("./fixtures/extension-event-surface-names.json");
+		expect(fixture).toEqual([...EXTENSION_EVENT_NAMES]);
+		expect(new Set(EXTENSION_EVENT_NAMES).size).toBe(EXTENSION_EVENT_NAMES.length);
+
+		const checkedNames = EXTENSION_EVENT_NAMES satisfies readonly ExtensionEventName[];
+		expect(checkedNames).toHaveLength(29);
+	});
+
+	it("parses Zig JSON wire goldens as TS-compatible AgentEvent payloads", () => {
+		const parsedEvents: AgentEvent[] = [];
+		for (const name of AGENT_EVENT_GOLDEN_FIXTURES) {
+			const payload = readJsonFixture(`../../../zig/test/golden/json/${name}.json`);
+			expectAgentEventWirePayload(payload);
+			parsedEvents.push(payload);
+		}
+
+		expect(parsedEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"turn_start",
+			"message_start",
+			"message_start",
+			"message_update",
+			"message_update",
+			"message_update",
+			"message_update",
+			"message_end",
+			"message_end",
+			"tool_execution_start",
+			"tool_execution_update",
+			"tool_execution_end",
+			"tool_execution_end",
+			"turn_end",
+			"agent_end",
+		]);
+	});
+});
 
 describe("ExtensionRunner", () => {
 	let tempDir: string;

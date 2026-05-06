@@ -493,7 +493,7 @@ test "print mode json outputs valid JSON lines for all events" {
         const event_type = parsed.value.object.get("type").?.string;
         if (std.mem.eql(u8, event_type, "agent_start")) {
             saw_agent_start = true;
-            const config_errors_value = parsed.value.object.get("config_errors").?;
+            const config_errors_value = parsed.value.object.get("configErrors").?;
             try std.testing.expectEqual(@as(usize, 1), config_errors_value.array.items.len);
             const config_error = config_errors_value.array.items[0].object;
             try std.testing.expectEqualStrings("settings", config_error.get("source").?.string);
