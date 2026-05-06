@@ -30,33 +30,35 @@ function writeWasmPackage(
 		artifactPath?: string;
 		artifactBytes?: Buffer | string;
 		capabilities?: string[];
+		resourceLimits?: Record<string, unknown>;
 		toolId?: string;
 	} = {},
 ): void {
 	const artifactPath = options.artifactPath ?? "wasm/plugin.wasm";
 	mkdirSync(join(packageRoot, dirname(artifactPath)), { recursive: true });
 	writeFileSync(join(packageRoot, artifactPath), options.artifactBytes ?? Buffer.from([0x00, 0x61, 0x73, 0x6d]));
-	writeFileSync(
-		join(packageRoot, "pi-extension.json"),
-		JSON.stringify({
-			schemaVersion: "pi-extension.v0",
-			id: "com.example.local-wasm",
-			name: "Local Wasm Fixture",
-			version: "0.1.0",
-			description: "Local Wasm package fixture.",
-			artifact: {
-				kind: "wasm-component",
-				path: artifactPath,
-			},
-			tool: {
-				id: options.toolId ?? "fixture.echo",
-				description: "Echoes deterministic JSON from a local Wasm fixture.",
-				inputSchema: {},
-				outputSchema: {},
-			},
-			capabilities: options.capabilities ?? [],
-		}),
-	);
+	const manifest: Record<string, unknown> = {
+		schemaVersion: "pi-extension.v0",
+		id: "com.example.local-wasm",
+		name: "Local Wasm Fixture",
+		version: "0.1.0",
+		description: "Local Wasm package fixture.",
+		artifact: {
+			kind: "wasm-component",
+			path: artifactPath,
+		},
+		tool: {
+			id: options.toolId ?? "fixture.echo",
+			description: "Echoes deterministic JSON from a local Wasm fixture.",
+			inputSchema: {},
+			outputSchema: {},
+		},
+		capabilities: options.capabilities ?? [],
+	};
+	if (options.resourceLimits !== undefined) {
+		manifest.resourceLimits = options.resourceLimits;
+	}
+	writeFileSync(join(packageRoot, "pi-extension.json"), JSON.stringify(manifest));
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -516,6 +518,95 @@ Content`,
 				'$.capabilities[0]: denied_capability: capability "file.read" is not approved for manifest-request',
 			);
 			expect(events.some((event) => event.type === "complete")).toBe(false);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+		});
+
+		it("should treat Wasm resource limits as constraints without granting capabilities", async () => {
+			const constrainedPackage = join(tempDir, "resource-limited-package");
+			mkdirSync(constrainedPackage, { recursive: true });
+			const resourceLimits = {
+				maxChildren: 0,
+				depth: 1,
+				turns: 3,
+				timeoutMs: 1000,
+				outputBytes: 4096,
+				outputLines: 80,
+				toolScopes: ["fixture.echo", "builtin.truncateHead"],
+			};
+			writeWasmPackage(constrainedPackage, { resourceLimits });
+
+			const result = await packageManager.resolveExtensionSources([constrainedPackage]);
+
+			expect(result.extensions).toHaveLength(0);
+			expect(result.wasmExtensions).toHaveLength(1);
+			expect(result.wasmExtensions[0].capabilities).toEqual([]);
+			expect(result.wasmExtensions[0].resourceLimits).toEqual(resourceLimits);
+		});
+
+		it("should reject invalid Wasm resource limits deterministically", async () => {
+			const cases: Array<{
+				name: string;
+				resourceLimits: unknown;
+				expected: string;
+			}> = [
+				{
+					name: "wrong-type",
+					resourceLimits: [],
+					expected: "$.resourceLimits: expected object",
+				},
+				{
+					name: "unknown-field",
+					resourceLimits: { network: 1 },
+					expected: "$.resourceLimits.network: unsupported resource limit",
+				},
+				{
+					name: "negative-timeout",
+					resourceLimits: { timeoutMs: -1 },
+					expected: "$.resourceLimits.timeoutMs: expected non-negative integer",
+				},
+				{
+					name: "fractional-turns",
+					resourceLimits: { turns: 1.5 },
+					expected: "$.resourceLimits.turns: expected non-negative integer",
+				},
+				{
+					name: "non-array-tool-scopes",
+					resourceLimits: { toolScopes: "fixture.echo" },
+					expected: "$.resourceLimits.toolScopes: expected array",
+				},
+				{
+					name: "empty-tool-scope",
+					resourceLimits: { toolScopes: ["fixture.echo", ""] },
+					expected: "$.resourceLimits.toolScopes[1]: must not be empty",
+				},
+			];
+
+			for (const testCase of cases) {
+				const pkgDir = join(tempDir, `invalid-resource-limit-${testCase.name}`);
+				mkdirSync(pkgDir, { recursive: true });
+				writeWasmPackage(pkgDir, { resourceLimits: testCase.resourceLimits as Record<string, unknown> });
+
+				await expect(packageManager.installAndPersist(pkgDir), testCase.name).rejects.toThrow(testCase.expected);
+				expect(settingsManager.getGlobalSettings().packages ?? [], testCase.name).toHaveLength(0);
+			}
+		});
+
+		it("should keep resource limits independent from Wasm capability denial", async () => {
+			const deniedCapabilityPackage = join(tempDir, "resource-limited-denied-capability-package");
+			mkdirSync(deniedCapabilityPackage, { recursive: true });
+			writeWasmPackage(deniedCapabilityPackage, {
+				artifactPath: "wasm/missing.wasm",
+				capabilities: ["file.read"],
+				resourceLimits: {
+					timeoutMs: 1000,
+					toolScopes: ["fixture.echo"],
+				},
+			});
+			rmSync(join(deniedCapabilityPackage, "wasm", "missing.wasm"));
+
+			await expect(packageManager.installAndPersist(deniedCapabilityPackage)).rejects.toThrow(
+				'$.capabilities[0]: denied_capability: capability "file.read" is not approved for manifest-request',
+			);
 			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
 		});
 

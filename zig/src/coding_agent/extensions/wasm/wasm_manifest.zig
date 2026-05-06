@@ -218,6 +218,26 @@ pub const Diagnostic = struct {
     }
 };
 
+pub const ResourceLimits = struct {
+    max_children: ?u64 = null,
+    depth: ?u64 = null,
+    turns: ?u64 = null,
+    timeout_ms: ?u64 = null,
+    output_bytes: ?u64 = null,
+    output_lines: ?u64 = null,
+    tool_scopes: [][]u8,
+
+    pub fn initEmpty(allocator: std.mem.Allocator) !ResourceLimits {
+        return .{ .tool_scopes = try allocator.alloc([]u8, 0) };
+    }
+
+    pub fn deinit(self: *ResourceLimits, allocator: std.mem.Allocator) void {
+        for (self.tool_scopes) |scope| allocator.free(scope);
+        allocator.free(self.tool_scopes);
+        self.* = undefined;
+    }
+};
+
 pub const Manifest = struct {
     schema_version: []u8,
     id: []u8,
@@ -232,6 +252,7 @@ pub const Manifest = struct {
     input_schema_json: []u8,
     output_schema_json: []u8,
     requested_capabilities: []Capability,
+    resource_limits: ResourceLimits,
 
     pub fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
         allocator.free(self.schema_version);
@@ -246,6 +267,7 @@ pub const Manifest = struct {
         allocator.free(self.input_schema_json);
         allocator.free(self.output_schema_json);
         allocator.free(self.requested_capabilities);
+        self.resource_limits.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -361,6 +383,12 @@ pub fn validateManifestText(
         }
     }
 
+    var resource_limits = switch (try validateResourceLimits(allocator, root)) {
+        .valid => |limits| limits,
+        .invalid => |diagnostic| return diagnostic,
+    };
+    errdefer resource_limits.deinit(allocator);
+
     const artifact_absolute_path = switch (try validateArtifactPath(allocator, package_root, artifact_path)) {
         .valid => |path| path,
         .invalid => |diagnostic| return diagnostic,
@@ -405,6 +433,7 @@ pub fn validateManifestText(
             .input_schema_json = owned_input_schema_json,
             .output_schema_json = owned_output_schema_json,
             .requested_capabilities = owned_capabilities,
+            .resource_limits = resource_limits,
         },
     };
 }
@@ -547,6 +576,135 @@ fn parseCapability(value: []const u8) ?Capability {
         if (std.mem.eql(u8, value, capability.jsonName())) return capability;
     }
     return null;
+}
+
+const ResourceLimitsValidation = union(enum) {
+    valid: ResourceLimits,
+    invalid: ValidationResult,
+};
+
+const OptionalLimitValidation = union(enum) {
+    valid: ?u64,
+    invalid: ValidationResult,
+};
+
+const ToolScopesValidation = union(enum) {
+    valid: [][]u8,
+    invalid: ValidationResult,
+};
+
+fn validateResourceLimits(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+) !ResourceLimitsValidation {
+    const value = root.get("resourceLimits") orelse return .{ .valid = try ResourceLimits.initEmpty(allocator) };
+    if (value != .object) {
+        return .{ .invalid = try invalidOne(allocator, .validate, "$.resourceLimits", "expected object") };
+    }
+
+    const limits = value.object;
+    var iterator = limits.iterator();
+    while (iterator.next()) |entry| {
+        if (!isResourceLimitField(entry.key_ptr.*)) {
+            const path = try std.fmt.allocPrint(allocator, "$.resourceLimits.{s}", .{entry.key_ptr.*});
+            defer allocator.free(path);
+            return .{ .invalid = try invalidOne(allocator, .validate, path, "unsupported resource limit") };
+        }
+    }
+
+    const max_children = switch (try optionalResourceLimitInteger(allocator, limits, "maxChildren")) {
+        .valid => |limit| limit,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+    const depth = switch (try optionalResourceLimitInteger(allocator, limits, "depth")) {
+        .valid => |limit| limit,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+    const turns = switch (try optionalResourceLimitInteger(allocator, limits, "turns")) {
+        .valid => |limit| limit,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+    const timeout_ms = switch (try optionalResourceLimitInteger(allocator, limits, "timeoutMs")) {
+        .valid => |limit| limit,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+    const output_bytes = switch (try optionalResourceLimitInteger(allocator, limits, "outputBytes")) {
+        .valid => |limit| limit,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+    const output_lines = switch (try optionalResourceLimitInteger(allocator, limits, "outputLines")) {
+        .valid => |limit| limit,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+    const tool_scopes = switch (try readToolScopes(allocator, limits)) {
+        .valid => |scopes| scopes,
+        .invalid => |diagnostic| return .{ .invalid = diagnostic },
+    };
+
+    return .{ .valid = .{
+        .max_children = max_children,
+        .depth = depth,
+        .turns = turns,
+        .timeout_ms = timeout_ms,
+        .output_bytes = output_bytes,
+        .output_lines = output_lines,
+        .tool_scopes = tool_scopes,
+    } };
+}
+
+fn isResourceLimitField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "maxChildren") or
+        std.mem.eql(u8, field, "depth") or
+        std.mem.eql(u8, field, "turns") or
+        std.mem.eql(u8, field, "timeoutMs") or
+        std.mem.eql(u8, field, "outputBytes") or
+        std.mem.eql(u8, field, "outputLines") or
+        std.mem.eql(u8, field, "toolScopes");
+}
+
+fn optionalResourceLimitInteger(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field: []const u8,
+) !OptionalLimitValidation {
+    const value = object.get(field) orelse return .{ .valid = null };
+    if (value != .integer or value.integer < 0) {
+        const path = try std.fmt.allocPrint(allocator, "$.resourceLimits.{s}", .{field});
+        defer allocator.free(path);
+        return .{ .invalid = try invalidOne(allocator, .validate, path, "expected non-negative integer") };
+    }
+    return .{ .valid = @intCast(value.integer) };
+}
+
+fn readToolScopes(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !ToolScopesValidation {
+    const value = object.get("toolScopes") orelse return .{ .valid = try allocator.alloc([]u8, 0) };
+    if (value != .array) {
+        return .{ .invalid = try invalidOne(allocator, .validate, "$.resourceLimits.toolScopes", "expected array") };
+    }
+
+    for (value.array.items, 0..) |item, index| {
+        const path = try std.fmt.allocPrint(allocator, "$.resourceLimits.toolScopes[{d}]", .{index});
+        defer allocator.free(path);
+        if (item != .string) {
+            return .{ .invalid = try invalidOne(allocator, .validate, path, "expected string") };
+        }
+        if (item.string.len == 0) {
+            return .{ .invalid = try invalidOne(allocator, .validate, path, "must not be empty") };
+        }
+    }
+
+    var scopes = std.ArrayList([]u8).empty;
+    errdefer {
+        for (scopes.items) |scope| allocator.free(scope);
+        scopes.deinit(allocator);
+    }
+    for (value.array.items) |item| {
+        try scopes.append(allocator, try allocator.dupe(u8, item.string));
+    }
+    return .{ .valid = try scopes.toOwnedSlice(allocator) };
 }
 
 const ArtifactPathValidation = union(enum) {
@@ -704,6 +862,7 @@ test "wasm manifest valid one-tool pi-extension validates successfully" {
     try std.testing.expectEqualStrings("com.example.valid", result.valid.id);
     try std.testing.expectEqualStrings("example.tool", result.valid.tool_id);
     try std.testing.expectEqual(@as(usize, 0), result.valid.requested_capabilities.len);
+    try std.testing.expectEqual(@as(usize, 0), result.valid.resource_limits.tool_scopes.len);
     try std.testing.expect(std.fs.path.isAbsolute(result.valid.artifact_absolute_path));
 }
 
@@ -777,6 +936,101 @@ test "wasm manifest omitted capabilities are default-deny and unknown capabiliti
         const expected = try std.fmt.allocPrint(allocator, "unknown capability \"{s}\"", .{grant});
         defer allocator.free(expected);
         try expectInvalid(&result, "$.capabilities[0]", expected);
+    }
+}
+
+test "wasm manifest resource limits constrain without granting capabilities" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const package_root = try makeValidPackage(allocator, tmp);
+    defer allocator.free(package_root);
+
+    var constrained = try validateManifestText(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limits","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"maxChildren":0,"depth":1,"turns":3,"timeoutMs":1000,"outputBytes":4096,"outputLines":80,"toolScopes":["example.tool","builtin.truncateHead"]}}
+    );
+    defer constrained.deinit(allocator);
+
+    try std.testing.expect(constrained == .valid);
+    try std.testing.expectEqual(@as(usize, 0), constrained.valid.requested_capabilities.len);
+    try std.testing.expectEqual(@as(u64, 0), constrained.valid.resource_limits.max_children.?);
+    try std.testing.expectEqual(@as(u64, 1), constrained.valid.resource_limits.depth.?);
+    try std.testing.expectEqual(@as(u64, 3), constrained.valid.resource_limits.turns.?);
+    try std.testing.expectEqual(@as(u64, 1000), constrained.valid.resource_limits.timeout_ms.?);
+    try std.testing.expectEqual(@as(u64, 4096), constrained.valid.resource_limits.output_bytes.?);
+    try std.testing.expectEqual(@as(u64, 80), constrained.valid.resource_limits.output_lines.?);
+    try std.testing.expectEqual(@as(usize, 2), constrained.valid.resource_limits.tool_scopes.len);
+    try std.testing.expectEqualStrings("example.tool", constrained.valid.resource_limits.tool_scopes[0]);
+    try std.testing.expectEqualStrings("builtin.truncateHead", constrained.valid.resource_limits.tool_scopes[1]);
+
+    var denied_with_limits = try validateManifestText(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Requested capability with limits","artifact":{"kind":"wasm-component","path":"wasm/missing.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":["file.read"],"resourceLimits":{"timeoutMs":1000,"toolScopes":["example.tool"]}}
+    );
+    defer denied_with_limits.deinit(allocator);
+    try expectDeniedCapability(&denied_with_limits, "$.capabilities[0]", .file_read, .validate);
+    try std.testing.expect(std.mem.indexOf(u8, denied_with_limits.invalid[0].message, "artifact file was not found") == null);
+}
+
+test "wasm manifest invalid resource limits fail with deterministic diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const package_root = try makeValidPackage(allocator, tmp);
+    defer allocator.free(package_root);
+
+    const cases = [_]struct {
+        manifest_text: []const u8,
+        expected_path: []const u8,
+        expected_message: []const u8,
+    }{
+        .{
+            .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit wrong type","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":[]}
+            ,
+            .expected_path = "$.resourceLimits",
+            .expected_message = "expected object",
+        },
+        .{
+            .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit unknown","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"network":1}}
+            ,
+            .expected_path = "$.resourceLimits.network",
+            .expected_message = "unsupported resource limit",
+        },
+        .{
+            .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit negative","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"timeoutMs":-1}}
+            ,
+            .expected_path = "$.resourceLimits.timeoutMs",
+            .expected_message = "expected non-negative integer",
+        },
+        .{
+            .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit fractional","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"turns":1.5}}
+            ,
+            .expected_path = "$.resourceLimits.turns",
+            .expected_message = "expected non-negative integer",
+        },
+        .{
+            .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit tool scopes type","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"toolScopes":"example.tool"}}
+            ,
+            .expected_path = "$.resourceLimits.toolScopes",
+            .expected_message = "expected array",
+        },
+        .{
+            .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit tool scopes empty","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"toolScopes":["example.tool",""]}}
+            ,
+            .expected_path = "$.resourceLimits.toolScopes[1]",
+            .expected_message = "must not be empty",
+        },
+    };
+
+    for (cases) |case| {
+        var result = try validateManifestText(allocator, package_root, case.manifest_text);
+        defer result.deinit(allocator);
+        try expectInvalid(&result, case.expected_path, case.expected_message);
     }
 }
 

@@ -22,6 +22,15 @@ export const WASM_CANONICAL_SECURITY_GRANTS = [
 export const WASM_CANONICAL_CAPABILITIES = WASM_CANONICAL_SECURITY_GRANTS;
 
 const SECURITY_GRANTS = new Set<string>(WASM_CANONICAL_SECURITY_GRANTS);
+const RESOURCE_LIMIT_FIELDS = new Set([
+	"maxChildren",
+	"depth",
+	"turns",
+	"timeoutMs",
+	"outputBytes",
+	"outputLines",
+	"toolScopes",
+]);
 const UNSUPPORTED_SURFACE_FIELDS = [
 	"commands",
 	"widgets",
@@ -50,6 +59,17 @@ export interface WasmExtensionPackageManifest {
 	toolId: string;
 	toolDescription: string;
 	capabilities: string[];
+	resourceLimits: WasmExtensionResourceLimits;
+}
+
+export interface WasmExtensionResourceLimits {
+	maxChildren?: number;
+	depth?: number;
+	turns?: number;
+	timeoutMs?: number;
+	outputBytes?: number;
+	outputLines?: number;
+	toolScopes: string[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -106,6 +126,7 @@ export function validateWasmExtensionPackage(packageRoot: string): WasmExtension
 	}
 
 	const capabilities = readCapabilities(root);
+	const resourceLimits = readResourceLimits(root);
 	denyRequestedCapabilities(capabilities);
 	const artifactAbsolutePath = validateArtifactPath(packageRoot, artifactPath);
 	const artifactSha256 = createHash("sha256").update(readFileSync(artifactAbsolutePath)).digest("hex");
@@ -126,6 +147,7 @@ export function validateWasmExtensionPackage(packageRoot: string): WasmExtension
 		toolId,
 		toolDescription,
 		capabilities,
+		resourceLimits,
 	};
 }
 
@@ -174,6 +196,54 @@ function readCapabilities(root: JsonObject): string[] {
 			throw new Error(`$.capabilities[${index}]: unknown capability "${capability}"`);
 		}
 		return capability;
+	});
+}
+
+function readResourceLimits(root: JsonObject): WasmExtensionResourceLimits {
+	const value = root.resourceLimits;
+	if (value === undefined) return { toolScopes: [] };
+	const limits = expectObject(value, "$.resourceLimits");
+
+	for (const field of Object.keys(limits)) {
+		if (!RESOURCE_LIMIT_FIELDS.has(field)) {
+			throw new Error(`$.resourceLimits.${field}: unsupported resource limit`);
+		}
+	}
+
+	return {
+		maxChildren: optionalResourceLimitInteger(limits, "$.resourceLimits", "maxChildren"),
+		depth: optionalResourceLimitInteger(limits, "$.resourceLimits", "depth"),
+		turns: optionalResourceLimitInteger(limits, "$.resourceLimits", "turns"),
+		timeoutMs: optionalResourceLimitInteger(limits, "$.resourceLimits", "timeoutMs"),
+		outputBytes: optionalResourceLimitInteger(limits, "$.resourceLimits", "outputBytes"),
+		outputLines: optionalResourceLimitInteger(limits, "$.resourceLimits", "outputLines"),
+		toolScopes: readToolScopes(limits),
+	};
+}
+
+function optionalResourceLimitInteger(object: JsonObject, parentPath: string, field: string): number | undefined {
+	const value = object[field];
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new Error(`${parentPath}.${field}: expected non-negative integer`);
+	}
+	return value;
+}
+
+function readToolScopes(limits: JsonObject): string[] {
+	const value = limits.toolScopes;
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) {
+		throw new Error("$.resourceLimits.toolScopes: expected array");
+	}
+	return value.map((scope, index) => {
+		if (typeof scope !== "string") {
+			throw new Error(`$.resourceLimits.toolScopes[${index}]: expected string`);
+		}
+		if (scope.length === 0) {
+			throw new Error(`$.resourceLimits.toolScopes[${index}]: must not be empty`);
+		}
+		return scope;
 	});
 }
 
