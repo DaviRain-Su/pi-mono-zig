@@ -35,6 +35,27 @@ export interface SubAgentResourceLimits {
 	toolScopes?: string[];
 }
 
+export type SubAgentNumericResourceLimit =
+	| "maxChildren"
+	| "depth"
+	| "turns"
+	| "timeoutMs"
+	| "outputBytes"
+	| "outputLines";
+
+export interface SubAgentResourceLimitDetail {
+	limit: number;
+	actual?: number;
+	truncated?: boolean;
+	reason?: string;
+}
+
+export type SubAgentResourceLimitDetails = Partial<
+	Record<SubAgentNumericResourceLimit, SubAgentResourceLimitDetail>
+> & {
+	toolScopes?: string[];
+};
+
 export interface SubAgentCancellationMetadata {
 	signalId?: string;
 	state: SubAgentCancellationState;
@@ -71,6 +92,7 @@ export interface SubAgentResourceSummary {
 	outputBytes?: number;
 	outputLines?: number;
 	childrenStarted?: number;
+	limitDetails?: SubAgentResourceLimitDetails;
 }
 
 export interface SubAgentTaskResultEnvelope extends SubAgentCorrelationIds, SubAgentLineage {
@@ -107,6 +129,16 @@ const RESOURCE_LIMIT_FIELDS = new Set([
 	"outputLines",
 	"toolScopes",
 ]);
+const NUMERIC_RESOURCE_LIMIT_FIELDS = [
+	"maxChildren",
+	"depth",
+	"turns",
+	"timeoutMs",
+	"outputBytes",
+	"outputLines",
+] as const;
+const RESOURCE_SUMMARY_FIELDS = new Set(["turns", "outputBytes", "outputLines", "childrenStarted", "limitDetails"]);
+const RESOURCE_LIMIT_DETAIL_FIELDS = new Set(["limit", "actual", "truncated", "reason"]);
 const FORBIDDEN_PRODUCT_FIELDS = new Set([
 	"ui",
 	"ux",
@@ -159,7 +191,7 @@ export function validateSubAgentTaskResultEnvelope(value: unknown): SubAgentTask
 	if (Object.hasOwn(root, "error")) validateTaskError(expectObject(root.error, "$.error"));
 	if (Object.hasOwn(root, "usage")) validateNumericSummary(expectObject(root.usage, "$.usage"), "$.usage");
 	if (Object.hasOwn(root, "resourceSummary")) {
-		validateNumericSummary(expectObject(root.resourceSummary, "$.resourceSummary"), "$.resourceSummary");
+		validateResourceSummary(expectObject(root.resourceSummary, "$.resourceSummary"));
 	}
 	return root as unknown as SubAgentTaskResultEnvelope;
 }
@@ -194,7 +226,7 @@ function validateResourceLimits(object: JsonObject): void {
 	for (const field of Object.keys(object)) {
 		if (!RESOURCE_LIMIT_FIELDS.has(field)) throw new Error(`$.limits.${field}: unsupported resource limit`);
 	}
-	for (const field of ["maxChildren", "depth", "turns", "timeoutMs", "outputBytes", "outputLines"] as const) {
+	for (const field of NUMERIC_RESOURCE_LIMIT_FIELDS) {
 		nonNegativeInteger(object, "$.limits", field, false);
 	}
 	if (!Object.hasOwn(object, "toolScopes")) return;
@@ -204,6 +236,51 @@ function validateResourceLimits(object: JsonObject): void {
 		if (typeof scope !== "string") throw new Error(`$.limits.toolScopes[${index}]: expected string`);
 		if (scope.length === 0) throw new Error(`$.limits.toolScopes[${index}]: must not be empty`);
 	});
+}
+
+function validateResourceSummary(object: JsonObject): void {
+	for (const field of Object.keys(object)) {
+		if (!RESOURCE_SUMMARY_FIELDS.has(field))
+			throw new Error(`$.resourceSummary.${field}: unsupported resource summary field`);
+	}
+	for (const field of ["turns", "outputBytes", "outputLines", "childrenStarted"] as const) {
+		nonNegativeNumber(object, "$.resourceSummary", field, false);
+	}
+	if (Object.hasOwn(object, "limitDetails"))
+		validateLimitDetails(expectObject(object.limitDetails, "$.resourceSummary.limitDetails"));
+}
+
+function validateLimitDetails(object: JsonObject): void {
+	for (const field of Object.keys(object)) {
+		if (!RESOURCE_LIMIT_FIELDS.has(field)) {
+			throw new Error(`$.resourceSummary.limitDetails.${field}: unsupported resource limit detail`);
+		}
+	}
+	for (const field of NUMERIC_RESOURCE_LIMIT_FIELDS) {
+		if (!Object.hasOwn(object, field)) continue;
+		validateLimitDetail(expectObject(object[field], `$.resourceSummary.limitDetails.${field}`), field);
+	}
+	if (!Object.hasOwn(object, "toolScopes")) return;
+	const scopes = object.toolScopes;
+	if (!Array.isArray(scopes)) throw new Error("$.resourceSummary.limitDetails.toolScopes: expected array");
+	scopes.forEach((scope, index) => {
+		if (typeof scope !== "string")
+			throw new Error(`$.resourceSummary.limitDetails.toolScopes[${index}]: expected string`);
+		if (scope.length === 0) throw new Error(`$.resourceSummary.limitDetails.toolScopes[${index}]: must not be empty`);
+	});
+}
+
+function validateLimitDetail(object: JsonObject, field: SubAgentNumericResourceLimit): void {
+	const path = `$.resourceSummary.limitDetails.${field}`;
+	for (const detailField of Object.keys(object)) {
+		if (!RESOURCE_LIMIT_DETAIL_FIELDS.has(detailField))
+			throw new Error(`${path}.${detailField}: unsupported limit detail field`);
+	}
+	nonNegativeNumber(object, path, "limit", true);
+	nonNegativeNumber(object, path, "actual", false);
+	optionalBoolean(object, path, "truncated");
+	const reason = optionalString(object, path, "reason");
+	if (reason !== undefined && reason.length === 0) throw new Error(`${path}.reason: must not be empty`);
 }
 
 function validateCancellation(object: JsonObject): void {
@@ -262,6 +339,13 @@ function optionalString(object: JsonObject, parentPath: string, field: string): 
 	const value = object[field];
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") throw new Error(`${parentPath}.${field}: expected string`);
+	return value;
+}
+
+function optionalBoolean(object: JsonObject, parentPath: string, field: string): boolean | undefined {
+	const value = object[field];
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") throw new Error(`${parentPath}.${field}: expected boolean`);
 	return value;
 }
 

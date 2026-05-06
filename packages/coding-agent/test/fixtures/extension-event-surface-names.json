@@ -11,6 +11,7 @@
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"sub_agent_readiness",
 	"turn_start",
 	"turn_end",
 	"message_start",

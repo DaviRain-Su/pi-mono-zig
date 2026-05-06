@@ -3227,6 +3227,79 @@ test "session manager persists branch summaries and custom entry types" {
     try std.testing.expect(std.mem.indexOf(u8, reopened_context.messages[2].user.content[0].text.text, BRANCH_SUMMARY_PREFIX) != null);
 }
 
+test "session manager replays sub-agent readiness records as data only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    var manager = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/subagent-project", session_dir);
+    defer manager.deinit();
+
+    var user = try userTextMessage(std.testing.allocator, "delegate safely", 1);
+    defer deinitMessage(std.testing.allocator, &user);
+    const user_id = try manager.appendMessage(user);
+
+    const readiness_data = try parseJsonTestValue(
+        std.testing.allocator,
+        "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"parentRunId\":\"parent-run\",\"input\":{\"text\":\"summarize\"},\"limits\":{\"maxChildren\":0,\"depth\":1,\"turns\":3,\"timeoutMs\":2500,\"outputBytes\":4096,\"outputLines\":80,\"toolScopes\":[\"read-only\"]},\"cancellation\":{\"signalId\":\"cancel-1\",\"state\":\"pending\",\"parentRunId\":\"parent-run\",\"parentTaskId\":\"parent-task\"}}",
+    );
+    defer common.deinitJsonValue(std.testing.allocator, readiness_data);
+    const readiness_id = try manager.appendCustomEntry("sub_agent.readiness", readiness_data);
+
+    const model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    var assistant = try assistantTextMessage(std.testing.allocator, "readiness metadata recorded", model, 2);
+    defer deinitMessage(std.testing.allocator, &assistant);
+    _ = try manager.appendMessage(assistant);
+
+    const session_file = try std.testing.allocator.dupe(u8, manager.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"customType\":\"sub_agent.readiness\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"sub_agent_task_invocation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"spawnPolicy\"") == null);
+
+    var reopened = try SessionManager.open(std.testing.allocator, std.testing.io, session_file, null);
+    defer reopened.deinit();
+
+    const readiness_entry = reopened.getEntry(readiness_id);
+    try std.testing.expect(readiness_entry != null);
+    try std.testing.expect(readiness_entry.?.* == .custom);
+    try std.testing.expectEqualStrings("sub_agent.readiness", readiness_entry.?.custom.custom_type);
+    try std.testing.expectEqualStrings(user_id, readiness_entry.?.custom.parent_id.?);
+    try std.testing.expect(readiness_entry.?.custom.data != null);
+    const data_object = readiness_entry.?.custom.data.?.object;
+    try std.testing.expectEqualStrings("sub_agent_task_invocation", data_object.get("type").?.string);
+    try std.testing.expectEqualStrings("task-opaque", data_object.get("taskId").?.string);
+    try std.testing.expectEqualStrings("parent-run", data_object.get("parentRunId").?.string);
+    try std.testing.expectEqualStrings("pending", data_object.get("cancellation").?.object.get("state").?.string);
+
+    var context = try reopened.buildSessionContext(std.testing.allocator);
+    defer context.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+    try std.testing.expectEqualStrings("delegate safely", context.messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("readiness metadata recorded", context.messages[1].assistant.content[0].text.text);
+}
+
 test "session manager logs corrupted lines while preserving valid entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

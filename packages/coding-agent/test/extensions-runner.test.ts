@@ -260,7 +260,7 @@ describe("subscriber event contract parity", () => {
 		expect(new Set(EXTENSION_EVENT_NAMES).size).toBe(EXTENSION_EVENT_NAMES.length);
 
 		const checkedNames = EXTENSION_EVENT_NAMES satisfies readonly ExtensionEventName[];
-		expect(checkedNames).toHaveLength(29);
+		expect(checkedNames).toHaveLength(30);
 	});
 
 	it("parses Zig JSON wire goldens as TS-compatible AgentEvent payloads", () => {
@@ -341,7 +341,17 @@ describe("sub-agent readiness envelope validation", () => {
 		startedAt: 10,
 		completedAt: 20,
 		usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3, toolCalls: 0 },
-		resourceSummary: { turns: 1, outputBytes: 128, outputLines: 2, childrenStarted: 0 },
+		resourceSummary: {
+			turns: 1,
+			outputBytes: 128,
+			outputLines: 2,
+			childrenStarted: 0,
+			limitDetails: {
+				outputBytes: { limit: 4096, actual: 5000, truncated: true, reason: "output truncated" },
+				timeoutMs: { limit: 2500, actual: 2500, truncated: false },
+				toolScopes: ["read-only"],
+			},
+		},
 	};
 
 	it("accepts substrate-only invocation and result envelopes with opaque identity lineage", () => {
@@ -372,6 +382,83 @@ describe("sub-agent readiness envelope validation", () => {
 		expect(() => validateSubAgentTaskResultEnvelope({ ...result, status: "complete" })).toThrow(
 			'$.status: unsupported task status "complete"',
 		);
+	});
+
+	it("validates cancellation propagation and resource limit detail paths", () => {
+		expect(() =>
+			validateSubAgentTaskInvocationEnvelope({
+				...invocation,
+				cancellation: { state: "aborted", propagatedFrom: "parent-run" },
+			}),
+		).toThrow('$.cancellation.state: unsupported cancellation state "aborted"');
+		expect(() =>
+			validateSubAgentTaskInvocationEnvelope({
+				...invocation,
+				cancellation: { state: "propagated", parentRunId: "" },
+			}),
+		).toThrow("$.cancellation.parentRunId: must not be empty");
+		expect(() => validateSubAgentTaskInvocationEnvelope({ ...invocation, limits: { maxChildren: -1 } })).toThrow(
+			"$.limits.maxChildren: expected non-negative integer",
+		);
+		expect(() =>
+			validateSubAgentTaskResultEnvelope({
+				...result,
+				resourceSummary: {
+					limitDetails: { outputBytes: { limit: -1 } },
+				},
+			}),
+		).toThrow("$.resourceSummary.limitDetails.outputBytes.limit: expected non-negative number");
+	});
+
+	it("persists readiness records as replay-only session data outside LLM context", () => {
+		const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-readiness-"));
+		try {
+			const session = SessionManager.create("/tmp/subagent-project", sessionDir);
+			const userId = session.appendMessage({ role: "user", content: "delegate safely", timestamp: 1 });
+			const readinessId = session.appendCustomEntry(
+				"sub_agent.readiness",
+				validateSubAgentReadinessEnvelope(invocation),
+			);
+			session.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "recorded readiness metadata" }],
+				api: "faux",
+				provider: "faux",
+				model: "faux",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			});
+
+			const sessionFile = session.getSessionFile();
+			expect(sessionFile).toBeTypeOf("string");
+			const reopened = SessionManager.open(sessionFile!, sessionDir);
+			const readinessEntry = reopened.getEntry(readinessId);
+			expect(readinessEntry?.type).toBe("custom");
+			if (readinessEntry?.type !== "custom") throw new Error("missing readiness custom entry");
+			expect(readinessEntry.customType).toBe("sub_agent.readiness");
+			expect(readinessEntry.parentId).toBe(userId);
+			expect(readinessEntry.data).toMatchObject({
+				type: "sub_agent_task_invocation",
+				taskId: "task-opaque",
+				parentRunId: "parent-run",
+				cancellation: { state: "pending" },
+			});
+
+			const context = reopened.buildSessionContext();
+			expect(context.messages).toHaveLength(2);
+			expect(context.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(JSON.stringify(context.messages)).not.toContain("sub_agent_task_invocation");
+		} finally {
+			fs.rmSync(sessionDir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -1219,6 +1306,63 @@ describe("ExtensionRunner", () => {
 
 			expect(cancellation).toEqual({ cancel: true });
 			expect((globalThis as { afterCancel?: boolean }).afterCancel).toBeUndefined();
+		});
+
+		it("lets subscribers observe sub-agent readiness without owning lifecycle transitions", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("sub_agent_readiness", async (event) => {
+						globalThis.readinessObserved = {
+							taskId: event.envelope.taskId,
+							phase: event.phase,
+							owner: event.owner,
+							readOnly: event.readOnly,
+						};
+						return { cancel: true, spawnPolicy: { automatic: true } };
+					});
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("sub_agent_readiness", async () => {
+						globalThis.readinessSecondObserverCalled = true;
+					});
+				}
+			`;
+			delete (globalThis as { readinessObserved?: unknown }).readinessObserved;
+			delete (globalThis as { readinessSecondObserverCalled?: boolean }).readinessSecondObserverCalled;
+			fs.writeFileSync(path.join(extensionsDir, "readiness-observer-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "readiness-observer-2.ts"), extCode2);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const readinessEnvelope = validateSubAgentReadinessEnvelope({
+				type: "sub_agent_task_invocation",
+				agentId: "agent-opaque",
+				runId: "run-opaque",
+				taskId: "task-opaque",
+				sessionId: "session-opaque",
+				input: { text: "observe only" },
+				cancellation: { state: "requested", reason: "abort signal requested" },
+				limits: { maxChildren: 0, depth: 1, turns: 1 },
+			});
+
+			const ownerResult = await runner.emit({
+				type: "sub_agent_readiness",
+				envelope: readinessEnvelope,
+				phase: "recorded",
+				owner: "agent",
+				readOnly: true,
+			});
+
+			expect(ownerResult).toBeUndefined();
+			expect((globalThis as { readinessObserved?: unknown }).readinessObserved).toEqual({
+				taskId: "task-opaque",
+				phase: "recorded",
+				owner: "agent",
+				readOnly: true,
+			});
+			expect((globalThis as { readinessSecondObserverCalled?: boolean }).readinessSecondObserverCalled).toBe(true);
 		});
 
 		it("chains same-role message_end replacements and rejects invalid roles", async () => {

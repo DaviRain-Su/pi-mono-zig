@@ -75,6 +75,7 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.js";
+import type { SubAgentReadinessEnvelope } from "./subagent-readiness.js";
 
 export type { ExecOptions, ExecResult } from "../exec.js";
 export type { BuildSystemPromptOptions } from "../system-prompt.js";
@@ -644,6 +645,16 @@ export interface AgentEndEvent {
 	messages: AgentMessage[];
 }
 
+/** Fired when substrate-only sub-agent readiness metadata is recorded or replayed. Observation only; no lifecycle control is delegated. */
+export interface SubAgentReadinessEvent {
+	type: "sub_agent_readiness";
+	envelope: SubAgentReadinessEnvelope;
+	phase: "recorded" | "replayed" | "observed";
+	owner: "agent" | "session";
+	readOnly: true;
+	signal?: AbortSignal;
+}
+
 /** Fired at the start of each turn */
 export interface TurnStartEvent {
 	type: "turn_start";
@@ -956,6 +967,7 @@ export type ExtensionEvent =
 	| BeforeAgentStartEvent
 	| AgentStartEvent
 	| AgentEndEvent
+	| SubAgentReadinessEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
@@ -984,6 +996,7 @@ export const EXTENSION_EVENT_NAMES = [
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"sub_agent_readiness",
 	"turn_start",
 	"turn_end",
 	"message_start",
@@ -1150,6 +1163,7 @@ export interface ExtensionAPI {
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
+	on(event: "sub_agent_readiness", handler: ExtensionHandler<SubAgentReadinessEvent>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;

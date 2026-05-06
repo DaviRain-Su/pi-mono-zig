@@ -24,7 +24,10 @@ export type {
 	SubAgentCancellationState,
 	SubAgentCorrelationIds,
 	SubAgentLineage,
+	SubAgentNumericResourceLimit,
 	SubAgentReadinessEnvelope,
+	SubAgentResourceLimitDetail,
+	SubAgentResourceLimitDetails,
 	SubAgentResourceLimits,
 	SubAgentResourceSummary,
 	SubAgentTaskError,
@@ -149,6 +152,7 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	SubAgentReadinessEvent,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,

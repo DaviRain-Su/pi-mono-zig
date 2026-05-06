@@ -17,6 +17,7 @@ pub const ExtensionEventType = enum {
     before_agent_start,
     agent_start,
     agent_end,
+    sub_agent_readiness,
     turn_start,
     turn_end,
     // Message events
@@ -55,6 +56,7 @@ pub const ExtensionEvent = union(ExtensionEventType) {
     before_agent_start: BeforeAgentStartEvent,
     agent_start: AgentStartEvent,
     agent_end: AgentEndEvent,
+    sub_agent_readiness: SubAgentReadinessEvent,
     turn_start: TurnStartEvent,
     turn_end: TurnEndEvent,
     message_start: MessageStartEvent,
@@ -128,6 +130,13 @@ pub const BeforeAgentStartEvent = struct {
 pub const AgentStartEvent = struct {};
 pub const AgentEndEvent = struct {
     stop_reason: ?[]const u8 = null,
+};
+
+pub const SubAgentReadinessEvent = struct {
+    envelope: []const u8,
+    phase: []const u8,
+    owner: []const u8,
+    read_only: bool = true,
 };
 
 pub const TurnStartEvent = struct {
@@ -384,6 +393,9 @@ pub const SubAgentReadinessValidation = union(enum) {
 const subagent_correlation_fields = [_][]const u8{ "agentId", "runId", "taskId", "sessionId" };
 const subagent_optional_id_fields = [_][]const u8{ "toolCallId", "parentAgentId", "parentRunId", "parentTaskId", "parentSessionId", "parentId" };
 const subagent_limit_fields = [_][]const u8{ "maxChildren", "depth", "turns", "timeoutMs", "outputBytes", "outputLines", "toolScopes" };
+const subagent_resource_summary_fields = [_][]const u8{ "turns", "outputBytes", "outputLines", "childrenStarted", "limitDetails" };
+const subagent_resource_summary_number_fields = [_][]const u8{ "turns", "outputBytes", "outputLines", "childrenStarted" };
+const subagent_limit_detail_fields = [_][]const u8{ "limit", "actual", "truncated", "reason" };
 const subagent_forbidden_fields = [_][]const u8{ "ui", "ux", "slashCommand", "spawn", "spawnPolicy", "automaticSpawn", "orchestrationPolicy", "modelSelectionUi", "approvalPolicy" };
 const subagent_cancellation_states = [_][]const u8{ "pending", "requested", "propagated", "completed" };
 const subagent_result_statuses = [_][]const u8{ "pending", "running", "completed", "failed", "cancelled" };
@@ -474,7 +486,7 @@ pub fn validateSubAgentTaskResultEnvelope(allocator: std.mem.Allocator, object: 
             .object => |summary_object| summary_object,
             else => return invalidReadiness(allocator, "$.resourceSummary", "expected object"),
         };
-        if (try numericSummaryDiagnostic(allocator, summary_object, "$.resourceSummary")) |diagnostic| return .{ .invalid = diagnostic };
+        if (try resourceSummaryDiagnostic(allocator, summary_object)) |diagnostic| return .{ .invalid = diagnostic };
     }
     return .{ .valid = .task_result };
 }
@@ -562,6 +574,88 @@ fn limitsDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap) !?
     return null;
 }
 
+fn resourceSummaryDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap) !?SubAgentReadinessDiagnostic {
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!stringInComptimeTable(entry.key_ptr.*, &subagent_resource_summary_fields)) {
+            const path = try std.fmt.allocPrint(allocator, "$.resourceSummary.{s}", .{entry.key_ptr.*});
+            defer allocator.free(path);
+            return (try invalidReadiness(allocator, path, "unsupported resource summary field")).invalid;
+        }
+    }
+    inline for (subagent_resource_summary_number_fields) |field| {
+        if (object.get(field)) |value| {
+            if (try nonNegativeNumberValueDiagnostic(allocator, value, "$.resourceSummary", field)) |diagnostic| return diagnostic;
+        }
+    }
+    if (object.get("limitDetails")) |limit_details| {
+        const details_object = switch (limit_details) {
+            .object => |details_object| details_object,
+            else => return (try invalidReadiness(allocator, "$.resourceSummary.limitDetails", "expected object")).invalid,
+        };
+        if (try limitDetailsDiagnostic(allocator, details_object)) |diagnostic| return diagnostic;
+    }
+    return null;
+}
+
+fn limitDetailsDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap) !?SubAgentReadinessDiagnostic {
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!stringInComptimeTable(entry.key_ptr.*, &subagent_limit_fields)) {
+            const path = try std.fmt.allocPrint(allocator, "$.resourceSummary.limitDetails.{s}", .{entry.key_ptr.*});
+            defer allocator.free(path);
+            return (try invalidReadiness(allocator, path, "unsupported resource limit detail")).invalid;
+        }
+    }
+    inline for (subagent_limit_fields[0..6]) |field| {
+        if (object.get(field)) |value| {
+            const detail_object = switch (value) {
+                .object => |detail_object| detail_object,
+                else => {
+                    const path = comptime "$.resourceSummary.limitDetails." ++ field;
+                    return (try invalidReadiness(allocator, path, "expected object")).invalid;
+                },
+            };
+            if (try limitDetailObjectDiagnostic(allocator, detail_object, field)) |diagnostic| return diagnostic;
+        }
+    }
+    if (object.get("toolScopes")) |tool_scopes| {
+        const array = switch (tool_scopes) {
+            .array => |array| array,
+            else => return (try invalidReadiness(allocator, "$.resourceSummary.limitDetails.toolScopes", "expected array")).invalid,
+        };
+        for (array.items, 0..) |scope, index| {
+            const path = try std.fmt.allocPrint(allocator, "$.resourceSummary.limitDetails.toolScopes[{d}]", .{index});
+            defer allocator.free(path);
+            const text = switch (scope) {
+                .string => |text| text,
+                else => return (try invalidReadiness(allocator, path, "expected string")).invalid,
+            };
+            if (text.len == 0) return (try invalidReadiness(allocator, path, "must not be empty")).invalid;
+        }
+    }
+    return null;
+}
+
+fn limitDetailObjectDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) !?SubAgentReadinessDiagnostic {
+    const parent_path = try std.fmt.allocPrint(allocator, "$.resourceSummary.limitDetails.{s}", .{field});
+    defer allocator.free(parent_path);
+
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!stringInComptimeTable(entry.key_ptr.*, &subagent_limit_detail_fields)) {
+            const path = try std.fmt.allocPrint(allocator, "$.resourceSummary.limitDetails.{s}.{s}", .{ field, entry.key_ptr.* });
+            defer allocator.free(path);
+            return (try invalidReadiness(allocator, path, "unsupported limit detail field")).invalid;
+        }
+    }
+    if (try requiredNonNegativeNumberDiagnostic(allocator, object, parent_path, "limit")) |diagnostic| return diagnostic;
+    if (try optionalNonNegativeNumberDiagnostic(allocator, object, parent_path, "actual")) |diagnostic| return diagnostic;
+    if (try optionalBooleanDiagnostic(allocator, object, parent_path, "truncated")) |diagnostic| return diagnostic;
+    if (try optionalStringDiagnostic(allocator, object, parent_path, "reason")) |diagnostic| return diagnostic;
+    return null;
+}
+
 fn cancellationDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap) !?SubAgentReadinessDiagnostic {
     const state = getString(object, "state") orelse return (try invalidReadiness(allocator, "$.cancellation.state", "missing required field")).invalid;
     if (!stringInComptimeTable(state, &subagent_cancellation_states)) {
@@ -604,6 +698,11 @@ fn optionalNonNegativeIntegerDiagnostic(allocator: std.mem.Allocator, object: st
     return (try invalidReadiness(allocator, path, "expected non-negative integer")).invalid;
 }
 
+fn optionalNonNegativeNumberDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
+    const value = object.get(field) orelse return null;
+    return nonNegativeNumberValueDiagnostic(allocator, value, parent_path, field);
+}
+
 fn nonNegativeNumberValueDiagnostic(allocator: std.mem.Allocator, value: std.json.Value, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
     const valid = switch (value) {
         .integer => |number| number >= 0,
@@ -614,6 +713,17 @@ fn nonNegativeNumberValueDiagnostic(allocator: std.mem.Allocator, value: std.jso
     const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ parent_path, field });
     defer allocator.free(path);
     return (try invalidReadiness(allocator, path, "expected non-negative number")).invalid;
+}
+
+fn optionalBooleanDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
+    const value = object.get(field) orelse return null;
+    switch (value) {
+        .bool => return null,
+        else => {},
+    }
+    const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ parent_path, field });
+    defer allocator.free(path);
+    return (try invalidReadiness(allocator, path, "expected boolean")).invalid;
 }
 
 fn optionalStringDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
@@ -1188,6 +1298,7 @@ pub fn eventSurfaceNames() []const []const u8 {
         "before_agent_start",
         "agent_start",
         "agent_end",
+        "sub_agent_readiness",
         "turn_start",
         "turn_end",
         "message_start",
@@ -1222,6 +1333,7 @@ pub fn eventName(event_type: ExtensionEventType) []const u8 {
         .before_agent_start => "before_agent_start",
         .agent_start => "agent_start",
         .agent_end => "agent_end",
+        .sub_agent_readiness => "sub_agent_readiness",
         .turn_start => "turn_start",
         .turn_end => "turn_end",
         .message_start => "message_start",
@@ -1777,6 +1889,49 @@ test "extension event conformance helper covers every supported event surface" {
     }
 }
 
+var subagent_readiness_observed: bool = false;
+var subagent_readiness_second_observer_called: bool = false;
+
+fn subAgentReadinessObserver(event: ExtensionEvent) !void {
+    try std.testing.expect(event == .sub_agent_readiness);
+    try std.testing.expect(event.sub_agent_readiness.read_only);
+    try std.testing.expectEqualStrings("recorded", event.sub_agent_readiness.phase);
+    try std.testing.expectEqualStrings("agent", event.sub_agent_readiness.owner);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event.sub_agent_readiness.envelope, .{});
+    defer parsed.deinit();
+    var validation = try validateSubAgentReadinessEnvelope(std.testing.allocator, parsed.value);
+    defer validation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(SubAgentReadinessEnvelopeKind.task_invocation, validation.valid);
+
+    subagent_readiness_observed = true;
+}
+
+fn subAgentReadinessSecondObserver(event: ExtensionEvent) !void {
+    try std.testing.expect(event == .sub_agent_readiness);
+    subagent_readiness_second_observer_called = true;
+}
+
+test "sub-agent readiness events are subscriber observation only" {
+    var bus = EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    subagent_readiness_observed = false;
+    subagent_readiness_second_observer_called = false;
+
+    try bus.on(.sub_agent_readiness, subAgentReadinessObserver, "/tmp/readiness-one.ts");
+    try bus.on(.sub_agent_readiness, subAgentReadinessSecondObserver, "/tmp/readiness-two.ts");
+
+    try bus.emit(.{ .sub_agent_readiness = .{
+        .envelope = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"input\":{\"text\":\"observe only\"},\"cancellation\":{\"state\":\"requested\",\"reason\":\"abort signal requested\"},\"limits\":{\"maxChildren\":0,\"depth\":1,\"turns\":1}}",
+        .phase = "recorded",
+        .owner = "agent",
+        .read_only = true,
+    } });
+
+    try std.testing.expect(subagent_readiness_observed);
+    try std.testing.expect(subagent_readiness_second_observer_called);
+}
+
 test "sub-agent readiness envelopes validate identity lineage invocation and result wire shape" {
     const allocator = std.testing.allocator;
     const invocation_json =
@@ -1790,7 +1945,7 @@ test "sub-agent readiness envelopes validate identity lineage invocation and res
     try std.testing.expectEqual(SubAgentReadinessEnvelopeKind.task_invocation, invocation_validation.valid);
 
     const result_json =
-        \\{"type":"sub_agent_task_result","agentId":"agent-opaque","runId":"run-opaque","taskId":"task-opaque","sessionId":"session-opaque","parentAgentId":"parent-agent","parentRunId":"parent-run","parentTaskId":"parent-task","parentSessionId":"parent-session","status":"completed","content":[{"type":"text","text":"done"}],"details":{"replaySafe":true},"startedAt":10,"completedAt":20,"usage":{"inputTokens":1,"outputTokens":2,"totalTokens":3,"toolCalls":0},"resourceSummary":{"turns":1,"outputBytes":128,"outputLines":2,"childrenStarted":0}}
+        \\{"type":"sub_agent_task_result","agentId":"agent-opaque","runId":"run-opaque","taskId":"task-opaque","sessionId":"session-opaque","parentAgentId":"parent-agent","parentRunId":"parent-run","parentTaskId":"parent-task","parentSessionId":"parent-session","status":"completed","content":[{"type":"text","text":"done"}],"details":{"replaySafe":true},"startedAt":10,"completedAt":20,"usage":{"inputTokens":1,"outputTokens":2,"totalTokens":3,"toolCalls":0},"resourceSummary":{"turns":1,"outputBytes":128,"outputLines":2,"childrenStarted":0,"limitDetails":{"outputBytes":{"limit":4096,"actual":5000,"truncated":true,"reason":"output truncated"},"timeoutMs":{"limit":2500,"actual":2500,"truncated":false},"toolScopes":["read-only"]}}}
     ;
     var result = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
     defer result.deinit();
@@ -1831,6 +1986,26 @@ test "sub-agent readiness envelope validation rejects missing ids product fields
             .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"limits\":{\"toolScopes\":[\"\"]}}",
             .path = "$.limits.toolScopes[0]",
             .message = "must not be empty",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"cancellation\":{\"state\":\"aborted\",\"propagatedFrom\":\"parent-run\"}}",
+            .path = "$.cancellation.state",
+            .message = "unsupported cancellation state \"aborted\"",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"cancellation\":{\"state\":\"propagated\",\"parentRunId\":\"\"}}",
+            .path = "$.cancellation.parentRunId",
+            .message = "must not be empty",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"limits\":{\"maxChildren\":-1}}",
+            .path = "$.limits.maxChildren",
+            .message = "expected non-negative integer",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"status\":\"completed\",\"startedAt\":1,\"completedAt\":2,\"resourceSummary\":{\"limitDetails\":{\"outputBytes\":{\"limit\":-1}}}}",
+            .path = "$.resourceSummary.limitDetails.outputBytes.limit",
+            .message = "expected non-negative number",
         },
     };
 
