@@ -170,6 +170,7 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "set_widget",
     "clear_widget",
     "clear_ui_hooks_for_reload",
+    "clear_extension_registrations",
     "resources_discover",
     "register_message_renderer",
     "unregister_message_renderer",
@@ -358,6 +359,7 @@ pub const ProtocolState = struct {
                     .set_widget_hook,
                     .cleared_widget_hook,
                     .cleared_ui_hooks_for_reload,
+                    .cleared_extension_registrations,
                     .resources_discovered,
                     .registered_message_renderer,
                     .unregistered_message_renderer,
@@ -1149,6 +1151,45 @@ test "extension_host ProtocolState accepts live register_capability frame" {
     try std.testing.expectEqualStrings("cap-workflow", state.registry.capabilities.items[0].id);
     try std.testing.expectEqualStrings("workflow", state.registry.capabilities.items[0].kind);
     try std.testing.expectEqualStrings("Workflow", state.registry.capabilities.items[0].title);
+}
+
+test "extension_host ProtocolState applies clear_extension_registrations without clearing UI lifecycle" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"target-tool\",\"label\":\"Target\",\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"other-tool\",\"label\":\"Other\",\"extensionPath\":\"fixture/other.ts\"}\n" ++
+        "{\"type\":\"register_capability\",\"id\":\"target-capability\",\"kind\":\"workflow\",\"title\":\"Target\",\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"register_capability\",\"id\":\"other-capability\",\"kind\":\"workflow\",\"title\":\"Other\",\"extensionPath\":\"fixture/other.ts\"}\n" ++
+        "{\"type\":\"register_message_renderer\",\"customType\":\"target-message\",\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"register_message_renderer\",\"customType\":\"other-message\",\"extensionPath\":\"fixture/other.ts\"}\n" ++
+        "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/target/skills\"],\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/other/skills\"],\"extensionPath\":\"fixture/other.ts\"}\n" ++
+        "{\"type\":\"set_header\",\"lines\":[\"Target header\"],\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"set_widget\",\"key\":\"target-widget\",\"lines\":[\"Target widget\"],\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"clear_extension_registrations\",\"extensionPath\":\"fixture/target.ts\"}\n" ++
+        "{\"type\":\"clear_extension_registrations\",\"extensionPath\":42}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 11), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.tools.items.len);
+    try std.testing.expectEqualStrings("other-tool", state.registry.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("other-capability", state.registry.capabilities.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("other-message", state.registry.message_renderers.items[0].custom_type);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.resource_discoveries.items.len);
+    try std.testing.expectEqualStrings("fixture/other.ts", state.registry.resource_discoveries.items[0].extension_path);
+    try std.testing.expect(state.registry.header_hook != null);
+    try std.testing.expectEqualStrings("fixture/target.ts", state.registry.header_hook.?.extension_path);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.widgets.items.len);
+    try std.testing.expectEqualStrings("target-widget", state.registry.widgets.items[0].key);
 }
 
 test "M11 host process drains live register_* frames into observable runtime registry" {
