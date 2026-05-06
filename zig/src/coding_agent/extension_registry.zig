@@ -682,6 +682,85 @@ pub const Registry = struct {
         return false;
     }
 
+    /// Remove static registrations owned by one extension path before a
+    /// reload or replacement replays that extension's register_* frames.
+    /// UI hooks and widgets are intentionally left to
+    /// clearUiHooksForReload because they have separate lifecycle
+    /// semantics.
+    pub fn clearStaticRegistrationsForExtension(self: *Registry, extension_path: []const u8) void {
+        var tool_index = self.tools.items.len;
+        while (tool_index > 0) {
+            tool_index -= 1;
+            if (std.mem.eql(u8, self.tools.items[tool_index].extension_path, extension_path)) {
+                var removed = self.tools.orderedRemove(tool_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var command_index = self.commands.items.len;
+        while (command_index > 0) {
+            command_index -= 1;
+            if (std.mem.eql(u8, self.commands.items[command_index].extension_path, extension_path)) {
+                var removed = self.commands.orderedRemove(command_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var shortcut_index = self.shortcuts.items.len;
+        while (shortcut_index > 0) {
+            shortcut_index -= 1;
+            if (std.mem.eql(u8, self.shortcuts.items[shortcut_index].extension_path, extension_path)) {
+                var removed = self.shortcuts.orderedRemove(shortcut_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var flag_index = self.flags.items.len;
+        while (flag_index > 0) {
+            flag_index -= 1;
+            if (std.mem.eql(u8, self.flags.items[flag_index].extension_path, extension_path)) {
+                var removed = self.flags.orderedRemove(flag_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var provider_index = self.providers.items.len;
+        while (provider_index > 0) {
+            provider_index -= 1;
+            if (std.mem.eql(u8, self.providers.items[provider_index].extension_path, extension_path)) {
+                var removed = self.providers.orderedRemove(provider_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var capability_index = self.capabilities.items.len;
+        while (capability_index > 0) {
+            capability_index -= 1;
+            if (std.mem.eql(u8, self.capabilities.items[capability_index].extension_path, extension_path)) {
+                var removed = self.capabilities.orderedRemove(capability_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var renderer_index = self.message_renderers.items.len;
+        while (renderer_index > 0) {
+            renderer_index -= 1;
+            if (std.mem.eql(u8, self.message_renderers.items[renderer_index].extension_path, extension_path)) {
+                var removed = self.message_renderers.orderedRemove(renderer_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var discovery_index = self.resource_discoveries.items.len;
+        while (discovery_index > 0) {
+            discovery_index -= 1;
+            if (std.mem.eql(u8, self.resource_discoveries.items[discovery_index].extension_path, extension_path)) {
+                var removed = self.resource_discoveries.orderedRemove(discovery_index);
+                removed.deinit(self.allocator);
+            }
+        }
+    }
+
     /// Set the parsed CLI value for a registered flag. Mirrors the TS
     /// `extensionState.flags[name] = value` step the runtime performs
     /// after parsing the CLI. Returns `true` when the flag is known
@@ -1394,6 +1473,7 @@ pub const FrameOutcome = enum {
     set_widget_hook,
     cleared_widget_hook,
     cleared_ui_hooks_for_reload,
+    cleared_extension_registrations,
     registered_message_renderer,
     unregistered_message_renderer,
     ignored_unsupported,
@@ -1646,6 +1726,11 @@ pub fn applyHostFrame(
     if (std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload")) {
         registry.clearUiHooksForReload();
         return .cleared_ui_hooks_for_reload;
+    }
+    if (std.mem.eql(u8, type_name, "clear_extension_registrations")) {
+        const target_extension_path = optionalString(object, "extensionPath") orelse return .ignored_malformed;
+        registry.clearStaticRegistrationsForExtension(target_extension_path);
+        return .cleared_extension_registrations;
     }
 
     if (std.mem.eql(u8, type_name, "register_message_renderer")) {
@@ -2076,8 +2161,8 @@ test "applyHostFrame handles resources_discover with skill/prompt/theme paths" {
     defer registry.deinit();
 
     const frames =
-        \\{ "type": "resources_discover", "skillPaths": ["/path/to/skills"], "promptPaths": ["/path/to/prompts"], "themePaths": ["/path/to/themes"], "extensionPath": "/tmp/ext.ts" }
-        \\{ "type": "resources_discover", "skillPaths": ["/another/skill"], "extensionPath": "/tmp/ext2.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/path/to/skills", 42], "promptPaths": ["/path/to/prompts", false], "themePaths": ["/path/to/themes", null], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/another/skill"], "promptPaths": [13], "themePaths": ["theme-two"], "extensionPath": "/tmp/ext2.ts" }
         \\
     ;
 
@@ -2097,7 +2182,366 @@ test "applyHostFrame handles resources_discover with skill/prompt/theme paths" {
     const discovery2 = registry.resource_discoveries.items[1];
     try std.testing.expectEqualStrings("/tmp/ext2.ts", discovery2.extension_path);
     try std.testing.expectEqual(@as(usize, 1), discovery2.skill_paths.items.len);
+    try std.testing.expectEqualStrings("/another/skill", discovery2.skill_paths.items[0]);
     try std.testing.expectEqual(@as(usize, 0), discovery2.prompt_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 1), discovery2.theme_paths.items.len);
+    try std.testing.expectEqualStrings("theme-two", discovery2.theme_paths.items[0]);
+}
+
+test "Registry clearStaticRegistrationsForExtension removes only target static registrations" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const target = "/tmp/target.ts";
+    const other = "/tmp/other.ts";
+
+    try registry.registerTool("target-tool", "Target Tool", "target", target);
+    try registry.registerTool("other-tool", "Other Tool", "other", other);
+    try registry.registerCommand("target-command", "target", target);
+    try registry.registerCommand("other-command", "other", other);
+    try registry.registerShortcut("ctrl+t", "target", "target-command", target);
+    try registry.registerShortcut("ctrl+o", "other", "other-command", other);
+    try registry.registerFlag("target-flag", .boolean, "target", .{ .boolean = true }, target);
+    try registry.registerFlag("other-flag", .string, "other", .{ .string = "kept" }, other);
+    try registry.registerProvider("target-provider", "Target", null, "openai-completions", &.{.{ .id = "target-model", .name = "Target Model" }}, target);
+    try registry.registerProvider("other-provider", "Other", null, "openai-completions", &.{.{ .id = "other-model", .name = "Other Model" }}, other);
+    try registry.registerCapability("target-capability", "workflow", "Target", null, "target-command", "target/resource", target);
+    try registry.registerCapability("other-capability", "workflow", "Other", null, "other-command", "other/resource", other);
+    try registry.registerMessageRenderer("target-message", target);
+    try registry.registerMessageRenderer("other-message", other);
+
+    const lines = [_][]const u8{"UI hook"};
+    try registry.setHeaderHook(&lines, target);
+    try registry.setFooterHook(&lines, target);
+    try registry.registerTerminalInput("target-input", true, "rewritten", target);
+    try registry.setEditorComponentHook("target-editor", target);
+    try registry.setWidgetHook("target-widget", &lines, .above_editor, target);
+    try registry.recordUiRequest("ui-target");
+
+    const discovery_frames =
+        \\{ "type": "resources_discover", "skillPaths": ["/target/skills"], "promptPaths": ["/target/prompts"], "themePaths": ["/target/themes"], "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/other/skills"], "extensionPath": "/tmp/other.ts" }
+        \\
+    ;
+    _ = try applyHostFrameStream(&registry, discovery_frames);
+
+    registry.clearStaticRegistrationsForExtension(target);
+
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings("other-tool", registry.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
+    try std.testing.expectEqualStrings("other-command", registry.commands.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.shortcuts.items.len);
+    try std.testing.expectEqualStrings("ctrl+o", registry.shortcuts.items[0].shortcut);
+    try std.testing.expectEqual(@as(usize, 1), registry.flags.items.len);
+    try std.testing.expectEqualStrings("other-flag", registry.flags.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("other-provider", registry.providers.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("other-capability", registry.capabilities.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("other-message", registry.message_renderers.items[0].custom_type);
+    try std.testing.expectEqual(@as(usize, 1), registry.resource_discoveries.items.len);
+    try std.testing.expectEqualStrings(other, registry.resource_discoveries.items[0].extension_path);
+
+    try std.testing.expect(registry.header_hook != null);
+    try std.testing.expectEqualStrings(target, registry.header_hook.?.extension_path);
+    try std.testing.expect(registry.footer_hook != null);
+    try std.testing.expectEqualStrings(target, registry.footer_hook.?.extension_path);
+    try std.testing.expectEqual(@as(usize, 1), registry.terminal_input_subs.items.len);
+    try std.testing.expectEqualStrings("target-input", registry.terminal_input_subs.items[0].id);
+    try std.testing.expect(registry.editor_component_hook != null);
+    try std.testing.expectEqualStrings("target-editor", registry.editor_component_hook.?.label);
+    try std.testing.expectEqual(@as(usize, 1), registry.widgets.items.len);
+    try std.testing.expectEqualStrings("target-widget", registry.widgets.items[0].key);
+    try std.testing.expectEqual(@as(usize, 1), registry.ui_request_ids.items.len);
+    try std.testing.expectEqualStrings("ui-target", registry.ui_request_ids.items[0]);
+
+    registry.clearStaticRegistrationsForExtension(target);
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.shortcuts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.resource_discoveries.items.len);
+}
+
+test "clear_extension_registrations frame handles missing paths as no-op" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_tool", "name": "tool", "label": "Tool", "description": "kept", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_command", "name": "command", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+x", "command": "command", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_flag", "name": "flag", "valueType": "boolean", "default": true, "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_provider", "name": "provider", "models": [{ "id": "model", "name": "Model" }], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_capability", "id": "capability", "kind": "workflow", "title": "Capability", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_message_renderer", "customType": "message", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/skills"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "clear_extension_registrations", "extensionPath": "/tmp/missing.ts" }
+        \\
+    ;
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 9), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.shortcuts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.resource_discoveries.items.len);
+
+    const cleared_frame =
+        \\{ "type": "clear_extension_registrations", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    const cleared = try applyHostFrameStream(&registry, cleared_frame);
+    try std.testing.expectEqual(@as(usize, 1), cleared);
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.shortcuts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.resource_discoveries.items.len);
+}
+
+test "clear_extension_registrations frame matches direct cleanup semantics" {
+    const allocator = std.testing.allocator;
+    var direct = Registry.init(allocator);
+    defer direct.deinit();
+    var framed = Registry.init(allocator);
+    defer framed.deinit();
+
+    const seed_frames =
+        \\{ "type": "register_tool", "name": "target-tool", "label": "Target", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_tool", "name": "other-tool", "label": "Other", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_command", "name": "target-command", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_command", "name": "other-command", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+t", "command": "target-command", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+o", "command": "other-command", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_flag", "name": "target-flag", "valueType": "boolean", "default": true, "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_flag", "name": "other-flag", "valueType": "string", "default": "other", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_provider", "name": "target-provider", "models": [{ "id": "target-model" }], "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_provider", "name": "other-provider", "models": [{ "id": "other-model" }], "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_capability", "id": "target-capability", "kind": "workflow", "title": "Target", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_capability", "id": "other-capability", "kind": "workflow", "title": "Other", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_message_renderer", "customType": "target-message", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_message_renderer", "customType": "other-message", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/target/skills"], "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/other/skills"], "extensionPath": "/tmp/other.ts" }
+        \\
+    ;
+    _ = try applyHostFrameStream(&direct, seed_frames);
+    _ = try applyHostFrameStream(&framed, seed_frames);
+
+    direct.clearStaticRegistrationsForExtension("/tmp/target.ts");
+    const clear_frame =
+        \\{ "type": "clear_extension_registrations", "extensionPath": "/tmp/target.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try applyHostFrameStream(&framed, clear_frame));
+
+    try std.testing.expectEqual(direct.tools.items.len, framed.tools.items.len);
+    try std.testing.expectEqualStrings(direct.tools.items[0].name, framed.tools.items[0].name);
+    try std.testing.expectEqual(direct.commands.items.len, framed.commands.items.len);
+    try std.testing.expectEqualStrings(direct.commands.items[0].name, framed.commands.items[0].name);
+    try std.testing.expectEqual(direct.shortcuts.items.len, framed.shortcuts.items.len);
+    try std.testing.expectEqualStrings(direct.shortcuts.items[0].shortcut, framed.shortcuts.items[0].shortcut);
+    try std.testing.expectEqual(direct.flags.items.len, framed.flags.items.len);
+    try std.testing.expectEqualStrings(direct.flags.items[0].name, framed.flags.items[0].name);
+    try std.testing.expectEqual(direct.providers.items.len, framed.providers.items.len);
+    try std.testing.expectEqualStrings(direct.providers.items[0].name, framed.providers.items[0].name);
+    try std.testing.expectEqual(direct.capabilities.items.len, framed.capabilities.items.len);
+    try std.testing.expectEqualStrings(direct.capabilities.items[0].id, framed.capabilities.items[0].id);
+    try std.testing.expectEqual(direct.message_renderers.items.len, framed.message_renderers.items.len);
+    try std.testing.expectEqualStrings(direct.message_renderers.items[0].custom_type, framed.message_renderers.items[0].custom_type);
+    try std.testing.expectEqual(direct.resource_discoveries.items.len, framed.resource_discoveries.items.len);
+    try std.testing.expectEqualStrings(direct.resource_discoveries.items[0].extension_path, framed.resource_discoveries.items[0].extension_path);
+}
+
+test "unregister provider capability and message renderer frames are targeted no-ops for missing keys" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "name": "provider-a", "models": [{ "id": "model-a" }], "extensionPath": "/tmp/a.ts" }
+        \\{ "type": "register_provider", "name": "provider-b", "models": [{ "id": "model-b" }], "extensionPath": "/tmp/b.ts" }
+        \\{ "type": "register_capability", "id": "cap-a", "kind": "workflow", "title": "A", "extensionPath": "/tmp/a.ts" }
+        \\{ "type": "register_capability", "id": "cap-b", "kind": "workflow", "title": "B", "extensionPath": "/tmp/b.ts" }
+        \\{ "type": "register_message_renderer", "customType": "message-a", "extensionPath": "/tmp/a.ts" }
+        \\{ "type": "register_message_renderer", "customType": "message-b", "extensionPath": "/tmp/b.ts" }
+        \\{ "type": "unregister_provider", "name": "missing-provider" }
+        \\{ "type": "unregister_capability", "id": "missing-cap" }
+        \\{ "type": "unregister_message_renderer", "customType": "missing-message" }
+        \\{ "type": "unregister_provider", "name": "provider-a" }
+        \\{ "type": "unregister_capability", "id": "cap-a" }
+        \\{ "type": "unregister_message_renderer", "customType": "message-a" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 12), try applyHostFrameStream(&registry, frames));
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("provider-b", registry.providers.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("cap-b", registry.capabilities.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("message-b", registry.message_renderers.items[0].custom_type);
+}
+
+test "cross-extension replacements keep latest provenance for cleanup" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_tool", "name": "same-tool", "label": "Target Tool", "description": "old", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_tool", "name": "same-tool", "label": "Other Tool", "description": "new", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_command", "name": "same-command", "description": "old", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_command", "name": "same-command", "description": "new", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+s", "description": "old", "command": "old", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+s", "description": "new", "command": "new", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_flag", "name": "same-flag", "valueType": "boolean", "default": false, "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_flag", "name": "same-flag", "valueType": "string", "default": "new", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_provider", "name": "same-provider", "models": [{ "id": "old" }], "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_provider", "name": "same-provider", "models": [{ "id": "new" }], "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_capability", "id": "same-capability", "kind": "workflow", "title": "Old", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_capability", "id": "same-capability", "kind": "workflow", "title": "New", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_message_renderer", "customType": "same-message", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_message_renderer", "customType": "same-message", "extensionPath": "/tmp/other.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 14), try applyHostFrameStream(&registry, frames));
+
+    registry.clearStaticRegistrationsForExtension("/tmp/target.ts");
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings("/tmp/other.ts", registry.tools.items[0].extension_path);
+    try std.testing.expectEqualStrings("Other Tool", registry.tools.items[0].label);
+    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
+    try std.testing.expectEqualStrings("/tmp/other.ts", registry.commands.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 1), registry.shortcuts.items.len);
+    try std.testing.expectEqualStrings("new", registry.shortcuts.items[0].command.?);
+    try std.testing.expectEqual(@as(usize, 1), registry.flags.items.len);
+    try std.testing.expectEqualStrings("/tmp/other.ts", registry.flags.items[0].extension_path);
+    try std.testing.expect(registry.flags.items[0].type_kind == .string);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("new", registry.providers.items[0].models[0].id);
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("New", registry.capabilities.items[0].title);
+    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
+    try std.testing.expectEqualStrings("/tmp/other.ts", registry.message_renderers.items[0].extension_path);
+
+    registry.clearStaticRegistrationsForExtension("/tmp/other.ts");
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.shortcuts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+}
+
+test "missing or non-string extensionPath has deterministic empty provenance" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_tool", "name": "empty-tool", "label": "Empty Tool" }
+        \\{ "type": "register_command", "name": "empty-command", "extensionPath": 42 }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+e", "extensionPath": false }
+        \\{ "type": "register_flag", "name": "empty-flag", "valueType": "boolean", "extensionPath": null }
+        \\{ "type": "register_provider", "name": "empty-provider", "extensionPath": {} }
+        \\{ "type": "register_capability", "id": "empty-capability", "kind": "workflow", "title": "Empty", "extensionPath": [] }
+        \\{ "type": "register_message_renderer", "customType": "empty-message", "extensionPath": 42 }
+        \\{ "type": "resources_discover", "skillPaths": ["/empty/skills"], "extensionPath": false }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 8), try applyHostFrameStream(&registry, frames));
+    try std.testing.expectEqualStrings("", registry.tools.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.commands.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.shortcuts.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.flags.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.providers.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.capabilities.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.message_renderers.items[0].extension_path);
+    try std.testing.expectEqualStrings("", registry.resource_discoveries.items[0].extension_path);
+
+    registry.clearStaticRegistrationsForExtension("");
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.shortcuts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.resource_discoveries.items.len);
+}
+
+test "malformed registry lifecycle frames do not partially mutate state" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const seed_frames =
+        \\{ "type": "register_tool", "name": "tool", "label": "Tool", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_command", "name": "command", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+x", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_flag", "name": "flag", "valueType": "boolean", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_provider", "name": "provider", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_capability", "id": "capability", "kind": "workflow", "title": "Capability", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_message_renderer", "customType": "message", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/skills"], "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 8), try applyHostFrameStream(&registry, seed_frames));
+
+    const before_counts = .{
+        .tools = registry.tools.items.len,
+        .commands = registry.commands.items.len,
+        .shortcuts = registry.shortcuts.items.len,
+        .flags = registry.flags.items.len,
+        .providers = registry.providers.items.len,
+        .capabilities = registry.capabilities.items.len,
+        .message_renderers = registry.message_renderers.items.len,
+        .resource_discoveries = registry.resource_discoveries.items.len,
+    };
+
+    const malformed_frames =
+        \\{ "type": "register_tool", "label": "missing name", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "register_command", "description": "missing name", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "register_shortcut", "description": "missing shortcut", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "register_flag", "name": "bad-flag", "valueType": "number", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "register_capability", "id": "bad-capability", "kind": "workflow", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "register_message_renderer", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "unregister_provider", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "unregister_capability", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "unregister_message_renderer", "extensionPath": "/tmp/bad.ts" }
+        \\{ "type": "clear_extension_registrations" }
+        \\{ "type": "clear_extension_registrations", "extensionPath": 42 }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try applyHostFrameStream(&registry, malformed_frames));
+
+    try std.testing.expectEqual(before_counts.tools, registry.tools.items.len);
+    try std.testing.expectEqual(before_counts.commands, registry.commands.items.len);
+    try std.testing.expectEqual(before_counts.shortcuts, registry.shortcuts.items.len);
+    try std.testing.expectEqual(before_counts.flags, registry.flags.items.len);
+    try std.testing.expectEqual(before_counts.providers, registry.providers.items.len);
+    try std.testing.expectEqual(before_counts.capabilities, registry.capabilities.items.len);
+    try std.testing.expectEqual(before_counts.message_renderers, registry.message_renderers.items.len);
+    try std.testing.expectEqual(before_counts.resource_discoveries, registry.resource_discoveries.items.len);
+    try std.testing.expectEqualStrings("tool", registry.tools.items[0].name);
+    try std.testing.expectEqualStrings("provider", registry.providers.items[0].name);
+    try std.testing.expectEqualStrings("capability", registry.capabilities.items[0].id);
+    try std.testing.expectEqualStrings("message", registry.message_renderers.items[0].custom_type);
 }
 
 test "registerProvider with OAuth round-trips" {

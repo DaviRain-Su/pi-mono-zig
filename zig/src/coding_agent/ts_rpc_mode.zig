@@ -8,7 +8,7 @@ const session_mod = @import("session.zig");
 const session_advanced = @import("session_advanced.zig");
 const session_cwd_mod = @import("session_cwd.zig");
 const session_manager_mod = @import("session_manager.zig");
-const extension_host_mod = @import("extension_host.zig");
+const extension_runtime = @import("extension_runtime.zig");
 
 pub const RunTsRpcModeOptions = struct {
     extension_ui_parity_scenario: bool = false,
@@ -519,7 +519,7 @@ const TsRpcServer = struct {
     next_bash_response_sequence: usize = 0,
     pending_extension_requests: std.StringHashMap(PendingExtensionUIRequest),
     completed_extension_requests: std.ArrayList(ResolvedExtensionUIRequest) = .empty,
-    extension_host: ?*extension_host_mod.HostProcess = null,
+    extension_host: ?extension_runtime.RuntimeAdapter = null,
     suppress_events: bool = false,
     finished: bool = false,
     /// Incremented on each turn_start event so extension frames carry sequential turnIndex values.
@@ -554,7 +554,7 @@ const TsRpcServer = struct {
 
     fn startExtensionHost(self: *TsRpcServer, options: ExtensionHostOptions) !void {
         if (self.extension_host != null) return error.ExtensionHostAlreadyStarted;
-        const host = try extension_host_mod.HostProcess.start(self.allocator, self.io, .{
+        const host = try extension_runtime.startRuntime(self.allocator, self.io, .{ .process_jsonl = .{
             .argv = options.argv,
             .cwd = options.cwd,
             .initialize = .{
@@ -563,7 +563,7 @@ const TsRpcServer = struct {
                 .fixture = options.fixture,
             },
             .shutdown_timeout_ms = options.shutdown_timeout_ms,
-        });
+        } });
         errdefer host.deinit();
         try host.waitForReady(options.ready_timeout_ms);
         self.extension_host = host;
@@ -1809,7 +1809,7 @@ const TsRpcServer = struct {
         try self.resolveWaitForIdleRequests();
     }
 
-    fn writeExtensionUIRequestFromHost(self: *TsRpcServer, request: extension_host_mod.ExtensionUiRequest) !void {
+    fn writeExtensionUIRequestFromHost(self: *TsRpcServer, request: extension_runtime.ExtensionUiRequest) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, request.payload_json, .{}) catch return;
         defer parsed.deinit();
         const payload = switch (parsed.value) {
@@ -2012,7 +2012,7 @@ const TsRpcServer = struct {
         const line = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(line);
 
-        // Forward agent event to extension host stdin (non-blocking; drops if pipe full)
+        // Forward agent events through the runtime facade using best-effort delivery.
         if (self.extension_host) |host| {
             switch (event.event_type) {
                 .turn_start => {
@@ -2039,7 +2039,7 @@ const TsRpcServer = struct {
 
     /// Emit a `tool_call` extension event frame when a tool starts executing.
     /// Mirrors the TS `ToolCallEvent` wire format: type, toolCallId, toolName, input.
-    fn emitExtensionToolCallEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, event: agent.AgentEvent) void {
+    fn emitExtensionToolCallEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, event: agent.AgentEvent) void {
         const tool_call_id = event.tool_call_id orelse return;
         const tool_name = event.tool_name orelse return;
         var out: std.Io.Writer.Allocating = .init(self.allocator);
@@ -2064,7 +2064,7 @@ const TsRpcServer = struct {
     /// Mirrors the TS `ToolResultEvent` wire format: type, toolCallId, toolName,
     /// input (original call args from event.args), content, isError.
     /// thinking and tool_call content blocks are skipped (not emitted as empty text).
-    fn emitExtensionToolResultEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, event: agent.AgentEvent) void {
+    fn emitExtensionToolResultEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, event: agent.AgentEvent) void {
         const tool_call_id = event.tool_call_id orelse return;
         const tool_name = event.tool_name orelse return;
         var out: std.Io.Writer.Allocating = .init(self.allocator);
@@ -2117,7 +2117,7 @@ const TsRpcServer = struct {
 
     /// Emit a `model_select` extension event frame when the active model changes.
     /// Mirrors the TS `ModelSelectEvent` wire format.
-    fn emitExtensionModelSelectEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, model: ai.Model, prev_model: ai.Model, source: []const u8) void {
+    fn emitExtensionModelSelectEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, model: ai.Model, prev_model: ai.Model, source: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"model_select\",\"model\":") catch return;
@@ -2132,7 +2132,7 @@ const TsRpcServer = struct {
 
     /// Emit a `thinking_level_select` extension event frame when the thinking level changes.
     /// Mirrors the TS `ThinkingLevelSelectEvent` wire format.
-    fn emitExtensionThinkingLevelSelectEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, level: agent.ThinkingLevel, prev_level: agent.ThinkingLevel) void {
+    fn emitExtensionThinkingLevelSelectEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, level: agent.ThinkingLevel, prev_level: agent.ThinkingLevel) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"thinking_level_select\",\"level\":") catch return;
@@ -2145,7 +2145,7 @@ const TsRpcServer = struct {
 
     /// Emit an `input` extension event frame when user input is received.
     /// Mirrors the TS `InputEvent` wire format: type, text, source.
-    fn emitExtensionInputEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, text: []const u8, source: []const u8) void {
+    fn emitExtensionInputEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, text: []const u8, source: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"input\",\"text\":") catch return;
@@ -2158,7 +2158,7 @@ const TsRpcServer = struct {
 
     /// Emit a `turn_start` extension event frame with the current turnIndex and timestamp.
     /// Mirrors the TS TurnStartEvent wire format: type, turnIndex, timestamp.
-    fn emitExtensionTurnStartFrame(self: *TsRpcServer, host: *extension_host_mod.HostProcess) void {
+    fn emitExtensionTurnStartFrame(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter) void {
         const ts_ms = @divFloor(std.Io.Clock.now(.awake, self.io).nanoseconds, std.time.ns_per_ms);
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
@@ -2173,7 +2173,7 @@ const TsRpcServer = struct {
     /// type field. The base_frame (from json_event_wire) carries message and
     /// toolResults; this function prepends the parity fields before forwarding to the host.
     /// Note: TS TurnEndEvent does not declare a timestamp field; timestamp is only on turn_start.
-    fn emitExtensionTurnEndFrame(self: *TsRpcServer, host: *extension_host_mod.HostProcess, base_frame: []const u8) void {
+    fn emitExtensionTurnEndFrame(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, base_frame: []const u8) void {
         const base_prefix = "{\"type\":\"turn_end\"";
         if (!std.mem.startsWith(u8, base_frame, base_prefix)) {
             host.sendExtensionEventFrame(base_frame);
@@ -2195,7 +2195,7 @@ const TsRpcServer = struct {
 
     /// Emit session_before_switch to extension host.
     /// reason: "new" | "resume"
-    fn emitSessionBeforeSwitchEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, reason: []const u8, target_file: ?[]const u8) void {
+    fn emitSessionBeforeSwitchEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, target_file: ?[]const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_before_switch\",\"reason\":") catch return;
@@ -2210,7 +2210,7 @@ const TsRpcServer = struct {
 
     /// Emit session_shutdown to extension host.
     /// reason: "quit" | "reload" | "new" | "resume" | "fork"
-    fn emitSessionShutdownEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, reason: []const u8, target_file: ?[]const u8) void {
+    fn emitSessionShutdownEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, target_file: ?[]const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_shutdown\",\"reason\":") catch return;
@@ -2224,7 +2224,7 @@ const TsRpcServer = struct {
     }
 
     /// Emit session_before_fork to extension host.
-    fn emitSessionBeforeForkEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, entry_id: []const u8, position: []const u8) void {
+    fn emitSessionBeforeForkEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, entry_id: []const u8, position: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_before_fork\",\"entryId\":") catch return;
@@ -2236,7 +2236,7 @@ const TsRpcServer = struct {
     }
 
     /// Emit session_before_compact to extension host.
-    fn emitSessionBeforeCompactEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, custom_instructions: ?[]const u8) void {
+    fn emitSessionBeforeCompactEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, custom_instructions: ?[]const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_before_compact\"") catch return;
@@ -2249,13 +2249,13 @@ const TsRpcServer = struct {
     }
 
     /// Emit session_compact to extension host after compaction completes.
-    fn emitSessionCompactEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess) void {
+    fn emitSessionCompactEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter) void {
         _ = self;
         host.sendExtensionEventFrame("{\"type\":\"session_compact\",\"fromExtension\":false}");
     }
 
     /// Emit session_before_tree to extension host before navigating the session tree.
-    fn emitSessionBeforeTreeEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, target_id: []const u8) void {
+    fn emitSessionBeforeTreeEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, target_id: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_before_tree\",\"preparation\":{\"targetId\":") catch return;
@@ -2265,7 +2265,7 @@ const TsRpcServer = struct {
     }
 
     /// Emit session_tree to extension host after tree navigation completes.
-    fn emitSessionTreeEvent(self: *TsRpcServer, host: *extension_host_mod.HostProcess, new_leaf_id: ?[]const u8, old_leaf_id: ?[]const u8) void {
+    fn emitSessionTreeEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, new_leaf_id: ?[]const u8, old_leaf_id: ?[]const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_tree\",\"newLeafId\":") catch return;
@@ -7206,7 +7206,7 @@ test "command_context: waitForIdle does not queue when agent is idle" {
 
     // Agent is idle (not streaming). The request should be handled immediately
     // without being queued into pending_wait_for_idle_ids.
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "wfi-1"),
         .method = try allocator.dupe(u8, "wait_for_idle"),
         .response_required = true,
@@ -7237,7 +7237,7 @@ test "command_context: waitForIdle queues when streaming and resolves after idle
     // Simulate the agent being busy.
     session.agent.is_streaming = true;
 
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "wfi-2"),
         .method = try allocator.dupe(u8, "wait_for_idle"),
         .response_required = true,
@@ -7274,7 +7274,7 @@ test "command_context: sendCustomMessage creates session entry with correct fiel
     defer server.finish() catch {};
 
     const payload = "{\"customType\":\"ext.test\",\"content\":\"hello from extension\",\"display\":true}";
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "scm-1"),
         .method = try allocator.dupe(u8, "send_custom_message"),
         .response_required = false,
@@ -7324,7 +7324,7 @@ test "command_context: sendCustomMessage respects deliverAs followUp when stream
     session.agent.is_streaming = true;
 
     const payload = "{\"customType\":\"ext.note\",\"content\":\"follow-up note\",\"display\":false,\"deliverAs\":\"followUp\"}";
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "scm-fu"),
         .method = try allocator.dupe(u8, "send_custom_message"),
         .response_required = false,
@@ -7371,7 +7371,7 @@ test "command_context: sendUserMessage queues followUp when agent is streaming" 
     // Simulate agent busy.
     session.agent.is_streaming = true;
 
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "sum-1"),
         .method = try allocator.dupe(u8, "send_user_message"),
         .response_required = false,
@@ -7409,7 +7409,7 @@ test "command_context: sendUserMessage starts background prompt when agent is id
     try server.start();
     defer server.finish() catch {};
 
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "sum-idle"),
         .method = try allocator.dupe(u8, "send_user_message"),
         .response_required = false,
@@ -7564,7 +7564,7 @@ test "wire_format_cleanup: send_custom_message nextTurn returns error without pe
     try server.start();
     defer server.finish() catch {};
 
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "wfc-next-1"),
         .method = try allocator.dupe(u8, "send_custom_message"),
         .response_required = false,
@@ -7598,7 +7598,7 @@ test "wire_format_cleanup: send_user_message nextTurn does not queue the message
     // Simulate agent busy so follow-up queuing would normally happen.
     session.agent.is_streaming = true;
 
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "wfc-user-nt"),
         .method = try allocator.dupe(u8, "send_user_message"),
         .response_required = false,
@@ -7631,7 +7631,7 @@ test "wire_format_cleanup: send_custom_message malformed customType returns with
     defer server.finish() catch {};
 
     // customType is a number (not a string) — malformed payload.
-    var req = extension_host_mod.ExtensionUiRequest{
+    var req = extension_runtime.ExtensionUiRequest{
         .id = try allocator.dupe(u8, "wfc-bad-type"),
         .method = try allocator.dupe(u8, "send_custom_message"),
         .response_required = false,
