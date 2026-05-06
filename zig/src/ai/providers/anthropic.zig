@@ -2821,7 +2821,11 @@ fn applyAuthHeaders(
     const api_key = if (options) |stream_options| stream_options.api_key orelse "" else "";
     if (api_key.len == 0) return;
 
-    if (std.mem.eql(u8, model.provider, "github-copilot") or usesAnthropicOAuth(model, api_key)) {
+    if (std.mem.eql(u8, model.provider, "cloudflare-ai-gateway")) {
+        const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+        defer allocator.free(authorization);
+        try putOwnedHeader(allocator, headers, "cf-aig-authorization", authorization);
+    } else if (std.mem.eql(u8, model.provider, "github-copilot") or usesAnthropicOAuth(model, api_key)) {
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(authorization);
         try putOwnedHeader(allocator, headers, "Authorization", authorization);

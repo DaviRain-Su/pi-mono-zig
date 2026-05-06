@@ -1601,7 +1601,11 @@ fn buildRequestHeadersWithCacheRetentionEnv(
     if (std.mem.trim(u8, api_key, &std.ascii.whitespace).len > 0) {
         const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(auth_header);
-        try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+        if (std.mem.eql(u8, model.provider, "cloudflare-ai-gateway")) {
+            try putOwnedHeader(allocator, &headers, "cf-aig-authorization", auth_header);
+        } else {
+            try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+        }
     }
 
     try mergeHeaders(allocator, &headers, model.headers);

@@ -7,6 +7,7 @@ const env_api_keys = @import("../env_api_keys.zig");
 const model_registry = @import("../model_registry.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const cloudflare = @import("cloudflare.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
 
@@ -144,7 +145,13 @@ pub const OpenAIResponsesProvider = struct {
             return;
         }
 
-        const url = try buildRequestUrl(allocator, model.base_url);
+        const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
+            try cloudflare.resolveCloudflareBaseUrl(allocator, model)
+        else
+            null;
+        defer if (resolved_base_url) |base_url| allocator.free(base_url);
+
+        const url = try buildRequestUrl(allocator, resolved_base_url orelse model.base_url);
         defer allocator.free(url);
 
         var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
@@ -338,7 +345,11 @@ fn buildRequestHeaders(
     try putOwnedHeader(allocator, &headers, "Accept", "application/json");
     const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(authorization);
-    try putOwnedHeader(allocator, &headers, "Authorization", authorization);
+    if (std.mem.eql(u8, model.provider, "cloudflare-ai-gateway")) {
+        try putOwnedHeader(allocator, &headers, "cf-aig-authorization", authorization);
+    } else {
+        try putOwnedHeader(allocator, &headers, "Authorization", authorization);
+    }
     try mergeHeaders(allocator, &headers, model.headers);
 
     if (std.mem.eql(u8, model.provider, "github-copilot")) {

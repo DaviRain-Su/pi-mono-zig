@@ -318,6 +318,104 @@ pub const TestStatusServer = struct {
     }
 };
 
+pub const TestCaptureServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    status: u16,
+    reason: []const u8,
+    response_headers: []const u8,
+    body: []const u8,
+    request_head: [8192]u8 = undefined,
+    request_head_len: usize = 0,
+    request_head_truncated: bool = false,
+    thread: ?std.Thread = null,
+
+    pub fn init(
+        io: std.Io,
+        status: u16,
+        reason: []const u8,
+        response_headers: []const u8,
+        body: []const u8,
+    ) !TestCaptureServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .status = status,
+            .reason = reason,
+            .response_headers = response_headers,
+            .body = body,
+        };
+    }
+
+    pub fn start(self: *TestCaptureServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    pub fn deinit(self: *TestCaptureServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    pub fn url(self: *const TestCaptureServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    pub fn requestHead(self: *const TestCaptureServer) []const u8 {
+        return self.request_head[0..self.request_head_len];
+    }
+
+    fn run(self: *TestCaptureServer) void {
+        const stream = self.server.accept(self.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => std.debug.panic("test capture server accept failed: {}", .{err}),
+        };
+        defer stream.close(self.io);
+
+        self.readRequestHead(stream) catch |err| std.debug.panic("test capture server read failed: {}", .{err});
+        writeResponse(self, stream) catch |err| std.debug.panic("test capture server write failed: {}", .{err});
+    }
+
+    fn readRequestHead(self: *TestCaptureServer, stream: std.Io.net.Stream) !void {
+        var read_buffer: [1024]u8 = undefined;
+        var reader = stream.reader(std.testing.io, &read_buffer);
+        var tail = [_]u8{ 0, 0, 0, 0 };
+        var count: usize = 0;
+
+        while (true) {
+            const byte = try reader.interface.takeByte();
+            tail[count % tail.len] = byte;
+            if (count < self.request_head.len) {
+                self.request_head[count] = byte;
+                self.request_head_len = count + 1;
+            } else {
+                self.request_head_truncated = true;
+            }
+            count += 1;
+            if (count >= 4) {
+                const start_index = count % tail.len;
+                const ordered = [_]u8{
+                    tail[start_index],
+                    tail[(start_index + 1) % tail.len],
+                    tail[(start_index + 2) % tail.len],
+                    tail[(start_index + 3) % tail.len],
+                };
+                if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
+            }
+        }
+    }
+
+    fn writeResponse(self: *TestCaptureServer, stream: std.Io.net.Stream) !void {
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n{s}\r\n",
+            .{ self.status, self.reason, self.body.len, self.response_headers },
+        );
+        try writer.interface.writeAll(self.body);
+        try writer.interface.flush();
+    }
+};
+
 test "HTTP provider error formatter redacts secrets paths ids and bounds body" {
     const allocator = std.testing.allocator;
 
