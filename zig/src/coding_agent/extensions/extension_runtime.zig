@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("agent");
+const extension_events = @import("extension_events.zig");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
 const native_runtime = @import("native_runtime.zig");
@@ -1126,6 +1127,24 @@ const native_instance_isolation_descriptor: NativeDescriptor = .{
     .start = nativeInstanceIsolationStart,
 };
 
+fn nativeUiLifecycleStart(api: *NativeHostApi) !void {
+    try api.requestUi("native-pre-ready", "input", true, "{\"title\":\"Pre-ready\"}");
+    try api.ready();
+    try api.requestUi("native-notify", "notify", false, "{\"message\":\"Native notice\"}");
+    try api.requestUi("native-pending", "input", true, "{\"title\":\"Native input\"}");
+    try api.requestUi("native-pending", "input", true, "{\"title\":\"Duplicate\"}");
+    try api.registerTool(native_static_tool);
+}
+
+const native_ui_lifecycle_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-ui-lifecycle",
+    .name = "Native UI Lifecycle Fixture",
+    .version = "0.1.0",
+    .description = "Native fixture used to prove UI request and response lifecycle safety",
+    .tools = &.{native_static_tool},
+    .start = nativeUiLifecycleStart,
+};
+
 fn expectNativeStaticRegistry(context: ?*anyopaque, registry: *const Registry) !void {
     _ = context;
     const counts = extension_registry.registrySurfaceCounts(registry);
@@ -1494,6 +1513,57 @@ test "native runtime participates in adapter conformance and event frames are st
     const snapshot_after_shutdown_event = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(snapshot_after_shutdown_event);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_after_shutdown_event, "\"tools\":[]") != null);
+}
+
+test "native runtime UI lifecycle rejects unsafe requests and resolves pending responses once" {
+    const allocator = std.testing.allocator;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_ui_lifecycle_descriptor,
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 2), adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCategoryCount(.host_error));
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCategoryCount(.duplicate_pending_request));
+
+    const requests = try adapter.takeUiRequests(allocator);
+    defer freeUiRequests(allocator, requests);
+    try std.testing.expectEqual(@as(usize, 2), requests.len);
+    try std.testing.expectEqualStrings("native-notify", requests[0].id);
+    try std.testing.expect(!requests[0].response_required);
+    try std.testing.expectEqualStrings("notify", requests[0].method);
+    try std.testing.expectEqualStrings("{\"message\":\"Native notice\"}", requests[0].payload_json);
+    try std.testing.expectEqualStrings("native-pending", requests[1].id);
+    try std.testing.expect(requests[1].response_required);
+    try std.testing.expectEqualStrings("input", requests[1].method);
+
+    requests[1].id[0] = 'X';
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
+    try adapter.sendExtensionUiResponse("unknown", "{\"ignored\":true}");
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
+    try adapter.sendExtensionUiResponse("native-pending", "{\"accepted\":true}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try adapter.sendExtensionUiResponse("native-pending", "{\"duplicate\":true}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+
+    var agent_tool = (try adapter.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"after-ui\"}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "native-ui-success", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"after-ui\"}", success.content[0].text.text);
+
+    try adapter.shutdown();
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "native.fixture.echo"));
+    try adapter.sendExtensionUiResponse("native-pending", "{\"postShutdown\":true}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
 }
 
 test "native host API privileged operations are explicit default-deny boundaries" {
@@ -2124,6 +2194,73 @@ test "process_jsonl runtime adapter applies duplicate and unregister registry fr
     try std.testing.expect(adapter.hasShutdownComplete());
 }
 
+test "runtime-owned tool execution conformance preserves process wasm and native contracts" {
+    const allocator = std.testing.allocator;
+    const process_script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_tool\",\"name\":\"process-owned-tool\",\"label\":\"Process Tool\",\"description\":\"registered by process\",\"parameters\":{\"type\":\"object\"},\"extensionPath\":\"fixture/process-tool.ts\"}\\n'; " ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
+    const process_argv = [_][]const u8{ "/bin/sh", "-c", process_script, "process-jsonl-tool-contract" };
+    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "process-tool-contract",
+            .cwd = "/process-tool-contract-cwd",
+            .fixture = "process-tool-contract",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter.deinit();
+    try process_adapter.waitForReady(500);
+    var process_elapsed: u64 = 0;
+    while (process_adapter.registryFramesApplied() < 1 and process_elapsed <= 1000) : (process_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), process_adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try process_adapter.agentTool(allocator, "process-owned-tool"));
+    try process_adapter.shutdown();
+    try std.testing.expect(process_adapter.hasShutdownComplete());
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer wasm_adapter.deinit();
+    try expectWasmToolSubsetConformance(allocator, wasm_adapter, manifest_result.valid.artifact_absolute_path);
+    try wasm_adapter.shutdown();
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+
+    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer native_adapter.deinit();
+    try native_adapter.waitForReady(0);
+    var native_tool = (try native_adapter.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &native_tool);
+    var native_success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"tool-contract\"}", .{});
+    defer native_success_params.deinit();
+    const native_success = try native_tool.execute.?(allocator, "native-tool-contract-success", native_success_params.value, native_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, native_success.content);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"tool-contract\"}", native_success.content[0].text.text);
+
+    var native_invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "[]", .{});
+    defer native_invalid_params.deinit();
+    const native_invalid = try native_tool.execute.?(allocator, "native-tool-contract-invalid", native_invalid_params.value, native_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, native_invalid.content);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object with string field value\"}}",
+        native_invalid.content[0].text.text,
+    );
+    try std.testing.expectEqual(@as(usize, 1), native_adapter.diagnosticCategoryCount(.host_error));
+    try native_adapter.shutdown();
+    try std.testing.expect(native_adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try native_adapter.agentTool(allocator, "native.fixture.echo"));
+}
+
 test "process_jsonl runtime adapter carries subscriber readiness envelopes byte stably" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2219,6 +2356,120 @@ test "wasm runtime ignores subscriber event envelopes without tool or unload sid
     const unloaded_snapshot = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(unloaded_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, unloaded_snapshot, "\"tools\":[]") != null);
+}
+
+test "runtime adapter event surface matrix is explicit across process wasm and native" {
+    const allocator = std.testing.allocator;
+    const event_surfaces = extension_events.eventSurfaceNames();
+    try std.testing.expect(event_surfaces.len > 0);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "process-jsonl-event-surface-matrix.jsonl");
+    defer allocator.free(capture_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const process_argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-event-surface-matrix" };
+    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "event-surface-matrix",
+            .cwd = "/event-surface-matrix-cwd",
+            .fixture = "event-surface-matrix",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter.deinit();
+    try process_adapter.waitForReady(500);
+
+    for (event_surfaces, 0..) |event_surface, index| {
+        const frame = try std.fmt.allocPrint(allocator, "{{\"type\":\"{s}\",\"surfaceIndex\":{d}}}", .{ event_surface, index });
+        defer allocator.free(frame);
+        process_adapter.sendExtensionEventFrame(frame);
+    }
+    process_adapter.sendExtensionEventFrame("{\"type\":\"unsupported_event_surface\",\"payload\":{\"stable\":true}}");
+    process_adapter.sendExtensionEventFrame("{");
+    var process_elapsed: u64 = 0;
+    while (process_elapsed <= 200) : (process_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try process_adapter.shutdown();
+    try std.testing.expect(process_adapter.hasShutdownComplete());
+    process_adapter.sendExtensionEventFrame("{\"type\":\"post_shutdown_event\"}");
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    for (event_surfaces) |event_surface| {
+        const needle = try std.fmt.allocPrint(allocator, "\"type\":\"{s}\"", .{event_surface});
+        defer allocator.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, capture, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"unsupported_event_surface\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"shutdown\"}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "post_shutdown_event") == null);
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer wasm_adapter.deinit();
+    try wasm_adapter.waitForReady(0);
+    const wasm_snapshot_before = try wasm_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(wasm_snapshot_before);
+    for (event_surfaces, 0..) |event_surface, index| {
+        const frame = try std.fmt.allocPrint(allocator, "{{\"type\":\"{s}\",\"surfaceIndex\":{d}}}", .{ event_surface, index });
+        defer allocator.free(frame);
+        wasm_adapter.sendExtensionEventFrame(frame);
+    }
+    wasm_adapter.sendExtensionEventFrame("{\"type\":\"unsupported_event_surface\"}");
+    wasm_adapter.sendExtensionEventFrame("{");
+    const wasm_snapshot_after = try wasm_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(wasm_snapshot_after);
+    try std.testing.expectEqualStrings(wasm_snapshot_before, wasm_snapshot_after);
+    try std.testing.expectEqual(@as(usize, 0), wasm_adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), wasm_adapter.diagnosticCount());
+
+    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    defer native_adapter.deinit();
+    try native_adapter.waitForReady(0);
+    const native_snapshot_before = try native_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(native_snapshot_before);
+    for (event_surfaces, 0..) |event_surface, index| {
+        const frame = try std.fmt.allocPrint(allocator, "{{\"type\":\"{s}\",\"surfaceIndex\":{d}}}", .{ event_surface, index });
+        defer allocator.free(frame);
+        native_adapter.sendExtensionEventFrame(frame);
+    }
+    native_adapter.sendExtensionEventFrame("{\"type\":\"unsupported_event_surface\"}");
+    native_adapter.sendExtensionEventFrame("{");
+    const native_snapshot_after = try native_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(native_snapshot_after);
+    try std.testing.expectEqualStrings(native_snapshot_before, native_snapshot_after);
+    try std.testing.expectEqual(@as(usize, 0), native_adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), native_adapter.diagnosticCount());
+
+    try wasm_adapter.shutdown();
+    try native_adapter.shutdown();
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+    try std.testing.expect(native_adapter.hasShutdownComplete());
+    wasm_adapter.sendExtensionEventFrame("{\"type\":\"post_shutdown_event\"}");
+    native_adapter.sendExtensionEventFrame("{\"type\":\"post_shutdown_event\"}");
+    try std.testing.expectEqual(@as(usize, 0), wasm_adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), native_adapter.pendingCount());
 }
 
 test "process_jsonl runtime adapter preserves readiness diagnostics timeout and startup errors" {

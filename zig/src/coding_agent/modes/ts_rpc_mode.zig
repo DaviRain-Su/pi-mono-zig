@@ -6167,6 +6167,7 @@ test "M6 extension UI bridge serializes host requests and forwards responses exa
 
     try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":true}");
     try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"value\":\"option-a\"}");
+    try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_missing\",\"value\":\"ignored\"}");
     try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"confirmed\":false}");
     try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"cancelled\":true}");
     try server.handleLine("{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"value\":\"edited text\"}");
@@ -6181,6 +6182,7 @@ test "M6 extension UI bridge serializes host requests and forwards responses exa
     try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_select\",\"payload\":{\"value\":\"option-a\"}}\n");
     try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_input\",\"payload\":{\"cancelled\":true}}\n");
     try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"payload\":{\"value\":\"edited text\"}}\n");
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_missing\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"payload\":{\"confirmed\":false}}\n") == null);
 }
 
