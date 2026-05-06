@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 
 const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
@@ -1139,12 +1140,7 @@ fn headerExists(headers: *const std.StringHashMap([]const u8), key: []const u8) 
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| {
-            return signal.load(.seq_cst);
-        }
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn emptyJsonObject(allocator: std.mem.Allocator) !std.json.Value {

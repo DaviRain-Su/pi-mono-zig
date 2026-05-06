@@ -1,4 +1,5 @@
 const std = @import("std");
+const abort_helper = @import("abort_signal.zig");
 const event_stream = @import("../event_stream.zig");
 const types = @import("../types.zig");
 
@@ -54,9 +55,7 @@ pub fn runtimeStopReason(err: anyerror) types.StopReason {
 /// TypeScript `options?.signal?.aborted` check that providers use to classify
 /// in-flight failures as aborted rather than generic errors.
 pub fn isAbortRequested(options: ?types.StreamOptions) bool {
-    const stream_options = options orelse return false;
-    const signal = stream_options.signal orelse return false;
-    return signal.load(.seq_cst);
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 pub fn runtimeErrorMessage(err: anyerror) []const u8 {

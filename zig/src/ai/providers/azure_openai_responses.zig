@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
@@ -1251,10 +1252,7 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(.seq_cst);
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn removeObjectField(allocator: std.mem.Allocator, payload: *std.json.Value, field_name: []const u8) !void {

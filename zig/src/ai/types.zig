@@ -37,11 +37,19 @@ pub const KnownProvider = enum {
     mistral,
     minimax,
     minimax_cn,
+    moonshotai,
+    moonshotai_cn,
     huggingface,
     fireworks,
     opencode,
     opencode_go,
     kimi_coding,
+    cloudflare_workers_ai,
+    cloudflare_ai_gateway,
+    xiaomi,
+    xiaomi_token_plan_cn,
+    xiaomi_token_plan_ams,
+    xiaomi_token_plan_sgp,
     faux,
 };
 
@@ -54,6 +62,29 @@ pub const ThinkingLevel = enum {
     medium,
     high,
     xhigh,
+};
+
+pub const ModelThinkingLevel = enum {
+    off,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+};
+
+pub const ThinkingLevelMapping = union(enum) {
+    unsupported,
+    mapped: []const u8,
+};
+
+pub const ModelThinkingLevelMap = struct {
+    off: ?ThinkingLevelMapping = null,
+    minimal: ?ThinkingLevelMapping = null,
+    low: ?ThinkingLevelMapping = null,
+    medium: ?ThinkingLevelMapping = null,
+    high: ?ThinkingLevelMapping = null,
+    xhigh: ?ThinkingLevelMapping = null,
 };
 
 pub const AnthropicEffort = enum {
@@ -348,6 +379,7 @@ pub const Model = struct {
     provider: Provider,
     base_url: []const u8,
     reasoning: bool = false,
+    thinking_level_map: ?ModelThinkingLevelMap = null,
     tool_calling: bool = true,
     loaded: bool = false,
     input_types: []const []const u8, // "text", "image"
@@ -636,11 +668,19 @@ test "KnownProvider enum completeness" {
         .mistral => "mistral",
         .minimax => "minimax",
         .minimax_cn => "minimax-cn",
+        .moonshotai => "moonshotai",
+        .moonshotai_cn => "moonshotai-cn",
         .huggingface => "huggingface",
         .fireworks => "fireworks",
         .opencode => "opencode",
         .opencode_go => "opencode-go",
         .kimi_coding => "kimi-coding",
+        .cloudflare_workers_ai => "cloudflare-workers-ai",
+        .cloudflare_ai_gateway => "cloudflare-ai-gateway",
+        .xiaomi => "xiaomi",
+        .xiaomi_token_plan_cn => "xiaomi-token-plan-cn",
+        .xiaomi_token_plan_ams => "xiaomi-token-plan-ams",
+        .xiaomi_token_plan_sgp => "xiaomi-token-plan-sgp",
         .faux => "faux",
     };
     try std.testing.expectEqualStrings("openai", str);

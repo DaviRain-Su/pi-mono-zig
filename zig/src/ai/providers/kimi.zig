@@ -3,6 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const openai = @import("openai.zig");
@@ -864,12 +865,7 @@ fn finishCurrentBlock(
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| {
-            return signal.load(.monotonic);
-        }
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 pub fn parseSseLine(line: []const u8) ?[]const u8 {
