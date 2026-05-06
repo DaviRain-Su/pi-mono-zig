@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { WASM_CANONICAL_SECURITY_GRANTS } from "../src/core/wasm-extension-package.js";
 import { shouldUseWindowsShell } from "../src/utils/child-process.js";
 
 function normalizeForMatch(value: string): string {
@@ -19,6 +20,7 @@ function pathEndsWith(actualPath: string, suffix: string): boolean {
 }
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const securityGrantFixturePath = join(repoRoot, "packages/coding-agent/test/fixtures/extension-security-grants.json");
 const pureWasmFixtureRoot = join(repoRoot, "zig/test/fixtures/wasm/pure-truncate-head-v0");
 const browserWasmFixtureRoot = join(repoRoot, "zig/test/fixtures/wasm/browser-tool-v0");
 
@@ -515,6 +517,57 @@ Content`,
 			);
 			expect(events.some((event) => event.type === "complete")).toBe(false);
 			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+		});
+
+		it("should share canonical security grants with the parity fixture", () => {
+			const fixture = JSON.parse(readFileSync(securityGrantFixturePath, "utf-8"));
+			expect(WASM_CANONICAL_SECURITY_GRANTS).toEqual(fixture);
+			expect(WASM_CANONICAL_SECURITY_GRANTS).toEqual([
+				"file.read",
+				"file.write",
+				"network.request",
+				"shell.run",
+				"env.read",
+				"model.call",
+				"session.read",
+				"session.write",
+				"ui.notify",
+				"tool.use",
+				"agent.spawn",
+				"agent.delegate",
+			]);
+		});
+
+		it("should deny every canonical Wasm security grant before artifact validation or persistence", async () => {
+			for (const capability of WASM_CANONICAL_SECURITY_GRANTS) {
+				const deniedCapabilityPackage = join(tempDir, `denied-${capability.replaceAll(".", "-")}-package`);
+				mkdirSync(deniedCapabilityPackage, { recursive: true });
+				writeWasmPackage(deniedCapabilityPackage, {
+					artifactPath: "wasm/missing.wasm",
+					capabilities: [capability],
+				});
+				rmSync(join(deniedCapabilityPackage, "wasm", "missing.wasm"));
+
+				await expect(packageManager.installAndPersist(deniedCapabilityPackage), capability).rejects.toThrow(
+					`$.capabilities[0]: denied_capability: capability "${capability}" is not approved for manifest-request`,
+				);
+				expect(settingsManager.getGlobalSettings().packages ?? [], capability).toHaveLength(0);
+			}
+		});
+
+		it("should reject legacy broad Wasm security grants as unknown", async () => {
+			for (const capability of ["network", "shell", "env", "model", "session"]) {
+				const unknownCapabilityPackage = join(tempDir, `unknown-${capability}-package`);
+				mkdirSync(unknownCapabilityPackage, { recursive: true });
+				writeWasmPackage(unknownCapabilityPackage, {
+					capabilities: [capability],
+				});
+
+				await expect(packageManager.installAndPersist(unknownCapabilityPackage), capability).rejects.toThrow(
+					`$.capabilities[0]: unknown capability "${capability}"`,
+				);
+				expect(settingsManager.getGlobalSettings().packages ?? [], capability).toHaveLength(0);
+			}
 		});
 
 		it("should accept repository Wasm fixtures with normalized handoff identities", async () => {

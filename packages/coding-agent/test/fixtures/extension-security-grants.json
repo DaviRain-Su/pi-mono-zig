@@ -1,0 +1,14 @@
+[
+	"file.read",
+	"file.write",
+	"network.request",
+	"shell.run",
+	"env.read",
+	"model.call",
+	"session.read",
+	"session.write",
+	"ui.notify",
+	"tool.use",
+	"agent.spawn",
+	"agent.delegate"
+]

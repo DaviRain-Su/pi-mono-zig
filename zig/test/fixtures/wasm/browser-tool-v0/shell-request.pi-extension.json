@@ -14,5 +14,5 @@
 		"inputSchema": {},
 		"outputSchema": {}
 	},
-	"capabilities": ["shell"]
+	"capabilities": ["shell.run"]
 }

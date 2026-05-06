@@ -1,12 +1,16 @@
 export const CANONICAL_CAPABILITIES = [
 	"file.read",
 	"file.write",
-	"network",
-	"shell",
-	"env",
-	"model",
-	"session",
+	"network.request",
+	"shell.run",
+	"env.read",
+	"model.call",
+	"session.read",
+	"session.write",
 	"ui.notify",
+	"tool.use",
+	"agent.spawn",
+	"agent.delegate",
 ];
 const CAPABILITIES = new Set(CANONICAL_CAPABILITIES);
 const UNAVAILABLE_BROWSER_CAPABILITIES = new Set(CAPABILITIES);
@@ -274,18 +278,26 @@ function runtimeImportSpec(capability) {
 			return { capability, moduleName: "pi:filesystem", fieldName: "read" };
 		case "file.write":
 			return { capability, moduleName: "pi:filesystem", fieldName: "write" };
-		case "network":
+		case "network.request":
 			return { capability, moduleName: "pi:network", fieldName: "fetch" };
-		case "shell":
+		case "shell.run":
 			return { capability, moduleName: "pi:shell", fieldName: "run" };
-		case "env":
+		case "env.read":
 			return { capability, moduleName: "pi:environment", fieldName: "get" };
-		case "model":
+		case "model.call":
 			return { capability, moduleName: "pi:model", fieldName: "call" };
-		case "session":
+		case "session.read":
 			return { capability, moduleName: "pi:session", fieldName: "get" };
+		case "session.write":
+			return { capability, moduleName: "pi:session", fieldName: "set" };
 		case "ui.notify":
 			return { capability, moduleName: "pi:ui", fieldName: "notify" };
+		case "tool.use":
+			return { capability, moduleName: "pi:tool", fieldName: "use" };
+		case "agent.spawn":
+			return { capability, moduleName: "pi:agent", fieldName: "spawn" };
+		case "agent.delegate":
+			return { capability, moduleName: "pi:agent", fieldName: "delegate" };
 		default:
 			throw new Error(`unsupported runtime import fixture capability: ${capability}`);
 	}
@@ -614,7 +626,7 @@ function wireBrowserHarness() {
 	});
 	document.querySelector("#deny-shell-runtime").addEventListener("click", async () => {
 		const beforeCount = networkLog.length;
-		const result = await attemptRuntimeImport("shell");
+		const result = await attemptRuntimeImport("shell.run");
 		renderNetwork(beforeCount);
 		print(result);
 	});

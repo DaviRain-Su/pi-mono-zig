@@ -5,18 +5,23 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 export const WASM_EXTENSION_MANIFEST_NAME = "pi-extension.json";
 export const WASM_EXTENSION_SCHEMA_VERSION = "pi-extension.v0";
 export const WASM_DENIED_CAPABILITY_CATEGORY = "denied_capability";
-export const WASM_CANONICAL_CAPABILITIES = [
+export const WASM_CANONICAL_SECURITY_GRANTS = [
 	"file.read",
 	"file.write",
-	"network",
-	"shell",
-	"env",
-	"model",
-	"session",
+	"network.request",
+	"shell.run",
+	"env.read",
+	"model.call",
+	"session.read",
+	"session.write",
 	"ui.notify",
+	"tool.use",
+	"agent.spawn",
+	"agent.delegate",
 ] as const;
+export const WASM_CANONICAL_CAPABILITIES = WASM_CANONICAL_SECURITY_GRANTS;
 
-const CAPABILITIES = new Set<string>(WASM_CANONICAL_CAPABILITIES);
+const SECURITY_GRANTS = new Set<string>(WASM_CANONICAL_SECURITY_GRANTS);
 const UNSUPPORTED_SURFACE_FIELDS = [
 	"commands",
 	"widgets",
@@ -165,7 +170,7 @@ function readCapabilities(root: JsonObject): string[] {
 		if (typeof capability !== "string") {
 			throw new Error(`$.capabilities[${index}]: expected string`);
 		}
-		if (!CAPABILITIES.has(capability)) {
+		if (!SECURITY_GRANTS.has(capability)) {
 			throw new Error(`$.capabilities[${index}]: unknown capability "${capability}"`);
 		}
 		return capability;

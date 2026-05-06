@@ -36,23 +36,31 @@ pub const ArtifactKind = enum {
 pub const Capability = enum {
     file_read,
     file_write,
-    network,
-    shell,
-    env,
-    model,
-    session,
+    network_request,
+    shell_run,
+    env_read,
+    model_call,
+    session_read,
+    session_write,
     ui_notify,
+    tool_use,
+    agent_spawn,
+    agent_delegate,
 
     pub fn jsonName(self: Capability) []const u8 {
         return switch (self) {
             .file_read => "file.read",
             .file_write => "file.write",
-            .network => "network",
-            .shell => "shell",
-            .env => "env",
-            .model => "model",
-            .session => "session",
+            .network_request => "network.request",
+            .shell_run => "shell.run",
+            .env_read => "env.read",
+            .model_call => "model.call",
+            .session_read => "session.read",
+            .session_write => "session.write",
             .ui_notify => "ui.notify",
+            .tool_use => "tool.use",
+            .agent_spawn => "agent.spawn",
+            .agent_delegate => "agent.delegate",
         };
     }
 
@@ -60,12 +68,16 @@ pub const Capability = enum {
         return switch (self) {
             .file_read => .filesystem_read,
             .file_write => .filesystem_write,
-            .network => .network_request,
-            .shell => .shell_process,
-            .env => .environment_variable,
-            .model => .model_call,
-            .session => .session_state,
+            .network_request => .network_request,
+            .shell_run => .shell_process,
+            .env_read => .environment_variable,
+            .model_call => .model_call,
+            .session_read => .session_read,
+            .session_write => .session_write,
             .ui_notify => .ui_notification,
+            .tool_use => .tool_execution,
+            .agent_spawn => .agent_spawn,
+            .agent_delegate => .agent_delegate,
         };
     }
 };
@@ -73,12 +85,16 @@ pub const Capability = enum {
 pub const CANONICAL_CAPABILITIES = [_]Capability{
     .file_read,
     .file_write,
-    .network,
-    .shell,
-    .env,
-    .model,
-    .session,
+    .network_request,
+    .shell_run,
+    .env_read,
+    .model_call,
+    .session_read,
+    .session_write,
     .ui_notify,
+    .tool_use,
+    .agent_spawn,
+    .agent_delegate,
 };
 
 pub const CapabilityEnforcementBranch = enum {
@@ -88,8 +104,12 @@ pub const CapabilityEnforcementBranch = enum {
     shell_process,
     environment_variable,
     model_call,
-    session_state,
+    session_read,
+    session_write,
     ui_notification,
+    tool_execution,
+    agent_spawn,
+    agent_delegate,
 
     pub fn jsonName(self: CapabilityEnforcementBranch) []const u8 {
         return switch (self) {
@@ -99,8 +119,12 @@ pub const CapabilityEnforcementBranch = enum {
             .shell_process => "shell.process",
             .environment_variable => "environment.variable",
             .model_call => "model.call",
-            .session_state => "session.state",
+            .session_read => "session.read",
+            .session_write => "session.write",
             .ui_notification => "ui.notification",
+            .tool_execution => "tool.execution",
+            .agent_spawn => "agent.spawn",
+            .agent_delegate => "agent.delegate",
         };
     }
 };
@@ -141,12 +165,16 @@ pub fn denyRuntimeCapability(
 pub fn runtimeImportCapability(module_name: []const u8, field_name: []const u8) ?Capability {
     if (std.mem.eql(u8, module_name, "pi:filesystem") and std.mem.eql(u8, field_name, "read")) return .file_read;
     if (std.mem.eql(u8, module_name, "pi:filesystem") and std.mem.eql(u8, field_name, "write")) return .file_write;
-    if (std.mem.eql(u8, module_name, "pi:network") and std.mem.eql(u8, field_name, "fetch")) return .network;
-    if (std.mem.eql(u8, module_name, "pi:shell") and std.mem.eql(u8, field_name, "run")) return .shell;
-    if (std.mem.eql(u8, module_name, "pi:environment") and std.mem.eql(u8, field_name, "get")) return .env;
-    if (std.mem.eql(u8, module_name, "pi:model") and std.mem.eql(u8, field_name, "call")) return .model;
-    if (std.mem.eql(u8, module_name, "pi:session") and std.mem.eql(u8, field_name, "get")) return .session;
+    if (std.mem.eql(u8, module_name, "pi:network") and std.mem.eql(u8, field_name, "fetch")) return .network_request;
+    if (std.mem.eql(u8, module_name, "pi:shell") and std.mem.eql(u8, field_name, "run")) return .shell_run;
+    if (std.mem.eql(u8, module_name, "pi:environment") and std.mem.eql(u8, field_name, "get")) return .env_read;
+    if (std.mem.eql(u8, module_name, "pi:model") and std.mem.eql(u8, field_name, "call")) return .model_call;
+    if (std.mem.eql(u8, module_name, "pi:session") and std.mem.eql(u8, field_name, "get")) return .session_read;
+    if (std.mem.eql(u8, module_name, "pi:session") and std.mem.eql(u8, field_name, "set")) return .session_write;
     if (std.mem.eql(u8, module_name, "pi:ui") and std.mem.eql(u8, field_name, "notify")) return .ui_notify;
+    if (std.mem.eql(u8, module_name, "pi:tool") and std.mem.eql(u8, field_name, "use")) return .tool_use;
+    if (std.mem.eql(u8, module_name, "pi:agent") and std.mem.eql(u8, field_name, "spawn")) return .agent_spawn;
+    if (std.mem.eql(u8, module_name, "pi:agent") and std.mem.eql(u8, field_name, "delegate")) return .agent_delegate;
     return null;
 }
 
@@ -736,6 +764,20 @@ test "wasm manifest omitted capabilities are default-deny and unknown capabiliti
     );
     defer unknown.deinit(allocator);
     try expectInvalid(&unknown, "$.capabilities[0]", "unknown capability \"database\"");
+
+    const legacy_broad_grants = [_][]const u8{ "network", "shell", "env", "model", "session" };
+    for (legacy_broad_grants) |grant| {
+        const manifest_text = try std.fmt.allocPrint(allocator,
+            \\{{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Legacy broad grant","artifact":{{"kind":"wasm-component","path":"wasm/example-tool.wasm"}},"tool":{{"id":"example.tool","description":"Tool","inputSchema":{{}},"outputSchema":{{}}}},"capabilities":["{s}"]}}
+        , .{grant});
+        defer allocator.free(manifest_text);
+
+        var result = try validateManifestText(allocator, package_root, manifest_text);
+        defer result.deinit(allocator);
+        const expected = try std.fmt.allocPrint(allocator, "unknown capability \"{s}\"", .{grant});
+        defer allocator.free(expected);
+        try expectInvalid(&result, "$.capabilities[0]", expected);
+    }
 }
 
 test "wasm manifest denies requested capabilities before artifact validation" {
@@ -876,12 +918,16 @@ test "wasm capability canonical ids map to explicit enforcement branches" {
     }{
         .{ .capability = .file_read, .id = "file.read", .branch = .filesystem_read },
         .{ .capability = .file_write, .id = "file.write", .branch = .filesystem_write },
-        .{ .capability = .network, .id = "network", .branch = .network_request },
-        .{ .capability = .shell, .id = "shell", .branch = .shell_process },
-        .{ .capability = .env, .id = "env", .branch = .environment_variable },
-        .{ .capability = .model, .id = "model", .branch = .model_call },
-        .{ .capability = .session, .id = "session", .branch = .session_state },
+        .{ .capability = .network_request, .id = "network.request", .branch = .network_request },
+        .{ .capability = .shell_run, .id = "shell.run", .branch = .shell_process },
+        .{ .capability = .env_read, .id = "env.read", .branch = .environment_variable },
+        .{ .capability = .model_call, .id = "model.call", .branch = .model_call },
+        .{ .capability = .session_read, .id = "session.read", .branch = .session_read },
+        .{ .capability = .session_write, .id = "session.write", .branch = .session_write },
         .{ .capability = .ui_notify, .id = "ui.notify", .branch = .ui_notification },
+        .{ .capability = .tool_use, .id = "tool.use", .branch = .tool_execution },
+        .{ .capability = .agent_spawn, .id = "agent.spawn", .branch = .agent_spawn },
+        .{ .capability = .agent_delegate, .id = "agent.delegate", .branch = .agent_delegate },
     };
 
     try std.testing.expectEqual(CANONICAL_CAPABILITIES.len, expected.len);
@@ -892,6 +938,26 @@ test "wasm capability canonical ids map to explicit enforcement branches" {
         try std.testing.expectEqual(entry.branch, entry.capability.enforcementBranch());
     }
     try std.testing.expectEqual(@as(?Capability, null), parseCapability("filesystem"));
+    try std.testing.expectEqual(@as(?Capability, null), parseCapability("session"));
+    try std.testing.expectEqual(@as(?Capability, null), parseCapability("cap-wiki"));
+}
+
+test "wasm capability canonical ids match TypeScript parity fixture" {
+    const fixture_path = "../packages/coding-agent/test/fixtures/extension-security-grants.json";
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, fixture_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .array);
+    const fixture_capabilities = parsed.value.array.items;
+    try std.testing.expectEqual(CANONICAL_CAPABILITIES.len, fixture_capabilities.len);
+
+    for (CANONICAL_CAPABILITIES, fixture_capabilities) |capability, fixture_capability| {
+        try std.testing.expect(fixture_capability == .string);
+        try std.testing.expectEqualStrings(capability.jsonName(), fixture_capability.string);
+    }
 }
 
 test "wasm capability requested but unapproved declarations are denied deterministically" {
@@ -906,11 +972,11 @@ test "wasm capability requested but unapproved declarations are denied determini
 
     try std.testing.expectEqual(
         @as(?CapabilityDenialDiagnostic, null),
-        denyFirstUnapprovedCapability(&.{ .shell, .network }, &.{ .shell, .network }, .initialize, "manifest-request"),
+        denyFirstUnapprovedCapability(&.{ .shell_run, .network_request }, &.{ .shell_run, .network_request }, .initialize, "manifest-request"),
     );
     try std.testing.expectEqual(
-        Capability.shell,
-        denyFirstUnapprovedCapability(&.{.shell}, &.{.network}, .initialize, "manifest-request").?.capability,
+        Capability.shell_run,
+        denyFirstUnapprovedCapability(&.{.shell_run}, &.{.network_request}, .initialize, "manifest-request").?.capability,
     );
 }
 
@@ -933,12 +999,16 @@ test "wasm capability runtime import mappings share canonical denial vocabulary"
     }{
         .{ .module_name = "pi:filesystem", .field_name = "read", .capability = .file_read },
         .{ .module_name = "pi:filesystem", .field_name = "write", .capability = .file_write },
-        .{ .module_name = "pi:network", .field_name = "fetch", .capability = .network },
-        .{ .module_name = "pi:shell", .field_name = "run", .capability = .shell },
-        .{ .module_name = "pi:environment", .field_name = "get", .capability = .env },
-        .{ .module_name = "pi:model", .field_name = "call", .capability = .model },
-        .{ .module_name = "pi:session", .field_name = "get", .capability = .session },
+        .{ .module_name = "pi:network", .field_name = "fetch", .capability = .network_request },
+        .{ .module_name = "pi:shell", .field_name = "run", .capability = .shell_run },
+        .{ .module_name = "pi:environment", .field_name = "get", .capability = .env_read },
+        .{ .module_name = "pi:model", .field_name = "call", .capability = .model_call },
+        .{ .module_name = "pi:session", .field_name = "get", .capability = .session_read },
+        .{ .module_name = "pi:session", .field_name = "set", .capability = .session_write },
         .{ .module_name = "pi:ui", .field_name = "notify", .capability = .ui_notify },
+        .{ .module_name = "pi:tool", .field_name = "use", .capability = .tool_use },
+        .{ .module_name = "pi:agent", .field_name = "spawn", .capability = .agent_spawn },
+        .{ .module_name = "pi:agent", .field_name = "delegate", .capability = .agent_delegate },
     };
 
     for (expected) |entry| {

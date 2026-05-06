@@ -46,11 +46,14 @@ only the plugin-side `metadata`, `schema`, and `execute` functions and provides
 no host callbacks for:
 
 - file access: `file.read`, `file.write`
-- shell/process access: `shell`
-- network access: `network`
-- environment access: `env`
-- model/session access: `model`, `session`
+- shell/process access: `shell.run`
+- network access: `network.request`
+- environment access: `env.read`
+- model access: `model.call`
+- session access: `session.read`, `session.write`
 - UI notification access: `ui.notify`
+- tool access: `tool.use`
+- agent access: `agent.spawn`, `agent.delegate`
 
 This matches the manifest validator's default-deny capability vocabulary.
 Requested capabilities remain denied until a later host contract adds explicit
