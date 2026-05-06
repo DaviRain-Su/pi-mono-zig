@@ -29,6 +29,7 @@ import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
+import { hasWasmExtensionManifest } from "../wasm-extension-package.js";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -492,6 +493,10 @@ function isExtensionFile(name: string): boolean {
  * Returns resolved paths or null if no entry points found.
  */
 function resolveExtensionEntries(dir: string): string[] | null {
+	if (hasWasmExtensionManifest(dir)) {
+		return null;
+	}
+
 	// Check for package.json with "pi" field first
 	const packageJsonPath = path.join(dir, "package.json");
 	if (fs.existsSync(packageJsonPath)) {
@@ -535,6 +540,9 @@ function resolveExtensionEntries(dir: string): string[] | null {
  */
 function discoverExtensionsInDir(dir: string): string[] {
 	if (!fs.existsSync(dir)) {
+		return [];
+	}
+	if (hasWasmExtensionManifest(dir)) {
 		return [];
 	}
 
@@ -601,6 +609,9 @@ export async function discoverAndLoadExtensions(
 	for (const p of configuredPaths) {
 		const resolved = resolvePath(p, cwd);
 		if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+			if (hasWasmExtensionManifest(resolved)) {
+				continue;
+			}
 			// Check for package.json with pi manifest or index.ts
 			const entries = resolveExtensionEntries(resolved);
 			if (entries) {

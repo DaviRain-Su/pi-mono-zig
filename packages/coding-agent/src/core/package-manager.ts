@@ -538,6 +538,10 @@ function readPiManifestFile(packageJsonPath: string): PiManifest | null {
 }
 
 function resolveExtensionEntries(dir: string): string[] | null {
+	if (hasWasmExtensionManifest(dir)) {
+		return null;
+	}
+
 	const packageJsonPath = join(dir, "package.json");
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifestFile(packageJsonPath);
@@ -1939,6 +1943,9 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 	): boolean {
 		const hasWasmExtension = this.collectWasmExtensionPackage(packageRoot, accumulator, metadata);
+		if (hasWasmExtension) {
+			return true;
+		}
 
 		if (filter) {
 			for (const resourceType of RESOURCE_TYPES) {
@@ -1968,7 +1975,7 @@ export class DefaultPackageManager implements PackageManager {
 			return true;
 		}
 
-		let hasAnyDir = hasWasmExtension;
+		let hasAnyDir = false;
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
 			if (existsSync(dir)) {

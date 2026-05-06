@@ -204,6 +204,20 @@ describe("extensions discovery", () => {
 		const subdir = path.join(extensionsDir, "wasm-package");
 		fs.mkdirSync(path.join(subdir, "wasm"), { recursive: true });
 		fs.writeFileSync(path.join(subdir, "wasm", "plugin.wasm"), Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+		fs.writeFileSync(path.join(subdir, "index.ts"), "throw new Error('index.ts must not load for Wasm packages');");
+		fs.writeFileSync(
+			path.join(subdir, "custom.ts"),
+			"throw new Error('package.json pi.extensions must not load for Wasm packages');",
+		);
+		fs.writeFileSync(
+			path.join(subdir, "package.json"),
+			JSON.stringify({
+				name: "wasm-package",
+				pi: {
+					extensions: ["./custom.ts"],
+				},
+			}),
+		);
 		fs.writeFileSync(
 			path.join(subdir, "pi-extension.json"),
 			JSON.stringify({
@@ -227,6 +241,49 @@ describe("extensions discovery", () => {
 		);
 
 		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions).toHaveLength(0);
+	});
+
+	it("ignores configured pi-extension.json Wasm package directories in Bun extension loading", async () => {
+		const subdir = path.join(tempDir, "configured-wasm-package");
+		fs.mkdirSync(path.join(subdir, "wasm"), { recursive: true });
+		fs.writeFileSync(path.join(subdir, "wasm", "plugin.wasm"), Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+		fs.writeFileSync(path.join(subdir, "index.ts"), "throw new Error('configured index.ts must not load');");
+		fs.writeFileSync(path.join(subdir, "custom.ts"), "throw new Error('configured custom.ts must not load');");
+		fs.writeFileSync(
+			path.join(subdir, "package.json"),
+			JSON.stringify({
+				name: "configured-wasm-package",
+				pi: {
+					extensions: ["./custom.ts"],
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(subdir, "pi-extension.json"),
+			JSON.stringify({
+				schemaVersion: "pi-extension.v0",
+				id: "com.example.configured-discovery-wasm",
+				name: "Configured Discovery Wasm Fixture",
+				version: "0.1.0",
+				description: "A configured Wasm package fixture that should not be loaded through the Bun path.",
+				artifact: {
+					kind: "wasm-component",
+					path: "wasm/plugin.wasm",
+				},
+				tool: {
+					id: "fixture.configuredDiscovery",
+					description: "Configured discovery fixture",
+					inputSchema: {},
+					outputSchema: {},
+				},
+				capabilities: [],
+			}),
+		);
+
+		const result = await discoverAndLoadExtensions([subdir], tempDir, tempDir);
 
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(0);
