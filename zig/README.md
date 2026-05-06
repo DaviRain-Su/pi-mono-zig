@@ -72,6 +72,10 @@ zig build test-openai-chat-parity
 zig build test-openai-responses-parity
 ```
 
+`zig build test` includes native stdio MCP discovery/execution/lifecycle
+coverage, extension metadata/conflict/event parity checks, and no-credential
+provider smoke coverage for Moonshot, Cloudflare, and Xiaomi routing.
+
 ## Release Process
 
 1. **Build release binary:**
