@@ -3,6 +3,7 @@ const api_registry = @import("api_registry.zig");
 const event_stream = @import("event_stream.zig");
 const model_registry = @import("model_registry.zig");
 const register_builtins = @import("providers/register_builtins.zig");
+const abort_helper = @import("shared/abort_signal.zig");
 const simple_options_mod = @import("shared/simple_options.zig");
 const types = @import("types.zig");
 
@@ -188,9 +189,7 @@ fn mapThinkingLevelToAnthropicEffort(
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    const stream_options = options orelse return false;
-    const signal = stream_options.signal orelse return false;
-    return signal.load(types.abort_signal_load_order);
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn createProviderContractErrorStream(

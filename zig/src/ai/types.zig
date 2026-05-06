@@ -43,13 +43,13 @@ pub const KnownProvider = enum {
     minimax_cn,
     moonshotai,
     moonshotai_cn,
-    cloudflare_workers_ai,
-    cloudflare_ai_gateway,
     huggingface,
     fireworks,
     opencode,
     opencode_go,
     kimi_coding,
+    cloudflare_workers_ai,
+    cloudflare_ai_gateway,
     xiaomi,
     xiaomi_token_plan_cn,
     xiaomi_token_plan_ams,
@@ -77,20 +77,20 @@ pub const ModelThinkingLevel = enum {
     xhigh,
 };
 
-pub const ThinkingLevelMapEntry = union(enum) {
+pub const ThinkingLevelMapping = union(enum) {
     unsupported,
     mapped: []const u8,
 };
 
-pub const ThinkingLevelMap = struct {
-    off: ?ThinkingLevelMapEntry = null,
-    minimal: ?ThinkingLevelMapEntry = null,
-    low: ?ThinkingLevelMapEntry = null,
-    medium: ?ThinkingLevelMapEntry = null,
-    high: ?ThinkingLevelMapEntry = null,
-    xhigh: ?ThinkingLevelMapEntry = null,
+pub const ModelThinkingLevelMap = struct {
+    off: ?ThinkingLevelMapping = null,
+    minimal: ?ThinkingLevelMapping = null,
+    low: ?ThinkingLevelMapping = null,
+    medium: ?ThinkingLevelMapping = null,
+    high: ?ThinkingLevelMapping = null,
+    xhigh: ?ThinkingLevelMapping = null,
 
-    pub fn get(self: ThinkingLevelMap, level: ModelThinkingLevel) ?ThinkingLevelMapEntry {
+    pub fn get(self: ModelThinkingLevelMap, level: ModelThinkingLevel) ?ThinkingLevelMapping {
         return switch (level) {
             .off => self.off,
             .minimal => self.minimal,
@@ -101,6 +101,9 @@ pub const ThinkingLevelMap = struct {
         };
     }
 };
+
+pub const ThinkingLevelMapEntry = ThinkingLevelMapping;
+pub const ThinkingLevelMap = ModelThinkingLevelMap;
 
 pub const AnthropicEffort = enum {
     low,
@@ -394,7 +397,7 @@ pub const Model = struct {
     provider: Provider,
     base_url: []const u8,
     reasoning: bool = false,
-    thinking_level_map: ?ThinkingLevelMap = null,
+    thinking_level_map: ?ModelThinkingLevelMap = null,
     tool_calling: bool = true,
     loaded: bool = false,
     input_types: []const []const u8, // "text", "image"
@@ -685,13 +688,13 @@ test "KnownProvider enum completeness" {
         .minimax_cn => "minimax-cn",
         .moonshotai => "moonshotai",
         .moonshotai_cn => "moonshotai-cn",
-        .cloudflare_workers_ai => "cloudflare-workers-ai",
-        .cloudflare_ai_gateway => "cloudflare-ai-gateway",
         .huggingface => "huggingface",
         .fireworks => "fireworks",
         .opencode => "opencode",
         .opencode_go => "opencode-go",
         .kimi_coding => "kimi-coding",
+        .cloudflare_workers_ai => "cloudflare-workers-ai",
+        .cloudflare_ai_gateway => "cloudflare-ai-gateway",
         .xiaomi => "xiaomi",
         .xiaomi_token_plan_cn => "xiaomi-token-plan-cn",
         .xiaomi_token_plan_ams => "xiaomi-token-plan-ams",

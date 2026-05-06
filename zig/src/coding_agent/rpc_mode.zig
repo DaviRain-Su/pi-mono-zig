@@ -647,7 +647,39 @@ fn buildModelValue(allocator: std.mem.Allocator, model: ai.Model) !std.json.Valu
     try putStringField(&result, allocator, "name", model.name);
     try putStringField(&result, allocator, "provider", model.provider);
     try putStringField(&result, allocator, "api", model.api);
+    if (model.thinking_level_map) |map| {
+        try putField(&result, allocator, "thinkingLevelMap", try buildThinkingLevelMapValue(allocator, map));
+    }
     return .{ .object = result };
+}
+
+fn buildThinkingLevelMapValue(allocator: std.mem.Allocator, map: ai.types.ModelThinkingLevelMap) !std.json.Value {
+    var result = try initObject(allocator);
+    errdefer {
+        const value: std.json.Value = .{ .object = result };
+        common.deinitJsonValue(allocator, value);
+    }
+
+    try putThinkingLevelMapField(&result, allocator, "off", map.off);
+    try putThinkingLevelMapField(&result, allocator, "minimal", map.minimal);
+    try putThinkingLevelMapField(&result, allocator, "low", map.low);
+    try putThinkingLevelMapField(&result, allocator, "medium", map.medium);
+    try putThinkingLevelMapField(&result, allocator, "high", map.high);
+    try putThinkingLevelMapField(&result, allocator, "xhigh", map.xhigh);
+    return .{ .object = result };
+}
+
+fn putThinkingLevelMapField(
+    object: *std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    mapping: ?ai.types.ThinkingLevelMapping,
+) !void {
+    const value = mapping orelse return;
+    switch (value) {
+        .unsupported => try putField(object, allocator, key, .null),
+        .mapped => |mapped| try putStringField(object, allocator, key, mapped),
+    }
 }
 
 fn buildUsageValue(allocator: std.mem.Allocator, usage: ai.Usage) !std.json.Value {

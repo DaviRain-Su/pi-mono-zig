@@ -4,6 +4,8 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
+const model_registry = @import("../model_registry.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
@@ -277,7 +279,10 @@ pub fn buildRequestPayload(
             if (stream_options.responses_reasoning_effort != null or stream_options.responses_reasoning_summary != null) {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                const effort = if (stream_options.responses_reasoning_effort) |reasoning_effort| thinkingLevelString(reasoning_effort) else "medium";
+                const effort = if (stream_options.responses_reasoning_effort) |reasoning_effort|
+                    model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(reasoning_effort)) orelse thinkingLevelString(reasoning_effort)
+                else
+                    "medium";
                 const summary = stream_options.responses_reasoning_summary orelse "auto";
                 try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, effort) });
                 try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, summary) });
@@ -287,18 +292,18 @@ pub fn buildRequestPayload(
                 errdefer include.deinit();
                 try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
                 try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
-            } else if (!std.mem.eql(u8, model.provider, "github-copilot")) {
+            } else if (!std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, "none") });
+                try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, model_registry.mappedThinkingLevelValue(model, .off) orelse "none") });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
             }
         }
     }
-    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot")) {
+    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
         var reasoning = try initObject(allocator);
         errdefer reasoning.deinit(allocator);
-        try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, "none") });
+        try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, model_registry.mappedThinkingLevelValue(model, .off) orelse "none") });
         try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
     }
 
@@ -1999,6 +2004,16 @@ fn thinkingLevelString(level: types.ThinkingLevel) []const u8 {
     };
 }
 
+fn modelThinkingLevel(level: types.ThinkingLevel) types.ModelThinkingLevel {
+    return switch (level) {
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+}
+
 fn putOwnedHeader(
     allocator: std.mem.Allocator,
     headers: *std.StringHashMap([]const u8),
@@ -2068,10 +2083,7 @@ fn normalizedResponseHeaders(
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(types.abort_signal_load_order);
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
@@ -3441,6 +3453,27 @@ test "VAL-RUNTIME-002 streamSimple on_response failure returns one terminal erro
     defer stream.deinit();
 
     try expectOnlyTerminalErrorResponses(&stream, "FixtureResponsesResponseFailure", .error_reason);
+}
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const model = streamErrorContractTestModel("http://127.0.0.1:1");
+    const context = streamErrorContractTestContext();
+
+    var stream = try OpenAIResponsesProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("openai-responses", event.message.?.api);
+    try std.testing.expectEqualStrings("openai", event.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-5-mini", event.message.?.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(event.message.?.error_message.?.len > 0);
+    try std.testing.expect(stream.next() == null);
 }
 
 fn expectMissingApiKeyTerminalErrorResponses(

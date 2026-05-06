@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const event_stream = @import("../event_stream.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const asn1 = std.crypto.codecs.asn1;
 
@@ -1608,10 +1609,7 @@ fn mergeHeaders(
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| return signal.load(types.abort_signal_load_order);
-    }
-    return false;
+    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {

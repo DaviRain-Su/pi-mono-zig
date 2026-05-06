@@ -1990,14 +1990,18 @@ fn nextSupportedThinkingLevel(model: ai.Model, current: agent.ThinkingLevel) age
 }
 
 fn thinkingLevelSupported(model: ai.Model, level: agent.ThinkingLevel) bool {
-    return ai.model_registry.isThinkingLevelSupported(model, switch (level) {
+    return ai.model_registry.thinkingLevelSupported(model, agentThinkingLevelToModel(level));
+}
+
+fn agentThinkingLevelToModel(level: agent.ThinkingLevel) ai.types.ModelThinkingLevel {
+    return switch (level) {
         .off => .off,
         .minimal => .minimal,
         .low => .low,
         .medium => .medium,
         .high => .high,
         .xhigh => .xhigh,
-    });
+    };
 }
 
 const ModelCycleDirection = enum { forward, backward };

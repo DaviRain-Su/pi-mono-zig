@@ -1,6 +1,5 @@
 const std = @import("std");
-const types = @import("types.zig");
-
+const abort_helper = @import("shared/abort_signal.zig");
 pub const HttpMethod = enum {
     GET,
     POST,
@@ -233,11 +232,9 @@ pub const StreamingResponse = struct {
         const io = self.io orelse return;
 
         while (!self.watchdog_done.load(.acquire)) {
-            if (self.aborted) |aborted| {
-                if (aborted.load(types.abort_signal_load_order)) {
-                    self.triggerTermination(.aborted);
-                    return;
-                }
+            if (abort_helper.isRequested(self.aborted)) {
+                self.triggerTermination(.aborted);
+                return;
             }
 
             if (self.timeout_ms > 0) {
@@ -366,10 +363,7 @@ pub const HttpClient = struct {
     /// The caller must call streaming.deinit() when done.
     pub fn requestStreaming(self: *HttpClient, req: HttpRequest) anyerror!StreamingResponse {
         // Check abort signal before starting
-        if (req.aborted) |aborted| {
-            if (aborted.load(types.abort_signal_load_order)) return HttpError.RequestAborted;
-        }
-
+        if (abort_helper.isRequested(req.aborted)) return HttpError.RequestAborted;
         const method: std.http.Method = switch (req.method) {
             .GET => .GET,
             .POST => .POST,
@@ -590,7 +584,7 @@ test "HttpRequest timeout and abort fields" {
 
     try std.testing.expectEqual(@as(u32, 5000), req.timeout_ms);
     try std.testing.expect(req.aborted != null);
-    try std.testing.expect(!req.aborted.?.load(types.abort_signal_load_order));
+    try std.testing.expect(!abort_helper.isRequested(req.aborted));
 }
 
 test "StreamingResponse readAll" {

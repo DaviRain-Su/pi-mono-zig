@@ -24,7 +24,6 @@ const extension_events = @import("extension_events.zig");
 /// `extension_flags.zig`; this module deliberately mirrors the flag
 /// types so JSONL `register_flag` frames can populate both registries
 /// from a single live source.
-
 /// Supported flag kinds. Matches `extension_flags.FlagKind` byte-for-byte.
 pub const FlagKind = enum { boolean, string };
 
@@ -163,7 +162,7 @@ pub const ProviderModel = struct {
 pub const ProviderOAuth = struct {
     /// Display name for the provider in login UI
     name: []u8,
-    
+
     pub fn deinit(self: *ProviderOAuth, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         self.* = undefined;
@@ -1315,13 +1314,13 @@ pub fn applyHostFrame(
         const description = optionalString(object, "description") orelse "";
         const render_shell = optionalString(object, "renderShell");
         try registry.registerTool(name, label, description, extension_path);
-        
+
         // Apply render shell and render hook if present
         if (registry.findToolIndex(name)) |idx| {
             if (render_shell) |rs| {
                 registry.tools.items[idx].render_shell = try registry.allocator.dupe(u8, rs);
             }
-            
+
             if (object.get("renderHook")) |render_hook_val| {
                 if (render_hook_val == .object) {
                     var render_config_buf: std.Io.Writer.Allocating = .init(registry.allocator);
@@ -1337,7 +1336,7 @@ pub fn applyHostFrame(
                 }
             }
         }
-        
+
         return .registered_tool;
     }
 
@@ -1389,12 +1388,12 @@ pub fn applyHostFrame(
                 }
             }
         }
-        
+
         // Parse auth_header
         const auth_header = optionalBool(object, "authHeader") orelse false;
-        
+
         try registry.registerProviderFull(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header);
-        
+
         // Apply OAuth after provider is registered to avoid memory leak on failure
         if (object.get("oauth")) |oauth_val| {
             if (oauth_val == .object) {
@@ -1408,7 +1407,7 @@ pub fn applyHostFrame(
                 }
             }
         }
-        
+
         return .registered_provider;
     }
 
@@ -1869,6 +1868,46 @@ test "registration fixture refresh updates tools and removes provider" {
     try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
 }
 
+test "provider unregister and re-register ordering keeps only latest models" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "name": "dynamic-provider", "displayName": "Dynamic", "api": "openai-completions", "baseUrl": "http://localhost:0", "models": [{ "id": "first", "name": "First" }], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "unregister_provider", "name": "dynamic-provider" }
+        \\{ "type": "register_provider", "name": "dynamic-provider", "displayName": "Dynamic", "api": "openai-completions", "baseUrl": "http://localhost:0", "models": [{ "id": "second", "name": "Second" }], "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 3), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("dynamic-provider", registry.providers.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items[0].models.len);
+    try std.testing.expectEqualStrings("second", registry.providers.items[0].models[0].id);
+}
+
+test "malformed provider registration is isolated from subsequent valid refresh frames" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_provider", "displayName": "Missing name", "models": [{ "id": "bad", "name": "Bad" }], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_tool", "name": "good-tool", "label": "Good Tool", "description": "ok", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_provider", "name": "good-provider", "displayName": "Good", "api": "openai-completions", "models": [{ "id": "good", "name": "Good" }], "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 2), applied);
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings("good-tool", registry.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("good-provider", registry.providers.items[0].name);
+}
+
 test "applyHostFrame records ui request ids for bridge correlation" {
     const allocator = std.testing.allocator;
     var registry = Registry.init(allocator);
@@ -1919,7 +1958,7 @@ test "applyHostFrame handles resources_discover with skill/prompt/theme paths" {
     const applied = try applyHostFrameStream(&registry, frames);
     try std.testing.expectEqual(@as(usize, 2), applied);
     try std.testing.expectEqual(@as(usize, 2), registry.resource_discoveries.items.len);
-    
+
     const discovery1 = registry.resource_discoveries.items[0];
     try std.testing.expectEqualStrings("/tmp/ext.ts", discovery1.extension_path);
     try std.testing.expectEqual(@as(usize, 1), discovery1.skill_paths.items.len);

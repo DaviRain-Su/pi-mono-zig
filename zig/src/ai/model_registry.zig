@@ -15,7 +15,7 @@ pub const ModelDefinition = struct {
     api: ?types.Api = null,
     base_url: ?[]const u8 = null,
     reasoning: bool = false,
-    thinking_level_map: ?types.ThinkingLevelMap = null,
+    thinking_level_map: ?types.ModelThinkingLevelMap = null,
     tool_calling: bool = true,
     loaded: bool = false,
     input_types: []const []const u8,
@@ -66,6 +66,7 @@ pub const ModelSummary = struct {
     name: []const u8,
     provider: []const u8,
     reasoning: bool,
+    thinking_level_map: ?types.ModelThinkingLevelMap,
     tool_calling: bool,
     loaded: bool,
     input_types: []const []const u8,
@@ -305,6 +306,7 @@ pub const ModelRegistry = struct {
                 .name = entry.model.name,
                 .provider = entry.model.provider,
                 .reasoning = entry.model.reasoning,
+                .thinking_level_map = entry.model.thinking_level_map,
                 .tool_calling = entry.model.tool_calling,
                 .loaded = entry.model.loaded,
                 .input_types = entry.model.input_types,
@@ -441,6 +443,29 @@ pub fn registerModel(model: types.Model) RegisterError!void {
     return getDefault().registerModel(model);
 }
 
+pub fn thinkingLevelSupported(model: types.Model, level: types.ModelThinkingLevel) bool {
+    return isThinkingLevelSupported(model, level);
+}
+
+pub fn mappedThinkingLevelValue(model: types.Model, level: types.ModelThinkingLevel) ?[]const u8 {
+    if (thinkingLevelMapping(model, level)) |mapping| {
+        if (mapping == .mapped) return mapping.mapped;
+    }
+    return null;
+}
+
+fn thinkingLevelMapping(model: types.Model, level: types.ModelThinkingLevel) ?types.ThinkingLevelMapping {
+    const map = model.thinking_level_map orelse return null;
+    return switch (level) {
+        .off => map.off,
+        .minimal => map.minimal,
+        .low => map.low,
+        .medium => map.medium,
+        .high => map.high,
+        .xhigh => map.xhigh,
+    };
+}
+
 pub fn cloneOwnedModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!types.Model {
     const cloned = try cloneModel(allocator, model);
     return cloned.model;
@@ -474,9 +499,8 @@ fn cloneModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!Mo
     const owned_compat = if (model.compat) |compat| try cloneJsonValue(allocator, compat) else null;
     errdefer if (owned_compat) |compat| deinitJsonValue(allocator, compat);
 
-    var owned_thinking_level_map = try cloneThinkingLevelMap(allocator, model.thinking_level_map);
-    errdefer if (owned_thinking_level_map) |*thinking_level_map| deinitThinkingLevelMap(allocator, thinking_level_map);
-
+    var owned_thinking_level_map = if (model.thinking_level_map) |map| try cloneThinkingLevelMap(allocator, map) else null;
+    errdefer if (owned_thinking_level_map) |*map| deinitThinkingLevelMap(allocator, map);
     return .{
         .model = .{
             .id = owned_id,
@@ -525,58 +549,9 @@ pub fn deinitOwnedModel(allocator: std.mem.Allocator, model: *types.Model) void 
     if (model.compat) |compat| {
         deinitJsonValue(allocator, compat);
     }
-    if (model.thinking_level_map) |*thinking_level_map| {
-        deinitThinkingLevelMap(allocator, thinking_level_map);
+    if (model.thinking_level_map) |*map| {
+        deinitThinkingLevelMap(allocator, map);
     }
-}
-
-fn cloneThinkingLevelMap(
-    allocator: std.mem.Allocator,
-    maybe_map: ?types.ThinkingLevelMap,
-) !?types.ThinkingLevelMap {
-    const map = maybe_map orelse return null;
-    var cloned = types.ThinkingLevelMap{};
-    errdefer deinitThinkingLevelMap(allocator, &cloned);
-
-    cloned.off = try cloneThinkingLevelMapEntry(allocator, map.off);
-    cloned.minimal = try cloneThinkingLevelMapEntry(allocator, map.minimal);
-    cloned.low = try cloneThinkingLevelMapEntry(allocator, map.low);
-    cloned.medium = try cloneThinkingLevelMapEntry(allocator, map.medium);
-    cloned.high = try cloneThinkingLevelMapEntry(allocator, map.high);
-    cloned.xhigh = try cloneThinkingLevelMapEntry(allocator, map.xhigh);
-
-    return cloned;
-}
-
-fn cloneThinkingLevelMapEntry(
-    allocator: std.mem.Allocator,
-    maybe_entry: ?types.ThinkingLevelMapEntry,
-) !?types.ThinkingLevelMapEntry {
-    const entry = maybe_entry orelse return null;
-    return switch (entry) {
-        .unsupported => .unsupported,
-        .mapped => |mapped| .{ .mapped = try allocator.dupe(u8, mapped) },
-    };
-}
-
-fn deinitThinkingLevelMap(allocator: std.mem.Allocator, map: *types.ThinkingLevelMap) void {
-    deinitThinkingLevelMapEntry(allocator, map.off);
-    deinitThinkingLevelMapEntry(allocator, map.minimal);
-    deinitThinkingLevelMapEntry(allocator, map.low);
-    deinitThinkingLevelMapEntry(allocator, map.medium);
-    deinitThinkingLevelMapEntry(allocator, map.high);
-    deinitThinkingLevelMapEntry(allocator, map.xhigh);
-    map.* = .{};
-}
-
-fn deinitThinkingLevelMapEntry(
-    allocator: std.mem.Allocator,
-    maybe_entry: ?types.ThinkingLevelMapEntry,
-) void {
-    if (maybe_entry) |entry| switch (entry) {
-        .unsupported => {},
-        .mapped => |mapped| allocator.free(mapped),
-    };
 }
 
 fn cloneHeaders(
@@ -611,6 +586,42 @@ fn deinitHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap([]con
         allocator.free(entry.value_ptr.*);
     }
     headers.deinit();
+}
+
+fn cloneThinkingLevelMap(allocator: std.mem.Allocator, map: types.ModelThinkingLevelMap) !types.ModelThinkingLevelMap {
+    return .{
+        .off = try cloneThinkingLevelMapping(allocator, map.off),
+        .minimal = try cloneThinkingLevelMapping(allocator, map.minimal),
+        .low = try cloneThinkingLevelMapping(allocator, map.low),
+        .medium = try cloneThinkingLevelMapping(allocator, map.medium),
+        .high = try cloneThinkingLevelMapping(allocator, map.high),
+        .xhigh = try cloneThinkingLevelMapping(allocator, map.xhigh),
+    };
+}
+
+fn cloneThinkingLevelMapping(allocator: std.mem.Allocator, mapping: ?types.ThinkingLevelMapping) !?types.ThinkingLevelMapping {
+    const value = mapping orelse return null;
+    return switch (value) {
+        .unsupported => .unsupported,
+        .mapped => |mapped| .{ .mapped = try allocator.dupe(u8, mapped) },
+    };
+}
+
+fn deinitThinkingLevelMap(allocator: std.mem.Allocator, map: *types.ModelThinkingLevelMap) void {
+    deinitThinkingLevelMapping(allocator, map.off);
+    deinitThinkingLevelMapping(allocator, map.minimal);
+    deinitThinkingLevelMapping(allocator, map.low);
+    deinitThinkingLevelMapping(allocator, map.medium);
+    deinitThinkingLevelMapping(allocator, map.high);
+    deinitThinkingLevelMapping(allocator, map.xhigh);
+    map.* = undefined;
+}
+
+fn deinitThinkingLevelMapping(allocator: std.mem.Allocator, mapping: ?types.ThinkingLevelMapping) void {
+    if (mapping) |value| switch (value) {
+        .unsupported => {},
+        .mapped => |mapped| allocator.free(mapped),
+    };
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
@@ -995,6 +1006,14 @@ test "built-in models are registered at startup" {
     try std.testing.expect(find("huggingface", "moonshotai/Kimi-K2.6") != null);
     try std.testing.expect(find("opencode-go", "kimi-k2.6") != null);
     try std.testing.expect(find("kimi-coding", "kimi-for-coding") != null);
+    try std.testing.expect(find("moonshotai", "kimi-k2.6") != null);
+    try std.testing.expect(find("moonshotai-cn", "kimi-k2.6") != null);
+    try std.testing.expect(find("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6") != null);
+    try std.testing.expect(find("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") != null);
+    try std.testing.expect(find("xiaomi", "mimo-v2.5-pro") != null);
+    try std.testing.expect(find("xiaomi-token-plan-cn", "mimo-v2.5-pro") != null);
+    try std.testing.expect(find("xiaomi-token-plan-ams", "mimo-v2.5-pro") != null);
+    try std.testing.expect(find("xiaomi-token-plan-sgp", "mimo-v2.5-pro") != null);
 
     const provider = getProviderConfig("openai").?;
     try std.testing.expectEqualStrings("openai-completions", provider.api);
@@ -1030,6 +1049,14 @@ test "phase4 provider expansion registers configs and default models" {
         .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
         .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
         .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
+        .{ .provider = "moonshotai", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .default_model_id = "kimi-k2.6" },
+        .{ .provider = "moonshotai-cn", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
+        .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .default_model_id = "@cf/moonshotai/kimi-k2.6" },
+        .{ .provider = "cloudflare-ai-gateway", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .default_model_id = "workers-ai/@cf/moonshotai/kimi-k2.6" },
+        .{ .provider = "xiaomi", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+        .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+        .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
+        .{ .provider = "xiaomi-token-plan-sgp", .api = "anthropic-messages", .base_url = "https://token-plan-sgp.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     };
 
     for (cases) |case| {
@@ -1220,6 +1247,44 @@ fn expectCompatString(model: types.Model, key: []const u8, expected: []const u8)
     const value = compat.object.get(key) orelse return error.TestExpectedEqual;
     try std.testing.expect(value == .string);
     try std.testing.expectEqualStrings(expected, value.string);
+}
+
+test "model thinking level map preserves off and xhigh support metadata" {
+    var registry = ModelRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerProvider(.{
+        .provider = "local-thinking",
+        .api = "openai-responses",
+        .base_url = "http://localhost:11434/v1",
+        .default_model_id = "thinking-model",
+    });
+    try registry.registerModelDefinition(.{
+        .provider = "local-thinking",
+        .id = "thinking-model",
+        .name = "Thinking Model",
+        .reasoning = true,
+        .thinking_level_map = .{
+            .off = .unsupported,
+            .xhigh = .{ .mapped = "max" },
+        },
+        .input_types = TEXT_INPUTS[0..],
+        .context_window = 4096,
+        .max_tokens = 1024,
+    });
+
+    const model = registry.find("local-thinking", "thinking-model").?;
+    try std.testing.expect(!thinkingLevelSupported(model, .off));
+    try std.testing.expect(thinkingLevelSupported(model, .minimal));
+    try std.testing.expect(thinkingLevelSupported(model, .xhigh));
+    try std.testing.expectEqualStrings("max", mappedThinkingLevelValue(model, .xhigh).?);
+    try std.testing.expectEqual(types.ModelThinkingLevel.minimal, clampThinkingLevel(model, .off));
+
+    var owned = try cloneOwnedModel(std.testing.allocator, model);
+    defer deinitOwnedModel(std.testing.allocator, &owned);
+    try std.testing.expect(owned.thinking_level_map != null);
+    try std.testing.expect(!thinkingLevelSupported(owned, .off));
+    try std.testing.expectEqualStrings("max", mappedThinkingLevelValue(owned, .xhigh).?);
 }
 
 test "supportsXhigh requires explicit non-null xhigh metadata" {

@@ -309,14 +309,13 @@ const PromptTask = struct {
         if (self.id != null) {
             try self.server.writeSuccessResponseNoData(self.id, "prompt");
             // Signal the main thread that the response has been written before
-            // sleeping. This allows the dispatcher to process already-buffered
-            // JSONL input (abort, steer, follow_up, etc.) during the yield window
-            // so those commands are fully processed before agent events begin.
+            // waiting. This allows the dispatcher to process already-buffered
+            // JSONL input (abort, steer, follow_up, etc.) before agent events begin.
             self.response_sent.store(true, .seq_cst);
-            // Yield briefly so rapid controls can be handled in dispatcher order
-            // instead of racing the prompt worker. The sleep must come after
+            // Wait until rapid controls are handled in dispatcher order instead
+            // of racing the prompt worker. The wait must come after
             // response_sent.store so the main thread unblocks first.
-            std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch {};
+            self.server.waitForPromptStart();
         }
     }
 };
@@ -513,6 +512,7 @@ const TsRpcServer = struct {
     deferred_responses_mutex: std.Io.Mutex = .init,
     deferred_flush_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     deferred_flush_input_backlog: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    input_dispatch_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     deferred_flush_last_activity_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     deferred_flush_thread: ?std.Thread = null,
     next_deferred_response_sequence: usize = 0,
@@ -678,9 +678,26 @@ const TsRpcServer = struct {
         self.deferred_flush_last_activity_ms.store(self.deferredFlushNowMs(), .seq_cst);
     }
 
+    fn setInputDispatchActive(self: *TsRpcServer, active: bool) void {
+        self.input_dispatch_active.store(active, .seq_cst);
+        self.markDeferredFlushActivity();
+    }
+
     fn setDeferredFlushInputBacklog(self: *TsRpcServer, has_backlog: bool) void {
         self.deferred_flush_input_backlog.store(has_backlog, .seq_cst);
         if (has_backlog) self.markDeferredFlushActivity();
+    }
+
+    fn shouldHoldPromptStart(self: *TsRpcServer) bool {
+        return self.deferred_flush_input_backlog.load(.seq_cst) or
+            self.input_dispatch_active.load(.seq_cst) or
+            self.hasPromptStartDeferredResponses();
+    }
+
+    fn waitForPromptStart(self: *TsRpcServer) void {
+        while (!self.deferred_flush_stop.load(.seq_cst) and self.shouldHoldPromptStart()) {
+            std.Io.sleep(self.io, .fromMilliseconds(1), .awake) catch {};
+        }
     }
 
     fn shouldHoldDeferredFlush(self: *TsRpcServer) bool {
@@ -917,6 +934,8 @@ const TsRpcServer = struct {
     }
 
     fn handleLine(self: *TsRpcServer, line: []const u8) !void {
+        self.setInputDispatchActive(true);
+        defer self.setInputDispatchActive(false);
         self.markDeferredFlushActivity();
         defer self.markDeferredFlushActivity();
 
@@ -1195,12 +1214,13 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "cycle_thinking_level")) {
-            if (!session.agent.getModel().reasoning) {
+            const model = session.agent.getModel();
+            if (!model.reasoning) {
                 try self.writeSuccessResponseRawData(id, command, "null");
                 return;
             }
             const prev_level = session.agent.getThinkingLevel();
-            const next_level = nextThinkingLevel(prev_level);
+            const next_level = nextSupportedThinkingLevel(model, prev_level);
             session.setThinkingLevel(next_level) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
@@ -1898,7 +1918,8 @@ const TsRpcServer = struct {
             // Build content: prefer string, fall back to empty text.
             const content_text: []const u8 = if (payload.get("content")) |c|
                 if (c == .string) c.string else ""
-            else "";
+            else
+                "";
             const content: session_manager_mod.CustomMessageContent = .{ .text = content_text };
 
             // Persist the custom message entry in the session file.
@@ -2552,6 +2573,15 @@ const TsRpcServer = struct {
         });
     }
 
+    fn hasPromptStartDeferredResponses(self: *TsRpcServer) bool {
+        self.deferred_responses_mutex.lockUncancelable(self.io);
+        defer self.deferred_responses_mutex.unlock(self.io);
+        for (self.deferred_responses.items) |response| {
+            if (response.priority != .bash_completion) return true;
+        }
+        return false;
+    }
+
     fn flushDeferredResponses(self: *TsRpcServer) !void {
         self.deferred_responses_mutex.lockUncancelable(self.io);
         defer self.deferred_responses_mutex.unlock(self.io);
@@ -3086,14 +3116,27 @@ fn parseThinkingLevel(object: std.json.ObjectMap, key: []const u8) !agent.Thinki
     return error.InvalidFieldType;
 }
 
-fn nextThinkingLevel(level: agent.ThinkingLevel) agent.ThinkingLevel {
+fn nextSupportedThinkingLevel(model: ai.Model, current: agent.ThinkingLevel) agent.ThinkingLevel {
+    const levels = [_]agent.ThinkingLevel{ .off, .minimal, .low, .medium, .high, .xhigh };
+    const current_index = for (levels, 0..) |level, index| {
+        if (level == current) break index;
+    } else 0;
+
+    for (1..levels.len + 1) |offset| {
+        const candidate = levels[(current_index + offset) % levels.len];
+        if (ai.model_registry.thinkingLevelSupported(model, agentThinkingLevelToModel(candidate))) return candidate;
+    }
+    return .off;
+}
+
+fn agentThinkingLevelToModel(level: agent.ThinkingLevel) ai.types.ModelThinkingLevel {
     return switch (level) {
-        .off => .minimal,
-        .minimal => .low,
-        .low => .medium,
-        .medium => .high,
-        .high => .xhigh,
-        .xhigh => .off,
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
     };
 }
 
@@ -3180,6 +3223,17 @@ fn writeModelJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, model: a
     try writeJsonString(allocator, writer, model.base_url);
     try writer.writeAll(",\"reasoning\":");
     try writer.writeAll(if (model.reasoning) "true" else "false");
+    if (model.thinking_level_map) |map| {
+        try writer.writeAll(",\"thinkingLevelMap\":{");
+        var first = true;
+        try writeThinkingLevelMapEntry(allocator, writer, "off", map.off, &first);
+        try writeThinkingLevelMapEntry(allocator, writer, "minimal", map.minimal, &first);
+        try writeThinkingLevelMapEntry(allocator, writer, "low", map.low, &first);
+        try writeThinkingLevelMapEntry(allocator, writer, "medium", map.medium, &first);
+        try writeThinkingLevelMapEntry(allocator, writer, "high", map.high, &first);
+        try writeThinkingLevelMapEntry(allocator, writer, "xhigh", map.xhigh, &first);
+        try writer.writeAll("}");
+    }
     try writer.writeAll(",\"input\":[");
     for (model.input_types, 0..) |input, index| {
         if (index > 0) try writer.writeAll(",");
@@ -3215,6 +3269,24 @@ fn writeModelJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, model: a
         try writer.writeAll(compat_json);
     }
     try writer.writeAll("}");
+}
+
+fn writeThinkingLevelMapEntry(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    key: []const u8,
+    mapping: ?ai.types.ThinkingLevelMapping,
+    first: *bool,
+) !void {
+    const value = mapping orelse return;
+    if (!first.*) try writer.writeAll(",");
+    first.* = false;
+    try writeJsonString(allocator, writer, key);
+    try writer.writeAll(":");
+    switch (value) {
+        .unsupported => try writer.writeAll("null"),
+        .mapped => |mapped| try writeJsonString(allocator, writer, mapped),
+    }
 }
 
 fn writeJsonNumber(allocator: std.mem.Allocator, writer: *std.Io.Writer, number: f64) !void {
@@ -4246,7 +4318,7 @@ test "TS RPC M3 model thinking and queue controls use TS response bytes" {
     try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"missing\",\"type\":\"response\",\"command\":\"set_model\",\"success\":false,\"error\":\"Model not found: anthropic/missing-model\"}\n");
     try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"cycle_model\",\"type\":\"response\",\"command\":\"cycle_model\",\"success\":true,\"data\":null}\n");
     try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"think\",\"type\":\"response\",\"command\":\"set_thinking_level\",\"success\":true}\n");
-    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"cycle_think\",\"type\":\"response\",\"command\":\"cycle_thinking_level\",\"success\":true,\"data\":{\"level\":\"xhigh\"}}\n");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"cycle_think\",\"type\":\"response\",\"command\":\"cycle_thinking_level\",\"success\":true,\"data\":{\"level\":\"off\"}}\n");
     try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"steer_mode\",\"type\":\"response\",\"command\":\"set_steering_mode\",\"success\":true}\n");
     try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"follow_mode\",\"type\":\"response\",\"command\":\"set_follow_up_mode\",\"success\":true}\n");
     try std.testing.expectEqual(agent.QueueMode.all, session.agent.steering_queue.mode);
