@@ -378,6 +378,7 @@ const WasmRuntime = struct {
     mutex: std.Io.Mutex = .init,
     manifest: OwnedWasmManifest,
     host: wasm_host.Host,
+    unloaded: bool,
 
     fn start(allocator: std.mem.Allocator, io: std.Io, options: WasmOptions) !*WasmRuntime {
         try options.manifest.validate();
@@ -395,6 +396,7 @@ const WasmRuntime = struct {
             .state = extension_host.ProtocolState.init(allocator),
             .manifest = owned_manifest,
             .host = host,
+            .unloaded = false,
         };
         errdefer runtime.state.deinit();
         runtime.state.ready_seen = true;
@@ -417,7 +419,18 @@ const WasmRuntime = struct {
         self.state.registry_frames_applied += 1;
     }
 
+    fn cleanupForUnload(self: *WasmRuntime) void {
+        self.state.clearPendingRequests();
+        if (!self.unloaded) {
+            self.host.unload(&self.state.registry, self.manifest.tool_id);
+            self.unloaded = true;
+            return;
+        }
+        _ = self.state.registry.unregisterTool(self.manifest.tool_id);
+    }
+
     fn deinit(self: *WasmRuntime) void {
+        self.cleanupForUnload();
         self.host.deinit();
         self.state.deinit();
         self.manifest.deinit(self.allocator);
@@ -643,8 +656,7 @@ fn wasmShutdown(ptr: *anyopaque) !void {
     const runtime = wasmRuntime(ptr);
     runtime.mutex.lockUncancelable(runtime.io);
     defer runtime.mutex.unlock(runtime.io);
-    runtime.state.clearPendingRequests();
-    runtime.host.unload(&runtime.state.registry, runtime.manifest.tool_id);
+    runtime.cleanupForUnload();
     runtime.state.shutdown_complete_seen = true;
 }
 
@@ -952,6 +964,104 @@ test "wasm runtime registers schema preserving tool and executes through agent t
     const unloaded_snapshot = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(unloaded_snapshot);
     try std.testing.expect(std.mem.indexOf(u8, unloaded_snapshot, "\"tools\":[]") != null);
+}
+
+test "wasm unload shutdown is idempotent and final across repeated cycles" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    var expected_output: ?[]u8 = null;
+    defer if (expected_output) |output| allocator.free(output);
+
+    for (0..2) |cycle| {
+        const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+            .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+        } });
+        defer adapter.deinit();
+
+        try adapter.waitForReady(0);
+        try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+        {
+            const counts = wasmRuntime(adapter.ptr).host.resourceCounts();
+            try std.testing.expect(counts.memory_bytes > 0);
+            try std.testing.expect(counts.function_returns > 0);
+            try std.testing.expect(counts.function_exports > 0);
+        }
+
+        var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+        defer deinitAgentTool(allocator, &agent_tool);
+
+        var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\\nbravo\\ncharlie\\ndelta\",\"maxLines\":2,\"maxBytes\":1024}", .{});
+        defer success_params.deinit();
+        const success = try agent_tool.execute.?(allocator, "wasm-cycle-success", success_params.value, agent_tool.execute_context, null, null, null);
+        defer tools_common.deinitContentBlocks(allocator, success.content);
+        try std.testing.expectEqual(@as(usize, 1), success.content.len);
+        if (cycle == 0) {
+            expected_output = try allocator.dupe(u8, success.content[0].text.text);
+        } else {
+            try std.testing.expectEqualStrings(expected_output.?, success.content[0].text.text);
+        }
+
+        try adapter.shutdown();
+        try adapter.shutdown();
+        try std.testing.expect(adapter.hasShutdownComplete());
+        try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "builtin.truncateHead"));
+        const counts_after_shutdown = wasmRuntime(adapter.ptr).host.resourceCounts();
+        try std.testing.expectEqual(@as(usize, 0), counts_after_shutdown.memory_bytes);
+        try std.testing.expectEqual(@as(usize, 0), counts_after_shutdown.function_returns);
+        try std.testing.expectEqual(@as(usize, 0), counts_after_shutdown.function_exports);
+        try std.testing.expectError(error.WasmToolNotRegistered, agent_tool.execute.?(allocator, "wasm-cycle-stale", success_params.value, agent_tool.execute_context, null, null, null));
+
+        const unloaded_snapshot = try adapter.snapshotRegistryJson(allocator);
+        defer allocator.free(unloaded_snapshot);
+        try std.testing.expect(std.mem.indexOf(u8, unloaded_snapshot, "\"tools\":[]") != null);
+    }
+}
+
+test "wasm cleanup covers load failure call failure shutdown and deinit paths" {
+    const allocator = std.testing.allocator;
+
+    var mismatch_manifest = try wasm_manifest.validateManifestText(allocator, "test/fixtures/wasm/pure-truncate-head-v0",
+        \\{"schemaVersion":"pi-extension.v0","id":"com.pi.pure-truncate-head","name":"Pure Truncate Head Fixture","version":"0.1.0","description":"Capability-free Wasm migration fixture for the existing truncateHead pure tool implementation.","artifact":{"kind":"wasm-component","path":"wasm/plugin.wasm"},"tool":{"id":"wrong.truncateHead","description":"Keeps the beginning of content within line and byte limits.","inputSchema":{"type":"object","required":["content","maxLines","maxBytes"],"properties":{"content":{"type":"string"},"maxLines":{"type":"number"},"maxBytes":{"type":"number"}}},"outputSchema":{"type":"object"}},"capabilities":[]}
+    );
+    defer mismatch_manifest.deinit(allocator);
+    try std.testing.expect(mismatch_manifest == .valid);
+    try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&mismatch_manifest.valid),
+    } }));
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    {
+        const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+            .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+        } });
+        defer adapter.deinit();
+
+        var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+        defer deinitAgentTool(allocator, &agent_tool);
+        wasmRuntime(adapter.ptr).host.unload(null, null);
+        var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\\nbravo\",\"maxLines\":1,\"maxBytes\":1024}", .{});
+        defer success_params.deinit();
+        try std.testing.expectError(error.MissingWasmExport, agent_tool.execute.?(allocator, "wasm-call-failure", success_params.value, agent_tool.execute_context, null, null, null));
+        try adapter.shutdown();
+        try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "builtin.truncateHead"));
+        const counts_after_failure_shutdown = wasmRuntime(adapter.ptr).host.resourceCounts();
+        try std.testing.expectEqual(@as(usize, 0), counts_after_failure_shutdown.memory_bytes);
+        try std.testing.expectEqual(@as(usize, 0), counts_after_failure_shutdown.function_returns);
+        try std.testing.expectEqual(@as(usize, 0), counts_after_failure_shutdown.function_exports);
+    }
+
+    {
+        const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+            .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+        } });
+        adapter.deinit();
+    }
 }
 
 test "wasm runtime rejects metadata schema mismatch before registration" {

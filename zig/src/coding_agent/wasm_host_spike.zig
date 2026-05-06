@@ -92,6 +92,7 @@ pub const Host = struct {
         if (input_json.len > MAX_EXECUTE_INPUT_BYTES) return error.WasmInputTooLarge;
         if (!std.unicode.utf8ValidateSlice(input_json)) return error.InvalidUtf8Input;
         try expectJsonObject(self.allocator, input_json);
+        _ = self.function_exports.get("execute") orelse return error.MissingWasmExport;
         try self.deliverExecuteInput(input_json);
         _ = try self.invokeConstI32WithSignature("execute", 2);
 
@@ -600,6 +601,40 @@ test "wasm unload cleanup releases host resources and unregisters tool" {
     try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
     try std.testing.expect(!registry.unregisterTool(manifest_result.valid.tool_id));
     try std.testing.expectError(error.MissingWasmExport, host.callMetadata());
+}
+
+test "wasm unload is idempotent and final across metadata schema execute calls" {
+    const allocator = std.testing.allocator;
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, PURE_TOOL_PACKAGE_ROOT);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    var registry = extension_registry.Registry.init(allocator);
+    defer registry.deinit();
+
+    var host = try Host.loadFromFile(allocator, std.testing.io, manifest_result.valid.artifact_absolute_path);
+    defer host.deinit();
+
+    try registry.registerTool(
+        manifest_result.valid.tool_id,
+        manifest_result.valid.tool_id,
+        manifest_result.valid.description,
+        manifest_result.valid.artifact_absolute_path,
+    );
+
+    host.unload(&registry, manifest_result.valid.tool_id);
+    host.unload(&registry, manifest_result.valid.tool_id);
+
+    const after = host.resourceCounts();
+    try std.testing.expectEqual(@as(usize, 0), after.memory_bytes);
+    try std.testing.expectEqual(@as(usize, 0), after.function_returns);
+    try std.testing.expectEqual(@as(usize, 0), after.function_exports);
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+
+    try std.testing.expectError(error.MissingWasmExport, host.callMetadata());
+    try std.testing.expectError(error.MissingWasmExport, host.callSchema());
+    try std.testing.expectError(error.MissingWasmExport, host.callExecute(PURE_TOOL_SUCCESS_INPUT_JSON));
 }
 
 test "wasm pure tool selection names existing implementation manifest and artifact" {
