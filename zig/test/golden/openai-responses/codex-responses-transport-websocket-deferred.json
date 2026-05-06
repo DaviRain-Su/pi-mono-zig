@@ -25,6 +25,7 @@
             "role": "user"
           }
         ],
+        "instructions": "You are a helpful assistant.",
         "model": "gpt-5.1-codex-websocket-transport",
         "parallel_tool_calls": true,
         "prompt_cache_key": "fixture-codex-websocket-session",

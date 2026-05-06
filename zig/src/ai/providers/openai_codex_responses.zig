@@ -10,6 +10,7 @@ const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+const DEFAULT_CODEX_SYSTEM_PROMPT = "You are a helpful assistant.";
 const CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
 const MessagePartKind = enum {
@@ -248,11 +249,13 @@ pub fn buildRequestPayload(
     try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
     try payload.put(allocator, try allocator.dupe(u8, "include"), .{ .array = include });
 
-    if (context.system_prompt) |system_prompt| {
-        const instructions = try openai.sanitizeSurrogates(allocator, system_prompt);
-        defer allocator.free(instructions);
-        try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
-    }
+    const raw_instructions = if (context.system_prompt) |system_prompt|
+        if (system_prompt.len > 0) system_prompt else DEFAULT_CODEX_SYSTEM_PROMPT
+    else
+        DEFAULT_CODEX_SYSTEM_PROMPT;
+    const instructions = try openai.sanitizeSurrogates(allocator, raw_instructions);
+    defer allocator.free(instructions);
+    try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
 
     if (options) |stream_options| {
         if (stream_options.temperature) |temperature| {
@@ -1987,7 +1990,7 @@ test "stream onResponse failure is terminal error event" {
     try std.testing.expect(stream.next() == null);
 }
 
-test "buildRequestPayload omits instructions when no system prompt is provided" {
+test "buildRequestPayload uses default instructions when no system prompt is provided" {
     const allocator = std.testing.allocator;
     const model = types.Model{
         .id = "gpt-5.5",
@@ -2004,7 +2007,7 @@ test "buildRequestPayload omits instructions when no system prompt is provided" 
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, null);
     defer freeJsonValue(allocator, payload);
 
-    try std.testing.expect(payload.object.get("instructions") == null);
+    try std.testing.expectEqualStrings(DEFAULT_CODEX_SYSTEM_PROMPT, payload.object.get("instructions").?.string);
 }
 
 test "buildRequestPayload preserves requested Codex reasoning effort" {
