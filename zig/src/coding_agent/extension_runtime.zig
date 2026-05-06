@@ -231,34 +231,83 @@ fn freeUiRequests(allocator: std.mem.Allocator, requests: []ExtensionUiRequest) 
 }
 
 const RegistryExpectContext = struct {
+    tool_seen: bool = false,
     command_seen: bool = false,
+    shortcut_seen: bool = false,
     flag_seen: bool = false,
+    provider_seen: bool = false,
+    capability_seen: bool = false,
+    resource_seen: bool = false,
+    header_seen: bool = false,
+    footer_seen: bool = false,
+    terminal_input_seen: bool = false,
+    editor_seen: bool = false,
+    widget_seen: bool = false,
+    message_renderer_seen: bool = false,
 };
 
 fn expectRegistryEntriesCallback(context: ?*anyopaque, registry: *const Registry) !void {
     const result: *RegistryExpectContext = @ptrCast(@alignCast(context.?));
+    for (registry.tools.items) |tool| {
+        if (std.mem.eql(u8, tool.name, "adapter-tool")) result.tool_seen = true;
+    }
     for (registry.commands.items) |command| {
         if (std.mem.eql(u8, command.name, "adapter-command")) result.command_seen = true;
     }
+    for (registry.shortcuts.items) |shortcut| {
+        if (std.mem.eql(u8, shortcut.shortcut, "ctrl+a")) result.shortcut_seen = true;
+    }
     for (registry.flags.items) |flag| {
         if (std.mem.eql(u8, flag.name, "adapter-flag")) result.flag_seen = true;
+    }
+    for (registry.providers.items) |provider| {
+        if (std.mem.eql(u8, provider.name, "adapter-provider")) result.provider_seen = true;
+    }
+    for (registry.capabilities.items) |capability| {
+        if (std.mem.eql(u8, capability.id, "adapter-capability")) result.capability_seen = true;
+    }
+    for (registry.resource_discoveries.items) |discovery| {
+        if (std.mem.eql(u8, discovery.extension_path, "fixture/adapter.ts")) result.resource_seen = true;
+    }
+    result.header_seen = registry.header_hook != null;
+    result.footer_seen = registry.footer_hook != null;
+    for (registry.terminal_input_subs.items) |sub| {
+        if (std.mem.eql(u8, sub.id, "adapter-terminal-input")) result.terminal_input_seen = true;
+    }
+    result.editor_seen = registry.editor_component_hook != null;
+    for (registry.widgets.items) |widget| {
+        if (std.mem.eql(u8, widget.key, "adapter-widget")) result.widget_seen = true;
+    }
+    for (registry.message_renderers.items) |renderer| {
+        if (std.mem.eql(u8, renderer.custom_type, "adapter-message")) result.message_renderer_seen = true;
     }
 }
 
 fn expectAdapterRegistryUiEventShutdownConformance(allocator: std.mem.Allocator, adapter: RuntimeAdapter) !void {
     try adapter.waitForReady(500);
     var elapsed: u64 = 0;
-    while ((adapter.pendingCount() < 1 or adapter.registryFramesApplied() < 2) and elapsed <= 1000) : (elapsed += 10) {
+    while ((adapter.pendingCount() < 1 or adapter.registryFramesApplied() < 13) and elapsed <= 1000) : (elapsed += 10) {
         std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
-    try std.testing.expectEqual(@as(usize, 2), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 13), adapter.registryFramesApplied());
     try std.testing.expect(adapter.hasRegisteredCommand("adapter-command"));
 
     var registry_context = RegistryExpectContext{};
     try adapter.withRegistry(&registry_context, expectRegistryEntriesCallback);
+    try std.testing.expect(registry_context.tool_seen);
     try std.testing.expect(registry_context.command_seen);
+    try std.testing.expect(registry_context.shortcut_seen);
     try std.testing.expect(registry_context.flag_seen);
+    try std.testing.expect(registry_context.provider_seen);
+    try std.testing.expect(registry_context.capability_seen);
+    try std.testing.expect(registry_context.resource_seen);
+    try std.testing.expect(registry_context.header_seen);
+    try std.testing.expect(registry_context.footer_seen);
+    try std.testing.expect(registry_context.terminal_input_seen);
+    try std.testing.expect(registry_context.editor_seen);
+    try std.testing.expect(registry_context.widget_seen);
+    try std.testing.expect(registry_context.message_renderer_seen);
 
     const requests = try adapter.takeUiRequests(allocator);
     defer freeUiRequests(allocator, requests);
@@ -277,7 +326,18 @@ fn expectAdapterRegistryUiEventShutdownConformance(allocator: std.mem.Allocator,
     });
     const snapshot = try adapter.snapshotRegistryJson(allocator);
     defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"adapter-tool\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"adapter-command\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"shortcut\":\"ctrl+a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"adapter-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"id\":\"adapter-capability\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"resourceDiscoveries\":[{\"extensionPath\":\"fixture/adapter.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"headerHook\":{\"lines\":[\"Adapter header\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"footerHook\":{\"lines\":[\"Adapter footer\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"id\":\"adapter-terminal-input\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"editorComponentHook\":{\"label\":\"Adapter editor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"widgets\":[{\"key\":\"adapter-widget\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"customType\":\"adapter-message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"value\":\"from-cli\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"default\":\"default\"") != null);
 
@@ -323,8 +383,19 @@ test "process_jsonl runtime adapter preserves registry UI response event and shu
             "printf '{{\"type\":\"ready\"}}\\n'; " ++
             "printf '{{\"type\":\"extension_ui_request\",\"id\":\"notify\",\"method\":\"notice\",\"responseRequired\":false,\"payload\":{{\"ok\":true}}}}\\n'; " ++
             "printf '{{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true,\"payload\":{{\"text\":\"x\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"register_tool\",\"name\":\"adapter-tool\",\"label\":\"Adapter Tool\",\"description\":\"Adapter tool\",\"parameters\":{{\"type\":\"object\"}},\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
             "printf '{{\"type\":\"register_command\",\"name\":\"adapter-command\",\"description\":\"Adapter\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_shortcut\",\"shortcut\":\"ctrl+a\",\"command\":\"adapter-command\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
             "printf '{{\"type\":\"register_flag\",\"name\":\"adapter-flag\",\"valueType\":\"string\",\"default\":\"default\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_provider\",\"name\":\"adapter-provider\",\"displayName\":\"Adapter Provider\",\"api\":\"openai-completions\",\"models\":[{{\"id\":\"adapter-model\",\"name\":\"Adapter Model\"}}],\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_capability\",\"id\":\"adapter-capability\",\"kind\":\"workflow\",\"title\":\"Adapter Capability\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"promptPaths\":[\"fixture/prompts\"],\"themePaths\":[\"fixture/themes\"],\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"set_header\",\"lines\":[\"Adapter header\"],\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"set_footer\",\"lines\":[\"Adapter footer\"],\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_terminal_input\",\"id\":\"adapter-terminal-input\",\"consume\":false,\"transformTo\":\"rewritten\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"set_editor_component\",\"label\":\"Adapter editor\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"set_widget\",\"key\":\"adapter-widget\",\"lines\":[\"Adapter widget\"],\"placement\":\"belowEditor\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_message_renderer\",\"customType\":\"adapter-message\",\"extensionPath\":\"fixture/adapter.ts\"}}\\n'; " ++
             "while IFS= read -r line; do " ++
             "printf '%s\\n' \"$line\" >> {s}; " ++
             "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++

@@ -152,6 +152,25 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "unregister_message_renderer",
 };
 
+pub fn registryFrameTypeNames() []const []const u8 {
+    return REGISTRY_FRAME_TYPES[0..];
+}
+
+pub fn diagnosticCategoryNames() []const []const u8 {
+    return &.{
+        "blank_frame",
+        "malformed_json",
+        "non_object_frame",
+        "unsupported_message_type",
+        "duplicate_ready",
+        "duplicate_pending_request",
+        "incomplete_frame",
+        "startup_failure",
+        "host_error",
+        "host_exit",
+    };
+}
+
 fn isRegistryFrameType(type_name: []const u8) bool {
     inline for (REGISTRY_FRAME_TYPES) |candidate| {
         if (std.mem.eql(u8, type_name, candidate)) return true;
@@ -365,6 +384,14 @@ pub const ProtocolState = struct {
 
     pub fn pendingCount(self: *const ProtocolState) usize {
         return self.pending_request_ids.count();
+    }
+
+    pub fn diagnosticCategoryCount(self: *const ProtocolState, category: DiagnosticCategory) usize {
+        var count: usize = 0;
+        for (self.diagnostics.items) |diagnostic| {
+            if (diagnostic.category == category) count += 1;
+        }
+        return count;
     }
 
     pub fn resolvePendingRequest(self: *ProtocolState, id: []const u8) bool {
@@ -680,6 +707,50 @@ test "ProtocolState registry_frames_applied counts only accepted registry outcom
     try std.testing.expectEqual(@as(usize, 3), state.registry_frames_applied);
     try std.testing.expectEqual(@as(usize, 1), state.registry.ui_request_ids.items.len);
     try std.testing.expectEqualStrings("record-only", state.registry.ui_request_ids.items[0]);
+}
+
+test "extension protocol ABI conformance helper covers diagnostics registry frames and UI lifecycle" {
+    const frame_types = registryFrameTypeNames();
+    try std.testing.expectEqual(@as(usize, 23), frame_types.len);
+    try std.testing.expectEqualStrings("register_tool", frame_types[0]);
+    try std.testing.expectEqualStrings("unregister_message_renderer", frame_types[frame_types.len - 1]);
+
+    const diagnostic_names = diagnosticCategoryNames();
+    try std.testing.expectEqual(@typeInfo(DiagnosticCategory).@"enum".fields.len, diagnostic_names.len);
+    inline for (@typeInfo(DiagnosticCategory).@"enum".fields, 0..) |field, index| {
+        const category: DiagnosticCategory = @enumFromInt(field.value);
+        try std.testing.expectEqualStrings(category.jsonName(), diagnostic_names[index]);
+    }
+
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"extension_ui_request\",\"id\":\"pre-ready\",\"method\":\"input\",\"responseRequired\":true}\n" ++
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true}\n" ++
+        "{\"type\":\"register_message_renderer\",\"customType\":\"custom\",\"extensionPath\":\"fixture/protocol.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 1), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), state.diagnosticCategoryCount(.host_error));
+    try std.testing.expectEqual(@as(usize, 1), state.diagnosticCategoryCount(.duplicate_ready));
+    try std.testing.expectEqual(@as(usize, 1), state.diagnosticCategoryCount(.duplicate_pending_request));
+    try std.testing.expectEqual(@as(usize, 1), state.registry.message_renderers.items.len);
+
+    try std.testing.expect(state.resolvePendingRequest("pending"));
+    try std.testing.expectEqual(@as(usize, 0), state.pendingCount());
+    state.closePendingRequests();
+    try parser.feed(allocator, "{\"type\":\"extension_ui_request\",\"id\":\"after-close\",\"method\":\"input\",\"responseRequired\":true}\n", &state);
+    try std.testing.expectEqual(@as(usize, 1), state.ui_requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.pendingCount());
 }
 
 test "M6 host protocol serializes deterministic Zig to host frames" {

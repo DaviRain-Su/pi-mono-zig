@@ -1268,6 +1268,61 @@ pub const Registry = struct {
     }
 };
 
+pub const RegistrySurfaceCounts = struct {
+    tools: usize,
+    commands: usize,
+    shortcuts: usize,
+    flags: usize,
+    providers: usize,
+    capabilities: usize,
+    resource_discoveries: usize,
+    header_hooks: usize,
+    footer_hooks: usize,
+    terminal_input_subscriptions: usize,
+    editor_component_hooks: usize,
+    widgets: usize,
+    message_renderers: usize,
+    ui_request_ids: usize,
+};
+
+pub fn registrySurfaceNames() []const []const u8 {
+    return &.{
+        "tools",
+        "commands",
+        "shortcuts",
+        "flags",
+        "providers",
+        "capabilities",
+        "resourceDiscoveries",
+        "headerHook",
+        "footerHook",
+        "terminalInputSubscriptions",
+        "editorComponentHook",
+        "widgets",
+        "messageRenderers",
+        "uiRequestIds",
+    };
+}
+
+pub fn registrySurfaceCounts(registry: *const Registry) RegistrySurfaceCounts {
+    return .{
+        .tools = registry.tools.items.len,
+        .commands = registry.commands.items.len,
+        .shortcuts = registry.shortcuts.items.len,
+        .flags = registry.flags.items.len,
+        .providers = registry.providers.items.len,
+        .capabilities = registry.capabilities.items.len,
+        .resource_discoveries = registry.resource_discoveries.items.len,
+        .header_hooks = if (registry.header_hook != null) 1 else 0,
+        .footer_hooks = if (registry.footer_hook != null) 1 else 0,
+        .terminal_input_subscriptions = registry.terminal_input_subs.items.len,
+        .editor_component_hooks = if (registry.editor_component_hook != null) 1 else 0,
+        .widgets = registry.widgets.items.len,
+        .message_renderers = registry.message_renderers.items.len,
+        .ui_request_ids = registry.ui_request_ids.items.len,
+    };
+}
+
 fn makeTerminalInputSubscription(
     allocator: std.mem.Allocator,
     id: []const u8,
@@ -1617,6 +1672,32 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
     }
     try root.put(allocator, try allocator.dupe(u8, "providers"), .{ .array = providers_array });
 
+    var discoveries_array = std.json.Array.init(allocator);
+    for (registry.resource_discoveries.items) |discovery| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, discovery.extension_path) });
+
+        var skill_paths = std.json.Array.init(allocator);
+        for (discovery.skill_paths.items) |path| {
+            try skill_paths.append(.{ .string = try allocator.dupe(u8, path) });
+        }
+        try entry.put(allocator, try allocator.dupe(u8, "skillPaths"), .{ .array = skill_paths });
+
+        var prompt_paths = std.json.Array.init(allocator);
+        for (discovery.prompt_paths.items) |path| {
+            try prompt_paths.append(.{ .string = try allocator.dupe(u8, path) });
+        }
+        try entry.put(allocator, try allocator.dupe(u8, "promptPaths"), .{ .array = prompt_paths });
+
+        var theme_paths = std.json.Array.init(allocator);
+        for (discovery.theme_paths.items) |path| {
+            try theme_paths.append(.{ .string = try allocator.dupe(u8, path) });
+        }
+        try entry.put(allocator, try allocator.dupe(u8, "themePaths"), .{ .array = theme_paths });
+        try discoveries_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "resourceDiscoveries"), .{ .array = discoveries_array });
+
     var ids_array = std.json.Array.init(allocator);
     for (registry.ui_request_ids.items) |id| {
         try ids_array.append(.{ .string = try allocator.dupe(u8, id) });
@@ -1645,6 +1726,24 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
     } else {
         try root.put(allocator, try allocator.dupe(u8, "editorComponentHook"), .null);
     }
+
+    var widgets_array = std.json.Array.init(allocator);
+    for (registry.widgets.items) |widget| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "key"), .{ .string = try allocator.dupe(u8, widget.key) });
+        var lines_array = std.json.Array.init(allocator);
+        for (widget.lines) |line| {
+            try lines_array.append(.{ .string = try allocator.dupe(u8, line) });
+        }
+        try entry.put(allocator, try allocator.dupe(u8, "lines"), .{ .array = lines_array });
+        try entry.put(allocator, try allocator.dupe(u8, "placement"), .{ .string = try allocator.dupe(u8, switch (widget.placement) {
+            .above_editor => "aboveEditor",
+            .below_editor => "belowEditor",
+        }) });
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, widget.extension_path) });
+        try widgets_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "widgets"), .{ .array = widgets_array });
 
     var mr_array = std.json.Array.init(allocator);
     for (registry.message_renderers.items) |mr| {
@@ -3110,6 +3209,62 @@ test "Registry clearUiHooksForReload drops widgets" {
 
     registry.clearUiHooksForReload();
     try std.testing.expectEqual(@as(usize, 0), registry.widgets.items.len);
+}
+
+test "extension registry conformance helper snapshots every supported surface" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const surface_names = registrySurfaceNames();
+    try std.testing.expectEqual(@as(usize, 14), surface_names.len);
+    try std.testing.expectEqualStrings("tools", surface_names[0]);
+    try std.testing.expectEqualStrings("uiRequestIds", surface_names[surface_names.len - 1]);
+
+    const frames =
+        \\{ "type": "register_tool", "name": "tool", "label": "Tool", "description": "Tool desc", "parameters": { "type": "object" }, "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_command", "name": "command", "description": "Command desc", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_shortcut", "shortcut": "ctrl+f", "command": "command", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_flag", "name": "flag", "valueType": "string", "default": "default", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_provider", "name": "provider", "models": [{ "id": "model", "name": "Model" }], "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_capability", "id": "capability", "kind": "workflow", "title": "Capability", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "resources_discover", "skillPaths": ["/skills"], "promptPaths": ["/prompts"], "themePaths": ["/themes"], "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "set_header", "lines": ["Header"], "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "set_footer", "lines": ["Footer"], "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_terminal_input", "id": "terminal", "consume": false, "transformTo": "rewritten", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "set_editor_component", "label": "Editor", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "set_widget", "key": "widget", "lines": ["Widget"], "placement": "belowEditor", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_message_renderer", "customType": "custom", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "extension_ui_request", "id": "ui-request" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 13), try applyHostFrameStream(&registry, frames));
+
+    const counts = registrySurfaceCounts(&registry);
+    try std.testing.expectEqual(@as(usize, 1), counts.tools);
+    try std.testing.expectEqual(@as(usize, 1), counts.commands);
+    try std.testing.expectEqual(@as(usize, 1), counts.shortcuts);
+    try std.testing.expectEqual(@as(usize, 1), counts.flags);
+    try std.testing.expectEqual(@as(usize, 1), counts.providers);
+    try std.testing.expectEqual(@as(usize, 1), counts.capabilities);
+    try std.testing.expectEqual(@as(usize, 1), counts.resource_discoveries);
+    try std.testing.expectEqual(@as(usize, 1), counts.header_hooks);
+    try std.testing.expectEqual(@as(usize, 1), counts.footer_hooks);
+    try std.testing.expectEqual(@as(usize, 1), counts.terminal_input_subscriptions);
+    try std.testing.expectEqual(@as(usize, 1), counts.editor_component_hooks);
+    try std.testing.expectEqual(@as(usize, 1), counts.widgets);
+    try std.testing.expectEqual(@as(usize, 1), counts.message_renderers);
+    try std.testing.expectEqual(@as(usize, 1), counts.ui_request_ids);
+
+    _ = try registry.setFlagValue("flag", .{ .string = "cli" });
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"resourceDiscoveries\":[{\"extensionPath\":\"/tmp/full.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"widgets\":[{\"key\":\"widget\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"placement\":\"belowEditor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"value\":\"cli\"") != null);
 }
 
 // --------------------------------------------------------------------------

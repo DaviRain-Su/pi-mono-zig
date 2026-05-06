@@ -572,7 +572,41 @@ fn deinitResourcePathList(allocator: std.mem.Allocator, list: *std.ArrayList(Res
     list.deinit(allocator);
 }
 
-fn eventName(event_type: ExtensionEventType) []const u8 {
+pub fn eventSurfaceNames() []const []const u8 {
+    return &.{
+        "resources_discover",
+        "session_start",
+        "session_before_switch",
+        "session_before_fork",
+        "session_before_compact",
+        "session_compact",
+        "session_shutdown",
+        "session_before_tree",
+        "session_tree",
+        "before_agent_start",
+        "agent_start",
+        "agent_end",
+        "turn_start",
+        "turn_end",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "tool_call",
+        "tool_result",
+        "user_bash",
+        "context",
+        "before_provider_request",
+        "after_provider_response",
+        "model_select",
+        "thinking_level_select",
+        "input",
+    };
+}
+
+pub fn eventName(event_type: ExtensionEventType) []const u8 {
     return switch (event_type) {
         .resources_discover => "resources_discover",
         .session_start => "session_start",
@@ -829,4 +863,15 @@ test "ResultEventBus tool_result returns undefined empty and chains partial patc
     try std.testing.expectEqualStrings("first", patched.content[0]);
     try std.testing.expectEqualStrings("{\"source\":\"ext1\"}", patched.details.?);
     try std.testing.expect(patched.is_error);
+}
+
+test "extension event conformance helper covers every supported event surface" {
+    const names = eventSurfaceNames();
+    try std.testing.expectEqual(@typeInfo(ExtensionEventType).@"enum".fields.len, names.len);
+    try std.testing.expectEqualStrings("resources_discover", names[0]);
+    try std.testing.expectEqualStrings("input", names[names.len - 1]);
+    inline for (@typeInfo(ExtensionEventType).@"enum".fields, 0..) |field, index| {
+        const event_type: ExtensionEventType = @enumFromInt(field.value);
+        try std.testing.expectEqualStrings(eventName(event_type), names[index]);
+    }
 }
