@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
-const session_mod = @import("../session.zig");
+const session_mod = @import("../sessions/session.zig");
 const rendering = @import("rendering.zig");
 const AppState = rendering.AppState;
 

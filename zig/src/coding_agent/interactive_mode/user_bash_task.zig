@@ -1,5 +1,5 @@
 const std = @import("std");
-const session_mod = @import("../session.zig");
+const session_mod = @import("../sessions/session.zig");
 const bash_tool_mod = @import("../tools/bash.zig");
 const bash_execution = @import("bash_execution.zig");
 

@@ -2,9 +2,9 @@ const std = @import("std");
 const agent = @import("agent");
 const tools = @import("../tools/root.zig");
 const common = @import("../tools/common.zig");
-const provider_config = @import("../provider_config.zig");
-const session_mod = @import("../session.zig");
-const session_manager_mod = @import("../session_manager.zig");
+const provider_config = @import("../providers/provider_config.zig");
+const session_mod = @import("../sessions/session.zig");
+const session_manager_mod = @import("../sessions/session_manager.zig");
 const shared = @import("shared.zig");
 
 const AppContext = shared.AppContext;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const common = @import("tools/common.zig");
+const common = @import("../tools/common.zig");
 const extension_registry = @import("extension_registry.zig");
 
 pub const DiagnosticCategory = enum {

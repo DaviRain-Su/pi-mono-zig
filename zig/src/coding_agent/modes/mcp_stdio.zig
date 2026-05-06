@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const common = @import("tools/common.zig");
+const common = @import("../tools/common.zig");
 
 pub const protocol_version = "2025-11-25";
 

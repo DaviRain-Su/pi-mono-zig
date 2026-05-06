@@ -1,12 +1,12 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const auth = @import("auth.zig");
+const auth = @import("../auth/auth.zig");
 const config_errors = @import("config_errors.zig");
-const keybindings_mod = @import("keybindings.zig");
+const keybindings_mod = @import("../shared/keybindings.zig");
 const migrations = @import("migrations.zig");
-const resources_mod = @import("resources.zig");
-const session_mod = @import("session.zig");
+const resources_mod = @import("../resources/resources.zig");
+const session_mod = @import("../sessions/session.zig");
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;

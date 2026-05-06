@@ -1,9 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const config_mod = @import("../config.zig");
-const resources_mod = @import("../resources.zig");
-const session_mod = @import("../session.zig");
+const config_mod = @import("../config/config.zig");
+const resources_mod = @import("../resources/resources.zig");
+const session_mod = @import("../sessions/session.zig");
 const tui = @import("tui");
 
 pub const SettingId = enum {

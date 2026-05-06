@@ -2,9 +2,9 @@ const std = @import("std");
 const agent = @import("agent");
 const cli = @import("args.zig");
 const bootstrap = @import("bootstrap.zig");
-const config_mod = @import("../coding_agent/config.zig");
-const context_files_mod = @import("../coding_agent/context_files.zig");
-const resources_mod = @import("../coding_agent/resources.zig");
+const config_mod = @import("../coding_agent/config/config.zig");
+const context_files_mod = @import("../coding_agent/resources/context_files.zig");
+const resources_mod = @import("../coding_agent/resources/resources.zig");
 const coding_agent = @import("../coding_agent/root.zig");
 
 pub const PreparedCliRuntime = struct {

@@ -1,7 +1,7 @@
 const std = @import("std");
-const auth = @import("auth.zig");
-const session_manager = @import("session_manager.zig");
-const common = @import("tools/common.zig");
+const auth = @import("../auth/auth.zig");
+const session_manager = @import("../sessions/session_manager.zig");
+const common = @import("../tools/common.zig");
 
 const AUTH_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
     std.Io.File.Permissions.fromMode(0o600)

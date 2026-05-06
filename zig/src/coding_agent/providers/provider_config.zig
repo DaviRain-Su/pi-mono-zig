@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
-const auth = @import("auth.zig");
-const common = @import("tools/common.zig");
+const auth = @import("../auth/auth.zig");
+const common = @import("../tools/common.zig");
 
 const faux = ai.providers.faux;
 

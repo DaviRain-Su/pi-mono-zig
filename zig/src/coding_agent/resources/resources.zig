@@ -1,5 +1,5 @@
 const std = @import("std");
-const config_errors = @import("config_errors.zig");
+const config_errors = @import("../config/config_errors.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const tui = @import("tui");
-const keybindings_mod = @import("../keybindings.zig");
+const keybindings_mod = @import("../shared/keybindings.zig");
 
 pub const ResolvedInputKey = union(enum) {
     app_action: keybindings_mod.Action,

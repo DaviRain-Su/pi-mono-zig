@@ -266,13 +266,14 @@ pub fn build(b: *std.Build) void {
     }
 
     const coding_agent_rendering_mod = b.createModule(.{
-        .root_source_file = b.path("src/coding_agent/interactive_mode_rendering_test_root.zig"),
+        .root_source_file = b.path("src/coding_agent/tests/interactive_mode_rendering_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     coding_agent_rendering_mod.addImport("ai", ai_mod);
     coding_agent_rendering_mod.addImport("agent", agent_mod);
     coding_agent_rendering_mod.addImport("tui", tui_mod);
+    coding_agent_rendering_mod.addImport("coding_agent", coding_agent_mod);
 
     const coding_agent_rendering_tests = b.addTest(.{
         .root_module = coding_agent_rendering_mod,

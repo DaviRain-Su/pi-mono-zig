@@ -1,8 +1,8 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const common = @import("tools/common.zig");
-const session_mod = @import("session.zig");
+const common = @import("../tools/common.zig");
+const session_mod = @import("../sessions/session.zig");
 
 pub const RunRpcModeOptions = struct {};
 

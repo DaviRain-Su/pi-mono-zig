@@ -1,6 +1,6 @@
 const std = @import("std");
 const tui = @import("tui");
-const resources_mod = @import("../resources.zig");
+const resources_mod = @import("../resources/resources.zig");
 const pending_editor_images_mod = @import("pending_editor_images.zig");
 const render_text = @import("render_text.zig");
 

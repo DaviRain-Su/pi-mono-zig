@@ -1,6 +1,6 @@
 const std = @import("std");
-const extension_registry = @import("extension_registry.zig");
-const truncate_tool = @import("tools/truncate.zig");
+const extension_registry = @import("../extension_registry.zig");
+const truncate_tool = @import("../../tools/truncate.zig");
 const wasm_manifest = @import("wasm_manifest.zig");
 
 const PLUGIN_FIXTURE_PATH = "test/fixtures/wasm/native-tool-v0/plugin.wasm";
@@ -551,7 +551,7 @@ test "extism project-local blocker evidence is recorded for wasm host spike" {
 
 test "wasm host spike stays isolated from agent session and provider runtime" {
     const allocator = std.testing.allocator;
-    const source = try readRepoFile(allocator, "src/coding_agent/wasm_host_spike.zig");
+    const source = try readRepoFile(allocator, "src/coding_agent/extensions/wasm/wasm_host_spike.zig");
     defer allocator.free(source);
 
     try expectNotContains(source, "@import(\"extension_host.zig\")");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const common = @import("tools/common.zig");
+const common = @import("../tools/common.zig");
 const extension_events = @import("extension_events.zig");
 
 /// In-memory mirrors of the registration surfaces a Bun-hosted

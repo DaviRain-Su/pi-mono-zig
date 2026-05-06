@@ -8,11 +8,11 @@ const input_prep = @import("cli/input_prep.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
-const config_mod = @import("coding_agent/config.zig");
-const json_event_wire = @import("coding_agent/json_event_wire.zig");
-const extension_runtime_mod = @import("coding_agent/extension_runtime.zig");
-const extension_flags_mod = @import("coding_agent/extension_flags.zig");
-const extension_registry_mod = @import("coding_agent/extension_registry.zig");
+const config_mod = @import("coding_agent/config/config.zig");
+const json_event_wire = @import("coding_agent/modes/json_event_wire.zig");
+const extension_runtime_mod = @import("coding_agent/extensions/extension_runtime.zig");
+const extension_flags_mod = @import("coding_agent/extensions/extension_flags.zig");
+const extension_registry_mod = @import("coding_agent/extensions/extension_registry.zig");
 const builtin = @import("builtin");
 const cli_test = if (builtin.is_test) @import("cli/test_harness.zig") else struct {};
 

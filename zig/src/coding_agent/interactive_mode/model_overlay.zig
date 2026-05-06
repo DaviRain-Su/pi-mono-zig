@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
-const config_mod = @import("../config.zig");
-const provider_config = @import("../provider_config.zig");
+const config_mod = @import("../config/config.zig");
+const provider_config = @import("../providers/provider_config.zig");
 const shared = @import("shared.zig");
 const tui = @import("tui");
 

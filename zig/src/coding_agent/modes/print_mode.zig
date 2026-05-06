@@ -2,10 +2,10 @@ const builtin = @import("builtin");
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const common = @import("tools/common.zig");
-const config_mod = @import("config.zig");
+const common = @import("../tools/common.zig");
+const config_mod = @import("../config/config.zig");
 const json_event_wire = @import("json_event_wire.zig");
-const session_mod = @import("session.zig");
+const session_mod = @import("../sessions/session.zig");
 
 pub const OutputMode = enum {
     text,

@@ -1,8 +1,8 @@
 const std = @import("std");
 const cli = @import("args.zig");
-const config_mod = @import("../coding_agent/config.zig");
-const resources_mod = @import("../coding_agent/resources.zig");
-const session_advanced = @import("../coding_agent/session_advanced.zig");
+const config_mod = @import("../coding_agent/config/config.zig");
+const resources_mod = @import("../coding_agent/resources/resources.zig");
+const session_advanced = @import("../coding_agent/sessions/session_advanced.zig");
 const coding_agent = @import("../coding_agent/root.zig");
 
 pub fn runSessionExport(

@@ -1,6 +1,6 @@
 const std = @import("std");
-const common = @import("tools/common.zig");
-const resources_mod = @import("resources.zig");
+const common = @import("../tools/common.zig");
+const resources_mod = @import("../resources/resources.zig");
 const tui_mod = @import("tui");
 
 /// Package CLI subcommand parser/executor parity with the TypeScript

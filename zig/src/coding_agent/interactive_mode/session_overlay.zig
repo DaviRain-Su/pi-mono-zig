@@ -1,5 +1,5 @@
 const std = @import("std");
-const session_manager_mod = @import("../session_manager.zig");
+const session_manager_mod = @import("../sessions/session_manager.zig");
 const tui = @import("tui");
 
 pub const SessionChoice = struct {

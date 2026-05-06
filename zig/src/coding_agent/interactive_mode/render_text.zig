@@ -1,7 +1,7 @@
 const std = @import("std");
 const tui = @import("tui");
-const keybindings_mod = @import("../keybindings.zig");
-const resources_mod = @import("../resources.zig");
+const keybindings_mod = @import("../shared/keybindings.zig");
+const resources_mod = @import("../resources/resources.zig");
 
 pub const INPUT_PROMPT_PREFIX = "> ";
 pub const COMPACT_INPUT_PROMPT_PREFIX = "Input: ";

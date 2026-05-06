@@ -1,5 +1,5 @@
 const std = @import("std");
-const extension_registry = @import("../extension_registry.zig");
+const extension_registry = @import("../extensions/extension_registry.zig");
 
 pub const WidgetPlacement = enum {
     above_editor,

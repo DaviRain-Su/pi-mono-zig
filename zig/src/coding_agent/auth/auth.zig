@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
-const common = @import("tools/common.zig");
+const common = @import("../tools/common.zig");
 const oauth_callback_listener = @import("oauth_callback_listener.zig");
 
 pub const OAuthCallbackListener = oauth_callback_listener.OAuthCallbackListener;

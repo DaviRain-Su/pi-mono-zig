@@ -1,8 +1,8 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const config_errors = @import("config_errors.zig");
-const common = @import("tools/common.zig");
+const config_errors = @import("../config/config_errors.zig");
+const common = @import("../tools/common.zig");
 
 pub fn stringifyAgentEventLine(allocator: std.mem.Allocator, event: agent.AgentEvent) ![]u8 {
     return stringifyAgentEventLineWithConfigErrors(allocator, event, &.{});

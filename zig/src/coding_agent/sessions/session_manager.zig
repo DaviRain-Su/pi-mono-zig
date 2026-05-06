@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const common = @import("tools/common.zig");
+const common = @import("../tools/common.zig");
 const session_search = @import("session_search.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;

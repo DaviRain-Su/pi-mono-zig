@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
-const session_mod = @import("../session.zig");
+const session_mod = @import("../sessions/session.zig");
 const common = @import("../tools/common.zig");
 
 const PREVIEW_LOGICAL_LINES: usize = 20;

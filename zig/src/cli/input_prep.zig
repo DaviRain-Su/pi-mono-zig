@@ -1,8 +1,8 @@
 const std = @import("std");
 const ai = @import("ai");
 const cli = @import("args.zig");
-const config_mod = @import("../coding_agent/config.zig");
-const file_image = @import("../coding_agent/file_image.zig");
+const config_mod = @import("../coding_agent/config/config.zig");
+const file_image = @import("../coding_agent/resources/file_image.zig");
 
 pub const CliStdin = struct {
     is_tty: bool = true,

@@ -2,8 +2,8 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const tui = @import("tui");
-const session_mod = @import("../session.zig");
-const session_manager_mod = @import("../session_manager.zig");
+const session_mod = @import("../sessions/session.zig");
+const session_manager_mod = @import("../sessions/session_manager.zig");
 const formatting = @import("formatting.zig");
 
 const blocksToText = formatting.blocksToText;

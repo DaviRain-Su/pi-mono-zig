@@ -2,9 +2,9 @@ const std = @import("std");
 const agent = @import("agent");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
-const tools_common = @import("tools/common.zig");
-const wasm_host = @import("wasm_host_spike.zig");
-const wasm_manifest = @import("wasm_manifest.zig");
+const tools_common = @import("../tools/common.zig");
+const wasm_host = @import("wasm/wasm_host_spike.zig");
+const wasm_manifest = @import("wasm/wasm_manifest.zig");
 
 pub const DiagnosticCategory = extension_host.DiagnosticCategory;
 pub const ExtensionUiRequest = extension_host.ExtensionUiRequest;

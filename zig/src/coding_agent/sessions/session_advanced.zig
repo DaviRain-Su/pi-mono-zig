@@ -3,8 +3,8 @@ const ai = @import("ai");
 const agent = @import("agent");
 const session_mod = @import("session.zig");
 const session_manager_mod = @import("session_manager.zig");
-const common = @import("tools/common.zig");
-const formatting = @import("interactive_mode/formatting.zig");
+const common = @import("../tools/common.zig");
+const formatting = @import("../interactive_mode/formatting.zig");
 
 pub const ContextUsage = struct {
     tokens: ?u32,

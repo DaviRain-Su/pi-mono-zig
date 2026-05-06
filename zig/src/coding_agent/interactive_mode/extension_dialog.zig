@@ -1,6 +1,6 @@
 const std = @import("std");
 const tui = @import("tui");
-const keybindings_mod = @import("../keybindings.zig");
+const keybindings_mod = @import("../shared/keybindings.zig");
 
 pub const DialogKind = enum {
     select,
