@@ -146,6 +146,27 @@ pub const ExtensionShortcut = struct {
     }
 };
 
+pub const ExtensionCapability = struct {
+    id: []u8,
+    kind: []u8,
+    title: []u8,
+    description: []u8,
+    command: ?[]u8,
+    resource_path: ?[]u8,
+    extension_path: []u8,
+
+    pub fn deinit(self: *ExtensionCapability, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.kind);
+        allocator.free(self.title);
+        allocator.free(self.description);
+        if (self.command) |command| allocator.free(command);
+        if (self.resource_path) |path| allocator.free(path);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
 pub const ProviderModel = struct {
     id: []u8,
     name: []u8,
@@ -325,6 +346,7 @@ pub const Registry = struct {
     tools: std.ArrayList(ExtensionTool) = .empty,
     commands: std.ArrayList(ExtensionCommand) = .empty,
     shortcuts: std.ArrayList(ExtensionShortcut) = .empty,
+    capabilities: std.ArrayList(ExtensionCapability) = .empty,
     providers: std.ArrayList(ExtensionProvider) = .empty,
     /// Captured `extension_ui_request` ids in arrival order. Mirrors the
     /// host-side bridge log so UI bridge correlation can be asserted by
@@ -370,6 +392,8 @@ pub const Registry = struct {
         self.commands.deinit(self.allocator);
         for (self.shortcuts.items) |*sc| sc.deinit(self.allocator);
         self.shortcuts.deinit(self.allocator);
+        for (self.capabilities.items) |*capability| capability.deinit(self.allocator);
+        self.capabilities.deinit(self.allocator);
         for (self.providers.items) |*p| p.deinit(self.allocator);
         self.providers.deinit(self.allocator);
         for (self.ui_request_ids.items) |id| self.allocator.free(id);
@@ -406,6 +430,13 @@ pub const Registry = struct {
     fn findShortcutIndex(self: *const Registry, shortcut: []const u8) ?usize {
         for (self.shortcuts.items, 0..) |sc, idx| {
             if (std.mem.eql(u8, sc.shortcut, shortcut)) return idx;
+        }
+        return null;
+    }
+
+    pub fn findCapabilityIndex(self: *const Registry, id: []const u8) ?usize {
+        for (self.capabilities.items, 0..) |capability, idx| {
+            if (std.mem.eql(u8, capability.id, id)) return idx;
         }
         return null;
     }
@@ -520,6 +551,34 @@ pub const Registry = struct {
         }
         const sc = try makeShortcut(self.allocator, shortcut, description, command, extension_path);
         try self.shortcuts.append(self.allocator, sc);
+    }
+
+    pub fn registerCapability(
+        self: *Registry,
+        id: []const u8,
+        kind: []const u8,
+        title: []const u8,
+        description: ?[]const u8,
+        command: ?[]const u8,
+        resource_path: ?[]const u8,
+        extension_path: []const u8,
+    ) !void {
+        if (self.findCapabilityIndex(id)) |idx| {
+            self.capabilities.items[idx].deinit(self.allocator);
+            self.capabilities.items[idx] = try makeCapability(self.allocator, id, kind, title, description, command, resource_path, extension_path);
+            return;
+        }
+        const capability = try makeCapability(self.allocator, id, kind, title, description, command, resource_path, extension_path);
+        try self.capabilities.append(self.allocator, capability);
+    }
+
+    pub fn unregisterCapability(self: *Registry, id: []const u8) bool {
+        if (self.findCapabilityIndex(id)) |idx| {
+            var removed = self.capabilities.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            return true;
+        }
+        return false;
     }
 
     /// Register a flag with an optional default. Strings are borrowed;
@@ -1045,6 +1104,40 @@ fn makeShortcut(
     };
 }
 
+fn makeCapability(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    kind: []const u8,
+    title: []const u8,
+    description: ?[]const u8,
+    command: ?[]const u8,
+    resource_path: ?[]const u8,
+    extension_path: []const u8,
+) !ExtensionCapability {
+    const id_dup = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_dup);
+    const kind_dup = try allocator.dupe(u8, kind);
+    errdefer allocator.free(kind_dup);
+    const title_dup = try allocator.dupe(u8, title);
+    errdefer allocator.free(title_dup);
+    const description_dup = try allocator.dupe(u8, description orelse "");
+    errdefer allocator.free(description_dup);
+    const command_dup = if (command) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (command_dup) |value| allocator.free(value);
+    const resource_path_dup = if (resource_path) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (resource_path_dup) |value| allocator.free(value);
+    const extension_path_dup = try allocator.dupe(u8, extension_path);
+    return .{
+        .id = id_dup,
+        .kind = kind_dup,
+        .title = title_dup,
+        .description = description_dup,
+        .command = command_dup,
+        .resource_path = resource_path_dup,
+        .extension_path = extension_path_dup,
+    };
+}
+
 fn makeFlag(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -1127,6 +1220,20 @@ fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: *const Registr
         try shortcuts_array.append(.{ .object = entry });
     }
     try root.put(allocator, try allocator.dupe(u8, "shortcuts"), .{ .array = shortcuts_array });
+
+    var capabilities_array = std.json.Array.init(allocator);
+    for (registry.capabilities.items) |capability| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, capability.id) });
+        try entry.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, capability.kind) });
+        try entry.put(allocator, try allocator.dupe(u8, "title"), .{ .string = try allocator.dupe(u8, capability.title) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, capability.description) });
+        try entry.put(allocator, try allocator.dupe(u8, "command"), try optionalStringJson(allocator, capability.command));
+        try entry.put(allocator, try allocator.dupe(u8, "resourcePath"), try optionalStringJson(allocator, capability.resource_path));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, capability.extension_path) });
+        try capabilities_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "capabilities"), .{ .array = capabilities_array });
 
     var flags_array = std.json.Array.init(allocator);
     for (registry.flags.items) |flag| {
@@ -1273,6 +1380,8 @@ pub const FrameOutcome = enum {
     registered_flag,
     registered_provider,
     unregistered_provider,
+    registered_capability,
+    unregistered_capability,
     resources_discovered,
     set_header_hook,
     cleared_header_hook,
@@ -1415,6 +1524,23 @@ pub fn applyHostFrame(
         const name = optionalString(object, "name") orelse return .ignored_malformed;
         _ = registry.unregisterProvider(name);
         return .unregistered_provider;
+    }
+
+    if (std.mem.eql(u8, type_name, "register_capability")) {
+        const id = optionalString(object, "id") orelse return .ignored_malformed;
+        const kind = optionalString(object, "kind") orelse return .ignored_malformed;
+        const title = optionalString(object, "title") orelse return .ignored_malformed;
+        const description = optionalString(object, "description");
+        const command = optionalString(object, "command");
+        const resource_path = optionalString(object, "resourcePath");
+        try registry.registerCapability(id, kind, title, description, command, resource_path, extension_path);
+        return .registered_capability;
+    }
+
+    if (std.mem.eql(u8, type_name, "unregister_capability")) {
+        const id = optionalString(object, "id") orelse return .ignored_malformed;
+        _ = registry.unregisterCapability(id);
+        return .unregistered_capability;
     }
 
     if (std.mem.eql(u8, type_name, "resources_discover")) {
@@ -2253,6 +2379,119 @@ test "M11 snapshot JSON includes UI hook state" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"footerHook\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"terminalInputSubscriptions\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot2, "\"editorComponentHook\":null") != null);
+}
+
+// --------------------------------------------------------------------------
+// capability registry tests
+// --------------------------------------------------------------------------
+
+test "registry can register capability" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerCapability("cap-wiki", "wiki", "Wiki", "Browse project wiki", "wiki", "skills/wiki", "/tmp/ext.ts");
+
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("cap-wiki", registry.capabilities.items[0].id);
+    try std.testing.expectEqualStrings("wiki", registry.capabilities.items[0].kind);
+    try std.testing.expectEqualStrings("Wiki", registry.capabilities.items[0].title);
+    try std.testing.expectEqualStrings("Browse project wiki", registry.capabilities.items[0].description);
+    try std.testing.expectEqualStrings("wiki", registry.capabilities.items[0].command.?);
+    try std.testing.expectEqualStrings("skills/wiki", registry.capabilities.items[0].resource_path.?);
+    try std.testing.expectEqualStrings("/tmp/ext.ts", registry.capabilities.items[0].extension_path);
+    try std.testing.expectEqual(@as(?usize, 0), registry.findCapabilityIndex("cap-wiki"));
+}
+
+test "duplicate capability id replaces old metadata" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerCapability("cap-1", "workflow", "Old", "old description", "old", "old/path", "/tmp/old.ts");
+    try registry.registerCapability("cap-2", "qa", "QA", null, null, null, "/tmp/qa.ts");
+    try registry.registerCapability("cap-1", "review", "New", "new description", "new", "new/path", "/tmp/new.ts");
+
+    try std.testing.expectEqual(@as(usize, 2), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("cap-1", registry.capabilities.items[0].id);
+    try std.testing.expectEqualStrings("review", registry.capabilities.items[0].kind);
+    try std.testing.expectEqualStrings("New", registry.capabilities.items[0].title);
+    try std.testing.expectEqualStrings("new description", registry.capabilities.items[0].description);
+    try std.testing.expectEqualStrings("new", registry.capabilities.items[0].command.?);
+    try std.testing.expectEqualStrings("new/path", registry.capabilities.items[0].resource_path.?);
+    try std.testing.expectEqualStrings("/tmp/new.ts", registry.capabilities.items[0].extension_path);
+    try std.testing.expectEqualStrings("cap-2", registry.capabilities.items[1].id);
+}
+
+test "unregister capability removes and returns correct bool" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerCapability("cap-1", "workflow", "Workflow", null, null, null, "/tmp/ext.ts");
+    try registry.registerCapability("cap-2", "mission", "Mission", null, null, null, "/tmp/ext.ts");
+
+    try std.testing.expect(registry.unregisterCapability("cap-1"));
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("cap-2", registry.capabilities.items[0].id);
+    try std.testing.expect(!registry.unregisterCapability("cap-1"));
+    try std.testing.expect(!registry.unregisterCapability("missing"));
+}
+
+test "snapshot JSON includes capabilities with optional fields" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try registry.registerCapability("cap-1", "workflow", "Workflow", "Runs workflow", "workflow", "skills/workflow", "/tmp/workflow.ts");
+    try registry.registerCapability("cap-2", "shield", "Shield", null, null, null, "/tmp/shield.ts");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+
+    const snapshot = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"capabilities\":[{\"id\":\"cap-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"kind\":\"workflow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"title\":\"Workflow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"description\":\"Runs workflow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"command\":\"workflow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"resourcePath\":\"skills/workflow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"extensionPath\":\"/tmp/workflow.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "{\"id\":\"cap-2\",\"kind\":\"shield\",\"title\":\"Shield\",\"description\":\"\",\"command\":null,\"resourcePath\":null,\"extensionPath\":\"/tmp/shield.ts\"}") != null);
+}
+
+test "malformed register_capability is ignored" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_capability", "kind": "wiki", "title": "Wiki" }
+        \\{ "type": "register_capability", "id": "cap-wiki", "title": "Wiki" }
+        \\{ "type": "register_capability", "id": "cap-wiki", "kind": "wiki" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 0), applied);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+}
+
+test "applyHostFrame supports register_capability and unregister_capability" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_capability", "id": "cap-review", "kind": "review", "title": "Review", "description": "Code review", "command": "review", "resourcePath": "skills/review", "extensionPath": "/tmp/review.ts" }
+        \\{ "type": "unregister_capability", "id": "cap-review" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 2), applied);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
 }
 
 // --------------------------------------------------------------------------
