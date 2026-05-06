@@ -725,6 +725,46 @@ test "wasm host explicit v0 ABI validates flavor imports memory exports and requ
     try std.testing.expectError(error.MissingWasmMemoryExport, parseFixture(allocator, missing_memory));
 }
 
+test "wasm host denies every canonical runtime import before artifact registration" {
+    const allocator = std.testing.allocator;
+    const imports = [_]struct {
+        capability: wasm_manifest.Capability,
+        module_name: []const u8,
+        field_name: []const u8,
+    }{
+        .{ .capability = .file_read, .module_name = "pi:filesystem", .field_name = "read" },
+        .{ .capability = .file_write, .module_name = "pi:filesystem", .field_name = "write" },
+        .{ .capability = .network_request, .module_name = "pi:network", .field_name = "fetch" },
+        .{ .capability = .shell_run, .module_name = "pi:shell", .field_name = "run" },
+        .{ .capability = .env_read, .module_name = "pi:environment", .field_name = "get" },
+        .{ .capability = .model_call, .module_name = "pi:model", .field_name = "call" },
+        .{ .capability = .session_read, .module_name = "pi:session", .field_name = "get" },
+        .{ .capability = .session_write, .module_name = "pi:session", .field_name = "set" },
+        .{ .capability = .ui_notify, .module_name = "pi:ui", .field_name = "notify" },
+        .{ .capability = .tool_use, .module_name = "pi:tool", .field_name = "use" },
+        .{ .capability = .agent_spawn, .module_name = "pi:agent", .field_name = "spawn" },
+        .{ .capability = .agent_delegate, .module_name = "pi:agent", .field_name = "delegate" },
+    };
+
+    for (imports) |entry| {
+        try std.testing.expectEqual(entry.capability, wasm_manifest.runtimeImportCapability(entry.module_name, entry.field_name).?);
+        const denial = wasm_manifest.denyRuntimeImport(entry.module_name, entry.field_name, .load, "runtime/import").?;
+        try std.testing.expectEqualStrings("denied_capability", denial.category);
+        try std.testing.expectEqual(entry.capability, denial.capability);
+        try std.testing.expectEqual(entry.capability.enforcementBranch(), denial.branch);
+        try std.testing.expectEqual(wasm_manifest.LifecyclePhase.load, denial.phase);
+        try std.testing.expectEqualStrings("runtime/import", denial.mode);
+
+        const import_attempt = try makeV0AbiModule(allocator, .{
+            .with_import = true,
+            .import_module_name = entry.module_name,
+            .import_field_name = entry.field_name,
+        });
+        defer allocator.free(import_attempt);
+        try std.testing.expectError(error.DeniedWasmImportCapability, parseFixture(allocator, import_attempt));
+    }
+}
+
 test "wasm host execute receives input JSON and returns distinct bounded JSON outputs" {
     const allocator = std.testing.allocator;
 
@@ -879,6 +919,8 @@ const V0AbiModuleOptions = struct {
     execute_len_override: ?u32 = null,
     execute_params: u32 = 2,
     with_import: bool = false,
+    import_module_name: []const u8 = "pi:filesystem",
+    import_field_name: []const u8 = "read",
     omit_execute_len: bool = false,
     export_memory: bool = true,
 };
@@ -899,8 +941,8 @@ fn makeV0AbiModule(allocator: std.mem.Allocator, options: V0AbiModuleOptions) ![
         var import_payload = std.ArrayList(u8).empty;
         defer import_payload.deinit(allocator);
         try appendUleb(&import_payload, allocator, 1);
-        try appendName(&import_payload, allocator, "pi:filesystem");
-        try appendName(&import_payload, allocator, "read");
+        try appendName(&import_payload, allocator, options.import_module_name);
+        try appendName(&import_payload, allocator, options.import_field_name);
         try import_payload.append(allocator, 0);
         try appendUleb(&import_payload, allocator, 0);
         try appendSection(&module, allocator, 2, import_payload.items);

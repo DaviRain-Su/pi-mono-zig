@@ -81,7 +81,15 @@ pub const WasmManifestHandoff = struct {
         if (self.tool_description.len == 0) return error.InvalidRuntimeOptions;
         if (self.input_schema_json.len == 0) return error.InvalidRuntimeOptions;
         if (self.output_schema_json.len == 0) return error.InvalidRuntimeOptions;
-        if (self.requested_capabilities.len != 0) return error.UnsupportedRuntimeCapability;
+        if (self.deniedRuntimeCapability(.initialize, "runtime/handoff") != null) return error.UnsupportedRuntimeCapability;
+    }
+
+    pub fn deniedRuntimeCapability(
+        self: WasmManifestHandoff,
+        phase: wasm_manifest.LifecyclePhase,
+        mode: []const u8,
+    ) ?wasm_manifest.CapabilityDenialDiagnostic {
+        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, &.{}, phase, mode);
     }
 };
 
@@ -914,6 +922,32 @@ test "wasm manifest handoff starts runtime without capability execution" {
     defer allocator.free(snapshot);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"builtin.truncateHead\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"parameters\":{\"type\":\"object\"") != null);
+}
+
+test "wasm runtime handoff denies every canonical requested capability before registration" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const base_handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
+    for (wasm_manifest.CANONICAL_CAPABILITIES) |capability| {
+        const requested = [_]wasm_manifest.Capability{capability};
+        var handoff = base_handoff;
+        handoff.requested_capabilities = requested[0..];
+
+        const denial = handoff.deniedRuntimeCapability(.initialize, "runtime/handoff").?;
+        try std.testing.expectEqualStrings("denied_capability", denial.category);
+        try std.testing.expectEqual(capability, denial.capability);
+        try std.testing.expectEqual(capability.enforcementBranch(), denial.branch);
+        try std.testing.expectEqual(wasm_manifest.LifecyclePhase.initialize, denial.phase);
+        try std.testing.expectEqualStrings("runtime/handoff", denial.mode);
+
+        try std.testing.expectError(error.UnsupportedRuntimeCapability, handoff.validate());
+        try std.testing.expectError(error.UnsupportedRuntimeCapability, startRuntime(allocator, std.testing.io, .{ .wasm = .{
+            .manifest = handoff,
+        } }));
+    }
 }
 
 const WasmToolRegistryExpectContext = struct {
