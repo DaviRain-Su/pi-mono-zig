@@ -9,7 +9,6 @@ pub const DiagnosticSeverity = extension_protocol.DiagnosticSeverity;
 pub const Diagnostic = extension_protocol.Diagnostic;
 pub const ExtensionUiRequest = extension_protocol.ExtensionUiRequest;
 pub const RegistryFrame = extension_protocol.RegistryFrame;
-pub const ResourceDiscovery = extension_protocol.ResourceDiscovery;
 pub const HostMessage = extension_protocol.HostMessage;
 pub const JsonlFrameParser = extension_protocol.JsonlFrameParser;
 pub const ProtocolState = extension_protocol.ProtocolState;

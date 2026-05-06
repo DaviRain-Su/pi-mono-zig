@@ -100,25 +100,6 @@ pub const RegistryFrame = struct {
     }
 };
 
-/// Resource paths discovered from extensions
-pub const ResourceDiscovery = struct {
-    skill_paths: [][]u8,
-    prompt_paths: [][]u8,
-    theme_paths: [][]u8,
-    extension_path: []u8,
-
-    pub fn deinit(self: *ResourceDiscovery, allocator: std.mem.Allocator) void {
-        for (self.skill_paths) |path| allocator.free(path);
-        allocator.free(self.skill_paths);
-        for (self.prompt_paths) |path| allocator.free(path);
-        allocator.free(self.prompt_paths);
-        for (self.theme_paths) |path| allocator.free(path);
-        allocator.free(self.theme_paths);
-        allocator.free(self.extension_path);
-        self.* = undefined;
-    }
-};
-
 pub const HostMessage = union(enum) {
     ready,
     diagnostic: Diagnostic,
@@ -131,8 +112,6 @@ pub const HostMessage = union(enum) {
     /// `extension_registry.applyHostFrame` so the runtime registry
     /// reflects extension contributions in CLI / TS-RPC output.
     registry_frame: RegistryFrame,
-    /// Extension resource discovery result
-    resources_discover: ResourceDiscovery,
 
     pub fn deinit(self: *HostMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -140,7 +119,6 @@ pub const HostMessage = union(enum) {
             .extension_ui_request => |*request| request.deinit(allocator),
             .error_message => |*diagnostic| diagnostic.deinit(allocator),
             .registry_frame => |*frame| frame.deinit(allocator),
-            .resources_discover => |*discovery| discovery.deinit(allocator),
             else => {},
         }
         self.* = undefined;
@@ -364,10 +342,6 @@ pub const ProtocolState = struct {
                     => self.registry_frames_applied += 1,
                     .none, .ignored_unsupported, .ignored_malformed => {},
                 }
-            },
-            .resources_discover => |discovery| {
-                // Resource discovery messages are handled by the caller
-                _ = discovery;
             },
         }
     }
@@ -599,6 +573,113 @@ test "M6 host protocol contains malformed unsupported duplicate and incomplete f
     try std.testing.expectEqual(DiagnosticCategory.duplicate_ready, state.diagnostics.items[4].category);
     try std.testing.expectEqual(DiagnosticCategory.duplicate_pending_request, state.diagnostics.items[5].category);
     try std.testing.expectEqual(DiagnosticCategory.incomplete_frame, state.diagnostics.items[6].category);
+}
+
+test "ProtocolState handles resources_discover only through registry frames" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\",42],\"promptPaths\":[\"fixture/prompts\",false],\"themePaths\":[\"fixture/themes\",null],\"extensionPath\":\"fixture/extension.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 0), state.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.ui_requests.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.resource_discoveries.items.len);
+
+    const discovery = state.registry.resource_discoveries.items[0];
+    try std.testing.expectEqualStrings("fixture/extension.ts", discovery.extension_path);
+    try std.testing.expectEqual(@as(usize, 1), discovery.skill_paths.items.len);
+    try std.testing.expectEqualStrings("fixture/skills", discovery.skill_paths.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), discovery.prompt_paths.items.len);
+    try std.testing.expectEqualStrings("fixture/prompts", discovery.prompt_paths.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), discovery.theme_paths.items.len);
+    try std.testing.expectEqualStrings("fixture/themes", discovery.theme_paths.items[0]);
+}
+
+test "ProtocolState keeps UI request edge cases stable" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    try parser.feed(allocator, "{\"type\":\"extension_ui_request\",\"id\":\"pre-ready\",\"method\":\"input\",\"responseRequired\":true}\n", &state);
+    try std.testing.expectEqual(@as(usize, 1), state.diagnostics.items.len);
+    try std.testing.expectEqual(DiagnosticCategory.host_error, state.diagnostics.items[0].category);
+    try std.testing.expectEqual(@as(usize, 0), state.ui_requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.pendingCount());
+
+    const ready_and_requests =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"notify\",\"method\":\"notification\",\"responseRequired\":false}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true}\n";
+    try parser.feed(allocator, ready_and_requests, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 2), state.diagnostics.items.len);
+    try std.testing.expectEqual(DiagnosticCategory.duplicate_pending_request, state.diagnostics.items[1].category);
+    try std.testing.expectEqual(@as(usize, 2), state.ui_requests.items.len);
+    try std.testing.expectEqualStrings("notify", state.ui_requests.items[0].id);
+    try std.testing.expect(!state.ui_requests.items[0].response_required);
+    try std.testing.expectEqualStrings("pending", state.ui_requests.items[1].id);
+    try std.testing.expect(state.ui_requests.items[1].response_required);
+    try std.testing.expectEqual(@as(usize, 1), state.pendingCount());
+    try std.testing.expect(!state.resolvePendingRequest("unknown"));
+
+    state.closePendingRequests();
+    try std.testing.expectEqual(@as(usize, 0), state.pendingCount());
+    try parser.feed(allocator, "{\"type\":\"extension_ui_request\",\"id\":\"after-close\",\"method\":\"input\",\"responseRequired\":true}\n", &state);
+    try std.testing.expectEqual(@as(usize, 2), state.ui_requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.pendingCount());
+    try std.testing.expect(!state.resolvePendingRequest("pending"));
+}
+
+test "ProtocolState registry_frames_applied counts only accepted registry outcomes" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    try parser.feed(allocator, "{\"type\":\"ready\"}\n", &state);
+    try std.testing.expectEqual(@as(usize, 0), state.registry_frames_applied);
+
+    try parser.feed(allocator, "{\"type\":\"register_tool\",\"name\":\"tool\",\"label\":\"Tool\",\"extensionPath\":\"fixture/extension.ts\"}\n", &state);
+    try std.testing.expectEqual(@as(usize, 1), state.registry_frames_applied);
+
+    try parser.feed(allocator, "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"extensionPath\":\"fixture/extension.ts\"}\n", &state);
+    try std.testing.expectEqual(@as(usize, 2), state.registry_frames_applied);
+
+    try parser.feed(allocator, "{\"type\":\"clear_extension_registrations\",\"extensionPath\":\"fixture/extension.ts\"}\n", &state);
+    try std.testing.expectEqual(@as(usize, 3), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 0), state.registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.registry.resource_discoveries.items.len);
+
+    try parser.feed(allocator, "{\"type\":\"register_tool\",\"label\":\"missing name\",\"extensionPath\":\"fixture/extension.ts\"}\n", &state);
+    try parser.feed(allocator, "{\"type\":\"clear_extension_registrations\"}\n", &state);
+    try parser.feed(allocator, "{\"type\":\"unsupported\"}\n", &state);
+    try parser.feed(allocator, "{\"type\":\"extension_ui_request\",\"id\":\"notify\",\"method\":\"notification\",\"responseRequired\":false}\n", &state);
+    try std.testing.expectEqual(@as(usize, 3), state.registry_frames_applied);
+
+    var unsupported = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"unsupported_registry_frame\"}", .{});
+    defer unsupported.deinit();
+    try state.onMessage(.{ .registry_frame = .{ .payload = unsupported.value } });
+    try std.testing.expectEqual(@as(usize, 3), state.registry_frames_applied);
+
+    var none = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"extension_ui_request\",\"id\":\"record-only\"}", .{});
+    defer none.deinit();
+    try state.onMessage(.{ .registry_frame = .{ .payload = none.value } });
+    try std.testing.expectEqual(@as(usize, 3), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.ui_request_ids.items.len);
+    try std.testing.expectEqualStrings("record-only", state.registry.ui_request_ids.items[0]);
 }
 
 test "M6 host protocol serializes deterministic Zig to host frames" {
