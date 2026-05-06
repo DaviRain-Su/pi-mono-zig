@@ -157,6 +157,8 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "register_flag",
     "register_provider",
     "unregister_provider",
+    "register_capability",
+    "unregister_capability",
     "set_header",
     "clear_header",
     "set_footer",
@@ -343,6 +345,8 @@ pub const ProtocolState = struct {
                     .registered_flag,
                     .registered_provider,
                     .unregistered_provider,
+                    .registered_capability,
+                    .unregistered_capability,
                     .set_header_hook,
                     .cleared_header_hook,
                     .set_footer_hook,
@@ -1125,6 +1129,26 @@ test "M11 host protocol applies live register_* JSONL frames into runtime regist
     _ = try state.registry.setFlagValue("model-alias", .{ .string = "claude-opus" });
     const alias_after = state.registry.getFlag("model-alias");
     try std.testing.expectEqualStrings("claude-opus", alias_after.string);
+}
+
+test "extension_host ProtocolState accepts live register_capability frame" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_capability\",\"id\":\"cap-workflow\",\"kind\":\"workflow\",\"title\":\"Workflow\",\"description\":\"Runs workflow\",\"command\":\"workflow\",\"resourcePath\":\"skills/workflow\",\"extensionPath\":\"fixture/extension.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 1), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("cap-workflow", state.registry.capabilities.items[0].id);
+    try std.testing.expectEqualStrings("workflow", state.registry.capabilities.items[0].kind);
+    try std.testing.expectEqualStrings("Workflow", state.registry.capabilities.items[0].title);
 }
 
 test "M11 host process drains live register_* frames into observable runtime registry" {
