@@ -3,9 +3,11 @@ const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
 const bootstrap = @import("cli/bootstrap.zig");
+const package_command_dispatch = @import("cli/package_command_dispatch.zig");
 const cli_preflight = @import("cli/preflight.zig");
 const input_prep = @import("cli/input_prep.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
+const run_mode_dispatch = @import("cli/run_mode_dispatch.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 const config_mod = @import("coding_agent/config/config.zig");
@@ -18,10 +20,7 @@ const cli_test = if (builtin.is_test) @import("cli/test_harness.zig") else struc
 
 const VERSION = "0.1.0";
 
-const AppMode = bootstrap.AppMode;
 const CliStdin = input_prep.CliStdin;
-const PreparedInitialInput = input_prep.PreparedInitialInput;
-const PreparedCliRuntime = runtime_prep.PreparedCliRuntime;
 const effectiveToolSelection = bootstrap.effectiveToolSelection;
 const offlineModeEnabled = bootstrap.offlineModeEnabled;
 const prepareCliRuntime = runtime_prep.prepareCliRuntime;
@@ -72,46 +71,16 @@ fn runCliWithInput(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
-    // Dispatch package-management subcommands (`pi install`, `pi remove`,
-    // `pi uninstall`, `pi update`, `pi list`) before the standard CLI
-    // parser runs. The package commands have their own positional and
-    // option grammar that the regular `parseArgs` would misclassify
-    // (positional sources would be consumed as prompt text). Mirrors
-    // TypeScript `main.ts` which runs `handlePackageCommand` before the
-    // standard prompt/agent path. Only the `local-fixtures-first` slice
-    // is implemented here for M12 m12-package-cli-local-fixtures; npm/git
-    // sources and self-update return deterministic out-of-scope errors.
-    if (coding_agent.package_manager.isPackageCommand(argv)) {
-        var package_command = coding_agent.package_manager.parsePackageCommand(allocator, argv) catch |err| switch (err) {
-            error.NotPackageCommand => unreachable,
-            else => return err,
-        };
-        defer package_command.deinit(allocator);
-        const cwd = if (cwd_override) |override| blk: {
-            break :blk try allocator.dupe(u8, override);
-        } else blk: {
-            const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-            defer allocator.free(real_cwd);
-            break :blk try allocator.dupe(u8, real_cwd);
-        };
-        defer allocator.free(cwd);
-        const agent_dir = try config_mod.resolveAgentDir(allocator, env_map);
-        defer allocator.free(agent_dir);
-        const stdout_is_tty = std.Io.File.stdout().isTty(io) catch false;
-        const result = try coding_agent.package_manager.executePackageCommand(
-            allocator,
-            io,
-            package_command,
-            .{
-                .cwd = cwd,
-                .agent_dir = agent_dir,
-                .stdout_is_tty = stdout_is_tty,
-                .env_map = env_map,
-            },
-            stdout,
-            stderr,
-        );
-        return result.exit_code;
+    if (try package_command_dispatch.dispatchPackageCommand(
+        allocator,
+        io,
+        env_map,
+        argv,
+        cwd_override,
+        stdout,
+        stderr,
+    )) |exit_code| {
+        return exit_code;
     }
 
     var options = bootstrap.parseArgs(allocator, argv) catch |err| {
@@ -367,223 +336,23 @@ fn runCliWithInput(
     };
     defer initial_input.deinit(allocator);
 
-    if (app_mode == .print or app_mode == .json) {
-        if (initial_input.prompt == null) {
-            try stderr.writeAll("Error: No prompt provided\n\n");
-            try output.printUsage(allocator, VERSION, stdout);
-            return 1;
-        }
-    }
-
-    if (app_mode != .interactive) {
-        // Preflight stored-session cwd BEFORE provider/auth resolution and
-        // tool construction so missing-cwd diagnostics always preempt
-        // unrelated bootstrap failures. Matches TypeScript main.ts ordering.
-        const preflight_result = try cli_preflight.runMissingSessionCwdPreflight(
-            allocator,
-            io,
-            &effective_env_map,
-            cli_preflight.preparedContext(cwd, prepared.session_dir, prepared.system_prompt, prepared.provider_name, &options),
-            false,
-            stderr,
-        );
-        if (preflight_result.exit_code) |exit_code| return exit_code;
-    }
-
-    var provider_runtime = coding_agent.resolveProviderConfig(
+    return try run_mode_dispatch.dispatchRunMode(
         allocator,
         io,
         &effective_env_map,
-        prepared.provider_name,
-        prepared.model_name,
-        options.api_key,
-        prepared.runtime_config.lookupApiKey(prepared.provider_name),
-    ) catch |err| {
-        try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, prepared.provider_name)});
-        return 1;
-    };
-    defer provider_runtime.deinit(allocator);
-
-    if (app_mode != .interactive) {
-        var app_context = coding_agent.interactive_mode.AppContext.init(cwd, io);
-        var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, &app_context, selected_tools);
-        defer built_tools.deinit();
-
-        var missing_cwd_issue: ?coding_agent.interactive_mode.OwnedMissingSessionCwdIssue = null;
-        defer if (missing_cwd_issue) |*captured| captured.deinit(allocator);
-        var session = coding_agent.interactive_mode.openInitialSessionWithMissingCwd(
-            allocator,
-            io,
-            prepared.session_dir,
-            .{
-                .cwd = cwd,
-                .system_prompt = prepared.system_prompt,
-                .session_dir = prepared.session_dir,
-                .provider = prepared.provider_name,
-                .model = prepared.model_name,
-                .api_key = options.api_key,
-                .thinking = prepared.thinking_level,
-                .session = options.session,
-                .@"continue" = options.@"continue",
-                .@"resume" = options.@"resume",
-                .fork = options.fork,
-                .no_session = options.no_session,
-                .model_patterns = options.models,
-                .selected_tools = selected_tools,
-                .initial_prompt = null,
-                .initial_images = &.{},
-                .prompt_templates = prepared.resource_bundle.prompt_templates,
-                .keybindings = &prepared.runtime_config.keybindings,
-                .theme = prepared.resource_bundle.selectedTheme(),
-                .runtime_config = &prepared.runtime_config,
-                // Non-interactive flows must never silently fall back to the
-                // launch cwd when the stored session cwd no longer exists.
-                // The early preflight already failed/exited before this
-                // point if the stored cwd was missing, so a missing-cwd
-                // issue here is purely a race fallback.
-                .missing_cwd_mode = .fail,
-                .missing_cwd_already_confirmed = preflight_continue_confirmed,
-            },
-            provider_runtime.model,
-            provider_runtime.api_key,
-            built_tools.items,
-            &missing_cwd_issue,
-        ) catch |err| switch (err) {
-            error.MissingSessionCwd => {
-                if (missing_cwd_issue) |captured| {
-                    try cli_preflight.writeMissingSessionCwdError(allocator, captured.issue(), stderr);
-                } else {
-                    try cli_preflight.writeMissingSessionCwdFallbackError(stderr);
-                }
-                try stderr.flush();
-                return 1;
-            },
-            else => return err,
-        };
-        defer session.deinit();
-
-        if (app_mode == .rpc) {
-            return try coding_agent.runRpcMode(
-                allocator,
-                io,
-                &session,
-                .{},
-                stdout,
-                stderr,
-            );
-        }
-
-        if (app_mode == .ts_rpc) {
-            var extension_host_options = try tsRpcExtensionHostOptions(allocator, &effective_env_map, cwd);
-            defer extension_host_options.deinit(allocator);
-            return try coding_agent.runTsRpcMode(
-                allocator,
-                io,
-                &session,
-                .{
-                    .extension_ui_parity_scenario = isEnabledEnv(&effective_env_map, "PI_TS_RPC_EXTENSION_UI_PARITY_SCENARIO"),
-                    .extension_host = extension_host_options.options,
-                },
-                stdout,
-                stderr,
-            );
-        }
-
-        return try coding_agent.runPrintMode(
-            allocator,
-            io,
-            &session,
-            initial_input.prompt.?,
-            .{
-                .mode = if (app_mode == .json) .json else .text,
-                .config_errors = prepared.runtime_config.errors,
-                .initial_images = initial_input.images,
-            },
-            stdout,
-            stderr,
-        );
-    }
-
-    return try coding_agent.runInteractiveMode(
-        allocator,
-        io,
-        &effective_env_map,
+        &options,
+        &prepared,
+        &initial_input,
         .{
             .cwd = cwd,
-            .system_prompt = prepared.system_prompt,
-            .session_dir = prepared.session_dir,
-            .provider = prepared.provider_name,
-            .model = prepared.model_name,
-            .api_key = options.api_key,
-            .thinking = prepared.thinking_level,
-            .session = options.session,
-            .@"continue" = options.@"continue",
-            .@"resume" = options.@"resume",
-            .fork = options.fork,
-            .no_session = options.no_session,
-            .model_patterns = options.models,
+            .app_mode = app_mode,
             .selected_tools = selected_tools,
-            .initial_prompt = initial_input.prompt,
-            .initial_images = initial_input.images,
-            .prompt_templates = prepared.resource_bundle.prompt_templates,
-            .keybindings = &prepared.runtime_config.keybindings,
-            .theme = prepared.resource_bundle.selectedTheme(),
-            .terminal_name = prepared.resource_bundle.terminal_name,
-            .runtime_config = &prepared.runtime_config,
-            .offline = options.offline,
-            .verbose = options.verbose,
-            // Continue path of the early pre-`prepareCliRuntime` preflight
-            // already showed the Continue/Cancel selector and the user
-            // chose Continue. Skip the duplicate prompt inside the
-            // interactive bootstrap and let it apply the launch cwd
-            // fallback directly.
-            .missing_cwd_mode = if (preflight_continue_confirmed) .use_fallback else .fail,
-            .missing_cwd_already_confirmed = preflight_continue_confirmed,
+            .preflight_continue_confirmed = preflight_continue_confirmed,
+            .version = VERSION,
         },
+        stdout,
         stderr,
     );
-}
-
-fn isEnabledEnv(env_map: *const std.process.Environ.Map, key: []const u8) bool {
-    const value = env_map.get(key) orelse return false;
-    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes");
-}
-
-const OwnedTsRpcExtensionHostOptions = struct {
-    options: ?coding_agent.ts_rpc_mode.ExtensionHostOptions = null,
-    argv: ?[][]const u8 = null,
-
-    fn deinit(self: *OwnedTsRpcExtensionHostOptions, allocator: std.mem.Allocator) void {
-        if (self.argv) |argv| allocator.free(argv);
-        self.* = undefined;
-    }
-};
-
-fn tsRpcExtensionHostOptions(
-    allocator: std.mem.Allocator,
-    env_map: *const std.process.Environ.Map,
-    cwd: []const u8,
-) !OwnedTsRpcExtensionHostOptions {
-    const entry = env_map.get("PI_M6_EXTENSION_HOST_ENTRY") orelse return .{};
-    if (env_map.get("PI_M6_EXTENSION_HOST_DISABLED")) |value| {
-        if (isEnabledValue(value)) return .{};
-    }
-    const runtime = env_map.get("PI_M6_EXTENSION_HOST_RUNTIME") orelse "bun";
-    const fixture = env_map.get("PI_M6_EXTENSION_HOST_FIXTURE") orelse "m6-fixture";
-    const marker = env_map.get(extension_runtime_mod.HOST_MARKER_ENV) orelse "pi-m6-extension-host";
-    var argv = try allocator.alloc([]const u8, 3);
-    argv[0] = runtime;
-    argv[1] = entry;
-    argv[2] = marker;
-    return .{
-        .argv = argv,
-        .options = .{
-            .argv = argv,
-            .cwd = cwd,
-            .marker = marker,
-            .fixture = fixture,
-        },
-    };
 }
 
 fn isEnabledValue(value: []const u8) bool {
@@ -862,6 +631,44 @@ test "runCli prints faux response end to end" {
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("hello from cli\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli dispatches package commands before normal CLI parsing" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+
+    const agent_dir = try cli_test.makeTmpPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "install", "--help" },
+        project_dir,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "Usage:\n  pi install <source> [-l]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "Install a package and add it to settings.") != null);
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
@@ -1636,6 +1443,64 @@ test "runCli rejects conflicting fork flags" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
     try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "--fork cannot be combined") != null);
+}
+
+test "runCli rejects prompt arguments in RPC modes before runtime routing" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const cases = [_][]const u8{ "rpc", "ts-rpc" };
+    for (cases) |mode| {
+        var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stdout_capture.deinit();
+        var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr_capture.deinit();
+
+        const exit_code = try runCli(
+            allocator,
+            std.testing.io,
+            &env_map,
+            &.{ "--mode", mode, "hello" },
+            "/tmp/project",
+            &stdout_capture.writer,
+            &stderr_capture.writer,
+        );
+
+        try std.testing.expectEqual(@as(u8, 1), exit_code);
+        try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
+        try std.testing.expectEqualStrings("Error: Prompt arguments are not supported in RPC mode\n", stderr_capture.writer.buffered());
+    }
+}
+
+test "runCli rejects file arguments in RPC modes before runtime routing" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const cases = [_][]const u8{ "rpc", "ts-rpc" };
+    for (cases) |mode| {
+        var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stdout_capture.deinit();
+        var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr_capture.deinit();
+
+        const exit_code = try runCli(
+            allocator,
+            std.testing.io,
+            &env_map,
+            &.{ "--mode", mode, "@missing.txt" },
+            "/tmp/project",
+            &stdout_capture.writer,
+            &stderr_capture.writer,
+        );
+
+        try std.testing.expectEqual(@as(u8, 1), exit_code);
+        try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
+        try std.testing.expectEqualStrings("Error: @file arguments are not supported in RPC mode\n", stderr_capture.writer.buffered());
+    }
 }
 
 test "runCli rejects unregistered unknown long flag with sanitized diagnostic" {

@@ -77,9 +77,11 @@ Acceptance criteria:
 
 ## Next Suggested Refactor Step
 
-Continue the Task 7 provider-internal-shape slices now that the guardrails and
-Task 5/6 decomposition are in place. Session/RPC decomposition remains a later
-refactor step.
+Continue the screenshot maintainability slices now that the provider registry
+boilerplate and the first two `main.zig` CLI extraction slices are complete.
+The guarded pure wire/protocol helper extraction from `ts_rpc_mode.zig` is now
+complete for the first slice. Broader interactive, extension, provider-parser,
+and session/RPC decomposition remains later refactor work.
 
 ### 5. Interactive Mode Decomposition
 
@@ -194,7 +196,72 @@ Acceptance criteria:
   `cd zig && zig build test-openai-responses-parity`,
   `cd zig && zig build test-bedrock-parity`, and `npm run check`.
 
-### 8. Session and RPC Decomposition
+### 8. Screenshot Maintainability Slices
+
+Status: Started/current `register_builtins.zig`, `main.zig` package-command
+plus run-mode dispatch, and the first guarded `ts_rpc_mode.zig` wire helper
+slice complete.
+`zig/src/ai/providers/register_builtins.zig` now uses a single provider
+metadata table to generate the built-in API list, built-in provider registry
+entries, lazy-load state lookup, test override lookup, and comptime stream /
+streamSimple dispatch wrappers. The public registry helpers, built-in API
+ordering/count, uniqueness, lazy-load state semantics, `setProviderOverride`,
+`isLoaded`, and provider stream contract matrix behavior are preserved.
+`main.zig` now delegates pre-parse package-command handling to
+`zig/src/cli/package_command_dispatch.zig`, preserving the `runCli` call
+surface while keeping package command detection, cwd/agent-dir resolution,
+package-manager invocation options, stdout/stderr routing, and exit-code
+mapping in a focused helper.
+`main.zig` now also delegates prepared CLI run-mode dispatch to
+`zig/src/cli/run_mode_dispatch.zig`, preserving interactive vs print/json/RPC/
+TS-RPC selection, the post-runtime non-interactive missing-cwd preflight before
+provider/auth/tool setup, RPC/TS-RPC routing, stdout/stderr routing, and
+exit-code behavior.
+`ts_rpc_mode.zig` now delegates focused wire/protocol helpers to
+`zig/src/coding_agent/ts_rpc_wire.zig`: known command metadata, LF/CR input
+framing, TypeScript-shaped JSON parse diagnostics, base response frame
+serialization, JSON string escaping, and extension UI request frame
+serialization. The server still owns command dispatch, session lifecycle,
+extension host request correlation/cancel/timeout behavior, and direct bash
+lifecycle.
+
+Remaining boundaries:
+
+- Further `ts_rpc_mode.zig` decomposition remains deferred beyond this guarded
+  pure wire/protocol helper extraction. Do not move extension ABI/protocol,
+  session lifecycle, extension UI response/cancel/timeout behavior, direct bash
+  lifecycle, or command dispatch without a separately assigned guarded slice.
+- Broad interactive-mode, extension-registry, provider parser/state-machine,
+  session, build-graph, and extension ABI/interface decomposition remains
+  deferred unless assigned explicitly.
+
+Acceptance criteria:
+
+- `register_builtins.zig` metadata drives all built-in registry outputs and
+  dispatch wrappers without provider-specific override or `isLoaded` chains.
+- Focused tests prove built-in API order, count, uniqueness, override clearing,
+  per-provider lazy-load state, and stream/streamSimple wrapper coverage.
+- `main.zig` delegates package-command dispatch before standard CLI parsing,
+  and focused tests prove package help precedence plus cwd/agent-dir scope
+  resolution through the extracted helper.
+- `main.zig` delegates prepared run-mode dispatch after initial input
+  preparation, and focused tests prove RPC/TS-RPC prompt and `@file`
+  restrictions remain pre-runtime while parity validators cover print/json/RPC/
+  TS-RPC flow behavior.
+- Verification for the completed provider registry slice:
+  `cd zig && zig build test-ai`,
+  `cd zig && zig build test-coding-agent`, and `npm run check`.
+- Verification for the completed package-dispatch slice:
+  `cd zig && zig build test` and `npm run check`.
+- Verification for the completed run-mode dispatch slice:
+  `cd zig && zig build test`,
+  `cd zig && zig build test-cross-area`,
+  `cd zig && zig build test-ts-rpc-parity`, and `npm run check`.
+- Verification for the completed first TS-RPC wire helper slice:
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-ts-rpc-parity`, and `npm run check`.
+
+### 9. Session and RPC Decomposition
 
 - Split session parse, replay, persistence, compaction, and display formatting.
 - Split `ts_rpc_mode.zig` by wire encoding, session lifecycle, extension UI bridge, and command handling.

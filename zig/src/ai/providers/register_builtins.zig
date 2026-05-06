@@ -43,110 +43,101 @@ const LazyProviderState = struct {
     provider: ?ProviderFns = null,
 };
 
+const ProviderMetadata = struct {
+    api: types.Api,
+    default_provider: ProviderFns,
+};
+
 const BuiltInProviderError = error{
     UnknownBuiltInApi,
     TestOnlyProviderOverrideUnavailable,
 };
 
-var openai_state = LazyProviderState{};
-var kimi_state = LazyProviderState{};
-var anthropic_state = LazyProviderState{};
-var mistral_state = LazyProviderState{};
-var openai_responses_state = LazyProviderState{};
-var azure_openai_responses_state = LazyProviderState{};
-var openai_codex_responses_state = LazyProviderState{};
-var google_state = LazyProviderState{};
-var google_gemini_cli_state = LazyProviderState{};
-var google_vertex_state = LazyProviderState{};
-var bedrock_state = LazyProviderState{};
-
-const Overrides = struct {
-    openai: ?ProviderFns = null,
-    kimi: ?ProviderFns = null,
-    anthropic: ?ProviderFns = null,
-    mistral: ?ProviderFns = null,
-    openai_responses: ?ProviderFns = null,
-    azure_openai_responses: ?ProviderFns = null,
-    openai_codex_responses: ?ProviderFns = null,
-    google: ?ProviderFns = null,
-    google_gemini_cli: ?ProviderFns = null,
-    google_vertex: ?ProviderFns = null,
-    bedrock: ?ProviderFns = null,
-};
-
-var test_overrides = Overrides{};
-
-const BUILT_IN_APIS = [_]types.Api{
-    "anthropic-messages",
-    "openai-completions",
-    "kimi-completions",
-    "mistral-conversations",
-    "openai-responses",
-    "azure-openai-responses",
-    "openai-codex-responses",
-    "google-generative-ai",
-    "google-gemini-cli",
-    "google-vertex",
-    "bedrock-converse-stream",
-};
-
-const BUILT_IN_PROVIDERS = [_]BuiltInProvider{
+const PROVIDER_METADATA = [_]ProviderMetadata{
     .{
         .api = "anthropic-messages",
-        .stream = streamAnthropic,
-        .stream_simple = streamSimpleAnthropic,
+        .default_provider = .{
+            .stream = anthropic.AnthropicProvider.stream,
+            .stream_simple = anthropic.AnthropicProvider.streamSimple,
+        },
     },
     .{
         .api = "openai-completions",
-        .stream = streamOpenAI,
-        .stream_simple = streamSimpleOpenAI,
+        .default_provider = .{
+            .stream = openai.OpenAIProvider.stream,
+            .stream_simple = openai.OpenAIProvider.streamSimple,
+        },
     },
     .{
         .api = "kimi-completions",
-        .stream = streamKimi,
-        .stream_simple = streamSimpleKimi,
+        .default_provider = .{
+            .stream = kimi.KimiProvider.stream,
+            .stream_simple = kimi.KimiProvider.streamSimple,
+        },
     },
     .{
         .api = "mistral-conversations",
-        .stream = streamMistral,
-        .stream_simple = streamSimpleMistral,
+        .default_provider = .{
+            .stream = mistral.MistralProvider.stream,
+            .stream_simple = mistral.MistralProvider.streamSimple,
+        },
     },
     .{
         .api = "openai-responses",
-        .stream = streamOpenAIResponses,
-        .stream_simple = streamSimpleOpenAIResponses,
+        .default_provider = .{
+            .stream = openai_responses.OpenAIResponsesProvider.stream,
+            .stream_simple = openai_responses.OpenAIResponsesProvider.streamSimple,
+        },
     },
     .{
         .api = "azure-openai-responses",
-        .stream = streamAzureOpenAIResponses,
-        .stream_simple = streamSimpleAzureOpenAIResponses,
+        .default_provider = .{
+            .stream = azure_openai_responses.AzureOpenAIResponsesProvider.stream,
+            .stream_simple = azure_openai_responses.AzureOpenAIResponsesProvider.streamSimple,
+        },
     },
     .{
         .api = "openai-codex-responses",
-        .stream = streamOpenAICodexResponses,
-        .stream_simple = streamSimpleOpenAICodexResponses,
+        .default_provider = .{
+            .stream = openai_codex_responses.OpenAICodexResponsesProvider.stream,
+            .stream_simple = openai_codex_responses.OpenAICodexResponsesProvider.streamSimple,
+        },
     },
     .{
         .api = "google-generative-ai",
-        .stream = streamGoogle,
-        .stream_simple = streamSimpleGoogle,
+        .default_provider = .{
+            .stream = google.GoogleProvider.stream,
+            .stream_simple = google.GoogleProvider.streamSimple,
+        },
     },
     .{
         .api = "google-gemini-cli",
-        .stream = streamGoogleGeminiCli,
-        .stream_simple = streamSimpleGoogleGeminiCli,
+        .default_provider = .{
+            .stream = google_gemini_cli.GoogleGeminiCliProvider.stream,
+            .stream_simple = google_gemini_cli.GoogleGeminiCliProvider.streamSimple,
+        },
     },
     .{
         .api = "google-vertex",
-        .stream = streamGoogleVertex,
-        .stream_simple = streamSimpleGoogleVertex,
+        .default_provider = .{
+            .stream = google_vertex.GoogleVertexProvider.stream,
+            .stream_simple = google_vertex.GoogleVertexProvider.streamSimple,
+        },
     },
     .{
         .api = "bedrock-converse-stream",
-        .stream = streamBedrock,
-        .stream_simple = streamSimpleBedrock,
+        .default_provider = .{
+            .stream = bedrock.BedrockProvider.stream,
+            .stream_simple = bedrock.BedrockProvider.streamSimple,
+        },
     },
 };
+
+var lazy_states = [_]LazyProviderState{.{}} ** PROVIDER_METADATA.len;
+var test_overrides = [_]?ProviderFns{null} ** PROVIDER_METADATA.len;
+
+const BUILT_IN_APIS = buildBuiltInApis();
+const BUILT_IN_PROVIDERS = buildBuiltInProviders();
 
 pub fn expectedBuiltInApis() []const types.Api {
     return BUILT_IN_APIS[0..];
@@ -161,22 +152,12 @@ pub fn builtInProviders() []const BuiltInProvider {
 }
 
 pub fn resetLazyState() void {
-    openai_state = .{};
-    kimi_state = .{};
-    anthropic_state = .{};
-    mistral_state = .{};
-    openai_responses_state = .{};
-    azure_openai_responses_state = .{};
-    openai_codex_responses_state = .{};
-    google_state = .{};
-    google_gemini_cli_state = .{};
-    google_vertex_state = .{};
-    bedrock_state = .{};
+    lazy_states = [_]LazyProviderState{.{}} ** PROVIDER_METADATA.len;
 }
 
 pub fn clearProviderOverrides() void {
     if (builtin.is_test) {
-        test_overrides = .{};
+        test_overrides = [_]?ProviderFns{null} ** PROVIDER_METADATA.len;
     }
     resetLazyState();
 }
@@ -184,61 +165,69 @@ pub fn clearProviderOverrides() void {
 pub fn setProviderOverride(api: types.Api, provider: ProviderFns) BuiltInProviderError!void {
     if (!builtin.is_test) return BuiltInProviderError.TestOnlyProviderOverrideUnavailable;
 
-    if (std.mem.eql(u8, api, "openai-completions")) {
-        test_overrides.openai = provider;
-    } else if (std.mem.eql(u8, api, "kimi-completions")) {
-        test_overrides.kimi = provider;
-    } else if (std.mem.eql(u8, api, "anthropic-messages")) {
-        test_overrides.anthropic = provider;
-    } else if (std.mem.eql(u8, api, "mistral-conversations")) {
-        test_overrides.mistral = provider;
-    } else if (std.mem.eql(u8, api, "openai-responses")) {
-        test_overrides.openai_responses = provider;
-    } else if (std.mem.eql(u8, api, "azure-openai-responses")) {
-        test_overrides.azure_openai_responses = provider;
-    } else if (std.mem.eql(u8, api, "openai-codex-responses")) {
-        test_overrides.openai_codex_responses = provider;
-    } else if (std.mem.eql(u8, api, "google-generative-ai")) {
-        test_overrides.google = provider;
-    } else if (std.mem.eql(u8, api, "google-gemini-cli")) {
-        test_overrides.google_gemini_cli = provider;
-    } else if (std.mem.eql(u8, api, "google-vertex")) {
-        test_overrides.google_vertex = provider;
-    } else if (std.mem.eql(u8, api, "bedrock-converse-stream")) {
-        test_overrides.bedrock = provider;
-    } else {
-        return BuiltInProviderError.UnknownBuiltInApi;
-    }
+    const index = providerIndexForApi(api) orelse return BuiltInProviderError.UnknownBuiltInApi;
+    test_overrides[index] = provider;
     resetLazyState();
 }
 
 pub fn isLoaded(api: types.Api) bool {
-    if (std.mem.eql(u8, api, "openai-completions")) return openai_state.provider != null;
-    if (std.mem.eql(u8, api, "kimi-completions")) return kimi_state.provider != null;
-    if (std.mem.eql(u8, api, "anthropic-messages")) return anthropic_state.provider != null;
-    if (std.mem.eql(u8, api, "mistral-conversations")) return mistral_state.provider != null;
-    if (std.mem.eql(u8, api, "openai-responses")) return openai_responses_state.provider != null;
-    if (std.mem.eql(u8, api, "azure-openai-responses")) return azure_openai_responses_state.provider != null;
-    if (std.mem.eql(u8, api, "openai-codex-responses")) return openai_codex_responses_state.provider != null;
-    if (std.mem.eql(u8, api, "google-generative-ai")) return google_state.provider != null;
-    if (std.mem.eql(u8, api, "google-gemini-cli")) return google_gemini_cli_state.provider != null;
-    if (std.mem.eql(u8, api, "google-vertex")) return google_vertex_state.provider != null;
-    if (std.mem.eql(u8, api, "bedrock-converse-stream")) return bedrock_state.provider != null;
-    return false;
+    const index = providerIndexForApi(api) orelse return false;
+    return lazy_states[index].provider != null;
+}
+
+fn buildBuiltInApis() [PROVIDER_METADATA.len]types.Api {
+    var apis: [PROVIDER_METADATA.len]types.Api = undefined;
+    inline for (PROVIDER_METADATA, 0..) |metadata, index| {
+        apis[index] = metadata.api;
+    }
+    return apis;
+}
+
+fn buildBuiltInProviders() [PROVIDER_METADATA.len]BuiltInProvider {
+    var providers: [PROVIDER_METADATA.len]BuiltInProvider = undefined;
+    inline for (PROVIDER_METADATA, 0..) |metadata, index| {
+        providers[index] = .{
+            .api = metadata.api,
+            .stream = streamWrapper(index, .stream),
+            .stream_simple = streamWrapper(index, .stream_simple),
+        };
+    }
+    return providers;
+}
+
+fn providerIndexForApi(api: types.Api) ?usize {
+    for (PROVIDER_METADATA, 0..) |metadata, index| {
+        if (std.mem.eql(u8, api, metadata.api)) return index;
+    }
+    return null;
+}
+
+fn streamWrapper(comptime index: usize, comptime mode: DispatchMode) StreamFunction {
+    return struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            model: types.Model,
+            context: types.Context,
+            options: ?types.StreamOptions,
+        ) anyerror!event_stream.AssistantMessageEventStream {
+            return dispatchLazy(index, mode, allocator, io, model, context, options);
+        }
+    }.call;
 }
 
 fn dispatchLazy(
-    state: *LazyProviderState,
-    loader: *const fn () ProviderFns,
-    mode: DispatchMode,
+    comptime index: usize,
+    comptime mode: DispatchMode,
     allocator: std.mem.Allocator,
     io: std.Io,
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
 ) !event_stream.AssistantMessageEventStream {
+    const state = &lazy_states[index];
     if (state.provider == null) {
-        state.provider = loader();
+        state.provider = loadProvider(index);
     }
 
     const provider = state.provider.?;
@@ -248,301 +237,16 @@ fn dispatchLazy(
     };
 }
 
-fn loadOpenAIProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.openai else null) orelse .{
-        .stream = openai.OpenAIProvider.stream,
-        .stream_simple = openai.OpenAIProvider.streamSimple,
-    };
+fn loadProvider(comptime index: usize) ProviderFns {
+    if (builtin.is_test) {
+        if (test_overrides[index]) |provider| return provider;
+    }
+    return PROVIDER_METADATA[index].default_provider;
 }
 
-fn loadKimiProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.kimi else null) orelse .{
-        .stream = kimi.KimiProvider.stream,
-        .stream_simple = kimi.KimiProvider.streamSimple,
-    };
-}
-
-fn loadAnthropicProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.anthropic else null) orelse .{
-        .stream = anthropic.AnthropicProvider.stream,
-        .stream_simple = anthropic.AnthropicProvider.streamSimple,
-    };
-}
-
-fn loadMistralProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.mistral else null) orelse .{
-        .stream = mistral.MistralProvider.stream,
-        .stream_simple = mistral.MistralProvider.streamSimple,
-    };
-}
-
-fn loadOpenAIResponsesProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.openai_responses else null) orelse .{
-        .stream = openai_responses.OpenAIResponsesProvider.stream,
-        .stream_simple = openai_responses.OpenAIResponsesProvider.streamSimple,
-    };
-}
-
-fn loadAzureOpenAIResponsesProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.azure_openai_responses else null) orelse .{
-        .stream = azure_openai_responses.AzureOpenAIResponsesProvider.stream,
-        .stream_simple = azure_openai_responses.AzureOpenAIResponsesProvider.streamSimple,
-    };
-}
-
-fn loadOpenAICodexResponsesProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.openai_codex_responses else null) orelse .{
-        .stream = openai_codex_responses.OpenAICodexResponsesProvider.stream,
-        .stream_simple = openai_codex_responses.OpenAICodexResponsesProvider.streamSimple,
-    };
-}
-
-fn loadGoogleProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.google else null) orelse .{
-        .stream = google.GoogleProvider.stream,
-        .stream_simple = google.GoogleProvider.streamSimple,
-    };
-}
-
-fn loadGoogleGeminiCliProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.google_gemini_cli else null) orelse .{
-        .stream = google_gemini_cli.GoogleGeminiCliProvider.stream,
-        .stream_simple = google_gemini_cli.GoogleGeminiCliProvider.streamSimple,
-    };
-}
-
-fn loadGoogleVertexProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.google_vertex else null) orelse .{
-        .stream = google_vertex.GoogleVertexProvider.stream,
-        .stream_simple = google_vertex.GoogleVertexProvider.streamSimple,
-    };
-}
-
-fn loadBedrockProvider() ProviderFns {
-    return (if (builtin.is_test) test_overrides.bedrock else null) orelse .{
-        .stream = bedrock.BedrockProvider.stream,
-        .stream_simple = bedrock.BedrockProvider.streamSimple,
-    };
-}
-
-fn streamOpenAI(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&openai_state, loadOpenAIProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleOpenAI(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&openai_state, loadOpenAIProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamKimi(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&kimi_state, loadKimiProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleKimi(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&kimi_state, loadKimiProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamAnthropic(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&anthropic_state, loadAnthropicProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleAnthropic(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&anthropic_state, loadAnthropicProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamMistral(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&mistral_state, loadMistralProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleMistral(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&mistral_state, loadMistralProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamOpenAIResponses(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&openai_responses_state, loadOpenAIResponsesProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleOpenAIResponses(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&openai_responses_state, loadOpenAIResponsesProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamAzureOpenAIResponses(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&azure_openai_responses_state, loadAzureOpenAIResponsesProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleAzureOpenAIResponses(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&azure_openai_responses_state, loadAzureOpenAIResponsesProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamOpenAICodexResponses(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&openai_codex_responses_state, loadOpenAICodexResponsesProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleOpenAICodexResponses(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&openai_codex_responses_state, loadOpenAICodexResponsesProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamGoogle(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&google_state, loadGoogleProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleGoogle(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&google_state, loadGoogleProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamGoogleGeminiCli(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&google_gemini_cli_state, loadGoogleGeminiCliProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleGoogleGeminiCli(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&google_gemini_cli_state, loadGoogleGeminiCliProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamGoogleVertex(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&google_vertex_state, loadGoogleVertexProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleGoogleVertex(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&google_vertex_state, loadGoogleVertexProvider, .stream_simple, allocator, io, model, context, options);
-}
-
-fn streamBedrock(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&bedrock_state, loadBedrockProvider, .stream, allocator, io, model, context, options);
-}
-
-fn streamSimpleBedrock(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    return try dispatchLazy(&bedrock_state, loadBedrockProvider, .stream_simple, allocator, io, model, context, options);
+fn testOverrideForApi(api: types.Api) ?ProviderFns {
+    const index = providerIndexForApi(api) orelse return null;
+    return test_overrides[index];
 }
 
 fn dummyLazyStream(
@@ -882,6 +586,28 @@ fn validateHandoffPayload(allocator: std.mem.Allocator, model: types.Model, cont
 test "built-in api list matches TypeScript registry count" {
     try std.testing.expectEqual(@as(usize, 11), expectedBuiltInApiCount());
     try std.testing.expectEqual(expectedBuiltInApiCount(), expectedBuiltInApis().len);
+
+    const expected_order = [_][]const u8{
+        "anthropic-messages",
+        "openai-completions",
+        "kimi-completions",
+        "mistral-conversations",
+        "openai-responses",
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "google-generative-ai",
+        "google-gemini-cli",
+        "google-vertex",
+        "bedrock-converse-stream",
+    };
+    try std.testing.expectEqual(expected_order.len, expectedBuiltInApiCount());
+    for (expectedBuiltInApis(), 0..) |api, index| {
+        try std.testing.expectEqualStrings(expected_order[index], api);
+        try std.testing.expectEqualStrings(api, builtInProviders()[index].api);
+        for (expectedBuiltInApis()[0..index]) |prior_api| {
+            try std.testing.expect(!std.mem.eql(u8, api, prior_api));
+        }
+    }
 }
 
 test "lazy wrapper loads provider on first stream call" {
@@ -896,7 +622,8 @@ test "lazy wrapper loads provider on first stream call" {
     try std.testing.expect(!isLoaded("openai-completions"));
 
     const model = testModelForApi("openai-completions");
-    var stream_instance = try streamOpenAI(
+    const provider = builtInProviders()[providerIndexForApi("openai-completions").?];
+    var stream_instance = try provider.stream(
         std.testing.allocator,
         std.Io.failing,
         model,
@@ -921,19 +648,61 @@ test "provider override fixture clears between same-process uses" {
         .stream = dummyLazyStream,
         .stream_simple = dummyLazyStream,
     });
-    try std.testing.expect(test_overrides.openai != null);
-    try std.testing.expect(test_overrides.kimi == null);
+    try std.testing.expect(testOverrideForApi("openai-completions") != null);
+    try std.testing.expect(testOverrideForApi("kimi-completions") == null);
 
     clearProviderOverrides();
-    try std.testing.expect(test_overrides.openai == null);
+    try std.testing.expect(testOverrideForApi("openai-completions") == null);
     try std.testing.expect(!isLoaded("openai-completions"));
 
     try setProviderOverride("kimi-completions", .{
         .stream = dummyLazyStream,
         .stream_simple = dummyLazyStream,
     });
-    try std.testing.expect(test_overrides.openai == null);
-    try std.testing.expect(test_overrides.kimi != null);
+    try std.testing.expect(testOverrideForApi("openai-completions") == null);
+    try std.testing.expect(testOverrideForApi("kimi-completions") != null);
+}
+
+test "metadata dispatch wrappers cover every built-in provider" {
+    clearProviderOverrides();
+    defer clearProviderOverrides();
+
+    for (builtInProviders()) |provider| {
+        try setProviderOverride(provider.api, .{
+            .stream = dummyLazyStream,
+            .stream_simple = dummyLazyStream,
+        });
+        try std.testing.expect(!isLoaded(provider.api));
+
+        const model = testModelForApi(provider.api);
+        var stream_instance = try provider.stream(
+            std.testing.allocator,
+            std.Io.failing,
+            model,
+            .{ .messages = &[_]types.Message{} },
+            null,
+        );
+        defer stream_instance.deinit();
+        while (stream_instance.next()) |_| {}
+        try std.testing.expect(isLoaded(provider.api));
+        const result = stream_instance.result().?;
+        try std.testing.expectEqualStrings("lazy provider response", result.content[0].text.text);
+
+        resetLazyState();
+        try std.testing.expect(!isLoaded(provider.api));
+        var simple_stream_instance = try provider.stream_simple(
+            std.testing.allocator,
+            std.Io.failing,
+            model,
+            .{ .messages = &[_]types.Message{} },
+            null,
+        );
+        defer simple_stream_instance.deinit();
+        while (simple_stream_instance.next()) |_| {}
+        try std.testing.expect(isLoaded(provider.api));
+        const simple_result = simple_stream_instance.result().?;
+        try std.testing.expectEqualStrings("lazy provider response", simple_result.content[0].text.text);
+    }
 }
 
 test "cross-provider handoff payload builders accept tool and thinking contexts" {

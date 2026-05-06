@@ -36,6 +36,17 @@ The Zig implementation is now usable for the main coding-agent workflows:
 - provider-owned JSON value lifecycle support now has shared clone/free/empty
   object helpers used by provider payload and replay helpers without moving
   provider-specific request or response mapping
+- built-in provider registry boilerplate in `register_builtins.zig` is now
+  metadata-driven: one table generates the built-in API list, registry entries,
+  lazy-load state lookup, test override lookup, and comptime stream /
+  streamSimple dispatch wrappers while preserving public registry behavior
+- package-command dispatch is now isolated in `cli/package_command_dispatch.zig`
+  so `main.zig` keeps pre-parse package precedence without owning cwd,
+  agent-dir, package-manager invocation, stdout/stderr, and exit-code plumbing
+- prepared CLI run-mode routing is now isolated in `cli/run_mode_dispatch.zig`
+  so `main.zig` keeps the runCli orchestration boundary while print/json/RPC/
+  TS-RPC/interactive dispatch, prepared missing-cwd preflight, session opening,
+  stdout/stderr routing, and exit-code behavior live in a focused helper
 - extension host process boundary and registration surface for tools,
   commands, shortcuts, flags, providers, widgets, editor hooks, header/footer
   hooks, terminal input hooks, and package-management commands
@@ -164,6 +175,60 @@ Current provider helper/deferred-path matrix:
 | Kimi and Anthropic/Kimi-compatible tolerance | Deferred/provider-owned. Kimi noncanonical `data:` tolerance, malformed JSON repair, unknown/control envelopes, orphan tool deltas, partial EOF finalization, and first-party Anthropic strictness are guarded by focused tests. | `zig build test-ai`, especially the Anthropic/Kimi-compatible parser fixtures in `anthropic.zig`. |
 | Bedrock Converse Stream | Deferred/provider-owned. Binary event-stream parsing, partial-block finalization, provider exceptions, and SigV4 signing stay on the Bedrock path. | `zig build test-ai` plus `zig build test-bedrock-parity`. |
 | Cloudflare routing and GitHub Copilot dynamic headers | Deferred/provider-owned. Cloudflare base URL/proxy resolution and Copilot initiator/vision headers remain in boundary helpers and request builders. | `zig build test-ai` plus `zig build test-openai-responses-parity` for Responses Copilot scenarios. |
+
+### Register Built-ins Metadata Dispatch
+
+Resolved for the current maintainability slice. `register_builtins.zig` no
+longer keeps separate state variables, override fields, loader functions, and
+stream/streamSimple wrapper functions for every built-in provider. A single
+provider metadata table now drives:
+
+- built-in API list generation
+- built-in provider registry entry generation
+- lazy-load state indexing
+- test override lookup/clearing
+- comptime-generated stream and streamSimple dispatch wrappers
+
+Focused tests pin the built-in API count/order/uniqueness, registry entry order,
+override clearing, per-provider lazy-load semantics, and stream/streamSimple
+wrapper coverage for every built-in provider. Later screenshot maintainability
+boundaries are intentionally separate and recorded below.
+
+### CLI Package Command Dispatch
+
+Resolved for the current maintainability slice. `main.zig` now delegates
+pre-parse package command handling to `cli/package_command_dispatch.zig`.
+The extracted helper owns package-command detection, parse/execute handoff,
+cwd override or real-cwd resolution, `PI_CODING_AGENT_DIR`/agent-dir
+resolution, stdout/stderr forwarding, TTY detection, and exit-code mapping.
+
+Focused tests prove non-package argv returns to normal CLI parsing, local and
+user package scopes still use cwd and agent-dir paths correctly, and `runCli`
+still routes `pi install --help` to package-command help before the normal CLI
+parser can treat it as top-level help or prompt input. The follow-up run-mode
+routing slice is recorded below.
+
+### CLI Run Mode Dispatch
+
+Resolved for the current maintainability slice. `main.zig` now delegates the
+prepared CLI execution branch to `cli/run_mode_dispatch.zig`. The extracted
+helper owns print/json prompt validation, the post-runtime non-interactive
+missing-cwd preflight, provider/auth resolution, non-interactive session
+opening, interactive launch options, print/json/RPC/TS-RPC dispatch, TS-RPC
+extension-host options, stdout/stderr forwarding, and returned exit codes.
+
+The early pre-runtime missing-cwd preflight and RPC/TS-RPC prompt/`@file`
+restrictions remain in `main.zig` before runtime preparation, preserving their
+ordering relative to provider/resource failures. Focused tests pin those
+RPC/TS-RPC restrictions while the cross-area and TS-RPC parity validators cover
+the black-box routing behavior. The remaining screenshot maintainability
+boundary has started with the guarded pure wire/protocol extraction from
+`ts_rpc_mode.zig`: `coding_agent/ts_rpc_wire.zig` owns known command metadata,
+input CR/LF framing, TypeScript-shaped parse diagnostics, response frame
+serialization, JSON string escaping, and extension UI request frame
+serialization. Broader `ts_rpc_mode.zig` command dispatch, session lifecycle,
+extension UI correlation/cancel/timeout handling, and direct bash lifecycle
+splits remain deferred.
 
 ## Recommended Next Work Order
 
