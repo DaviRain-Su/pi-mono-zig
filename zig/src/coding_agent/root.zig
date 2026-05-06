@@ -14,6 +14,7 @@ pub const extension_flags = @import("extension_flags.zig");
 pub const extension_registry = @import("extension_registry.zig");
 pub const wasm_manifest = @import("wasm_manifest.zig");
 pub const wasm_wit_contract = @import("wasm_wit_contract.zig");
+pub const wasm_host_spike = @import("wasm_host_spike.zig");
 pub const package_manager = @import("package_manager.zig");
 pub const provider_config = @import("provider_config.zig");
 pub const oauth_callback_listener = @import("oauth_callback_listener.zig");
@@ -80,6 +81,7 @@ test {
     _ = @import("extension_registry.zig");
     _ = @import("wasm_manifest.zig");
     _ = @import("wasm_wit_contract.zig");
+    _ = @import("wasm_host_spike.zig");
     _ = @import("package_manager.zig");
     _ = @import("ts_rpc_fixture_tests.zig");
     _ = @import("provider_config.zig");
