@@ -2076,6 +2076,199 @@ test "extension runtime mixed process_jsonl and wasm adapters isolate interleave
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"shutdown\"}\n") != null);
 }
 
+test "cross-runtime capability metadata and resource limits do not grant or leak privileges" {
+    const allocator = std.testing.allocator;
+    const process_script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_tool\",\"name\":\"process-display-tool\",\"label\":\"Process Display Tool\",\"description\":\"registry metadata only\",\"parameters\":{\"type\":\"object\"},\"extensionPath\":\"fixture/process-display.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_capability\",\"id\":\"tool.use\",\"kind\":\"display\",\"title\":\"Tool Use Display\",\"description\":\"metadata only\",\"extensionPath\":\"fixture/process-display.ts\"}\\n'; " ++
+        "printf '{\"type\":\"register_command\",\"name\":\"process-display-command\",\"description\":\"metadata only\",\"extensionPath\":\"fixture/process-display.ts\"}\\n'; " ++
+        "printf '{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"promptPaths\":[],\"themePaths\":[],\"extensionPath\":\"fixture/process-display.ts\"}\\n'; " ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
+    const process_argv = [_][]const u8{ "/bin/sh", "-c", process_script, "process-jsonl-display-metadata" };
+    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "display-metadata-marker",
+            .cwd = "/display-metadata-cwd",
+            .fixture = "display-metadata",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter.deinit();
+    try process_adapter.waitForReady(500);
+    var process_elapsed: u64 = 0;
+    while (process_adapter.registryFramesApplied() < 4 and process_elapsed <= 1000) : (process_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 4), process_adapter.registryFramesApplied());
+    try std.testing.expect(process_adapter.hasRegisteredCommand("process-display-command"));
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try process_adapter.agentTool(allocator, "process-display-tool"));
+
+    var wasm_resource_manifest = try wasm_manifest.validateManifestText(allocator, "test/fixtures/wasm/pure-truncate-head-v0",
+        \\{"schemaVersion":"pi-extension.v0","id":"com.pi.pure-truncate-head","name":"Pure Truncate Head Fixture","version":"0.1.0","description":"Capability-free Wasm migration fixture for the existing truncateHead pure tool implementation.","artifact":{"kind":"wasm-component","path":"wasm/plugin.wasm"},"tool":{"id":"builtin.truncateHead","description":"Keeps the beginning of content within line and byte limits.","inputSchema":{"type":"object","required":["content","maxLines","maxBytes"],"properties":{"content":{"type":"string"},"maxLines":{"type":"number"},"maxBytes":{"type":"number"}}},"outputSchema":{"type":"object"}},"capabilities":[],"resourceLimits":{"turns":1,"timeoutMs":10,"outputBytes":128,"outputLines":2,"toolScopes":["builtin.truncateHead"]}}
+    );
+    defer wasm_resource_manifest.deinit(allocator);
+    try std.testing.expect(wasm_resource_manifest == .valid);
+    try std.testing.expectEqual(@as(usize, 0), wasm_resource_manifest.valid.requested_capabilities.len);
+    try std.testing.expectEqual(@as(u64, 1), wasm_resource_manifest.valid.resource_limits.turns.?);
+    try std.testing.expectEqual(@as(usize, 1), wasm_resource_manifest.valid.resource_limits.tool_scopes.len);
+
+    var wasm_runtime_manifest = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer wasm_runtime_manifest.deinit(allocator);
+    try std.testing.expect(wasm_runtime_manifest == .valid);
+    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&wasm_runtime_manifest.valid),
+    } });
+    defer wasm_adapter.deinit();
+    try expectWasmToolSubsetConformance(allocator, wasm_adapter, wasm_runtime_manifest.valid.artifact_absolute_path);
+
+    const native_resource_denial_descriptor: NativeDescriptor = .{
+        .id = "com.pi.native-resource-denial-isolation",
+        .name = "Native Resource Denial Isolation",
+        .version = "0.1.0",
+        .description = "Resource limits and display metadata must not grant native host API operations",
+        .tools = &.{native_static_tool},
+        .resource_limits = .{
+            .turns = 1,
+            .timeout_ms = 10,
+            .output_bytes = 128,
+            .tool_scopes = &.{ "process-display-tool", "native.fixture.echo" },
+        },
+        .start = nativeHostApiBoundaryStart,
+    };
+    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_resource_denial_descriptor,
+    } });
+    defer native_adapter.deinit();
+    try native_adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), native_adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 13), native_adapter.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 13), native_adapter.diagnosticCategoryCount(.host_error));
+
+    const native_boundary_runtime = nativeRuntime(native_adapter.ptr);
+    for (wasm_manifest.CANONICAL_CAPABILITIES) |capability| {
+        const denial = wasm_manifest.denyRuntimeCapability(capability, .initialize, "native/host-api");
+        var found = false;
+        for (native_boundary_runtime.state.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, denial.capability.jsonName()) != null and
+                std.mem.indexOf(u8, diagnostic.message, denial.branch.jsonName()) != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"category\":\"denied_capability\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"mode\":\"native/host-api\"") != null)
+            {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+
+    const process_snapshot = try process_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(process_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot, "\"id\":\"tool.use\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot, "\"name\":\"process-display-tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot, "native.fixture.echo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, process_snapshot, "builtin.truncateHead") == null);
+
+    const wasm_snapshot = try wasm_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(wasm_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot, "\"name\":\"builtin.truncateHead\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot, "\"id\":\"tool.use\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_snapshot, "native.fixture.echo") == null);
+
+    const native_snapshot = try native_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(native_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot, "\"name\":\"native.fixture.echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot, "\"id\":\"tool.use\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot, "builtin.truncateHead") == null);
+    try std.testing.expect(std.mem.indexOf(u8, native_snapshot, "process-display-tool") == null);
+
+    try wasm_adapter.shutdown();
+    try native_adapter.shutdown();
+    try process_adapter.shutdown();
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+    try std.testing.expect(native_adapter.hasShutdownComplete());
+    try std.testing.expect(process_adapter.hasShutdownComplete());
+}
+
+test "runtime validation failures occur before registration while process_jsonl remains compatible" {
+    const allocator = std.testing.allocator;
+
+    var denied_wasm_manifest = try wasm_manifest.validateManifestText(allocator, "test/fixtures/wasm/pure-truncate-head-v0",
+        \\{"schemaVersion":"pi-extension.v0","id":"com.pi.denied-before-artifact","name":"Denied Before Artifact","version":"0.1.0","description":"Denied capability before artifact handoff","artifact":{"kind":"wasm-component","path":"wasm/missing.wasm"},"tool":{"id":"builtin.truncateHead","description":"Keeps the beginning of content within line and byte limits.","inputSchema":{},"outputSchema":{}},"capabilities":["file.read"],"resourceLimits":{"timeoutMs":10,"toolScopes":["builtin.truncateHead"]}}
+    );
+    defer denied_wasm_manifest.deinit(allocator);
+    try std.testing.expect(denied_wasm_manifest == .invalid);
+    try std.testing.expectEqual(@as(usize, 1), denied_wasm_manifest.invalid.len);
+    try std.testing.expectEqualStrings("denied_capability", denied_wasm_manifest.invalid[0].category);
+    try std.testing.expectEqual(wasm_manifest.Capability.file_read, denied_wasm_manifest.invalid[0].capability.?);
+    try std.testing.expect(std.mem.indexOf(u8, denied_wasm_manifest.invalid[0].message, "artifact file was not found") == null);
+
+    const invalid_native_descriptor: NativeDescriptor = .{
+        .id = "com.pi.invalid-native-preregistration",
+        .name = "Invalid Native Preregistration",
+        .version = "0.1.0",
+        .description = "Forbidden fields are rejected before static descriptor registration",
+        .tools = &.{native_static_tool},
+        .remote_url = "https://example.invalid/remote.wasm",
+        .workflow_preset = "workflow",
+    };
+    try std.testing.expectEqualStrings("remote_url", invalid_native_descriptor.firstForbiddenField().?);
+    try std.testing.expectError(error.ForbiddenNativeDescriptorField, startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &invalid_native_descriptor,
+    } }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "validation-process-jsonl-compat.jsonl");
+    defer allocator.free(capture_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"compat-pending\",\"method\":\"input\",\"responseRequired\":true,\"payload\":{{\"text\":\"compat\"}}}}\\n'; " ++
+            "printf '{{\"type\":\"register_tool\",\"name\":\"compat-tool\",\"label\":\"Compat Tool\",\"description\":\"process registry remains compatible\",\"parameters\":{{\"type\":\"object\"}},\"extensionPath\":\"fixture/compat.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+    const process_argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-validation-compat" };
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "validation-compat-marker",
+            .cwd = "/validation-compat-cwd",
+            .fixture = "validation-compat",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(500);
+    var elapsed: u64 = 0;
+    while ((adapter.pendingCount() < 1 or adapter.registryFramesApplied() < 1) and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "compat-tool"));
+    try adapter.sendExtensionUiResponse("compat-pending", "{\"ok\":true}");
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"initialize\",\"marker\":\"validation-compat-marker\",\"cwd\":\"/validation-compat-cwd\",\"fixture\":\"validation-compat\"}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"compat-pending\",\"payload\":{\"ok\":true}}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"shutdown\"}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "denied-before-artifact") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "invalid-native-preregistration") == null);
+}
+
 test "process_jsonl runtime adapter preserves registry UI response event and shutdown semantics" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
