@@ -68,27 +68,40 @@ function getAliases(): Record<string, string> {
 	if (_aliases) return _aliases;
 
 	const __dirname = path.dirname(fileURLToPath(import.meta.url));
-	const packageIndex = path.resolve(__dirname, "../..", "index.js");
 
 	const typeboxEntry = require.resolve("typebox");
 	const typeboxCompileEntry = require.resolve("typebox/compile");
 	const typeboxValueEntry = require.resolve("typebox/value");
 
 	const packagesRoot = path.resolve(__dirname, "../../../../");
-	const resolveWorkspaceOrImport = (workspaceRelativePath: string, specifier: string): string => {
-		const workspacePath = path.join(packagesRoot, workspaceRelativePath);
-		if (fs.existsSync(workspacePath)) {
-			return workspacePath;
+	const resolveWorkspaceOrImport = (workspaceRelativePaths: string[], specifier: string): string => {
+		for (const workspaceRelativePath of workspaceRelativePaths) {
+			const workspacePath = path.join(packagesRoot, workspaceRelativePath);
+			if (fs.existsSync(workspacePath)) {
+				return workspacePath;
+			}
 		}
-		return fileURLToPath(import.meta.resolve(specifier));
+		return require.resolve(specifier);
 	};
 
 	_aliases = {
-		"@mariozechner/pi-coding-agent": packageIndex,
-		"@mariozechner/pi-agent-core": resolveWorkspaceOrImport("agent/dist/index.js", "@mariozechner/pi-agent-core"),
-		"@mariozechner/pi-tui": resolveWorkspaceOrImport("tui/dist/index.js", "@mariozechner/pi-tui"),
-		"@mariozechner/pi-ai": resolveWorkspaceOrImport("ai/dist/index.js", "@mariozechner/pi-ai"),
-		"@mariozechner/pi-ai/oauth": resolveWorkspaceOrImport("ai/dist/oauth.js", "@mariozechner/pi-ai/oauth"),
+		"@mariozechner/pi-coding-agent": resolveWorkspaceOrImport(
+			["coding-agent/dist/index.js", "coding-agent/src/index.ts"],
+			"@mariozechner/pi-coding-agent",
+		),
+		"@mariozechner/pi-agent-core": resolveWorkspaceOrImport(
+			["agent/dist/index.js", "agent/src/index.ts"],
+			"@mariozechner/pi-agent-core",
+		),
+		"@mariozechner/pi-tui": resolveWorkspaceOrImport(
+			["tui/dist/index.js", "tui/src/index.ts"],
+			"@mariozechner/pi-tui",
+		),
+		"@mariozechner/pi-ai": resolveWorkspaceOrImport(["ai/dist/index.js", "ai/src/index.ts"], "@mariozechner/pi-ai"),
+		"@mariozechner/pi-ai/oauth": resolveWorkspaceOrImport(
+			["ai/dist/oauth.js", "ai/src/oauth.ts"],
+			"@mariozechner/pi-ai/oauth",
+		),
 		typebox: typeboxEntry,
 		"typebox/compile": typeboxCompileEntry,
 		"typebox/value": typeboxValueEntry,
