@@ -60,6 +60,40 @@ pub const ThinkingLevel = enum {
     xhigh,
 };
 
+pub const ModelThinkingLevel = enum {
+    off,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+};
+
+pub const ThinkingLevelMapEntry = union(enum) {
+    unsupported,
+    mapped: []const u8,
+};
+
+pub const ThinkingLevelMap = struct {
+    off: ?ThinkingLevelMapEntry = null,
+    minimal: ?ThinkingLevelMapEntry = null,
+    low: ?ThinkingLevelMapEntry = null,
+    medium: ?ThinkingLevelMapEntry = null,
+    high: ?ThinkingLevelMapEntry = null,
+    xhigh: ?ThinkingLevelMapEntry = null,
+
+    pub fn get(self: ThinkingLevelMap, level: ModelThinkingLevel) ?ThinkingLevelMapEntry {
+        return switch (level) {
+            .off => self.off,
+            .minimal => self.minimal,
+            .low => self.low,
+            .medium => self.medium,
+            .high => self.high,
+            .xhigh => self.xhigh,
+        };
+    }
+};
+
 pub const AnthropicEffort = enum {
     low,
     medium,
@@ -352,6 +386,7 @@ pub const Model = struct {
     provider: Provider,
     base_url: []const u8,
     reasoning: bool = false,
+    thinking_level_map: ?ThinkingLevelMap = null,
     tool_calling: bool = true,
     loaded: bool = false,
     input_types: []const []const u8, // "text", "image"

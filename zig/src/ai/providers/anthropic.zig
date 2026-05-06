@@ -3235,7 +3235,6 @@ fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.Assist
         allocator.free(tool_calls);
     }
     if (message.response_id) |response_id| allocator.free(response_id);
-    if (message.error_message) |error_message| allocator.free(error_message);
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {

@@ -869,6 +869,7 @@ test "streamSimple preserves xhigh reasoning for Codex GPT-5.5" {
         .provider = "openai-codex",
         .base_url = "https://chatgpt.com/backend-api",
         .reasoning = true,
+        .thinking_level_map = .{ .xhigh = .{ .mapped = "xhigh" } },
         .input_types = &[_][]const u8{"text"},
         .context_window = 400000,
         .max_tokens = 128000,

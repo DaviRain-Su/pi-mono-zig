@@ -29,6 +29,9 @@ pub const providers = struct {
 // Re-export commonly used types
 pub const Model = types.Model;
 pub const ModelCost = types.ModelCost;
+pub const ModelThinkingLevel = types.ModelThinkingLevel;
+pub const ThinkingLevelMap = types.ThinkingLevelMap;
+pub const ThinkingLevelMapEntry = types.ThinkingLevelMapEntry;
 pub const Message = types.Message;
 pub const Context = types.Context;
 pub const StreamOptions = types.StreamOptions;

@@ -13,6 +13,7 @@ pub const ModelDefinition = struct {
     id: []const u8,
     name: []const u8,
     reasoning: bool = false,
+    thinking_level_map: ?types.ThinkingLevelMap = null,
     tool_calling: bool = true,
     loaded: bool = false,
     input_types: []const []const u8,
@@ -141,6 +142,7 @@ pub const ModelRegistry = struct {
             .provider = provider.provider,
             .base_url = provider.base_url,
             .reasoning = definition.reasoning,
+            .thinking_level_map = definition.thinking_level_map,
             .tool_calling = definition.tool_calling,
             .loaded = definition.loaded,
             .input_types = definition.input_types,
@@ -453,6 +455,9 @@ fn cloneModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!Mo
     const owned_compat = if (model.compat) |compat| try cloneJsonValue(allocator, compat) else null;
     errdefer if (owned_compat) |compat| deinitJsonValue(allocator, compat);
 
+    var owned_thinking_level_map = try cloneThinkingLevelMap(allocator, model.thinking_level_map);
+    errdefer if (owned_thinking_level_map) |*thinking_level_map| deinitThinkingLevelMap(allocator, thinking_level_map);
+
     return .{
         .model = .{
             .id = owned_id,
@@ -461,6 +466,7 @@ fn cloneModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!Mo
             .provider = owned_provider,
             .base_url = owned_base_url,
             .reasoning = model.reasoning,
+            .thinking_level_map = owned_thinking_level_map,
             .tool_calling = model.tool_calling,
             .loaded = model.loaded,
             .input_types = owned_input_types,
@@ -500,6 +506,58 @@ pub fn deinitOwnedModel(allocator: std.mem.Allocator, model: *types.Model) void 
     if (model.compat) |compat| {
         deinitJsonValue(allocator, compat);
     }
+    if (model.thinking_level_map) |*thinking_level_map| {
+        deinitThinkingLevelMap(allocator, thinking_level_map);
+    }
+}
+
+fn cloneThinkingLevelMap(
+    allocator: std.mem.Allocator,
+    maybe_map: ?types.ThinkingLevelMap,
+) !?types.ThinkingLevelMap {
+    const map = maybe_map orelse return null;
+    var cloned = types.ThinkingLevelMap{};
+    errdefer deinitThinkingLevelMap(allocator, &cloned);
+
+    cloned.off = try cloneThinkingLevelMapEntry(allocator, map.off);
+    cloned.minimal = try cloneThinkingLevelMapEntry(allocator, map.minimal);
+    cloned.low = try cloneThinkingLevelMapEntry(allocator, map.low);
+    cloned.medium = try cloneThinkingLevelMapEntry(allocator, map.medium);
+    cloned.high = try cloneThinkingLevelMapEntry(allocator, map.high);
+    cloned.xhigh = try cloneThinkingLevelMapEntry(allocator, map.xhigh);
+
+    return cloned;
+}
+
+fn cloneThinkingLevelMapEntry(
+    allocator: std.mem.Allocator,
+    maybe_entry: ?types.ThinkingLevelMapEntry,
+) !?types.ThinkingLevelMapEntry {
+    const entry = maybe_entry orelse return null;
+    return switch (entry) {
+        .unsupported => .unsupported,
+        .mapped => |mapped| .{ .mapped = try allocator.dupe(u8, mapped) },
+    };
+}
+
+fn deinitThinkingLevelMap(allocator: std.mem.Allocator, map: *types.ThinkingLevelMap) void {
+    deinitThinkingLevelMapEntry(allocator, map.off);
+    deinitThinkingLevelMapEntry(allocator, map.minimal);
+    deinitThinkingLevelMapEntry(allocator, map.low);
+    deinitThinkingLevelMapEntry(allocator, map.medium);
+    deinitThinkingLevelMapEntry(allocator, map.high);
+    deinitThinkingLevelMapEntry(allocator, map.xhigh);
+    map.* = .{};
+}
+
+fn deinitThinkingLevelMapEntry(
+    allocator: std.mem.Allocator,
+    maybe_entry: ?types.ThinkingLevelMapEntry,
+) void {
+    if (maybe_entry) |entry| switch (entry) {
+        .unsupported => {},
+        .mapped => |mapped| allocator.free(mapped),
+    };
 }
 
 fn cloneHeaders(
@@ -651,24 +709,93 @@ fn isAlias(id: []const u8) bool {
     return false;
 }
 
+pub const MODEL_THINKING_LEVELS = [_]types.ModelThinkingLevel{ .off, .minimal, .low, .medium, .high, .xhigh };
+
+pub fn isThinkingLevelSupported(model: types.Model, level: types.ModelThinkingLevel) bool {
+    if (!model.reasoning) return level == .off;
+
+    const mapped = if (model.thinking_level_map) |thinking_level_map| thinking_level_map.get(level) else null;
+    if (mapped) |entry| {
+        switch (entry) {
+            .unsupported => return false,
+            .mapped => {},
+        }
+    }
+    if (level == .xhigh) return mapped != null;
+    return true;
+}
+
+pub fn supportedThinkingLevels(
+    model: types.Model,
+    buffer: *[MODEL_THINKING_LEVELS.len]types.ModelThinkingLevel,
+) []const types.ModelThinkingLevel {
+    var count: usize = 0;
+    for (MODEL_THINKING_LEVELS) |level| {
+        if (isThinkingLevelSupported(model, level)) {
+            buffer[count] = level;
+            count += 1;
+        }
+    }
+    return buffer[0..count];
+}
+
+pub fn clampThinkingLevel(
+    model: types.Model,
+    requested: ?types.ModelThinkingLevel,
+) types.ModelThinkingLevel {
+    var supported_buffer: [MODEL_THINKING_LEVELS.len]types.ModelThinkingLevel = undefined;
+    const supported = supportedThinkingLevels(model, &supported_buffer);
+    const requested_level = requested orelse return if (supported.len > 0) supported[0] else .off;
+
+    if (containsThinkingLevel(supported, requested_level)) return requested_level;
+
+    const requested_index = thinkingLevelIndex(requested_level);
+    var upward_index = requested_index;
+    while (upward_index < MODEL_THINKING_LEVELS.len) : (upward_index += 1) {
+        const candidate = MODEL_THINKING_LEVELS[upward_index];
+        if (containsThinkingLevel(supported, candidate)) return candidate;
+    }
+
+    var downward_index = requested_index;
+    while (downward_index > 0) {
+        downward_index -= 1;
+        const candidate = MODEL_THINKING_LEVELS[downward_index];
+        if (containsThinkingLevel(supported, candidate)) return candidate;
+    }
+
+    return if (supported.len > 0) supported[0] else .off;
+}
+
+pub fn parseModelThinkingLevel(value: []const u8) ?types.ModelThinkingLevel {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return null;
+}
+
+pub fn clampThinkingLevelName(model: types.Model, value: []const u8) types.ModelThinkingLevel {
+    return clampThinkingLevel(model, parseModelThinkingLevel(value));
+}
+
 pub fn supportsXhigh(model: types.Model) bool {
-    if (std.mem.indexOf(u8, model.id, "gpt-5.2") != null or
-        std.mem.indexOf(u8, model.id, "gpt-5.3") != null or
-        std.mem.indexOf(u8, model.id, "gpt-5.4") != null or
-        std.mem.indexOf(u8, model.id, "gpt-5.5") != null)
-    {
-        return true;
-    }
+    return isThinkingLevelSupported(model, .xhigh);
+}
 
-    if (std.mem.indexOf(u8, model.id, "opus-4-6") != null or
-        std.mem.indexOf(u8, model.id, "opus-4.6") != null or
-        std.mem.indexOf(u8, model.id, "opus-4-7") != null or
-        std.mem.indexOf(u8, model.id, "opus-4.7") != null)
-    {
-        return true;
+fn containsThinkingLevel(haystack: []const types.ModelThinkingLevel, needle: types.ModelThinkingLevel) bool {
+    for (haystack) |level| {
+        if (level == needle) return true;
     }
-
     return false;
+}
+
+fn thinkingLevelIndex(level: types.ModelThinkingLevel) usize {
+    for (MODEL_THINKING_LEVELS, 0..) |candidate, index| {
+        if (candidate == level) return index;
+    }
+    unreachable;
 }
 
 const TEXT_INPUTS = [_][]const u8{"text"};
@@ -703,26 +830,32 @@ const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "faux", .api = "faux", .base_url = "http://localhost:0", .default_model_id = "faux-1" },
 };
 
+const THINKING_MAP_OFF_UNSUPPORTED = types.ThinkingLevelMap{ .off = .unsupported };
+const THINKING_MAP_XHIGH_MAX = types.ThinkingLevelMap{ .xhigh = .{ .mapped = "max" } };
+const THINKING_MAP_XHIGH_XHIGH = types.ThinkingLevelMap{ .xhigh = .{ .mapped = "xhigh" } };
+const THINKING_MAP_OFF_UNSUPPORTED_XHIGH = types.ThinkingLevelMap{ .off = .unsupported, .xhigh = .{ .mapped = "xhigh" } };
+const THINKING_MAP_CODEX_XHIGH = types.ThinkingLevelMap{ .minimal = .{ .mapped = "low" }, .xhigh = .{ .mapped = "xhigh" } };
+
 const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "openai", .id = "gpt-4.1-mini", .name = "GPT-4.1 Mini", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 128000, .max_tokens = 16384 },
-    .{ .provider = "openai", .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
-    .{ .provider = "openai", .id = "gpt-5.5", .name = "GPT-5.5", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
+    .{ .provider = "openai", .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
+    .{ .provider = "openai", .id = "gpt-5.5", .name = "GPT-5.5", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
 
     .{ .provider = "kimi", .id = "moonshot-v1-8k", .name = "Moonshot v1 8K", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 8192, .max_tokens = 8192 },
     .{ .provider = "kimi", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
 
     .{ .provider = "anthropic", .id = "claude-sonnet-4-5", .name = "Claude Sonnet 4.5", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 64000 },
     .{ .provider = "anthropic", .id = "claude-sonnet-4-5-20250929", .name = "Claude Sonnet 4.5 (2025-09-29)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 64000 },
-    .{ .provider = "anthropic", .id = "claude-opus-4-7", .name = "Claude Opus 4.7", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
+    .{ .provider = "anthropic", .id = "claude-opus-4-7", .name = "Claude Opus 4.7", .reasoning = true, .thinking_level_map = THINKING_MAP_XHIGH_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
 
     .{ .provider = "mistral", .id = "mistral-medium-latest", .name = "Mistral Medium Latest", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 131072, .max_tokens = 32768 },
     .{ .provider = "mistral", .id = "devstral-medium-latest", .name = "Devstral Medium Latest", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 131072, .max_tokens = 32768 },
 
-    .{ .provider = "openai-responses", .id = "gpt-5-mini", .name = "GPT-5 Mini", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 200000, .max_tokens = 16384 },
-    .{ .provider = "azure-openai-responses", .id = "gpt-5.4", .name = "Azure GPT-5.4", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
-    .{ .provider = "openai-codex", .id = "gpt-5.5", .name = "Codex GPT-5.5", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
+    .{ .provider = "openai-responses", .id = "gpt-5-mini", .name = "GPT-5 Mini", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 200000, .max_tokens = 16384 },
+    .{ .provider = "azure-openai-responses", .id = "gpt-5.4", .name = "Azure GPT-5.4", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
+    .{ .provider = "openai-codex", .id = "gpt-5.5", .name = "Codex GPT-5.5", .reasoning = true, .thinking_level_map = THINKING_MAP_CODEX_XHIGH, .input_types = TEXT_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
     .{ .provider = "openai-codex", .id = "codex-mini-latest", .name = "Codex Mini Latest", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 200000, .max_tokens = 32768 },
-    .{ .provider = "github-copilot", .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
+    .{ .provider = "github-copilot", .id = "gpt-5.4", .name = "GPT-5.4", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED_XHIGH, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 400000, .max_tokens = 128000 },
 
     .{ .provider = "google", .id = "gemini-2.5-pro", .name = "Gemini 2.5 Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 65536 },
     .{ .provider = "google", .id = "gemini-3.1-pro-preview", .name = "Gemini 3.1 Pro Preview", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 65536 },
@@ -730,8 +863,8 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "google-vertex", .id = "gemini-3.1-pro-preview", .name = "Vertex Gemini 3.1 Pro Preview", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 65536 },
 
     .{ .provider = "amazon-bedrock", .id = "anthropic.claude-3-7-sonnet-20250219-v1:0", .name = "Bedrock Claude 3.7 Sonnet", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 200000, .max_tokens = 8192 },
-    .{ .provider = "amazon-bedrock", .id = "us.anthropic.claude-opus-4-6-v1", .name = "Bedrock Claude Opus 4.6 (US)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
-    .{ .provider = "amazon-bedrock", .id = "global.anthropic.claude-opus-4-6-v1", .name = "Bedrock Claude Opus 4.6 (Global)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
+    .{ .provider = "amazon-bedrock", .id = "us.anthropic.claude-opus-4-6-v1", .name = "Bedrock Claude Opus 4.6 (US)", .reasoning = true, .thinking_level_map = THINKING_MAP_XHIGH_MAX, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
+    .{ .provider = "amazon-bedrock", .id = "global.anthropic.claude-opus-4-6-v1", .name = "Bedrock Claude Opus 4.6 (Global)", .reasoning = true, .thinking_level_map = THINKING_MAP_XHIGH_MAX, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1000000, .max_tokens = 128000 },
     .{ .provider = "xai", .id = "grok-4.20-0309-reasoning", .name = "Grok 4.20 (Reasoning)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 2000000, .max_tokens = 30000 },
     .{ .provider = "groq", .id = "openai/gpt-oss-120b", .name = "GPT OSS 120B", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 131072, .max_tokens = 65536 },
     .{ .provider = "cerebras", .id = "zai-glm-4.7", .name = "Z.AI GLM-4.7", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 131072, .max_tokens = 40000 },
@@ -915,7 +1048,7 @@ test "custom models can be registered at runtime" {
     try std.testing.expectEqualStrings("http://localhost:11434/v1", model.base_url);
 }
 
-test "supportsXhigh matches GPT-5.5 and Opus 4.7 families" {
+test "supportsXhigh requires explicit non-null xhigh metadata" {
     const text_inputs = &[_][]const u8{"text"};
 
     const gpt_model = types.Model{
@@ -925,6 +1058,7 @@ test "supportsXhigh matches GPT-5.5 and Opus 4.7 families" {
         .provider = "openai",
         .base_url = "https://api.openai.com/v1",
         .reasoning = true,
+        .thinking_level_map = .{ .xhigh = .{ .mapped = "xhigh" } },
         .input_types = text_inputs,
         .context_window = 400000,
         .max_tokens = 128000,
@@ -938,6 +1072,7 @@ test "supportsXhigh matches GPT-5.5 and Opus 4.7 families" {
         .provider = "anthropic",
         .base_url = "https://api.anthropic.com/v1",
         .reasoning = true,
+        .thinking_level_map = .{ .xhigh = .{ .mapped = "xhigh" } },
         .input_types = text_inputs,
         .context_window = 1000000,
         .max_tokens = 128000,
@@ -956,4 +1091,212 @@ test "supportsXhigh matches GPT-5.5 and Opus 4.7 families" {
         .max_tokens = 16384,
     };
     try std.testing.expect(!supportsXhigh(mini_model));
+}
+
+test "model thinking level domain matches TypeScript" {
+    const expected = [_]types.ModelThinkingLevel{ .off, .minimal, .low, .medium, .high, .xhigh };
+    try std.testing.expectEqualSlices(types.ModelThinkingLevel, expected[0..], MODEL_THINKING_LEVELS[0..]);
+}
+
+test "non-reasoning models support only off despite thinking level map" {
+    const text_inputs = &[_][]const u8{"text"};
+    const model = types.Model{
+        .id = "local-non-reasoning",
+        .name = "Local Non Reasoning",
+        .api = "openai-completions",
+        .provider = "local",
+        .base_url = "http://localhost:11434/v1",
+        .reasoning = false,
+        .thinking_level_map = .{ .off = .unsupported, .xhigh = .{ .mapped = "xhigh" } },
+        .input_types = text_inputs,
+        .context_window = 8192,
+        .max_tokens = 4096,
+    };
+
+    try expectSupportedThinkingLevels(model, &.{.off});
+    try std.testing.expectEqual(types.ModelThinkingLevel.off, clampThinkingLevel(model, .xhigh));
+    try std.testing.expectEqual(types.ModelThinkingLevel.off, clampThinkingLevel(model, null));
+}
+
+test "custom registered non-reasoning models support only off" {
+    var registry = ModelRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerProvider(.{
+        .provider = "local-openai",
+        .api = "openai-completions",
+        .base_url = "http://localhost:11434/v1",
+    });
+    try registry.registerModelDefinition(.{
+        .provider = "local-openai",
+        .id = "local-chat",
+        .name = "Local Chat",
+        .reasoning = false,
+        .thinking_level_map = .{ .off = .unsupported, .xhigh = .{ .mapped = "xhigh" } },
+        .input_types = TEXT_INPUTS[0..],
+        .context_window = 131072,
+        .max_tokens = 8192,
+    });
+
+    const model = registry.find("local-openai", "local-chat").?;
+    try expectSupportedThinkingLevels(model, &.{.off});
+}
+
+test "built-in non-reasoning models support only off" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const summaries = try listSummaries(std.testing.allocator);
+    defer std.testing.allocator.free(summaries);
+
+    var checked_non_reasoning: usize = 0;
+    for (summaries) |summary| {
+        if (summary.reasoning) continue;
+        const model = find(summary.provider, summary.id).?;
+        try expectSupportedThinkingLevels(model, &.{.off});
+        checked_non_reasoning += 1;
+    }
+
+    try std.testing.expect(checked_non_reasoning > 0);
+}
+
+test "reasoning models apply null suppression and xhigh opt-in rules" {
+    const text_inputs = &[_][]const u8{"text"};
+    const default_model = types.Model{
+        .id = "reasoning-defaults",
+        .name = "Reasoning Defaults",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = text_inputs,
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try expectSupportedThinkingLevels(default_model, &.{ .off, .minimal, .low, .medium, .high });
+    try std.testing.expect(!supportsXhigh(default_model));
+    try std.testing.expectEqual(types.ModelThinkingLevel.off, clampThinkingLevel(default_model, .off));
+
+    const null_suppressed = types.Model{
+        .id = "reasoning-null-suppressed",
+        .name = "Reasoning Null Suppressed",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .thinking_level_map = .{
+            .off = .unsupported,
+            .minimal = .unsupported,
+            .medium = .unsupported,
+            .xhigh = .unsupported,
+        },
+        .input_types = text_inputs,
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try expectSupportedThinkingLevels(null_suppressed, &.{ .low, .high });
+    try std.testing.expect(!supportsXhigh(null_suppressed));
+
+    const xhigh_model = types.Model{
+        .id = "reasoning-xhigh",
+        .name = "Reasoning XHigh",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .thinking_level_map = .{ .xhigh = .{ .mapped = "xhigh" } },
+        .input_types = text_inputs,
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try expectSupportedThinkingLevels(xhigh_model, &.{ .off, .minimal, .low, .medium, .high, .xhigh });
+    try std.testing.expect(supportsXhigh(xhigh_model));
+}
+
+test "thinking level clamping honors TypeScript ordering and fallback" {
+    const text_inputs = &[_][]const u8{"text"};
+    const off_suppressed = types.Model{
+        .id = "off-suppressed",
+        .name = "Off Suppressed",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .thinking_level_map = .{ .off = .unsupported },
+        .input_types = text_inputs,
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try std.testing.expectEqual(types.ModelThinkingLevel.minimal, clampThinkingLevel(off_suppressed, .off));
+
+    const xhigh_unsupported = types.Model{
+        .id = "xhigh-unsupported",
+        .name = "XHigh Unsupported",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .thinking_level_map = .{ .low = .unsupported, .medium = .unsupported, .high = .unsupported },
+        .input_types = text_inputs,
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try expectSupportedThinkingLevels(xhigh_unsupported, &.{ .off, .minimal });
+    try std.testing.expectEqual(types.ModelThinkingLevel.minimal, clampThinkingLevel(xhigh_unsupported, .xhigh));
+
+    const google_style = types.Model{
+        .id = "gemini-3-pro",
+        .name = "Gemini 3 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .thinking_level_map = .{
+            .off = .unsupported,
+            .minimal = .unsupported,
+            .low = .{ .mapped = "LOW" },
+            .medium = .unsupported,
+            .high = .{ .mapped = "HIGH" },
+        },
+        .input_types = text_inputs,
+        .context_window = 1048576,
+        .max_tokens = 65536,
+    };
+    try expectSupportedThinkingLevels(google_style, &.{ .low, .high });
+    try std.testing.expectEqual(types.ModelThinkingLevel.low, clampThinkingLevel(google_style, .off));
+    try std.testing.expectEqual(types.ModelThinkingLevel.low, clampThinkingLevel(google_style, .minimal));
+    try std.testing.expectEqual(types.ModelThinkingLevel.high, clampThinkingLevel(google_style, .medium));
+    try std.testing.expectEqual(types.ModelThinkingLevel.low, clampThinkingLevel(google_style, null));
+    try std.testing.expectEqual(types.ModelThinkingLevel.low, clampThinkingLevelName(google_style, "unknown"));
+
+    const no_supported_levels = types.Model{
+        .id = "no-supported-levels",
+        .name = "No Supported Levels",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .thinking_level_map = .{
+            .off = .unsupported,
+            .minimal = .unsupported,
+            .low = .unsupported,
+            .medium = .unsupported,
+            .high = .unsupported,
+        },
+        .input_types = text_inputs,
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try expectSupportedThinkingLevels(no_supported_levels, &.{});
+    try std.testing.expectEqual(types.ModelThinkingLevel.off, clampThinkingLevel(no_supported_levels, null));
+    try std.testing.expectEqual(types.ModelThinkingLevel.off, clampThinkingLevelName(no_supported_levels, "unknown"));
+}
+
+fn expectSupportedThinkingLevels(
+    model: types.Model,
+    expected: []const types.ModelThinkingLevel,
+) !void {
+    var buffer: [MODEL_THINKING_LEVELS.len]types.ModelThinkingLevel = undefined;
+    const actual = supportedThinkingLevels(model, &buffer);
+    try std.testing.expectEqualSlices(types.ModelThinkingLevel, expected, actual);
 }
