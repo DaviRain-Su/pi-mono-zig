@@ -1057,10 +1057,53 @@ fn updateSearchFromKey(
         },
         .backspace => {
             if (current_search.len == 0) return null;
-            return try allocator.dupe(u8, current_search[0 .. current_search.len - 1]);
+            return try allocator.dupe(u8, current_search[0..previousSearchGraphemeStart(current_search)]);
         },
         else => return null,
     }
+}
+
+fn previousSearchGraphemeStart(text: []const u8) usize {
+    var cursor: usize = 0;
+    var previous: usize = 0;
+    while (cursor < text.len) {
+        previous = cursor;
+        const cluster = tui.ansi.nextDisplayCluster(text, cursor);
+        if (cluster.end >= text.len or cluster.end <= cursor) return previous;
+        cursor = cluster.end;
+    }
+    return previous;
+}
+
+test "updateSearchFromKey appends Chinese printable text" {
+    const allocator = std.testing.allocator;
+
+    const next = (try updateSearchFromKey(allocator, "模型", .{
+        .printable = tui.keys.PrintableKey.fromSlice("搜索"),
+    }, .{})).?;
+    defer allocator.free(next);
+
+    try std.testing.expectEqualStrings("模型搜索", next);
+}
+
+test "updateSearchFromKey backspace removes full Chinese grapheme" {
+    const allocator = std.testing.allocator;
+
+    const next = (try updateSearchFromKey(allocator, "模型搜索", .backspace, .{})).?;
+    defer allocator.free(next);
+
+    try std.testing.expectEqualStrings("模型搜", next);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(next));
+}
+
+test "updateSearchFromKey backspace removes combining grapheme" {
+    const allocator = std.testing.allocator;
+
+    const next = (try updateSearchFromKey(allocator, "cafe\u{301}", .backspace, .{})).?;
+    defer allocator.free(next);
+
+    try std.testing.expectEqualStrings("caf", next);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(next));
 }
 
 pub fn submitEditorText(

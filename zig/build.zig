@@ -210,6 +210,7 @@ pub fn build(b: *std.Build) void {
         .root_module = coding_agent_mod,
     });
     const run_coding_agent_tests = b.addRunArtifact(coding_agent_tests);
+    run_coding_agent_tests.setCwd(b.path("."));
     test_step.dependOn(&run_coding_agent_tests.step);
 
     const coding_agent_test_step = b.step("test-coding-agent", "Run coding-agent unit tests only");

@@ -46,10 +46,8 @@ jobs:
         working-directory: .
         run: npm ci
 
-      # mlugg/setup-zig@v1 still uses the pre-0.16 tarball naming
-      # (zig-<os>-<arch>-<ver>) and 404s on 0.16.0 which switched to
-      # zig-<arch>-<os>-<ver>. Install Zig directly from ziglang.org.
-      - name: Setup Zig 0.16.0
+      - name: Resolve Zig 0.16.0 package
+        id: zig-package
         shell: bash
         run: |
           set -euo pipefail
@@ -61,15 +59,132 @@ jobs:
             macOS-ARM64) ARCH=aarch64-macos ;;
             *) echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
           esac
+          echo "version=${ZIG_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "arch=${ARCH}" >> "${GITHUB_OUTPUT}"
+          echo "install-dir=${HOME}/.zig/${ZIG_VERSION}-${ARCH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache Zig 0.16.0
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.zig-package.outputs.install-dir }}
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ steps.zig-package.outputs.version }}-${{ steps.zig-package.outputs.arch }}
+
+      # mlugg/setup-zig@v1 still uses the pre-0.16 tarball naming
+      # (zig-<os>-<arch>-<ver>) and 404s on 0.16.0 which switched to
+      # zig-<arch>-<os>-<ver>. Install the official stable tarball directly
+      # from ziglang.org or a community mirror, with a cache so transient
+      # network failures don't break every CI run.
+      - name: Setup Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION="${{ steps.zig-package.outputs.version }}"
+          ARCH="${{ steps.zig-package.outputs.arch }}"
+          INSTALL_DIR="${{ steps.zig-package.outputs.install-dir }}"
+          if [ -x "${INSTALL_DIR}/zig" ]; then
+            ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+            if [ "${ACTUAL_VERSION}" != "${ZIG_VERSION}" ]; then
+              echo "Expected cached Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
+              exit 1
+            fi
+            echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+            echo "${ACTUAL_VERSION}"
+            exit 0
+          fi
+
           TARBALL="zig-${ARCH}-${ZIG_VERSION}.tar.xz"
-          URL="https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}"
-          echo "Downloading ${URL}"
-          curl -fsSL --retry 3 --retry-delay 5 -o "${TARBALL}" "${URL}"
-          mkdir -p "${HOME}/.zig"
-          tar -xJf "${TARBALL}" -C "${HOME}/.zig" --strip-components=1
-          rm -f "${TARBALL}"
-          echo "${HOME}/.zig" >> "${GITHUB_PATH}"
-          "${HOME}/.zig/zig" version
+          case "${ARCH}" in
+            x86_64-linux)   EXPECTED_SHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+            aarch64-linux)  EXPECTED_SHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+            x86_64-macos)   EXPECTED_SHA=0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7 ;;
+            aarch64-macos)  EXPECTED_SHA=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
+            *) echo "No Zig ${ZIG_VERSION} checksum configured for ${ARCH}" >&2; exit 1 ;;
+          esac
+
+          DEST="${RUNNER_TEMP}/${TARBALL}"
+          SOURCES_FILE="${RUNNER_TEMP}/zig-download-sources.txt"
+          MIRRORS_FILE="${RUNNER_TEMP}/zig-community-mirrors.txt"
+          : > "${SOURCES_FILE}"
+          printf '%s\n' "https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}" >> "${SOURCES_FILE}"
+
+          if ! curl --fail --show-error --location \
+            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 15 --max-time 180 \
+            --output "${MIRRORS_FILE}" \
+            "https://ziglang.org/download/community-mirrors.txt"; then
+            echo "Unable to fetch Zig community mirror list; using embedded fallback list" >&2
+            printf '%s\n' \
+              "https://pkg.hexops.org/zig" \
+              "https://zigmirror.hryx.net/zig" \
+              "https://zig.linus.dev/zig" \
+              "https://zig.squirl.dev" \
+              "https://zig.mirror.mschae23.de/zig" \
+              "https://ziglang.freetls.fastly.net" \
+              "https://zig.tilok.dev" \
+              "https://zig-mirror.tsimnet.eu/zig" \
+              "https://zig.karearl.com/zig" \
+              "https://pkg.earth/zig" \
+              "https://fs.liujiacai.net/zigbuilds" \
+              "https://zigmirror.com" \
+              "https://zig.chainsafe.dev" \
+              "https://zig.savalione.com" \
+              > "${MIRRORS_FILE}"
+          fi
+
+          while IFS= read -r MIRROR; do
+            [ -n "${MIRROR}" ] || continue
+            case "${MIRROR}" in
+              https://*) ;;
+              *) echo "Skipping invalid Zig mirror entry: ${MIRROR}" >&2; continue ;;
+            esac
+            printf '%s/%s?source=pi-mono-zig-ci\n' "${MIRROR%/}" "${TARBALL}" >> "${SOURCES_FILE}"
+          done < "${MIRRORS_FILE}"
+
+          DOWNLOADED=0
+          SOURCE_INDEX=0
+          while IFS= read -r URL; do
+            SOURCE_INDEX=$((SOURCE_INDEX + 1))
+            SOURCE_DEST="${RUNNER_TEMP}/${TARBALL}.${SOURCE_INDEX}.partial"
+            echo "Downloading ${URL}"
+            if curl --fail --show-error --location \
+              --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
+              --connect-timeout 30 --max-time 900 --continue-at - \
+              --output "${SOURCE_DEST}" "${URL}"; then
+              ACTUAL_SHA="$(shasum -a 256 "${SOURCE_DEST}" | awk '{print $1}')"
+              if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+                echo "Checksum mismatch from ${URL}: expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}" >&2
+                rm -f "${SOURCE_DEST}"
+                continue
+              fi
+              if ! tar -tJf "${SOURCE_DEST}" >/dev/null; then
+                echo "Archive validation failed for ${URL}" >&2
+                rm -f "${SOURCE_DEST}"
+                continue
+              fi
+              mv "${SOURCE_DEST}" "${DEST}"
+              DOWNLOADED=1
+              break
+            fi
+            echo "Download failed from ${URL}" >&2
+            rm -f "${SOURCE_DEST}"
+          done < "${SOURCES_FILE}"
+
+          if [ "${DOWNLOADED}" -ne 1 ]; then
+            echo "Failed to download and validate ${TARBALL} from ziglang.org or any configured mirror" >&2
+            exit 1
+          fi
+
+          tar -tJf "${DEST}" >/dev/null
+          mkdir -p "${INSTALL_DIR}"
+          tar -xJf "${DEST}" -C "${INSTALL_DIR}" --strip-components=1
+          rm -f "${DEST}"
+          echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+          ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+          if [ "${ACTUAL_VERSION}" != "${ZIG_VERSION}" ]; then
+            echo "Expected Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
+            exit 1
+          fi
+          echo "${ACTUAL_VERSION}"
 
       - name: Install system tools (Linux)
         if: runner.os == 'Linux'

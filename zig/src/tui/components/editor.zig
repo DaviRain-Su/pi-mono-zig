@@ -2326,6 +2326,20 @@ test "editor accepts multi-byte grapheme via PrintableKey" {
     try std.testing.expectEqualStrings("你好", editor.text());
 }
 
+test "editor backspace deletes a full Chinese character" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("你好") });
+    _ = try editor.handleKey(.backspace);
+
+    try std.testing.expectEqualStrings("你", editor.text());
+    try std.testing.expectEqual(@as(usize, "你".len), editor.cursorIndex());
+    try std.testing.expectEqual(CursorPosition{ .line = 0, .column = 2 }, editor.cursorPosition());
+}
+
 test "editor prompt history skips empty and consecutive duplicates with one hundred entry cap" {
     const allocator = std.testing.allocator;
 

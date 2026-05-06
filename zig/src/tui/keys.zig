@@ -4,10 +4,10 @@ const vaxis = @import("vaxis");
 const ESC = "\x1b";
 
 pub const PrintableKey = struct {
-    pub const max_bytes: usize = 32;
+    pub const max_bytes: usize = 256;
 
     bytes: [max_bytes]u8 = [_]u8{0} ** max_bytes,
-    len: u8 = 0,
+    len: u16 = 0,
 
     pub fn fromSlice(input: []const u8) PrintableKey {
         std.debug.assert(input.len <= max_bytes);
@@ -320,6 +320,8 @@ fn asciiControlKeyFromCodepoint(codepoint: u32) ?u8 {
 }
 
 fn printableKeyFromCodepoint(codepoint: u32) ?Key {
+    if (codepoint == 0) return null;
+
     var utf8: [4]u8 = undefined;
     const scalar = std.math.cast(u21, codepoint) orelse return null;
     const length = std.unicode.utf8Encode(scalar, &utf8) catch return null;
@@ -525,6 +527,20 @@ test "parsedInputFromVaxisKey honours IME text with zero codepoint" {
     }, result);
 }
 
+test "parsedInputFromVaxisKey honours IME text longer than legacy printable cap" {
+    const committed = "中文输入法提交的较长文本超过三十二字节";
+    try std.testing.expect(committed.len > 32);
+
+    const result = parsedInputFromVaxisKey(.{
+        .codepoint = 0,
+        .text = committed,
+    }, .press).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice(committed) } },
+        .consumed = 0,
+    }, result);
+}
+
 test "parsedInputFromVaxisKey honours multicodepoint text for ZWJ emoji" {
     const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧
     const result = parsedInputFromVaxisKey(.{
@@ -547,6 +563,12 @@ test "parsedInputFromVaxisKey honours multicodepoint text for regional flag" {
         .event = .{ .key = .{ .printable = PrintableKey.fromSlice(flag) } },
         .consumed = 0,
     }, result);
+}
+
+test "parsedInputFromVaxisKey ignores zero codepoint without text" {
+    try std.testing.expect(parsedInputFromVaxisKey(.{
+        .codepoint = 0,
+    }, .press) == null);
 }
 
 test "parsedInputFromVaxisKey ignores text for ascii control bytes" {

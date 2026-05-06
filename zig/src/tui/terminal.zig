@@ -484,6 +484,25 @@ test "processLoopEvent maps vaxis key presses to parsed input events" {
     }, result.parsed);
 }
 
+test "processLoopEvent forwards IME committed text with zero codepoint" {
+    var paste_buffer = std.ArrayList(u8).empty;
+    defer paste_buffer.deinit(std.testing.allocator);
+    var paste_active = false;
+
+    const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .key_press = .{
+            .codepoint = 0,
+            .text = "你好",
+        },
+    })).?;
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .key = .{ .printable = keys.PrintableKey.fromSlice("你好") } },
+        .consumed = 0,
+    }, result.parsed);
+}
+
 test "processLoopEvent aggregates bracketed paste content from libvaxis events" {
     var paste_buffer = std.ArrayList(u8).empty;
     defer paste_buffer.deinit(std.testing.allocator);
