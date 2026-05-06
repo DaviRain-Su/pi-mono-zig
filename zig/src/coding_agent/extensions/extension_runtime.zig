@@ -1305,6 +1305,103 @@ test "process_jsonl runtime adapter preserves registry UI response event and shu
     try std.testing.expect(std.mem.eql(u8, "/tmp\n", child_cwd) or std.mem.eql(u8, "/private/tmp\n", child_cwd));
 }
 
+test "process_jsonl runtime adapter carries subscriber readiness envelopes byte stably" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "process-jsonl-subscriber-envelope-capture.jsonl");
+    defer allocator.free(capture_path);
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; " ++
+            "done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-subscriber-envelope" };
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "subscriber-envelope-marker",
+            .cwd = "/subscriber-envelope-cwd",
+            .fixture = "subscriber-envelope-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(500);
+
+    const subscriber_envelope =
+        "{\"type\":\"before_agent_start\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"task\":{\"taskId\":\"task-opaque\",\"parentAgentId\":\"parent-opaque\",\"input\":{\"text\":\"delegate\"}},\"requestedGrants\":[\"agent.spawn\"],\"cancellation\":{\"signalId\":\"cancel-1\",\"parentRunId\":\"parent-run\",\"state\":\"pending\"},\"limits\":{\"maxChildren\":0,\"depth\":1,\"timeoutMs\":2500,\"outputBytes\":4096,\"toolScopes\":[\"read-only\"]},\"readiness\":{\"kind\":\"sub_agent_task_invocation\",\"sessionId\":\"session-opaque\",\"toolCallId\":\"tool-call-opaque\"}}";
+    adapter.sendExtensionEventFrame(subscriber_envelope);
+
+    var elapsed: u64 = 0;
+    while (elapsed <= 200) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    adapter.sendExtensionEventFrame("{\"type\":\"agent_end\",\"messages\":[]}");
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expectEqualStrings(
+        subscriber_envelope ++ "\n{\"type\":\"shutdown\"}\n",
+        capture,
+    );
+}
+
+test "wasm runtime ignores subscriber event envelopes without tool or unload side effects" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
+
+    adapter.sendExtensionEventFrame(
+        "{\"type\":\"before_agent_start\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"requestedGrants\":[\"agent.spawn\"],\"limits\":{\"maxChildren\":0},\"readiness\":{\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\"}}",
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), adapter.diagnosticCount());
+
+    var registry_expect = WasmToolRegistryExpectContext{ .expected_artifact_path = manifest_result.valid.artifact_absolute_path };
+    try adapter.withRegistry(&registry_expect, expectWasmToolOnlyRegistry);
+
+    var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\\nbravo\\ncharlie\",\"maxLines\":2,\"maxBytes\":1024}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "wasm-subscriber-envelope-success", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expectEqual(@as(usize, 1), success.content.len);
+    try std.testing.expect(std.mem.indexOf(u8, success.content[0].text.text, "\"content\":\"alpha\\nbravo\"") != null);
+
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "builtin.truncateHead"));
+    const unloaded_snapshot = try adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(unloaded_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, unloaded_snapshot, "\"tools\":[]") != null);
+}
+
 test "process_jsonl runtime adapter preserves readiness diagnostics timeout and startup errors" {
     const allocator = std.testing.allocator;
 

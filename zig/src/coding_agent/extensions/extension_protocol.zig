@@ -709,6 +709,62 @@ test "ProtocolState registry_frames_applied counts only accepted registry outcom
     try std.testing.expectEqualStrings("record-only", state.registry.ui_request_ids.items[0]);
 }
 
+test "process_jsonl protocol rejects invalid subscriber readiness frames without state mutation" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const baseline_frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"stable-tool\",\"label\":\"Stable Tool\",\"extensionPath\":\"fixture/stable.ts\"}\n" ++
+        "{\"type\":\"extension_ui_request\",\"id\":\"pending\",\"method\":\"input\",\"responseRequired\":true,\"payload\":{\"text\":\"stable\"}}\n";
+    try parser.feed(allocator, baseline_frames, &state);
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 1), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), state.ui_requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.diagnostics.items.len);
+
+    const counts_before = extension_registry.registrySurfaceCounts(&state.registry);
+    const registry_frames_before = state.registry_frames_applied;
+    const pending_before = state.pendingCount();
+    const ui_requests_before = state.ui_requests.items.len;
+
+    const invalid_readiness_frames =
+        "{\"type\":\"sub_agent_task_result\",\"taskId\":\"task-opaque\",\"runId\":\"run-opaque\",\"status\":\"complete\",\"readiness\":{\"agentId\":\"agent-opaque\"}}\n" ++
+        "{\"type\":\"agent_start\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"requestedGrants\":[\"agent.spawn\"],\"limits\":{\"maxChildren\":0}}\n" ++
+        "{\"type\":\"sub_agent_task_invocation\",\"taskId\":\n" ++
+        "[{\"type\":\"sub_agent_task_result\",\"taskId\":\"array-is-not-object\"}]\n";
+    try parser.feed(allocator, invalid_readiness_frames, &state);
+
+    const counts_after = extension_registry.registrySurfaceCounts(&state.registry);
+    try std.testing.expectEqual(registry_frames_before, state.registry_frames_applied);
+    try std.testing.expectEqual(pending_before, state.pendingCount());
+    try std.testing.expectEqual(ui_requests_before, state.ui_requests.items.len);
+    try std.testing.expectEqual(counts_before.tools, counts_after.tools);
+    try std.testing.expectEqual(counts_before.commands, counts_after.commands);
+    try std.testing.expectEqual(counts_before.shortcuts, counts_after.shortcuts);
+    try std.testing.expectEqual(counts_before.flags, counts_after.flags);
+    try std.testing.expectEqual(counts_before.providers, counts_after.providers);
+    try std.testing.expectEqual(counts_before.capabilities, counts_after.capabilities);
+    try std.testing.expectEqual(counts_before.resource_discoveries, counts_after.resource_discoveries);
+    try std.testing.expectEqual(counts_before.header_hooks, counts_after.header_hooks);
+    try std.testing.expectEqual(counts_before.footer_hooks, counts_after.footer_hooks);
+    try std.testing.expectEqual(counts_before.terminal_input_subscriptions, counts_after.terminal_input_subscriptions);
+    try std.testing.expectEqual(counts_before.editor_component_hooks, counts_after.editor_component_hooks);
+    try std.testing.expectEqual(counts_before.widgets, counts_after.widgets);
+    try std.testing.expectEqual(counts_before.message_renderers, counts_after.message_renderers);
+    try std.testing.expectEqual(counts_before.ui_request_ids, counts_after.ui_request_ids);
+
+    try std.testing.expectEqual(@as(usize, 4), state.diagnostics.items.len);
+    try std.testing.expectEqual(DiagnosticCategory.unsupported_message_type, state.diagnostics.items[0].category);
+    try std.testing.expectEqual(DiagnosticCategory.unsupported_message_type, state.diagnostics.items[1].category);
+    try std.testing.expectEqual(DiagnosticCategory.malformed_json, state.diagnostics.items[2].category);
+    try std.testing.expectEqual(DiagnosticCategory.non_object_frame, state.diagnostics.items[3].category);
+}
+
 test "extension protocol ABI conformance helper covers diagnostics registry frames and UI lifecycle" {
     const frame_types = registryFrameTypeNames();
     try std.testing.expectEqual(@as(usize, 23), frame_types.len);
