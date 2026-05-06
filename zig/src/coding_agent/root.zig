@@ -17,6 +17,7 @@ pub const provider_config = @import("provider_config.zig");
 pub const oauth_callback_listener = @import("oauth_callback_listener.zig");
 pub const interactive_mode = @import("interactive_mode.zig");
 pub const file_image = @import("file_image.zig");
+pub const mcp_stdio = @import("mcp_stdio.zig");
 
 pub const SessionManager = session_manager.SessionManager;
 pub const SessionContext = session_manager.SessionContext;
@@ -84,4 +85,5 @@ test {
     _ = @import("file_image.zig");
     _ = @import("migrations.zig");
     _ = @import("provider_stream_contract_matrix_test.zig");
+    _ = @import("mcp_stdio.zig");
 }
