@@ -331,7 +331,11 @@ fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
     if (missing_tools.items.len > 0) {
         const missing_summary = std.mem.join(b.allocator, "\n", missing_tools.items) catch @panic("OOM");
         const fail_step = b.addFail(b.fmt(
-            "Missing required external tools:\n{s}\n\nInstall them and ensure they are on PATH before running `zig build` or `zig build test`.\nHomebrew: `brew install ripgrep fd`.",
+            "Missing required external tools:\n{s}\n\n" ++
+                "Install them and ensure `rg` and `fd` are on PATH before running `zig build` or `zig build test`.\n" ++
+                "Debian/Ubuntu: `sudo apt install ripgrep fd-find`, then ensure `fd` points to `fdfind` (for example, `sudo ln -sf \"$(command -v fdfind)\" /usr/local/bin/fd`).\n" ++
+                "macOS/Homebrew: `brew install ripgrep fd`.\n" ++
+                "Note: the required binary name is `fd`.",
             .{missing_summary},
         ));
         step.dependOn(&fail_step.step);

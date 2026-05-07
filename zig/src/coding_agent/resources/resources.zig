@@ -468,12 +468,35 @@ pub fn resolveThemeIndex(
         runtime_theme,
         project_theme,
         global_theme,
-        "dark",
+        detectDefaultThemeName(env_map),
     };
     for (candidates) |candidate| {
         if (findThemeIndex(themes, candidate)) |index| return index;
     }
     return 0;
+}
+
+fn detectDefaultThemeName(env_map: ?*const std.process.Environ.Map) []const u8 {
+    const colorfgbg = resourceEnvValue(env_map, "COLORFGBG");
+    const value = colorfgbg orelse return "dark";
+
+    var parts = std.mem.splitScalar(u8, value, ';');
+    _ = parts.next() orelse return "dark";
+    const bg_text = parts.next() orelse return "dark";
+    const bg = std.fmt.parseInt(u8, std.mem.trim(u8, bg_text, " \t\r\n"), 10) catch return "dark";
+    return if (bg < 8) "dark" else "light";
+}
+
+fn resourceEnvValue(env_map: ?*const std.process.Environ.Map, comptime key: [:0]const u8) ?[]const u8 {
+    const raw = if (env_map) |map| map.get(key) else cEnvValue(key);
+    const value = raw orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+fn cEnvValue(comptime key: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(key) orelse return null;
+    return std.mem.span(value);
 }
 
 fn detectTerminalName(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) ![]u8 {
@@ -2295,6 +2318,14 @@ test "theme resolution priority honors env runtime project global default" {
 
     const default_index = resolveThemeIndex(bundle.themes, &env_map, null, null, null);
     try std.testing.expectEqualStrings("dark", bundle.themes[default_index].name);
+
+    try env_map.put("COLORFGBG", "0;15");
+    const detected_light_index = resolveThemeIndex(bundle.themes, &env_map, null, null, null);
+    try std.testing.expectEqualStrings("light", bundle.themes[detected_light_index].name);
+
+    try env_map.put("PI_THEME", "dark");
+    const env_over_detected_index = resolveThemeIndex(bundle.themes, &env_map, null, null, null);
+    try std.testing.expectEqualStrings("dark", bundle.themes[env_over_detected_index].name);
 }
 
 test "default themes include dark light and codex palettes" {

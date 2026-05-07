@@ -949,12 +949,13 @@ test "interactive mode startup renders welcome message footer and hints through 
 
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(backend.restored);
+    const expected_use_kitty = tui.terminal.testing.shouldUseKittyKeyboardProtocolForCurrentEnv();
     try std.testing.expectEqualStrings(
-        tui.Terminal.ALT_SCREEN_ENABLE ++ tui.Terminal.BRACKETED_PASTE_ENABLE ++ tui.Terminal.HIDE_CURSOR ++ tui.Terminal.AUTO_WRAP_DISABLE ++ tui.Terminal.KITTY_KEYBOARD_QUERY ++ tui.Terminal.KITTY_KEYBOARD_ENABLE ++ tui.Terminal.MOUSE_ENABLE,
+        tui.terminal.testing.expectedStartupSequence(expected_use_kitty),
         backend.writes.items[0],
     );
     try std.testing.expectEqualStrings(
-        tui.Terminal.MOUSE_DISABLE ++ tui.Terminal.AUTO_WRAP_ENABLE ++ tui.Terminal.ALT_SCREEN_DISABLE ++ tui.Terminal.BRACKETED_PASTE_DISABLE ++ tui.Terminal.KITTY_KEYBOARD_DISABLE ++ tui.Terminal.SHOW_CURSOR,
+        tui.terminal.testing.expectedStopSequence(expected_use_kitty),
         backend.writes.items[backend.writes.items.len - 1],
     );
     try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));

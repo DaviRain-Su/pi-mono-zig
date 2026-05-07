@@ -201,7 +201,10 @@ pub const SelectList = struct {
             style_mod.styleFor(theme, .text)
         else
             vaxis.Cell.Style{};
-        const row_style = withReverse(base_style, is_selected);
+        const row_style = if (is_selected)
+            if (active_theme) |theme| style_mod.styleFor(theme, .select_selected) else base_style
+        else
+            base_style;
         row_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = row_style });
 
         var segments = std.ArrayList(vaxis.Segment).empty;
@@ -227,11 +230,12 @@ pub const SelectList = struct {
                     try segments.append(allocator, .{ .text = spaces, .style = row_style });
                 }
 
-                var description_style = if (active_theme) |theme|
+                const description_style = if (is_selected)
+                    row_style
+                else if (active_theme) |theme|
                     style_mod.styleFor(theme, .select_description)
                 else
                     vaxis.Cell.Style{};
-                description_style.reverse = is_selected;
                 try segments.append(allocator, .{ .text = truncated_description, .style = description_style });
             } else {
                 const truncated = try truncatePlainAlloc(allocator, display, content_width);
@@ -369,12 +373,6 @@ fn normalizeSingleLine(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n");
 }
 
-fn withReverse(style: vaxis.Cell.Style, reverse: bool) vaxis.Cell.Style {
-    var updated = style;
-    updated.reverse = reverse;
-    return updated;
-}
-
 test "select list highlights current selection and navigates" {
     var list = SelectList{
         .items = &[_]SelectItem{
@@ -391,7 +389,7 @@ test "select list highlights current selection and navigates" {
 
         const selected = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("o", selected.char.grapheme);
-        try std.testing.expect(selected.style.reverse);
+        try std.testing.expect(!selected.style.reverse);
     }
 
     try std.testing.expectEqualDeep(HandleResult.handled, list.handleKey(.down));
@@ -404,7 +402,7 @@ test "select list highlights current selection and navigates" {
         const first_row = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
         const second_row = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
         try std.testing.expect(!first_row.style.reverse);
-        try std.testing.expect(second_row.style.reverse);
+        try std.testing.expect(!second_row.style.reverse);
         try std.testing.expectEqualStrings("t", second_row.char.grapheme);
     }
 }
@@ -424,7 +422,7 @@ test "select list confirms the selected item on enter" {
     try std.testing.expectEqualStrings("two", list.selectedItem().?.value);
 }
 
-test "select list uses reverse selection and muted description styling" {
+test "select list uses selected token and muted description styling" {
     var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
     defer theme.deinit(std.testing.allocator);
 
@@ -443,12 +441,12 @@ test "select list uses reverse selection and muted description styling" {
     const muted = style_mod.styleFor(&theme, .select_description);
     try test_helpers.expectCell(&screen, 13, 0, "f", muted);
 
-    var muted_selected = muted;
-    muted_selected.reverse = true;
-    try test_helpers.expectCell(&screen, 13, 1, "s", muted_selected);
+    const selected_style = style_mod.styleFor(&theme, .select_selected);
+    try test_helpers.expectCell(&screen, 13, 1, "s", selected_style);
 
     const selected_label = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(selected_label.style.reverse);
+    try std.testing.expectEqual(selected_style, selected_label.style);
+    try std.testing.expect(!selected_label.style.reverse);
 }
 
 test "select list truncation respects display width for wide and combining graphemes" {

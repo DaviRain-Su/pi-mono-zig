@@ -5289,7 +5289,7 @@ test "screen draw stacks autocomplete below the prompt editor child window" {
 
     const selected = screen.readCell(@intCast(promptEditorOffsetX(80) + 2), 7) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("r", selected.char.grapheme);
-    try std.testing.expect(selected.style.reverse);
+    try std.testing.expect(!selected.style.reverse);
 }
 
 test "borrowed lines component draws stored cell rows without ansi strings" {

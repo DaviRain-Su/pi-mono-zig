@@ -449,7 +449,8 @@ fn readClipboardImageViaPowerShellWsl(
         if (c == '\'') try ps_path.appendSlice(allocator, "''") else try ps_path.append(allocator, c);
     }
 
-    const script = try std.fmt.allocPrint(allocator,
+    const script = try std.fmt.allocPrint(
+        allocator,
         "Add-Type -AssemblyName System.Windows.Forms; " ++
             "Add-Type -AssemblyName System.Drawing; " ++
             "$path = '{s}'; " ++

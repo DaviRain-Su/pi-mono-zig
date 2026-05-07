@@ -134,6 +134,8 @@ pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?
         return parsedKeyInput(.{ .ctrl = ctrl }, .{}, event_type);
     }
 
+    if (vaxis_key.isModifier()) return null;
+
     if (printableKeyFromVaxisText(vaxis_key, modifiers)) |printable_key| {
         return parsedKeyInput(printable_key, modifiers, event_type);
     }
@@ -359,6 +361,18 @@ fn normalizeFunctionalCodepoint(codepoint: u32) u32 {
     };
 }
 
+fn parsedInputFromParserSequence(sequence: []const u8) !?ParsedInput {
+    var parser: vaxis.Parser = .{};
+    const result = try parser.parse(sequence, std.testing.allocator);
+    try std.testing.expectEqual(sequence.len, result.n);
+
+    return switch (result.event.?) {
+        .key_press => |key| parsedInputFromVaxisKey(key, .press),
+        .key_release => |key| parsedInputFromVaxisKey(key, .release),
+        else => error.ExpectedKeyEvent,
+    };
+}
+
 test "vaxis.Parser emits bracketed paste boundary events" {
     var parser: vaxis.Parser = .{};
 
@@ -523,6 +537,43 @@ test "parsedInputFromVaxisKey honours IME text with zero codepoint" {
     }, .press).?;
     try std.testing.expectEqualDeep(ParsedInput{
         .event = .{ .key = .{ .printable = PrintableKey.fromSlice("你好") } },
+        .consumed = 0,
+    }, result);
+}
+
+test "vaxis.Parser maps IME associated text with empty modifier field" {
+    const result = (try parsedInputFromParserSequence(ESC ++ "[0;;20320:22909u")).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice("你好") } },
+        .consumed = 0,
+    }, result);
+}
+
+test "vaxis.Parser maps IME associated text with default modifier field" {
+    const result = (try parsedInputFromParserSequence(ESC ++ "[0;1;20320:22909u")).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .printable = PrintableKey.fromSlice("你好") } },
+        .consumed = 0,
+    }, result);
+}
+
+test "parsedInputFromVaxisKey ignores modifier-only ctrl events from vaxis.Parser" {
+    const sequences = [_][]const u8{
+        ESC ++ "[57442;5u",
+        ESC ++ "[57442;5:3u",
+        ESC ++ "[57448;5u",
+        ESC ++ "[57448;5:3u",
+    };
+
+    for (sequences) |sequence| {
+        try std.testing.expect((try parsedInputFromParserSequence(sequence)) == null);
+    }
+}
+
+test "vaxis.Parser maps kitty ctrl+c sequence to ctrl shortcut" {
+    const result = (try parsedInputFromParserSequence(ESC ++ "[99;5u")).?;
+    try std.testing.expectEqualDeep(ParsedInput{
+        .event = .{ .key = .{ .ctrl = 'c' } },
         .consumed = 0,
     }, result);
 }

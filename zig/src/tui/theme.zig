@@ -218,10 +218,10 @@ pub const Theme = struct {
         try self.setDerivedStyle(allocator, .footer, .{ .fg = self.colors.get(.muted) });
         try self.setDerivedStyle(allocator, .prompt, .{ .fg = self.colors.get(.primary), .bold = true });
         try self.setDerivedStyle(allocator, .box_border, .{ .fg = self.colors.get(.border) });
-        try self.setDerivedStyle(allocator, .text, .{ .fg = self.colors.get(.foreground), .bg = self.colors.get(.background) });
-        try self.setDerivedStyle(allocator, .editor, .{ .fg = self.colors.get(.foreground), .bg = self.colors.get(.background) });
+        try self.setDerivedStyle(allocator, .text, .{});
+        try self.setDerivedStyle(allocator, .editor, .{});
         try self.setDerivedStyle(allocator, .editor_cursor, .{ .fg = self.colors.get(.background), .bg = self.colors.get(.primary), .bold = true });
-        try self.setDerivedStyle(allocator, .select_selected, .{ .fg = self.colors.get(.background), .bg = self.colors.get(.primary), .bold = true });
+        try self.setDerivedStyle(allocator, .select_selected, .{ .fg = self.colors.get(.primary), .bold = true });
         try self.setDerivedStyle(allocator, .select_description, .{ .fg = self.colors.get(.muted) });
         try self.setDerivedStyle(allocator, .select_scroll, .{ .fg = self.colors.get(.muted) });
         try self.setDerivedStyle(allocator, .select_empty, .{ .fg = self.colors.get(.muted), .italic = true });
@@ -364,4 +364,16 @@ test "codex theme and new token fallbacks derive non-default styles" {
     try std.testing.expect(tool_result.dim);
     try std.testing.expect(tool_result.fg != null);
     try std.testing.expect(!std.mem.eql(u8, dark.colors.foreground.?, tool_result.fg.?));
+
+    const text = dark.styles[@intFromEnum(ThemeToken.text)];
+    try std.testing.expect(text.fg == null);
+    try std.testing.expect(text.bg == null);
+
+    const editor = dark.styles[@intFromEnum(ThemeToken.editor)];
+    try std.testing.expect(editor.fg == null);
+    try std.testing.expect(editor.bg == null);
+
+    const selected = dark.styles[@intFromEnum(ThemeToken.select_selected)];
+    try std.testing.expectEqualStrings(dark.colors.primary.?, selected.fg.?);
+    try std.testing.expect(selected.bg == null);
 }

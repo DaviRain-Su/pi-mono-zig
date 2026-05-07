@@ -2120,7 +2120,7 @@ test "editor shows fuzzy-ranked autocomplete suggestions as user types" {
 
     const selected = screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("r", selected.char.grapheme);
-    try std.testing.expect(selected.style.reverse);
+    try std.testing.expect(!selected.style.reverse);
 }
 
 test "editor autocomplete navigates suggestions and applies tab selection" {
@@ -2310,7 +2310,8 @@ test "editor applies theme colors to content and autocomplete without ansi parsi
     defer autocomplete_screen.deinit(std.testing.allocator);
 
     const selected = autocomplete_screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(selected.style.reverse);
+    try std.testing.expectEqual(style_mod.styleFor(&theme, .select_selected), selected.style);
+    try std.testing.expect(!selected.style.reverse);
     const description = autocomplete_screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
     try std.testing.expect(description.style.reverse == false);
 }

@@ -1625,7 +1625,34 @@ pub fn dispatchInputEvent(
 ) !void {
     switch (parsed.event) {
         .key => |key| {
+            const editor_len_before = editor.text().len;
+            maybeLogInputDebug(
+                allocator,
+                io,
+                env_map,
+                "before",
+                parsed,
+                key,
+                overlay,
+                auth_flow,
+                editor,
+                editor_len_before,
+                editor_len_before,
+            );
             if (parsed.event_type == .release) {
+                maybeLogInputDebug(
+                    allocator,
+                    io,
+                    env_map,
+                    "after",
+                    parsed,
+                    key,
+                    overlay,
+                    auth_flow,
+                    editor,
+                    editor_len_before,
+                    editor.text().len,
+                );
                 consumeInputBytes(input_buffer, parsed.consumed);
                 return;
             }
@@ -1652,11 +1679,37 @@ pub fn dispatchInputEvent(
                                 should_exit,
                                 live_resources,
                             );
+                            maybeLogInputDebug(
+                                allocator,
+                                io,
+                                env_map,
+                                "after",
+                                parsed,
+                                key,
+                                overlay,
+                                auth_flow,
+                                editor,
+                                editor_len_before,
+                                editor.text().len,
+                            );
                             consumeInputBytes(input_buffer, parsed.consumed);
                             return;
                         },
                         .message_dequeue => {
                             try handleDequeueAction(allocator, session, app_state, editor);
+                            maybeLogInputDebug(
+                                allocator,
+                                io,
+                                env_map,
+                                "after",
+                                parsed,
+                                key,
+                                overlay,
+                                auth_flow,
+                                editor,
+                                editor_len_before,
+                                editor.text().len,
+                            );
                             consumeInputBytes(input_buffer, parsed.consumed);
                             return;
                         },
@@ -1686,6 +1739,19 @@ pub fn dispatchInputEvent(
                 app_context,
                 live_resources,
             );
+            maybeLogInputDebug(
+                allocator,
+                io,
+                env_map,
+                "after",
+                parsed,
+                key,
+                overlay,
+                auth_flow,
+                editor,
+                editor_len_before,
+                editor.text().len,
+            );
         },
         .paste => |content| {
             if (overlay.* != null) {
@@ -1702,6 +1768,160 @@ pub fn dispatchInputEvent(
         },
     }
     consumeInputBytes(input_buffer, parsed.consumed);
+}
+
+fn maybeLogInputDebug(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    phase: []const u8,
+    parsed: tui.keys.ParsedInput,
+    key: tui.Key,
+    overlay: *const ?SelectorOverlay,
+    auth_flow: *const ?AuthFlow,
+    editor: *const tui.Editor,
+    editor_len_before: usize,
+    editor_len_after: usize,
+) void {
+    const path = env_map.get("PI_INPUT_DEBUG_LOG") orelse return;
+    if (std.mem.trim(u8, path, " \t\r\n").len == 0) return;
+    writeInputDebugLine(
+        allocator,
+        io,
+        path,
+        phase,
+        parsed,
+        key,
+        activeInputDebugTag(overlay, auth_flow, editor),
+        editor_len_before,
+        editor_len_after,
+    ) catch {};
+}
+
+fn writeInputDebugLine(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    phase: []const u8,
+    parsed: tui.keys.ParsedInput,
+    key: tui.Key,
+    active_tag: []const u8,
+    editor_len_before: usize,
+    editor_len_after: usize,
+) !void {
+    const line = try formatInputDebugLine(
+        allocator,
+        phase,
+        parsed,
+        key,
+        active_tag,
+        editor_len_before,
+        editor_len_after,
+    );
+    defer allocator.free(line);
+
+    var file = std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = false }) catch return;
+    defer file.close(io);
+
+    const offset = file.length(io) catch return;
+    file.writePositionalAll(io, line, offset) catch return;
+}
+
+fn formatInputDebugLine(
+    allocator: std.mem.Allocator,
+    phase: []const u8,
+    parsed: tui.keys.ParsedInput,
+    key: tui.Key,
+    active_tag: []const u8,
+    editor_len_before: usize,
+    editor_len_after: usize,
+) ![]u8 {
+    const key_kind = @tagName(std.meta.activeTag(key));
+    return switch (key) {
+        .printable => |printable| blk: {
+            const hex = try inputDebugHexAlloc(allocator, printable.slice());
+            defer allocator.free(hex);
+            break :blk std.fmt.allocPrint(
+                allocator,
+                "phase={s} active={s} event=key event_type={s} key={s} modifiers=shift:{},alt:{},ctrl:{},super:{} consumed={d} editor_len_before={d} editor_len_after={d} printable_utf8=\"{f}\" printable_hex={s}\n",
+                .{
+                    phase,
+                    active_tag,
+                    @tagName(parsed.event_type),
+                    key_kind,
+                    parsed.modifiers.shift,
+                    parsed.modifiers.alt,
+                    parsed.modifiers.ctrl,
+                    parsed.modifiers.super,
+                    parsed.consumed,
+                    editor_len_before,
+                    editor_len_after,
+                    std.zig.fmtString(printable.slice()),
+                    hex,
+                },
+            );
+        },
+        .ctrl => |ctrl| blk: {
+            const ctrl_text = [_]u8{ctrl};
+            break :blk std.fmt.allocPrint(
+                allocator,
+                "phase={s} active={s} event=key event_type={s} key={s} modifiers=shift:{},alt:{},ctrl:{},super:{} consumed={d} editor_len_before={d} editor_len_after={d} ctrl_byte=0x{x:0>2} ctrl_char=\"{f}\"\n",
+                .{
+                    phase,
+                    active_tag,
+                    @tagName(parsed.event_type),
+                    key_kind,
+                    parsed.modifiers.shift,
+                    parsed.modifiers.alt,
+                    parsed.modifiers.ctrl,
+                    parsed.modifiers.super,
+                    parsed.consumed,
+                    editor_len_before,
+                    editor_len_after,
+                    ctrl,
+                    std.zig.fmtString(&ctrl_text),
+                },
+            );
+        },
+        else => std.fmt.allocPrint(
+            allocator,
+            "phase={s} active={s} event=key event_type={s} key={s} modifiers=shift:{},alt:{},ctrl:{},super:{} consumed={d} editor_len_before={d} editor_len_after={d}\n",
+            .{
+                phase,
+                active_tag,
+                @tagName(parsed.event_type),
+                key_kind,
+                parsed.modifiers.shift,
+                parsed.modifiers.alt,
+                parsed.modifiers.ctrl,
+                parsed.modifiers.super,
+                parsed.consumed,
+                editor_len_before,
+                editor_len_after,
+            },
+        ),
+    };
+}
+
+fn inputDebugHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const charset = "0123456789abcdef";
+    const hex = try allocator.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, index| {
+        hex[index * 2] = charset[byte >> 4];
+        hex[index * 2 + 1] = charset[byte & 0x0f];
+    }
+    return hex;
+}
+
+fn activeInputDebugTag(
+    overlay: *const ?SelectorOverlay,
+    auth_flow: *const ?AuthFlow,
+    editor: *const tui.Editor,
+) []const u8 {
+    if (overlay.*) |overlay_value| return @tagName(std.meta.activeTag(overlay_value));
+    if (auth_flow.* != null) return "auth_flow";
+    if (editor.isShowingAutocomplete()) return "autocomplete";
+    return "editor";
 }
 
 fn handleProtocolEvent(app_context: *AppContext, protocol: tui.keys.ProtocolEvent) void {
