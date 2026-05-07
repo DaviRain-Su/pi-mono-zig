@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -75,6 +75,27 @@ function writeWasmPackage(
 		manifest.resourceLimits = options.resourceLimits;
 	}
 	writeFileSync(join(packageRoot, "pi-extension.json"), JSON.stringify(manifest));
+}
+
+function writeTypeScriptPackage(packageRoot: string, options: { name?: string; version?: string } = {}): string {
+	mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+	const entryPath = join(packageRoot, "extensions", "entry.ts");
+	writeFileSync(entryPath, "export default function() {}");
+	writeFileSync(
+		join(packageRoot, "package.json"),
+		JSON.stringify({
+			name: options.name ?? "local-typescript-package",
+			version: options.version ?? "1.0.0",
+			pi: {
+				extensions: ["extensions/entry.ts"],
+			},
+		}),
+	);
+	return entryPath;
+}
+
+function readJsonFile(path: string): unknown {
+	return JSON.parse(readFileSync(path, "utf-8"));
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -348,7 +369,8 @@ Content`,
 			const pkgDir = join(tempDir, "local-wasm-package");
 			mkdirSync(pkgDir, { recursive: true });
 			writeWasmPackage(pkgDir, { toolId: "fixture.local" });
-			settingsManager.setPackages([pkgDir]);
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			const result = await packageManager.resolve();
 
@@ -387,7 +409,8 @@ Content`,
 				}),
 			);
 
-			settingsManager.setPackages([pkgDir]);
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 			const unfiltered = await packageManager.resolve();
 
 			expect(unfiltered.extensions).toHaveLength(0);
@@ -1414,6 +1437,175 @@ Content`,
 		});
 	});
 
+	describe("extension provenance lockfiles", () => {
+		it("should write deterministic scope-local lockfiles with normalized provenance", async () => {
+			const userPackage = join(tempDir, "user-package");
+			const projectPackage = join(tempDir, "project-package");
+			writeTypeScriptPackage(userPackage, { name: "user-package", version: "1.0.0" });
+			writeWasmPackage(projectPackage, { toolId: "fixture.project" });
+
+			await packageManager.installAndPersist(userPackage);
+			await settingsManager.flush();
+			const userLockPath = join(agentDir, "extensions.lock.json");
+			const projectLockPath = join(tempDir, ".pi", "extensions.lock.json");
+			expect(existsSync(userLockPath)).toBe(true);
+			expect(existsSync(projectLockPath)).toBe(false);
+			const firstUserLockBytes = readFileSync(userLockPath, "utf-8");
+
+			await packageManager.installAndPersist(`${userPackage}/`);
+			await settingsManager.flush();
+			expect(readFileSync(userLockPath, "utf-8")).toBe(firstUserLockBytes);
+
+			await packageManager.installAndPersist(projectPackage, { local: true });
+			await settingsManager.flush();
+			expect(readFileSync(userLockPath, "utf-8")).toBe(firstUserLockBytes);
+			expect(existsSync(projectLockPath)).toBe(true);
+
+			const userLock = readJsonFile(userLockPath) as {
+				schemaVersion: string;
+				entries: Array<{
+					key: string;
+					scope: string;
+					source: { type: string; identity: string };
+					manifest: { kind: string; packageName: string; packageVersion: string };
+					packageRoot: string;
+					manifestPath: string;
+					digests: { packageRootSha256: string };
+				}>;
+			};
+			expect(firstUserLockBytes.endsWith("\n")).toBe(true);
+			expect(userLock.schemaVersion).toBe("pi-extension-lock.v0");
+			expect(userLock.entries).toHaveLength(1);
+			expect(userLock.entries[0]).toMatchObject({
+				key: `local:${realpathSync(userPackage)}`,
+				scope: "user",
+				source: { type: "local", identity: realpathSync(userPackage) },
+				manifest: { kind: "typescript-package", packageName: "user-package", packageVersion: "1.0.0" },
+				packageRoot: realpathSync(userPackage),
+				manifestPath: join(userPackage, "package.json"),
+			});
+			expect(userLock.entries[0].digests.packageRootSha256).toMatch(/^[a-f0-9]{64}$/);
+
+			const projectLock = readJsonFile(projectLockPath) as {
+				entries: Array<{
+					scope: string;
+					manifest: { kind: string; schemaVersion: string; id: string; name: string; version: string };
+					artifact: { kind: string; path: string; absolutePath: string; sha256: string };
+					digests: { packageRootSha256: string };
+				}>;
+			};
+			expect(projectLock.entries).toHaveLength(1);
+			expect(projectLock.entries[0]).toMatchObject({
+				scope: "project",
+				manifest: {
+					kind: "wasm-extension",
+					schemaVersion: "pi-extension.v0",
+					id: "com.example.local-wasm",
+					name: "Local Wasm Fixture",
+					version: "0.1.0",
+				},
+				artifact: {
+					kind: "wasm-component",
+					path: "wasm/plugin.wasm",
+					absolutePath: realpathSync(join(projectPackage, "wasm/plugin.wasm")),
+				},
+			});
+			expect(projectLock.entries[0].artifact.sha256).toMatch(/^[a-f0-9]{64}$/);
+			expect(projectLock.entries[0].digests.packageRootSha256).toMatch(/^[a-f0-9]{64}$/);
+			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("signature");
+			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("publisher");
+			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("marketplace");
+			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("approvalUi");
+			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("remoteWasmUrl");
+		});
+
+		it("should not trust configured packages from missing or malformed lockfiles", async () => {
+			const pkgDir = join(tempDir, "configured-without-lock");
+			writeTypeScriptPackage(pkgDir);
+			settingsManager.setPackages([pkgDir]);
+
+			const missing = await packageManager.resolve();
+			expect(missing.extensions).toHaveLength(0);
+			expect(missing.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "missing_lockfile",
+					scope: "user",
+					source: pkgDir,
+					lockfilePath: join(agentDir, "extensions.lock.json"),
+				}),
+			]);
+			expect(existsSync(join(agentDir, "extensions.lock.json"))).toBe(false);
+
+			const lockPath = join(agentDir, "extensions.lock.json");
+			writeFileSync(lockPath, "{");
+			const beforeBytes = readFileSync(lockPath, "utf-8");
+			const malformed = await packageManager.resolve();
+			expect(malformed.extensions).toHaveLength(0);
+			expect(malformed.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "malformed_lockfile",
+					scope: "user",
+					lockfilePath: lockPath,
+					path: "$",
+				}),
+			]);
+			expect(readFileSync(lockPath, "utf-8")).toBe(beforeBytes);
+		});
+
+		it("should reject unsupported v0 trust surfaces without trusting partial lock data", async () => {
+			const pkgDir = join(tempDir, "unsupported-lock-surface");
+			writeTypeScriptPackage(pkgDir);
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const lock = readJsonFile(lockPath) as { entries: Array<Record<string, unknown>> };
+			lock.entries[0].signature = "not-supported";
+			writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+			settingsManager.setPackages([pkgDir]);
+
+			const result = await packageManager.resolve();
+			expect(result.extensions).toHaveLength(0);
+			expect(result.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "malformed_lockfile",
+					scope: "user",
+					lockfilePath: lockPath,
+					path: "$.entries[0].signature",
+				}),
+			]);
+			expect(readFileSync(lockPath, "utf-8")).toContain("not-supported");
+		});
+
+		it("should preserve unrelated lock entries when updating one package", async () => {
+			const firstPackage = join(tempDir, "first-package");
+			const secondPackage = join(tempDir, "second-package");
+			writeTypeScriptPackage(firstPackage, { name: "first-package" });
+			writeTypeScriptPackage(secondPackage, { name: "second-package" });
+
+			await packageManager.installAndPersist(firstPackage);
+			await settingsManager.flush();
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const firstEntry = (readJsonFile(lockPath) as { entries: unknown[] }).entries[0];
+
+			await packageManager.installAndPersist(secondPackage);
+			await settingsManager.flush();
+			const twoEntryLock = readJsonFile(lockPath) as { entries: unknown[] };
+			expect(twoEntryLock.entries).toHaveLength(2);
+			expect(twoEntryLock.entries).toContainEqual(firstEntry);
+		});
+
+		it("should not persist temporary extension source provenance", async () => {
+			const pkgDir = join(tempDir, "temporary-source");
+			writeTypeScriptPackage(pkgDir);
+
+			const result = await packageManager.resolveExtensionSources([pkgDir], { temporary: true });
+			expect(result.extensions).toHaveLength(1);
+			expect(existsSync(join(agentDir, "extensions.lock.json"))).toBe(false);
+			expect(existsSync(join(tempDir, ".pi", "extensions.lock.json"))).toBe(false);
+			expect(result.diagnostics).toEqual([]);
+		});
+	});
+
 	describe("HTTPS git URL parsing (old behavior)", () => {
 		it("should parse HTTPS GitHub URLs correctly", async () => {
 			const parsed = (packageManager as any).parseSource("https://github.com/user/repo");
@@ -1698,6 +1890,8 @@ Content`,
 					},
 				}),
 			);
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			// User filter adds exclusion for bar.ts
 			settingsManager.setPackages([
@@ -1725,6 +1919,8 @@ Content`,
 			writeFileSync(join(pkgDir, "extensions", "foo.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "bar.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "baz.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1747,6 +1943,8 @@ Content`,
 			mkdirSync(join(pkgDir, "themes"), { recursive: true });
 			writeFileSync(join(pkgDir, "themes", "nice.json"), "{}");
 			writeFileSync(join(pkgDir, "themes", "ugly.json"), "{}");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1769,6 +1967,8 @@ Content`,
 			writeFileSync(join(pkgDir, "extensions", "alpha.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "beta.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "gamma.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1791,6 +1991,8 @@ Content`,
 			mkdirSync(join(pkgDir, "extensions"), { recursive: true });
 			writeFileSync(join(pkgDir, "extensions", "one.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "two.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1831,6 +2033,8 @@ Content`,
 			writeFileSync(join(pkgDir, "extensions", "alpha.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "beta.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "gamma.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1856,6 +2060,8 @@ Content`,
 			writeFileSync(join(pkgDir, "skills/skill-a", "SKILL.md"), "---\nname: skill-a\ndescription: A\n---\nContent");
 			writeFileSync(join(pkgDir, "skills/skill-b", "SKILL.md"), "---\nname: skill-b\ndescription: B\n---\nContent");
 			writeFileSync(join(pkgDir, "skills/skill-c", "SKILL.md"), "---\nname: skill-c\ndescription: C\n---\nContent");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1959,6 +2165,8 @@ Content`,
 			mkdirSync(join(pkgDir, "extensions"), { recursive: true });
 			writeFileSync(join(pkgDir, "extensions", "alpha.ts"), "export default function() {}");
 			writeFileSync(join(pkgDir, "extensions", "beta.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
 
 			settingsManager.setPackages([
 				{
@@ -1981,6 +2189,9 @@ Content`,
 			const pkgDir = join(tempDir, "shared-pkg");
 			mkdirSync(join(pkgDir, "extensions"), { recursive: true });
 			writeFileSync(join(pkgDir, "extensions", "shared.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkgDir);
+			await packageManager.installAndPersist(pkgDir, { local: true });
+			await settingsManager.flush();
 
 			// Same package in both global and project
 			settingsManager.setPackages([pkgDir]); // global
@@ -2006,6 +2217,9 @@ Content`,
 			mkdirSync(join(pkg2Dir, "extensions"), { recursive: true });
 			writeFileSync(join(pkg1Dir, "extensions", "from-pkg1.ts"), "export default function() {}");
 			writeFileSync(join(pkg2Dir, "extensions", "from-pkg2.ts"), "export default function() {}");
+			await packageManager.installAndPersist(pkg1Dir);
+			await packageManager.installAndPersist(pkg2Dir, { local: true });
+			await settingsManager.flush();
 
 			settingsManager.setPackages([pkg1Dir]); // global
 			settingsManager.setProjectPackages([pkg2Dir]); // project
@@ -2394,6 +2608,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			writeFileSync(join(installedPath, "extensions", "index.ts"), "export default function() {};");
 			settingsManager.setProjectPackages(["npm:example"]);
+			(packageManager as any).writeProvenanceLockForSource("npm:example", "project");
 
 			const runCommandCaptureSpy = vi.spyOn(packageManager as any, "runCommandCapture");
 
@@ -2407,6 +2622,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			mkdirSync(installedPath, { recursive: true });
 			writeFileSync(join(installedPath, "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
 			settingsManager.setProjectPackages(["npm:example@2.0.0"]);
+			(packageManager as any).writeProvenanceLockForSource("npm:example@2.0.0", "project");
 
 			const installParsedSourceSpy = vi
 				.spyOn(packageManager as any, "installParsedSource")

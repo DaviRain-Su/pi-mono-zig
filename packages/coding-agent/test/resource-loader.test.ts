@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { DefaultPackageManager } from "../src/core/package-manager.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -222,6 +223,10 @@ Project skill`,
 			);
 
 			const settingsManager = SettingsManager.inMemory({ packages: [packageRoot] });
+			const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			settingsManager.setPackages([packageRoot]);
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,

@@ -1,6 +1,15 @@
 import { type ChildProcess, type ChildProcessByStdio, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
@@ -32,6 +41,20 @@ import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import { createWasmExtensionIdentity, type ExtensionPolicy, type WasmExtensionIdentity } from "./extension-policy.js";
+import {
+	createExtensionProvenanceLockEntry,
+	createMissingLockEntryDiagnostic,
+	createMissingLockfileDiagnostic,
+	createWasmArtifactIdentity,
+	type ExtensionProvenanceDiagnostic,
+	type ExtensionProvenanceLockEntry,
+	type ExtensionProvenanceScope,
+	type ExtensionProvenanceSourceIdentity,
+	getExtensionProvenanceLockfilePath,
+	makeExtensionProvenanceEntryKey,
+	readExtensionProvenanceLockfile,
+	writeExtensionProvenanceLockEntry,
+} from "./extension-provenance-lockfile.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
 import { createSourceInfo } from "./source-info.js";
@@ -80,6 +103,7 @@ export interface ResolvedPaths {
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
+	diagnostics: ExtensionProvenanceDiagnostic[];
 }
 
 export type MissingSourceAction = "install" | "skip" | "error";
@@ -169,12 +193,19 @@ interface PiManifest {
 	themes?: string[];
 }
 
+interface PackageJsonIdentity {
+	name?: string;
+	version?: string;
+	pi?: PiManifest;
+}
+
 interface ResourceAccumulator {
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	wasmExtensions: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
+	diagnostics: ExtensionProvenanceDiagnostic[];
 }
 
 /**
@@ -850,6 +881,145 @@ export class DefaultPackageManager implements PackageManager {
 		return undefined;
 	}
 
+	private getProvenanceLockfilePath(scope: ExtensionProvenanceScope): string {
+		return getExtensionProvenanceLockfilePath({
+			scope,
+			agentDir: this.agentDir,
+			cwd: this.cwd,
+			configDirName: CONFIG_DIR_NAME,
+		});
+	}
+
+	private getNormalizedSourceIdentityForParsedSource(
+		_source: string,
+		parsed: ParsedSource,
+		scope: SourceScope,
+		mode: "input" | "settings",
+	): ExtensionProvenanceSourceIdentity {
+		if (parsed.type === "npm") {
+			return { type: "npm", identity: parsed.name };
+		}
+		if (parsed.type === "git") {
+			return { type: "git", identity: `${parsed.host}/${parsed.path}` };
+		}
+		const resolved =
+			mode === "settings"
+				? this.resolvePathFromBase(parsed.path, this.getBaseDirForScope(scope))
+				: this.resolvePath(parsed.path);
+		const identity = existsSync(resolved) ? realpathSync(resolved) : resolved;
+		return { type: "local", identity };
+	}
+
+	private getTrustedLockEntryForSource(
+		source: string,
+		parsed: ParsedSource,
+		scope: InstalledSourceScope,
+		accumulator: ResourceAccumulator,
+	): ExtensionProvenanceLockEntry | undefined {
+		const lockfilePath = this.getProvenanceLockfilePath(scope);
+		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, "settings");
+		const key = makeExtensionProvenanceEntryKey(sourceIdentity);
+		const loaded = readExtensionProvenanceLockfile({ scope, lockfilePath, phase: "resolve" });
+		if (loaded.diagnostic) {
+			accumulator.diagnostics.push(loaded.diagnostic);
+			return undefined;
+		}
+		if (!existsSync(lockfilePath)) {
+			accumulator.diagnostics.push(createMissingLockfileDiagnostic({ scope, source, lockfilePath }));
+			return undefined;
+		}
+		const entry = loaded.entries.get(key);
+		if (!entry) {
+			accumulator.diagnostics.push(createMissingLockEntryDiagnostic({ scope, source, lockfilePath }));
+			return undefined;
+		}
+		return entry;
+	}
+
+	private writeProvenanceLockForSource(source: string, scope: InstalledSourceScope): void {
+		const parsed = this.parseSource(source);
+		const entry = this.createProvenanceLockEntryForSource(source, parsed, scope);
+		if (!entry) {
+			return;
+		}
+		writeExtensionProvenanceLockEntry({
+			scope,
+			lockfilePath: this.getProvenanceLockfilePath(scope),
+			entry,
+		});
+	}
+
+	private createProvenanceLockEntryForSource(
+		source: string,
+		parsed: ParsedSource,
+		scope: InstalledSourceScope,
+	): ExtensionProvenanceLockEntry | undefined {
+		const packageRoot = this.getPackageRootForInstalledSource(parsed, scope);
+		if (!packageRoot || !existsSync(packageRoot) || !statSync(packageRoot).isDirectory()) {
+			return undefined;
+		}
+		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, "input");
+		const wasmManifest = hasWasmExtensionManifest(packageRoot)
+			? validateWasmExtensionPackage(packageRoot, { approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS })
+			: undefined;
+		if (wasmManifest) {
+			return createExtensionProvenanceLockEntry({
+				scope,
+				source: sourceIdentity,
+				packageRoot,
+				manifestPath: wasmManifest.manifestPath,
+				manifest: {
+					kind: "wasm-extension",
+					schemaVersion: wasmManifest.schemaVersion,
+					id: wasmManifest.id,
+					name: wasmManifest.name,
+					version: wasmManifest.version,
+					toolId: wasmManifest.toolId,
+				},
+				artifact: createWasmArtifactIdentity(wasmManifest),
+			});
+		}
+		const packageJsonPath = join(packageRoot, "package.json");
+		const packageJson = this.readPackageJsonIdentity(packageJsonPath);
+		const hasPiManifest = Boolean(packageJson?.pi);
+		return createExtensionProvenanceLockEntry({
+			scope,
+			source: sourceIdentity,
+			packageRoot,
+			manifestPath: existsSync(packageJsonPath) ? packageJsonPath : packageRoot,
+			manifest: {
+				kind: hasPiManifest ? "typescript-package" : "resource-package",
+				packageName: packageJson?.name,
+				packageVersion: packageJson?.version,
+			},
+		});
+	}
+
+	private getPackageRootForInstalledSource(parsed: ParsedSource, scope: InstalledSourceScope): string | undefined {
+		if (parsed.type === "npm") {
+			return this.getNpmInstallPath(parsed, scope);
+		}
+		if (parsed.type === "git") {
+			return this.getGitInstallPath(parsed, scope);
+		}
+		const resolved = this.resolvePath(parsed.path);
+		if (!existsSync(resolved)) {
+			return undefined;
+		}
+		return statSync(resolved).isDirectory() ? resolved : dirname(resolved);
+	}
+
+	private readPackageJsonIdentity(packageJsonPath: string): PackageJsonIdentity | undefined {
+		if (!existsSync(packageJsonPath)) {
+			return undefined;
+		}
+		try {
+			return JSON.parse(readFileSync(packageJsonPath, "utf-8")) as PackageJsonIdentity;
+		} catch {
+			return undefined;
+		}
+	}
+
 	private emitProgress(event: ProgressEvent): void {
 		this.progressCallback?.(event);
 	}
@@ -887,7 +1057,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
-		await this.resolvePackageSources(packageSources, accumulator, onMissing);
+		await this.resolvePackageSources(packageSources, accumulator, onMissing, true);
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -932,7 +1102,7 @@ export class DefaultPackageManager implements PackageManager {
 		const accumulator = this.createAccumulator();
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
 		const packageSources = sources.map((source) => ({ pkg: source as PackageSource, scope }));
-		await this.resolvePackageSources(packageSources, accumulator);
+		await this.resolvePackageSources(packageSources, accumulator, undefined, false);
 		return this.toResolvedPaths(accumulator);
 	}
 
@@ -995,6 +1165,8 @@ export class DefaultPackageManager implements PackageManager {
 
 	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
 		await this.install(source, options);
+		const scope: InstalledSourceScope = options?.local ? "project" : "user";
+		this.writeProvenanceLockForSource(source, scope);
 		this.addSourceToSettings(source, options);
 	}
 
@@ -1052,6 +1224,9 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		await this.updateConfiguredSources(updateSources);
+		for (const entry of updateSources) {
+			this.writeProvenanceLockForSource(entry.source, entry.scope);
+		}
 	}
 
 	private async updateConfiguredSources(sources: ConfiguredUpdateSource[]): Promise<void> {
@@ -1221,12 +1396,19 @@ export class DefaultPackageManager implements PackageManager {
 		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
+		enforceProvenance = false,
 	): Promise<void> {
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
 			const parsed = this.parseSource(sourceStr);
 			const metadata: PathMetadata = { source: sourceStr, scope, origin: "package" };
+			if (enforceProvenance && scope !== "temporary") {
+				const lockEntry = this.getTrustedLockEntryForSource(sourceStr, parsed, scope, accumulator);
+				if (!lockEntry) {
+					continue;
+				}
+			}
 
 			if (parsed.type === "local") {
 				const baseDir = this.getBaseDirForScope(scope);
@@ -2391,6 +2573,7 @@ export class DefaultPackageManager implements PackageManager {
 			skills: new Map(),
 			prompts: new Map(),
 			themes: new Map(),
+			diagnostics: [],
 		};
 	}
 
@@ -2420,6 +2603,7 @@ export class DefaultPackageManager implements PackageManager {
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),
+			diagnostics: [...accumulator.diagnostics],
 		};
 	}
 
