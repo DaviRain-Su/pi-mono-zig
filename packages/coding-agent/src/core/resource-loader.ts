@@ -564,6 +564,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				resolvedPath: extension.resolvedPath,
 				sourceInfo: extension.sourceInfo,
 			});
+			extension.effectivePolicy = this.settingsManager.getExtensionPolicy(extension.identity.key);
 			for (const command of extension.commands.values()) {
 				command.sourceInfo = extension.sourceInfo;
 			}

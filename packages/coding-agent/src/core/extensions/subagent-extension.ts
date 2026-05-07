@@ -1,5 +1,7 @@
 import { type Static, Type } from "typebox";
+import type { ExtensionPolicy, ExtensionResourceLimits, TypeScriptExtensionIdentity } from "../extension-policy.js";
 import type { CustomEntry } from "../session-manager.js";
+import type { SourceInfo } from "../source-info.js";
 import {
 	type BoundedSubAgentExecutor,
 	defaultBoundedSubAgentExecutor,
@@ -7,6 +9,7 @@ import {
 } from "./bounded-subagent-execution.js";
 import {
 	type SubAgentCancellationMetadata,
+	type SubAgentResourceLimits,
 	type SubAgentTaskInvocationEnvelope,
 	type SubAgentTaskResultEnvelope,
 	validateSubAgentTaskInvocationEnvelope,
@@ -91,7 +94,7 @@ export const subAgentDelegationInputSchema = Type.Object(
 export type SubAgentDelegationInput = Static<typeof subAgentDelegationInputSchema>;
 
 export function createSubAgentExtension(options: SubAgentExtensionOptions = {}): ExtensionFactory {
-	const approvedCapabilities = new Set(options.approvedCapabilities ?? []);
+	const fallbackApprovedCapabilities = new Set(options.approvedCapabilities ?? []);
 
 	return (pi: ExtensionAPI): void => {
 		const executeDelegation = async (
@@ -99,7 +102,10 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 			signal: AbortSignal | undefined,
 			ctx: ExtensionContext,
 		): Promise<SubAgentTaskResultEnvelope> => {
-			const invocation = buildInvocation(params, signal);
+			const policy = pi.getExtensionPolicy();
+			const approvedCapabilities = approvedCapabilitiesFor(policy, fallbackApprovedCapabilities);
+			const policyDetails = policyDiagnosticDetails(pi.getExtensionIdentity());
+			const invocation = buildInvocation(params, signal, policy?.resourceLimits);
 			let replayedResult: SubAgentTaskResultEnvelope | undefined;
 			const executor: BoundedSubAgentExecutor = async (boundedInvocation, executionContext) => {
 				const delegate = options.delegate ?? defaultDelegate;
@@ -131,6 +137,7 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 								details: {
 									capability: "agent.delegate",
 									operation: "agent.delegate",
+									...policyDetails,
 								},
 							},
 			});
@@ -192,14 +199,92 @@ function parseCommandPayload(args: string): SubAgentDelegationInput {
 function buildInvocation(
 	params: SubAgentDelegationInput,
 	signal: AbortSignal | undefined,
+	policyLimits: ExtensionResourceLimits | undefined,
 ): SubAgentTaskInvocationEnvelope {
 	const cancellation = normalizeCancellation(params.cancellation, signal);
 	const candidate: Record<string, unknown> = {
 		...params,
 		type: "sub_agent_task_invocation",
 	};
+	const limits = narrowResourceLimits(policyLimits, params.limits);
+	if (limits !== undefined) candidate.limits = limits;
 	if (cancellation !== undefined) candidate.cancellation = cancellation;
 	return validateSubAgentTaskInvocationEnvelope(candidate);
+}
+
+function approvedCapabilitiesFor(
+	policy: ExtensionPolicy | undefined,
+	fallbackApprovedCapabilities: ReadonlySet<SubAgentDelegationCapability>,
+): ReadonlySet<SubAgentDelegationCapability> {
+	if (policy?.approvedGrants !== undefined) {
+		return new Set(
+			policy.approvedGrants.filter((grant): grant is SubAgentDelegationCapability => grant === "agent.delegate"),
+		);
+	}
+	return fallbackApprovedCapabilities;
+}
+
+function narrowResourceLimits(
+	policyLimits: ExtensionResourceLimits | undefined,
+	requestLimits: SubAgentResourceLimits | undefined,
+): SubAgentResourceLimits | undefined {
+	if (policyLimits === undefined && requestLimits === undefined) return undefined;
+	const limits: SubAgentResourceLimits = {};
+	narrowNumericLimit(limits, "maxChildren", policyLimits?.maxChildren, requestLimits?.maxChildren);
+	narrowNumericLimit(limits, "depth", policyLimits?.depth, requestLimits?.depth);
+	narrowNumericLimit(limits, "turns", policyLimits?.turns, requestLimits?.turns);
+	narrowNumericLimit(limits, "timeoutMs", policyLimits?.timeoutMs, requestLimits?.timeoutMs);
+	narrowNumericLimit(limits, "outputBytes", policyLimits?.outputBytes, requestLimits?.outputBytes);
+	narrowNumericLimit(limits, "outputLines", policyLimits?.outputLines, requestLimits?.outputLines);
+	const toolScopes = narrowToolScopes(policyLimits?.toolScopes, requestLimits?.toolScopes);
+	if (toolScopes !== undefined) limits.toolScopes = toolScopes;
+	return limits;
+}
+
+function narrowNumericLimit(
+	limits: SubAgentResourceLimits,
+	field: Exclude<keyof SubAgentResourceLimits, "toolScopes">,
+	policyLimit: number | undefined,
+	requestLimit: number | undefined,
+): void {
+	if (policyLimit === undefined && requestLimit === undefined) return;
+	limits[field] =
+		policyLimit === undefined
+			? requestLimit
+			: requestLimit === undefined
+				? policyLimit
+				: Math.min(policyLimit, requestLimit);
+}
+
+function narrowToolScopes(
+	policyScopes: readonly string[] | undefined,
+	requestScopes: readonly string[] | undefined,
+): string[] | undefined {
+	if (policyScopes === undefined && requestScopes === undefined) return undefined;
+	if (policyScopes === undefined) return [...(requestScopes ?? [])];
+	if (requestScopes === undefined) return [...policyScopes];
+	const requestSet = new Set(requestScopes);
+	return policyScopes.filter((scope) => requestSet.has(scope));
+}
+
+function policyDiagnosticDetails(identity: TypeScriptExtensionIdentity): Record<string, unknown> {
+	return {
+		extensionIdentity: identity.key,
+		extensionKind: identity.kind,
+		extensionDisplayName: identity.displayName,
+		runtimeKind: identity.runtimeKind,
+		source: sourceDiagnosticDetails(identity.sourceInfo),
+	};
+}
+
+function sourceDiagnosticDetails(sourceInfo: SourceInfo): Record<string, unknown> {
+	return {
+		scope: sourceInfo.scope,
+		source: sourceInfo.source,
+		origin: sourceInfo.origin,
+		path: sourceInfo.path,
+		baseDir: sourceInfo.baseDir,
+	};
 }
 
 function normalizeCancellation(

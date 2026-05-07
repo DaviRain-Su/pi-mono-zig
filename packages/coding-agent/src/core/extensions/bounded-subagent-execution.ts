@@ -591,6 +591,7 @@ function buildFailedResult(
 			capability: "agent.delegate",
 			operation: "agent.delegate",
 			replayed: false,
+			...options.details,
 		},
 		resourceSummary: options.resourceSummary,
 	});

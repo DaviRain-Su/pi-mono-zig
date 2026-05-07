@@ -45,7 +45,7 @@ import type { BashResult } from "../bash-executor.js";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.js";
 import type { EventBus } from "../event-bus.js";
 import type { ExecOptions, ExecResult } from "../exec.js";
-import type { TypeScriptExtensionIdentity } from "../extension-policy.js";
+import type { ExtensionPolicy, TypeScriptExtensionIdentity } from "../extension-policy.js";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.js";
 import type { KeybindingsManager } from "../keybindings.js";
 import type { CustomMessage } from "../messages.js";
@@ -1138,6 +1138,10 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** @internal Returns this extension's canonical policy identity after loader source attribution. */
+	getExtensionIdentity(): TypeScriptExtensionIdentity;
+	/** @internal Returns the effective user/project policy snapshotted for this extension load. */
+	getExtensionPolicy(): ExtensionPolicy | undefined;
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1597,6 +1601,7 @@ export interface Extension {
 	resolvedPath: string;
 	sourceInfo: SourceInfo;
 	identity: TypeScriptExtensionIdentity;
+	effectivePolicy?: ExtensionPolicy;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;

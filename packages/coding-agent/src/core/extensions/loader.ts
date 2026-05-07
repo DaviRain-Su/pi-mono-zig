@@ -205,6 +205,16 @@ function createExtensionAPI(
 	eventBus: EventBus,
 ): ExtensionAPI {
 	const api = {
+		getExtensionIdentity() {
+			runtime.assertActive();
+			return extension.identity;
+		},
+
+		getExtensionPolicy() {
+			runtime.assertActive();
+			return extension.effectivePolicy;
+		},
+
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): void {
 			runtime.assertActive();

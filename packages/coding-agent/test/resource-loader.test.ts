@@ -261,6 +261,59 @@ Project skill`,
 			expect(inline?.identity.resolvedPath).toBe("<inline:1>");
 		});
 
+		it("should snapshot effective extension policy by canonical TypeScript identity on reload", async () => {
+			const projectExtensionDir = join(cwd, ".pi", "extensions");
+			mkdirSync(projectExtensionDir, { recursive: true });
+			const extensionPath = join(projectExtensionDir, "sub-agent.ts");
+			const siblingPath = join(projectExtensionDir, "sibling.ts");
+			writeFileSync(extensionPath, "export default function() {}");
+			writeFileSync(siblingPath, "export default function() {}");
+
+			const settingsManager = SettingsManager.inMemory();
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+
+			const firstLoad = loader.getExtensions().extensions.find((extension) => extension.path === extensionPath);
+			const sibling = loader.getExtensions().extensions.find((extension) => extension.path === siblingPath);
+			expect(firstLoad).toBeDefined();
+			expect(sibling).toBeDefined();
+			const identityKey = firstLoad!.identity.key;
+
+			settingsManager.setExtensionPolicy(identityKey, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 5, toolScopes: ["read", "write"] },
+			});
+			settingsManager.setProjectExtensionPolicy(identityKey, {
+				resourceLimits: { turns: 1, toolScopes: ["read"] },
+			});
+			await loader.reload();
+
+			const policyLoad = loader.getExtensions().extensions.find((extension) => extension.path === extensionPath);
+			const unrelated = loader.getExtensions().extensions.find((extension) => extension.path === siblingPath);
+			expect(policyLoad?.effectivePolicy).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 1, toolScopes: ["read"] },
+			});
+			expect(unrelated?.effectivePolicy).toBeUndefined();
+
+			settingsManager.setProjectExtensionPolicy(identityKey, {
+				approvedGrants: [],
+				resourceLimits: { turns: 0, toolScopes: [] },
+			});
+			expect(policyLoad?.effectivePolicy).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 1, toolScopes: ["read"] },
+			});
+
+			await loader.reload();
+
+			const reloaded = loader.getExtensions().extensions.find((extension) => extension.path === extensionPath);
+			expect(reloaded?.effectivePolicy).toEqual({
+				approvedGrants: [],
+				resourceLimits: { turns: 0, toolScopes: [] },
+			});
+		});
+
 		it("should keep both extensions loaded when command names collide", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			const projectExtDir = join(cwd, ".pi", "extensions");

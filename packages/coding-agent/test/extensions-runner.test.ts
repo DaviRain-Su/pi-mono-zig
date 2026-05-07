@@ -1087,11 +1087,24 @@ describe("neutral sub-agent delegation extension", () => {
 
 		expect(delegateCalls).toBe(0);
 		expect(envelope.status).toBe("failed");
-		expect(envelope.error).toMatchObject({ reason: "denied_capability" });
+		expect(envelope.error).toMatchObject({
+			reason: "denied_capability",
+			details: {
+				capability: "agent.delegate",
+				operation: "agent.delegate",
+				extensionIdentity: extension.identity.key,
+				runtimeKind: "typescript",
+				source: {
+					scope: "temporary",
+					origin: "top-level",
+				},
+			},
+		});
 		expect(envelope.details).toMatchObject({
 			capability: "agent.delegate",
 			operation: "agent.delegate",
 			replayed: false,
+			extensionIdentity: extension.identity.key,
 		});
 		expect(replayEnvelope).toEqual(envelope);
 		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
@@ -1101,6 +1114,82 @@ describe("neutral sub-agent delegation extension", () => {
 				.filter((entry) => entry.type === "custom")
 				.map((entry) => entry.customType),
 		).toEqual([SUB_AGENT_READINESS_ENTRY, SUB_AGENT_DELEGATION_RESULT_ENTRY]);
+	});
+
+	it("applies snapshotted effective policy grants and narrows request limits for delegation", async () => {
+		let delegateCalls = 0;
+		const observedLimits: Array<SubAgentDelegationInput["limits"]> = [];
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				delegate: (invocation) => {
+					delegateCalls++;
+					observedLimits.push(invocation.limits);
+					return completedResultFor(invocation, "line one\nline two", { startedAt: 10, completedAt: 20 });
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		extension.effectivePolicy = {
+			approvedGrants: ["agent.delegate"],
+			resourceLimits: { turns: 1, outputBytes: 1024, outputLines: 1, toolScopes: ["read"] },
+		};
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+
+		const allowed = await tool!.execute(
+			"tool-call-policy-allowed",
+			{
+				...delegateInput,
+				taskId: "task-policy-allowed",
+				limits: { turns: 5, outputBytes: 2048, outputLines: 5, toolScopes: ["read", "write"] },
+			},
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const allowedEnvelope = JSON.parse(textFromToolResult(allowed)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(1);
+		expect(observedLimits).toEqual([{ turns: 1, outputBytes: 1024, outputLines: 1, toolScopes: ["read"] }]);
+		expect(allowedEnvelope).toMatchObject({
+			status: "completed",
+			content: [{ type: "text", text: "line one" }],
+			resourceSummary: {
+				turns: 1,
+				outputLines: 1,
+				limitDetails: {
+					turns: { limit: 1, actual: 1, truncated: false },
+					outputLines: { limit: 1, actual: 2, truncated: true },
+					toolScopes: ["read"],
+				},
+			},
+		});
+
+		const deniedByRequestLimit = await tool!.execute(
+			"tool-call-policy-request-limit",
+			{
+				...delegateInput,
+				taskId: "task-policy-request-limit",
+				limits: { turns: 0, toolScopes: ["read"] },
+			},
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const deniedEnvelope = JSON.parse(textFromToolResult(deniedByRequestLimit)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(1);
+		expect(deniedEnvelope).toMatchObject({
+			status: "failed",
+			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: turns" },
+			resourceSummary: { turns: 0, childrenStarted: 0 },
+		});
 	});
 
 	it("delegates through the neutral substrate and replays recorded results without re-execution", async () => {
