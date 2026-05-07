@@ -469,7 +469,10 @@ fn parseSseStreamLines(
             .arguments = arguments,
         };
         try ensureContentSlotCapacity(allocator, &content_slots, tool_call.event_index);
-        content_slots.items[tool_call.event_index] = null;
+        // Inline tool call lives in `content` as the single source of truth.
+        // The legacy AssistantMessage.tool_calls cache is intentionally left
+        // null; readers go through collectAssistantToolCalls / inline blocks.
+        content_slots.items[tool_call.event_index] = .{ .tool_call = final_tool_call };
         try tool_calls.append(allocator, final_tool_call);
         stream_ptr.push(.{
             .event_type = .toolcall_end,
@@ -480,7 +483,6 @@ fn parseSseStreamLines(
 
     calculateCost(model, &output.usage);
     output.content = try materializeContent(allocator, content_slots.items);
-    output.tool_calls = if (tool_calls.items.len > 0) try cloneToolCallsSlice(allocator, tool_calls.items) else null;
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -509,7 +511,8 @@ fn finalizeOutputFromPartials(
             .arguments = arguments,
         };
         try ensureContentSlotCapacity(allocator, content_slots, tool_call.event_index);
-        content_slots.items[tool_call.event_index] = null;
+        // Inline tool call is the source of truth (see parseSseStreamLines).
+        content_slots.items[tool_call.event_index] = .{ .tool_call = final_tool_call };
         try tool_calls.append(allocator, final_tool_call);
         stream_ptr.push(.{
             .event_type = .toolcall_end,
@@ -522,9 +525,6 @@ fn finalizeOutputFromPartials(
     calculateCost(model, &output.usage);
     if (output.content.len == 0 and content_slots.items.len > 0) {
         output.content = try materializeContent(allocator, content_slots.items);
-    }
-    if (output.tool_calls == null and tool_calls.items.len > 0) {
-        output.tool_calls = try cloneToolCallsSlice(allocator, tool_calls.items);
     }
 }
 

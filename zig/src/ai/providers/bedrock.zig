@@ -2225,6 +2225,10 @@ fn finalizeOutputFromPartials(
     }
 
     output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
+    // Bedrock uses dual allocation: tool calls have separate copies in
+    // `tool_calls` and inline `content`. Legacy field retains ownership of
+    // the ArrayList copies for freeAssistantMessage cleanup; inline content
+    // is the canonical source consumers read from.
     output.tool_calls = if (output.tool_calls == null and tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else output.tool_calls;
     output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 }
@@ -2268,6 +2272,7 @@ fn collectOutputFromPartials(
     }
 
     output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
+    // See note in collectOutputFromPartials about dual allocation.
     output.tool_calls = if (output.tool_calls == null and tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else output.tool_calls;
     output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 }
@@ -2378,6 +2383,7 @@ fn finalizeOutput(
         return;
     }
     output.content = try content_blocks.toOwnedSlice(allocator);
+    // See note in collectOutputFromPartials about dual allocation.
     output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
     output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 

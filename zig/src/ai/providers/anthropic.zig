@@ -1851,6 +1851,10 @@ fn parseSseStreamLines(
     output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
     calculateCost(model, &output.usage);
     output.content = try content_blocks.toOwnedSlice(allocator);
+    // Anthropic uses dual allocation: each tool call has separate copies in
+    // `tool_calls` and inline `content`. The legacy field still owns the
+    // ArrayList copies so they are freed via freeAssistantMessage. Inline
+    // content is the canonical source consumers read from.
     output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
 
     stream_ptr.push(.{
@@ -1906,6 +1910,8 @@ fn finalizeOutputFromPartials(
     output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
     calculateCost(model, &output.usage);
     if (output.content.len == 0 and content_blocks.items.len > 0) output.content = try content_blocks.toOwnedSlice(allocator);
+    // See note in the main streaming path: legacy field retains ownership of
+    // the dual-allocation ArrayList copies for cleanup.
     if (output.tool_calls == null and tool_calls.items.len > 0) output.tool_calls = try tool_calls.toOwnedSlice(allocator);
 }
 

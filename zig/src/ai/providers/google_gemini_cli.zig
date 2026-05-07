@@ -435,31 +435,27 @@ fn parseSseStreamLines(
                                         .arguments = args,
                                         .thought_signature = thought_signature,
                                     };
-                                    try tool_calls.append(allocator, tool_call);
-                                    try content_blocks.append(allocator, .{ .tool_call = .{
-                                        .id = try allocator.dupe(u8, tool_call.id),
-                                        .name = try allocator.dupe(u8, tool_call.name),
-                                        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
-                                        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
-                                    } });
+                                    try content_blocks.append(allocator, .{ .tool_call = tool_call });
+                                    const content_index = content_blocks.items.len - 1;
+                                    try tool_calls.append(allocator, content_blocks.items[content_index].tool_call);
 
                                     stream_ptr.push(.{
                                         .event_type = .toolcall_start,
-                                        .content_index = @intCast(content_blocks.items.len - 1),
+                                        .content_index = @intCast(content_index),
                                     });
 
                                     const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
                                     defer allocator.free(args_json);
                                     stream_ptr.push(.{
                                         .event_type = .toolcall_delta,
-                                        .content_index = @intCast(content_blocks.items.len - 1),
+                                        .content_index = @intCast(content_index),
                                         .delta = try allocator.dupe(u8, args_json),
                                         .owns_delta = true,
                                     });
                                     stream_ptr.push(.{
                                         .event_type = .toolcall_end,
-                                        .content_index = @intCast(content_blocks.items.len - 1),
-                                        .tool_call = tool_call,
+                                        .content_index = @intCast(content_index),
+                                        .tool_call = content_blocks.items[content_index].tool_call,
                                     });
                                 }
                             }
@@ -479,7 +475,6 @@ fn parseSseStreamLines(
     try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
     calculateCost(model, &output.usage);
     output.content = try content_blocks.toOwnedSlice(allocator);
-    output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -493,7 +488,7 @@ fn finalizeOutputFromPartials(
     output: *types.AssistantMessage,
     current_block: *?CurrentBlock,
     content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
+    _: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
     model: types.Model,
 ) !void {
@@ -501,9 +496,6 @@ fn finalizeOutputFromPartials(
     calculateCost(model, &output.usage);
     if (output.content.len == 0 and content_blocks.items.len > 0) {
         output.content = try content_blocks.toOwnedSlice(allocator);
-    }
-    if (output.tool_calls == null and tool_calls.items.len > 0) {
-        output.tool_calls = try tool_calls.toOwnedSlice(allocator);
     }
 }
 

@@ -184,6 +184,10 @@ fn finishParserState(state: *SseParseState) !void {
     }
 
     if (state.tool_calls.items.len > 0) {
+        // openai_chat_sse uses dual allocation: tool calls have separate copies
+        // in `tool_calls` and inline `content`. The legacy field still owns
+        // the ArrayList copies so they are freed via freeAssistantMessage.
+        // Inline content is the canonical source consumers read from.
         state.output.tool_calls = try state.tool_calls.toOwnedSlice(allocator);
         state.tool_calls_transferred = true;
         if (state.output.stop_reason == .stop) state.output.stop_reason = .tool_use;
