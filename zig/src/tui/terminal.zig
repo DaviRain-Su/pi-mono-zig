@@ -104,6 +104,7 @@ pub const Terminal = struct {
     started: bool = false,
     raw_mode_enabled: bool = false,
     use_kitty_keyboard_protocol: bool = true,
+    use_mouse_reporting: bool = false,
     current_size: Size = .{ .width = 80, .height = 24 },
 
     pub const ALT_SCREEN_ENABLE = vaxis.ctlseqs.smcup;
@@ -147,8 +148,9 @@ pub const Terminal = struct {
                 errdefer backend.restoreMode() catch {};
 
                 self.use_kitty_keyboard_protocol = shouldUseKittyKeyboardProtocol();
-                try backend.write(startupSequence(self.use_kitty_keyboard_protocol));
-                errdefer backend.write(stopSequence(self.use_kitty_keyboard_protocol)) catch {};
+                self.use_mouse_reporting = shouldUseMouseReporting();
+                try backend.write(startupSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting));
+                errdefer backend.write(stopSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting)) catch {};
 
                 self.current_size = try backend.getSize();
             },
@@ -158,12 +160,13 @@ pub const Terminal = struct {
 
                 const writer = try native.writer();
                 self.use_kitty_keyboard_protocol = shouldUseKittyKeyboardProtocol();
-                try writer.writeAll(startupSequence(self.use_kitty_keyboard_protocol));
+                self.use_mouse_reporting = shouldUseMouseReporting();
+                try writer.writeAll(startupSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting));
                 try writer.flush();
                 errdefer {
                     const stop_writer = native.writer() catch null;
                     if (stop_writer) |w| {
-                        w.writeAll(stopSequence(self.use_kitty_keyboard_protocol)) catch {};
+                        w.writeAll(stopSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting)) catch {};
                         w.flush() catch {};
                     }
                 }
@@ -181,13 +184,13 @@ pub const Terminal = struct {
 
         switch (self.state) {
             .backend => |backend| {
-                backend.write(stopSequence(self.use_kitty_keyboard_protocol)) catch {};
+                backend.write(stopSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting)) catch {};
                 backend.restoreMode() catch {};
             },
             .native => |*native| {
                 const writer = native.writer() catch null;
                 if (writer) |tty_writer| {
-                    tty_writer.writeAll(stopSequence(self.use_kitty_keyboard_protocol)) catch {};
+                    tty_writer.writeAll(stopSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting)) catch {};
                     tty_writer.flush() catch {};
                 }
                 native.stop();
@@ -262,6 +265,14 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(value);
 }
 
+fn shouldUseMouseReporting() bool {
+    const value = getenv("PI_ENABLE_MOUSE") orelse return false;
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
 fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resources_dir: ?[]const u8, term: ?[]const u8) bool {
     if (term_program) |value| {
         // Ghostty/Fcitx IME can drop committed text with Kitty enabled; raw UTF-8 works.
@@ -274,18 +285,20 @@ fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resou
     return true;
 }
 
-fn startupSequence(use_kitty_keyboard_protocol: bool) []const u8 {
-    return if (use_kitty_keyboard_protocol)
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE
-    else
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.MOUSE_ENABLE;
+fn startupSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {
+    _ = use_mouse_reporting;
+    if (use_kitty_keyboard_protocol) {
+        return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE;
+    }
+    return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR;
 }
 
-fn stopSequence(use_kitty_keyboard_protocol: bool) []const u8 {
-    return if (use_kitty_keyboard_protocol)
-        Terminal.MOUSE_DISABLE ++ Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR
-    else
-        Terminal.MOUSE_DISABLE ++ Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR;
+fn stopSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {
+    _ = use_mouse_reporting;
+    if (use_kitty_keyboard_protocol) {
+        return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR;
+    }
+    return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR;
 }
 
 pub const testing = if (builtin.is_test) struct {
@@ -294,11 +307,11 @@ pub const testing = if (builtin.is_test) struct {
     }
 
     pub fn expectedStartupSequence(use_kitty_keyboard_protocol: bool) []const u8 {
-        return startupSequence(use_kitty_keyboard_protocol);
+        return startupSequence(use_kitty_keyboard_protocol, shouldUseMouseReporting());
     }
 
     pub fn expectedStopSequence(use_kitty_keyboard_protocol: bool) []const u8 {
-        return stopSequence(use_kitty_keyboard_protocol);
+        return stopSequence(use_kitty_keyboard_protocol, shouldUseMouseReporting());
     }
 } else struct {};
 
@@ -668,19 +681,20 @@ test "terminal enters raw mode on startup and restores on exit" {
     defer backend.deinit(std.testing.allocator);
 
     const expected_use_kitty = shouldUseKittyKeyboardProtocol();
+    const expected_use_mouse = shouldUseMouseReporting();
     var terminal = Terminal.init(backend.backend());
     try terminal.start();
 
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(terminal.raw_mode_enabled);
     try std.testing.expectEqualStrings(
-        startupSequence(expected_use_kitty),
+        startupSequence(expected_use_kitty, expected_use_mouse),
         backend.writes.items[0],
     );
     try std.testing.expectEqual(expected_use_kitty, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[>7u") != null);
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[>31u") == null);
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1002h") != null);
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1006h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1002h") == null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1006h") == null);
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1003h") == null);
 
     terminal.stop();
@@ -688,18 +702,19 @@ test "terminal enters raw mode on startup and restores on exit" {
     try std.testing.expect(backend.restored);
     try std.testing.expect(!terminal.raw_mode_enabled);
     try std.testing.expectEqualStrings(
-        stopSequence(expected_use_kitty),
+        stopSequence(expected_use_kitty, expected_use_mouse),
         backend.writes.items[1],
     );
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1006l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1002l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1006l") == null);
+    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1002l") == null);
 }
 
-test "terminal restores terminal modes when startup fails after entering alternate screen" {
+test "terminal restores terminal modes when startup fails" {
     var backend = MockBackend{ .fail_get_size = true };
     defer backend.deinit(std.testing.allocator);
 
     const expected_use_kitty = shouldUseKittyKeyboardProtocol();
+    const expected_use_mouse = shouldUseMouseReporting();
     var terminal = Terminal.init(backend.backend());
     try std.testing.expectError(error.GetSizeFailed, terminal.start());
 
@@ -709,39 +724,52 @@ test "terminal restores terminal modes when startup fails after entering alterna
     try std.testing.expect(!terminal.raw_mode_enabled);
     try std.testing.expectEqual(@as(usize, 2), backend.writes.items.len);
     try std.testing.expectEqualStrings(
-        startupSequence(expected_use_kitty),
+        startupSequence(expected_use_kitty, expected_use_mouse),
         backend.writes.items[0],
     );
     try std.testing.expectEqualStrings(
-        stopSequence(expected_use_kitty),
+        stopSequence(expected_use_kitty, expected_use_mouse),
         backend.writes.items[1],
     );
 }
 
-test "terminal startup and stop sequences include Kitty keyboard protocol by default" {
+test "terminal startup and stop sequences include Kitty keyboard protocol by default without mouse reporting" {
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE,
-        startupSequence(true),
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
+        startupSequence(true, false),
     );
     try std.testing.expectEqualStrings(
-        Terminal.MOUSE_DISABLE ++ Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
-        stopSequence(true),
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
+        stopSequence(true, false),
     );
+}
+
+test "terminal startup and stop sequences leave mouse wheel for scrollback" {
+    try std.testing.expectEqualStrings(
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
+        startupSequence(true, true),
+    );
+    try std.testing.expectEqualStrings(
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
+        stopSequence(true, true),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, startupSequence(true, true), Terminal.MOUSE_ENABLE) == null);
+    try std.testing.expect(std.mem.indexOf(u8, stopSequence(true, true), Terminal.MOUSE_DISABLE) == null);
 }
 
 test "terminal startup and stop sequences omit Kitty keyboard protocol for Ghostty" {
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.AUTO_WRAP_DISABLE ++ Terminal.MOUSE_ENABLE,
-        startupSequence(false),
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR,
+        startupSequence(false, false),
     );
-    try std.testing.expect(std.mem.indexOf(u8, startupSequence(false), Terminal.KITTY_KEYBOARD_QUERY) == null);
-    try std.testing.expect(std.mem.indexOf(u8, startupSequence(false), Terminal.KITTY_KEYBOARD_ENABLE) == null);
+    try std.testing.expect(std.mem.indexOf(u8, startupSequence(false, false), Terminal.KITTY_KEYBOARD_QUERY) == null);
+    try std.testing.expect(std.mem.indexOf(u8, startupSequence(false, false), Terminal.KITTY_KEYBOARD_ENABLE) == null);
 
     try std.testing.expectEqualStrings(
-        Terminal.MOUSE_DISABLE ++ Terminal.AUTO_WRAP_ENABLE ++ Terminal.ALT_SCREEN_DISABLE ++ Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR,
-        stopSequence(false),
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR,
+        stopSequence(false, false),
     );
-    try std.testing.expect(std.mem.indexOf(u8, stopSequence(false), Terminal.KITTY_KEYBOARD_DISABLE) == null);
+    try std.testing.expect(std.mem.indexOf(u8, stopSequence(false, false), Terminal.KITTY_KEYBOARD_DISABLE) == null);
 }
 
 test "terminal detects Ghostty environment before using Kitty keyboard protocol" {

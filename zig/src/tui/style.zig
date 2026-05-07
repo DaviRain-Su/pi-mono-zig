@@ -148,31 +148,31 @@ test "styleFor maps representative theme tokens to vaxis styles" {
     defer theme.deinit(std.testing.allocator);
 
     const welcome = styleForWithColorMode(&theme, .welcome, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 158, 206, 106 } }, welcome.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 181, 189, 104 } }, welcome.fg);
     try std.testing.expect(welcome.bold);
 
     const selected = styleForWithColorMode(&theme, .select_selected, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 122, 162, 247 } }, selected.fg);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .default = {} }, selected.bg);
+    try std.testing.expectEqual(vaxis.Cell.Color.default, selected.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 58, 58, 74 } }, selected.bg);
     try std.testing.expect(selected.bold);
 
     const link = styleForWithColorMode(&theme, .markdown_link, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 187, 154, 247 } }, link.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 129, 162, 190 } }, link.fg);
     try std.testing.expectEqual(vaxis.Cell.Style.Underline.single, link.ul_style);
 
     const empty = styleForWithColorMode(&theme, .select_empty, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 127, 132, 156 } }, empty.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 128, 128, 128 } }, empty.fg);
     try std.testing.expect(empty.italic);
 
     const prompt_glyph = styleForWithColorMode(&theme, .prompt_glyph, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 122, 162, 247 } }, prompt_glyph.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 138, 190, 183 } }, prompt_glyph.fg);
     try std.testing.expect(prompt_glyph.bold);
 
     const prompt_border = styleForWithColorMode(&theme, .prompt_border, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 65, 72, 104 } }, prompt_border.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 95, 135, 255 } }, prompt_border.fg);
 
     const terminal_badge = styleForWithColorMode(&theme, .terminal_badge, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 127, 132, 156 } }, terminal_badge.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 128, 128, 128 } }, terminal_badge.fg);
     try std.testing.expect(!terminal_badge.bold);
 }
 
@@ -212,11 +212,11 @@ test "color mode detection mirrors limited terminal fallbacks" {
 }
 
 test "hex colors downgrade to xterm 256 indexes in limited color mode" {
-    const truecolor = styleFromSpecWithColorMode(.{ .fg = @constCast("#7aa2f7"[0..]), .bg = @constCast("#1a1b26"[0..]) }, .truecolor);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 122, 162, 247 } }, truecolor.fg);
-    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 26, 27, 38 } }, truecolor.bg);
+    const truecolor = styleFromSpecWithColorMode(.{ .fg = @constCast("#8ab4ff"[0..]), .bg = @constCast("#0b1020"[0..]) }, .truecolor);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 138, 180, 255 } }, truecolor.fg);
+    try std.testing.expectEqual(vaxis.Cell.Color{ .rgb = .{ 11, 16, 32 } }, truecolor.bg);
 
-    const downgraded = styleFromSpecWithColorMode(.{ .fg = @constCast("#7aa2f7"[0..]), .bg = @constCast("#1a1b26"[0..]) }, .@"256color");
+    const downgraded = styleFromSpecWithColorMode(.{ .fg = @constCast("#8ab4ff"[0..]), .bg = @constCast("#0b1020"[0..]) }, .@"256color");
     try std.testing.expectEqual(vaxis.Cell.Color{ .index = 111 }, downgraded.fg);
     try std.testing.expectEqual(vaxis.Cell.Color{ .index = 16 }, downgraded.bg);
 

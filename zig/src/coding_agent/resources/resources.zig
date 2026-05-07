@@ -1678,15 +1678,65 @@ fn parseThemeToken(name: []const u8) ?ThemeToken {
 }
 
 fn parseThemeColor(name: []const u8) ?ThemeColor {
-    if (std.mem.eql(u8, name, "primary")) return .primary;
-    if (std.mem.eql(u8, name, "secondary")) return .secondary;
-    if (std.mem.eql(u8, name, "success")) return .success;
-    if (std.mem.eql(u8, name, "warning")) return .warning;
-    if (std.mem.eql(u8, name, "error")) return .@"error";
-    if (std.mem.eql(u8, name, "background")) return .background;
-    if (std.mem.eql(u8, name, "foreground")) return .foreground;
-    if (std.mem.eql(u8, name, "border")) return .border;
-    if (std.mem.eql(u8, name, "muted")) return .muted;
+    const aliases = [_]struct { []const u8, ThemeColor }{
+        .{ "primary", .primary },
+        .{ "secondary", .secondary },
+        .{ "success", .success },
+        .{ "warning", .warning },
+        .{ "error", .@"error" },
+        .{ "background", .background },
+        .{ "foreground", .foreground },
+        .{ "border", .border },
+        .{ "muted", .muted },
+        .{ "dim", .dim },
+        .{ "thinkingText", .thinking_text },
+        .{ "thinking_text", .thinking_text },
+        .{ "selectedBg", .selected_bg },
+        .{ "selected_bg", .selected_bg },
+        .{ "userMessageBg", .user_message_bg },
+        .{ "user_message_bg", .user_message_bg },
+        .{ "customMessageBg", .custom_message_bg },
+        .{ "custom_message_bg", .custom_message_bg },
+        .{ "toolPendingBg", .tool_pending_bg },
+        .{ "tool_pending_bg", .tool_pending_bg },
+        .{ "toolSuccessBg", .tool_success_bg },
+        .{ "tool_success_bg", .tool_success_bg },
+        .{ "toolErrorBg", .tool_error_bg },
+        .{ "tool_error_bg", .tool_error_bg },
+        .{ "borderAccent", .border_accent },
+        .{ "border_accent", .border_accent },
+        .{ "borderMuted", .border_muted },
+        .{ "border_muted", .border_muted },
+        .{ "mdHeading", .markdown_heading },
+        .{ "markdownHeading", .markdown_heading },
+        .{ "markdown_heading", .markdown_heading },
+        .{ "mdLink", .markdown_link },
+        .{ "markdownLink", .markdown_link },
+        .{ "markdown_link", .markdown_link },
+        .{ "mdCode", .markdown_code },
+        .{ "markdownCode", .markdown_code },
+        .{ "markdown_code", .markdown_code },
+        .{ "mdCodeBlockBorder", .markdown_code_border },
+        .{ "markdownCodeBorder", .markdown_code_border },
+        .{ "markdown_code_border", .markdown_code_border },
+        .{ "mdQuote", .markdown_quote },
+        .{ "markdownQuote", .markdown_quote },
+        .{ "markdown_quote", .markdown_quote },
+        .{ "mdQuoteBorder", .markdown_quote_border },
+        .{ "markdownQuoteBorder", .markdown_quote_border },
+        .{ "markdown_quote_border", .markdown_quote_border },
+        .{ "mdHr", .markdown_rule },
+        .{ "markdownRule", .markdown_rule },
+        .{ "markdown_rule", .markdown_rule },
+        .{ "mdListBullet", .markdown_list_bullet },
+        .{ "markdownListBullet", .markdown_list_bullet },
+        .{ "markdown_list_bullet", .markdown_list_bullet },
+        .{ "toolOutput", .tool_output },
+        .{ "tool_output", .tool_output },
+    };
+    for (aliases) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
     return null;
 }
 
