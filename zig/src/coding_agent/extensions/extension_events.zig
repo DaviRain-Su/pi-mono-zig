@@ -2029,6 +2029,42 @@ test "sub-agent readiness envelope validation rejects missing ids product fields
     }
 }
 
+test "sub-agent readiness envelope validation rejects every forbidden product policy field" {
+    const allocator = std.testing.allocator;
+
+    inline for (subagent_forbidden_fields) |field| {
+        const invocation_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{{}},\"{s}\":{{\"automatic\":true}}}}",
+            .{field},
+        );
+        defer allocator.free(invocation_json);
+        var invocation = try std.json.parseFromSlice(std.json.Value, allocator, invocation_json, .{});
+        defer invocation.deinit();
+        var invocation_validation = try validateSubAgentReadinessEnvelope(allocator, invocation.value);
+        defer invocation_validation.deinit(allocator);
+        const expected_path = try std.fmt.allocPrint(allocator, "$.{s}", .{field});
+        defer allocator.free(expected_path);
+        try std.testing.expect(invocation_validation == .invalid);
+        try std.testing.expectEqualStrings(expected_path, invocation_validation.invalid.path);
+        try std.testing.expectEqualStrings("product UX/spawn policy is not allowed", invocation_validation.invalid.message);
+
+        const result_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"status\":\"completed\",\"startedAt\":1,\"completedAt\":2,\"{s}\":{{\"automatic\":true}}}}",
+            .{field},
+        );
+        defer allocator.free(result_json);
+        var result = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+        defer result.deinit();
+        var result_validation = try validateSubAgentReadinessEnvelope(allocator, result.value);
+        defer result_validation.deinit(allocator);
+        try std.testing.expect(result_validation == .invalid);
+        try std.testing.expectEqualStrings(expected_path, result_validation.invalid.path);
+        try std.testing.expectEqualStrings("product UX/spawn policy is not allowed", result_validation.invalid.message);
+    }
+}
+
 test "extension event surface matches TypeScript parity fixture" {
     const fixture_path = "../packages/coding-agent/test/fixtures/extension-event-surface-names.json";
     const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, fixture_path, std.testing.allocator, .unlimited);

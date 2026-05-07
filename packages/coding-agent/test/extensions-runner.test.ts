@@ -26,6 +26,18 @@ import { KeybindingsManager, type KeyId } from "../src/core/keybindings.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 
+const SUB_AGENT_FORBIDDEN_PRODUCT_FIELDS = [
+	"ui",
+	"ux",
+	"slashCommand",
+	"spawn",
+	"spawnPolicy",
+	"automaticSpawn",
+	"orchestrationPolicy",
+	"modelSelectionUi",
+	"approvalPolicy",
+] as const;
+
 const AGENT_EVENT_GOLDEN_FIXTURES = [
 	"agent_start",
 	"turn_start",
@@ -373,9 +385,14 @@ describe("sub-agent readiness envelope validation", () => {
 	});
 
 	it("rejects product UX, automatic spawning policy, and invalid wire fields", () => {
-		expect(() => validateSubAgentTaskInvocationEnvelope({ ...invocation, spawnPolicy: { automatic: true } })).toThrow(
-			"$.spawnPolicy: product UX/spawn policy is not allowed",
-		);
+		for (const field of SUB_AGENT_FORBIDDEN_PRODUCT_FIELDS) {
+			expect(() => validateSubAgentTaskInvocationEnvelope({ ...invocation, [field]: { automatic: true } })).toThrow(
+				`$.${field}: product UX/spawn policy is not allowed`,
+			);
+			expect(() => validateSubAgentTaskResultEnvelope({ ...result, [field]: { automatic: true } })).toThrow(
+				`$.${field}: product UX/spawn policy is not allowed`,
+			);
+		}
 		expect(() => validateSubAgentTaskInvocationEnvelope({ ...invocation, limits: { toolScopes: [""] } })).toThrow(
 			"$.limits.toolScopes[0]: must not be empty",
 		);
@@ -781,7 +798,7 @@ describe("ExtensionRunner", () => {
 						label: "shared",
 						description: "first",
 						parameters: Type.Object({}),
-						execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+						execute: async () => ({ content: [{ type: "text", text: "first result" }], details: { source: "first" } }),
 					});
 				}
 			`;
@@ -793,7 +810,7 @@ describe("ExtensionRunner", () => {
 						label: "shared",
 						description: "second",
 						parameters: Type.Object({}),
-						execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+						execute: async () => ({ content: [{ type: "text", text: "second result" }], details: { source: "second" } }),
 					});
 				}
 			`;
@@ -805,7 +822,17 @@ describe("ExtensionRunner", () => {
 			const tools = runner.getAllRegisteredTools();
 
 			expect(tools).toHaveLength(1);
-			expect(tools[0]?.definition.description).toBe("first");
+			const selectedTool = tools[0];
+			expect(selectedTool).toBeDefined();
+			if (!selectedTool) throw new Error("missing duplicate winner tool");
+			expect(selectedTool.definition.description).toBe("first");
+			expect(runner.getToolDefinition("shared")?.description).toBe("first");
+			await expect(
+				selectedTool.definition.execute("tool-call-1", {}, undefined, undefined, runner.createContext()),
+			).resolves.toEqual({
+				content: [{ type: "text", text: "first result" }],
+				details: { source: "first" },
+			});
 		});
 	});
 
