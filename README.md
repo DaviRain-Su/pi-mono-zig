@@ -57,6 +57,8 @@ I regularly publish my own `pi-mono` work sessions here:
 
 The coding agent includes a static Zig native runtime adapter and a local WASM, `process_jsonl`, and native runtime substrate. The substrate provides generic enforcement boundaries and child-agent readiness for sub-agent extensions.
 
+Bounded Sub-agent execution v0 adds product-neutral `sub_agent.delegate` and `/sub-agent` paths for a single bounded child execution, including limit, cancellation, and replay semantics. It does not include Workflow, Wiki, QA, or Review presets.
+
 Validation:
 
 ```bash
