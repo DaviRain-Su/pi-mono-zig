@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWasmExtensionManifestPolicyKey } from "../src/core/extension-policy.js";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { SettingsManager, type SettingsScope, type SettingsStorage } from "../src/core/settings-manager.js";
 import {
 	WASM_CANONICAL_SECURITY_GRANTS,
 	WasmExtensionCapabilityDenialError,
@@ -96,6 +96,41 @@ function writeTypeScriptPackage(packageRoot: string, options: { name?: string; v
 
 function readJsonFile(path: string): unknown {
 	return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+class FailNextSettingsStorage implements SettingsStorage {
+	private global: string | undefined;
+	private project: string | undefined;
+	private failNextWrites = new Set<SettingsScope>();
+
+	constructor(initialGlobal: Record<string, unknown> = {}, initialProject: Record<string, unknown> = {}) {
+		this.global = JSON.stringify(initialGlobal, null, 2);
+		this.project = JSON.stringify(initialProject, null, 2);
+	}
+
+	failNextWrite(scope: SettingsScope): void {
+		this.failNextWrites.add(scope);
+	}
+
+	read(scope: SettingsScope): string | undefined {
+		return scope === "global" ? this.global : this.project;
+	}
+
+	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+		const current = this.read(scope);
+		const next = fn(current);
+		if (next === undefined) {
+			return;
+		}
+		if (this.failNextWrites.delete(scope)) {
+			throw new Error(`injected ${scope} settings write failure`);
+		}
+		if (scope === "global") {
+			this.global = next;
+		} else {
+			this.project = next;
+		}
+	}
 }
 
 class MockSpawnedProcess extends EventEmitter {
@@ -1517,6 +1552,84 @@ Content`,
 			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("marketplace");
 			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("approvalUi");
 			expect(readFileSync(projectLockPath, "utf-8")).not.toContain("remoteWasmUrl");
+		});
+
+		it("should leave settings and lockfile unchanged when settings persistence fails during install", async () => {
+			const storage = new FailNextSettingsStorage({ packages: [] });
+			settingsManager = SettingsManager.fromStorage(storage);
+			packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+			});
+			const pkgDir = join(tempDir, "settings-failure-package");
+			writeTypeScriptPackage(pkgDir, { name: "settings-failure-package" });
+			const initialSettingsBytes = storage.read("global");
+
+			storage.failNextWrite("global");
+			await expect(packageManager.installAndPersist(pkgDir)).rejects.toThrow(
+				"injected global settings write failure",
+			);
+
+			expect(storage.read("global")).toBe(initialSettingsBytes);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toEqual([]);
+			expect(existsSync(join(agentDir, "extensions.lock.json"))).toBe(false);
+		});
+
+		it("should atomically refresh local package provenance on update while preserving unrelated entries", async () => {
+			const refreshedPackage = join(tempDir, "refreshed-package");
+			const unrelatedPackage = join(tempDir, "unrelated-refresh-package");
+			writeTypeScriptPackage(refreshedPackage, { name: "refreshed-package", version: "1.0.0" });
+			writeTypeScriptPackage(unrelatedPackage, { name: "unrelated-refresh-package", version: "1.0.0" });
+
+			await packageManager.installAndPersist(refreshedPackage);
+			await packageManager.installAndPersist(unrelatedPackage);
+			await settingsManager.flush();
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const settingsBeforeUpdate = settingsManager.getGlobalSettings().packages ?? [];
+			const lockBeforeUpdate = readJsonFile(lockPath) as {
+				entries: Array<{
+					key: string;
+					manifest: { packageVersion?: string };
+					digests: { packageRootSha256: string };
+				}>;
+			};
+			const refreshedKey = `local:${realpathSync(refreshedPackage)}`;
+			const unrelatedKey = `local:${realpathSync(unrelatedPackage)}`;
+			const refreshedBefore = lockBeforeUpdate.entries.find((entry) => entry.key === refreshedKey);
+			const unrelatedBefore = lockBeforeUpdate.entries.find((entry) => entry.key === unrelatedKey);
+			expect(refreshedBefore).toBeDefined();
+			expect(unrelatedBefore).toBeDefined();
+
+			writeTypeScriptPackage(refreshedPackage, { name: "refreshed-package", version: "1.0.1" });
+			await packageManager.update(refreshedPackage);
+			await settingsManager.flush();
+
+			expect(settingsManager.getGlobalSettings().packages ?? []).toEqual(settingsBeforeUpdate);
+			const lockAfterUpdate = readJsonFile(lockPath) as typeof lockBeforeUpdate;
+			const refreshedAfter = lockAfterUpdate.entries.find((entry) => entry.key === refreshedKey);
+			const unrelatedAfter = lockAfterUpdate.entries.find((entry) => entry.key === unrelatedKey);
+			expect(lockAfterUpdate.entries).toHaveLength(2);
+			expect(refreshedAfter?.manifest.packageVersion).toBe("1.0.1");
+			expect(refreshedAfter?.digests.packageRootSha256).not.toBe(refreshedBefore?.digests.packageRootSha256);
+			expect(unrelatedAfter).toEqual(unrelatedBefore);
+		});
+
+		it("should preserve the previous trusted lock entry when a local update fails validation", async () => {
+			const pkgDir = join(tempDir, "failed-update-wasm-package");
+			writeWasmPackage(pkgDir);
+
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const lockBeforeUpdate = readFileSync(lockPath, "utf-8");
+
+			writeWasmPackage(pkgDir, { artifactBytes: "not wasm" });
+			await expect(packageManager.update(pkgDir)).rejects.toThrow(
+				"$.artifact.path: artifact file is not a valid Wasm binary",
+			);
+
+			expect(readFileSync(lockPath, "utf-8")).toBe(lockBeforeUpdate);
 		});
 
 		it("should not trust configured packages from missing or malformed lockfiles", async () => {

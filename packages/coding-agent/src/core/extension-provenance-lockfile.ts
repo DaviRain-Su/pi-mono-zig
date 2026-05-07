@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, relative, sep } from "node:path";
 import type { WasmExtensionPackageManifest } from "./wasm-extension-package.js";
 
 export const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
@@ -372,6 +382,19 @@ export function serializeExtensionProvenanceLockfile(entries: Iterable<Extension
 	return `${JSON.stringify(lockfile, null, 2)}\n`;
 }
 
+function writeLockfileAtomically(lockfilePath: string, serialized: string): void {
+	const dir = dirname(lockfilePath);
+	mkdirSync(dir, { recursive: true });
+	const tempPath = join(dir, `.${basename(lockfilePath)}.${process.pid}.${Date.now()}.tmp`);
+	try {
+		writeFileSync(tempPath, serialized, "utf-8");
+		renameSync(tempPath, lockfilePath);
+	} catch (error) {
+		rmSync(tempPath, { force: true });
+		throw error;
+	}
+}
+
 export function writeExtensionProvenanceLockEntry(options: {
 	scope: ExtensionProvenanceScope;
 	lockfilePath: string;
@@ -387,8 +410,7 @@ export function writeExtensionProvenanceLockEntry(options: {
 	}
 	current.entries.set(options.entry.key, normalizeEntryForSerialization(options.entry));
 	const serialized = serializeExtensionProvenanceLockfile(current.entries.values());
-	mkdirSync(dirname(options.lockfilePath), { recursive: true });
-	writeFileSync(options.lockfilePath, serialized, "utf-8");
+	writeLockfileAtomically(options.lockfilePath, serialized);
 }
 
 export function removeExtensionProvenanceLockEntry(options: {
@@ -412,7 +434,7 @@ export function removeExtensionProvenanceLockEntry(options: {
 		return false;
 	}
 	const serialized = serializeExtensionProvenanceLockfile(current.entries.values());
-	writeFileSync(options.lockfilePath, serialized, "utf-8");
+	writeLockfileAtomically(options.lockfilePath, serialized);
 	return true;
 }
 

@@ -57,7 +57,7 @@ import {
 	writeExtensionProvenanceLockEntry,
 } from "./extension-provenance-lockfile.js";
 import { isStdoutTakenOver } from "./output-guard.js";
-import type { PackageSource, SettingsManager } from "./settings-manager.js";
+import type { PackageSource, SettingsManager, SettingsScope } from "./settings-manager.js";
 import { createSourceInfo } from "./source-info.js";
 import {
 	hasWasmExtensionManifest,
@@ -177,6 +177,12 @@ type InstalledSourceScope = Exclude<SourceScope, "temporary">;
 interface ConfiguredUpdateSource {
 	source: string;
 	scope: InstalledSourceScope;
+}
+
+interface FileSnapshot {
+	path: string;
+	existed: boolean;
+	bytes?: string;
 }
 
 interface NpmUpdateTarget extends ConfiguredUpdateSource {
@@ -891,6 +897,72 @@ export class DefaultPackageManager implements PackageManager {
 		});
 	}
 
+	private getSettingsPath(scope: InstalledSourceScope): string {
+		return scope === "user" ? join(this.agentDir, "settings.json") : join(this.cwd, CONFIG_DIR_NAME, "settings.json");
+	}
+
+	private getSettingsScope(scope: InstalledSourceScope): SettingsScope {
+		return scope === "user" ? "global" : "project";
+	}
+
+	private captureFileSnapshot(path: string): FileSnapshot {
+		if (!existsSync(path)) {
+			return { path, existed: false };
+		}
+		const stats = statSync(path);
+		return stats.isFile() ? { path, existed: true, bytes: readFileSync(path, "utf-8") } : { path, existed: true };
+	}
+
+	private restoreFileSnapshot(snapshot: FileSnapshot): void {
+		if (!snapshot.existed) {
+			rmSync(snapshot.path, { force: true });
+			return;
+		}
+		if (snapshot.bytes === undefined) {
+			return;
+		}
+		mkdirSync(dirname(snapshot.path), { recursive: true });
+		writeFileSync(snapshot.path, snapshot.bytes, "utf-8");
+	}
+
+	private restoreFileSnapshots(snapshots: FileSnapshot[]): void {
+		for (const snapshot of snapshots) {
+			this.restoreFileSnapshot(snapshot);
+		}
+	}
+
+	private async flushSettingsOrThrow(scope: InstalledSourceScope, action: string): Promise<void> {
+		await this.settingsManager.flush();
+		const settingsScope = this.getSettingsScope(scope);
+		const errors = this.settingsManager.drainErrors();
+		const scopedErrors = errors.filter((entry) => entry.scope === settingsScope);
+		if (scopedErrors.length === 0) {
+			return;
+		}
+		throw new Error(
+			`Failed to persist ${scope} package settings while ${action}: ${scopedErrors
+				.map((entry) => entry.error.message)
+				.join("; ")}`,
+		);
+	}
+
+	private restorePackageSettingsInMemory(scope: InstalledSourceScope, packages: PackageSource[]): void {
+		if (scope === "project") {
+			this.settingsManager.setProjectPackages(packages);
+		} else {
+			this.settingsManager.setPackages(packages);
+		}
+	}
+
+	private async restorePackageSettingsAfterFailedTransaction(
+		scope: InstalledSourceScope,
+		packages: PackageSource[],
+	): Promise<void> {
+		this.restorePackageSettingsInMemory(scope, packages);
+		await this.settingsManager.flush();
+		this.settingsManager.drainErrors();
+	}
+
 	private getNormalizedSourceIdentityForParsedSource(
 		_source: string,
 		parsed: ParsedSource,
@@ -937,11 +1009,15 @@ export class DefaultPackageManager implements PackageManager {
 		return entry;
 	}
 
-	private writeProvenanceLockForSource(source: string, scope: InstalledSourceScope): void {
+	private writeProvenanceLockForSource(
+		source: string,
+		scope: InstalledSourceScope,
+		mode: "input" | "settings" = "input",
+	): void {
 		const parsed = this.parseSource(source);
-		const entry = this.createProvenanceLockEntryForSource(source, parsed, scope);
+		const entry = this.createProvenanceLockEntryForSource(source, parsed, scope, mode);
 		if (!entry) {
-			return;
+			throw new Error(`Unable to compute extension provenance for ${scope} package source ${source}`);
 		}
 		writeExtensionProvenanceLockEntry({
 			scope,
@@ -982,12 +1058,13 @@ export class DefaultPackageManager implements PackageManager {
 		source: string,
 		parsed: ParsedSource,
 		scope: InstalledSourceScope,
+		mode: "input" | "settings" = "input",
 	): ExtensionProvenanceLockEntry | undefined {
-		const packageRoot = this.getPackageRootForInstalledSource(parsed, scope);
+		const packageRoot = this.getPackageRootForInstalledSource(parsed, scope, mode);
 		if (!packageRoot || !existsSync(packageRoot) || !statSync(packageRoot).isDirectory()) {
 			return undefined;
 		}
-		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, "input");
+		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, mode);
 		const wasmManifest = hasWasmExtensionManifest(packageRoot)
 			? validateWasmExtensionPackage(packageRoot, { approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS })
 			: undefined;
@@ -1024,14 +1101,21 @@ export class DefaultPackageManager implements PackageManager {
 		});
 	}
 
-	private getPackageRootForInstalledSource(parsed: ParsedSource, scope: InstalledSourceScope): string | undefined {
+	private getPackageRootForInstalledSource(
+		parsed: ParsedSource,
+		scope: InstalledSourceScope,
+		mode: "input" | "settings" = "input",
+	): string | undefined {
 		if (parsed.type === "npm") {
 			return this.getNpmInstallPath(parsed, scope);
 		}
 		if (parsed.type === "git") {
 			return this.getGitInstallPath(parsed, scope);
 		}
-		const resolved = this.resolvePath(parsed.path);
+		const resolved =
+			mode === "settings"
+				? this.resolvePathFromBase(parsed.path, this.getBaseDirForScope(scope))
+				: this.resolvePath(parsed.path);
 		if (!existsSync(resolved)) {
 			return undefined;
 		}
@@ -1195,8 +1279,24 @@ export class DefaultPackageManager implements PackageManager {
 	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
 		await this.install(source, options);
 		const scope: InstalledSourceScope = options?.local ? "project" : "user";
-		this.writeProvenanceLockForSource(source, scope);
-		this.addSourceToSettings(source, options);
+		const currentSettings =
+			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+		const previousPackages = currentSettings.packages ?? [];
+		const snapshots = [
+			this.captureFileSnapshot(this.getProvenanceLockfilePath(scope)),
+			this.captureFileSnapshot(this.getSettingsPath(scope)),
+		];
+		try {
+			this.writeProvenanceLockForSource(source, scope);
+			const changed = this.addSourceToSettings(source, options);
+			if (changed) {
+				await this.flushSettingsOrThrow(scope, "installing package");
+			}
+		} catch (error) {
+			await this.restorePackageSettingsAfterFailedTransaction(scope, previousPackages);
+			this.restoreFileSnapshots(snapshots);
+			throw error;
+		}
 	}
 
 	async remove(source: string, options?: { local?: boolean }): Promise<void> {
@@ -1263,8 +1363,37 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		await this.updateConfiguredSources(updateSources);
-		for (const entry of updateSources) {
-			this.writeProvenanceLockForSource(entry.source, entry.scope);
+		const entriesToWrite = updateSources
+			.map((entry) => {
+				const parsed = this.parseSource(entry.source);
+				const lockEntry = this.createProvenanceLockEntryForSource(entry.source, parsed, entry.scope, "settings");
+				if (!lockEntry) {
+					if (parsed.type !== "local") {
+						return undefined;
+					}
+					throw new Error(
+						`Unable to compute extension provenance for ${entry.scope} package source ${entry.source}`,
+					);
+				}
+				return { scope: entry.scope, lockEntry };
+			})
+			.filter((entry): entry is { scope: InstalledSourceScope; lockEntry: ExtensionProvenanceLockEntry } =>
+				Boolean(entry),
+			);
+		const lockSnapshots = Array.from(new Set(entriesToWrite.map((entry) => entry.scope))).map((scope) =>
+			this.captureFileSnapshot(this.getProvenanceLockfilePath(scope)),
+		);
+		try {
+			for (const entry of entriesToWrite) {
+				writeExtensionProvenanceLockEntry({
+					scope: entry.scope,
+					lockfilePath: this.getProvenanceLockfilePath(entry.scope),
+					entry: entry.lockEntry,
+				});
+			}
+		} catch (error) {
+			this.restoreFileSnapshots(lockSnapshots);
+			throw error;
 		}
 	}
 
