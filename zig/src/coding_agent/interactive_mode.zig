@@ -925,7 +925,7 @@ test "screen renders welcome prompt footer and tool lines" {
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "Session: session.jsonl") != null);
 }
 
-test "interactive mode startup renders welcome message footer and hints through a mock backend" {
+test "interactive mode startup renders welcome message and footer through a mock backend" {
     const allocator = std.testing.allocator;
 
     var state = try AppState.init(allocator, std.testing.io);
@@ -965,8 +965,8 @@ test "interactive mode startup renders welcome message footer and hints through 
     try std.testing.expect(renderedLinesContain(lines.items, "Session: session.jsonl"));
     try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
-    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Alt+⏎ queue"));
+    try std.testing.expect(!renderedLinesContain(lines.items, "⏎ send"));
+    try std.testing.expect(!renderedLinesContain(lines.items, "Alt+⏎ queue"));
 }
 
 test "terminal title and progress helpers emit TS control sequences without duplicates" {
@@ -1380,7 +1380,7 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "TERM") != null);
 }
 
-test "screen renders themed output and custom keybinding hints" {
+test "screen renders themed output without persistent keybinding hints" {
     const allocator = std.testing.allocator;
 
     var state = try AppState.init(allocator, std.testing.io);
@@ -1420,7 +1420,7 @@ test "screen renders themed output and custom keybinding hints" {
         if (std.mem.indexOf(u8, line, "Ctrl+X sessions") != null) saw_custom_hint = true;
     }
 
-    try std.testing.expect(saw_custom_hint);
+    try std.testing.expect(!saw_custom_hint);
 }
 
 test "screen renders assistant markdown while keeping user messages plain" {

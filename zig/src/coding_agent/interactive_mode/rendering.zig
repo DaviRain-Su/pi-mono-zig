@@ -2000,15 +2000,12 @@ pub const ScreenComponent = struct {
         else
             try formatFooterLineWithTerminalForDisplay(allocator, self.keybindings, self.theme, &snapshot, self.terminal_name, width, self.now_ms);
         defer allocator.free(footer_line);
-        const hints_line = try formatHintsLine(allocator, self.keybindings, self.theme, width);
-        defer allocator.free(hints_line);
 
         var autocomplete_lines = tui.LineList.empty;
         defer freeLinesSafe(allocator, &autocomplete_lines);
         try self.editor.renderAutocompleteInto(allocator, width, &autocomplete_lines);
 
-        const hints_height = hintsHeightForWidth(width);
-        const reserved_lines: usize = task_panel_lines.items.len + prompt_lines.items.len + queued_lines.items.len + hints_height + 1 + autocomplete_lines.items.len;
+        const reserved_lines: usize = task_panel_lines.items.len + prompt_lines.items.len + queued_lines.items.len + 1 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
         const max_offset = chat_lines.items.len -| chat_capacity;
         self.state.updateChatScrollLayout(chat_lines.items.len, chat_capacity, task_panel_lines.items.len, width);
@@ -2034,7 +2031,6 @@ pub const ScreenComponent = struct {
         for (autocomplete_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
-        if (hints_height > 0) try tui.component.appendOwnedLine(lines, allocator, hints_line);
         try tui.component.appendOwnedLine(lines, allocator, footer_line);
     }
 
@@ -2064,7 +2060,6 @@ pub const ScreenComponent = struct {
             try formatExtensionFooterLineWithTerminal(ctx.arena, null, &snapshot, self.terminal_name, width)
         else
             try formatFooterTextForDisplay(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
-        const hints_text = try formatHintsText(ctx.arena, self.keybindings, width);
         const extension_above_height = extensionWidgetLineCount(snapshot.extension_widgets, .above_editor);
         const extension_editor_height: usize = if (snapshot.extension_editor_label != null) 1 else 0;
         const extension_below_height = extensionWidgetLineCount(snapshot.extension_widgets, .below_editor);
@@ -2079,8 +2074,7 @@ pub const ScreenComponent = struct {
         const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
         const task_panel_height = taskPanelHeightForWidth(width);
-        const hints_height = hintsHeightForWidth(width);
-        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + hints_height + 1 + autocomplete_height;
+        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + 1 + autocomplete_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
@@ -2187,10 +2181,6 @@ pub const ScreenComponent = struct {
         }
         row += autocomplete_height;
 
-        if (hints_height > 0 and row < window.height) {
-            drawFittedLine(window, row, hints_text, styleForToken(self.theme, .prompt));
-            row += 1;
-        }
         if (row < window.height) {
             try drawFooterWithTerminal(window, row, footer_text, self.terminal_name, self.theme, ctx.arena);
         }
@@ -3634,7 +3624,7 @@ test "task header owns status model provider while footer excludes them" {
     try std.testing.expect(std.mem.indexOf(u8, footer, "Provider:") == null);
 }
 
-test "prompt m2 renders hints above compact footer with distinct styles and terminal badge" {
+test "prompt m2 renders compact footer with terminal badge" {
     const allocator = std.testing.allocator;
 
     var state = try AppState.init(allocator, std.testing.io);
@@ -3669,18 +3659,15 @@ test "prompt m2 renders hints above compact footer with distinct styles and term
     const rendered = try tui.test_helpers.screenToString(&screen);
     defer allocator.free(rendered);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ follow-up") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Alt+Up dequeue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Ctrl+L models") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "⏎ send · Alt+⏎ follow-up") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Alt+Up dequeue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Ctrl+L models") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "GHOSTTY") != null);
 
-    const prompt_top = screen.readCell(0, 9) orelse return error.TestUnexpectedResult;
-    const hint_first = screen.readCell(0, 12) orelse return error.TestUnexpectedResult;
+    const prompt_top = screen.readCell(0, 10) orelse return error.TestUnexpectedResult;
     const footer_first = screen.readCell(0, 13) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("╭", prompt_top.char.grapheme);
-    try std.testing.expectEqualStrings("⏎", hint_first.char.grapheme);
     try std.testing.expectEqualStrings("B", footer_first.char.grapheme);
-    try std.testing.expect(!std.meta.eql(hint_first.style, footer_first.style));
 
     const footer_session_label = try allocator.dupe(u8, "demo-session.jsonl");
     defer allocator.free(footer_session_label);
@@ -3801,7 +3788,7 @@ test "screen draw re-reads theme after runtime switch without stale structural c
 
     var dark_screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 100, 14);
     defer dark_screen.deinit(std.testing.allocator);
-    const dark_glyph = dark_screen.readCell(1, 10) orelse return error.TestUnexpectedResult;
+    const dark_glyph = dark_screen.readCell(1, 11) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(">", dark_glyph.char.grapheme);
     try std.testing.expectEqual(styleForToken(&dark, .prompt_glyph), dark_glyph.style);
 
@@ -3811,7 +3798,7 @@ test "screen draw re-reads theme after runtime switch without stale structural c
     screen_component.theme = &codex;
     var codex_screen = try tui.test_helpers.renderToScreen(screen_component.drawComponent(), 100, 14);
     defer codex_screen.deinit(std.testing.allocator);
-    const codex_glyph = codex_screen.readCell(1, 10) orelse return error.TestUnexpectedResult;
+    const codex_glyph = codex_screen.readCell(1, 11) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(">", codex_glyph.char.grapheme);
     try std.testing.expectEqual(styleForToken(&codex, .prompt_glyph), codex_glyph.style);
     try std.testing.expect(!std.meta.eql(dark_glyph.style, codex_glyph.style));
@@ -5316,7 +5303,7 @@ test "borrowed lines component draws stored cell rows without ansi strings" {
     try tui.test_helpers.expectCell(&screen, 0, 1, "C", .{});
 }
 
-test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
+test "vaxis m8 visual parity snapshot covers chat rows footer and queue" {
     const allocator = std.testing.allocator;
 
     var state = try AppState.init(allocator, std.testing.io);
@@ -5355,9 +5342,9 @@ test "vaxis m8 visual parity snapshot covers chat rows footer hints and queue" {
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "> pending prompt"));
-    try std.testing.expect(renderedLinesContain(lines.items, "⏎ send · Alt+⏎ follow-up"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Alt+Up dequeue"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+C/Ctrl+D clear/exit"));
+    try std.testing.expect(!renderedLinesContain(lines.items, "⏎ send · Alt+⏎ follow-up"));
+    try std.testing.expect(!renderedLinesContain(lines.items, "Alt+Up dequeue"));
+    try std.testing.expect(!renderedLinesContain(lines.items, "Ctrl+C/Ctrl+D clear/exit"));
     try std.testing.expect(renderedLinesContain(lines.items, "Faux"));
     try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
     try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
@@ -5428,14 +5415,14 @@ test "vaxis m8 visual parity snapshot covers overlay composition" {
     var screen_component = ScreenComponent{
         .state = &state,
         .editor = &editor,
-        .height = 16,
+        .height = 24,
         .keybindings = &keybindings,
     };
 
     var overlay = try overlays.loadHotkeysOverlay(allocator, &keybindings);
     defer overlay.deinit(allocator);
 
-    var backend = InteractiveModeTestBackend{ .size = .{ .width = 100, .height = 16 } };
+    var backend = InteractiveModeTestBackend{ .size = .{ .width = 100, .height = 24 } };
     defer backend.deinit(allocator);
 
     var lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen_component, &overlay, &backend);

@@ -50,6 +50,106 @@ const loadForkOverlayOrStatus = session_lifecycle.loadForkOverlayOrStatus;
 const forkCurrentSessionBeforeUserMessage = session_lifecycle.forkCurrentSessionBeforeUserMessage;
 const resolveSessionPath = session_lifecycle.resolveSessionPath;
 
+pub const HelpSlashCommand = struct {
+    name: []const u8,
+    description: []const u8,
+    argument_hint: ?[]const u8 = null,
+};
+
+pub fn handleHelpSlashCommand(
+    allocator: std.mem.Allocator,
+    app_state: *AppState,
+    builtin_commands: []const HelpSlashCommand,
+    prompt_templates: []const resources_mod.PromptTemplate,
+    skills: []const resources_mod.Skill,
+    enable_skill_commands: bool,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) !void {
+    const markdown = try buildHelpMarkdown(
+        allocator,
+        builtin_commands,
+        prompt_templates,
+        skills,
+        enable_skill_commands,
+        keybindings,
+    );
+    defer allocator.free(markdown);
+    try app_state.appendMarkdown(markdown);
+}
+
+fn buildHelpMarkdown(
+    allocator: std.mem.Allocator,
+    builtin_commands: []const HelpSlashCommand,
+    prompt_templates: []const resources_mod.PromptTemplate,
+    skills: []const resources_mod.Skill,
+    enable_skill_commands: bool,
+    keybindings: ?*const keybindings_mod.Keybindings,
+) ![]u8 {
+    var builder = std.ArrayList(u8).empty;
+    defer builder.deinit(allocator);
+
+    try builder.appendSlice(allocator,
+        \\# Help
+        \\
+        \\## Slash commands
+        \\
+        \\### Built-in
+        \\
+    );
+    for (builtin_commands) |command| {
+        try appendHelpCommandBullet(allocator, &builder, command.name, command.argument_hint, command.description, false);
+    }
+
+    if (prompt_templates.len > 0) {
+        try builder.appendSlice(allocator,
+            \\
+            \\### Prompts
+            \\
+        );
+        for (prompt_templates) |template| {
+            try appendHelpCommandBullet(allocator, &builder, template.name, template.argument_hint, template.description, false);
+        }
+    }
+
+    if (enable_skill_commands and skills.len > 0) {
+        try builder.appendSlice(allocator,
+            \\
+            \\### Skills
+            \\
+        );
+        for (skills) |skill| {
+            try appendHelpCommandBullet(allocator, &builder, skill.name, null, skill.description, true);
+        }
+    }
+
+    const hotkeys = try buildHotkeysMarkdownWithHeading(allocator, keybindings, "## Keyboard shortcuts");
+    defer allocator.free(hotkeys);
+    try builder.append(allocator, '\n');
+    try builder.appendSlice(allocator, hotkeys);
+
+    return try builder.toOwnedSlice(allocator);
+}
+
+fn appendHelpCommandBullet(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    name: []const u8,
+    argument_hint: ?[]const u8,
+    description: []const u8,
+    skill_command: bool,
+) !void {
+    const prefix = if (skill_command) "/skill:" else "/";
+    if (argument_hint) |hint| {
+        const line = try std.fmt.allocPrint(allocator, "- `{s}{s} {s}` — {s}\n", .{ prefix, name, hint, description });
+        defer allocator.free(line);
+        try builder.appendSlice(allocator, line);
+    } else {
+        const line = try std.fmt.allocPrint(allocator, "- `{s}{s}` — {s}\n", .{ prefix, name, description });
+        defer allocator.free(line);
+        try builder.appendSlice(allocator, line);
+    }
+}
+
 pub fn handleHotkeysSlashCommand(
     allocator: std.mem.Allocator,
     app_state: *AppState,
@@ -63,6 +163,14 @@ pub fn handleHotkeysSlashCommand(
 fn buildHotkeysMarkdown(
     allocator: std.mem.Allocator,
     keybindings: ?*const keybindings_mod.Keybindings,
+) ![]u8 {
+    return buildHotkeysMarkdownWithHeading(allocator, keybindings, "# Keyboard shortcuts");
+}
+
+fn buildHotkeysMarkdownWithHeading(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    heading: []const u8,
 ) ![]u8 {
     const interrupt = try appKeyLabel(allocator, keybindings, .interrupt);
     defer allocator.free(interrupt);
@@ -96,55 +204,51 @@ fn buildHotkeysMarkdown(
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
 
+    try writer.writer.print("{s}\n\n", .{heading});
     try writer.writer.writeAll(
-        \\# Keyboard shortcuts
+        \\### Navigation
         \\
-        \\**Navigation**
-        \\| Key | Action |
-        \\|-----|--------|
-        \\| `Up` / `Down` / `Left` / `Right` | Move cursor / browse history (Up when empty) |
-        \\| `Alt+Left` / `Alt+Right` | Move by word |
-        \\| `Home` | Start of line |
-        \\| `End` | End of line |
-        \\| `Ctrl+F` | Jump forward to character |
-        \\| `Ctrl+B` | Jump backward to character |
-        \\| `PgUp` / `PgDn` | Scroll by page |
+        \\- `Up` / `Down` / `Left` / `Right` — Move cursor / browse history (Up when editor is empty)
+        \\- `Alt+Left` / `Alt+Right` — Move by word
+        \\- `Home` — Start of line
+        \\- `End` — End of line
+        \\- `Ctrl+F` — Jump forward to character
+        \\- `Ctrl+B` — Jump backward to character
+        \\- `PgUp` / `PgDn` — Scroll by page
         \\
-        \\**Editing**
-        \\| Key | Action |
-        \\|-----|--------|
-        \\| `Enter` | Send message |
-        \\| `Shift+Enter` | New line |
-        \\| `Ctrl+W` | Delete word backwards |
-        \\| `Alt+D` | Delete word forwards |
-        \\| `Ctrl+U` | Delete to start of line |
-        \\| `Ctrl+K` | Delete to end of line |
-        \\| `Ctrl+Y` | Paste the most-recently-deleted text |
-        \\| `Alt+Y` | Cycle through the deleted text after pasting |
-        \\| `Ctrl+_` | Undo |
+        \\### Editing
         \\
-        \\**Other**
-        \\| Key | Action |
-        \\|-----|--------|
-        \\| `Tab` | Path completion / accept autocomplete |
+        \\- `Enter` — Send message
+        \\- `Shift+Enter` — New line
+        \\- `Ctrl+W` — Delete word backwards
+        \\- `Alt+D` — Delete word forwards
+        \\- `Ctrl+U` — Delete to start of line
+        \\- `Ctrl+K` — Delete to end of line
+        \\- `Ctrl+Y` — Paste the most-recently-deleted text
+        \\- `Alt+Y` — Cycle through the deleted text after pasting
+        \\- `Ctrl+_` — Undo
+        \\
+        \\### Other
+        \\
+        \\- `Tab` — Path completion / accept autocomplete
     );
     try writer.writer.print(
-        \\| `{s}` | Cancel autocomplete / abort streaming |
-        \\| `{s}` | Clear editor (first) / exit (second) |
-        \\| `{s}` | Exit (when editor is empty) |
-        \\| `{s}` | Suspend to background |
-        \\| `{s}` | Cycle thinking level |
-        \\| `{s}` / `{s}` | Cycle models |
-        \\| `{s}` | Open model selector |
-        \\| `{s}` | Toggle tool output expansion |
-        \\| `{s}` | Toggle thinking block visibility |
-        \\| `{s}` | Edit message in external editor |
-        \\| `{s}` | Queue follow-up message |
-        \\| `{s}` | Restore queued messages |
-        \\| `{s}` | Paste image from clipboard |
-        \\| `/` | Slash commands |
-        \\| `!` | Run bash command |
-        \\| `!!` | Run bash command (excluded from context) |
+        \\- `{s}` — Cancel autocomplete / abort streaming
+        \\- `{s}` — Clear editor (first) / exit (second)
+        \\- `{s}` — Exit (when editor is empty)
+        \\- `{s}` — Suspend to background
+        \\- `{s}` — Cycle thinking level
+        \\- `{s}` / `{s}` — Cycle models
+        \\- `{s}` — Open model selector
+        \\- `{s}` — Toggle tool output expansion
+        \\- `{s}` — Toggle thinking block visibility
+        \\- `{s}` — Edit message in external editor
+        \\- `{s}` — Queue follow-up message
+        \\- `{s}` — Restore queued messages
+        \\- `{s}` — Paste image from clipboard
+        \\- `/` — Slash commands
+        \\- `!` — Run bash command
+        \\- `!!` — Run bash command (excluded from context)
         \\
     , .{
         interrupt,
@@ -2251,6 +2355,68 @@ test "fork selector lists user messages and fork branches before selected prompt
     defer reopened.deinit();
     try std.testing.expectEqualStrings(original_session_file, reopened.session_manager.header.parent_session.?);
     try std.testing.expectEqual(@as(usize, 2), reopened.agent.getMessages().len);
+}
+
+test "help markdown uses renderer-friendly bullets for commands resources and key shortcuts" {
+    const allocator = std.testing.allocator;
+
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+
+    const commands = [_]HelpSlashCommand{
+        .{ .name = "help", .description = "Show slash commands and keyboard shortcuts" },
+        .{ .name = "model", .description = "Select model (opens selector UI)" },
+    };
+
+    const prompt_templates = [_]resources_mod.PromptTemplate{.{
+        .name = @constCast("review"),
+        .description = @constCast("Run the review prompt"),
+        .argument_hint = @constCast("<scope>"),
+        .content = @constCast("Review {args}"),
+        .file_path = @constCast("/tmp/review.md"),
+        .source_info = .{
+            .path = @constCast("/tmp/review.md"),
+            .source = @constCast("test"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    }};
+    const skills = [_]resources_mod.Skill{.{
+        .name = @constCast("reviewer"),
+        .description = @constCast("Review code"),
+        .file_path = @constCast("/tmp/skills/reviewer/SKILL.md"),
+        .base_dir = @constCast("/tmp/skills/reviewer"),
+        .source_info = .{
+            .path = @constCast("/tmp/skills/reviewer/SKILL.md"),
+            .source = @constCast("test"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    }};
+    const markdown = try buildHelpMarkdown(allocator, &commands, &prompt_templates, &skills, true, &keybindings);
+    defer allocator.free(markdown);
+
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "# Help") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "## Slash commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "### Built-in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "- `/help` — Show slash commands and keyboard shortcuts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "- `/model` — Select model (opens selector UI)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "### Prompts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "- `/review <scope>` — Run the review prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "### Skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "- `/skill:reviewer` — Review code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "## Keyboard shortcuts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "- `Ctrl+L` — Open model selector") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "| Command |") == null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "| Key |") == null);
+
+    const rendered_markdown = tui.Markdown{ .text = markdown };
+    var screen = try tui.test_helpers.renderToScreen(rendered_markdown.drawComponent(), 80, 32);
+    defer screen.deinit(allocator);
+    const rendered = try tui.test_helpers.screenToString(&screen);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "• /help — Show slash commands and keyboard shortcuts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "| Command |") == null);
 }
 
 test "fork selector reports empty history without opening overlay" {

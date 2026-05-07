@@ -19,6 +19,7 @@ const loadTreeOverlay = overlays.loadTreeOverlay;
 const AppState = rendering.AppState;
 
 pub const SlashCommandKind = enum {
+    help,
     settings,
     model,
     theme,
@@ -57,6 +58,7 @@ pub const BuiltinSlashCommand = struct {
 };
 
 pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
+    .{ .name = "help", .description = "Show slash commands and keyboard shortcuts" },
     .{ .name = "settings", .description = "Open settings menu" },
     .{ .name = "model", .description = "Select model (opens selector UI)" },
     .{ .name = "theme", .description = "Switch color theme", .argument_hint = "[night|day]" },
@@ -92,6 +94,7 @@ pub fn parseSlashCommand(text: []const u8) ?SlashCommand {
         "";
     const argument = if (raw_argument.len == 0) null else raw_argument;
 
+    if (std.mem.eql(u8, command_name, "help")) return .{ .kind = .help, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "settings")) return .{ .kind = .settings, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
     if (std.mem.eql(u8, command_name, "theme")) return .{ .kind = .theme, .argument = argument, .raw = text };
@@ -150,7 +153,7 @@ pub fn handleSlashCommand(
     )) return;
 
     switch (command.kind) {
-        .settings, .model, .theme, .scoped_models, .share, .copy, .name, .hotkeys, .label, .session, .changelog => unreachable,
+        .help, .settings, .model, .theme, .scoped_models, .share, .copy, .name, .hotkeys, .label, .session, .changelog => unreachable,
         .import => {
             if (try blockDuringActivePrompt(prompt_worker_active, app_state, "wait for the current response to finish before importing a session")) return;
             try slash_commands.handleImportSlashCommand(
@@ -265,6 +268,26 @@ fn handleImmediateSlashCommand(
     live_resources: *LiveResources,
 ) !bool {
     switch (command.kind) {
+        .help => {
+            const help_commands = try allocator.alloc(slash_commands.HelpSlashCommand, BUILTIN_SLASH_COMMANDS.len);
+            defer allocator.free(help_commands);
+            for (BUILTIN_SLASH_COMMANDS, 0..) |builtin, index| {
+                help_commands[index] = .{
+                    .name = builtin.name,
+                    .description = builtin.description,
+                    .argument_hint = builtin.argument_hint,
+                };
+            }
+            try slash_commands.handleHelpSlashCommand(
+                allocator,
+                app_state,
+                help_commands,
+                live_resources.prompt_templates,
+                live_resources.skills,
+                if (live_resources.runtime_config) |runtime_config| runtime_config.enableSkillCommands() else true,
+                live_resources.keybindings,
+            );
+        },
         .settings => try slash_commands.handleSettingsSlashCommand(allocator, io, env_map, session, command.argument, options, app_state, overlay, live_resources),
         .model => try slash_commands.handleModelSlashCommand(allocator, env_map, session, current_provider, command.argument, options, live_resources.runtime_config, app_state, overlay),
         .theme => try slash_commands.handleThemeSlashCommand(allocator, io, env_map, options.cwd, command.argument, app_state, overlay, live_resources),
@@ -287,8 +310,9 @@ fn blockDuringActivePrompt(prompt_worker_active: *const bool, app_state: *AppSta
     return true;
 }
 
-test "built-in slash command autocomplete matrix matches TypeScript order" {
+test "built-in slash command autocomplete matrix keeps help before TypeScript order" {
     const expected = [_][]const u8{
+        "help",
         "settings",
         "model",
         "theme",
