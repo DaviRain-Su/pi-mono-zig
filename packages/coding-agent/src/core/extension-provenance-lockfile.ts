@@ -79,12 +79,26 @@ const UNSUPPORTED_TRUST_SURFACE_FIELDS = new Set([
 	"remoteWasmUrl",
 ]);
 
-const HOST_NOISE_DIRS = new Set([".git", ".hg", ".svn", ".pi"]);
+const HOST_NOISE_DIRS = new Set([
+	".git",
+	".hg",
+	".svn",
+	".pi",
+	".cache",
+	".npm",
+	".yarn",
+	".pnpm-store",
+	".parcel-cache",
+	".turbo",
+]);
 const HOST_NOISE_FILES = new Set([
 	EXTENSION_PROVENANCE_LOCKFILE_NAME,
 	"package-lock.json",
+	"npm-shrinkwrap.json",
 	"pnpm-lock.yaml",
 	"yarn.lock",
+	"bun.lock",
+	"bun.lockb",
 	".DS_Store",
 ]);
 
@@ -375,6 +389,31 @@ export function writeExtensionProvenanceLockEntry(options: {
 	const serialized = serializeExtensionProvenanceLockfile(current.entries.values());
 	mkdirSync(dirname(options.lockfilePath), { recursive: true });
 	writeFileSync(options.lockfilePath, serialized, "utf-8");
+}
+
+export function removeExtensionProvenanceLockEntry(options: {
+	scope: ExtensionProvenanceScope;
+	lockfilePath: string;
+	key: string;
+}): boolean {
+	if (!existsSync(options.lockfilePath)) {
+		return false;
+	}
+	const current = readExtensionProvenanceLockfile({
+		scope: options.scope,
+		lockfilePath: options.lockfilePath,
+		phase: "write",
+	});
+	if (current.diagnostic) {
+		throw new Error(current.diagnostic.message);
+	}
+	const removed = current.entries.delete(options.key);
+	if (!removed) {
+		return false;
+	}
+	const serialized = serializeExtensionProvenanceLockfile(current.entries.values());
+	writeFileSync(options.lockfilePath, serialized, "utf-8");
+	return true;
 }
 
 export function createExtensionProvenanceLockEntry(options: {

@@ -1594,6 +1594,147 @@ Content`,
 			expect(twoEntryLock.entries).toContainEqual(firstEntry);
 		});
 
+		it("should bind package-root digests to trusted package content and ignore fixed host noise", async () => {
+			const pkgDir = join(tempDir, "digest-bound-package");
+			writeTypeScriptPackage(pkgDir, { name: "digest-bound-package" });
+			mkdirSync(join(pkgDir, "lib"), { recursive: true });
+			mkdirSync(join(pkgDir, "data"), { recursive: true });
+			mkdirSync(join(pkgDir, "prompts"), { recursive: true });
+			mkdirSync(join(pkgDir, "skills", "digest-skill"), { recursive: true });
+			mkdirSync(join(pkgDir, "themes"), { recursive: true });
+			writeFileSync(join(pkgDir, "lib", "helper.js"), "export const helper = 1;\n");
+			writeFileSync(join(pkgDir, "data", "config.json"), JSON.stringify({ enabled: true }));
+			writeFileSync(join(pkgDir, "prompts", "digest.md"), "Prompt v1\n");
+			writeFileSync(
+				join(pkgDir, "skills", "digest-skill", "SKILL.md"),
+				`---
+name: digest-skill
+description: Digest skill
+---
+Skill v1
+`,
+			);
+			writeFileSync(join(pkgDir, "themes", "digest.json"), JSON.stringify({ name: "digest-theme" }));
+			writeFileSync(join(pkgDir, ".gitignore"), "dist\n");
+
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const readDigest = () =>
+				(
+					readJsonFile(lockPath) as {
+						entries: Array<{ digests: { packageRootSha256: string } }>;
+					}
+				).entries[0].digests.packageRootSha256;
+			let previousDigest = readDigest();
+
+			const trustedContentMutations = [
+				() =>
+					writeFileSync(
+						join(pkgDir, "package.json"),
+						readFileSync(join(pkgDir, "package.json"), "utf-8").replace("1.0.0", "1.0.1"),
+					),
+				() => writeFileSync(join(pkgDir, "extensions", "entry.ts"), "export default function changed() {}\n"),
+				() => writeFileSync(join(pkgDir, "lib", "helper.js"), "export const helper = 2;\n"),
+				() => writeFileSync(join(pkgDir, "data", "config.json"), JSON.stringify({ enabled: false })),
+				() => writeFileSync(join(pkgDir, "prompts", "digest.md"), "Prompt v2\n"),
+				() =>
+					writeFileSync(
+						join(pkgDir, "skills", "digest-skill", "SKILL.md"),
+						`---
+name: digest-skill
+description: Digest skill
+---
+Skill v2
+`,
+					),
+				() => writeFileSync(join(pkgDir, "themes", "digest.json"), JSON.stringify({ name: "digest-theme-v2" })),
+				() => writeFileSync(join(pkgDir, ".gitignore"), "dist\ncoverage\n"),
+			];
+
+			for (const mutateTrustedContent of trustedContentMutations) {
+				mutateTrustedContent();
+				await packageManager.installAndPersist(pkgDir);
+				await settingsManager.flush();
+				const nextDigest = readDigest();
+				expect(nextDigest).not.toBe(previousDigest);
+				previousDigest = nextDigest;
+			}
+
+			mkdirSync(join(pkgDir, ".git"), { recursive: true });
+			mkdirSync(join(pkgDir, ".pi"), { recursive: true });
+			mkdirSync(join(pkgDir, ".cache"), { recursive: true });
+			writeFileSync(join(pkgDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+			writeFileSync(join(pkgDir, ".pi", "extensions.lock.json"), "{}\n");
+			writeFileSync(join(pkgDir, ".cache", "tool-output.json"), JSON.stringify({ timestamp: Date.now() }));
+			writeFileSync(join(pkgDir, "package-lock.json"), JSON.stringify({ lockfileVersion: 3 }));
+
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			expect(readDigest()).toBe(previousDigest);
+		});
+
+		it("should remove only matching scope-local lock provenance after settings removal", async () => {
+			const removedPackage = join(tempDir, "removed-package");
+			const unrelatedPackage = join(tempDir, "unrelated-package");
+			const projectPackage = join(tempDir, "project-package-for-remove");
+			writeTypeScriptPackage(removedPackage, { name: "removed-package" });
+			writeTypeScriptPackage(unrelatedPackage, { name: "unrelated-package" });
+			writeTypeScriptPackage(projectPackage, { name: "project-package-for-remove" });
+
+			await packageManager.installAndPersist(removedPackage);
+			await packageManager.installAndPersist(unrelatedPackage);
+			await packageManager.installAndPersist(projectPackage, { local: true });
+			await settingsManager.flush();
+
+			const userLockPath = join(agentDir, "extensions.lock.json");
+			const projectLockPath = join(tempDir, ".pi", "extensions.lock.json");
+			const projectLockBeforeRemove = readFileSync(projectLockPath, "utf-8");
+			const unrelatedKey = `local:${realpathSync(unrelatedPackage)}`;
+			const removedKey = `local:${realpathSync(removedPackage)}`;
+
+			await expect(packageManager.removeAndPersist(removedPackage)).resolves.toBe(true);
+			await settingsManager.flush();
+
+			const userLockAfterRemove = readJsonFile(userLockPath) as {
+				entries: Array<{ key: string; packageRoot: string }>;
+			};
+			expect(userLockAfterRemove.entries.map((entry) => entry.key)).toEqual([unrelatedKey]);
+			expect(userLockAfterRemove.entries[0].packageRoot).toBe(realpathSync(unrelatedPackage));
+			expect(readFileSync(projectLockPath, "utf-8")).toBe(projectLockBeforeRemove);
+			const remainingSettings = settingsManager.getGlobalSettings().packages ?? [];
+			expect(remainingSettings).toHaveLength(1);
+			expect(realpathSync(join(agentDir, String(remainingSettings[0])))).toBe(realpathSync(unrelatedPackage));
+
+			settingsManager.setPackages([removedPackage, unrelatedPackage]);
+			const staleResolve = await packageManager.resolve();
+			expect(staleResolve.extensions.some((extension) => extension.metadata.baseDir === removedPackage)).toBe(false);
+			expect(staleResolve.extensions.some((extension) => extension.metadata.baseDir === unrelatedPackage)).toBe(
+				true,
+			);
+			expect(staleResolve.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "missing_lock_entry",
+					scope: "user",
+					source: removedPackage,
+				}),
+			]);
+
+			await packageManager.installAndPersist(removedPackage);
+			await settingsManager.flush();
+			const userLockAfterReinstall = readJsonFile(userLockPath) as {
+				entries: Array<{ key: string }>;
+			};
+			expect(userLockAfterReinstall.entries.map((entry) => entry.key).sort()).toEqual(
+				[removedKey, unrelatedKey].sort(),
+			);
+			const recoveredResolve = await packageManager.resolve();
+			expect(recoveredResolve.diagnostics).toEqual([]);
+			expect(recoveredResolve.extensions.some((extension) => extension.metadata.baseDir === removedPackage)).toBe(
+				true,
+			);
+		});
+
 		it("should not persist temporary extension source provenance", async () => {
 			const pkgDir = join(tempDir, "temporary-source");
 			writeTypeScriptPackage(pkgDir);

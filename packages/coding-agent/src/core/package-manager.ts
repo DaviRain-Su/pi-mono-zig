@@ -53,6 +53,7 @@ import {
 	getExtensionProvenanceLockfilePath,
 	makeExtensionProvenanceEntryKey,
 	readExtensionProvenanceLockfile,
+	removeExtensionProvenanceLockEntry,
 	writeExtensionProvenanceLockEntry,
 } from "./extension-provenance-lockfile.js";
 import { isStdoutTakenOver } from "./output-guard.js";
@@ -949,6 +950,34 @@ export class DefaultPackageManager implements PackageManager {
 		});
 	}
 
+	private removeProvenanceLockForSource(
+		source: string,
+		scope: InstalledSourceScope,
+		mode: "input" | "settings",
+		removedKeys: Set<string>,
+	): void {
+		const parsed = this.parseSource(source);
+		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, mode);
+		const key = makeExtensionProvenanceEntryKey(sourceIdentity);
+		if (removedKeys.has(key)) {
+			return;
+		}
+		removedKeys.add(key);
+		removeExtensionProvenanceLockEntry({
+			scope,
+			lockfilePath: this.getProvenanceLockfilePath(scope),
+			key,
+		});
+	}
+
+	private getConfiguredPackageSourcesMatching(source: string, scope: InstalledSourceScope): string[] {
+		const currentSettings =
+			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+		return (currentSettings.packages ?? [])
+			.filter((existing) => this.packageSourcesMatch(existing, source, scope))
+			.map((existing) => this.getPackageSourceString(existing));
+	}
+
 	private createProvenanceLockEntryForSource(
 		source: string,
 		parsed: ParsedSource,
@@ -1190,8 +1219,18 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	async removeAndPersist(source: string, options?: { local?: boolean }): Promise<boolean> {
+		const scope: InstalledSourceScope = options?.local ? "project" : "user";
+		const matchingConfiguredSources = this.getConfiguredPackageSourcesMatching(source, scope);
 		await this.remove(source, options);
-		return this.removeSourceFromSettings(source, options);
+		const removed = this.removeSourceFromSettings(source, options);
+		if (removed) {
+			const removedKeys = new Set<string>();
+			this.removeProvenanceLockForSource(source, scope, "input", removedKeys);
+			for (const matchingSource of matchingConfiguredSources) {
+				this.removeProvenanceLockForSource(matchingSource, scope, "settings", removedKeys);
+			}
+		}
+		return removed;
 	}
 
 	async update(source?: string): Promise<void> {
