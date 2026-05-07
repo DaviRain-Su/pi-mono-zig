@@ -59,6 +59,7 @@ pub const BuiltinSlashCommand = struct {
 pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
     .{ .name = "settings", .description = "Open settings menu" },
     .{ .name = "model", .description = "Select model (opens selector UI)" },
+    .{ .name = "theme", .description = "Switch color theme", .argument_hint = "[night|day]" },
     .{ .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling" },
     .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl)" },
     .{ .name = "import", .description = "Import and resume a session from a JSONL file" },
@@ -290,6 +291,7 @@ test "built-in slash command autocomplete matrix matches TypeScript order" {
     const expected = [_][]const u8{
         "settings",
         "model",
+        "theme",
         "scoped-models",
         "export",
         "import",

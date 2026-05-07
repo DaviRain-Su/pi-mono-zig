@@ -445,7 +445,8 @@ pub fn applyThemeByName(
         return;
     }
 
-    live_resources.applyTheme(allocator, io, env_map, cwd, theme_name) catch |err| switch (err) {
+    const resolved_theme_name = canonicalThemeName(theme_name);
+    live_resources.applyTheme(allocator, io, env_map, cwd, resolved_theme_name) catch |err| switch (err) {
         error.ThemeNotFound => {
             const message = try std.fmt.allocPrint(allocator, "Unknown theme `{s}`", .{theme_name});
             defer allocator.free(message);
@@ -459,13 +460,19 @@ pub fn applyThemeByName(
         try app_state.setStatus("theme switched for this session");
         return;
     };
-    try persistGlobalThemeSelection(allocator, io, runtime_config, theme_name);
-    try replaceRuntimeSettingsTheme(allocator, &live_resources.owned_runtime_config.?, theme_name);
+    try persistGlobalThemeSelection(allocator, io, runtime_config, resolved_theme_name);
+    try replaceRuntimeSettingsTheme(allocator, &live_resources.owned_runtime_config.?, resolved_theme_name);
 
     const active_theme_name = if (live_resources.theme) |theme| theme.name else theme_name;
     const message = try std.fmt.allocPrint(allocator, "Theme switched to {s}", .{active_theme_name});
     defer allocator.free(message);
     try app_state.setStatus(message);
+}
+
+fn canonicalThemeName(theme_name: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(theme_name, "night")) return "dark";
+    if (std.ascii.eqlIgnoreCase(theme_name, "day")) return "light";
+    return theme_name;
 }
 
 fn persistGlobalThemeSelection(
