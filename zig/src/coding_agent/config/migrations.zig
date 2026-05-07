@@ -141,7 +141,7 @@ fn migrateAuthStorage(
 
         if (oauth_content) |content| {
             if (!(try pathExists(io, migrated_path))) {
-                try common.writeFileAbsolute(io, migrated_path, content, true);
+                try writeFileWithPermissions(io, migrated_path, content);
             }
         }
         if (!preserves_client_config) {
@@ -393,6 +393,32 @@ fn writeJsonObjectFileWithPermissions(
     try writer.interface.writeAll(serialized);
     try writer.flush();
     try atomic_file.replace(io);
+    try setPrivateFilePermissions(io, path);
+}
+
+fn writeFileWithPermissions(
+    io: std.Io,
+    path: []const u8,
+    content: []const u8,
+) !void {
+    var atomic_file = try std.Io.Dir.createFileAtomic(.cwd(), io, path, .{
+        .permissions = AUTH_FILE_PERMISSIONS,
+        .make_path = true,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+
+    var buffer: [1024]u8 = undefined;
+    var writer = atomic_file.file.writer(io, &buffer);
+    try writer.interface.writeAll(content);
+    try writer.flush();
+    try atomic_file.replace(io);
+    try setPrivateFilePermissions(io, path);
+}
+
+fn setPrivateFilePermissions(io: std.Io, path: []const u8) !void {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return;
+    try std.Io.Dir.setFilePermissions(.cwd(), io, path, AUTH_FILE_PERMISSIONS, .{});
 }
 
 fn readOptionalFile(
@@ -488,6 +514,12 @@ fn deleteFileIfExists(io: std.Io, path: []const u8) !void {
         error.FileNotFound => {},
         else => return err,
     };
+}
+
+fn fileModeIfSupported(io: std.Io, path: []const u8) !?std.posix.mode_t {
+    if (!@hasDecl(std.Io.File.Permissions, "toMode")) return null;
+    const stat = try std.Io.Dir.statFile(.cwd(), io, path, .{});
+    return stat.permissions.toMode() & 0o777;
 }
 
 fn isLegacySessionDirectory(name: []const u8) bool {
@@ -601,6 +633,13 @@ test "run migrates oauth credentials and settings api keys into auth.json" {
     defer allocator.free(settings_bytes);
     try std.testing.expect(std.mem.indexOf(u8, settings_bytes, "\"defaultProvider\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, settings_bytes, "\"apiKeys\"") == null);
+
+    const migrated_oauth_bytes = (try readOptionalFile(allocator, std.testing.io, migrated_oauth_path)).?;
+    defer allocator.free(migrated_oauth_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, migrated_oauth_bytes, "\"oauth-access\"") != null);
+    if (try fileModeIfSupported(std.testing.io, migrated_oauth_path)) |mode| {
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
+    }
 }
 
 test "run preserves OAuth client config while migrating legacy oauth tokens" {

@@ -93,6 +93,7 @@ pub const KimiProvider = struct {
             .url = url,
             .headers = headers,
             .body = json_out.written(),
+            .timeout_ms = if (options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
             .aborted = if (options) |stream_options| stream_options.signal else null,
         };
 

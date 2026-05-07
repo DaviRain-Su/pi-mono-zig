@@ -46,6 +46,23 @@ describe("parseStreamingJsonWasm (Zig WASM implementation)", () => {
 		expect(result).toEqual(expect.any(Object));
 	});
 
+	it("preserves recoverable valid prefix fallback", async () => {
+		const result = await parseStreamingJsonWasm('{"foo": 123} trailing');
+		expect(result).toEqual({ foo: 123 });
+	});
+
+	it("returns promptly for malformed near-cap partial JSON", async () => {
+		await parseStreamingJsonWasm("{}");
+
+		const malformed = `[${" ".repeat(0x10000 - 2)}x`;
+		const startedAt = performance.now();
+		const result = await parseStreamingJsonWasm(malformed);
+		const elapsedMs = performance.now() - startedAt;
+
+		expect(result).toEqual({});
+		expect(elapsedMs).toBeLessThan(1000);
+	});
+
 	it("parses nested objects", async () => {
 		const result = await parseStreamingJsonWasm('{"a": {"b": [1, 2, 3]}}');
 		expect(result).toEqual({ a: { b: [1, 2, 3] } });

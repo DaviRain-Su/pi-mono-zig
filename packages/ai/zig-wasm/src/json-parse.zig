@@ -7,6 +7,9 @@ const std = @import("std");
 const INPUT_OFFSET = 0x10000;
 const OUTPUT_OFFSET = 0x20000;
 const MAX_SIZE = 0x10000; // 64KB max
+// Bound malformed partial-JSON repair work while still accepting short
+// trailing fragments after an otherwise valid streamed JSON value.
+const MAX_PARTIAL_JSON_PREFIX_RETRIES = 256;
 
 /// Copy input to WASM memory and parse it.
 /// Returns pointer to result in output buffer, or 0 on error.
@@ -17,14 +20,20 @@ export fn parseJson(inputPtr: [*]const u8, inputLen: usize) usize {
     // Try standard JSON parse first
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.wasm_allocator, input, .{}) catch {
         // If standard parse fails, try to parse as partial/incomplete JSON
-        var end_idx: usize = input.len;
-        while (end_idx > 0) : (end_idx -= 1) {
-            const prefix = input[0..end_idx];
-            if (std.json.parseFromSlice(std.json.Value, std.heap.wasm_allocator, prefix, .{})) |result| {
-                defer result.deinit();
-                return serializeValue(result.value);
-            } else |_| {
-                continue;
+        if (input.len > 1) {
+            var end_idx: usize = input.len - 1;
+            var retry_count: usize = 0;
+            while (end_idx > 0 and retry_count < MAX_PARTIAL_JSON_PREFIX_RETRIES) : ({
+                end_idx -= 1;
+                retry_count += 1;
+            }) {
+                const prefix = input[0..end_idx];
+                if (std.json.parseFromSlice(std.json.Value, std.heap.wasm_allocator, prefix, .{})) |result| {
+                    defer result.deinit();
+                    return serializeValue(result.value);
+                } else |_| {
+                    continue;
+                }
             }
         }
         // All parsing failed, return empty object

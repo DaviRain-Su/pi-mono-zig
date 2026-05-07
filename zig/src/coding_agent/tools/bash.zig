@@ -3,6 +3,11 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const truncate = @import("truncate.zig");
 
+const PRIVATE_LOG_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+    std.Io.File.Permissions.fromMode(0o600)
+else
+    .default_file;
+
 pub const BashArgs = struct {
     command: []const u8,
     timeout_seconds: ?u64 = null,
@@ -531,7 +536,10 @@ const SecureTempFile = struct {
             const path = try std.fmt.allocPrint(allocator, "/tmp/pi-bash-{s}.log", .{encoded[0..]});
             errdefer allocator.free(path);
 
-            var file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+            var file = std.Io.Dir.createFileAbsolute(io, path, .{
+                .exclusive = true,
+                .permissions = PRIVATE_LOG_FILE_PERMISSIONS,
+            }) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     allocator.free(path);
                     continue;
@@ -539,6 +547,7 @@ const SecureTempFile = struct {
                 else => return err,
             };
             errdefer file.close(io);
+            try setPrivateLogFilePermissions(io, path);
 
             return .{
                 .file = file,
@@ -561,6 +570,11 @@ const SecureTempFile = struct {
         self.* = undefined;
     }
 };
+
+fn setPrivateLogFilePermissions(io: std.Io, path: []const u8) !void {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return;
+    try std.Io.Dir.setFilePermissions(.cwd(), io, path, PRIVATE_LOG_FILE_PERMISSIONS, .{});
+}
 
 fn captureOutputInSecureTempFile(
     allocator: std.mem.Allocator,
@@ -633,6 +647,12 @@ fn processExists(allocator: std.mem.Allocator, pid: std.posix.pid_t) !bool {
         .exited => |code| code == 0,
         else => false,
     };
+}
+
+fn fileModeIfSupported(io: std.Io, path: []const u8) !?std.posix.mode_t {
+    if (!@hasDecl(std.Io.File.Permissions, "toMode")) return null;
+    const stat = try std.Io.Dir.statFile(.cwd(), io, path, .{});
+    return stat.permissions.toMode() & 0o777;
 }
 
 const StreamingUpdateCollector = struct {
@@ -807,6 +827,9 @@ test "bash tool truncates large output and exposes the temp path" {
         1,
         full_output_path,
     ));
+    if (try fileModeIfSupported(std.testing.io, full_output_path)) |mode| {
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
+    }
 }
 
 test "buildStreamingPreview frees truncation buffers for truncated output" {
@@ -945,4 +968,7 @@ test "secure temp file remains available after creation" {
 
     const file = try std.Io.Dir.openFileAbsolute(std.testing.io, first.path.?, .{});
     file.close(std.testing.io);
+    if (try fileModeIfSupported(std.testing.io, first.path.?)) |mode| {
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
+    }
 }

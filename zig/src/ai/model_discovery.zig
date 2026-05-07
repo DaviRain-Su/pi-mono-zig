@@ -7,6 +7,11 @@ const DEFAULT_CONTEXT_WINDOW: u32 = 128000;
 const DEFAULT_MAX_TOKENS: u32 = 16384;
 const TEXT_INPUTS = [_][]const u8{"text"};
 const TEXT_AND_IMAGE_INPUTS = [_][]const u8{ "text", "image" };
+/// Maximum JSON response bytes accepted by model discovery HTTP fetches.
+/// Public/provider model catalogs are normally small; using the shared 32 MiB
+/// one-shot HTTP cap keeps large legitimate local catalogs working while
+/// preventing unbounded JSON allocation before parsing.
+const max_model_discovery_json_bytes: usize = http_client.max_response_body_bytes;
 
 pub const DiscoveryKind = enum {
     auto,
@@ -20,6 +25,8 @@ pub const DiscoveryOptions = struct {
     models_url: ?[]const u8 = null,
     loaded_models_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
+    timeout_ms: u32 = 0,
+    aborted: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const DiscoverySummary = struct {
@@ -124,7 +131,7 @@ fn discoverOpenAICompatible(
         try joinUrl(allocator, provider.base_url, "models");
     defer allocator.free(owned_models_url);
 
-    var models_json = try requestJson(allocator, &client, .GET, owned_models_url, options.api_key, null);
+    var models_json = try requestJson(allocator, &client, .GET, owned_models_url, options.api_key, null, options.timeout_ms, options.aborted);
     defer models_json.deinit();
 
     var summary = DiscoverySummary{};
@@ -137,7 +144,7 @@ fn discoverOpenAICompatible(
             try joinUrl(allocator, provider.base_url, "loaded_models");
         defer allocator.free(owned_loaded_url);
 
-        var loaded_json = requestJson(allocator, &client, .GET, owned_loaded_url, options.api_key, null) catch return summary;
+        var loaded_json = requestJson(allocator, &client, .GET, owned_loaded_url, options.api_key, null, options.timeout_ms, options.aborted) catch return summary;
         defer loaded_json.deinit();
         summary.loaded_models = try registerLoadedModelsFromJson(allocator, registry, provider, loaded_json.value);
     }
@@ -164,7 +171,7 @@ fn discoverOllama(
         try joinUrl(allocator, root_url, "api/tags");
     defer allocator.free(owned_models_url);
 
-    var tags_json = try requestJson(allocator, &client, .GET, owned_models_url, options.api_key, null);
+    var tags_json = try requestJson(allocator, &client, .GET, owned_models_url, options.api_key, null, options.timeout_ms, options.aborted);
     defer tags_json.deinit();
 
     const owned_loaded_url = if (options.loaded_models_url) |url|
@@ -173,7 +180,7 @@ fn discoverOllama(
         try joinUrl(allocator, root_url, "api/ps");
     defer allocator.free(owned_loaded_url);
 
-    var maybe_loaded_json = requestJson(allocator, &client, .GET, owned_loaded_url, options.api_key, null) catch null;
+    var maybe_loaded_json = requestJson(allocator, &client, .GET, owned_loaded_url, options.api_key, null, options.timeout_ms, options.aborted) catch null;
     defer if (maybe_loaded_json) |*loaded_json| loaded_json.deinit();
 
     var summary = DiscoverySummary{};
@@ -188,7 +195,7 @@ fn discoverOllama(
         const show_url = try joinUrl(allocator, root_url, "api/show");
         defer allocator.free(show_url);
 
-        var show_json = requestOllamaShow(allocator, &client, show_url, options.api_key, id) catch null;
+        var show_json = requestOllamaShow(allocator, &client, show_url, options.api_key, id, options.timeout_ms, options.aborted) catch null;
         if (show_json) |*parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
@@ -215,13 +222,15 @@ fn requestOllamaShow(
     url: []const u8,
     api_key: ?[]const u8,
     model_id: []const u8,
+    timeout_ms: u32,
+    aborted: ?*const std.atomic.Value(bool),
 ) !std.json.Parsed(std.json.Value) {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     defer object.deinit(allocator);
     try object.put(allocator, "model", .{ .string = model_id });
     const body = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = object }, .{});
     defer allocator.free(body);
-    return requestJson(allocator, client, .POST, url, api_key, body);
+    return requestJson(allocator, client, .POST, url, api_key, body, timeout_ms, aborted);
 }
 
 fn requestJson(
@@ -231,6 +240,22 @@ fn requestJson(
     url: []const u8,
     api_key: ?[]const u8,
     body: ?[]const u8,
+    timeout_ms: u32,
+    aborted: ?*const std.atomic.Value(bool),
+) !std.json.Parsed(std.json.Value) {
+    return requestJsonWithCap(allocator, client, method, url, api_key, body, max_model_discovery_json_bytes, timeout_ms, aborted);
+}
+
+fn requestJsonWithCap(
+    allocator: std.mem.Allocator,
+    client: *http_client.HttpClient,
+    method: http_client.HttpMethod,
+    url: []const u8,
+    api_key: ?[]const u8,
+    body: ?[]const u8,
+    max_response_body_bytes: usize,
+    timeout_ms: u32,
+    aborted: ?*const std.atomic.Value(bool),
 ) !std.json.Parsed(std.json.Value) {
     var headers = std.StringHashMap([]const u8).init(allocator);
     defer headers.deinit();
@@ -252,6 +277,9 @@ fn requestJson(
         .url = url,
         .headers = headers,
         .body = body,
+        .max_response_body_bytes = max_response_body_bytes,
+        .timeout_ms = timeout_ms,
+        .aborted = aborted,
     });
     defer response.deinit();
 
@@ -679,6 +707,129 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+const TestJsonServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    response_bodies: []const []const u8,
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, response_bodies: []const []const u8) !TestJsonServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .response_bodies = response_bodies,
+        };
+    }
+
+    fn start(self: *TestJsonServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *TestJsonServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn port(self: *const TestJsonServer) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn url(self: *const TestJsonServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/models", .{self.port()});
+    }
+
+    fn run(self: *TestJsonServer) void {
+        for (self.response_bodies) |body| {
+            const stream = self.server.accept(self.io) catch |err| switch (err) {
+                error.SocketNotListening, error.Canceled => return,
+                else => std.debug.panic("test JSON server accept failed: {}", .{err}),
+            };
+            defer stream.close(self.io);
+
+            readRequestHead(stream) catch |err| std.debug.panic("test JSON server read failed: {}", .{err});
+            writeResponse(self.io, stream, body) catch return;
+        }
+    }
+
+    fn readRequestHead(stream: std.Io.net.Stream) !void {
+        var read_buffer: [1024]u8 = undefined;
+        var reader = stream.reader(std.testing.io, &read_buffer);
+        var tail = [_]u8{ 0, 0, 0, 0 };
+        var count: usize = 0;
+
+        while (true) {
+            const byte = try reader.interface.takeByte();
+            tail[count % tail.len] = byte;
+            count += 1;
+
+            if (count >= 4) {
+                const start_index = count % tail.len;
+                const ordered = [_]u8{
+                    tail[start_index],
+                    tail[(start_index + 1) % tail.len],
+                    tail[(start_index + 2) % tail.len],
+                    tail[(start_index + 3) % tail.len],
+                };
+                if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
+            }
+        }
+    }
+
+    fn writeResponse(io: std.Io, stream: std.Io.net.Stream, body: []const u8) !void {
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
+        try writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{body.len},
+        );
+        try writer.interface.writeAll(body);
+        try writer.interface.flush();
+    }
+};
+
+const TestStalledJsonServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    stall_ms: u64,
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, stall_ms: u64) !TestStalledJsonServer {
+        return .{
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .stall_ms = stall_ms,
+        };
+    }
+
+    fn start(self: *TestStalledJsonServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *TestStalledJsonServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn port(self: *const TestStalledJsonServer) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn url(self: *const TestStalledJsonServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/models", .{self.port()});
+    }
+
+    fn run(self: *TestStalledJsonServer) void {
+        const stream = self.server.accept(self.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => std.debug.panic("test stalled JSON server accept failed: {}", .{err}),
+        };
+        defer stream.close(self.io);
+
+        TestJsonServer.readRequestHead(stream) catch return;
+        std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.stall_ms)), .awake) catch {};
+    }
+};
+
 test "registerModelsFromJson parses rich model specs" {
     var registry = model_registry.ModelRegistry.init(std.testing.allocator);
     defer registry.deinit();
@@ -717,6 +868,97 @@ test "registerModelsFromJson parses rich model specs" {
     try std.testing.expect(model.tool_calling);
     try std.testing.expect(model.loaded);
     try std.testing.expectEqual(@as(usize, 2), model.input_types.len);
+}
+
+test "discoverAndRegister accepts normal capped model discovery fixture" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const model_fixture =
+        \\{
+        \\  "models": [
+        \\    {"id": "fixture-text", "name": "Fixture Text", "context_window": 64000},
+        \\    {"id": "fixture-vision", "name": "Fixture Vision", "capabilities": ["vision"]}
+        \\  ]
+        \\}
+    ;
+    const responses = [_][]const u8{model_fixture};
+
+    var server = try TestJsonServer.init(io, &responses);
+    defer server.deinit();
+    try server.start();
+
+    const models_url = try server.url(allocator);
+    defer allocator.free(models_url);
+
+    var registry = model_registry.ModelRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerProvider(.{
+        .provider = "fixture-provider",
+        .api = "openai-completions",
+        .base_url = "http://127.0.0.1/v1",
+    });
+    const provider = registry.getProviderConfig("fixture-provider").?;
+
+    const summary = try discoverAndRegister(allocator, io, &registry, provider, .{
+        .kind = .openai,
+        .models_url = models_url,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), summary.registered_models);
+    try std.testing.expectEqualStrings("Fixture Text", registry.find("fixture-provider", "fixture-text").?.name);
+    try std.testing.expectEqual(@as(u32, 64000), registry.find("fixture-provider", "fixture-text").?.context_window);
+    try std.testing.expectEqual(@as(usize, 2), registry.find("fixture-provider", "fixture-vision").?.input_types.len);
+}
+
+test "discoverAndRegister propagates timeout through capped request path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try TestStalledJsonServer.init(io, 500);
+    defer server.deinit();
+    try server.start();
+
+    const models_url = try server.url(allocator);
+    defer allocator.free(models_url);
+
+    var registry = model_registry.ModelRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerProvider(.{
+        .provider = "timeout-provider",
+        .api = "openai-completions",
+        .base_url = "http://127.0.0.1/v1",
+    });
+    const provider = registry.getProviderConfig("timeout-provider").?;
+
+    const start_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    const summary = discoverAndRegister(allocator, io, &registry, provider, .{
+        .kind = .openai,
+        .models_url = models_url,
+        .timeout_ms = 100,
+    });
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, io).nanoseconds - start_ns, std.time.ns_per_ms);
+
+    try std.testing.expectError(http_client.HttpError.Timeout, summary);
+    try std.testing.expect(elapsed_ms < server.stall_ms);
+}
+
+test "model discovery JSON fetch rejects oversized response before parsing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const responses = [_][]const u8{"not-json-but-over-cap"};
+
+    var server = try TestJsonServer.init(io, &responses);
+    defer server.deinit();
+    try server.start();
+
+    const models_url = try server.url(allocator);
+    defer allocator.free(models_url);
+
+    var client = try http_client.HttpClient.init(allocator, io);
+    defer client.deinit();
+
+    const parsed = requestJsonWithCap(allocator, &client, .GET, models_url, null, null, 8, 0, null);
+    try std.testing.expectError(http_client.HttpError.ResponseBodyTooLarge, parsed);
 }
 
 test "registerLoadedModelsFromJson marks and registers loaded models" {

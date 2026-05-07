@@ -151,6 +151,7 @@ pub const AnthropicProvider = struct {
             .url = url,
             .headers = headers,
             .body = json_body,
+            .timeout_ms = if (resolved_options.options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
             .aborted = if (resolved_options.options) |stream_options| stream_options.signal else null,
         });
         defer response.deinit();
