@@ -205,8 +205,9 @@ Acceptance criteria:
 
 Status: Started/current `register_builtins.zig`, `main.zig` package-command
 plus run-mode dispatch, `main.zig` extension flag/registry-dump dispatch, the
-first guarded `ts_rpc_mode.zig` wire helper slice, and the TS-RPC direct bash
-subsystem slice complete.
+first guarded `ts_rpc_mode.zig` wire helper slice, the TS-RPC direct bash
+subsystem slice, the session HTML export renderer slice, and the package
+command parser slice complete.
 `zig/src/ai/providers/register_builtins.zig` now uses a single provider
 metadata table to generate the built-in API list, built-in provider registry
 entries, lazy-load state lookup, test override lookup, and comptime stream /
@@ -246,17 +247,25 @@ extension host request correlation/cancel/timeout behavior.
 `zig/src/ai/providers/openai_chat_payload.zig`: system/developer/user/
 assistant/tool-result message conversion, tool-call argument/id normalization,
 cache-retention payload fields, compat payload switches, and request snapshot
-payload parity helpers live behind that focused boundary. `openai.zig` still
-owns provider authentication, request headers, URL/Cloudflare/Copilot routing,
-HTTP streaming, response callbacks, stream contracts, and the OpenAI Chat SSE
-parser/state machine.
+payload parity helpers live behind that focused boundary. `openai.zig` now also
+delegates OpenAI Chat SSE parsing and accumulator state to
+`zig/src/ai/providers/openai_chat_sse.zig`: text/thinking/tool-call streaming
+blocks, data-line/chunk parsing, tool id/index aliasing, usage/stop-reason
+normalization, terminal error finalization, and `parseSseAssistantMessageFromSlice`
+live behind that focused boundary. `openai.zig` still owns provider
+authentication, request headers, URL/Cloudflare/Copilot routing, HTTP streaming,
+response callbacks, and stream contract entry points.
 `package_manager.zig` now delegates the interactive package config selector to
 `zig/src/coding_agent/packages/config_selector.zig`: config kind metadata,
 selector entries/state, settings-backed selector load/save, TUI rendering, and
 keyboard navigation live behind that focused package helper. The package manager
-still owns package command parsing, install/list/run/remove/update/self-update
-dispatch, non-interactive config toggle behavior, stdout/stderr routing, and
-exit-code behavior.
+also delegates package command argument parsing to
+`zig/src/coding_agent/packages/package_command_parser.zig`: package-command
+recognition, parsed command data structures, option/positional parsing,
+help/usage decisions, config toggle parse state, and update target resolution
+live behind that parser boundary. The package manager still owns
+install/list/run/remove/update/self-update dispatch, non-interactive config
+toggle execution, config IO, stdout/stderr routing, and exit-code behavior.
 `session_manager.zig` now delegates session JSONL header/entry ownership,
 parse/write codec helpers, message/content JSON conversion, and associated
 owned-value cleanup/clone helpers to
@@ -264,6 +273,13 @@ owned-value cleanup/clone helpers to
 owns session lifecycle orchestration, persistence timing, replay ordering,
 search indexing, tree/fork mutation, context reconstruction, label maps,
 corrupted-line warning policy, and missing-cwd preflight integration.
+`session_advanced.zig` now delegates HTML export rendering to
+`zig/src/coding_agent/sessions/session_html_export.zig`: HTML document
+assembly, skill-wrapper parsing/rendering, content-block HTML rendering,
+escaping, rich-text/code-block HTML rendering, and focused HTML export tests
+live behind that focused boundary. `session_advanced.zig` still owns
+export path resolution, JSON/JSONL/Markdown/HTML dispatch, file writing, and
+session statistics/context-usage calculation.
 `ts_rpc_mode.zig` now delegates TS-RPC state/model/message JSON writer and
 parser helpers to `zig/src/coding_agent/modes/ts_rpc_state_json.zig`: state,
 messages, model lists, model payloads, compaction results, session stats, fork
@@ -303,9 +319,6 @@ Remaining boundaries:
   Do not move extension ABI/protocol, session lifecycle, extension UI
   response/cancel/timeout behavior, deferred queue ordering, or broad command
   dispatch without a separately assigned guarded slice.
-- OpenAI Chat SSE parser extraction remains deferred. Do not move
-  `parseSseStreamLines` or related streaming response state out of `openai.zig`
-  without a separately assigned parser-focused slice and local parity fixtures.
 - Further package-manager decomposition remains deferred. Do not move package
   command parsing, package install/list/remove/update dispatch, self-update
   behavior, or non-interactive config toggle stdout/stderr/exit behavior without
@@ -314,6 +327,10 @@ Remaining boundaries:
   tree mutation, session lifecycle orchestration, replay/context semantics,
   search ranking, corrupted-line warning output, or missing-cwd behavior without
   a separately assigned session lifecycle/search slice.
+- Further session export decomposition remains deferred beyond the HTML renderer
+  boundary. Do not move export dispatch, path resolution, file writing,
+  JSON/JSONL/Markdown export, or session statistics/context-usage calculation
+  without a separately assigned guarded slice.
 - Further extension-registry decomposition remains deferred beyond the snapshot
   helper boundary. Do not move `applyHostFrame`, extension ABI/protocol
   parsing, provider auth-state registration, UI hook mutation lifecycle,
@@ -370,6 +387,11 @@ Acceptance criteria:
   `cd zig && zig build test-ai`,
   `cd zig && zig build test-openai-chat-parity`,
   `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed OpenAI Chat SSE parser boundary:
+  `cd zig && npx tsx test/generate-openai-chat-fixtures.ts --check`,
+  `cd zig && zig build test-openai-chat-parity`,
+  `cd zig && zig build test-ai`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
 - Verification for the completed main CLI extension flag/registry-dump slice:
   `cd zig && zig build test`,
   `cd zig && zig build test-ts-rpc-parity`,
@@ -394,6 +416,12 @@ Acceptance criteria:
   `cd zig && zig build test-tidy`, and `npm run check`.
 - Verification for the completed active-operation rendering boundary:
   `cd zig && zig build test-tui`,
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed session HTML export renderer boundary:
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed package command parser boundary:
   `cd zig && zig build test-coding-agent`,
   `cd zig && zig build test-tidy`, and `npm run check`.
 

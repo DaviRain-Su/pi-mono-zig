@@ -4,6 +4,7 @@ pub const tools = @import("tools/root.zig");
 pub const session_jsonl = @import("sessions/session_jsonl.zig");
 pub const session_manager = @import("sessions/session_manager.zig");
 pub const session = @import("sessions/session.zig");
+pub const session_html_export = @import("sessions/session_html_export.zig");
 pub const session_cwd = @import("sessions/session_cwd.zig");
 pub const missing_cwd_selector = @import("sessions/missing_cwd_selector.zig");
 pub const system_prompt = @import("resources/system_prompt.zig");
@@ -83,6 +84,7 @@ test {
     _ = @import("sessions/session_manager.zig");
     _ = @import("sessions/session_search.zig");
     _ = @import("sessions/session.zig");
+    _ = @import("sessions/session_html_export.zig");
     _ = @import("sessions/session_cwd.zig");
     _ = @import("sessions/missing_cwd_selector.zig");
     _ = @import("resources/system_prompt.zig");

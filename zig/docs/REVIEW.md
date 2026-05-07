@@ -69,14 +69,25 @@ The Zig implementation is now usable for the main coding-agent workflows:
   stream/SSE parser behavior in `openai.zig`
 - package config selector state, settings-backed load/save, TUI rendering, and
   keyboard navigation are now isolated in
-  `coding_agent/packages/config_selector.zig`, preserving package command
-  parsing, non-interactive config toggles, config persistence, stdout/stderr,
-  and exit-code behavior in `package_manager.zig`
+  `coding_agent/packages/config_selector.zig`, preserving non-interactive
+  config toggles, config persistence, stdout/stderr, and exit-code behavior in
+  `package_manager.zig`
+- package command argument parsing, parsed-command data structures, option
+  handling, help/usage decisions, config toggle parse state, and update target
+  resolution are now isolated in
+  `coding_agent/packages/package_command_parser.zig`, preserving command
+  execution, config IO, self-update handling, stdout/stderr, and exit-code
+  behavior in `package_manager.zig`
 - session JSONL header/entry data types, parse/write codec helpers,
   message/content JSON conversion, and owned-value cleanup/clone helpers are
   now isolated in `coding_agent/sessions/session_jsonl.zig`, preserving
   storage bytes, replay/search/tree/fork/context behavior, parent metadata, and
   corrupted-line compatibility policy in `session_manager.zig`
+- session HTML export rendering is now isolated in
+  `coding_agent/sessions/session_html_export.zig`, preserving `/export` and
+  `/share` HTML structure, skill-wrapper stripping, escaping, markdown/code
+  rendering, content-block ordering, and session statistics calculated by
+  `session_advanced.zig`
 - extension host process boundary and registration surface for tools,
   commands, shortcuts, flags, providers, widgets, editor hooks, header/footer
   hooks, terminal input hooks, and package-management commands
@@ -268,6 +279,19 @@ existing JSONL lines byte-for-byte, while session-manager tests continue to
 cover replay, search, labels, branch summaries, custom entries, context
 exclusion, corruption tolerance, and tree/fork behavior.
 
+### Session HTML Export Renderer Boundary
+
+Resolved for the current large-file decomposition slice. `session_advanced.zig`
+now delegates standalone HTML document assembly, skill-wrapper parsing and
+rendering, content-block HTML rendering, escaping, and rich-text/code-block
+HTML rendering to `coding_agent/sessions/session_html_export.zig`.
+
+`session_advanced.zig` still owns export path resolution, JSON/JSONL/Markdown/
+HTML dispatch, writing exported files, and session statistics/context-usage
+calculation. Focused HTML export tests moved with the renderer and continue to
+pin skill-wrapper stripping, literal closing-tag handling, user-authored prompt
+rendering, content-block ordering, escaping, and non-skill message behavior.
+
 ### CLI Run Mode Dispatch
 
 Resolved for the current maintainability slice. `main.zig` now delegates the
@@ -346,10 +370,35 @@ normalization, cache-retention payload fields, compat payload switches, and the
 OpenAI Chat request snapshot payload helper used by parity fixtures.
 
 `openai.zig` still owns provider authentication, request headers, request URL
-construction, Cloudflare/Copilot routing, HTTP streaming, `on_response`, stream
-contract error mapping, and the OpenAI Chat SSE parser/state machine. Chat SSE
-parser extraction remains explicitly deferred to a parser-focused slice with
-local parity fixtures.
+construction, Cloudflare/Copilot routing, HTTP streaming, `on_response`, and
+stream contract entry points. Chat SSE parsing now has its own parser-focused
+boundary.
+
+### OpenAI Chat SSE Parser Boundary
+
+Resolved for the current large-file decomposition slice. `openai.zig` now
+delegates OpenAI Chat SSE parsing and accumulator state to
+`providers/openai_chat_sse.zig`. The helper owns active text/thinking/tool-call
+blocks, SSE data-line and chunk parsing, independent accumulator finalization,
+tool id/index aliasing, first id/name preservation, thinking signatures, usage
+normalization, stop-reason mapping, terminal error finalization, and the
+`parseSseAssistantMessageFromSlice` parity helper.
+
+`openai.zig` retains request payload/header/auth/url construction,
+Cloudflare/Copilot routing, HTTP streaming setup, response callbacks, missing
+API key diagnostics, and provider stream contract entry points.
+
+### Package Command Parser Boundary
+
+Resolved for the current large-file decomposition slice. `package_manager.zig`
+now delegates package CLI argument parsing to
+`packages/package_command_parser.zig`. The helper owns subcommand recognition,
+parsed-command structs/enums, option/positional scanning, help and usage parse
+decisions, config toggle parse state, and update target resolution.
+
+`package_manager.zig` retains install/list/run/remove/update/self-update
+execution, package config selector/IO behavior, stdout/stderr routing, settings
+mutations, and exit-code mapping.
 
 ### Extension Registry Snapshot Boundary
 

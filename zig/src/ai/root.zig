@@ -64,6 +64,7 @@ pub const getEnvApiKey = env_api_keys.getEnvApiKey;
 
 test {
     _ = @import("providers/openai.zig");
+    _ = @import("providers/openai_chat_sse.zig");
     _ = @import("providers/openai_responses.zig");
     _ = @import("providers/azure_openai_responses.zig");
     _ = @import("providers/openai_codex_responses.zig");
