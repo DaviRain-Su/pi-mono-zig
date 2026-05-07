@@ -5,6 +5,7 @@ const cli = @import("cli/args.zig");
 const bootstrap = @import("cli/bootstrap.zig");
 const package_command_dispatch = @import("cli/package_command_dispatch.zig");
 const cli_preflight = @import("cli/preflight.zig");
+const extension_cli = @import("cli/extension_cli.zig");
 const input_prep = @import("cli/input_prep.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
 const run_mode_dispatch = @import("cli/run_mode_dispatch.zig");
@@ -12,9 +13,6 @@ const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 const config_mod = @import("coding_agent/config/config.zig");
 const json_event_wire = @import("coding_agent/modes/json_event_wire.zig");
-const extension_runtime_mod = @import("coding_agent/extensions/extension_runtime.zig");
-const extension_flags_mod = @import("coding_agent/extensions/extension_flags.zig");
-const extension_registry_mod = @import("coding_agent/extensions/extension_registry.zig");
 const builtin = @import("builtin");
 const cli_test = if (builtin.is_test) @import("cli/test_harness.zig") else struct {};
 
@@ -90,33 +88,13 @@ fn runCliWithInput(
     };
     defer options.deinit(allocator);
 
-    // Build the extension flag registry from local Bun-fixture manifest
-    // sidecars next to each `--extension <path>` entry. This is the
-    // deterministic compatibility hook for M11 extension CLI flag
-    // passthrough; live Bun JSONL flag registration is handled by the
-    // sibling registration-surfaces feature.
-    var extension_flag_registry = extension_flags_mod.Registry.init(allocator);
-    defer extension_flag_registry.deinit();
-    if (options.extensions) |paths| {
-        try extension_flags_mod.loadFromExtensionPaths(&extension_flag_registry, io, paths);
-    }
+    var prepared_extensions = extension_cli.PreparedExtensionCli.init(allocator);
+    defer prepared_extensions.deinit();
+    try prepared_extensions.loadFlagSidecars(io, options.extensions);
 
     if (options.help) {
-        const ext_flags_snapshot = try extension_flag_registry.snapshotForHelp(allocator);
-        defer allocator.free(ext_flags_snapshot);
-        const help_flags = try allocator.alloc(cli.ExtensionFlagInfo, ext_flags_snapshot.len);
+        const help_flags = try prepared_extensions.snapshotHelpFlags(allocator);
         defer allocator.free(help_flags);
-        for (ext_flags_snapshot, 0..) |flag, idx| {
-            help_flags[idx] = .{
-                .name = flag.name,
-                .description = flag.description,
-                .type_kind = switch (flag.type_kind) {
-                    .boolean => .boolean,
-                    .string => .string,
-                },
-                .extension_path = flag.extension_path,
-            };
-        }
         try output.printUsageWithExtensions(allocator, VERSION, help_flags, stdout);
         return 0;
     }
@@ -126,100 +104,21 @@ fn runCliWithInput(
         return 0;
     }
 
-    // Validate any unknown long flags against the extension flag
-    // registry. Unregistered flags are surfaced as TS-compatible
-    // `Unknown option(s):` diagnostics; registered flags are accepted.
-    // Parsed flag values (boolean true / explicit string) are
-    // collected here so the M11 live Bun host registry dump path
-    // below can plumb them into the runtime registry, mirroring TS
-    // `extensionState.flags[name] = value`.
-    var parsed_flag_owned_names = std.ArrayList([]u8).empty;
-    var parsed_flag_owned_strings = std.ArrayList([]u8).empty;
-    var parsed_extension_flag_values = std.ArrayList(extension_registry_mod.ParsedCliFlag).empty;
-    defer {
-        parsed_extension_flag_values.deinit(allocator);
-        for (parsed_flag_owned_names.items) |s| allocator.free(s);
-        parsed_flag_owned_names.deinit(allocator);
-        for (parsed_flag_owned_strings.items) |s| allocator.free(s);
-        parsed_flag_owned_strings.deinit(allocator);
-    }
-    if (options.unknown_flags) |unknown_flags| {
-        const parsed = try allocator.alloc(extension_flags_mod.ParsedUnknownFlag, unknown_flags.len);
-        defer allocator.free(parsed);
-        for (unknown_flags, 0..) |raw, idx| {
-            parsed[idx] = .{
-                .name = raw.name,
-                .value = switch (raw.value) {
-                    .boolean => |b| .{ .boolean = b },
-                    .string => |s| .{ .string = s },
-                },
-            };
-        }
+    if (!try prepared_extensions.applyUnknownFlags(options.unknown_flags, stderr)) return 1;
 
-        var apply_result = try extension_flags_mod.applyUnknownFlags(
+    if (extension_cli.shouldRunRegistryDump(env_map, options.extensions)) {
+        const paths = options.extensions.?;
+        return try extension_cli.runExtensionRegistryDump(
             allocator,
-            &extension_flag_registry,
-            parsed,
+            io,
+            env_map,
+            paths,
+            prepared_extensions.parsedCliFlagValues(),
+            cwd_override,
+            stdout,
+            stderr,
         );
-        defer apply_result.deinit(allocator);
-
-        if (apply_result.diagnostics.len > 0) {
-            var saw_error = false;
-            for (apply_result.diagnostics) |diagnostic| {
-                if (diagnostic.severity == .@"error") saw_error = true;
-                try stderr.print("Error: {s}\n", .{diagnostic.message});
-            }
-            if (saw_error) return 1;
-        }
-
-        for (apply_result.values) |entry| {
-            const name_owned = try allocator.dupe(u8, entry.name);
-            try parsed_flag_owned_names.append(allocator, name_owned);
-            switch (entry.value) {
-                .boolean => |b| {
-                    try parsed_extension_flag_values.append(allocator, .{
-                        .name = name_owned,
-                        .value = .{ .boolean = b },
-                    });
-                },
-                .string => |s| {
-                    const value_owned = try allocator.dupe(u8, s);
-                    try parsed_flag_owned_strings.append(allocator, value_owned);
-                    try parsed_extension_flag_values.append(allocator, .{
-                        .name = name_owned,
-                        .value = .{ .string = value_owned },
-                    });
-                },
-            }
-        }
     }
-
-    // M11 explicit --extension end-to-end: when the registry-dump env
-    // var is enabled and at least one --extension path is provided,
-    // start the configured Bun-hosted extension runtime, drain its
-    // live register_* JSONL frames into the runtime registry, plumb
-    // parsed CLI flag values through host.applyCliFlagValues, and
-    // print the deterministic registry snapshot to stdout. This is
-    // the deterministic CLI hook used by VAL-M11-EXT-007/008/012/etc
-    // to observe live extension contributions without relying on
-    // sidecar manifests.
-    if (options.extensions) |paths| if (paths.len > 0) {
-        if (env_map.get("PI_M11_EXTENSION_REGISTRY_DUMP")) |dump_value| {
-            if (isEnabledValue(dump_value)) {
-                const exit_code = try runExtensionRegistryDump(
-                    allocator,
-                    io,
-                    env_map,
-                    paths,
-                    parsed_extension_flag_values.items,
-                    cwd_override,
-                    stdout,
-                    stderr,
-                );
-                return exit_code;
-            }
-        }
-    };
 
     var effective_env_map = try prepareEffectiveEnvMap(allocator, env_map, &options);
     defer effective_env_map.deinit();
@@ -353,105 +252,6 @@ fn runCliWithInput(
         stdout,
         stderr,
     );
-}
-
-fn isEnabledValue(value: []const u8) bool {
-    return std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes");
-}
-
-/// Start a Bun-hosted extension via the M11 registry-dump CLI hook,
-/// drain live register_* JSONL frames into the runtime registry, plumb
-/// parsed CLI flag values into `extensionState`, and write the
-/// deterministic snapshot to stdout. The runtime is configurable via
-/// `PI_M11_EXTENSION_HOST_RUNTIME` (default `bun`) so deterministic
-/// validation can substitute a local shell stub for the live Bun
-/// runtime when needed. Always exits cleanly with the host shut down.
-fn runExtensionRegistryDump(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-    extension_paths: []const []const u8,
-    parsed_flag_values: []const extension_registry_mod.ParsedCliFlag,
-    cwd_override: ?[]const u8,
-    stdout: *std.Io.Writer,
-    stderr: *std.Io.Writer,
-) !u8 {
-    if (extension_paths.len == 0) return 0;
-    const runtime = env_map.get("PI_M11_EXTENSION_HOST_RUNTIME") orelse "bun";
-    const marker = env_map.get("PI_M11_EXTENSION_HOST_MARKER") orelse "pi-m11-extension-host";
-    const fixture = env_map.get("PI_M11_EXTENSION_HOST_FIXTURE") orelse "m11-fixture";
-    const ready_timeout_ms: u64 = std.fmt.parseInt(u64, env_map.get("PI_M11_EXTENSION_READY_TIMEOUT_MS") orelse "1500", 10) catch 1500;
-    const drain_timeout_ms: u64 = std.fmt.parseInt(u64, env_map.get("PI_M11_EXTENSION_DRAIN_TIMEOUT_MS") orelse "1500", 10) catch 1500;
-    const shutdown_timeout_ms: u64 = std.fmt.parseInt(u64, env_map.get("PI_M11_EXTENSION_SHUTDOWN_TIMEOUT_MS") orelse "1000", 10) catch 1000;
-
-    // Prefer the first --extension path as the entry point; additional
-    // paths are forwarded as host argv tail so a local shell stub can
-    // observe them. Bun ignores trailing argv after the entry script.
-    const cwd = if (cwd_override) |override| try allocator.dupe(u8, override) else blk: {
-        const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-        break :blk real_cwd;
-    };
-    defer allocator.free(cwd);
-
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, runtime);
-    for (extension_paths) |p| try argv.append(allocator, p);
-    try argv.append(allocator, marker);
-
-    const host = extension_runtime_mod.startRuntime(allocator, io, .{ .process_jsonl = .{
-        .argv = argv.items,
-        .cwd = cwd,
-        .initialize = .{
-            .marker = marker,
-            .cwd = cwd,
-            .fixture = fixture,
-        },
-        .shutdown_timeout_ms = shutdown_timeout_ms,
-    } }) catch |err| {
-        try stderr.print("Error: failed to start extension host: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    defer host.deinit();
-
-    host.waitForReady(ready_timeout_ms) catch {
-        try stderr.writeAll("Error: extension host did not become ready\n");
-        return 1;
-    };
-
-    // Wait until the host has been quiescent for >100ms with no new
-    // registry frames arriving, or `drain_timeout_ms` has elapsed.
-    var elapsed: u64 = 0;
-    var last_count: usize = 0;
-    var quiet: u64 = 0;
-    const tick_ms: u64 = 10;
-    while (elapsed < drain_timeout_ms) : (elapsed += tick_ms) {
-        const cur = host.registryFramesApplied();
-        if (cur != last_count) {
-            last_count = cur;
-            quiet = 0;
-        } else {
-            quiet += tick_ms;
-            if (quiet >= 100 and last_count != 0) break;
-        }
-        std.Io.sleep(io, .fromMilliseconds(@intCast(tick_ms)), .awake) catch {};
-    }
-
-    // Plumb parsed CLI flag values into the live registry so
-    // extensions can observe them through `getFlag()`.
-    if (parsed_flag_values.len > 0) {
-        host.applyCliFlagValues(parsed_flag_values) catch {};
-    }
-
-    const snapshot = try host.snapshotRegistryJson(allocator);
-    defer allocator.free(snapshot);
-    try stdout.print("{s}\n", .{snapshot});
-
-    host.shutdown() catch |err| {
-        try stderr.print("Error: extension host shutdown failed: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    return 0;
 }
 
 fn prepareEffectiveEnvMap(

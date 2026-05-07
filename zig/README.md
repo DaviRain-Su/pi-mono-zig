@@ -52,6 +52,12 @@ zig build test             # Run tests
 zig build run             # Build and run
 ```
 
+## Code Organization
+
+- `src/coding_agent/modes/ts_rpc_mode.zig` owns TS-RPC routing and delegates direct bash task execution to `src/coding_agent/modes/ts_rpc_bash.zig`.
+- `src/cli/extension_cli.zig` owns extension CLI flag preprocessing and registry dump setup used by `src/main.zig`.
+- `src/ai/providers/openai_chat_payload.zig` owns OpenAI Chat request payload construction while `src/ai/providers/openai.zig` retains transport and stream parsing.
+
 ## Testing
 
 ```bash

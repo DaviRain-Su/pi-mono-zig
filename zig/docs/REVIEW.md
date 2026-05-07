@@ -47,6 +47,18 @@ The Zig implementation is now usable for the main coding-agent workflows:
   so `main.zig` keeps the runCli orchestration boundary while print/json/RPC/
   TS-RPC/interactive dispatch, prepared missing-cwd preflight, session opening,
   stdout/stderr routing, and exit-code behavior live in a focused helper
+- extension CLI sidecar flag preprocessing and live registry dumping are now
+  isolated in `cli/extension_cli.zig` so `main.zig` preserves top-level
+  argument precedence and run-mode orchestration without owning extension flag
+  registry state, parsed flag retention, registry dump enablement, or extension
+  host setup/shutdown diagnostics
+- TS-RPC direct bash execution is now isolated in `modes/ts_rpc_bash.zig`,
+  preserving the server-owned command dispatch, deferred queue ordering, and
+  TS-RPC wire response boundary
+- OpenAI Chat request/message payload construction is now isolated in
+  `providers/openai_chat_payload.zig`, preserving request JSON parity,
+  tool-call normalization, cache-retention payload behavior, and provider-owned
+  stream/SSE parser behavior in `openai.zig`
 - extension host process boundary and registration surface for tools,
   commands, shortcuts, flags, providers, widgets, editor hooks, header/footer
   hooks, terminal input hooks, and package-management commands
@@ -227,8 +239,55 @@ boundary has started with the guarded pure wire/protocol extraction from
 input CR/LF framing, TypeScript-shaped parse diagnostics, response frame
 serialization, JSON string escaping, and extension UI request frame
 serialization. Broader `ts_rpc_mode.zig` command dispatch, session lifecycle,
-extension UI correlation/cancel/timeout handling, and direct bash lifecycle
-splits remain deferred.
+and extension UI correlation/cancel/timeout handling remain deferred.
+
+### CLI Extension Flag and Registry Dump Boundary
+
+Resolved for the current maintainability slice. `main.zig` now delegates
+extension sidecar flag registry loading, help flag snapshot conversion, unknown
+long-flag validation, parsed CLI flag value retention for extension state, and
+the live M11 extension registry dump path to `cli/extension_cli.zig`.
+
+The extracted helper owns registry dump enablement checks, runtime argv/cwd
+preparation, host ready/drain/shutdown handling, parsed flag application into
+the live registry, JSON snapshot writing, and shutdown-failure diagnostics.
+`main.zig` still owns package-command precedence, top-level help/version
+ordering, export/list-model routing, missing-cwd preflight, and the prepared
+run-mode dispatch boundary. Focused helper tests and existing `runCli` tests
+pin sidecar flag help/preprocessing, unregistered flag diagnostics, live
+registry snapshot JSON, unregister behavior, stdout/stderr, exit codes, and the
+shutdown-failure path.
+
+### TS-RPC Direct Bash Boundary
+
+Resolved for the current maintainability slice. `ts_rpc_mode.zig` now delegates
+direct bash task/result/output reader state, UTF-8 sanitization, retained-log
+and truncation handling, process execution, and cancellation lifecycle helpers
+to `coding_agent/modes/ts_rpc_bash.zig`. `ts_rpc_mode.zig` still owns the
+`bash` / `abort_bash` command dispatch points, response framing callbacks,
+deferred response priority/flush ordering, session replacement ordering, and
+extension host event loop semantics.
+
+Focused coding-agent tests continue to pin exact BashResult bytes,
+sanitization, truncation/retained logs, cancellation cleanup, live command-loop
+behavior, and the generated TypeScript bash-control fixture. The live TS-RPC
+parity harness remains the black-box guardrail for TS-vs-Zig direct bash wire
+bytes.
+
+### OpenAI Chat Payload Boundary
+
+Resolved for the current maintainability slice. `openai.zig` now delegates
+OpenAI Chat request/message payload construction to
+`providers/openai_chat_payload.zig`. The helper owns system/developer/user/
+assistant/tool-result message JSON construction, tool-call id/argument
+normalization, cache-retention payload fields, compat payload switches, and the
+OpenAI Chat request snapshot payload helper used by parity fixtures.
+
+`openai.zig` still owns provider authentication, request headers, request URL
+construction, Cloudflare/Copilot routing, HTTP streaming, `on_response`, stream
+contract error mapping, and the OpenAI Chat SSE parser/state machine. Chat SSE
+parser extraction remains explicitly deferred to a parser-focused slice with
+local parity fixtures.
 
 ## Recommended Next Work Order
 

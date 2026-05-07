@@ -64,6 +64,7 @@ const DeadlineTerminationReason = enum(u8) {
 const HttpDeadlineGuard = struct {
     io: ?std.Io = null,
     shutdown_stream: ?std.Io.net.Stream = null,
+    request: ?*std.http.Client.Request = null,
     aborted: ?*const std.atomic.Value(bool) = null,
     timeout_ms: u32 = 0,
     created_at_ns: i128 = 0,
@@ -75,6 +76,7 @@ const HttpDeadlineGuard = struct {
     fn init(
         io: std.Io,
         shutdown_stream: ?std.Io.net.Stream,
+        request: ?*std.http.Client.Request,
         aborted: ?*const std.atomic.Value(bool),
         timeout_ms: u32,
         created_at_ns: i128,
@@ -82,6 +84,7 @@ const HttpDeadlineGuard = struct {
         return .{
             .io = io,
             .shutdown_stream = shutdown_stream,
+            .request = request,
             .aborted = aborted,
             .timeout_ms = timeout_ms,
             .created_at_ns = created_at_ns,
@@ -127,6 +130,10 @@ const HttpDeadlineGuard = struct {
 
     fn triggerTermination(self: *HttpDeadlineGuard, reason: DeadlineTerminationReason) void {
         self.termination_reason.store(@intFromEnum(reason), .release);
+
+        if (self.request) |request| {
+            if (request.connection) |connection| connection.closing = true;
+        }
 
         if (self.shutdown_stream) |stream| {
             const io = self.io orelse return;
@@ -354,7 +361,7 @@ pub const StreamingResponse = struct {
     }
 
     fn consumeLiveLineDelimiter(self: *StreamingResponse, reader: *std.Io.Reader) !?[]const u8 {
-        const byte = reader.takeByte() catch |err| {
+        reader.discardAll(1) catch |err| {
             if (self.currentTerminationReason()) |reason| {
                 self.done = true;
                 return terminationError(reason);
@@ -370,7 +377,6 @@ pub const StreamingResponse = struct {
             return err;
         };
 
-        std.debug.assert(byte == '\n');
         trimTrailingCarriageReturn(&self.buffer);
         return self.buffer.items;
     }
@@ -433,26 +439,6 @@ pub const HttpRequest = struct {
     max_response_body_bytes: usize = max_response_body_bytes,
 };
 
-const RequestDeadlineGuard = struct {
-    request: *std.http.Client.Request,
-    watchdog: HttpDeadlineGuard,
-
-    fn start(self: *RequestDeadlineGuard) !void {
-        try self.watchdog.start();
-    }
-
-    fn deinit(self: *RequestDeadlineGuard) void {
-        self.watchdog.deinit();
-    }
-
-    fn check(self: *const RequestDeadlineGuard) !void {
-        if (self.watchdog.currentTerminationReason()) |reason| {
-            if (self.request.connection) |connection| connection.closing = true;
-            return terminationError(reason);
-        }
-    }
-};
-
 fn httpMethodFor(method: HttpMethod) std.http.Method {
     return switch (method) {
         .GET => .GET,
@@ -486,7 +472,7 @@ fn cloneRequestHeaders(
 fn sendRequestWithDeadline(
     request: *std.http.Client.Request,
     body: ?[]const u8,
-    deadline_guard: *const RequestDeadlineGuard,
+    deadline_guard: *const HttpDeadlineGuard,
 ) !void {
     if (body) |bytes| {
         request.transfer_encoding = .{ .content_length = bytes.len };
@@ -746,22 +732,6 @@ fn connectTcpDeadlinePosix(
     } };
 }
 
-const RawStreamDeadlineGuard = struct {
-    watchdog: HttpDeadlineGuard,
-
-    fn start(self: *RawStreamDeadlineGuard) !void {
-        try self.watchdog.start();
-    }
-
-    fn deinit(self: *RawStreamDeadlineGuard) void {
-        self.watchdog.deinit();
-    }
-
-    fn check(self: *const RawStreamDeadlineGuard) !void {
-        try self.watchdog.check();
-    }
-};
-
 const LocalTlsConnection = struct {
     client: std.crypto.tls.Client,
     connection: std.http.Client.Connection,
@@ -956,9 +926,7 @@ pub const HttpClient = struct {
             .protocol = .tls,
         };
 
-        var guard = RawStreamDeadlineGuard{
-            .watchdog = HttpDeadlineGuard.init(self.client.io, stream, req.aborted, req.timeout_ms, started_at_ns),
-        };
+        var guard = HttpDeadlineGuard.init(self.client.io, stream, null, req.aborted, req.timeout_ms, started_at_ns);
         try guard.start();
         defer guard.deinit();
 
@@ -1082,12 +1050,10 @@ pub const HttpClient = struct {
             if (hasDeadlineExpired(req.timeout_ms, request_started_at_ns, self.client.io)) return HttpError.Timeout;
 
             const shutdown_stream = request_ptr.connection.?.stream_reader.stream;
-            var deadline_guard = RequestDeadlineGuard{
-                .request = request_ptr,
-                .watchdog = HttpDeadlineGuard.init(self.client.io, shutdown_stream, req.aborted, req.timeout_ms, request_started_at_ns),
-            };
+            var deadline_guard = HttpDeadlineGuard.init(self.client.io, shutdown_stream, request_ptr, req.aborted, req.timeout_ms, request_started_at_ns);
             try deadline_guard.start();
-            defer deadline_guard.deinit();
+            var deadline_guard_active = true;
+            defer if (deadline_guard_active) deadline_guard.deinit();
 
             try sendRequestWithDeadline(request_ptr, req.body, &deadline_guard);
 
@@ -1108,6 +1074,8 @@ pub const HttpClient = struct {
                 current_uri = current_uri.resolveInPlace(location.len, &redirect_aux_buffer) catch return HttpError.InvalidUrl;
                 redirects_remaining -= 1;
 
+                deadline_guard.deinit();
+                deadline_guard_active = false;
                 request_ptr.deinit();
                 self.allocator.destroy(request_ptr);
                 owns_request = false;
@@ -1128,7 +1096,7 @@ pub const HttpClient = struct {
                 .transfer_buffer = try self.allocator.alloc(u8, live_stream_transfer_buffer_bytes),
                 .redirect_buffer = redirect_buffer,
                 .extra_headers = extra_headers_owned,
-                .deadline_guard = HttpDeadlineGuard.init(self.client.io, shutdown_stream, req.aborted, req.timeout_ms, request_started_at_ns),
+                .deadline_guard = HttpDeadlineGuard.init(self.client.io, shutdown_stream, request_ptr, req.aborted, req.timeout_ms, request_started_at_ns),
             };
             errdefer streaming.deinit();
             owns_request = false;

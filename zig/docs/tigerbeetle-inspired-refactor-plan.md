@@ -78,10 +78,12 @@ Acceptance criteria:
 ## Next Suggested Refactor Step
 
 Continue the screenshot maintainability slices now that the provider registry
-boilerplate and the first two `main.zig` CLI extraction slices are complete.
-The guarded pure wire/protocol helper extraction from `ts_rpc_mode.zig` is now
-complete for the first slice. Broader interactive, extension, provider-parser,
-and session/RPC decomposition remains later refactor work.
+boilerplate and the `main.zig` package, run-mode, and extension CLI extraction
+slices are complete.
+The guarded pure wire/protocol helper extraction and the direct bash subsystem
+extraction from `ts_rpc_mode.zig` are now complete. Broader interactive,
+extension, provider-parser, and session/RPC decomposition remains later
+refactor work.
 
 ### 5. Interactive Mode Decomposition
 
@@ -199,8 +201,9 @@ Acceptance criteria:
 ### 8. Screenshot Maintainability Slices
 
 Status: Started/current `register_builtins.zig`, `main.zig` package-command
-plus run-mode dispatch, and the first guarded `ts_rpc_mode.zig` wire helper
-slice complete.
+plus run-mode dispatch, `main.zig` extension flag/registry-dump dispatch, the
+first guarded `ts_rpc_mode.zig` wire helper slice, and the TS-RPC direct bash
+subsystem slice complete.
 `zig/src/ai/providers/register_builtins.zig` now uses a single provider
 metadata table to generate the built-in API list, built-in provider registry
 entries, lazy-load state lookup, test override lookup, and comptime stream /
@@ -217,20 +220,44 @@ mapping in a focused helper.
 TS-RPC selection, the post-runtime non-interactive missing-cwd preflight before
 provider/auth/tool setup, RPC/TS-RPC routing, stdout/stderr routing, and
 exit-code behavior.
+`main.zig` now also delegates extension CLI sidecar flag registry loading,
+unknown long-flag validation, parsed extension flag value retention, registry
+dump enablement checks, and live extension host registry dumping to
+`zig/src/cli/extension_cli.zig`. The parent CLI still owns top-level argument
+precedence, help/version ordering, package pre-dispatch, missing-cwd preflight,
+and run-mode orchestration; the helper owns the focused extension flag/dump
+boundary while preserving registry dump JSON, stdout/stderr, exit codes, and
+extension host shutdown diagnostics.
 `ts_rpc_mode.zig` now delegates focused wire/protocol helpers to
 `zig/src/coding_agent/ts_rpc_wire.zig`: known command metadata, LF/CR input
 framing, TypeScript-shaped JSON parse diagnostics, base response frame
 serialization, JSON string escaping, and extension UI request frame
-serialization. The server still owns command dispatch, session lifecycle,
-extension host request correlation/cancel/timeout behavior, and direct bash
-lifecycle.
+serialization.
+`ts_rpc_mode.zig` now also delegates direct bash task/result/output reader
+state, UTF-8 sanitization, retained-log/truncation handling, process execution,
+and cancellation lifecycle helpers to
+`zig/src/coding_agent/modes/ts_rpc_bash.zig`. The server still owns command
+dispatch, deferred response priority/flush policy, session lifecycle, and
+extension host request correlation/cancel/timeout behavior.
+`openai.zig` now delegates OpenAI Chat request/message payload construction to
+`zig/src/ai/providers/openai_chat_payload.zig`: system/developer/user/
+assistant/tool-result message conversion, tool-call argument/id normalization,
+cache-retention payload fields, compat payload switches, and request snapshot
+payload parity helpers live behind that focused boundary. `openai.zig` still
+owns provider authentication, request headers, URL/Cloudflare/Copilot routing,
+HTTP streaming, response callbacks, stream contracts, and the OpenAI Chat SSE
+parser/state machine.
 
 Remaining boundaries:
 
-- Further `ts_rpc_mode.zig` decomposition remains deferred beyond this guarded
-  pure wire/protocol helper extraction. Do not move extension ABI/protocol,
-  session lifecycle, extension UI response/cancel/timeout behavior, direct bash
-  lifecycle, or command dispatch without a separately assigned guarded slice.
+- Further `ts_rpc_mode.zig` decomposition remains deferred beyond these guarded
+  wire/protocol and direct-bash helper extractions. Do not move extension
+  ABI/protocol, session lifecycle, extension UI response/cancel/timeout
+  behavior, deferred queue ordering, or broad command dispatch without a
+  separately assigned guarded slice.
+- OpenAI Chat SSE parser extraction remains deferred. Do not move
+  `parseSseStreamLines` or related streaming response state out of `openai.zig`
+  without a separately assigned parser-focused slice and local parity fixtures.
 - Broad interactive-mode, extension-registry, provider parser/state-machine,
   session, build-graph, and extension ABI/interface decomposition remains
   deferred unless assigned explicitly.
@@ -248,6 +275,10 @@ Acceptance criteria:
   preparation, and focused tests prove RPC/TS-RPC prompt and `@file`
   restrictions remain pre-runtime while parity validators cover print/json/RPC/
   TS-RPC flow behavior.
+- `main.zig` delegates extension flag preprocessing and registry dumping to a
+  focused CLI helper, and focused tests prove sidecar flag help/preprocessing,
+  unknown flag diagnostics, dump enablement checks, live registry snapshots,
+  unregister behavior, and shutdown-failure diagnostics remain unchanged.
 - Verification for the completed provider registry slice:
   `cd zig && zig build test-ai`,
   `cd zig && zig build test-coding-agent`, and `npm run check`.
@@ -260,6 +291,18 @@ Acceptance criteria:
 - Verification for the completed first TS-RPC wire helper slice:
   `cd zig && zig build test-coding-agent`,
   `cd zig && zig build test-ts-rpc-parity`, and `npm run check`.
+- Verification for the completed TS-RPC direct bash subsystem slice:
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-ts-rpc-parity`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed OpenAI Chat payload boundary:
+  `cd zig && zig build test-ai`,
+  `cd zig && zig build test-openai-chat-parity`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed main CLI extension flag/registry-dump slice:
+  `cd zig && zig build test`,
+  `cd zig && zig build test-ts-rpc-parity`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
 
 ### 9. Session and RPC Decomposition
 
