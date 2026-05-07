@@ -27,6 +27,20 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const securityGrantFixturePath = join(repoRoot, "packages/coding-agent/test/fixtures/extension-security-grants.json");
 const pureWasmFixtureRoot = join(repoRoot, "zig/test/fixtures/wasm/pure-truncate-head-v0");
 const browserWasmFixtureRoot = join(repoRoot, "zig/test/fixtures/wasm/browser-tool-v0");
+const wasmPackageTrustParityFixtures = {
+	"com.pi.pure-truncate-head": {
+		root: pureWasmFixtureRoot,
+		artifactSha256: "fffac4554b1c0f2e8a8f44372f0766826ba4a06d60a314b67b7e78dca95c952e",
+		packageRootSha256: "8a4bcc11ba1a0302523cf648c3d0efa1b823100ba1a20805ac0dfcf4886e6b7e",
+		toolId: "builtin.truncateHead",
+	},
+	"com.pi.browser-fixture": {
+		root: browserWasmFixtureRoot,
+		artifactSha256: "b7bf7f6ecf5ac4092017d317b7630b1aeff4c2fd11ecffae52c93900025ea520",
+		packageRootSha256: "4ea7cbb8ed506639af92f7a1a2bca6edeec95771b87fd58b8f9bb9b60940b688",
+		toolId: "fixture.echo",
+	},
+} as const;
 
 function writeWasmPackage(
 	packageRoot: string,
@@ -973,6 +987,71 @@ Content`,
 				origin: "package",
 				baseDir: pureWasmFixtureRoot,
 			});
+		});
+
+		it("should preserve shared Wasm package trust parity principals for repository fixtures", async () => {
+			for (const fixture of Object.values(wasmPackageTrustParityFixtures)) {
+				await packageManager.installAndPersist(fixture.root);
+			}
+			await settingsManager.flush();
+
+			const lock = readJsonFile(join(agentDir, "extensions.lock.json")) as {
+				entries: Array<{
+					key: string;
+					source: { identity: string; type: string };
+					manifest: { schemaVersion: string; id: string; version: string; toolId: string };
+					packageRoot: string;
+					manifestPath: string;
+					artifact: { path: string; absolutePath: string; sha256: string };
+					digests: { packageRootSha256: string };
+				}>;
+			};
+			const resolved = await packageManager.resolve();
+
+			for (const [manifestId, fixture] of Object.entries(wasmPackageTrustParityFixtures)) {
+				const packageRoot = realpathSync(fixture.root);
+				const manifestPath = join(fixture.root, "pi-extension.json");
+				const artifactAbsolutePath = realpathSync(join(fixture.root, "wasm/plugin.wasm"));
+				const lockEntry = lock.entries.find((entry) => entry.manifest.id === manifestId);
+				expect(lockEntry).toMatchObject({
+					key: `local:${packageRoot}`,
+					source: { type: "local", identity: packageRoot },
+					manifest: {
+						schemaVersion: "pi-extension.v0",
+						id: manifestId,
+						version: "0.1.0",
+						toolId: fixture.toolId,
+					},
+					packageRoot,
+					manifestPath,
+					artifact: {
+						path: "wasm/plugin.wasm",
+						absolutePath: artifactAbsolutePath,
+						sha256: fixture.artifactSha256,
+					},
+					digests: { packageRootSha256: fixture.packageRootSha256 },
+				});
+				const wasmExtension = resolved.wasmExtensions.find((extension) => extension.id === manifestId);
+				expect(wasmExtension?.identity.key).toBe(
+					`wasm:package:pi-extension.v0:${manifestId}:0.1.0:user:${packageRoot}:${packageRoot}:${fixture.packageRootSha256}:${fixture.artifactSha256}:${manifestPath}:${artifactAbsolutePath}`,
+				);
+			}
+		});
+
+		it("should reject invalid bytes in copied repository Wasm fixture artifacts", async () => {
+			const invalidFixtureRoot = join(tempDir, "invalid-pure-truncate-head-v0");
+			mkdirSync(join(invalidFixtureRoot, "wasm"), { recursive: true });
+			writeFileSync(
+				join(invalidFixtureRoot, "pi-extension.json"),
+				readFileSync(join(pureWasmFixtureRoot, "pi-extension.json")),
+			);
+			writeFileSync(join(invalidFixtureRoot, "wasm/plugin.wasm"), "not wasm");
+
+			await expect(packageManager.installAndPersist(invalidFixtureRoot)).rejects.toThrow(
+				"$.artifact.path: artifact file is not a valid Wasm binary",
+			);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+			expect(existsSync(join(agentDir, "extensions.lock.json"))).toBe(false);
 		});
 
 		it("should preserve package.json pi.extensions Bun package behavior without pi-extension.json", async () => {

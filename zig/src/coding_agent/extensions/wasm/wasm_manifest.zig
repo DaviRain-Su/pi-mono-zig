@@ -3,6 +3,33 @@ const std = @import("std");
 pub const MANIFEST_FILE_NAME = "pi-extension.json";
 pub const SCHEMA_VERSION = "pi-extension.v0";
 const MAX_SAFE_INTEGER: u64 = 9007199254740991;
+pub const ARTIFACT_DIGEST_MISMATCH_CATEGORY = "artifact_digest_mismatch";
+pub const ARTIFACT_INVALID_CATEGORY = "artifact_invalid";
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const SHA256_HEX_LEN = Sha256.digest_length * 2;
+const HOST_NOISE_DIRS = [_][]const u8{
+    ".git",
+    ".hg",
+    ".svn",
+    ".pi",
+    ".cache",
+    ".npm",
+    ".yarn",
+    ".pnpm-store",
+    ".parcel-cache",
+    ".turbo",
+};
+const HOST_NOISE_FILES = [_][]const u8{
+    "extensions.lock.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+    ".DS_Store",
+};
 
 pub const LifecyclePhase = enum {
     discover,
@@ -289,6 +316,7 @@ pub const Manifest = struct {
     artifact_path: []u8,
     artifact_absolute_path: []u8,
     artifact_sha256: []u8,
+    package_root_sha256: []u8,
     tool_id: []u8,
     tool_description: []u8,
     input_schema_json: []u8,
@@ -307,6 +335,7 @@ pub const Manifest = struct {
         allocator.free(self.artifact_path);
         allocator.free(self.artifact_absolute_path);
         allocator.free(self.artifact_sha256);
+        allocator.free(self.package_root_sha256);
         allocator.free(self.tool_id);
         allocator.free(self.tool_description);
         allocator.free(self.input_schema_json);
@@ -521,8 +550,10 @@ fn buildValidManifestResult(
     errdefer allocator.free(owned_package_root);
     const owned_manifest_path = try std.fs.path.join(allocator, &.{ fields.package_root, MANIFEST_FILE_NAME });
     errdefer allocator.free(owned_manifest_path);
-    const owned_artifact_sha256 = try allocator.dupe(u8, "");
+    const owned_artifact_sha256 = try computeArtifactSha256(allocator, fields.artifact_absolute_path);
     errdefer allocator.free(owned_artifact_sha256);
+    const owned_package_root_sha256 = try computePackageRootSha256(allocator, owned_package_root);
+    errdefer allocator.free(owned_package_root_sha256);
     const owned_schema_version = try allocator.dupe(u8, fields.schema_version);
     errdefer allocator.free(owned_schema_version);
     const owned_extension_id = try allocator.dupe(u8, fields.extension_id);
@@ -559,6 +590,7 @@ fn buildValidManifestResult(
             .artifact_path = owned_artifact_path,
             .artifact_absolute_path = fields.artifact_absolute_path,
             .artifact_sha256 = owned_artifact_sha256,
+            .package_root_sha256 = owned_package_root_sha256,
             .tool_id = owned_tool_id,
             .tool_description = owned_tool_description,
             .input_schema_json = owned_input_schema_json,
@@ -595,18 +627,7 @@ pub fn validateManifestFileWithOptions(
         return .{ .invalid = diagnostics };
     };
     defer allocator.free(bytes);
-    var result = try validateManifestTextWithOptions(allocator, package_root, bytes, options);
-    errdefer result.deinit(allocator);
-    if (result == .valid) {
-        const artifact_bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, result.valid.artifact_absolute_path, allocator, .limited(64 * 1024 * 1024));
-        defer allocator.free(artifact_bytes);
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(artifact_bytes, &digest, .{});
-        const artifact_sha256 = try bytesToHexAlloc(allocator, &digest);
-        allocator.free(result.valid.artifact_sha256);
-        result.valid.artifact_sha256 = artifact_sha256;
-    }
-    return result;
+    return validateManifestTextWithOptions(allocator, package_root, bytes, options);
 }
 
 const unsupported_surface_fields = [_][]const u8{
@@ -627,9 +648,20 @@ fn invalidOne(
     path: []const u8,
     message: []const u8,
 ) !ValidationResult {
+    return invalidOneCategory(allocator, "validation_error", phase, path, message);
+}
+
+fn invalidOneCategory(
+    allocator: std.mem.Allocator,
+    category: []const u8,
+    phase: LifecyclePhase,
+    path: []const u8,
+    message: []const u8,
+) !ValidationResult {
     const diagnostics = try allocator.alloc(Diagnostic, 1);
     errdefer allocator.free(diagnostics);
     diagnostics[0] = .{
+        .category = category,
         .phase = phase,
         .path = try allocator.dupe(u8, path),
         .message = try allocator.dupe(u8, message),
@@ -1002,6 +1034,25 @@ fn validateArtifactPath(
         return .{ .invalid = try invalidOne(allocator, .validate, "$.artifact.path", "artifact path resolves outside package root") };
     }
 
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const stat = std.Io.Dir.statFile(.cwd(), io, candidate_real, .{}) catch {
+        allocator.free(candidate_real);
+        return .{ .invalid = try invalidOne(allocator, .validate, "$.artifact.path", "artifact file was not found") };
+    };
+    if (stat.kind != .file) {
+        allocator.free(candidate_real);
+        return .{ .invalid = try invalidOne(allocator, .validate, "$.artifact.path", "artifact path must point to a file") };
+    }
+    const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, candidate_real, allocator, .limited(512 * 1024)) catch {
+        allocator.free(candidate_real);
+        return .{ .invalid = try invalidOne(allocator, .validate, "$.artifact.path", "artifact file was not found") };
+    };
+    defer allocator.free(bytes);
+    if (bytes.len < 4 or bytes[0] != 0x00 or bytes[1] != 0x61 or bytes[2] != 0x73 or bytes[3] != 0x6d) {
+        allocator.free(candidate_real);
+        return .{ .invalid = try invalidOneCategory(allocator, ARTIFACT_INVALID_CATEGORY, .validate, "$.artifact.path", "artifact file is not a valid Wasm binary") };
+    }
+
     return .{ .valid = candidate_real };
 }
 
@@ -1020,13 +1071,272 @@ fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return allocator.dupe(u8, std.mem.span(resolved));
 }
 
-fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const output = try allocator.alloc(u8, bytes.len * 2);
-    for (bytes, 0..) |byte, index| {
-        output[index * 2] = std.fmt.digitToChar(@intCast(byte >> 4), .lower);
-        output[index * 2 + 1] = std.fmt.digitToChar(@intCast(byte & 0x0f), .lower);
+pub const ArtifactDigestDiagnostic = struct {
+    category: []const u8 = ARTIFACT_DIGEST_MISMATCH_CATEGORY,
+    expected: []u8,
+    actual: []u8,
+    artifact_path: []u8,
+
+    pub fn deinit(self: *ArtifactDigestDiagnostic, allocator: std.mem.Allocator) void {
+        allocator.free(self.expected);
+        allocator.free(self.actual);
+        allocator.free(self.artifact_path);
+        self.* = undefined;
     }
-    return output;
+};
+
+pub const PackageTrustPrincipalInputs = struct {
+    scope: []u8,
+    source_identity: []u8,
+    lock_entry_key: []u8,
+    schema_version: []u8,
+    id: []u8,
+    version: []u8,
+    package_root: []u8,
+    package_root_sha256: []u8,
+    manifest_path: []u8,
+    artifact_path: []u8,
+    artifact_absolute_path: []u8,
+    artifact_sha256: []u8,
+
+    pub fn deinit(self: *PackageTrustPrincipalInputs, allocator: std.mem.Allocator) void {
+        allocator.free(self.scope);
+        allocator.free(self.source_identity);
+        allocator.free(self.lock_entry_key);
+        allocator.free(self.schema_version);
+        allocator.free(self.id);
+        allocator.free(self.version);
+        allocator.free(self.package_root);
+        allocator.free(self.package_root_sha256);
+        allocator.free(self.manifest_path);
+        allocator.free(self.artifact_path);
+        allocator.free(self.artifact_absolute_path);
+        allocator.free(self.artifact_sha256);
+        self.* = undefined;
+    }
+};
+
+pub fn packageTrustPrincipalInputs(
+    allocator: std.mem.Allocator,
+    scope: []const u8,
+    source_identity: []const u8,
+    manifest: *const Manifest,
+) !PackageTrustPrincipalInputs {
+    const owned_scope = try allocator.dupe(u8, scope);
+    errdefer allocator.free(owned_scope);
+    const owned_source_identity = try allocator.dupe(u8, source_identity);
+    errdefer allocator.free(owned_source_identity);
+    const lock_entry_key = try std.fmt.allocPrint(allocator, "local:{s}", .{source_identity});
+    errdefer allocator.free(lock_entry_key);
+    const schema_version = try allocator.dupe(u8, manifest.schema_version);
+    errdefer allocator.free(schema_version);
+    const id = try allocator.dupe(u8, manifest.id);
+    errdefer allocator.free(id);
+    const version = try allocator.dupe(u8, manifest.version);
+    errdefer allocator.free(version);
+    const package_root = try allocator.dupe(u8, manifest.package_root);
+    errdefer allocator.free(package_root);
+    const package_root_sha256 = try allocator.dupe(u8, manifest.package_root_sha256);
+    errdefer allocator.free(package_root_sha256);
+    const manifest_path = try allocator.dupe(u8, manifest.manifest_path);
+    errdefer allocator.free(manifest_path);
+    const artifact_path = try allocator.dupe(u8, manifest.artifact_path);
+    errdefer allocator.free(artifact_path);
+    const artifact_absolute_path = try allocator.dupe(u8, manifest.artifact_absolute_path);
+    errdefer allocator.free(artifact_absolute_path);
+    const artifact_sha256 = try allocator.dupe(u8, manifest.artifact_sha256);
+    errdefer allocator.free(artifact_sha256);
+
+    return .{
+        .scope = owned_scope,
+        .source_identity = owned_source_identity,
+        .lock_entry_key = lock_entry_key,
+        .schema_version = schema_version,
+        .id = id,
+        .version = version,
+        .package_root = package_root,
+        .package_root_sha256 = package_root_sha256,
+        .manifest_path = manifest_path,
+        .artifact_path = artifact_path,
+        .artifact_absolute_path = artifact_absolute_path,
+        .artifact_sha256 = artifact_sha256,
+    };
+}
+
+pub fn verifyArtifactSha256(
+    allocator: std.mem.Allocator,
+    artifact_path: []const u8,
+    expected_sha256: []const u8,
+) !?ArtifactDigestDiagnostic {
+    const actual_sha256 = try computeArtifactSha256(allocator, artifact_path);
+    errdefer allocator.free(actual_sha256);
+    if (std.mem.eql(u8, expected_sha256, actual_sha256)) {
+        allocator.free(actual_sha256);
+        return null;
+    }
+    const expected = try allocator.dupe(u8, expected_sha256);
+    errdefer allocator.free(expected);
+    const path = try allocator.dupe(u8, artifact_path);
+    errdefer allocator.free(path);
+    return .{
+        .expected = expected,
+        .actual = actual_sha256,
+        .artifact_path = path,
+    };
+}
+
+pub fn computeArtifactSha256(allocator: std.mem.Allocator, artifact_path: []const u8) ![]u8 {
+    const bytes = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.Io.Threaded.global_single_threaded.io(),
+        artifact_path,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    return sha256HexAlloc(allocator, bytes);
+}
+
+pub fn computePackageRootSha256(allocator: std.mem.Allocator, package_root: []const u8) ![]u8 {
+    const root_real = try realpathAlloc(allocator, package_root);
+    defer allocator.free(root_real);
+    var files = std.ArrayList(DigestFile).empty;
+    defer deinitDigestFiles(allocator, &files);
+    try collectPackageDigestFiles(allocator, root_real, root_real, &files);
+    std.mem.sort(DigestFile, files.items, {}, digestFileLessThan);
+
+    var hasher = Sha256.init(.{});
+    for (files.items) |file| {
+        const bytes = try std.Io.Dir.readFileAlloc(
+            .cwd(),
+            std.Io.Threaded.global_single_threaded.io(),
+            file.absolute_path,
+            allocator,
+            .limited(64 * 1024 * 1024),
+        );
+        defer allocator.free(bytes);
+        hasher.update(file.relative_path);
+        hasher.update("\x00");
+        hasher.update(bytes);
+        hasher.update("\x00");
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digestHexAlloc(allocator, digest);
+}
+
+fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return digestHexAlloc(allocator, digest);
+}
+
+fn digestHexAlloc(allocator: std.mem.Allocator, digest: [Sha256.digest_length]u8) ![]u8 {
+    var hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, hex[0..]);
+}
+
+fn expectLowercaseSha256(value: []const u8) !void {
+    try std.testing.expectEqual(@as(usize, SHA256_HEX_LEN), value.len);
+    for (value) |byte| {
+        try std.testing.expect((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'));
+    }
+}
+
+const DigestFile = struct {
+    absolute_path: []u8,
+    relative_path: []u8,
+};
+
+fn deinitDigestFiles(allocator: std.mem.Allocator, files: *std.ArrayList(DigestFile)) void {
+    for (files.items) |file| {
+        allocator.free(file.absolute_path);
+        allocator.free(file.relative_path);
+    }
+    files.deinit(allocator);
+}
+
+fn collectPackageDigestFiles(
+    allocator: std.mem.Allocator,
+    root_real: []const u8,
+    dir_path: []const u8,
+    files: *std.ArrayList(DigestFile),
+) anyerror!void {
+    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), dir_path, .{ .iterate = true });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var iterator = dir.iterate();
+    while (try iterator.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (shouldSkipHostNoise(entry.name)) continue;
+        const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(full_path);
+        switch (entry.kind) {
+            .directory => try collectPackageDigestFiles(allocator, root_real, full_path, files),
+            .file => try appendDigestFile(allocator, root_real, full_path, files),
+            .sym_link => try collectSymlinkTargetDigestFile(allocator, root_real, full_path, files),
+            else => {},
+        }
+    }
+}
+
+fn collectSymlinkTargetDigestFile(
+    allocator: std.mem.Allocator,
+    root_real: []const u8,
+    link_path: []const u8,
+    files: *std.ArrayList(DigestFile),
+) anyerror!void {
+    const target_real = realpathAlloc(allocator, link_path) catch return;
+    defer allocator.free(target_real);
+    const stat = std.Io.Dir.statFile(.cwd(), std.Io.Threaded.global_single_threaded.io(), target_real, .{}) catch return;
+    if (stat.kind == .directory) {
+        try collectPackageDigestFiles(allocator, root_real, target_real, files);
+    } else if (stat.kind == .file) {
+        try appendDigestFile(allocator, root_real, target_real, files);
+    }
+}
+
+fn appendDigestFile(
+    allocator: std.mem.Allocator,
+    root_real: []const u8,
+    absolute_path: []const u8,
+    files: *std.ArrayList(DigestFile),
+) !void {
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    const relative_native = try std.fs.path.relative(allocator, cwd, null, root_real, absolute_path);
+    defer allocator.free(relative_native);
+    const relative_path = try toPolicyPathAlloc(allocator, relative_native);
+    errdefer allocator.free(relative_path);
+    const owned_absolute_path = try allocator.dupe(u8, absolute_path);
+    errdefer allocator.free(owned_absolute_path);
+    try files.append(allocator, .{
+        .absolute_path = owned_absolute_path,
+        .relative_path = relative_path,
+    });
+}
+
+fn digestFileLessThan(_: void, lhs: DigestFile, rhs: DigestFile) bool {
+    return std.mem.lessThan(u8, lhs.relative_path, rhs.relative_path);
+}
+
+fn shouldSkipHostNoise(name: []const u8) bool {
+    if (name.len > 0 and name[0] == '.') {
+        for (HOST_NOISE_DIRS) |noise_dir| {
+            if (std.mem.eql(u8, name, noise_dir)) return true;
+        }
+    }
+    for (HOST_NOISE_FILES) |noise_file| {
+        if (std.mem.eql(u8, name, noise_file)) return true;
+    }
+    return false;
+}
+
+fn toPolicyPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const normalized = try allocator.dupe(u8, path);
+    for (normalized) |*byte| {
+        if (byte.* == std.fs.path.sep) byte.* = '/';
+    }
+    return normalized;
 }
 
 const VALID_MANIFEST =
@@ -1117,6 +1427,119 @@ test "wasm manifest valid one-tool pi-extension validates successfully" {
     try std.testing.expectEqual(@as(usize, 0), result.valid.requested_capabilities.len);
     try std.testing.expectEqual(@as(usize, 0), result.valid.resource_limits.tool_scopes.len);
     try std.testing.expect(std.fs.path.isAbsolute(result.valid.artifact_absolute_path));
+}
+
+test "wasm manifest package trust digests match TypeScript parity fixtures" {
+    const allocator = std.testing.allocator;
+    const fixtures = [_]struct {
+        root: []const u8,
+        manifest_id: []const u8,
+        tool_id: []const u8,
+        artifact_sha256: []const u8,
+        package_root_sha256: []const u8,
+    }{
+        .{
+            .root = "test/fixtures/wasm/pure-truncate-head-v0",
+            .manifest_id = "com.pi.pure-truncate-head",
+            .tool_id = "builtin.truncateHead",
+            .artifact_sha256 = "fffac4554b1c0f2e8a8f44372f0766826ba4a06d60a314b67b7e78dca95c952e",
+            .package_root_sha256 = "8a4bcc11ba1a0302523cf648c3d0efa1b823100ba1a20805ac0dfcf4886e6b7e",
+        },
+        .{
+            .root = "test/fixtures/wasm/browser-tool-v0",
+            .manifest_id = "com.pi.browser-fixture",
+            .tool_id = "fixture.echo",
+            .artifact_sha256 = "b7bf7f6ecf5ac4092017d317b7630b1aeff4c2fd11ecffae52c93900025ea520",
+            .package_root_sha256 = "4ea7cbb8ed506639af92f7a1a2bca6edeec95771b87fd58b8f9bb9b60940b688",
+        },
+    };
+
+    for (fixtures) |fixture| {
+        var result = try validateManifestFile(allocator, std.testing.io, fixture.root);
+        defer result.deinit(allocator);
+        try std.testing.expect(result == .valid);
+        try std.testing.expectEqualStrings(fixture.manifest_id, result.valid.id);
+        try std.testing.expectEqualStrings(fixture.tool_id, result.valid.tool_id);
+        try std.testing.expectEqualStrings(fixture.artifact_sha256, result.valid.artifact_sha256);
+        try std.testing.expectEqualStrings(fixture.package_root_sha256, result.valid.package_root_sha256);
+        try expectLowercaseSha256(result.valid.artifact_sha256);
+        try expectLowercaseSha256(result.valid.package_root_sha256);
+    }
+}
+
+test "wasm manifest package trust principal inputs match TypeScript parity shape" {
+    const allocator = std.testing.allocator;
+    const package_root = try realpathAlloc(allocator, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer allocator.free(package_root);
+    var result = try validateManifestFile(allocator, std.testing.io, package_root);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .valid);
+
+    var principal = try packageTrustPrincipalInputs(allocator, "user", package_root, &result.valid);
+    defer principal.deinit(allocator);
+
+    try std.testing.expectEqualStrings("user", principal.scope);
+    try std.testing.expectEqualStrings(package_root, principal.source_identity);
+    const expected_key = try std.fmt.allocPrint(allocator, "local:{s}", .{package_root});
+    defer allocator.free(expected_key);
+    try std.testing.expectEqualStrings(expected_key, principal.lock_entry_key);
+    try std.testing.expectEqualStrings("pi-extension.v0", principal.schema_version);
+    try std.testing.expectEqualStrings("com.pi.pure-truncate-head", principal.id);
+    try std.testing.expectEqualStrings("0.1.0", principal.version);
+    try std.testing.expectEqualStrings(package_root, principal.package_root);
+    try std.testing.expectEqualStrings("8a4bcc11ba1a0302523cf648c3d0efa1b823100ba1a20805ac0dfcf4886e6b7e", principal.package_root_sha256);
+    try std.testing.expect(std.mem.endsWith(u8, principal.manifest_path, "pure-truncate-head-v0/pi-extension.json"));
+    try std.testing.expectEqualStrings("wasm/plugin.wasm", principal.artifact_path);
+    try std.testing.expect(std.mem.endsWith(u8, principal.artifact_absolute_path, "pure-truncate-head-v0/wasm/plugin.wasm"));
+    try std.testing.expectEqualStrings("fffac4554b1c0f2e8a8f44372f0766826ba4a06d60a314b67b7e78dca95c952e", principal.artifact_sha256);
+}
+
+test "wasm manifest artifact mutation diagnostic uses TypeScript parity vocabulary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const package_root = try makeValidPackage(allocator, tmp);
+    defer allocator.free(package_root);
+
+    var result = try validateManifestText(allocator, package_root, VALID_MANIFEST);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .valid);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "package/wasm/example-tool.wasm", .data = "\x00asm\x02" });
+    var diagnostic = (try verifyArtifactSha256(allocator, result.valid.artifact_absolute_path, result.valid.artifact_sha256)).?;
+    defer diagnostic.deinit(allocator);
+
+    try std.testing.expectEqualStrings("artifact_digest_mismatch", diagnostic.category);
+    try std.testing.expectEqualStrings(result.valid.artifact_sha256, diagnostic.expected);
+    try expectLowercaseSha256(diagnostic.actual);
+    try std.testing.expect(!std.mem.eql(u8, diagnostic.expected, diagnostic.actual));
+}
+
+test "wasm manifest rejects invalid bytes in copied repository fixture artifacts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "package", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "package/wasm", .default_dir);
+    const manifest_bytes = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "test/fixtures/wasm/pure-truncate-head-v0/pi-extension.json",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(manifest_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "package/pi-extension.json", .data = manifest_bytes });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "package/wasm/plugin.wasm", .data = "not wasm" });
+    const package_root = try makeAbsoluteTestPath(allocator, tmp, "package");
+    defer allocator.free(package_root);
+
+    var result = try validateManifestFile(allocator, std.testing.io, package_root);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .invalid);
+    try std.testing.expectEqualStrings("artifact_invalid", result.invalid[0].category);
+    try std.testing.expectEqualStrings("$.artifact.path", result.invalid[0].path);
+    try std.testing.expectEqualStrings("artifact file is not a valid Wasm binary", result.invalid[0].message);
 }
 
 test "wasm manifest missing required fields produce deterministic diagnostics" {
