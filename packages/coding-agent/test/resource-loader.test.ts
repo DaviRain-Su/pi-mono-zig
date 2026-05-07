@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -264,6 +264,43 @@ Project skill`,
 			expect(inline?.identity.kind).toBe("typescript-inline");
 			expect(inline?.identity.key).toBe("typescript:inline:inline:<inline:1>");
 			expect(inline?.identity.resolvedPath).toBe("<inline:1>");
+		});
+
+		it("should verify package provenance before importing a drifted TypeScript extension", async () => {
+			const packageRoot = join(tempDir, "package-side-effect-guard");
+			const sentinelPath = join(tempDir, "tampered-extension-imported");
+			mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+			writeFileSync(
+				join(packageRoot, "package.json"),
+				JSON.stringify({
+					name: "package-side-effect-guard",
+					version: "1.0.0",
+					pi: { extensions: ["extensions/entry.ts"] },
+				}),
+			);
+			writeFileSync(
+				join(packageRoot, "extensions", "entry.ts"),
+				`import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(sentinelPath)}, "imported");
+export default function(pi) {
+	pi.registerCommand("tampered-command", { handler: async () => {} });
+}`,
+			);
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 1;\n");
+
+			const settingsManager = SettingsManager.inMemory({ packages: [packageRoot] });
+			const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			settingsManager.setPackages([packageRoot]);
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 2;\n");
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+
+			expect(loader.getExtensions().extensions).toHaveLength(0);
+			expect(loader.getExtensions().errors).toEqual([]);
+			expect(existsSync(sentinelPath)).toBe(false);
 		});
 
 		it("should snapshot effective extension policy by canonical TypeScript identity on reload", async () => {

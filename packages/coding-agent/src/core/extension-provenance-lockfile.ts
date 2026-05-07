@@ -63,7 +63,17 @@ export interface ExtensionProvenanceLockfile {
 	entries: ExtensionProvenanceLockEntry[];
 }
 
-export type ExtensionProvenanceDiagnosticCategory = "missing_lockfile" | "missing_lock_entry" | "malformed_lockfile";
+export type ExtensionProvenanceDiagnosticCategory =
+	| "missing_lockfile"
+	| "missing_lock_entry"
+	| "malformed_lockfile"
+	| "source_identity_mismatch"
+	| "package_root_mismatch"
+	| "manifest_provenance_mismatch"
+	| "artifact_path_mismatch"
+	| "artifact_digest_mismatch"
+	| "package_root_digest_mismatch"
+	| "package_validation_failed";
 
 export interface ExtensionProvenanceDiagnostic {
 	category: ExtensionProvenanceDiagnosticCategory;
@@ -74,6 +84,12 @@ export interface ExtensionProvenanceDiagnostic {
 	recoveryHint: string;
 	source?: string;
 	path?: string;
+	field?: string;
+	expected?: string;
+	actual?: string;
+	packageRoot?: string;
+	manifestPath?: string;
+	artifactPath?: string;
 }
 
 export interface ExtensionProvenanceLoadResult {

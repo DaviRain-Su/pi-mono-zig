@@ -243,6 +243,17 @@ interface PackageFilter {
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 
 const RESOURCE_TYPES: ResourceType[] = ["extensions", "skills", "prompts", "themes"];
+const PROVENANCE_SOURCE_FIELDS: Array<keyof ExtensionProvenanceSourceIdentity> = ["type", "identity", "specifier"];
+const PROVENANCE_MANIFEST_FIELDS: Array<keyof ExtensionProvenanceLockEntry["manifest"]> = [
+	"kind",
+	"packageName",
+	"packageVersion",
+	"schemaVersion",
+	"id",
+	"name",
+	"version",
+	"toolId",
+];
 
 const FILE_PATTERNS: Record<ResourceType, RegExp> = {
 	extensions: /\.(ts|js)$/,
@@ -1009,6 +1020,282 @@ export class DefaultPackageManager implements PackageManager {
 		return entry;
 	}
 
+	private verifyTrustedLockEntryForSource(
+		source: string,
+		parsed: ParsedSource,
+		scope: InstalledSourceScope,
+		lockEntry: ExtensionProvenanceLockEntry,
+		accumulator: ResourceAccumulator,
+	): boolean {
+		let currentEntry: ExtensionProvenanceLockEntry | undefined;
+		try {
+			currentEntry = this.createProvenanceLockEntryForSource(source, parsed, scope, "settings");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "package_validation_failed",
+					scope,
+					source,
+					lockEntry,
+					message: `Unable to validate package provenance for ${scope} package source ${source}: ${message}`,
+					expected: "valid package provenance",
+					actual: message,
+					path: "$",
+				}),
+			);
+			return false;
+		}
+
+		if (!currentEntry) {
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "package_root_mismatch",
+					scope,
+					source,
+					lockEntry,
+					message: `Package root drift for ${scope} package source ${source}: configured package root is missing`,
+					expected: lockEntry.packageRoot,
+					actual: "missing",
+				}),
+			);
+			return false;
+		}
+
+		if (lockEntry.key !== currentEntry.key) {
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "source_identity_mismatch",
+					scope,
+					source,
+					lockEntry,
+					currentEntry,
+					message: `Source identity drift for ${scope} package source ${source}: lock entry key changed`,
+					expected: lockEntry.key,
+					actual: currentEntry.key,
+					field: "key",
+				}),
+			);
+			return false;
+		}
+
+		if (lockEntry.scope !== currentEntry.scope) {
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "source_identity_mismatch",
+					scope,
+					source,
+					lockEntry,
+					currentEntry,
+					message: `Source identity drift for ${scope} package source ${source}: scope changed`,
+					expected: lockEntry.scope,
+					actual: currentEntry.scope,
+					field: "scope",
+				}),
+			);
+			return false;
+		}
+
+		for (const field of PROVENANCE_SOURCE_FIELDS) {
+			const expected = lockEntry.source[field];
+			const actual = currentEntry.source[field];
+			if (expected !== actual) {
+				accumulator.diagnostics.push(
+					this.createProvenanceDriftDiagnostic({
+						category: "source_identity_mismatch",
+						scope,
+						source,
+						lockEntry,
+						currentEntry,
+						message: `Source identity drift for ${scope} package source ${source}: source.${field} changed`,
+						expected,
+						actual,
+						field: `source.${field}`,
+					}),
+				);
+				return false;
+			}
+		}
+
+		if (lockEntry.packageRoot !== currentEntry.packageRoot) {
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "package_root_mismatch",
+					scope,
+					source,
+					lockEntry,
+					currentEntry,
+					message: `Package root drift for ${scope} package source ${source}`,
+					expected: lockEntry.packageRoot,
+					actual: currentEntry.packageRoot,
+					field: "packageRoot",
+				}),
+			);
+			return false;
+		}
+
+		if (lockEntry.manifestPath !== currentEntry.manifestPath) {
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "manifest_provenance_mismatch",
+					scope,
+					source,
+					lockEntry,
+					currentEntry,
+					message: `Manifest provenance drift for ${scope} package source ${source}: manifestPath changed`,
+					expected: lockEntry.manifestPath,
+					actual: currentEntry.manifestPath,
+					field: "manifestPath",
+				}),
+			);
+			return false;
+		}
+
+		for (const field of PROVENANCE_MANIFEST_FIELDS) {
+			const expected = lockEntry.manifest[field];
+			const actual = currentEntry.manifest[field];
+			if (expected !== actual) {
+				accumulator.diagnostics.push(
+					this.createProvenanceDriftDiagnostic({
+						category: "manifest_provenance_mismatch",
+						scope,
+						source,
+						lockEntry,
+						currentEntry,
+						message: `Manifest provenance drift for ${scope} package source ${source}: manifest.${field} changed`,
+						expected,
+						actual,
+						field: `manifest.${field}`,
+					}),
+				);
+				return false;
+			}
+		}
+
+		const artifactDiagnostic = this.verifyTrustedArtifactProvenance(source, scope, lockEntry, currentEntry);
+		if (artifactDiagnostic) {
+			accumulator.diagnostics.push(artifactDiagnostic);
+			return false;
+		}
+
+		if (lockEntry.digests.packageRootSha256 !== currentEntry.digests.packageRootSha256) {
+			accumulator.diagnostics.push(
+				this.createProvenanceDriftDiagnostic({
+					category: "package_root_digest_mismatch",
+					scope,
+					source,
+					lockEntry,
+					currentEntry,
+					message: `Package-root digest drift for ${scope} package source ${source}`,
+					expected: lockEntry.digests.packageRootSha256,
+					actual: currentEntry.digests.packageRootSha256,
+					field: "digests.packageRootSha256",
+				}),
+			);
+			return false;
+		}
+
+		return true;
+	}
+
+	private verifyTrustedArtifactProvenance(
+		source: string,
+		scope: InstalledSourceScope,
+		lockEntry: ExtensionProvenanceLockEntry,
+		currentEntry: ExtensionProvenanceLockEntry,
+	): ExtensionProvenanceDiagnostic | undefined {
+		if (!lockEntry.artifact && !currentEntry.artifact) {
+			return undefined;
+		}
+		if (!lockEntry.artifact || !currentEntry.artifact) {
+			return this.createProvenanceDriftDiagnostic({
+				category: "artifact_path_mismatch",
+				scope,
+				source,
+				lockEntry,
+				currentEntry,
+				message: `Artifact provenance drift for ${scope} package source ${source}: artifact presence changed`,
+				expected: lockEntry.artifact?.path,
+				actual: currentEntry.artifact?.path,
+				field: "artifact",
+			});
+		}
+		if (lockEntry.artifact.path !== currentEntry.artifact.path) {
+			return this.createProvenanceDriftDiagnostic({
+				category: "artifact_path_mismatch",
+				scope,
+				source,
+				lockEntry,
+				currentEntry,
+				message: `Artifact path drift for ${scope} package source ${source}`,
+				expected: lockEntry.artifact.path,
+				actual: currentEntry.artifact.path,
+				field: "artifact.path",
+			});
+		}
+		if (lockEntry.artifact.absolutePath !== currentEntry.artifact.absolutePath) {
+			return this.createProvenanceDriftDiagnostic({
+				category: "artifact_path_mismatch",
+				scope,
+				source,
+				lockEntry,
+				currentEntry,
+				message: `Artifact resolved path drift for ${scope} package source ${source}`,
+				expected: lockEntry.artifact.absolutePath,
+				actual: currentEntry.artifact.absolutePath,
+				field: "artifact.absolutePath",
+			});
+		}
+		if (lockEntry.artifact.sha256 !== currentEntry.artifact.sha256) {
+			return this.createProvenanceDriftDiagnostic({
+				category: "artifact_digest_mismatch",
+				scope,
+				source,
+				lockEntry,
+				currentEntry,
+				message: `Artifact digest drift for ${scope} package source ${source}`,
+				expected: lockEntry.artifact.sha256,
+				actual: currentEntry.artifact.sha256,
+				field: "artifact.sha256",
+			});
+		}
+		return undefined;
+	}
+
+	private createProvenanceDriftDiagnostic(options: {
+		category: ExtensionProvenanceDiagnostic["category"];
+		scope: InstalledSourceScope;
+		source: string;
+		lockEntry: ExtensionProvenanceLockEntry;
+		currentEntry?: ExtensionProvenanceLockEntry;
+		message: string;
+		expected?: string;
+		actual?: string;
+		field?: string;
+		path?: string;
+	}): ExtensionProvenanceDiagnostic {
+		const diagnostic: ExtensionProvenanceDiagnostic = {
+			category: options.category,
+			scope: options.scope,
+			lockfilePath: this.getProvenanceLockfilePath(options.scope),
+			phase: "resolve",
+			source: options.source,
+			message: options.message,
+			recoveryHint: "Run install or update for the package to refresh trusted extension provenance.",
+		};
+		const packageRoot = options.currentEntry?.packageRoot ?? options.lockEntry.packageRoot;
+		const manifestPath = options.currentEntry?.manifestPath ?? options.lockEntry.manifestPath;
+		const artifactPath = options.currentEntry?.artifact?.path ?? options.lockEntry.artifact?.path;
+		if (options.expected !== undefined) diagnostic.expected = options.expected;
+		if (options.actual !== undefined) diagnostic.actual = options.actual;
+		if (options.field !== undefined) diagnostic.field = options.field;
+		if (options.path !== undefined) diagnostic.path = options.path;
+		if (packageRoot !== undefined) diagnostic.packageRoot = packageRoot;
+		if (manifestPath !== undefined) diagnostic.manifestPath = manifestPath;
+		if (artifactPath !== undefined) diagnostic.artifactPath = artifactPath;
+		return diagnostic;
+	}
+
 	private writeProvenanceLockForSource(
 		source: string,
 		scope: InstalledSourceScope,
@@ -1574,6 +1861,9 @@ export class DefaultPackageManager implements PackageManager {
 			if (enforceProvenance && scope !== "temporary") {
 				const lockEntry = this.getTrustedLockEntryForSource(sourceStr, parsed, scope, accumulator);
 				if (!lockEntry) {
+					continue;
+				}
+				if (!this.verifyTrustedLockEntryForSource(sourceStr, parsed, scope, lockEntry, accumulator)) {
 					continue;
 				}
 			}

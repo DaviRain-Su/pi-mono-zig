@@ -1787,6 +1787,192 @@ Skill v2
 			expect(readDigest()).toBe(previousDigest);
 		});
 
+		it("should reject package-root drift during resolve without refreshing trust and recover after install", async () => {
+			const pkgDir = join(tempDir, "resolve-drift-package");
+			const entryPath = writeTypeScriptPackage(pkgDir, { name: "resolve-drift-package" });
+
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			settingsManager.setPackages([pkgDir]);
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const trustedLockBytes = readFileSync(lockPath, "utf-8");
+			const trustedLock = readJsonFile(lockPath) as {
+				entries: Array<{ digests: { packageRootSha256: string }; packageRoot: string }>;
+			};
+			const expectedDigest = trustedLock.entries[0].digests.packageRootSha256;
+
+			writeFileSync(entryPath, "export default function changed() {}\n");
+			const drifted = await packageManager.resolve();
+
+			expect(drifted.extensions).toHaveLength(0);
+			expect(drifted.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "package_root_digest_mismatch",
+					scope: "user",
+					source: pkgDir,
+					lockfilePath: lockPath,
+					packageRoot: realpathSync(pkgDir),
+					expected: expectedDigest,
+					phase: "resolve",
+				}),
+			]);
+			expect(drifted.diagnostics[0]?.actual).toMatch(/^[a-f0-9]{64}$/);
+			expect(drifted.diagnostics[0]?.actual).not.toBe(expectedDigest);
+			expect(readFileSync(lockPath, "utf-8")).toBe(trustedLockBytes);
+
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			const recovered = await packageManager.resolve();
+			expect(recovered.diagnostics).toEqual([]);
+			expect(recovered.extensions.some((extension) => extension.path === entryPath)).toBe(true);
+		});
+
+		it("should classify Wasm artifact, artifact path, and manifest drift before package-root drift", async () => {
+			const artifactDigestPackage = join(tempDir, "artifact-digest-drift-package");
+			writeWasmPackage(artifactDigestPackage, {
+				artifactBytes: Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01]),
+			});
+			await packageManager.installAndPersist(artifactDigestPackage);
+			await settingsManager.flush();
+			settingsManager.setPackages([artifactDigestPackage]);
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const digestLock = readJsonFile(lockPath) as {
+				entries: Array<{ artifact: { sha256: string; path: string; absolutePath: string } }>;
+			};
+			writeFileSync(join(artifactDigestPackage, "wasm", "plugin.wasm"), Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x02]));
+
+			const artifactDigestDrift = await packageManager.resolve();
+			expect(artifactDigestDrift.wasmExtensions).toHaveLength(0);
+			expect(artifactDigestDrift.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "artifact_digest_mismatch",
+					scope: "user",
+					source: artifactDigestPackage,
+					artifactPath: "wasm/plugin.wasm",
+					expected: digestLock.entries[0].artifact.sha256,
+				}),
+			]);
+			expect(artifactDigestDrift.diagnostics[0]?.actual).toMatch(/^[a-f0-9]{64}$/);
+
+			const artifactPathPackage = join(tempDir, "artifact-path-drift-package");
+			writeWasmPackage(artifactPathPackage, {
+				artifactBytes: Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x03]),
+			});
+			await packageManager.installAndPersist(artifactPathPackage);
+			await settingsManager.flush();
+			settingsManager.setPackages([artifactPathPackage]);
+			const pathManifest = readJsonFile(join(artifactPathPackage, "pi-extension.json")) as {
+				artifact: { path: string };
+			};
+			mkdirSync(join(artifactPathPackage, "alternate"), { recursive: true });
+			writeFileSync(
+				join(artifactPathPackage, "alternate", "plugin.wasm"),
+				readFileSync(join(artifactPathPackage, "wasm", "plugin.wasm")),
+			);
+			pathManifest.artifact.path = "alternate/plugin.wasm";
+			writeFileSync(join(artifactPathPackage, "pi-extension.json"), JSON.stringify(pathManifest));
+
+			const artifactPathDrift = await packageManager.resolve();
+			expect(artifactPathDrift.wasmExtensions).toHaveLength(0);
+			expect(artifactPathDrift.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "artifact_path_mismatch",
+					scope: "user",
+					source: artifactPathPackage,
+					artifactPath: "alternate/plugin.wasm",
+					expected: "wasm/plugin.wasm",
+					actual: "alternate/plugin.wasm",
+				}),
+			]);
+
+			const manifestPackage = join(tempDir, "manifest-drift-package");
+			writeWasmPackage(manifestPackage, { id: "com.example.original-manifest" });
+			await packageManager.installAndPersist(manifestPackage);
+			await settingsManager.flush();
+			settingsManager.setPackages([manifestPackage]);
+			const manifest = readJsonFile(join(manifestPackage, "pi-extension.json")) as { id: string };
+			manifest.id = "com.example.changed-manifest";
+			writeFileSync(join(manifestPackage, "pi-extension.json"), JSON.stringify(manifest));
+
+			const manifestDrift = await packageManager.resolve();
+			expect(manifestDrift.wasmExtensions).toHaveLength(0);
+			expect(manifestDrift.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "manifest_provenance_mismatch",
+					scope: "user",
+					source: manifestPackage,
+					manifestPath: join(manifestPackage, "pi-extension.json"),
+					expected: "com.example.original-manifest",
+					actual: "com.example.changed-manifest",
+				}),
+			]);
+		});
+
+		it("should deny lockfile source identity and package-root provenance mismatches", async () => {
+			const pkgDir = join(tempDir, "identity-mismatch-package");
+			writeTypeScriptPackage(pkgDir);
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			settingsManager.setPackages([pkgDir]);
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const lock = readJsonFile(lockPath) as {
+				entries: Array<{ source: { identity: string }; packageRoot: string }>;
+			};
+			lock.entries[0].source.identity = join(tempDir, "other-source");
+			writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+			const sourceMismatch = await packageManager.resolve();
+			expect(sourceMismatch.extensions).toHaveLength(0);
+			expect(sourceMismatch.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "source_identity_mismatch",
+					scope: "user",
+					source: pkgDir,
+					expected: join(tempDir, "other-source"),
+					actual: realpathSync(pkgDir),
+				}),
+			]);
+
+			lock.entries[0].source.identity = realpathSync(pkgDir);
+			lock.entries[0].packageRoot = join(tempDir, "other-root");
+			writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+			const rootMismatch = await packageManager.resolve();
+			expect(rootMismatch.extensions).toHaveLength(0);
+			expect(rootMismatch.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "package_root_mismatch",
+					scope: "user",
+					source: pkgDir,
+					expected: join(tempDir, "other-root"),
+					actual: realpathSync(pkgDir),
+				}),
+			]);
+		});
+
+		it("should isolate drift diagnostics to the offending package", async () => {
+			const driftedPackage = join(tempDir, "isolated-drift-package");
+			const cleanPackage = join(tempDir, "isolated-clean-package");
+			const driftedEntry = writeTypeScriptPackage(driftedPackage, { name: "isolated-drift-package" });
+			const cleanEntry = writeTypeScriptPackage(cleanPackage, { name: "isolated-clean-package" });
+
+			await packageManager.installAndPersist(driftedPackage);
+			await packageManager.installAndPersist(cleanPackage);
+			await settingsManager.flush();
+			settingsManager.setPackages([driftedPackage, cleanPackage]);
+			writeFileSync(driftedEntry, "export default function drifted() {}\n");
+
+			const result = await packageManager.resolve();
+			expect(result.extensions.map((extension) => extension.path)).toEqual([cleanEntry]);
+			expect(result.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "package_root_digest_mismatch",
+					scope: "user",
+					source: driftedPackage,
+				}),
+			]);
+		});
+
 		it("should remove only matching scope-local lock provenance after settings removal", async () => {
 			const removedPackage = join(tempDir, "removed-package");
 			const unrelatedPackage = join(tempDir, "unrelated-package");
