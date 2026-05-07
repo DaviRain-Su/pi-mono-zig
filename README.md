@@ -63,6 +63,10 @@ Bounded Sub-agent execution v0 adds product-neutral `sub_agent.delegate` and `/s
 
 Extension policy/config substrate adds canonical extension identities and persistent `extensionPolicies` with user/project policy merge. Policies default deny unless approved grants and resource limits allow execution, and denial diagnostics are auditable.
 
+Package trust/provenance for local extensions records validated package identity in a scope-local `extensions.lock.json`. Install and update compute manifest/package-root provenance, package-root SHA-256, and WASM artifact SHA-256 when applicable; load-time resolution rechecks those values before TypeScript import or WASM runtime handoff and reports drift without refreshing trust.
+
+Package-backed policies are bound to the locked digest identity, so stale, cross-scope, or legacy non-digest policy keys cannot authorize changed packages. The TypeScript and Zig implementations share the same digest/principal shape and are covered by package-manager, resource-loader, runner, and TS/Zig parity checks.
+
 Validation:
 
 ```bash
