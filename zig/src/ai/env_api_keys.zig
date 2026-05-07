@@ -147,6 +147,7 @@ fn resolveEnvVar(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "opencode-go")) return "OPENCODE_API_KEY";
     if (std.mem.eql(u8, provider, "kimi")) return "MOONSHOT_API_KEY";
     if (std.mem.eql(u8, provider, "kimi-coding")) return "KIMI_API_KEY";
+    if (std.mem.eql(u8, provider, "kimi-code-openai")) return "KIMI_API_KEY";
     if (std.mem.eql(u8, provider, "cloudflare-workers-ai")) return "CLOUDFLARE_API_KEY";
     if (std.mem.eql(u8, provider, "cloudflare-ai-gateway")) return "CLOUDFLARE_API_KEY";
     if (std.mem.eql(u8, provider, "xiaomi")) return "XIAOMI_API_KEY";
@@ -228,6 +229,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
         .{ .provider = "opencode-go", .expected = "opencode-key" },
         .{ .provider = "kimi", .expected = "moonshot-key" },
         .{ .provider = "kimi-coding", .expected = "kimi-key" },
+        .{ .provider = "kimi-code-openai", .expected = "kimi-key" },
         .{ .provider = "cloudflare-workers-ai", .expected = "cloudflare-key" },
         .{ .provider = "cloudflare-ai-gateway", .expected = "cloudflare-key" },
         .{ .provider = "xiaomi", .expected = "xiaomi-key" },
@@ -294,6 +296,10 @@ test "getEnvApiKey ignores blank credential values" {
     const kimi_coding = try getEnvApiKeyFromMap(allocator, &env_map, "kimi-coding");
     defer if (kimi_coding) |value| allocator.free(value);
     try std.testing.expect(kimi_coding == null);
+
+    const kimi_code_openai = try getEnvApiKeyFromMap(allocator, &env_map, "kimi-code-openai");
+    defer if (kimi_code_openai) |value| allocator.free(value);
+    try std.testing.expect(kimi_code_openai == null);
 
     const blank_provider_cases = [_][]const u8{
         "moonshotai",

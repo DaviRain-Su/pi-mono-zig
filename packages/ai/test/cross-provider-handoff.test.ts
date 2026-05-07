@@ -108,7 +108,7 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// Hugging Face
 	{ provider: "huggingface", model: "moonshotai/Kimi-K2.5", label: "huggingface-kimi-k2.5" },
 	// Kimi For Coding
-	{ provider: "kimi-coding", model: "kimi-k2-thinking", label: "kimi-coding-k2-thinking" },
+	{ provider: "kimi-coding", model: "kimi-for-coding", label: "kimi-coding-kimi-for-coding" },
 	// Mistral
 	{ provider: "mistral", model: "devstral-medium-latest", label: "mistral-devstral-medium" },
 	// MiniMax

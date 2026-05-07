@@ -907,6 +907,7 @@ const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
     .{ .provider = "opencode-go", .api = "openai-completions", .base_url = "https://opencode.ai/zen/go/v1", .default_model_id = "kimi-k2.6" },
     .{ .provider = "kimi-coding", .api = "anthropic-messages", .base_url = "https://api.kimi.com/coding", .default_model_id = "kimi-for-coding" },
+    .{ .provider = "kimi-code-openai", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .default_model_id = "kimi-for-coding" },
     .{ .provider = "xiaomi", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
@@ -983,6 +984,7 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "opencode", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
     .{ .provider = "opencode-go", .id = "kimi-k2.6", .name = "Kimi K2.6 (3x limits)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
     .{ .provider = "kimi-coding", .id = "kimi-for-coding", .name = "Kimi For Coding", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768 },
+    .{ .provider = "kimi-code-openai", .id = "kimi-for-coding", .name = "Kimi For Coding", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768, .openai_compat = OPENAI_COMPAT_MOONSHOT },
     .{ .provider = "xiaomi", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
     .{ .provider = "xiaomi-token-plan-cn", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
     .{ .provider = "xiaomi-token-plan-ams", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
@@ -1006,6 +1008,7 @@ test "built-in models are registered at startup" {
     try std.testing.expect(find("huggingface", "moonshotai/Kimi-K2.6") != null);
     try std.testing.expect(find("opencode-go", "kimi-k2.6") != null);
     try std.testing.expect(find("kimi-coding", "kimi-for-coding") != null);
+    try std.testing.expect(find("kimi-code-openai", "kimi-for-coding") != null);
     try std.testing.expect(find("moonshotai", "kimi-k2.6") != null);
     try std.testing.expect(find("moonshotai-cn", "kimi-k2.6") != null);
     try std.testing.expect(find("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6") != null);
@@ -1049,6 +1052,7 @@ test "phase4 provider expansion registers configs and default models" {
         .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
         .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
         .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
+        .{ .provider = "kimi-code-openai", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .default_model_id = "kimi-for-coding" },
         .{ .provider = "moonshotai", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .default_model_id = "kimi-k2.6" },
         .{ .provider = "moonshotai-cn", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
         .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .default_model_id = "@cf/moonshotai/kimi-k2.6" },
@@ -1079,6 +1083,13 @@ test "phase4 provider expansion registers configs and default models" {
         try expectCompatString(model, "maxTokensField", "max_tokens");
         try expectCompatBool(model, "supportsStrictMode", false);
     }
+
+    const kimi_code_openai = find("kimi-code-openai", "kimi-for-coding").?;
+    try expectCompatBool(kimi_code_openai, "supportsStore", false);
+    try expectCompatBool(kimi_code_openai, "supportsDeveloperRole", false);
+    try expectCompatBool(kimi_code_openai, "supportsReasoningEffort", false);
+    try expectCompatString(kimi_code_openai, "maxTokensField", "max_tokens");
+    try expectCompatBool(kimi_code_openai, "supportsStrictMode", false);
 }
 
 test "provider catalog config parity registers Moonshot Cloudflare and Xiaomi providers" {

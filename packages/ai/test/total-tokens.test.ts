@@ -547,10 +547,10 @@ describe("totalTokens field", () => {
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding", () => {
 		it(
-			"kimi-k2-thinking - should return totalTokens equal to sum of components",
+			"kimi-for-coding - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
 			async () => {
-				const llm = getModel("kimi-coding", "kimi-k2-thinking");
+				const llm = getModel("kimi-coding", "kimi-for-coding");
 
 				console.log(`\nKimi For Coding / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.KIMI_API_KEY });

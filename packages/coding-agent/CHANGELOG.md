@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `kimi-code-openai` default-model, API-key login, and display-name support for OpenAI-compatible Kimi Code.
+
 ### Fixed
 
+- Fixed Kimi Code provider metadata to keep Anthropic-compatible `kimi-coding` distinct from legacy Moonshot/Kimi and use the canonical `kimi-for-coding` model.
 - Fixed `pi -p` treating prompts that start with YAML frontmatter as extension flags instead of user messages ([#4163](https://github.com/badlogic/pi-mono/issues/4163)).
 - Fixed pending tool results not updating in the live TUI after toggling thinking block visibility while the tool is running ([#4167](https://github.com/badlogic/pi-mono/issues/4167)).
 - Fixed `/copy` reporting success on Linux without writing the clipboard on Wayland-only compositors (Hyprland, Niri, ...) by skipping the X11-only native addon on Linux and routing through `wl-copy`/`xclip`/`xsel` instead ([#4177](https://github.com/badlogic/pi-mono/issues/4177)).

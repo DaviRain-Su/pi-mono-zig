@@ -515,6 +515,7 @@ test "phase4 provider expansion models route through shared api streams" {
         .{ .provider = "minimax", .expected_api = "anthropic-messages" },
         .{ .provider = "moonshotai", .expected_api = "openai-completions" },
         .{ .provider = "moonshotai-cn", .expected_api = "openai-completions" },
+        .{ .provider = "kimi-code-openai", .expected_api = "openai-completions" },
         .{ .provider = "cloudflare-workers-ai", .expected_api = "openai-completions" },
         .{ .provider = "cloudflare-ai-gateway", .expected_api = "openai-completions" },
         .{ .provider = "huggingface", .expected_api = "openai-completions" },

@@ -65,10 +65,6 @@ const COPILOT_STATIC_HEADERS = {
 	"Copilot-Integration-Id": "vscode-chat",
 } as const;
 
-const KIMI_STATIC_HEADERS = {
-	"User-Agent": "KimiCLI/1.5",
-} as const;
-
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
@@ -852,39 +848,58 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
-		// Process Kimi For Coding models
+		// Process Kimi Code models
 		if (data["kimi-for-coding"]?.models) {
 			const kimiModels = data["kimi-for-coding"].models as Record<string, ModelsDevModel>;
-			const hasCanonicalModel = Object.prototype.hasOwnProperty.call(kimiModels, "kimi-for-coding");
+			// Kimi Code docs require the fixed model id `kimi-for-coding` for
+			// both Anthropic-compatible and OpenAI-compatible APIs. models.dev
+			// can include transient backend ids; keep only the public alias.
+			const canonicalModel = kimiModels["kimi-for-coding"] ?? kimiModels.k2p5;
 
-			for (const [modelId, model] of Object.entries(kimiModels)) {
-				const m = model as ModelsDevModel;
-				if (m.tool_call !== true) continue;
-				// models.dev still exposes deprecated "k2p5" in some snapshots.
-				// Normalize to the canonical model id and drop duplicates when canonical exists.
-				if (modelId === "k2p5" && hasCanonicalModel) continue;
-
-				const normalizedId = modelId === "k2p5" ? "kimi-for-coding" : modelId;
-				const normalizedName = modelId === "k2p5" ? "Kimi For Coding" : m.name || normalizedId;
+			if (canonicalModel?.tool_call === true) {
+				const input: ("text" | "image")[] = canonicalModel.modalities?.input?.includes("image")
+					? ["text", "image"]
+					: ["text"];
+				const cost = {
+					input: canonicalModel.cost?.input || 0,
+					output: canonicalModel.cost?.output || 0,
+					cacheRead: canonicalModel.cost?.cache_read || 0,
+					cacheWrite: canonicalModel.cost?.cache_write || 0,
+				};
+				const contextWindow = canonicalModel.limit?.context || 4096;
+				const maxTokens = canonicalModel.limit?.output || 4096;
 
 				models.push({
-					id: normalizedId,
-					name: normalizedName,
+					id: "kimi-for-coding",
+					name: "Kimi For Coding",
 					api: "anthropic-messages",
 					provider: "kimi-coding",
-					// Kimi For Coding's Anthropic-compatible API - SDK appends /v1/messages
+					// Kimi Code's Anthropic-compatible API - SDK appends /v1/messages
 					baseUrl: "https://api.kimi.com/coding",
-					headers: { ...KIMI_STATIC_HEADERS },
-					reasoning: m.reasoning === true,
-					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
+					reasoning: canonicalModel.reasoning === true,
+					input,
+					cost,
+					contextWindow,
+					maxTokens,
+				});
+				models.push({
+					id: "kimi-for-coding",
+					name: "Kimi For Coding",
+					api: "openai-completions",
+					provider: "kimi-code-openai",
+					baseUrl: "https://api.kimi.com/coding/v1",
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: false,
+						maxTokensField: "max_tokens",
+						supportsStrictMode: false,
 					},
-					contextWindow: m.limit?.context || 4096,
-					maxTokens: m.limit?.output || 4096,
+					reasoning: canonicalModel.reasoning === true,
+					input,
+					cost,
+					contextWindow,
+					maxTokens,
 				});
 			}
 		}

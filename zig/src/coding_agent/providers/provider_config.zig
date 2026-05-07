@@ -264,7 +264,7 @@ fn availableModelAlreadyIncluded(models: []const AvailableModel, candidate: Avai
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
     return switch (err) {
         error.MissingApiKey => missingApiKeyMessage(provider),
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, moonshotai, moonshotai-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, cloudflare-workers-ai, cloudflare-ai-gateway, xiaomi, xiaomi-token-plan-cn, xiaomi-token-plan-ams, xiaomi-token-plan-sgp, faux.",
+        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, moonshotai, moonshotai-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, kimi-code-openai, cloudflare-workers-ai, cloudflare-ai-gateway, xiaomi, xiaomi-token-plan-cn, xiaomi-token-plan-ams, xiaomi-token-plan-sgp, faux.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
         error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
@@ -705,6 +705,9 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "kimi-coding")) {
         return "Kimi For Coding credentials required.\nSet KIMI_API_KEY, pass --api-key, or run /login kimi-coding.";
     }
+    if (std.mem.eql(u8, provider, "kimi-code-openai")) {
+        return "Kimi Code (OpenAI Compatible) credentials required.\nSet KIMI_API_KEY, pass --api-key, or run /login kimi-code-openai.";
+    }
     if (std.mem.eql(u8, provider, "kimi")) {
         return "Kimi credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login kimi.";
     }
@@ -839,6 +842,7 @@ test "resolveProviderConfig accepts provider catalog parity providers" {
     defer env_map.deinit();
 
     try env_map.put("MOONSHOT_API_KEY", "moonshot-key");
+    try env_map.put("KIMI_API_KEY", "kimi-key");
     try env_map.put("CLOUDFLARE_API_KEY", "cloudflare-key");
     try env_map.put("XIAOMI_API_KEY", "xiaomi-key");
     try env_map.put("XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-cn-key");
@@ -855,6 +859,7 @@ test "resolveProviderConfig accepts provider catalog parity providers" {
     }{
         .{ .provider = "moonshotai", .expected_key = "moonshot-key", .model_id = "kimi-k2.6", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .display_name = "Moonshot AI" },
         .{ .provider = "moonshotai-cn", .expected_key = "moonshot-key", .model_id = "kimi-k2.6", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .display_name = "Moonshot AI (China)" },
+        .{ .provider = "kimi-code-openai", .expected_key = "kimi-key", .model_id = "kimi-for-coding", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .display_name = "Kimi Code (OpenAI Compatible)" },
         .{ .provider = "cloudflare-workers-ai", .expected_key = "cloudflare-key", .model_id = "@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .display_name = "Cloudflare Workers AI" },
         .{ .provider = "cloudflare-ai-gateway", .expected_key = "cloudflare-key", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .display_name = "Cloudflare AI Gateway" },
         .{ .provider = "xiaomi", .expected_key = "xiaomi-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo" },
@@ -1042,6 +1047,7 @@ test "listAvailableModels surfaces provider catalog parity auth states" {
     }{
         .{ .provider = "moonshotai", .model_id = "kimi-k2.6", .env_var = "MOONSHOT_API_KEY" },
         .{ .provider = "moonshotai-cn", .model_id = "kimi-k2.6", .env_var = "MOONSHOT_API_KEY" },
+        .{ .provider = "kimi-code-openai", .model_id = "kimi-for-coding", .env_var = "KIMI_API_KEY" },
         .{ .provider = "cloudflare-workers-ai", .model_id = "@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
         .{ .provider = "cloudflare-ai-gateway", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
         .{ .provider = "xiaomi", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_API_KEY" },
@@ -1148,7 +1154,7 @@ test "findInitialDefaultModel uses configured kimi credentials" {
     try std.testing.expectEqualStrings("kimi-k2.6", model.id);
 }
 
-test "KIMI_API_KEY configures kimi-coding only" {
+test "KIMI_API_KEY configures Kimi Code providers without legacy Kimi" {
     const allocator = std.testing.allocator;
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -1160,6 +1166,7 @@ test "KIMI_API_KEY configures kimi-coding only" {
 
     var saw_kimi = false;
     var saw_kimi_coding = false;
+    var saw_kimi_code_openai = false;
     for (models) |entry| {
         if (std.mem.eql(u8, entry.provider, "kimi") and std.mem.eql(u8, entry.model_id, "kimi-k2.6")) {
             saw_kimi = true;
@@ -1169,16 +1176,33 @@ test "KIMI_API_KEY configures kimi-coding only" {
             saw_kimi_coding = true;
             try std.testing.expect(entry.available);
         }
+        if (std.mem.eql(u8, entry.provider, "kimi-code-openai") and std.mem.eql(u8, entry.model_id, "kimi-for-coding")) {
+            saw_kimi_code_openai = true;
+            try std.testing.expect(entry.available);
+        }
     }
 
     try std.testing.expect(saw_kimi);
     try std.testing.expect(saw_kimi_coding);
+    try std.testing.expect(saw_kimi_code_openai);
 
     const configured = try filterConfiguredModels(allocator, models);
     defer allocator.free(configured);
-    try std.testing.expectEqual(@as(usize, 1), configured.len);
-    try std.testing.expectEqualStrings("kimi-coding", configured[0].provider);
-    try std.testing.expectEqualStrings("kimi-for-coding", configured[0].model_id);
+    try std.testing.expectEqual(@as(usize, 2), configured.len);
+    var configured_kimi_coding = false;
+    var configured_kimi_code_openai = false;
+    for (configured) |entry| {
+        if (std.mem.eql(u8, entry.provider, "kimi-coding")) {
+            configured_kimi_coding = true;
+            try std.testing.expectEqualStrings("kimi-for-coding", entry.model_id);
+        }
+        if (std.mem.eql(u8, entry.provider, "kimi-code-openai")) {
+            configured_kimi_code_openai = true;
+            try std.testing.expectEqualStrings("kimi-for-coding", entry.model_id);
+        }
+    }
+    try std.testing.expect(configured_kimi_coding);
+    try std.testing.expect(configured_kimi_code_openai);
 
     const model = (try findInitialDefaultModel(allocator, &env_map, .{})).?;
     try std.testing.expectEqualStrings("kimi-coding", model.provider);
@@ -1285,6 +1309,10 @@ test "resolveProviderErrorMessage includes provider-specific env and login guida
     try std.testing.expect(std.mem.indexOf(u8, moonshot, "MOONSHOT_API_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, moonshot, "/login moonshotai") != null);
 
+    const kimi_code_openai = resolveProviderErrorMessage(error.MissingApiKey, "kimi-code-openai");
+    try std.testing.expect(std.mem.indexOf(u8, kimi_code_openai, "KIMI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kimi_code_openai, "/login kimi-code-openai") != null);
+
     const cloudflare_gateway = resolveProviderErrorMessage(error.MissingApiKey, "cloudflare-ai-gateway");
     try std.testing.expect(std.mem.indexOf(u8, cloudflare_gateway, "CLOUDFLARE_API_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, cloudflare_gateway, "/login cloudflare-ai-gateway") != null);
@@ -1295,6 +1323,7 @@ test "resolveProviderErrorMessage includes provider-specific env and login guida
 
     const unsupported = resolveProviderErrorMessage(error.UnknownProvider, "unknown");
     try std.testing.expect(std.mem.indexOf(u8, unsupported, "moonshotai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "kimi-code-openai") != null);
     try std.testing.expect(std.mem.indexOf(u8, unsupported, "cloudflare-ai-gateway") != null);
     try std.testing.expect(std.mem.indexOf(u8, unsupported, "xiaomi-token-plan-sgp") != null);
 }

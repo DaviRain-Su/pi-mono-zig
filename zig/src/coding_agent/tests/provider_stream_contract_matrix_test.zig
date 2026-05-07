@@ -21,7 +21,9 @@ const ProviderStreamContractCase = struct {
 const provider_stream_contract_matrix = [_]ProviderStreamContractCase{
     .{ .label = "Anthropic", .api = "anthropic-messages", .provider = "anthropic", .model = "claude-3-7-sonnet" },
     .{ .label = "OpenAI Completions", .api = "openai-completions", .provider = "openai", .model = "gpt-4.1-mini" },
-    .{ .label = "Kimi For Coding", .api = "kimi-completions", .provider = "kimi", .model = "kimi-k2.6" },
+    .{ .label = "Legacy Kimi/Moonshot", .api = "kimi-completions", .provider = "kimi", .model = "kimi-k2.6" },
+    .{ .label = "Kimi Code Anthropic Compatible", .api = "anthropic-messages", .provider = "kimi-coding", .model = "kimi-for-coding", .built_in = false },
+    .{ .label = "Kimi Code OpenAI Compatible", .api = "openai-completions", .provider = "kimi-code-openai", .model = "kimi-for-coding", .built_in = false },
     .{ .label = "Mistral", .api = "mistral-conversations", .provider = "mistral", .model = "mistral-medium-latest" },
     .{ .label = "OpenAI Responses", .api = "openai-responses", .provider = "openai", .model = "gpt-5-mini" },
     .{ .label = "Azure OpenAI Responses", .api = "azure-openai-responses", .provider = "azure-openai-responses", .model = "azure-gpt-5-mini" },

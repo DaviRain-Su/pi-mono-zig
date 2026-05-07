@@ -1318,7 +1318,7 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
     );
 }
 
-test "kimi-coding api-key headers remain Kimi-safe" {
+test "kimi-coding api-key headers preserve truthful client identity" {
     const allocator = std.testing.allocator;
 
     const model = types.Model{
@@ -1342,7 +1342,7 @@ test "kimi-coding api-key headers remain Kimi-safe" {
         .api_key = "placeholder-auth-value",
     });
 
-    try std.testing.expectEqualStrings("KimiCLI/1.5", headers.get("user-agent").?);
+    try std.testing.expect(headers.get("user-agent") == null);
     try std.testing.expectEqualStrings("placeholder-auth-value", headers.get("x-api-key").?);
     try std.testing.expect(headers.get("Authorization") == null);
     try std.testing.expect(headers.get("anthropic-beta") == null);
@@ -2867,8 +2867,6 @@ fn applyDefaultAnthropicHeaders(
         defer allocator.free(user_agent);
         try putOwnedHeader(allocator, headers, "user-agent", user_agent);
         try putOwnedHeader(allocator, headers, "x-app", "cli");
-    } else if (std.mem.eql(u8, model.provider, "kimi-coding")) {
-        try putOwnedHeader(allocator, headers, "user-agent", "KimiCLI/1.5");
     }
 }
 

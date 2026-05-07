@@ -101,6 +101,7 @@ pub const API_KEY_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "huggingface", .name = "Hugging Face", .auth_type = .api_key },
     .{ .id = "kimi", .name = "Kimi", .auth_type = .api_key },
     .{ .id = "kimi-coding", .name = "Kimi For Coding", .auth_type = .api_key },
+    .{ .id = "kimi-code-openai", .name = "Kimi Code (OpenAI Compatible)", .auth_type = .api_key },
     .{ .id = "mistral", .name = "Mistral", .auth_type = .api_key },
     .{ .id = "minimax", .name = "MiniMax", .auth_type = .api_key },
     .{ .id = "minimax-cn", .name = "MiniMax (China)", .auth_type = .api_key },

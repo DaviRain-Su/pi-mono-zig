@@ -174,7 +174,7 @@ fn runAnthropicCapture(expectation: CaptureExpectation) !void {
     );
 }
 
-test "provider smoke Moonshot standalone captures OpenAI routing auth and metadata" {
+test "provider smoke Moonshot and Kimi Code standalone captures OpenAI routing auth and metadata" {
     const cases = [_]CaptureExpectation{
         .{
             .provider = "moonshotai",
@@ -192,6 +192,15 @@ test "provider smoke Moonshot standalone captures OpenAI routing auth and metada
             .expected_request_line = "POST /v1/chat/completions HTTP/1.1",
             .expected_auth_header = "\r\nauthorization: bearer provider-smoke-key\r\n",
         },
+        .{
+            .provider = "kimi-code-openai",
+            .api = "openai-completions",
+            .model_id = "kimi-for-coding",
+            .base_path = "/coding/v1",
+            .expected_request_line = "POST /coding/v1/chat/completions HTTP/1.1",
+            .expected_auth_header = "\r\nauthorization: bearer provider-smoke-key\r\n",
+            .forbidden_auth_header = "\r\nuser-agent: kimicli/1.5\r\n",
+        },
     };
 
     for (cases) |case| {
@@ -203,6 +212,26 @@ test "provider smoke Moonshot standalone captures OpenAI routing auth and metada
         try std.testing.expectEqualStrings(case.api, registered_model.api);
         try runOpenAICompatCapture(case);
     }
+}
+
+test "provider smoke Kimi Code Anthropic captures routing auth and metadata" {
+    const case = CaptureExpectation{
+        .provider = "kimi-coding",
+        .api = "anthropic-messages",
+        .model_id = "kimi-for-coding",
+        .base_path = "/coding",
+        .expected_request_line = "POST /coding/v1/messages HTTP/1.1",
+        .expected_auth_header = "\r\nx-api-key: provider-smoke-key\r\n",
+        .forbidden_auth_header = "\r\nuser-agent: kimicli/1.5\r\n",
+    };
+
+    const provider_config = model_registry.getProviderConfig(case.provider).?;
+    try std.testing.expectEqualStrings(case.api, provider_config.api);
+    try std.testing.expectEqualStrings(case.model_id, provider_config.default_model_id.?);
+    const registered_model = model_registry.find(case.provider, case.model_id).?;
+    try std.testing.expectEqualStrings(case.provider, registered_model.provider);
+    try std.testing.expectEqualStrings(case.api, registered_model.api);
+    try runAnthropicCapture(case);
 }
 
 test "provider smoke Xiaomi standalone captures Anthropic routing auth and metadata" {
@@ -460,10 +489,11 @@ fn expectAnthropicSetupFailure(expectation: CaptureExpectation) !void {
     try expectOnlyTerminalErrorMetadata(&stream, expectation.api, expectation.provider, expectation.model_id);
 }
 
-test "provider smoke Moonshot and Cloudflare setup failures are terminal error events" {
+test "provider smoke Moonshot Kimi Code and Cloudflare setup failures are terminal error events" {
     const openai_cases = [_]CaptureExpectation{
         .{ .provider = "moonshotai", .api = "openai-completions", .model_id = "kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
         .{ .provider = "moonshotai-cn", .api = "openai-completions", .model_id = "kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
+        .{ .provider = "kimi-code-openai", .api = "openai-completions", .model_id = "kimi-for-coding", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
         .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .model_id = "@cf/moonshotai/kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
         .{ .provider = "cloudflare-ai-gateway", .api = "openai-completions", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
     };
@@ -491,6 +521,16 @@ test "provider smoke Moonshot and Cloudflare setup failures are terminal error e
     );
     defer anthropic_stream.deinit();
     try expectOnlyTerminalErrorMetadata(&anthropic_stream, "anthropic-messages", "cloudflare-ai-gateway", "claude-opus-4-7");
+
+    var kimi_code_stream = try anthropic.AnthropicProvider.stream(
+        allocator,
+        io,
+        smokeModel(.{ .provider = "kimi-coding", .api = "anthropic-messages", .model_id = "kimi-for-coding", .base_path = "", .expected_request_line = "", .expected_auth_header = "" }, "http://127.0.0.1:1"),
+        smokeContext(),
+        .{ .api_key = "provider-smoke-key" },
+    );
+    defer kimi_code_stream.deinit();
+    try expectOnlyTerminalErrorMetadata(&kimi_code_stream, "anthropic-messages", "kimi-coding", "kimi-for-coding");
 }
 
 test "provider smoke Xiaomi setup failures are terminal error events" {
