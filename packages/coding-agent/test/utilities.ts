@@ -216,6 +216,7 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 
 	return {
 		getExtensions: () => extensionsResult,
+		getWasmExtensions: () => [],
 		getSkills: () => ({ skills: [], diagnostics: [] }),
 		getPrompts: () => ({ prompts: [], diagnostics: [] }),
 		getThemes: () => ({ themes: [], diagnostics: [] }),

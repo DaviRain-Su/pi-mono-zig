@@ -12,6 +12,42 @@ import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 
+function writeWasmPackage(
+	packageRoot: string,
+	options: {
+		artifactBytes?: Buffer;
+		resourceLimits?: Record<string, unknown>;
+	} = {},
+): void {
+	mkdirSync(join(packageRoot, "wasm"), { recursive: true });
+	writeFileSync(
+		join(packageRoot, "wasm", "plugin.wasm"),
+		options.artifactBytes ?? Buffer.from([0x00, 0x61, 0x73, 0x6d]),
+	);
+	const manifest: Record<string, unknown> = {
+		schemaVersion: "pi-extension.v0",
+		id: "com.example.resource-loader-wasm",
+		name: "Resource Loader Wasm Fixture",
+		version: "0.1.0",
+		description: "Resource loader Wasm package fixture.",
+		artifact: {
+			kind: "wasm-component",
+			path: "wasm/plugin.wasm",
+		},
+		tool: {
+			id: "fixture.resourceLoaderWasm",
+			description: "A deterministic resource-loader Wasm tool fixture.",
+			inputSchema: {},
+			outputSchema: {},
+		},
+		capabilities: [],
+	};
+	if (options.resourceLimits !== undefined) {
+		manifest.resourceLimits = options.resourceLimits;
+	}
+	writeFileSync(join(packageRoot, "pi-extension.json"), JSON.stringify(manifest));
+}
+
 describe("DefaultResourceLoader", () => {
 	let tempDir: string;
 	let agentDir: string;
@@ -349,6 +385,113 @@ export default function(pi) {
 				entries: Array<{ digests: { packageRootSha256: string } }>;
 			};
 			expect(loaded?.identity.key).toContain(lockfile.entries[0].digests.packageRootSha256);
+		});
+
+		it("should expose matching package TypeScript policy to runtime and ignore stale digests after refresh", async () => {
+			const packageRoot = join(tempDir, "package-typescript-digest-policy");
+			mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+			writeFileSync(
+				join(packageRoot, "package.json"),
+				JSON.stringify({
+					name: "package-typescript-digest-policy",
+					version: "1.0.0",
+					pi: { extensions: ["extensions/entry.ts"] },
+				}),
+			);
+			const entryPath = join(packageRoot, "extensions", "entry.ts");
+			writeFileSync(
+				entryPath,
+				`export default function(pi) {
+	const policy = pi.getExtensionPolicy();
+	if (policy?.resourceLimits?.turns === 7) {
+		pi.registerCommand("digest-policy-visible", { handler: async () => {} });
+	}
+}`,
+			);
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 1;\n");
+
+			const settingsManager = SettingsManager.inMemory({ packages: [packageRoot] });
+			const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			settingsManager.setPackages([packageRoot]);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+			const loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.identity.kind).toBe("typescript-package");
+			const originalIdentityKey = loaded!.identity.key;
+			settingsManager.setExtensionPolicy(originalIdentityKey, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 7 },
+			});
+
+			await loader.reload();
+			const policyLoaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(policyLoaded?.effectivePolicy).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 7 },
+			});
+			expect(policyLoaded?.commands.has("digest-policy-visible")).toBe(true);
+
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 2;\n");
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			settingsManager.setPackages([packageRoot]);
+
+			await loader.reload();
+			const refreshed = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(refreshed).toBeDefined();
+			expect(refreshed?.identity.key).not.toBe(originalIdentityKey);
+			expect(refreshed?.effectivePolicy).toBeUndefined();
+			expect(refreshed?.commands.has("digest-policy-visible")).toBe(false);
+		});
+
+		it("should expose locked WASM packages through resource-loader and runner with digest-bound policy", async () => {
+			const packageRoot = join(tempDir, "package-wasm-runtime-bridge");
+			writeWasmPackage(packageRoot, {
+				resourceLimits: { turns: 3, toolScopes: ["fixture.resourceLoaderWasm"] },
+			});
+			const settingsManager = SettingsManager.inMemory({ packages: [packageRoot] });
+			const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			settingsManager.setPackages([packageRoot]);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+			const lockedWasm = loader.getWasmExtensions()[0];
+			expect(lockedWasm).toBeDefined();
+			expect(lockedWasm.identity.runtimeKind).toBe("wasm");
+			expect(lockedWasm.identity.key).toContain(lockedWasm.metadata.provenance!.packageRootSha256);
+			expect(lockedWasm.identity.key).toContain(lockedWasm.metadata.provenance!.artifactSha256!);
+			settingsManager.setExtensionPolicy(lockedWasm.identity.key, {
+				resourceLimits: { turns: 3, toolScopes: ["fixture.resourceLoaderWasm"] },
+			});
+
+			await loader.reload();
+			const wasmExtensions = loader.getWasmExtensions();
+			expect(wasmExtensions).toHaveLength(1);
+			expect(wasmExtensions[0].effectivePolicy).toEqual({
+				resourceLimits: { turns: 3, toolScopes: ["fixture.resourceLoaderWasm"] },
+			});
+			expect(wasmExtensions[0].identity.key).toContain(wasmExtensions[0].metadata.provenance!.packageRootSha256);
+			expect(wasmExtensions[0].identity.key).toContain(wasmExtensions[0].metadata.provenance!.artifactSha256!);
+
+			const sessionManager = SessionManager.inMemory();
+			const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+			const modelRegistry = ModelRegistry.create(authStorage);
+			const extensionsResult = loader.getExtensions();
+			const runner = new ExtensionRunner(
+				extensionsResult.extensions,
+				extensionsResult.runtime,
+				cwd,
+				sessionManager,
+				modelRegistry,
+				wasmExtensions,
+			);
+
+			expect(runner.getWasmExtensions()).toEqual(wasmExtensions);
 		});
 
 		it("should snapshot effective extension policy by canonical TypeScript identity on reload", async () => {

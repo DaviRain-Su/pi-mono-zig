@@ -27,8 +27,12 @@ import * as _bundledPiCodingAgent from "../../index.js";
 import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
-import { createTypeScriptExtensionIdentity } from "../extension-policy.js";
-import { createSyntheticSourceInfo } from "../source-info.js";
+import {
+	createTypeScriptExtensionIdentity,
+	type ExtensionPolicy,
+	type TypeScriptExtensionIdentity,
+} from "../extension-policy.js";
+import { createSyntheticSourceInfo, type SourceInfo } from "../source-info.js";
 import { hasWasmExtensionManifest } from "../wasm-extension-package.js";
 import type {
 	Extension,
@@ -154,6 +158,11 @@ function resolvePath(extPath: string, cwd: string): string {
 }
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+
+export interface LoadExtensionOptions {
+	resolveSourceInfo?: (request: { configuredPath: string; resolvedPath: string }) => SourceInfo | undefined;
+	resolveEffectivePolicy?: (identity: TypeScriptExtensionIdentity) => ExtensionPolicy | undefined;
+}
 
 /**
  * Create a runtime with throwing stubs for action methods.
@@ -393,19 +402,24 @@ async function loadExtensionModule(extensionPath: string) {
 /**
  * Create an Extension object with empty collections.
  */
-function createExtension(extensionPath: string, resolvedPath: string): Extension {
+function createExtension(
+	extensionPath: string,
+	resolvedPath: string,
+	options?: { sourceInfo?: SourceInfo; effectivePolicy?: ExtensionPolicy },
+): Extension {
 	const source =
 		extensionPath.startsWith("<") && extensionPath.endsWith(">")
 			? extensionPath.slice(1, -1).split(":")[0] || "temporary"
 			: "local";
 	const baseDir = extensionPath.startsWith("<") ? undefined : path.dirname(resolvedPath);
 
-	const sourceInfo = createSyntheticSourceInfo(extensionPath, { source, baseDir });
+	const sourceInfo = options?.sourceInfo ?? createSyntheticSourceInfo(extensionPath, { source, baseDir });
 	return {
 		path: extensionPath,
 		resolvedPath,
 		sourceInfo,
 		identity: createTypeScriptExtensionIdentity({ configuredPath: extensionPath, resolvedPath, sourceInfo }),
+		effectivePolicy: options?.effectivePolicy,
 		handlers: new Map(),
 		tools: new Map(),
 		messageRenderers: new Map(),
@@ -420,16 +434,19 @@ async function loadExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
+	options?: LoadExtensionOptions,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 
 	try {
+		const sourceInfo = options?.resolveSourceInfo?.({ configuredPath: extensionPath, resolvedPath });
+		const extension = createExtension(extensionPath, resolvedPath, { sourceInfo });
+		extension.effectivePolicy = options?.resolveEffectivePolicy?.(extension.identity);
 		const factory = await loadExtensionModule(resolvedPath);
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
-		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 		await factory(api);
 
@@ -459,14 +476,19 @@ export async function loadExtensionFromFactory(
 /**
  * Load extensions from paths.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	options?: LoadExtensionOptions,
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
 
 	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
+		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime, options);
 
 		if (error) {
 			errors.push({ path: extPath, error });

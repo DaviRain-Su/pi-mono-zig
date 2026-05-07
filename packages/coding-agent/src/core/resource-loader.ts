@@ -13,7 +13,7 @@ import { createEventBus, type EventBus } from "./event-bus.js";
 import { createTypeScriptExtensionIdentity } from "./extension-policy.js";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
-import { DefaultPackageManager, type PathMetadata } from "./package-manager.js";
+import { DefaultPackageManager, type PathMetadata, type ResolvedWasmExtensionPackage } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
 import { SettingsManager } from "./settings-manager.js";
@@ -29,6 +29,7 @@ export interface ResourceExtensionPaths {
 
 export interface ResourceLoader {
 	getExtensions(): LoadExtensionsResult;
+	getWasmExtensions(): ResolvedWasmExtensionPackage[];
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
@@ -189,6 +190,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private appendSystemPromptOverride?: (base: string[]) => string[];
 
 	private extensionsResult: LoadExtensionsResult;
+	private wasmExtensions: ResolvedWasmExtensionPackage[];
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
 	private prompts: PromptTemplate[];
@@ -236,6 +238,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.appendSystemPromptOverride = options.appendSystemPromptOverride;
 
 		this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+		this.wasmExtensions = [];
 		this.skills = [];
 		this.skillDiagnostics = [];
 		this.prompts = [];
@@ -254,6 +257,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getExtensions(): LoadExtensionsResult {
 		return this.extensionsResult;
+	}
+
+	getWasmExtensions(): ResolvedWasmExtensionPackage[] {
+		return [...this.wasmExtensions];
 	}
 
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
@@ -348,6 +355,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			resources: Array<{ path: string; enabled: boolean; metadata: PathMetadata }>,
 		): string[] => getEnabledResources(resources).map((r) => r.path);
 		const enabledExtensions = getEnabledPaths(resolvedPaths.extensions);
+		this.wasmExtensions = resolvedPaths.wasmExtensions.filter((extension) => extension.enabled);
 		const enabledSkillResources = getEnabledResources(resolvedPaths.skills);
 		const enabledPrompts = getEnabledPaths(resolvedPaths.prompts);
 		const enabledThemes = getEnabledPaths(resolvedPaths.themes);
@@ -397,7 +405,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
 
-		const extensionsResult = await loadExtensions(extensionPaths, this.cwd, this.eventBus);
+		const extensionsResult = await loadExtensions(extensionPaths, this.cwd, this.eventBus, {
+			resolveSourceInfo: ({ configuredPath, resolvedPath }) =>
+				this.findSourceInfoForPath(resolvedPath, undefined, metadataByPath) ??
+				this.findSourceInfoForPath(configuredPath, undefined, metadataByPath),
+			resolveEffectivePolicy: (identity) => this.settingsManager.getExtensionPolicy(identity.key),
+		});
 		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
 		extensionsResult.extensions.push(...inlineExtensions.extensions);
 		extensionsResult.errors.push(...inlineExtensions.errors);

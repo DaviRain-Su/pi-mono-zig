@@ -39,6 +39,7 @@ const cwd = process.cwd();
 
 const resourceLoader: ResourceLoader = {
 	getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+	getWasmExtensions: () => [],
 	getSkills: () => ({ skills: [], diagnostics: [] }),
 	getPrompts: () => ({ prompts: [], diagnostics: [] }),
 	getThemes: () => ({ themes: [], diagnostics: [] }),

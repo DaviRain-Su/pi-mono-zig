@@ -2363,6 +2363,7 @@ export class AgentSession {
 			this._cwd,
 			this.sessionManager,
 			this._modelRegistry,
+			this._resourceLoader.getWasmExtensions(),
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;

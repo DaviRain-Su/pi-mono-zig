@@ -9,6 +9,7 @@ import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
 import type { ResourceDiagnostic } from "../diagnostics.js";
 import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
+import type { ResolvedWasmExtensionPackage } from "../package-manager.js";
 import type { SessionManager } from "../session-manager.js";
 import type { BuildSystemPromptOptions } from "../system-prompt.js";
 import type {
@@ -223,6 +224,7 @@ const noOpUIContext: ExtensionUIContext = {
 
 export class ExtensionRunner {
 	private extensions: Extension[];
+	private wasmExtensions: ResolvedWasmExtensionPackage[];
 	private runtime: ExtensionRuntime;
 	private uiContext: ExtensionUIContext;
 	private cwd: string;
@@ -254,8 +256,10 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
+		wasmExtensions: ResolvedWasmExtensionPackage[] = [],
 	) {
 		this.extensions = extensions;
+		this.wasmExtensions = [...wasmExtensions];
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
@@ -368,6 +372,10 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map((e) => e.path);
+	}
+
+	getWasmExtensions(): ResolvedWasmExtensionPackage[] {
+		return [...this.wasmExtensions];
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */

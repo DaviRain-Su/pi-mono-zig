@@ -37,6 +37,7 @@ import type {
 import { EXTENSION_EVENT_NAMES } from "../src/core/extensions/types.js";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import type { ResolvedWasmExtensionPackage } from "../src/core/package-manager.js";
 import { SessionManager } from "../src/core/session-manager.js";
 
 const SUB_AGENT_FORBIDDEN_PRODUCT_FIELDS = [
@@ -2197,6 +2198,63 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("tool collection", () => {
+		it("exposes resolved Wasm packages to runner-visible runtime surfaces", () => {
+			const wasmExtension = {
+				path: path.join(tempDir, "pi-extension.json"),
+				enabled: true,
+				metadata: {
+					source: path.join(tempDir, "wasm-package"),
+					scope: "user",
+					origin: "package",
+					baseDir: path.join(tempDir, "wasm-package"),
+					provenance: {
+						sourceIdentity: `local:${path.join(tempDir, "wasm-package")}`,
+						packageRoot: path.join(tempDir, "wasm-package"),
+						packageRootSha256: "a".repeat(64),
+						artifactSha256: "b".repeat(64),
+					},
+				},
+				identity: {
+					kind: "wasm-manifest",
+					runtimeKind: "wasm",
+					key: `wasm:package:pi-extension.v0:com.example.runner-wasm:0.1.0:user:local:${path.join(
+						tempDir,
+						"wasm-package",
+					)}:${path.join(tempDir, "wasm-package")}:${"a".repeat(64)}:${"b".repeat(64)}:${path.join(
+						tempDir,
+						"pi-extension.json",
+					)}:${path.join(tempDir, "wasm", "plugin.wasm")}`,
+					displayName: "com.example.runner-wasm",
+					schemaVersion: "pi-extension.v0",
+					manifestId: "com.example.runner-wasm",
+					name: "Runner Wasm",
+					version: "0.1.0",
+					manifestPath: path.join(tempDir, "pi-extension.json"),
+					packageRoot: path.join(tempDir, "wasm-package"),
+					artifactPath: "wasm/plugin.wasm",
+					artifactAbsolutePath: path.join(tempDir, "wasm", "plugin.wasm"),
+					artifactSha256: "b".repeat(64),
+					toolId: "fixture.runnerWasm",
+					sourceInfo: {
+						path: path.join(tempDir, "pi-extension.json"),
+						source: path.join(tempDir, "wasm-package"),
+						scope: "user",
+						origin: "package",
+						baseDir: path.join(tempDir, "wasm-package"),
+					},
+				},
+				effectivePolicy: {
+					resourceLimits: { turns: 2, toolScopes: ["fixture.runnerWasm"] },
+				},
+			} as unknown as ResolvedWasmExtensionPackage;
+			const runner = new ExtensionRunner([], createExtensionRuntime(), tempDir, sessionManager, modelRegistry, [
+				wasmExtension,
+			]);
+
+			expect(runner.getWasmExtensions()).toEqual([wasmExtension]);
+			expect(runner.getWasmExtensions()).not.toBe(runner.getWasmExtensions());
+		});
+
 		it("collects tools from multiple extensions", async () => {
 			const toolCode = (name: string) => `
 				import { Type } from "typebox";
