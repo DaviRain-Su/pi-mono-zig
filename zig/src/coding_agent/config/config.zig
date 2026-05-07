@@ -3,6 +3,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const auth = @import("../auth/auth.zig");
 const config_errors = @import("config_errors.zig");
+const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
 const migrations = @import("migrations.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -37,6 +38,56 @@ pub const TreeFilterMode = enum {
     labeled_only,
     all,
 };
+
+const MAX_SAFE_INTEGER: u64 = 9007199254740991;
+
+pub const ExtensionResourceLimits = struct {
+    max_children: ?u64 = null,
+    depth: ?u64 = null,
+    turns: ?u64 = null,
+    timeout_ms: ?u64 = null,
+    output_bytes: ?u64 = null,
+    output_lines: ?u64 = null,
+    tool_scopes: ?[]const []const u8 = null,
+
+    pub fn deinit(self: *ExtensionResourceLimits, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, self.tool_scopes);
+        self.* = .{};
+    }
+
+    fn clone(self: ExtensionResourceLimits, allocator: std.mem.Allocator) !ExtensionResourceLimits {
+        return .{
+            .max_children = self.max_children,
+            .depth = self.depth,
+            .turns = self.turns,
+            .timeout_ms = self.timeout_ms,
+            .output_bytes = self.output_bytes,
+            .output_lines = self.output_lines,
+            .tool_scopes = try cloneStringList(allocator, self.tool_scopes),
+        };
+    }
+};
+
+pub const ExtensionPolicy = struct {
+    approved_grants: ?[]const []const u8 = null,
+    resource_limits: ?ExtensionResourceLimits = null,
+
+    pub fn deinit(self: *ExtensionPolicy, allocator: std.mem.Allocator) void {
+        freeStringList(allocator, self.approved_grants);
+        if (self.resource_limits) |*limits| limits.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn clone(self: ExtensionPolicy, allocator: std.mem.Allocator) !ExtensionPolicy {
+        var cloned = ExtensionPolicy{};
+        errdefer cloned.deinit(allocator);
+        cloned.approved_grants = try cloneStringList(allocator, self.approved_grants);
+        cloned.resource_limits = if (self.resource_limits) |limits| try limits.clone(allocator) else null;
+        return cloned;
+    }
+};
+
+pub const ExtensionPolicyMap = std.StringHashMap(ExtensionPolicy);
 
 pub const Settings = struct {
     default_provider: ?[]u8 = null,
@@ -76,6 +127,7 @@ pub const Settings = struct {
     skills: ?[]const []const u8 = null,
     prompts: ?[]const []const u8 = null,
     themes: ?[]const []const u8 = null,
+    extension_policies: ?ExtensionPolicyMap = null,
 
     pub fn deinit(self: *Settings, allocator: std.mem.Allocator) void {
         if (self.default_provider) |value| allocator.free(value);
@@ -88,6 +140,7 @@ pub const Settings = struct {
         freeStringList(allocator, self.skills);
         freeStringList(allocator, self.prompts);
         freeStringList(allocator, self.themes);
+        deinitExtensionPolicyMap(allocator, self.extension_policies);
         self.* = .{};
     }
 
@@ -127,6 +180,7 @@ pub const Settings = struct {
             .skills = try cloneStringList(allocator, self.skills),
             .prompts = try cloneStringList(allocator, self.prompts),
             .themes = try cloneStringList(allocator, self.themes),
+            .extension_policies = try cloneExtensionPolicyMap(allocator, self.extension_policies),
         };
     }
 };
@@ -240,6 +294,15 @@ pub const RuntimeConfig = struct {
         }
         if (self.provider_api_keys.get(provider)) |value| {
             if (isNonEmptyCredentialValue(value)) return value;
+        }
+        return null;
+    }
+
+    pub fn getExtensionPolicy(self: *const RuntimeConfig, identity_key: []const u8) ?ExtensionPolicy {
+        var policies = self.settings.extension_policies orelse return null;
+        var iterator = policies.iterator();
+        while (iterator.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, identity_key)) return entry.value_ptr.*;
         }
         return null;
     }
@@ -524,6 +587,13 @@ fn parseSettingsContent(
     result.skills = try parseStringList(allocator, parsed.value.object.get("skills"));
     result.prompts = try parseStringList(allocator, parsed.value.object.get("prompts"));
     result.themes = try parseStringList(allocator, parsed.value.object.get("themes"));
+    result.extension_policies = try parseExtensionPolicyMap(
+        allocator,
+        parsed.value.object.get("extensionPolicies"),
+        errors,
+        source,
+        path,
+    );
     return result;
 }
 
@@ -597,6 +667,11 @@ fn mergeSettings(allocator: std.mem.Allocator, base: Settings, overrides: Settin
         freeStringList(allocator, merged.themes);
         merged.themes = try cloneStringList(allocator, overrides.themes);
     }
+    if (overrides.extension_policies != null) {
+        const replacement = try mergeExtensionPolicyMaps(allocator, merged.extension_policies, overrides.extension_policies);
+        deinitExtensionPolicyMap(allocator, merged.extension_policies);
+        merged.extension_policies = replacement;
+    }
     return merged;
 }
 
@@ -620,6 +695,387 @@ fn mergeRetry(base: ?session_mod.RetrySettings, overrides: ?session_mod.RetrySet
         merged.base_delay_ms = value.base_delay_ms;
     }
     return merged;
+}
+
+pub fn validateExtensionPoliciesForSettingsWrite(
+    allocator: std.mem.Allocator,
+    settings_object: std.json.ObjectMap,
+    settings_path: []const u8,
+) !void {
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+    var parsed = try parseExtensionPolicyMap(
+        allocator,
+        settings_object.get("extensionPolicies"),
+        &errors,
+        .settings,
+        settings_path,
+    );
+    if (parsed) |*policies| deinitExtensionPolicyMapRequired(allocator, policies);
+    if (errors.items.len > 0) return error.InvalidExtensionPolicies;
+}
+
+fn parseExtensionPolicyMap(
+    allocator: std.mem.Allocator,
+    value: ?std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    path: []const u8,
+) !?ExtensionPolicyMap {
+    const map_value = value orelse return null;
+    if (map_value != .object) {
+        try appendPolicyMessage(allocator, errors, source, path, "$.extensionPolicies: expected object");
+        return null;
+    }
+
+    var policies = ExtensionPolicyMap.init(allocator);
+    errdefer deinitExtensionPolicyMapRequired(allocator, &policies);
+
+    var iterator = map_value.object.iterator();
+    while (iterator.next()) |entry| {
+        const identity = entry.key_ptr.*;
+        const policy_path = try extensionPolicyEntryPath(allocator, identity);
+        defer allocator.free(policy_path);
+        if (identity.len == 0) {
+            const message = try std.fmt.allocPrint(allocator, "{s}: extension identity must not be empty", .{policy_path});
+            defer allocator.free(message);
+            try appendPolicyMessage(allocator, errors, source, path, message);
+            continue;
+        }
+        var policy = (try parseExtensionPolicyShape(allocator, entry.value_ptr.*, errors, source, path, policy_path)) orelse continue;
+        errdefer policy.deinit(allocator);
+        const owned_identity = try allocator.dupe(u8, identity);
+        errdefer allocator.free(owned_identity);
+        if (try policies.fetchPut(owned_identity, policy)) |previous| {
+            allocator.free(owned_identity);
+            var previous_policy = previous.value;
+            previous_policy.deinit(allocator);
+        }
+    }
+
+    return policies;
+}
+
+fn parseExtensionPolicyShape(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    policy_path: []const u8,
+) !?ExtensionPolicy {
+    if (value != .object) {
+        try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}: expected object", .{policy_path});
+        return null;
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (!isPolicyField(entry.key_ptr.*)) {
+            try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.{s}: unsupported policy field", .{ policy_path, entry.key_ptr.* });
+            return null;
+        }
+    }
+
+    var policy = ExtensionPolicy{};
+    errdefer policy.deinit(allocator);
+    if (value.object.get("approvedGrants")) |approved_grants| {
+        policy.approved_grants = (try parseApprovedGrants(allocator, approved_grants, errors, source, settings_path, policy_path)) orelse return null;
+    }
+    if (value.object.get("resourceLimits")) |resource_limits| {
+        policy.resource_limits = (try parseResourceLimits(allocator, resource_limits, errors, source, settings_path, policy_path)) orelse {
+            policy.deinit(allocator);
+            return null;
+        };
+    }
+    return policy;
+}
+
+fn parseApprovedGrants(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    policy_path: []const u8,
+) !?[]const []const u8 {
+    if (value != .array) {
+        try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.approvedGrants: expected array", .{policy_path});
+        return null;
+    }
+    var grants = std.ArrayList([]const u8).empty;
+    errdefer deinitOwnedStringArrayList(allocator, &grants);
+    for (value.array.items, 0..) |grant_value, index| {
+        if (grant_value != .string) {
+            try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.approvedGrants[{d}]: expected string", .{ policy_path, index });
+            deinitOwnedStringArrayList(allocator, &grants);
+            return null;
+        }
+        if (!isCanonicalExtensionGrant(grant_value.string)) {
+            try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.approvedGrants[{d}]: unknown grant \"{s}\"", .{ policy_path, index, grant_value.string });
+            deinitOwnedStringArrayList(allocator, &grants);
+            return null;
+        }
+        try appendOwnedString(allocator, &grants, grant_value.string);
+    }
+    return try grants.toOwnedSlice(allocator);
+}
+
+fn deinitOwnedStringArrayList(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
+}
+
+fn parseResourceLimits(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    policy_path: []const u8,
+) !?ExtensionResourceLimits {
+    const limits_path = try std.fmt.allocPrint(allocator, "{s}.resourceLimits", .{policy_path});
+    defer allocator.free(limits_path);
+    if (value != .object) {
+        try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}: expected object", .{limits_path});
+        return null;
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (!isResourceLimitField(entry.key_ptr.*)) {
+            try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.{s}: unsupported resource limit", .{ limits_path, entry.key_ptr.* });
+            return null;
+        }
+    }
+
+    var limits = ExtensionResourceLimits{};
+    errdefer limits.deinit(allocator);
+    if (!try parseAndAssignResourceLimitInteger(allocator, value.object.get("maxChildren"), errors, source, settings_path, limits_path, "maxChildren", &limits.max_children)) return null;
+    if (!try parseAndAssignResourceLimitInteger(allocator, value.object.get("depth"), errors, source, settings_path, limits_path, "depth", &limits.depth)) return null;
+    if (!try parseAndAssignResourceLimitInteger(allocator, value.object.get("turns"), errors, source, settings_path, limits_path, "turns", &limits.turns)) return null;
+    if (!try parseAndAssignResourceLimitInteger(allocator, value.object.get("timeoutMs"), errors, source, settings_path, limits_path, "timeoutMs", &limits.timeout_ms)) return null;
+    if (!try parseAndAssignResourceLimitInteger(allocator, value.object.get("outputBytes"), errors, source, settings_path, limits_path, "outputBytes", &limits.output_bytes)) return null;
+    if (!try parseAndAssignResourceLimitInteger(allocator, value.object.get("outputLines"), errors, source, settings_path, limits_path, "outputLines", &limits.output_lines)) return null;
+    switch (try parseOptionalToolScopes(allocator, value.object.get("toolScopes"), errors, source, settings_path, limits_path)) {
+        .absent => {},
+        .invalid => return null,
+        .value => |scopes| limits.tool_scopes = scopes,
+    }
+    return limits;
+}
+
+const OptionalResourceLimitInteger = union(enum) {
+    absent,
+    invalid,
+    value: u64,
+};
+
+fn parseAndAssignResourceLimitInteger(
+    allocator: std.mem.Allocator,
+    value: ?std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    limits_path: []const u8,
+    field_name: []const u8,
+    target: *?u64,
+) !bool {
+    switch (try parseOptionalResourceLimitInteger(allocator, value, errors, source, settings_path, limits_path, field_name)) {
+        .absent => return true,
+        .invalid => return false,
+        .value => |field| {
+            target.* = field;
+            return true;
+        },
+    }
+}
+
+fn parseOptionalResourceLimitInteger(
+    allocator: std.mem.Allocator,
+    value: ?std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    limits_path: []const u8,
+    field_name: []const u8,
+) !OptionalResourceLimitInteger {
+    const field = value orelse return .absent;
+    if (field != .integer or field.integer < 0 or @as(u64, @intCast(field.integer)) > MAX_SAFE_INTEGER) {
+        try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.{s}: expected non-negative integer", .{ limits_path, field_name });
+        return .invalid;
+    }
+    return .{ .value = @intCast(field.integer) };
+}
+
+const OptionalToolScopes = union(enum) {
+    absent,
+    invalid,
+    value: []const []const u8,
+};
+
+fn parseOptionalToolScopes(
+    allocator: std.mem.Allocator,
+    value: ?std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    limits_path: []const u8,
+) !OptionalToolScopes {
+    const scopes_value = value orelse return .absent;
+    if (scopes_value != .array) {
+        try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.toolScopes: expected array", .{limits_path});
+        return .invalid;
+    }
+    var scopes = std.ArrayList([]const u8).empty;
+    errdefer deinitOwnedStringArrayList(allocator, &scopes);
+    for (scopes_value.array.items, 0..) |scope_value, index| {
+        if (scope_value != .string) {
+            try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.toolScopes[{d}]: expected string", .{ limits_path, index });
+            deinitOwnedStringArrayList(allocator, &scopes);
+            return .invalid;
+        }
+        if (scope_value.string.len == 0) {
+            try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.toolScopes[{d}]: must not be empty", .{ limits_path, index });
+            deinitOwnedStringArrayList(allocator, &scopes);
+            return .invalid;
+        }
+        try appendOwnedString(allocator, &scopes, scope_value.string);
+    }
+    return .{ .value = try scopes.toOwnedSlice(allocator) };
+}
+
+fn mergeExtensionPolicyMaps(
+    allocator: std.mem.Allocator,
+    base: ?ExtensionPolicyMap,
+    overrides: ?ExtensionPolicyMap,
+) !?ExtensionPolicyMap {
+    if (base == null and overrides == null) return null;
+
+    var merged = (try cloneExtensionPolicyMap(allocator, base)) orelse ExtensionPolicyMap.init(allocator);
+    errdefer deinitExtensionPolicyMapRequired(allocator, &merged);
+    if (overrides == null) return merged;
+
+    var override_map = overrides.?;
+    var iterator = override_map.iterator();
+    while (iterator.next()) |entry| {
+        var policy = try mergeExtensionPolicy(allocator, merged.get(entry.key_ptr.*), entry.value_ptr.*);
+        errdefer policy.deinit(allocator);
+        const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(owned_key);
+        if (try merged.fetchPut(owned_key, policy)) |previous| {
+            allocator.free(owned_key);
+            var previous_policy = previous.value;
+            previous_policy.deinit(allocator);
+        }
+    }
+    return merged;
+}
+
+fn mergeExtensionPolicy(
+    allocator: std.mem.Allocator,
+    base: ?ExtensionPolicy,
+    override: ExtensionPolicy,
+) !ExtensionPolicy {
+    var merged = if (base) |policy| try policy.clone(allocator) else ExtensionPolicy{};
+    errdefer merged.deinit(allocator);
+    if (override.approved_grants != null) {
+        const replacement = try cloneStringList(allocator, override.approved_grants);
+        freeStringList(allocator, merged.approved_grants);
+        merged.approved_grants = replacement;
+    }
+    if (override.resource_limits) |override_limits| {
+        if (merged.resource_limits == null) merged.resource_limits = .{};
+        if (override_limits.max_children) |field| merged.resource_limits.?.max_children = field;
+        if (override_limits.depth) |field| merged.resource_limits.?.depth = field;
+        if (override_limits.turns) |field| merged.resource_limits.?.turns = field;
+        if (override_limits.timeout_ms) |field| merged.resource_limits.?.timeout_ms = field;
+        if (override_limits.output_bytes) |field| merged.resource_limits.?.output_bytes = field;
+        if (override_limits.output_lines) |field| merged.resource_limits.?.output_lines = field;
+        if (override_limits.tool_scopes != null) {
+            const replacement = try cloneStringList(allocator, override_limits.tool_scopes);
+            freeStringList(allocator, merged.resource_limits.?.tool_scopes);
+            merged.resource_limits.?.tool_scopes = replacement;
+        }
+    }
+    return merged;
+}
+
+fn cloneExtensionPolicyMap(allocator: std.mem.Allocator, value: ?ExtensionPolicyMap) !?ExtensionPolicyMap {
+    var source = value orelse return null;
+    var cloned = ExtensionPolicyMap.init(allocator);
+    errdefer deinitExtensionPolicyMapRequired(allocator, &cloned);
+    var iterator = source.iterator();
+    while (iterator.next()) |entry| {
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        var policy = try entry.value_ptr.*.clone(allocator);
+        errdefer policy.deinit(allocator);
+        try cloned.put(key, policy);
+    }
+    return cloned;
+}
+
+fn deinitExtensionPolicyMap(allocator: std.mem.Allocator, value: ?ExtensionPolicyMap) void {
+    var map = value orelse return;
+    deinitExtensionPolicyMapRequired(allocator, &map);
+}
+
+fn deinitExtensionPolicyMapRequired(allocator: std.mem.Allocator, map: *ExtensionPolicyMap) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        entry.value_ptr.deinit(allocator);
+    }
+    map.deinit();
+}
+
+fn extensionPolicyEntryPath(allocator: std.mem.Allocator, identity: []const u8) ![]u8 {
+    const quoted = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = identity }, .{});
+    defer allocator.free(quoted);
+    return std.fmt.allocPrint(allocator, "$.extensionPolicies[{s}]", .{quoted});
+}
+
+fn appendPolicyMessageFmt(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    path: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(message);
+    try appendPolicyMessage(allocator, errors, source, path, message);
+}
+
+fn appendPolicyMessage(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    path: []const u8,
+    message: []const u8,
+) !void {
+    try config_errors.appendMessage(allocator, errors, source, path, message);
+}
+
+fn isPolicyField(value: []const u8) bool {
+    return std.mem.eql(u8, value, "approvedGrants") or std.mem.eql(u8, value, "resourceLimits");
+}
+
+fn isResourceLimitField(value: []const u8) bool {
+    return std.mem.eql(u8, value, "maxChildren") or
+        std.mem.eql(u8, value, "depth") or
+        std.mem.eql(u8, value, "turns") or
+        std.mem.eql(u8, value, "timeoutMs") or
+        std.mem.eql(u8, value, "outputBytes") or
+        std.mem.eql(u8, value, "outputLines") or
+        std.mem.eql(u8, value, "toolScopes");
+}
+
+fn isCanonicalExtensionGrant(value: []const u8) bool {
+    for (wasm_manifest.CANONICAL_CAPABILITIES) |capability| {
+        if (std.mem.eql(u8, capability.jsonName(), value)) return true;
+    }
+    return false;
 }
 
 fn loadAuthTokens(
@@ -1126,10 +1582,16 @@ fn parseStringList(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]con
 
     for (list_value.array.items) |item| {
         if (item != .string) continue;
-        try items.append(allocator, try allocator.dupe(u8, item.string));
+        try appendOwnedString(allocator, &items, item.string);
     }
 
     return try items.toOwnedSlice(allocator);
+}
+
+fn appendOwnedString(allocator: std.mem.Allocator, items: *std.ArrayList([]const u8), value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try items.append(allocator, owned);
 }
 
 fn parsePackageSources(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]const resources_mod.PackageSourceConfig {
@@ -1197,7 +1659,13 @@ fn cloneStringList(allocator: std.mem.Allocator, value: ?[]const []const u8) !?[
         for (cloned.items) |item| allocator.free(item);
         cloned.deinit(allocator);
     }
-    for (items) |item| try cloned.append(allocator, try allocator.dupe(u8, item));
+    for (items) |item| {
+        const cloned_item = try allocator.dupe(u8, item);
+        cloned.append(allocator, cloned_item) catch |err| {
+            allocator.free(cloned_item);
+            return err;
+        };
+    }
     return try cloned.toOwnedSlice(allocator);
 }
 
@@ -1432,6 +1900,454 @@ test "runtime config merges global and project settings with nested overrides" {
     const expected_session_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, "sessions" });
     defer allocator.free(expected_session_dir);
     try std.testing.expectEqualStrings(expected_session_dir, session_dir);
+}
+
+test "runtime config parses merges and looks up extension policies" {
+    const allocator = std.testing.allocator;
+    const identity_a = "typescript:local:project:/tmp/policy-a.ts";
+    const identity_b = "typescript:local:project:/tmp/policy-b.ts";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-b.ts": { "approvedGrants": ["file.read"] },
+        \\    "typescript:local:project:/tmp/policy-a.ts": {
+        \\      "approvedGrants": ["agent.delegate", "tool.use"],
+        \\      "resourceLimits": {
+        \\        "turns": 5,
+        \\        "timeoutMs": 1000,
+        \\        "outputLines": 20,
+        \\        "toolScopes": ["fixture.echo", "fixture.read"]
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "project/.pi/settings.json",
+        .data =
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": {
+        \\      "approvedGrants": ["tool.use"],
+        \\      "resourceLimits": {
+        \\        "turns": 1,
+        \\        "toolScopes": []
+        \\      }
+        \\    }
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    try std.testing.expectEqual(@as(usize, 0), runtime.errors.len);
+    try std.testing.expect(runtime.settings.extension_policies != null);
+    try std.testing.expectEqual(@as(u32, 2), runtime.settings.extension_policies.?.count());
+    const policy_a = runtime.getExtensionPolicy(identity_a).?;
+    try std.testing.expectEqual(@as(usize, 1), policy_a.approved_grants.?.len);
+    try std.testing.expectEqualStrings("tool.use", policy_a.approved_grants.?[0]);
+    try std.testing.expectEqual(@as(u64, 1), policy_a.resource_limits.?.turns.?);
+    try std.testing.expectEqual(@as(u64, 1000), policy_a.resource_limits.?.timeout_ms.?);
+    try std.testing.expectEqual(@as(u64, 20), policy_a.resource_limits.?.output_lines.?);
+    try std.testing.expectEqual(@as(usize, 0), policy_a.resource_limits.?.tool_scopes.?.len);
+
+    const policy_b = runtime.getExtensionPolicy(identity_b).?;
+    try std.testing.expectEqual(@as(usize, 1), policy_b.approved_grants.?.len);
+    try std.testing.expectEqualStrings("file.read", policy_b.approved_grants.?[0]);
+}
+
+test "extension policy merge replacement clones are OOM safe" {
+    const base_policy = ExtensionPolicy{
+        .approved_grants = &.{"file.read"},
+        .resource_limits = .{
+            .turns = 5,
+            .tool_scopes = &.{"base.scope"},
+        },
+    };
+    const override_policy = ExtensionPolicy{
+        .approved_grants = &.{"tool.use"},
+        .resource_limits = .{
+            .turns = 1,
+            .tool_scopes = &.{"override.scope"},
+        },
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing_allocator_state = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_allocator_state.allocator();
+
+        if (mergeExtensionPolicy(failing_allocator, base_policy, override_policy)) |merged| {
+            var owned = merged;
+            defer owned.deinit(failing_allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.approved_grants.?.len);
+            try std.testing.expectEqualStrings("tool.use", owned.approved_grants.?[0]);
+            try std.testing.expectEqual(@as(u64, 1), owned.resource_limits.?.turns.?);
+            try std.testing.expectEqual(@as(usize, 1), owned.resource_limits.?.tool_scopes.?.len);
+            try std.testing.expectEqualStrings("override.scope", owned.resource_limits.?.tool_scopes.?[0]);
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+    }
+}
+
+fn putOwnedTestPolicy(
+    allocator: std.mem.Allocator,
+    map: *ExtensionPolicyMap,
+    identity: []const u8,
+    grants: []const []const u8,
+    tool_scopes: ?[]const []const u8,
+) !void {
+    var policy = ExtensionPolicy{};
+    errdefer policy.deinit(allocator);
+    policy.approved_grants = (try cloneStringList(allocator, grants)).?;
+    if (tool_scopes) |scopes| {
+        policy.resource_limits = .{
+            .tool_scopes = (try cloneStringList(allocator, scopes)).?,
+        };
+    }
+    const owned_identity = try allocator.dupe(u8, identity);
+    errdefer allocator.free(owned_identity);
+    try map.put(owned_identity, policy);
+}
+
+fn expectBasePolicyUnchanged(base: ExtensionPolicyMap, identity_a: []const u8, identity_b: []const u8) !void {
+    const retained = base.get(identity_a).?;
+    try std.testing.expectEqual(@as(usize, 1), retained.approved_grants.?.len);
+    try std.testing.expectEqualStrings("file.read", retained.approved_grants.?[0]);
+    try std.testing.expectEqual(@as(usize, 1), retained.resource_limits.?.tool_scopes.?.len);
+    try std.testing.expectEqualStrings("base.scope", retained.resource_limits.?.tool_scopes.?[0]);
+    try std.testing.expect(base.get(identity_b) == null);
+}
+
+test "extension policy map merge preserves caller-owned base map on OOM" {
+    const allocator = std.testing.allocator;
+    const identity_a = "typescript:local:project:/tmp/policy-a.ts";
+    const identity_b = "typescript:local:project:/tmp/policy-b.ts";
+
+    var base = ExtensionPolicyMap.init(allocator);
+    defer deinitExtensionPolicyMapRequired(allocator, &base);
+    try putOwnedTestPolicy(allocator, &base, identity_a, &.{"file.read"}, &.{"base.scope"});
+
+    var overrides = ExtensionPolicyMap.init(allocator);
+    defer deinitExtensionPolicyMapRequired(allocator, &overrides);
+    try putOwnedTestPolicy(allocator, &overrides, identity_a, &.{"tool.use"}, &.{"override.scope"});
+    try putOwnedTestPolicy(allocator, &overrides, identity_b, &.{"agent.delegate"}, null);
+
+    var fail_index: usize = 0;
+    while (fail_index < 96) : (fail_index += 1) {
+        var failing_allocator_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_allocator_state.allocator();
+        if (mergeExtensionPolicyMaps(failing_allocator, base, overrides)) |maybe_merged| {
+            var merged = maybe_merged.?;
+            defer deinitExtensionPolicyMapRequired(failing_allocator, &merged);
+
+            const policy_a = merged.get(identity_a).?;
+            try std.testing.expectEqual(@as(usize, 1), policy_a.approved_grants.?.len);
+            try std.testing.expectEqualStrings("tool.use", policy_a.approved_grants.?[0]);
+            try std.testing.expectEqual(@as(usize, 1), policy_a.resource_limits.?.tool_scopes.?.len);
+            try std.testing.expectEqualStrings("override.scope", policy_a.resource_limits.?.tool_scopes.?[0]);
+            const policy_b = merged.get(identity_b).?;
+            try std.testing.expectEqual(@as(usize, 1), policy_b.approved_grants.?.len);
+            try std.testing.expectEqualStrings("agent.delegate", policy_b.approved_grants.?[0]);
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+
+        try expectBasePolicyUnchanged(base, identity_a, identity_b);
+    }
+}
+
+test "extension policy map clone releases cloned policy when put fails" {
+    const allocator = std.testing.allocator;
+
+    var source = ExtensionPolicyMap.init(allocator);
+    defer deinitExtensionPolicyMapRequired(allocator, &source);
+    try putOwnedTestPolicy(
+        allocator,
+        &source,
+        "typescript:local:project:/tmp/policy-a.ts",
+        &.{ "file.read", "tool.use" },
+        &.{ "scope.one", "scope.two" },
+    );
+
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing_allocator_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_allocator_state.allocator();
+
+        if (cloneExtensionPolicyMap(failing_allocator, source)) |maybe_cloned| {
+            if (maybe_cloned) |cloned| {
+                var owned = cloned;
+                deinitExtensionPolicyMapRequired(failing_allocator, &owned);
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+    }
+}
+
+test "extension policy parser list append failures release duplicated strings" {
+    const allocator = std.testing.allocator;
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+
+    var grants_value = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\["file.read", "tool.use"]
+    , .{});
+    defer grants_value.deinit();
+    var tool_scopes_value = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\["scope.one", "scope.two"]
+    , .{});
+    defer tool_scopes_value.deinit();
+    var string_list_value = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\["extensions", "skills"]
+    , .{});
+    defer string_list_value.deinit();
+
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing_allocator_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_allocator_state.allocator();
+        if (parseApprovedGrants(
+            failing_allocator,
+            grants_value.value,
+            &errors,
+            .settings,
+            "settings.json",
+            "$.extensionPolicies[\"policy\"]",
+        )) |maybe_grants| {
+            freeStringList(failing_allocator, maybe_grants);
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+    }
+
+    fail_index = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing_allocator_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_allocator_state.allocator();
+        if (parseOptionalToolScopes(
+            failing_allocator,
+            tool_scopes_value.value,
+            &errors,
+            .settings,
+            "settings.json",
+            "$.extensionPolicies[\"policy\"].resourceLimits",
+        )) |scopes_result| {
+            switch (scopes_result) {
+                .absent, .invalid => {},
+                .value => |scopes| freeStringList(failing_allocator, scopes),
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+    }
+
+    fail_index = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing_allocator_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_allocator_state.allocator();
+        if (parseStringList(failing_allocator, string_list_value.value)) |maybe_items| {
+            freeStringList(failing_allocator, maybe_items);
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+}
+
+test "runtime config reports malformed extension policies while preserving valid scopes" {
+    const allocator = std.testing.allocator;
+    const identity_a = "typescript:local:project:/tmp/policy-a.ts";
+    const identity_b = "typescript:local:project:/tmp/policy-b.ts";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": { "approvedGrants": ["agent.delegate"] },
+        \\    "typescript:local:project:/tmp/policy-b.ts": { "approvedGrants": ["agent"] }
+        \\  }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "project/.pi/settings.json",
+        .data =
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-b.ts": { "resourceLimits": { "turns": 1 } }
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.errors.len);
+    try std.testing.expectEqualStrings(
+        "$.extensionPolicies[\"typescript:local:project:/tmp/policy-b.ts\"].approvedGrants[0]: unknown grant \"agent\"",
+        runtime.errors[0].message,
+    );
+    try std.testing.expect(runtime.global_settings.extension_policies.?.get(identity_a) != null);
+    try std.testing.expect(runtime.global_settings.extension_policies.?.get(identity_b) == null);
+    const policy_b = runtime.getExtensionPolicy(identity_b).?;
+    try std.testing.expectEqual(@as(u64, 1), policy_b.resource_limits.?.turns.?);
+}
+
+test "runtime config rejects malformed resource limit policy entries for effective lookup" {
+    const allocator = std.testing.allocator;
+    const valid_identity = "typescript:local:project:/tmp/policy-valid.ts";
+    const timeout_identity = "typescript:local:project:/tmp/policy-timeout.ts";
+    const scopes_identity = "typescript:local:project:/tmp/policy-scopes.ts";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-valid.ts": {
+        \\      "approvedGrants": ["file.read"],
+        \\      "resourceLimits": { "turns": 1, "toolScopes": ["read"] }
+        \\    },
+        \\    "typescript:local:project:/tmp/policy-timeout.ts": {
+        \\      "approvedGrants": ["file.read"],
+        \\      "resourceLimits": { "timeoutMs": 9007199254740992 }
+        \\    },
+        \\    "typescript:local:project:/tmp/policy-scopes.ts": {
+        \\      "approvedGrants": ["file.read"],
+        \\      "resourceLimits": { "toolScopes": [""] }
+        \\    }
+        \\  }
+        \\}
+        ,
+    });
+
+    const home_dir = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var runtime = try loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.errors.len);
+    try std.testing.expectEqualStrings(
+        "$.extensionPolicies[\"typescript:local:project:/tmp/policy-timeout.ts\"].resourceLimits.timeoutMs: expected non-negative integer",
+        runtime.errors[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "$.extensionPolicies[\"typescript:local:project:/tmp/policy-scopes.ts\"].resourceLimits.toolScopes[0]: must not be empty",
+        runtime.errors[1].message,
+    );
+    try std.testing.expect(runtime.settings.extension_policies != null);
+    try std.testing.expectEqual(@as(u32, 1), runtime.settings.extension_policies.?.count());
+    try std.testing.expect(runtime.getExtensionPolicy(timeout_identity) == null);
+    try std.testing.expect(runtime.getExtensionPolicy(scopes_identity) == null);
+
+    const valid_policy = runtime.getExtensionPolicy(valid_identity).?;
+    try std.testing.expectEqual(@as(usize, 1), valid_policy.approved_grants.?.len);
+    try std.testing.expectEqualStrings("file.read", valid_policy.approved_grants.?[0]);
+    try std.testing.expectEqual(@as(u64, 1), valid_policy.resource_limits.?.turns.?);
+    try std.testing.expectEqual(@as(usize, 1), valid_policy.resource_limits.?.tool_scopes.?.len);
+    try std.testing.expectEqualStrings("read", valid_policy.resource_limits.?.tool_scopes.?[0]);
+}
+
+test "extension policy write validation blocks malformed active entries" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "theme": "dark",
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": { "approvedGrants": ["network"] }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidExtensionPolicies,
+        validateExtensionPoliciesForSettingsWrite(allocator, parsed.value.object, "settings.json"),
+    );
+
+    var unsafe_limit = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": {
+        \\      "resourceLimits": { "timeoutMs": 9007199254740992 }
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer unsafe_limit.deinit();
+    try std.testing.expectError(
+        error.InvalidExtensionPolicies,
+        validateExtensionPoliciesForSettingsWrite(allocator, unsafe_limit.value.object, "settings.json"),
+    );
+
+    var valid = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": {
+        \\      "approvedGrants": ["agent.delegate"],
+        \\      "resourceLimits": { "outputLines": 4 }
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer valid.deinit();
+    try validateExtensionPoliciesForSettingsWrite(allocator, valid.value.object, "settings.json");
 }
 
 test "runtime config loads auth and custom models from agent files" {

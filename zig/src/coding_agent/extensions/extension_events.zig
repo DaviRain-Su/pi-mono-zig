@@ -399,6 +399,7 @@ const subagent_limit_detail_fields = [_][]const u8{ "limit", "actual", "truncate
 const subagent_forbidden_fields = [_][]const u8{ "ui", "ux", "slashCommand", "spawn", "spawnPolicy", "automaticSpawn", "orchestrationPolicy", "modelSelectionUi", "approvalPolicy" };
 const subagent_cancellation_states = [_][]const u8{ "pending", "requested", "propagated", "completed" };
 const subagent_result_statuses = [_][]const u8{ "pending", "running", "completed", "failed", "cancelled" };
+const MAX_SAFE_INTEGER: u64 = 9007199254740991;
 
 pub fn validateSubAgentReadinessEnvelope(allocator: std.mem.Allocator, value: std.json.Value) !SubAgentReadinessValidation {
     const object = switch (value) {
@@ -689,7 +690,7 @@ fn requiredNonNegativeNumberDiagnostic(allocator: std.mem.Allocator, object: std
 fn optionalNonNegativeIntegerDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
     const value = object.get(field) orelse return null;
     const valid = switch (value) {
-        .integer => |number| number >= 0,
+        .integer => |number| number >= 0 and @as(u64, @intCast(number)) <= MAX_SAFE_INTEGER,
         else => false,
     };
     if (valid) return null;
@@ -2004,6 +2005,11 @@ test "sub-agent readiness envelope validation rejects missing ids product fields
         .{
             .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"limits\":{\"maxChildren\":-1}}",
             .path = "$.limits.maxChildren",
+            .message = "expected non-negative integer",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"limits\":{\"timeoutMs\":9007199254740992}}",
+            .path = "$.limits.timeoutMs",
             .message = "expected non-negative integer",
         },
         .{

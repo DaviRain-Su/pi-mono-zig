@@ -21,6 +21,7 @@ pub const writeShutdownFrame = extension_protocol.writeShutdownFrame;
 pub const HostProcessOptions = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
+    extension_path: ?[]const u8 = null,
     initialize: InitializeFrame,
     shutdown_timeout_ms: u64 = 1000,
 };

@@ -9,6 +9,7 @@ pub const CANONICAL_GRANTS = wasm_manifest.CANONICAL_CAPABILITIES;
 pub const Principal = struct {
     runtime_kind: []const u8,
     extension_id: []const u8,
+    policy_lookup_key: ?[]const u8 = null,
     package_root: ?[]const u8 = null,
     invocation_id: ?[]const u8 = null,
     session_id: ?[]const u8 = null,

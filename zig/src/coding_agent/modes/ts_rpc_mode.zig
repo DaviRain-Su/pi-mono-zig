@@ -1524,192 +1524,228 @@ const TsRpcServer = struct {
             else => return,
         };
 
+        if (try self.writeExtensionUIDialogRequestFromHost(request, payload)) return;
+        if (try self.writeExtensionUISurfaceRequestFromHost(request, payload)) return;
+        if (try self.writeExtensionCommandContextRequestFromHost(request, payload)) return;
+    }
+
+    fn writeExtensionUIDialogRequestFromHost(
+        self: *TsRpcServer,
+        request: extension_runtime.ExtensionUiRequest,
+        payload: std.json.ObjectMap,
+    ) !bool {
         if (std.mem.eql(u8, request.method, "select")) {
-            const title = requiredString(payload, "title") catch return;
+            const title = requiredString(payload, "title") catch return true;
             const options = try requiredStringArray(self.allocator, payload, "options");
             defer self.allocator.free(options);
             try self.writeExtensionUISelectRequest(request.id, title, options, optionalU64(payload, "timeout"));
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "confirm")) {
-            const title = requiredString(payload, "title") catch return;
-            const message = requiredString(payload, "message") catch return;
+            const title = requiredString(payload, "title") catch return true;
+            const message = requiredString(payload, "message") catch return true;
             try self.writeExtensionUIConfirmRequest(request.id, title, message, optionalU64(payload, "timeout"));
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "input")) {
-            const title = requiredString(payload, "title") catch return;
-            const placeholder = optionalString(payload, "placeholder") catch return;
+            const title = requiredString(payload, "title") catch return true;
+            const placeholder = optionalString(payload, "placeholder") catch return true;
             try self.writeExtensionUIInputRequest(request.id, title, placeholder, optionalU64(payload, "timeout"));
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "editor")) {
-            const title = requiredString(payload, "title") catch return;
-            const prefill = optionalString(payload, "prefill") catch return;
+            const title = requiredString(payload, "title") catch return true;
+            const prefill = optionalString(payload, "prefill") catch return true;
             try self.writeExtensionUIEditorRequest(request.id, title, prefill);
-            return;
+            return true;
         }
+        return false;
+    }
+
+    fn writeExtensionUISurfaceRequestFromHost(
+        self: *TsRpcServer,
+        request: extension_runtime.ExtensionUiRequest,
+        payload: std.json.ObjectMap,
+    ) !bool {
         if (std.mem.eql(u8, request.method, "notify")) {
-            const message = requiredString(payload, "message") catch return;
-            const notify_type = optionalString(payload, "notifyType") catch return;
+            const message = requiredString(payload, "message") catch return true;
+            const notify_type = optionalString(payload, "notifyType") catch return true;
             try self.writeExtensionUINotifyRequest(request.id, message, notify_type);
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "setStatus")) {
-            const status_key = requiredString(payload, "statusKey") catch return;
-            const status_text = optionalString(payload, "statusText") catch return;
+            const status_key = requiredString(payload, "statusKey") catch return true;
+            const status_text = optionalString(payload, "statusText") catch return true;
             try self.writeExtensionUISetStatusRequest(request.id, status_key, status_text);
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "setWidget")) {
-            const widget_key = requiredString(payload, "widgetKey") catch return;
+            const widget_key = requiredString(payload, "widgetKey") catch return true;
             const widget_lines = try optionalStringArray(self.allocator, payload, "widgetLines");
             defer if (widget_lines) |lines| self.allocator.free(lines);
-            const widget_placement = optionalString(payload, "widgetPlacement") catch return;
+            const widget_placement = optionalString(payload, "widgetPlacement") catch return true;
             try self.writeExtensionUISetWidgetRequest(request.id, widget_key, widget_lines, widget_placement);
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "setTitle")) {
-            const title = requiredString(payload, "title") catch return;
+            const title = requiredString(payload, "title") catch return true;
             try self.writeExtensionUISetTitleRequest(request.id, title);
-            return;
+            return true;
         }
         if (std.mem.eql(u8, request.method, "set_editor_text")) {
-            const text = requiredString(payload, "text") catch return;
+            const text = requiredString(payload, "text") catch return true;
             try self.writeExtensionUISetEditorTextRequest(request.id, text);
-            return;
+            return true;
         }
+        return false;
+    }
 
-        // Extension command context APIs (VAL-EXT-031..036)
-
+    fn writeExtensionCommandContextRequestFromHost(
+        self: *TsRpcServer,
+        request: extension_runtime.ExtensionUiRequest,
+        payload: std.json.ObjectMap,
+    ) !bool {
         if (std.mem.eql(u8, request.method, "wait_for_idle")) {
-            if (!self.isAgentBusy()) {
-                // Agent is already idle — respond immediately.
-                if (self.extension_host) |host| {
-                    try host.sendExtensionUiResponse(request.id, "{}");
-                }
-            } else {
-                // Agent is busy — queue the ID; resolveWaitForIdleRequests will
-                // send the response once the agent becomes idle.
-                const id_copy = try self.allocator.dupe(u8, request.id);
-                errdefer self.allocator.free(id_copy);
-                try self.pending_wait_for_idle_ids.append(self.allocator, id_copy);
-            }
-            return;
+            try self.handleExtensionWaitForIdleRequest(request.id);
+            return true;
         }
-
         if (std.mem.eql(u8, request.method, "send_custom_message")) {
-            const session = self.session orelse return;
-            // Default customType is "extension.message" when the field is omitted.
-            const custom_type_or_null = optionalString(payload, "customType") catch {
-                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"customType must be a string\"}");
-                return;
-            };
-            const custom_type = custom_type_or_null orelse "extension.message";
-            const display = optionalBool(payload, "display") orelse true;
-            const trigger_turn = optionalBool(payload, "triggerTurn") orelse false;
-            const deliver_as = optionalString(payload, "deliverAs") catch {
-                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs must be a string\"}");
-                return;
-            };
-
-            // deliverAs="nextTurn" is not yet supported — no holding queue is implemented.
-            // Return an explicit error so callers waiting on response_required don't hang.
-            if (deliver_as) |mode| {
-                if (std.mem.eql(u8, mode, "nextTurn")) {
-                    if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs nextTurn is not yet supported\"}");
-                    return;
-                }
-            }
-
-            // Build content: prefer string, fall back to empty text.
-            const content_text: []const u8 = if (payload.get("content")) |c|
-                if (c == .string) c.string else ""
-            else
-                "";
-            const content: session_manager_mod.CustomMessageContent = .{ .text = content_text };
-
-            // Persist the custom message entry in the session file.
-            const details = payload.get("details");
-            _ = try session.session_manager.appendCustomMessageEntry(custom_type, content, display, details);
-
-            // Handle delivery mode when the agent is streaming.
-            if (session.isStreaming() or self.hasInFlightPrompt()) {
-                if (deliver_as) |mode| {
-                    if (std.mem.eql(u8, mode, "steer")) {
-                        session.steer(content_text, &.{}) catch {};
-                    } else if (std.mem.eql(u8, mode, "followUp")) {
-                        session.followUp(content_text, &.{}) catch {};
-                    }
-                }
-            } else if (trigger_turn) {
-                // Not streaming but caller wants to trigger a new turn.
-                const text_copy = try self.allocator.dupe(u8, content_text);
-                errdefer self.allocator.free(text_copy);
-                const images = try self.allocator.alloc(ai.ImageContent, 0);
-                const task = try PromptTask.create(self.allocator, self.io, self, session, null, text_copy, images);
-                try self.prompt_tasks.append(self.allocator, task);
-                task.spawn() catch {
-                    _ = self.prompt_tasks.pop();
-                    task.joinAndDestroy();
-                };
-            }
-
-            // Acknowledge to the extension host.
-            if (self.extension_host) |host| {
-                try host.sendExtensionUiResponse(request.id, "{}");
-            }
-            return;
+            try self.handleExtensionSendCustomMessageRequest(request.id, payload);
+            return true;
         }
-
         if (std.mem.eql(u8, request.method, "send_user_message")) {
-            const session = self.session orelse return;
-            const text = optionalString(payload, "text") catch {
-                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"text must be a string\"}");
-                return;
-            } orelse "";
-            const deliver_as = optionalString(payload, "deliverAs") catch {
-                if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs must be a string\"}");
-                return;
-            };
-
-            // deliverAs="nextTurn" is not yet supported — no holding queue is implemented.
-            // Return an explicit error so callers waiting on response_required don't hang.
-            if (deliver_as) |mode| {
-                if (std.mem.eql(u8, mode, "nextTurn")) {
-                    if (self.extension_host) |host| try host.sendExtensionUiResponse(request.id, "{\"error\":\"deliverAs nextTurn is not yet supported\"}");
-                    return;
-                }
-            }
-
-            if (session.isStreaming() or self.hasInFlightPrompt()) {
-                // Route based on deliverAs when the agent is busy.
-                const is_steer = if (deliver_as) |mode| std.mem.eql(u8, mode, "steer") else false;
-                if (is_steer) {
-                    session.steer(text, &.{}) catch {};
-                } else {
-                    // Default: followUp when streaming.
-                    session.followUp(text, &.{}) catch {};
-                }
-            } else {
-                // Not streaming: start a new background prompt task.
-                const text_copy = try self.allocator.dupe(u8, text);
-                errdefer self.allocator.free(text_copy);
-                const images = try self.allocator.alloc(ai.ImageContent, 0);
-                const task = try PromptTask.create(self.allocator, self.io, self, session, null, text_copy, images);
-                try self.prompt_tasks.append(self.allocator, task);
-                task.spawn() catch {
-                    _ = self.prompt_tasks.pop();
-                    task.joinAndDestroy();
-                };
-            }
-
-            // Acknowledge to the extension host.
-            if (self.extension_host) |host| {
-                try host.sendExtensionUiResponse(request.id, "{}");
-            }
-            return;
+            try self.handleExtensionSendUserMessageRequest(request.id, payload);
+            return true;
         }
+        return false;
+    }
+
+    fn handleExtensionWaitForIdleRequest(self: *TsRpcServer, id: []const u8) !void {
+        if (!self.isAgentBusy()) {
+            try self.sendExtensionUiResponseIfPresent(id, "{}");
+        } else {
+            const id_copy = try self.allocator.dupe(u8, id);
+            errdefer self.allocator.free(id_copy);
+            try self.pending_wait_for_idle_ids.append(self.allocator, id_copy);
+        }
+    }
+
+    fn handleExtensionSendCustomMessageRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        payload: std.json.ObjectMap,
+    ) !void {
+        const session = self.session orelse return;
+        const custom_type_or_null = optionalString(payload, "customType") catch {
+            try self.sendExtensionUiResponseIfPresent(id, "{\"error\":\"customType must be a string\"}");
+            return;
+        };
+        const custom_type = custom_type_or_null orelse "extension.message";
+        const display = optionalBool(payload, "display") orelse true;
+        const trigger_turn = optionalBool(payload, "triggerTurn") orelse false;
+        const deliver_as = optionalString(payload, "deliverAs") catch {
+            try self.sendExtensionUiResponseIfPresent(id, "{\"error\":\"deliverAs must be a string\"}");
+            return;
+        };
+
+        if (try self.rejectUnsupportedNextTurn(id, deliver_as)) return;
+
+        const content_text = extensionPayloadText(payload, "content");
+        const content: session_manager_mod.CustomMessageContent = .{ .text = content_text };
+        const details = payload.get("details");
+        _ = try session.session_manager.appendCustomMessageEntry(custom_type, content, display, details);
+
+        if (session.isStreaming() or self.hasInFlightPrompt()) {
+            deliverExtensionCustomTextWhileBusy(session, content_text, deliver_as);
+        } else if (trigger_turn) {
+            try self.startExtensionPromptTask(session, content_text);
+        }
+
+        try self.sendExtensionUiResponseIfPresent(id, "{}");
+    }
+
+    fn handleExtensionSendUserMessageRequest(
+        self: *TsRpcServer,
+        id: []const u8,
+        payload: std.json.ObjectMap,
+    ) !void {
+        const session = self.session orelse return;
+        const text = optionalString(payload, "text") catch {
+            try self.sendExtensionUiResponseIfPresent(id, "{\"error\":\"text must be a string\"}");
+            return;
+        } orelse "";
+        const deliver_as = optionalString(payload, "deliverAs") catch {
+            try self.sendExtensionUiResponseIfPresent(id, "{\"error\":\"deliverAs must be a string\"}");
+            return;
+        };
+
+        if (try self.rejectUnsupportedNextTurn(id, deliver_as)) return;
+
+        if (session.isStreaming() or self.hasInFlightPrompt()) {
+            deliverExtensionUserTextWhileBusy(session, text, deliver_as);
+        } else {
+            try self.startExtensionPromptTask(session, text);
+        }
+
+        try self.sendExtensionUiResponseIfPresent(id, "{}");
+    }
+
+    fn sendExtensionUiResponseIfPresent(self: *TsRpcServer, id: []const u8, payload_json: []const u8) !void {
+        if (self.extension_host) |host| try host.sendExtensionUiResponse(id, payload_json);
+    }
+
+    fn rejectUnsupportedNextTurn(self: *TsRpcServer, id: []const u8, deliver_as: ?[]const u8) !bool {
+        if (deliver_as) |mode| {
+            if (std.mem.eql(u8, mode, "nextTurn")) {
+                try self.sendExtensionUiResponseIfPresent(id, "{\"error\":\"deliverAs nextTurn is not yet supported\"}");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn extensionPayloadText(payload: std.json.ObjectMap, key: []const u8) []const u8 {
+        const value = payload.get(key) orelse return "";
+        return if (value == .string) value.string else "";
+    }
+
+    fn deliverExtensionCustomTextWhileBusy(
+        session: *session_mod.AgentSession,
+        text: []const u8,
+        deliver_as: ?[]const u8,
+    ) void {
+        if (deliver_as) |mode| {
+            if (std.mem.eql(u8, mode, "steer")) {
+                session.steer(text, &.{}) catch {};
+            } else if (std.mem.eql(u8, mode, "followUp")) {
+                session.followUp(text, &.{}) catch {};
+            }
+        }
+    }
+
+    fn deliverExtensionUserTextWhileBusy(
+        session: *session_mod.AgentSession,
+        text: []const u8,
+        deliver_as: ?[]const u8,
+    ) void {
+        const is_steer = if (deliver_as) |mode| std.mem.eql(u8, mode, "steer") else false;
+        if (is_steer) {
+            session.steer(text, &.{}) catch {};
+        } else {
+            session.followUp(text, &.{}) catch {};
+        }
+    }
+
+    fn startExtensionPromptTask(self: *TsRpcServer, session: *session_mod.AgentSession, text: []const u8) !void {
+        const text_copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(text_copy);
+        const images = try self.allocator.alloc(ai.ImageContent, 0);
+        const task = try PromptTask.create(self.allocator, self.io, self, session, null, text_copy, images);
+        try self.prompt_tasks.append(self.allocator, task);
+        task.spawn() catch {
+            _ = self.prompt_tasks.pop();
+            task.joinAndDestroy();
+        };
     }
 
     fn writeEvent(self: *TsRpcServer, event: agent.AgentEvent) !void {

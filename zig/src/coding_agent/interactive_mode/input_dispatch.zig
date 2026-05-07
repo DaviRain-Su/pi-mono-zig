@@ -1118,6 +1118,27 @@ pub fn pollForInput() !bool {
     return (try std.posix.poll(fds[0..], 50)) > 0;
 }
 
+const InputDispatchEventContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    app_context: *AppContext,
+    live_resources: *LiveResources,
+};
+
 pub fn dispatchInputEvent(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1140,151 +1161,151 @@ pub fn dispatchInputEvent(
     app_context: *AppContext,
     live_resources: *LiveResources,
 ) !void {
+    var context = InputDispatchEventContext{
+        .allocator = allocator,
+        .io = io,
+        .env_map = env_map,
+        .session = session,
+        .current_provider = current_provider,
+        .session_dir = session_dir,
+        .options = options,
+        .tool_items = tool_items,
+        .app_state = app_state,
+        .editor = editor,
+        .overlay = overlay,
+        .auth_flow = auth_flow,
+        .prompt_worker = prompt_worker,
+        .prompt_worker_active = prompt_worker_active,
+        .subscriber = subscriber,
+        .should_exit = should_exit,
+        .app_context = app_context,
+        .live_resources = live_resources,
+    };
+
     switch (parsed.event) {
-        .key => |key| {
-            const editor_len_before = editor.text().len;
-            maybeLogInputDebug(
-                allocator,
-                io,
-                env_map,
-                "before",
-                parsed,
-                key,
-                overlay,
-                auth_flow,
-                editor,
-                editor_len_before,
-                editor_len_before,
-            );
-            if (parsed.event_type == .release) {
-                maybeLogInputDebug(
-                    allocator,
-                    io,
-                    env_map,
-                    "after",
-                    parsed,
-                    key,
-                    overlay,
-                    auth_flow,
-                    editor,
-                    editor_len_before,
-                    editor.text().len,
-                );
-                consumeInputBytes(input_buffer, parsed.consumed);
-                return;
-            }
-            if (overlay.* == null and auth_flow.* == null) {
-                if (resolveParsedAppAction(live_resources.keybindings, key, parsed.modifiers)) |action| {
-                    switch (action) {
-                        .message_followUp => {
-                            try handleFollowUpAction(
-                                allocator,
-                                io,
-                                env_map,
-                                session,
-                                current_provider,
-                                session_dir,
-                                options,
-                                tool_items,
-                                app_state,
-                                editor,
-                                overlay,
-                                auth_flow,
-                                prompt_worker,
-                                prompt_worker_active,
-                                subscriber,
-                                should_exit,
-                                live_resources,
-                            );
-                            maybeLogInputDebug(
-                                allocator,
-                                io,
-                                env_map,
-                                "after",
-                                parsed,
-                                key,
-                                overlay,
-                                auth_flow,
-                                editor,
-                                editor_len_before,
-                                editor.text().len,
-                            );
-                            consumeInputBytes(input_buffer, parsed.consumed);
-                            return;
-                        },
-                        .message_dequeue => {
-                            try handleDequeueAction(allocator, session, app_state, editor);
-                            maybeLogInputDebug(
-                                allocator,
-                                io,
-                                env_map,
-                                "after",
-                                parsed,
-                                key,
-                                overlay,
-                                auth_flow,
-                                editor,
-                                editor_len_before,
-                                editor.text().len,
-                            );
-                            consumeInputBytes(input_buffer, parsed.consumed);
-                            return;
-                        },
-                        else => {},
-                    }
-                }
-            }
-            try handleInputKeyWithModifiers(
-                allocator,
-                io,
-                env_map,
-                key,
-                parsed.modifiers,
-                session,
-                current_provider,
-                session_dir,
-                options,
-                tool_items,
-                app_state,
-                editor,
-                overlay,
-                auth_flow,
-                prompt_worker,
-                prompt_worker_active,
-                subscriber,
-                should_exit,
-                app_context,
-                live_resources,
-            );
-            maybeLogInputDebug(
-                allocator,
-                io,
-                env_map,
-                "after",
-                parsed,
-                key,
-                overlay,
-                auth_flow,
-                editor,
-                editor_len_before,
-                editor.text().len,
-            );
-        },
-        .paste => |content| {
-            if (overlay.* != null) {
-                consumeInputBytes(input_buffer, parsed.consumed);
-                return;
-            }
-            _ = try editor.handlePaste(content);
-        },
-        .protocol => |protocol| handleProtocolEvent(app_context, protocol),
+        .key => |key| try dispatchKeyInputEvent(&context, parsed, key),
+        .paste => |content| try dispatchPasteInputEvent(&context, content),
+        .protocol => |protocol| handleProtocolEvent(context.app_context, protocol),
         .mouse_wheel => |wheel| {
-            if (overlay.* == null and auth_flow.* == null) {
-                app_state.handleChatMouseWheel(wheel);
+            if (context.overlay.* == null and context.auth_flow.* == null) {
+                context.app_state.handleChatMouseWheel(wheel);
             }
         },
     }
     consumeInputBytes(input_buffer, parsed.consumed);
+}
+
+fn dispatchKeyInputEvent(
+    context: *InputDispatchEventContext,
+    parsed: tui.keys.ParsedInput,
+    key: tui.Key,
+) !void {
+    const editor_len_before = context.editor.text().len;
+    logKeyInputDebug(context, "before", parsed, key, editor_len_before, editor_len_before);
+
+    if (parsed.event_type == .release) {
+        logKeyInputDebug(context, "after", parsed, key, editor_len_before, context.editor.text().len);
+        return;
+    }
+
+    if (try dispatchMainEditorShortcut(context, parsed, key, editor_len_before)) return;
+
+    try handleInputKeyWithModifiers(
+        context.allocator,
+        context.io,
+        context.env_map,
+        key,
+        parsed.modifiers,
+        context.session,
+        context.current_provider,
+        context.session_dir,
+        context.options,
+        context.tool_items,
+        context.app_state,
+        context.editor,
+        context.overlay,
+        context.auth_flow,
+        context.prompt_worker,
+        context.prompt_worker_active,
+        context.subscriber,
+        context.should_exit,
+        context.app_context,
+        context.live_resources,
+    );
+    logKeyInputDebug(context, "after", parsed, key, editor_len_before, context.editor.text().len);
+}
+
+fn dispatchPasteInputEvent(
+    context: *InputDispatchEventContext,
+    content: []const u8,
+) !void {
+    if (context.overlay.* != null) return;
+    _ = try context.editor.handlePaste(content);
+}
+
+fn dispatchMainEditorShortcut(
+    context: *InputDispatchEventContext,
+    parsed: tui.keys.ParsedInput,
+    key: tui.Key,
+    editor_len_before: usize,
+) !bool {
+    if (context.overlay.* != null or context.auth_flow.* != null) return false;
+
+    const action = resolveParsedAppAction(context.live_resources.keybindings, key, parsed.modifiers) orelse return false;
+    switch (action) {
+        .message_followUp => try handleFollowUpAction(
+            context.allocator,
+            context.io,
+            context.env_map,
+            context.session,
+            context.current_provider,
+            context.session_dir,
+            context.options,
+            context.tool_items,
+            context.app_state,
+            context.editor,
+            context.overlay,
+            context.auth_flow,
+            context.prompt_worker,
+            context.prompt_worker_active,
+            context.subscriber,
+            context.should_exit,
+            context.live_resources,
+        ),
+        .message_dequeue => try handleDequeueAction(
+            context.allocator,
+            context.session,
+            context.app_state,
+            context.editor,
+        ),
+        else => return false,
+    }
+
+    logKeyInputDebug(context, "after", parsed, key, editor_len_before, context.editor.text().len);
+    return true;
+}
+
+fn logKeyInputDebug(
+    context: *InputDispatchEventContext,
+    phase: []const u8,
+    parsed: tui.keys.ParsedInput,
+    key: tui.Key,
+    editor_len_before: usize,
+    editor_len_after: usize,
+) void {
+    maybeLogInputDebug(
+        context.allocator,
+        context.io,
+        context.env_map,
+        phase,
+        parsed,
+        key,
+        context.overlay,
+        context.auth_flow,
+        context.editor,
+        editor_len_before,
+        editor_len_after,
+    );
 }
 
 fn maybeLogInputDebug(

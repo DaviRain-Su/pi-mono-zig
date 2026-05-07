@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const MANIFEST_FILE_NAME = "pi-extension.json";
 pub const SCHEMA_VERSION = "pi-extension.v0";
+const MAX_SAFE_INTEGER: u64 = 9007199254740991;
 
 pub const LifecyclePhase = enum {
     discover,
@@ -213,13 +214,45 @@ pub const Diagnostic = struct {
     branch: ?CapabilityEnforcementBranch = null,
     mode: ?[]u8 = null,
     reason: ?[]u8 = null,
+    principal: ?DiagnosticPrincipal = null,
+    source: ?DiagnosticSource = null,
     message: []u8,
 
     pub fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         if (self.mode) |mode| allocator.free(mode);
         if (self.reason) |reason| allocator.free(reason);
+        if (self.principal) |*principal| principal.deinit(allocator);
+        if (self.source) |*source| source.deinit(allocator);
         allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
+pub const DiagnosticPrincipal = struct {
+    runtime_kind: []u8,
+    extension_id: []u8,
+    policy_lookup_key: []u8,
+    tool_id: []u8,
+
+    fn deinit(self: *DiagnosticPrincipal, allocator: std.mem.Allocator) void {
+        allocator.free(self.runtime_kind);
+        allocator.free(self.extension_id);
+        allocator.free(self.policy_lookup_key);
+        allocator.free(self.tool_id);
+        self.* = undefined;
+    }
+};
+
+pub const DiagnosticSource = struct {
+    manifest_path: []u8,
+    package_root: []u8,
+    artifact_path: []u8,
+
+    fn deinit(self: *DiagnosticSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.manifest_path);
+        allocator.free(self.package_root);
+        allocator.free(self.artifact_path);
         self.* = undefined;
     }
 };
@@ -245,6 +278,8 @@ pub const ResourceLimits = struct {
 };
 
 pub const Manifest = struct {
+    package_root: []u8,
+    manifest_path: []u8,
     schema_version: []u8,
     id: []u8,
     name: []u8,
@@ -253,6 +288,7 @@ pub const Manifest = struct {
     artifact_kind: ArtifactKind,
     artifact_path: []u8,
     artifact_absolute_path: []u8,
+    artifact_sha256: []u8,
     tool_id: []u8,
     tool_description: []u8,
     input_schema_json: []u8,
@@ -261,6 +297,8 @@ pub const Manifest = struct {
     resource_limits: ResourceLimits,
 
     pub fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
+        allocator.free(self.package_root);
+        allocator.free(self.manifest_path);
         allocator.free(self.schema_version);
         allocator.free(self.id);
         allocator.free(self.name);
@@ -268,6 +306,7 @@ pub const Manifest = struct {
         allocator.free(self.description);
         allocator.free(self.artifact_path);
         allocator.free(self.artifact_absolute_path);
+        allocator.free(self.artifact_sha256);
         allocator.free(self.tool_id);
         allocator.free(self.tool_description);
         allocator.free(self.input_schema_json);
@@ -294,10 +333,41 @@ pub const ValidationResult = union(enum) {
     }
 };
 
+pub const ValidationOptions = struct {
+    approved_capabilities: []const Capability = &.{},
+};
+
+const ManifestBuildFields = struct {
+    package_root: []const u8,
+    schema_version: []const u8,
+    extension_id: []const u8,
+    extension_name: []const u8,
+    extension_version: []const u8,
+    extension_description: []const u8,
+    artifact_kind: ArtifactKind,
+    artifact_path: []const u8,
+    artifact_absolute_path: []u8,
+    tool_id: []const u8,
+    tool_description: []const u8,
+    input_schema: std.json.ObjectMap,
+    output_schema: std.json.ObjectMap,
+    capabilities: *std.ArrayList(Capability),
+    resource_limits: ResourceLimits,
+};
+
 pub fn validateManifestText(
     allocator: std.mem.Allocator,
     package_root: []const u8,
     manifest_text: []const u8,
+) !ValidationResult {
+    return validateManifestTextWithOptions(allocator, package_root, manifest_text, .{});
+}
+
+pub fn validateManifestTextWithOptions(
+    allocator: std.mem.Allocator,
+    package_root: []const u8,
+    manifest_text: []const u8,
+    options: ValidationOptions,
 ) !ValidationResult {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, manifest_text, .{}) catch {
         return invalidOne(allocator, .validate, "$", "malformed JSON");
@@ -359,6 +429,27 @@ pub fn validateManifestText(
     if (try requiredObject(allocator, tool_object, "$.tool", "outputSchema")) |diagnostic| return diagnostic;
     const output_schema = requiredObjectValue(tool_object, "outputSchema");
 
+    const diagnostic_manifest_path = try std.fs.path.join(allocator, &.{ package_root, MANIFEST_FILE_NAME });
+    defer allocator.free(diagnostic_manifest_path);
+    const diagnostic_policy_lookup_key = try manifestPolicyLookupKey(
+        allocator,
+        schema_version,
+        extension_id,
+        extension_version,
+        package_root,
+        diagnostic_manifest_path,
+        artifact_path,
+    );
+    defer allocator.free(diagnostic_policy_lookup_key);
+    const capability_context = CapabilityDenialContext{
+        .extension_id = extension_id,
+        .policy_lookup_key = diagnostic_policy_lookup_key,
+        .tool_id = tool_id,
+        .manifest_path = diagnostic_manifest_path,
+        .package_root = package_root,
+        .artifact_path = artifact_path,
+    };
+
     inline for (unsupported_surface_fields) |field| {
         if (root.get(field) != null) {
             const path = try std.fmt.allocPrint(allocator, "$.{s}", .{field});
@@ -384,8 +475,10 @@ pub fn validateManifestText(
                 defer allocator.free(message);
                 return invalidOne(allocator, .validate, path, message);
             };
-            const denial = denyRuntimeCapability(capability, .validate, "manifest-request");
-            return invalidCapabilityDenial(allocator, path, denial);
+            if (denyFirstUnapprovedCapability(&.{capability}, options.approved_capabilities, .validate, "manifest-request")) |denial| {
+                return invalidCapabilityDenial(allocator, path, denial, capability_context);
+            }
+            try capabilities.append(allocator, capability);
         }
     }
 
@@ -401,45 +494,77 @@ pub fn validateManifestText(
     };
     errdefer allocator.free(artifact_absolute_path);
 
-    const owned_schema_version = try allocator.dupe(u8, schema_version);
+    return buildValidManifestResult(allocator, .{
+        .package_root = package_root,
+        .schema_version = schema_version,
+        .extension_id = extension_id,
+        .extension_name = extension_name,
+        .extension_version = extension_version,
+        .extension_description = extension_description,
+        .artifact_kind = artifact_kind,
+        .artifact_path = artifact_path,
+        .artifact_absolute_path = artifact_absolute_path,
+        .tool_id = tool_id,
+        .tool_description = tool_description,
+        .input_schema = input_schema,
+        .output_schema = output_schema,
+        .capabilities = &capabilities,
+        .resource_limits = resource_limits,
+    });
+}
+
+fn buildValidManifestResult(
+    allocator: std.mem.Allocator,
+    fields: ManifestBuildFields,
+) !ValidationResult {
+    const owned_package_root = try realpathAlloc(allocator, fields.package_root);
+    errdefer allocator.free(owned_package_root);
+    const owned_manifest_path = try std.fs.path.join(allocator, &.{ fields.package_root, MANIFEST_FILE_NAME });
+    errdefer allocator.free(owned_manifest_path);
+    const owned_artifact_sha256 = try allocator.dupe(u8, "");
+    errdefer allocator.free(owned_artifact_sha256);
+    const owned_schema_version = try allocator.dupe(u8, fields.schema_version);
     errdefer allocator.free(owned_schema_version);
-    const owned_extension_id = try allocator.dupe(u8, extension_id);
+    const owned_extension_id = try allocator.dupe(u8, fields.extension_id);
     errdefer allocator.free(owned_extension_id);
-    const owned_extension_name = try allocator.dupe(u8, extension_name);
+    const owned_extension_name = try allocator.dupe(u8, fields.extension_name);
     errdefer allocator.free(owned_extension_name);
-    const owned_extension_version = try allocator.dupe(u8, extension_version);
+    const owned_extension_version = try allocator.dupe(u8, fields.extension_version);
     errdefer allocator.free(owned_extension_version);
-    const owned_extension_description = try allocator.dupe(u8, extension_description);
+    const owned_extension_description = try allocator.dupe(u8, fields.extension_description);
     errdefer allocator.free(owned_extension_description);
-    const owned_artifact_path = try allocator.dupe(u8, artifact_path);
+    const owned_artifact_path = try allocator.dupe(u8, fields.artifact_path);
     errdefer allocator.free(owned_artifact_path);
-    const owned_tool_id = try allocator.dupe(u8, tool_id);
+    const owned_tool_id = try allocator.dupe(u8, fields.tool_id);
     errdefer allocator.free(owned_tool_id);
-    const owned_tool_description = try allocator.dupe(u8, tool_description);
+    const owned_tool_description = try allocator.dupe(u8, fields.tool_description);
     errdefer allocator.free(owned_tool_description);
-    const owned_input_schema_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = input_schema }, .{});
+    const owned_input_schema_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = fields.input_schema }, .{});
     errdefer allocator.free(owned_input_schema_json);
-    const owned_output_schema_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = output_schema }, .{});
+    const owned_output_schema_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = fields.output_schema }, .{});
     errdefer allocator.free(owned_output_schema_json);
-    const owned_capabilities = try capabilities.toOwnedSlice(allocator);
+    const owned_capabilities = try fields.capabilities.toOwnedSlice(allocator);
     errdefer allocator.free(owned_capabilities);
 
     return .{
         .valid = .{
+            .package_root = owned_package_root,
+            .manifest_path = owned_manifest_path,
             .schema_version = owned_schema_version,
             .id = owned_extension_id,
             .name = owned_extension_name,
             .version = owned_extension_version,
             .description = owned_extension_description,
-            .artifact_kind = artifact_kind,
+            .artifact_kind = fields.artifact_kind,
             .artifact_path = owned_artifact_path,
-            .artifact_absolute_path = artifact_absolute_path,
+            .artifact_absolute_path = fields.artifact_absolute_path,
+            .artifact_sha256 = owned_artifact_sha256,
             .tool_id = owned_tool_id,
             .tool_description = owned_tool_description,
             .input_schema_json = owned_input_schema_json,
             .output_schema_json = owned_output_schema_json,
             .requested_capabilities = owned_capabilities,
-            .resource_limits = resource_limits,
+            .resource_limits = fields.resource_limits,
         },
     };
 }
@@ -448,6 +573,15 @@ pub fn validateManifestFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     package_root: []const u8,
+) !ValidationResult {
+    return validateManifestFileWithOptions(allocator, io, package_root, .{});
+}
+
+pub fn validateManifestFileWithOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_root: []const u8,
+    options: ValidationOptions,
 ) !ValidationResult {
     const manifest_path = try std.fs.path.join(allocator, &.{ package_root, MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
@@ -461,7 +595,18 @@ pub fn validateManifestFile(
         return .{ .invalid = diagnostics };
     };
     defer allocator.free(bytes);
-    return validateManifestText(allocator, package_root, bytes);
+    var result = try validateManifestTextWithOptions(allocator, package_root, bytes, options);
+    errdefer result.deinit(allocator);
+    if (result == .valid) {
+        const artifact_bytes = try std.Io.Dir.readFileAlloc(.cwd(), io, result.valid.artifact_absolute_path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(artifact_bytes);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(artifact_bytes, &digest, .{});
+        const artifact_sha256 = try bytesToHexAlloc(allocator, &digest);
+        allocator.free(result.valid.artifact_sha256);
+        result.valid.artifact_sha256 = artifact_sha256;
+    }
+    return result;
 }
 
 const unsupported_surface_fields = [_][]const u8{
@@ -496,6 +641,7 @@ fn invalidCapabilityDenial(
     allocator: std.mem.Allocator,
     path: []const u8,
     denial: CapabilityDenialDiagnostic,
+    context: CapabilityDenialContext,
 ) !ValidationResult {
     const message = try std.fmt.allocPrint(
         allocator,
@@ -513,6 +659,10 @@ fn invalidCapabilityDenial(
     errdefer allocator.free(owned_reason);
     const owned_message = try allocator.dupe(u8, message);
     errdefer allocator.free(owned_message);
+    var principal = try context.principal(allocator);
+    errdefer principal.deinit(allocator);
+    var source = try context.source(allocator);
+    errdefer source.deinit(allocator);
     diagnostics[0] = .{
         .category = denial.category,
         .phase = denial.phase,
@@ -522,10 +672,52 @@ fn invalidCapabilityDenial(
         .branch = denial.branch,
         .mode = owned_mode,
         .reason = owned_reason,
+        .principal = principal,
+        .source = source,
         .message = owned_message,
     };
     return .{ .invalid = diagnostics };
 }
+
+const CapabilityDenialContext = struct {
+    extension_id: []const u8,
+    policy_lookup_key: []const u8,
+    tool_id: []const u8,
+    manifest_path: []const u8,
+    package_root: []const u8,
+    artifact_path: []const u8,
+
+    fn principal(self: CapabilityDenialContext, allocator: std.mem.Allocator) !DiagnosticPrincipal {
+        const runtime_kind = try allocator.dupe(u8, "wasm");
+        errdefer allocator.free(runtime_kind);
+        const extension_id = try allocator.dupe(u8, self.extension_id);
+        errdefer allocator.free(extension_id);
+        const policy_lookup_key = try allocator.dupe(u8, self.policy_lookup_key);
+        errdefer allocator.free(policy_lookup_key);
+        const tool_id = try allocator.dupe(u8, self.tool_id);
+        errdefer allocator.free(tool_id);
+        return .{
+            .runtime_kind = runtime_kind,
+            .extension_id = extension_id,
+            .policy_lookup_key = policy_lookup_key,
+            .tool_id = tool_id,
+        };
+    }
+
+    fn source(self: CapabilityDenialContext, allocator: std.mem.Allocator) !DiagnosticSource {
+        const manifest_path = try allocator.dupe(u8, self.manifest_path);
+        errdefer allocator.free(manifest_path);
+        const package_root = try allocator.dupe(u8, self.package_root);
+        errdefer allocator.free(package_root);
+        const artifact_path = try allocator.dupe(u8, self.artifact_path);
+        errdefer allocator.free(artifact_path);
+        return .{
+            .manifest_path = manifest_path,
+            .package_root = package_root,
+            .artifact_path = artifact_path,
+        };
+    }
+};
 
 fn requiredString(
     allocator: std.mem.Allocator,
@@ -583,12 +775,42 @@ fn joinJsonPath(allocator: std.mem.Allocator, parent_path: []const u8, field: []
     return std.fmt.allocPrint(allocator, "{s}.{s}", .{ parent_path, field });
 }
 
+fn manifestPolicyLookupKey(
+    allocator: std.mem.Allocator,
+    schema_version: []const u8,
+    id: []const u8,
+    version: []const u8,
+    package_root: []const u8,
+    manifest_path: []const u8,
+    artifact_path: []const u8,
+) ![]u8 {
+    const normalized_package_root = try policyPathAlloc(allocator, package_root);
+    defer allocator.free(normalized_package_root);
+    const normalized_manifest_path = try policyPathAlloc(allocator, manifest_path);
+    defer allocator.free(normalized_manifest_path);
+    const normalized_artifact_path = try policyPathAlloc(allocator, artifact_path);
+    defer allocator.free(normalized_artifact_path);
+    return std.fmt.allocPrint(
+        allocator,
+        "wasm:manifest:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{ schema_version, id, version, normalized_package_root, normalized_manifest_path, normalized_artifact_path },
+    );
+}
+
+fn policyPathAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const normalized = try allocator.dupe(u8, value);
+    for (normalized) |*char| {
+        if (char.* == '\\') char.* = '/';
+    }
+    return normalized;
+}
+
 fn parseArtifactKind(value: []const u8) ?ArtifactKind {
     if (std.mem.eql(u8, value, ArtifactKind.wasm_component.jsonName())) return .wasm_component;
     return null;
 }
 
-fn parseCapability(value: []const u8) ?Capability {
+pub fn parseCapability(value: []const u8) ?Capability {
     inline for (@typeInfo(Capability).@"enum".fields) |field| {
         const capability: Capability = @enumFromInt(field.value);
         if (std.mem.eql(u8, value, capability.jsonName())) return capability;
@@ -686,7 +908,7 @@ fn optionalResourceLimitInteger(
     field: []const u8,
 ) !OptionalLimitValidation {
     const value = object.get(field) orelse return .{ .valid = null };
-    if (value != .integer or value.integer < 0) {
+    if (value != .integer or value.integer < 0 or @as(u64, @intCast(value.integer)) > MAX_SAFE_INTEGER) {
         const path = try std.fmt.allocPrint(allocator, "$.resourceLimits.{s}", .{field});
         defer allocator.free(path);
         return .{ .invalid = try invalidOne(allocator, .validate, path, "expected non-negative integer") };
@@ -796,6 +1018,15 @@ fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return error.FileNotFound;
     return allocator.dupe(u8, std.mem.span(resolved));
+}
+
+fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const output = try allocator.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, index| {
+        output[index * 2] = std.fmt.digitToChar(@intCast(byte >> 4), .lower);
+        output[index * 2 + 1] = std.fmt.digitToChar(@intCast(byte & 0x0f), .lower);
+    }
+    return output;
 }
 
 const VALID_MANIFEST =
@@ -991,6 +1222,27 @@ test "wasm manifest resource limits constrain without granting capabilities" {
     defer denied_with_limits.deinit(allocator);
     try expectDeniedCapability(&denied_with_limits, "$.capabilities[0]", .file_read, .validate);
     try std.testing.expect(std.mem.indexOf(u8, denied_with_limits.invalid[0].message, "artifact file was not found") == null);
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const expected_policy_key = try manifestPolicyLookupKey(
+        allocator,
+        SCHEMA_VERSION,
+        "com.example",
+        "0.1.0",
+        package_root,
+        manifest_path,
+        "wasm/missing.wasm",
+    );
+    defer allocator.free(expected_policy_key);
+    try std.testing.expect(denied_with_limits.invalid[0].principal != null);
+    try std.testing.expect(denied_with_limits.invalid[0].source != null);
+    try std.testing.expectEqualStrings("wasm", denied_with_limits.invalid[0].principal.?.runtime_kind);
+    try std.testing.expectEqualStrings("com.example", denied_with_limits.invalid[0].principal.?.extension_id);
+    try std.testing.expectEqualStrings(expected_policy_key, denied_with_limits.invalid[0].principal.?.policy_lookup_key);
+    try std.testing.expectEqualStrings("example.tool", denied_with_limits.invalid[0].principal.?.tool_id);
+    try std.testing.expectEqualStrings(manifest_path, denied_with_limits.invalid[0].source.?.manifest_path);
+    try std.testing.expectEqualStrings(package_root, denied_with_limits.invalid[0].source.?.package_root);
+    try std.testing.expectEqualStrings("wasm/missing.wasm", denied_with_limits.invalid[0].source.?.artifact_path);
 }
 
 test "wasm manifest invalid resource limits fail with deterministic diagnostics" {
@@ -1035,6 +1287,13 @@ test "wasm manifest invalid resource limits fail with deterministic diagnostics"
         },
         .{
             .manifest_text =
+            \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit unsafe integer","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"timeoutMs":9007199254740992}}
+            ,
+            .expected_path = "$.resourceLimits.timeoutMs",
+            .expected_message = "expected non-negative integer",
+        },
+        .{
+            .manifest_text =
             \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Resource limit tool scopes type","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[],"resourceLimits":{"toolScopes":"example.tool"}}
             ,
             .expected_path = "$.resourceLimits.toolScopes",
@@ -1075,6 +1334,34 @@ test "wasm manifest denies requested capabilities before artifact validation" {
         try expectDeniedCapability(&result, "$.capabilities[0]", capability, .validate);
         try std.testing.expect(std.mem.indexOf(u8, result.invalid[0].message, "artifact file was not found") == null);
     }
+}
+
+test "wasm manifest exact approved grants permit requested capabilities" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const package_root = try makeValidPackage(allocator, tmp);
+    defer allocator.free(package_root);
+
+    var approved = try validateManifestTextWithOptions(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Approved capability","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":["file.read"]}
+    , .{ .approved_capabilities = &.{.file_read} });
+    defer approved.deinit(allocator);
+    try std.testing.expect(approved == .valid);
+    try std.testing.expectEqual(@as(usize, 1), approved.valid.requested_capabilities.len);
+    try std.testing.expectEqual(Capability.file_read, approved.valid.requested_capabilities[0]);
+
+    var sibling = try validateManifestTextWithOptions(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Sibling grant","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":["file.read"]}
+    , .{ .approved_capabilities = &.{.file_write} });
+    defer sibling.deinit(allocator);
+    try expectDeniedCapability(&sibling, "$.capabilities[0]", .file_read, .validate);
+
+    var missing_artifact_after_approval = try validateManifestTextWithOptions(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Approved capability missing artifact","artifact":{"kind":"wasm-component","path":"wasm/missing.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":["file.read"]}
+    , .{ .approved_capabilities = &.{.file_read} });
+    defer missing_artifact_after_approval.deinit(allocator);
+    try expectInvalid(&missing_artifact_after_approval, "$.artifact.path", "artifact file was not found");
 }
 
 test "wasm manifest rejects zero multiple and non-tool declarations" {

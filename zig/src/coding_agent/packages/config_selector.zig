@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
+const config_mod = @import("../config/config.zig");
 const tui_mod = @import("tui");
 
 pub const ConfigKind = enum {
@@ -90,6 +91,7 @@ fn writeSettingsObject(
     settings_path: []const u8,
     settings_object: std.json.ObjectMap,
 ) !void {
+    try config_mod.validateExtensionPoliciesForSettingsWrite(allocator, settings_object, settings_path);
     const value: std.json.Value = .{ .object = settings_object };
     const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(serialized);

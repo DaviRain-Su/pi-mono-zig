@@ -806,6 +806,14 @@ fn pathHasApiVersion(base_url: []const u8) bool {
     return false;
 }
 
+const VertexSseParseState = struct {
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    current_block: *?CurrentBlock,
+    generated_tool_call_count: *usize,
+};
+
 fn parseSseStreamLines(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -833,6 +841,13 @@ fn parseSseStreamLines(
     defer if (current_block) |*block| deinitCurrentBlock(allocator, block);
 
     var generated_tool_call_count: usize = 0;
+    var state = VertexSseParseState{
+        .output = &output,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .current_block = &current_block,
+        .generated_tool_call_count = &generated_tool_call_count,
+    };
 
     stream_ptr.push(.{ .event_type = .start });
 
@@ -864,147 +879,7 @@ fn parseSseStreamLines(
         const value = parsed.value;
         if (value != .object) continue;
 
-        if (value.object.get("responseId")) |response_id| {
-            if (response_id == .string and output.response_id == null) {
-                output.response_id = try allocator.dupe(u8, response_id.string);
-            }
-        }
-
-        if (value.object.get("usageMetadata")) |usage_metadata| {
-            updateUsage(&output.usage, usage_metadata);
-            calculateCost(model, &output.usage);
-        }
-
-        const candidates_value = value.object.get("candidates") orelse continue;
-        if (candidates_value != .array or candidates_value.array.items.len == 0) continue;
-
-        const candidate = candidates_value.array.items[0];
-        if (candidate != .object) continue;
-
-        if (candidate.object.get("content")) |content_value| {
-            if (content_value == .object) {
-                if (content_value.object.get("parts")) |parts_value| {
-                    if (parts_value == .array) {
-                        for (parts_value.array.items) |part| {
-                            if (part != .object) continue;
-
-                            if (part.object.get("text")) |text_value| {
-                                if (text_value == .string and text_value.string.len > 0) {
-                                    const is_thinking = if (part.object.get("thought")) |thought_value|
-                                        thought_value == .bool and thought_value.bool
-                                    else
-                                        false;
-
-                                    if (current_block == null or !matchesCurrentBlock(current_block.?, is_thinking)) {
-                                        try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-                                        current_block = if (is_thinking)
-                                            .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
-                                        else
-                                            .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
-                                        stream_ptr.push(.{
-                                            .event_type = if (is_thinking) .thinking_start else .text_start,
-                                            .content_index = @intCast(content_blocks.items.len),
-                                        });
-                                    }
-
-                                    if (current_block) |*block| {
-                                        switch (block.*) {
-                                            .text => |*text| {
-                                                try text.text.appendSlice(allocator, text_value.string);
-                                                if (part.object.get("thoughtSignature")) |signature_value| {
-                                                    if (signature_value == .string and signature_value.string.len > 0) {
-                                                        if (text.signature) |existing| allocator.free(existing);
-                                                        text.signature = try allocator.dupe(u8, signature_value.string);
-                                                    }
-                                                }
-                                            },
-                                            .thinking => |*thinking| {
-                                                try thinking.text.appendSlice(allocator, text_value.string);
-                                                if (part.object.get("thoughtSignature")) |signature_value| {
-                                                    if (signature_value == .string and signature_value.string.len > 0) {
-                                                        if (thinking.signature) |existing| allocator.free(existing);
-                                                        thinking.signature = try allocator.dupe(u8, signature_value.string);
-                                                    }
-                                                }
-                                            },
-                                        }
-                                    }
-
-                                    stream_ptr.push(.{
-                                        .event_type = if (is_thinking) .thinking_delta else .text_delta,
-                                        .content_index = @intCast(content_blocks.items.len),
-                                        .delta = try allocator.dupe(u8, text_value.string),
-                                        .owns_delta = true,
-                                    });
-                                }
-                            }
-
-                            if (part.object.get("functionCall")) |function_call_value| {
-                                if (function_call_value == .object) {
-                                    try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-                                    const name_value = function_call_value.object.get("name");
-                                    if (name_value == null or name_value.? != .string) continue;
-
-                                    const args = if (function_call_value.object.get("args")) |args_value|
-                                        try cloneJsonValue(allocator, args_value)
-                                    else
-                                        try emptyJsonObject(allocator);
-
-                                    const tool_call_id = if (function_call_value.object.get("id")) |id_value|
-                                        if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, &generated_tool_call_count)
-                                    else
-                                        try generateToolCallId(allocator, &generated_tool_call_count);
-
-                                    const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
-                                        if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
-                                    else
-                                        null;
-
-                                    const tool_call = types.ToolCall{
-                                        .id = tool_call_id,
-                                        .name = try allocator.dupe(u8, name_value.?.string),
-                                        .arguments = args,
-                                        .thought_signature = thought_signature,
-                                    };
-                                    try tool_calls.append(allocator, tool_call);
-                                    try content_blocks.append(allocator, .{ .tool_call = .{
-                                        .id = try allocator.dupe(u8, tool_call.id),
-                                        .name = try allocator.dupe(u8, tool_call.name),
-                                        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
-                                        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
-                                    } });
-
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_start,
-                                        .content_index = @intCast(content_blocks.items.len - 1),
-                                    });
-
-                                    const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
-                                    defer allocator.free(args_json);
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_delta,
-                                        .content_index = @intCast(content_blocks.items.len - 1),
-                                        .delta = try allocator.dupe(u8, args_json),
-                                        .owns_delta = true,
-                                    });
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_end,
-                                        .content_index = @intCast(content_blocks.items.len - 1),
-                                        .tool_call = tool_call,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (candidate.object.get("finishReason")) |finish_reason| {
-            if (finish_reason == .string) {
-                output.stop_reason = if (tool_calls.items.len > 0) .tool_use else mapStopReason(finish_reason.string);
-            }
-        }
+        try processVertexSseObject(allocator, &state, stream_ptr, model, value.object);
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
@@ -1017,6 +892,186 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn processVertexSseObject(
+    allocator: std.mem.Allocator,
+    state: *VertexSseParseState,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    object: std.json.ObjectMap,
+) !void {
+    if (object.get("responseId")) |response_id| {
+        if (response_id == .string and state.output.response_id == null) {
+            state.output.response_id = try allocator.dupe(u8, response_id.string);
+        }
+    }
+
+    if (object.get("usageMetadata")) |usage_metadata| {
+        updateUsage(&state.output.usage, usage_metadata);
+        calculateCost(model, &state.output.usage);
+    }
+
+    const candidates_value = object.get("candidates") orelse return;
+    if (candidates_value != .array or candidates_value.array.items.len == 0) return;
+
+    const candidate = candidates_value.array.items[0];
+    if (candidate != .object) return;
+
+    try processVertexCandidateContent(allocator, state, stream_ptr, candidate.object);
+
+    if (candidate.object.get("finishReason")) |finish_reason| {
+        if (finish_reason == .string) {
+            state.output.stop_reason = if (state.tool_calls.items.len > 0) .tool_use else mapStopReason(finish_reason.string);
+        }
+    }
+}
+
+fn processVertexCandidateContent(
+    allocator: std.mem.Allocator,
+    state: *VertexSseParseState,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    candidate: std.json.ObjectMap,
+) !void {
+    const content_value = candidate.get("content") orelse return;
+    if (content_value != .object) return;
+    const parts_value = content_value.object.get("parts") orelse return;
+    if (parts_value != .array) return;
+
+    for (parts_value.array.items) |part| {
+        if (part != .object) continue;
+        try processVertexTextPart(allocator, state, stream_ptr, part.object);
+        try processVertexFunctionCallPart(allocator, state, stream_ptr, part.object);
+    }
+}
+
+fn processVertexTextPart(
+    allocator: std.mem.Allocator,
+    state: *VertexSseParseState,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    part: std.json.ObjectMap,
+) !void {
+    const text_value = part.get("text") orelse return;
+    if (text_value != .string or text_value.string.len == 0) return;
+
+    const is_thinking = if (part.get("thought")) |thought_value|
+        thought_value == .bool and thought_value.bool
+    else
+        false;
+
+    if (state.current_block.* == null or !matchesCurrentBlock(state.current_block.*.?, is_thinking)) {
+        try finishCurrentBlock(allocator, state.current_block, state.content_blocks, stream_ptr);
+        state.current_block.* = if (is_thinking)
+            .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
+        else
+            .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
+        stream_ptr.push(.{
+            .event_type = if (is_thinking) .thinking_start else .text_start,
+            .content_index = @intCast(state.content_blocks.items.len),
+        });
+    }
+
+    try appendVertexTextPart(allocator, state.current_block, part, text_value.string);
+    stream_ptr.push(.{
+        .event_type = if (is_thinking) .thinking_delta else .text_delta,
+        .content_index = @intCast(state.content_blocks.items.len),
+        .delta = try allocator.dupe(u8, text_value.string),
+        .owns_delta = true,
+    });
+}
+
+fn appendVertexTextPart(
+    allocator: std.mem.Allocator,
+    current_block: *?CurrentBlock,
+    part: std.json.ObjectMap,
+    text_delta: []const u8,
+) !void {
+    if (current_block.*) |*block| {
+        switch (block.*) {
+            .text => |*text| {
+                try text.text.appendSlice(allocator, text_delta);
+                try replaceCurrentBlockSignature(allocator, part, &text.signature);
+            },
+            .thinking => |*thinking| {
+                try thinking.text.appendSlice(allocator, text_delta);
+                try replaceCurrentBlockSignature(allocator, part, &thinking.signature);
+            },
+        }
+    }
+}
+
+fn replaceCurrentBlockSignature(
+    allocator: std.mem.Allocator,
+    part: std.json.ObjectMap,
+    signature: *?[]const u8,
+) !void {
+    const signature_value = part.get("thoughtSignature") orelse return;
+    if (signature_value != .string or signature_value.string.len == 0) return;
+    if (signature.*) |existing| allocator.free(existing);
+    signature.* = try allocator.dupe(u8, signature_value.string);
+}
+
+fn processVertexFunctionCallPart(
+    allocator: std.mem.Allocator,
+    state: *VertexSseParseState,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    part: std.json.ObjectMap,
+) !void {
+    const function_call_value = part.get("functionCall") orelse return;
+    if (function_call_value != .object) return;
+
+    try finishCurrentBlock(allocator, state.current_block, state.content_blocks, stream_ptr);
+    const name_value = function_call_value.object.get("name");
+    if (name_value == null or name_value.? != .string) return;
+
+    const args = if (function_call_value.object.get("args")) |args_value|
+        try cloneJsonValue(allocator, args_value)
+    else
+        try emptyJsonObject(allocator);
+
+    const tool_call_id = if (function_call_value.object.get("id")) |id_value|
+        if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, state.generated_tool_call_count)
+    else
+        try generateToolCallId(allocator, state.generated_tool_call_count);
+
+    const thought_signature = if (part.get("thoughtSignature")) |signature_value|
+        if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
+    else
+        null;
+
+    const tool_call = types.ToolCall{
+        .id = tool_call_id,
+        .name = try allocator.dupe(u8, name_value.?.string),
+        .arguments = args,
+        .thought_signature = thought_signature,
+    };
+    try state.tool_calls.append(allocator, tool_call);
+    try state.content_blocks.append(allocator, .{ .tool_call = .{
+        .id = try allocator.dupe(u8, tool_call.id),
+        .name = try allocator.dupe(u8, tool_call.name),
+        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+    } });
+
+    const content_index = state.content_blocks.items.len - 1;
+    stream_ptr.push(.{
+        .event_type = .toolcall_start,
+        .content_index = @intCast(content_index),
+    });
+
+    const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
+    defer allocator.free(args_json);
+    stream_ptr.push(.{
+        .event_type = .toolcall_delta,
+        .content_index = @intCast(content_index),
+        .delta = try allocator.dupe(u8, args_json),
+        .owns_delta = true,
+    });
+    stream_ptr.push(.{
+        .event_type = .toolcall_end,
+        .content_index = @intCast(content_index),
+        .tool_call = tool_call,
+    });
 }
 
 fn emitAuthError(

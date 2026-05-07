@@ -1,5 +1,8 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
+const config_mod = @import("../config/config.zig");
+const extension_runtime = @import("../extensions/extension_runtime.zig");
+const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const resources_mod = @import("../resources/resources.zig");
 const config_selector = @import("config_selector.zig");
 const package_command_parser = @import("package_command_parser.zig");
@@ -238,6 +241,7 @@ fn executeInstall(
         const owner: std.json.Value = .{ .object = settings_object };
         common.deinitJsonValue(allocator, owner);
     }
+    try config_mod.validateExtensionPoliciesForSettingsWrite(allocator, settings_object, settings_path);
 
     const packages_array_ptr = try ensurePackagesArray(allocator, &settings_object);
     const persisted_source = try normalizePackageSourceForSettings(allocator, source, command.local, options.cwd, options.agent_dir);
@@ -257,6 +261,10 @@ fn executeInstall(
         if (!installed) return .{ .exit_code = 1 };
     }
 
+    if (!try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, stderr)) {
+        return .{ .exit_code = 1 };
+    }
+
     var entry_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer {
         const cleanup: std.json.Value = .{ .object = entry_object };
@@ -268,6 +276,170 @@ fn executeInstall(
     try writeSettingsObject(allocator, io, settings_path, settings_object);
     try stdout.print("Installed {s}\n", .{source});
     return .{ .exit_code = 0 };
+}
+
+const WasmPackagePolicyRequest = struct {
+    policy_lookup_key: []u8,
+
+    fn deinit(self: *WasmPackagePolicyRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.policy_lookup_key);
+        self.* = undefined;
+    }
+};
+
+fn validateLocalWasmPackageForInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    stderr: *std.Io.Writer,
+) !bool {
+    if (!isLocalSource(source)) return true;
+
+    _ = is_project;
+    const package_root = try resolveLocalPathFromCwd(allocator, options.cwd, source);
+    defer allocator.free(package_root);
+
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    _ = std.Io.Dir.statFile(.cwd(), io, manifest_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+
+    var approved_capabilities: ?[]wasm_manifest.Capability = null;
+    defer {
+        if (approved_capabilities) |capabilities| allocator.free(capabilities);
+    }
+
+    if (try readWasmPackagePolicyRequest(allocator, io, package_root, manifest_path)) |request_value| {
+        var request = request_value;
+        defer request.deinit(allocator);
+        var effective_settings = try loadEffectiveSettingsForPackageInstall(allocator, io, options);
+        defer effective_settings.deinit(allocator);
+        const policy = (try resolveFinalWasmExtensionPolicy(allocator, io, effective_settings, package_root)) orelse
+            lookupExtensionPolicy(effective_settings, request.policy_lookup_key);
+        if (policy) |resolved_policy| {
+            approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, resolved_policy);
+        }
+    }
+
+    var result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = approved_capabilities orelse &.{},
+    });
+    defer result.deinit(allocator);
+    if (result == .invalid) {
+        try writeWasmValidationDiagnostics(stderr, result.invalid);
+        return false;
+    }
+    return true;
+}
+
+fn readWasmPackagePolicyRequest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_root: []const u8,
+    manifest_path: []const u8,
+) !?WasmPackagePolicyRequest {
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(manifest_text);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, manifest_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+    const schema_version = jsonStringField(root, "schemaVersion") orelse return null;
+    const id = jsonStringField(root, "id") orelse return null;
+    const version = jsonStringField(root, "version") orelse return null;
+    const artifact = root.get("artifact") orelse return null;
+    if (artifact != .object) return null;
+    const artifact_path = jsonStringField(artifact.object, "path") orelse return null;
+
+    const policy_lookup_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = schema_version,
+        .id = id,
+        .version = version,
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = artifact_path,
+    });
+    return .{ .policy_lookup_key = policy_lookup_key };
+}
+
+fn loadEffectiveSettingsForPackageInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+) !config_mod.Settings {
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", options.agent_dir);
+    return config_mod.loadMergedSettingsForPreflight(allocator, io, &env_map, options.cwd);
+}
+
+fn resolveFinalWasmExtensionPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    effective_settings: config_mod.Settings,
+    package_root: []const u8,
+) !?config_mod.ExtensionPolicy {
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    if (manifest_result != .valid) return null;
+    const identity_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(identity_key);
+    return lookupExtensionPolicy(effective_settings, identity_key);
+}
+
+fn lookupExtensionPolicy(settings: config_mod.Settings, identity_key: []const u8) ?config_mod.ExtensionPolicy {
+    var policies = settings.extension_policies orelse return null;
+    var iterator = policies.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, identity_key)) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+fn approvedCapabilitiesFromExtensionPolicy(
+    allocator: std.mem.Allocator,
+    policy: config_mod.ExtensionPolicy,
+) ![]wasm_manifest.Capability {
+    const approved_grants = policy.approved_grants orelse return allocator.alloc(wasm_manifest.Capability, 0);
+    var capabilities = std.ArrayList(wasm_manifest.Capability).empty;
+    errdefer capabilities.deinit(allocator);
+    for (approved_grants) |grant| {
+        if (wasm_manifest.parseCapability(grant)) |capability| {
+            try capabilities.append(allocator, capability);
+        }
+    }
+    return capabilities.toOwnedSlice(allocator);
+}
+
+fn writeWasmValidationDiagnostics(
+    stderr: *std.Io.Writer,
+    diagnostics: []const wasm_manifest.Diagnostic,
+) !void {
+    if (diagnostics.len == 0) {
+        try stderr.writeAll("Error: invalid Wasm extension package\n");
+        return;
+    }
+    for (diagnostics) |diagnostic| {
+        try stderr.print("Error: {s}: {s}\n", .{ diagnostic.path, diagnostic.message });
+    }
+}
+
+fn jsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
 }
 
 fn executeRemove(
@@ -1394,6 +1566,7 @@ fn writeSettingsObject(
     settings_path: []const u8,
     settings_object: std.json.ObjectMap,
 ) !void {
+    try config_mod.validateExtensionPoliciesForSettingsWrite(allocator, settings_object, settings_path);
     const value: std.json.Value = .{ .object = settings_object };
     const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(serialized);
@@ -1522,6 +1695,76 @@ fn fakeNetworkOptions(cwd: []const u8, agent_dir: []const u8) ExecuteOptions {
         .git_command_override = &.{"/usr/bin/true"},
         .self_update_command_override = &.{"/usr/bin/true"},
     };
+}
+
+fn writeWasmPackageFixture(
+    tmp: anytype,
+    package_relative_path: []const u8,
+    capability: []const u8,
+    write_artifact: bool,
+) !void {
+    const wasm_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ package_relative_path, "wasm" });
+    defer std.testing.allocator.free(wasm_dir);
+    try tmp.dir.createDirPath(std.testing.io, wasm_dir);
+    if (write_artifact) {
+        const artifact_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ package_relative_path, "wasm/example-tool.wasm" });
+        defer std.testing.allocator.free(artifact_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = artifact_path, .data = "\x00asm" });
+    }
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ package_relative_path, wasm_manifest.MANIFEST_FILE_NAME });
+    defer std.testing.allocator.free(manifest_path);
+    const manifest = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{
+        \\  "schemaVersion": "pi-extension.v0",
+        \\  "id": "com.example.policy",
+        \\  "name": "Policy Example",
+        \\  "version": "0.1.0",
+        \\  "description": "Policy fixture.",
+        \\  "artifact": {{ "kind": "wasm-component", "path": "wasm/example-tool.wasm" }},
+        \\  "tool": {{
+        \\    "id": "example.policy",
+        \\    "description": "Policy tool.",
+        \\    "inputSchema": {{}},
+        \\    "outputSchema": {{}}
+        \\  }},
+        \\  "capabilities": ["{s}"]
+        \\}}
+    , .{capability});
+    defer std.testing.allocator.free(manifest);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest });
+}
+
+fn writePolicySettings(
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+    policy_key: []const u8,
+    approved_grant: []const u8,
+    include_resource_limits: bool,
+) !void {
+    const grants_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{approved_grant});
+    defer allocator.free(grants_json);
+    try writePolicySettingsGrantList(allocator, settings_path, policy_key, grants_json, include_resource_limits);
+}
+
+fn writePolicySettingsGrantList(
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+    policy_key: []const u8,
+    approved_grants_json: []const u8,
+    include_resource_limits: bool,
+) !void {
+    const quoted_key = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = policy_key }, .{});
+    defer allocator.free(quoted_key);
+    const resource_limits = if (include_resource_limits) ", \"resourceLimits\": { \"timeoutMs\": 1000 }" else "";
+    const settings = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "extensionPolicies": {{
+        \\    {s}: {{ "approvedGrants": [{s}]{s} }}
+        \\  }}
+        \\}}
+    , .{ quoted_key, approved_grants_json, resource_limits });
+    defer allocator.free(settings);
+    try common.writeFileAbsolute(std.testing.io, settings_path, settings, true);
 }
 
 test "VAL-M12-PKG-001 local fixture installs at user scope" {
@@ -1685,6 +1928,465 @@ test "VAL-M12-PKG-004 remove detaches package without deleting other settings" {
     try std.testing.expect(std.mem.indexOf(u8, updated, "./fixtures/pkg") == null);
     try std.testing.expect(std.mem.indexOf(u8, updated, "\"defaultProvider\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated, "\"openai\"") != null);
+}
+
+test "settings writes preserve valid extensionPolicies and reject malformed policies" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": {
+        \\      "approvedGrants": ["agent.delegate"],
+        \\      "resourceLimits": { "outputLines": 4 }
+        \\    }
+        \\  }
+        \\}
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/pkg" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const valid_updated = try readSettings(allocator, settings_path);
+    defer allocator.free(valid_updated);
+    try std.testing.expect(std.mem.indexOf(u8, valid_updated, "\"extensionPolicies\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, valid_updated, "\"agent.delegate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, valid_updated, "\"outputLines\"") != null);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/pkg", false, cwd, agent_dir);
+    defer allocator.free(expected_source);
+    try std.testing.expect(std.mem.indexOf(u8, valid_updated, expected_source) != null);
+
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{
+        \\  "extensionPolicies": {
+        \\    "typescript:local:project:/tmp/policy-a.ts": { "approvedGrants": ["network"] }
+        \\  }
+        \\}
+    , true);
+    const before_invalid_write = try readSettings(allocator, settings_path);
+    defer allocator.free(before_invalid_write);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    try std.testing.expectError(
+        error.InvalidExtensionPolicies,
+        runCommand(allocator, &.{ "install", "./fixtures/pkg-b" }, options, &stdout_buf, &stderr_buf),
+    );
+
+    const after_invalid_write = try readSettings(allocator, settings_path);
+    defer allocator.free(after_invalid_write);
+    try std.testing.expectEqualStrings(before_invalid_write, after_invalid_write);
+}
+
+test "wasm package install preserves default-deny without approved grants" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-denied", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-denied" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, settings_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(!settings_exists);
+}
+
+test "wasm package install honors pre-artifact manifest approved grants" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-pre", "file.read", false);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-pre" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = wasm_manifest.SCHEMA_VERSION,
+        .id = "com.example.policy",
+        .version = "0.1.0",
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = "wasm/example-tool.wasm",
+    });
+    defer allocator.free(policy_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, policy_key, "file.read", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-pre" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "artifact file was not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") == null);
+
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"packages\"") == null);
+}
+
+test "wasm package install honors final artifact approved grants" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-final", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-final" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, final_key, "file.read", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-final" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("Installed ./fixtures/wasm-final\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/wasm-final", false, cwd, agent_dir);
+    defer allocator.free(expected_source);
+    try std.testing.expect(std.mem.indexOf(u8, settings, expected_source) != null);
+}
+
+test "wasm project install rejects approved grants from malformed resource limits policy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-invalid-policy", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-invalid-policy" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const quoted_key = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = final_key }, .{});
+    defer allocator.free(quoted_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    const settings = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "extensionPolicies": {{
+        \\    {s}: {{
+        \\      "approvedGrants": ["file.read"],
+        \\      "resourceLimits": {{ "timeoutMs": 9007199254740992 }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{quoted_key});
+    defer allocator.free(settings);
+    try common.writeFileAbsolute(std.testing.io, user_settings_path, settings, true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-invalid-policy", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const project_settings_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, project_settings_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (project_settings_exists) {
+        const project_settings = try readSettings(allocator, project_settings_path);
+        defer allocator.free(project_settings);
+        try std.testing.expect(std.mem.indexOf(u8, project_settings, "\"./fixtures/wasm-invalid-policy\"") == null);
+    }
+}
+
+test "wasm project install uses effective global pre-artifact approved grants" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-merged-pre", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-merged-pre" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = wasm_manifest.SCHEMA_VERSION,
+        .id = "com.example.policy",
+        .version = "0.1.0",
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = "wasm/example-tool.wasm",
+    });
+    defer allocator.free(policy_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, policy_key, "file.read", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-pre", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("Installed ./fixtures/wasm-merged-pre\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const project_settings = try readSettings(allocator, project_settings_path);
+    defer allocator.free(project_settings);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/wasm-merged-pre", true, cwd, agent_dir);
+    defer allocator.free(expected_source);
+    try std.testing.expect(std.mem.indexOf(u8, project_settings, expected_source) != null);
+}
+
+test "wasm project install uses effective global final artifact approved grants" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-merged-final", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-merged-final" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, final_key, "file.read", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-final", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("Installed ./fixtures/wasm-merged-final\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "wasm project policy override keeps pre-artifact grants default-denied when unapproved" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-merged-pre-denied", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-merged-pre-denied" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = wasm_manifest.SCHEMA_VERSION,
+        .id = "com.example.policy",
+        .version = "0.1.0",
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = "wasm/example-tool.wasm",
+    });
+    defer allocator.free(policy_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, policy_key, "file.read", false);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    try writePolicySettings(allocator, project_settings_path, policy_key, "file.write", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-pre-denied", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+}
+
+test "wasm project policy override keeps final artifact grants default-denied when unapproved" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-merged-final-denied", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-merged-final-denied" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, final_key, "file.read", false);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    try writePolicySettingsGrantList(allocator, project_settings_path, final_key, "", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-final-denied", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+}
+
+test "wasm package install rejects sibling grants and resource limits as approval" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-sibling", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-sibling" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = wasm_manifest.SCHEMA_VERSION,
+        .id = "com.example.policy",
+        .version = "0.1.0",
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = "wasm/example-tool.wasm",
+    });
+    defer allocator.free(policy_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, policy_key, "file.write", true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-sibling" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"packages\"") == null);
 }
 
 test "VAL-M12-PKG-005 uninstall alias matches remove" {

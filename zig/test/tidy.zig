@@ -309,6 +309,12 @@ const FunctionSpan = struct {
     saw_open_brace: bool = false,
 };
 
+const SyntaxLineScan = struct {
+    brace_delta: i32 = 0,
+    saw_open_brace: bool = false,
+    saw_semicolon: bool = false,
+};
+
 pub fn main(init: std.process.Init) !void {
     var config = Config{};
     var args = init.minimal.args.iterate();
@@ -357,11 +363,12 @@ fn scanLongFunctionsInFile(
         }
 
         if (span) |*active| {
-            active.brace_depth += braceDelta(line);
-            if (std.mem.indexOfScalar(u8, line, '{') != null) {
+            const syntax = scanSyntaxLine(line);
+            active.brace_depth += syntax.brace_delta;
+            if (syntax.saw_open_brace) {
                 active.saw_open_brace = true;
             }
-            if (!active.saw_open_brace and std.mem.indexOfScalar(u8, line, ';') != null) {
+            if (!active.saw_open_brace and syntax.saw_semicolon) {
                 span = null;
                 continue;
             }
@@ -410,6 +417,62 @@ fn functionName(line: []const u8) ?[]const u8 {
 }
 
 fn braceDelta(line: []const u8) i32 {
+    return scanSyntaxLine(line).brace_delta;
+}
+
+fn scanSyntaxLine(line: []const u8) SyntaxLineScan {
+    var scan = SyntaxLineScan{};
+    var index: usize = 0;
+    while (index < line.len) {
+        const byte = line[index];
+        switch (byte) {
+            '/' => {
+                if (index + 1 < line.len and line[index + 1] == '/') break;
+                index += 1;
+            },
+            '\\' => {
+                if (index + 1 < line.len and line[index + 1] == '\\') break;
+                index += 1;
+            },
+            '"' => index = skipQuotedLiteral(line, index, '"'),
+            '\'' => index = skipQuotedLiteral(line, index, '\''),
+            '{' => {
+                scan.brace_delta += 1;
+                scan.saw_open_brace = true;
+                index += 1;
+            },
+            '}' => {
+                scan.brace_delta -= 1;
+                index += 1;
+            },
+            ';' => {
+                scan.saw_semicolon = true;
+                index += 1;
+            },
+            else => index += 1,
+        }
+    }
+    return scan;
+}
+
+fn skipQuotedLiteral(line: []const u8, start: usize, quote: u8) usize {
+    var index = start + 1;
+    while (index < line.len) {
+        switch (line[index]) {
+            '\\' => {
+                index += 1;
+                if (index < line.len) index += 1;
+            },
+            else => |byte| {
+                index += 1;
+                if (byte == quote) return index;
+            },
+        }
+    }
+    return line.len;
+}
+
+fn rawBraceDelta(line: []const u8) i32 {
     var delta: i32 = 0;
     for (line) |byte| {
         switch (byte) {
@@ -510,6 +573,89 @@ test "scanLongFunctions reports only functions above threshold" {
     try std.testing.expectEqual(@as(usize, 1), tidy.warnings);
     try std.testing.expectEqual(@as(usize, 1), tidy.long_function_warnings.items.len);
     try std.testing.expectEqualStrings("long", tidy.long_function_warnings.items[0].function_name);
+}
+
+test "scanLongFunctions ignores braces in strings comments and multiline strings" {
+    const source =
+        \\fn literalBraces() void {
+        \\    const open = "{";
+        \\    const close = "}";
+        \\    const escaped = "\"{\"";
+        \\    const character = '{';
+        \\    // { comment brace should not extend the function
+        \\    const multiline =
+        \\        \\{
+        \\        \\}
+        \\    ;
+        \\}
+        \\fn realLong() void {
+        \\    const value = 1;
+        \\    if (true) {
+        \\        _ = value;
+        \\    }
+        \\    if (false) {
+        \\    }
+        \\    if (true) {
+        \\    }
+        \\    if (false) {
+        \\    }
+        \\    if (true) {
+        \\    }
+        \\}
+    ;
+    var tidy = Tidy{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .config = .{ .long_function_warning_lines = 11 },
+        .emit_warnings = false,
+        .reachable_files = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer tidy.deinit();
+    const warnings = try scanLongFunctionsInFile("sample.zig", source, 11, &tidy);
+    try std.testing.expectEqual(@as(usize, 1), warnings);
+    try std.testing.expectEqual(@as(usize, 1), tidy.warnings);
+    try std.testing.expectEqual(@as(usize, 1), tidy.long_function_warnings.items.len);
+    try std.testing.expectEqual(@as(usize, 12), tidy.long_function_warnings.items[0].start_line);
+    try std.testing.expectEqualStrings("realLong", tidy.long_function_warnings.items[0].function_name);
+}
+
+test "scanLongFunctions treats real scopes and prototypes separately from comments" {
+    const source =
+        \\fn declared() void; // { not a body
+        \\fn realScope() void {
+        \\    if (true) {
+        \\        // } comment brace should not close the scope
+        \\    }
+        \\}
+    ;
+    var tidy = Tidy{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .config = .{ .long_function_warning_lines = 3 },
+        .emit_warnings = false,
+        .reachable_files = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer tidy.deinit();
+    const warnings = try scanLongFunctionsInFile("sample.zig", source, 3, &tidy);
+    try std.testing.expectEqual(@as(usize, 1), warnings);
+    try std.testing.expectEqual(@as(usize, 1), tidy.warnings);
+    try std.testing.expectEqual(@as(usize, 1), tidy.long_function_warnings.items.len);
+    try std.testing.expectEqual(@as(usize, 2), tidy.long_function_warnings.items[0].start_line);
+    try std.testing.expectEqualStrings("realScope", tidy.long_function_warnings.items[0].function_name);
+}
+
+test "scanSyntaxLine ignores literal and comment braces while counting real syntax" {
+    const line =
+        \\if (ready) { const text = "{\"}"; const char = '}'; } // {
+    ;
+    const scan = scanSyntaxLine(line);
+    try std.testing.expectEqual(@as(i32, 0), scan.brace_delta);
+    try std.testing.expect(scan.saw_open_brace);
+    try std.testing.expect(scan.saw_semicolon);
+
+    try std.testing.expectEqual(@as(i32, 1), rawBraceDelta(
+        \\if (ready) {
+    ));
 }
 
 test "scanLongFunctions suppresses exact allowlisted legacy functions" {

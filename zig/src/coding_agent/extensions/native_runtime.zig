@@ -139,6 +139,8 @@ pub const NativeDescriptor = struct {
 pub const NativeOptions = struct {
     descriptor: *const NativeDescriptor,
     approved_capabilities: []const wasm_manifest.Capability = &.{},
+    resource_limits: ?NativeResourceLimits = null,
+    policy_lookup_key: ?[]const u8 = null,
     host_effects: ?*NativeHostEffects = null,
 };
 
@@ -362,11 +364,12 @@ pub const NativeHostApi = struct {
             .{
                 .runtime_kind = "native",
                 .extension_id = self.runtime.descriptor.id,
+                .policy_lookup_key = self.runtime.policy_lookup_key,
                 .package_root = "native://static",
             },
             .{
                 .approved_grants = self.runtime.approved_capabilities,
-                .resource_limits = nativeResourceLimitsToEnforcement(self.runtime.descriptor.resource_limits),
+                .resource_limits = nativeResourceLimitsToEnforcement(self.runtime.resource_limits),
             },
             operation,
             target,
@@ -401,6 +404,10 @@ pub const NativeHostApi = struct {
         try std.json.Stringify.value(denial.principal.runtime_kind, .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"extensionId\":");
         try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        if (denial.principal.policy_lookup_key) |policy_lookup_key| {
+            try envelope.writer.writeAll(",\"policyLookupKey\":");
+            try std.json.Stringify.value(policy_lookup_key, .{}, &envelope.writer);
+        }
         if (denial.principal.package_root) |package_root| {
             try envelope.writer.writeAll(",\"packageRoot\":");
             try std.json.Stringify.value(package_root, .{}, &envelope.writer);
@@ -415,6 +422,13 @@ pub const NativeHostApi = struct {
         }
         try envelope.writer.writeAll("},\"reason\":");
         try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"source\":{\"runtimeKind\":\"native\",\"descriptorId\":");
+        try std.json.Stringify.value(self.runtime.descriptor.id, .{}, &envelope.writer);
+        if (self.runtime.descriptor.tools.len > 0) {
+            try envelope.writer.writeAll(",\"extensionPath\":");
+            try std.json.Stringify.value(self.runtime.descriptor.tools[0].extension_path, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("}");
         try envelope.writer.writeAll(",\"message\":\"native host API operation denied by enforcement substrate\"}");
         try self.runtime.state.addDiagnostic(.host_error, .@"error", envelope.written());
     }
@@ -427,6 +441,8 @@ pub const NativeRuntime = struct {
     mutex: std.Io.Mutex = .init,
     descriptor: *const NativeDescriptor,
     approved_capabilities: []const wasm_manifest.Capability,
+    resource_limits: NativeResourceLimits,
+    policy_lookup_key: ?[]const u8,
     accounting: enforcement.Accounting,
     host_effects: ?*NativeHostEffects,
     tool_bindings: []NativeToolBinding,
@@ -434,6 +450,8 @@ pub const NativeRuntime = struct {
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);
+        const effective_resource_limits = options.resource_limits orelse options.descriptor.resource_limits;
+        try effective_resource_limits.validate();
         if (options.descriptor.deniedCapabilityWithApprovals(options.approved_capabilities, .initialize, "native/descriptor") != null) return error.UnsupportedRuntimeCapability;
 
         const tool_bindings = try allocator.alloc(NativeToolBinding, options.descriptor.tools.len);
@@ -447,6 +465,8 @@ pub const NativeRuntime = struct {
             .state = extension_host.ProtocolState.init(allocator),
             .descriptor = options.descriptor,
             .approved_capabilities = options.approved_capabilities,
+            .resource_limits = effective_resource_limits,
+            .policy_lookup_key = options.policy_lookup_key,
             .accounting = .{},
             .host_effects = options.host_effects,
             .tool_bindings = tool_bindings,

@@ -1612,254 +1612,294 @@ pub fn applyHostFrame(
 
     const extension_path = optionalString(object, "extensionPath") orelse "";
 
-    if (std.mem.eql(u8, type_name, "register_tool")) {
-        const name = optionalString(object, "name") orelse return .ignored_malformed;
-        const label = optionalString(object, "label") orelse name;
-        const description = optionalString(object, "description") orelse "";
-        const parameters = object.get("parameters") orelse .null;
-        const execution_mode = optionalString(object, "executionMode");
-        const render_shell = optionalString(object, "renderShell");
-        try registry.registerToolFull(name, label, description, parameters, execution_mode, render_shell, extension_path);
-
-        // Apply render shell and render hook if present
-        if (registry.findToolIndex(name)) |idx| {
-            if (object.get("renderHook")) |render_hook_val| {
-                if (render_hook_val == .object) {
-                    var render_config_buf: std.Io.Writer.Allocating = .init(registry.allocator);
-                    defer render_config_buf.deinit();
-                    try std.json.Stringify.value(render_hook_val, .{}, &render_config_buf.writer);
-                    const render_config = try registry.allocator.dupe(u8, render_config_buf.written());
-                    errdefer registry.allocator.free(render_config);
-                    registry.tools.items[idx].render_hook = .{
-                        .render_config = render_config,
-                        .tool_name = try registry.allocator.dupe(u8, name),
-                        .extension_path = try registry.allocator.dupe(u8, extension_path),
-                    };
-                }
-            }
-        }
-
-        return .registered_tool;
-    }
-
-    if (std.mem.eql(u8, type_name, "register_command")) {
-        const name = optionalString(object, "name") orelse return .ignored_malformed;
-        const description = optionalString(object, "description");
-        try registry.registerCommand(name, description, extension_path);
-        return .registered_command;
-    }
-
-    if (std.mem.eql(u8, type_name, "register_shortcut")) {
-        const shortcut = optionalString(object, "shortcut") orelse return .ignored_malformed;
-        const description = optionalString(object, "description");
-        const command = optionalString(object, "command");
-        try registry.registerShortcut(shortcut, description, command, extension_path);
-        return .registered_shortcut;
-    }
-
-    if (std.mem.eql(u8, type_name, "register_flag")) {
-        const name = optionalString(object, "name") orelse return .ignored_malformed;
-        const type_kind = parseFlagKind(optionalString(object, "valueType") orelse optionalString(object, "type") orelse "boolean") orelse return .ignored_malformed;
-        const description = optionalString(object, "description");
-        var default_value: FlagDefaultInput = .none;
-        if (object.get("default")) |default_val| {
-            switch (default_val) {
-                .bool => |b| default_value = .{ .boolean = b },
-                .string => |s| default_value = .{ .string = s },
-                else => {},
-            }
-        }
-        try registry.registerFlag(name, type_kind, description, default_value, extension_path);
-        return .registered_flag;
-    }
-
-    if (std.mem.eql(u8, type_name, "register_provider")) {
-        const name = optionalString(object, "name") orelse return .ignored_malformed;
-        const display_name = optionalString(object, "displayName");
-        const base_url = optionalString(object, "baseUrl");
-        const api = optionalString(object, "api");
-        var inputs = std.ArrayList(ProviderModelInput).empty;
-        defer inputs.deinit(registry.allocator);
-        if (object.get("models")) |models_value| {
-            if (models_value == .array) {
-                for (models_value.array.items) |m| {
-                    if (m != .object) continue;
-                    const id = optionalString(m.object, "id") orelse continue;
-                    const display = optionalString(m.object, "name") orelse id;
-                    try inputs.append(registry.allocator, .{ .id = id, .name = display });
-                }
-            }
-        }
-
-        // Parse auth_header
-        const auth_header = optionalBool(object, "authHeader") orelse false;
-        const api_key_configured = (optionalBool(object, "apiKeyConfigured") orelse false) or object.get("apiKey") != null;
-
-        try registry.registerProviderFullWithAuthState(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header, api_key_configured);
-
-        // Apply OAuth after provider is registered to avoid memory leak on failure
-        if (object.get("oauth")) |oauth_val| {
-            if (oauth_val == .object) {
-                const oauth_name = optionalString(oauth_val.object, "name") orelse name;
-                if (registry.findProviderIndex(name)) |idx| {
-                    const oauth_name_dup = try registry.allocator.dupe(u8, oauth_name);
-                    errdefer registry.allocator.free(oauth_name_dup);
-                    registry.providers.items[idx].oauth = .{
-                        .name = oauth_name_dup,
-                    };
-                }
-            }
-        }
-
-        return .registered_provider;
-    }
-
-    if (std.mem.eql(u8, type_name, "unregister_provider")) {
-        const name = optionalString(object, "name") orelse return .ignored_malformed;
-        _ = registry.unregisterProvider(name);
-        return .unregistered_provider;
-    }
-
-    if (std.mem.eql(u8, type_name, "register_capability")) {
-        const id = optionalString(object, "id") orelse return .ignored_malformed;
-        const kind = optionalString(object, "kind") orelse return .ignored_malformed;
-        const title = optionalString(object, "title") orelse return .ignored_malformed;
-        const description = optionalString(object, "description");
-        const command = optionalString(object, "command");
-        const resource_path = optionalString(object, "resourcePath");
-        try registry.registerCapability(id, kind, title, description, command, resource_path, extension_path);
-        return .registered_capability;
-    }
-
-    if (std.mem.eql(u8, type_name, "unregister_capability")) {
-        const id = optionalString(object, "id") orelse return .ignored_malformed;
-        _ = registry.unregisterCapability(id);
-        return .unregistered_capability;
-    }
-
-    if (std.mem.eql(u8, type_name, "resources_discover")) {
-        var discovery = ResourceDiscovery{
-            .extension_path = try registry.allocator.dupe(u8, extension_path),
-        };
-        errdefer discovery.deinit(registry.allocator);
-
-        if (object.get("skillPaths")) |paths| {
-            if (paths == .array) {
-                for (paths.array.items) |item| {
-                    if (item == .string) {
-                        try discovery.skill_paths.append(registry.allocator, try registry.allocator.dupe(u8, item.string));
-                    }
-                }
-            }
-        }
-        if (object.get("promptPaths")) |paths| {
-            if (paths == .array) {
-                for (paths.array.items) |item| {
-                    if (item == .string) {
-                        try discovery.prompt_paths.append(registry.allocator, try registry.allocator.dupe(u8, item.string));
-                    }
-                }
-            }
-        }
-        if (object.get("themePaths")) |paths| {
-            if (paths == .array) {
-                for (paths.array.items) |item| {
-                    if (item == .string) {
-                        try discovery.theme_paths.append(registry.allocator, try registry.allocator.dupe(u8, item.string));
-                    }
-                }
-            }
-        }
-
-        try registry.resource_discoveries.append(registry.allocator, discovery);
-        return .resources_discovered;
-    }
-
-    if (std.mem.eql(u8, type_name, "extension_ui_request")) {
-        if (optionalString(object, "id")) |id| {
-            try registry.recordUiRequest(id);
-        }
-        return .none;
-    }
-
-    if (std.mem.eql(u8, type_name, "set_header")) {
-        const lines = try optionalLinesArray(registry.allocator, object, "lines");
-        defer registry.allocator.free(lines);
-        try registry.setHeaderHook(lines, extension_path);
-        return .set_header_hook;
-    }
-    if (std.mem.eql(u8, type_name, "clear_header")) {
-        _ = registry.clearHeaderHook();
-        return .cleared_header_hook;
-    }
-    if (std.mem.eql(u8, type_name, "set_footer")) {
-        const lines = try optionalLinesArray(registry.allocator, object, "lines");
-        defer registry.allocator.free(lines);
-        try registry.setFooterHook(lines, extension_path);
-        return .set_footer_hook;
-    }
-    if (std.mem.eql(u8, type_name, "clear_footer")) {
-        _ = registry.clearFooterHook();
-        return .cleared_footer_hook;
-    }
-    if (std.mem.eql(u8, type_name, "register_terminal_input")) {
-        const id = optionalString(object, "id") orelse return .ignored_malformed;
-        const consume = optionalBool(object, "consume") orelse false;
-        const transform_to = optionalString(object, "transformTo");
-        try registry.registerTerminalInput(id, consume, transform_to, extension_path);
-        return .registered_terminal_input;
-    }
-    if (std.mem.eql(u8, type_name, "unregister_terminal_input")) {
-        const id = optionalString(object, "id") orelse return .ignored_malformed;
-        _ = registry.unregisterTerminalInput(id);
-        return .unregistered_terminal_input;
-    }
-    if (std.mem.eql(u8, type_name, "set_editor_component")) {
-        const label = optionalString(object, "label") orelse return .ignored_malformed;
-        try registry.setEditorComponentHook(label, extension_path);
-        return .set_editor_component_hook;
-    }
-    if (std.mem.eql(u8, type_name, "clear_editor_component")) {
-        _ = registry.clearEditorComponentHook();
-        return .cleared_editor_component_hook;
-    }
-    if (std.mem.eql(u8, type_name, "set_widget")) {
-        const key = optionalString(object, "key") orelse return .ignored_malformed;
-        const lines = try optionalLinesArray(registry.allocator, object, "lines");
-        defer registry.allocator.free(lines);
-        const placement_str = optionalString(object, "placement") orelse "aboveEditor";
-        const placement = if (std.mem.eql(u8, placement_str, "belowEditor")) WidgetPlacement.below_editor else WidgetPlacement.above_editor;
-        try registry.setWidgetHook(key, lines, placement, extension_path);
-        return .set_widget_hook;
-    }
-    if (std.mem.eql(u8, type_name, "clear_widget")) {
-        const key = optionalString(object, "key") orelse return .ignored_malformed;
-        _ = registry.clearWidgetHook(key);
-        return .cleared_widget_hook;
-    }
-    if (std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload")) {
-        registry.clearUiHooksForReload();
-        return .cleared_ui_hooks_for_reload;
-    }
-    if (std.mem.eql(u8, type_name, "clear_extension_registrations")) {
-        const target_extension_path = optionalString(object, "extensionPath") orelse return .ignored_malformed;
-        registry.clearStaticRegistrationsForExtension(target_extension_path);
-        return .cleared_extension_registrations;
-    }
-
-    if (std.mem.eql(u8, type_name, "register_message_renderer")) {
-        const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
-        try registry.registerMessageRenderer(custom_type, extension_path);
-        return .registered_message_renderer;
-    }
-
-    if (std.mem.eql(u8, type_name, "unregister_message_renderer")) {
-        const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
-        _ = registry.unregisterMessageRenderer(custom_type);
-        return .unregistered_message_renderer;
-    }
+    if (std.mem.eql(u8, type_name, "register_tool")) return try applyRegisterToolFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "register_command")) return try applyRegisterCommandFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "register_shortcut")) return try applyRegisterShortcutFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "register_flag")) return try applyRegisterFlagFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "register_provider")) return try applyRegisterProviderFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "unregister_provider")) return applyUnregisterProviderFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "register_capability")) return try applyRegisterCapabilityFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "unregister_capability")) return applyUnregisterCapabilityFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "resources_discover")) return try applyResourcesDiscoverFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "extension_ui_request")) return try applyExtensionUiRequestFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "set_header")) return try applySetHeaderFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "clear_header")) return applyClearHeaderFrame(registry);
+    if (std.mem.eql(u8, type_name, "set_footer")) return try applySetFooterFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "clear_footer")) return applyClearFooterFrame(registry);
+    if (std.mem.eql(u8, type_name, "register_terminal_input")) return try applyRegisterTerminalInputFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "unregister_terminal_input")) return applyUnregisterTerminalInputFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "set_editor_component")) return try applySetEditorComponentFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "clear_editor_component")) return applyClearEditorComponentFrame(registry);
+    if (std.mem.eql(u8, type_name, "set_widget")) return try applySetWidgetFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "clear_widget")) return applyClearWidgetFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload")) return applyClearUiHooksForReloadFrame(registry);
+    if (std.mem.eql(u8, type_name, "clear_extension_registrations")) return applyClearExtensionRegistrationsFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "register_message_renderer")) return try applyRegisterMessageRendererFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "unregister_message_renderer")) return applyUnregisterMessageRendererFrame(registry, object);
 
     return .ignored_unsupported;
+}
+
+fn applyRegisterToolFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const name = optionalString(object, "name") orelse return .ignored_malformed;
+    const label = optionalString(object, "label") orelse name;
+    const description = optionalString(object, "description") orelse "";
+    const parameters = object.get("parameters") orelse .null;
+    const execution_mode = optionalString(object, "executionMode");
+    const render_shell = optionalString(object, "renderShell");
+    try registry.registerToolFull(name, label, description, parameters, execution_mode, render_shell, extension_path);
+    try applyToolRenderHook(registry, object, name, extension_path);
+    return .registered_tool;
+}
+
+fn applyToolRenderHook(registry: *Registry, object: std.json.ObjectMap, name: []const u8, extension_path: []const u8) !void {
+    const idx = registry.findToolIndex(name) orelse return;
+    const render_hook_val = object.get("renderHook") orelse return;
+    if (render_hook_val != .object) return;
+
+    var render_config_buf: std.Io.Writer.Allocating = .init(registry.allocator);
+    defer render_config_buf.deinit();
+    try std.json.Stringify.value(render_hook_val, .{}, &render_config_buf.writer);
+
+    const render_config = try registry.allocator.dupe(u8, render_config_buf.written());
+    errdefer registry.allocator.free(render_config);
+    const tool_name = try registry.allocator.dupe(u8, name);
+    errdefer registry.allocator.free(tool_name);
+    const hook_extension_path = try registry.allocator.dupe(u8, extension_path);
+    errdefer registry.allocator.free(hook_extension_path);
+
+    registry.tools.items[idx].render_hook = .{
+        .render_config = render_config,
+        .tool_name = tool_name,
+        .extension_path = hook_extension_path,
+    };
+}
+
+fn applyRegisterCommandFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const name = optionalString(object, "name") orelse return .ignored_malformed;
+    const description = optionalString(object, "description");
+    try registry.registerCommand(name, description, extension_path);
+    return .registered_command;
+}
+
+fn applyRegisterShortcutFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const shortcut = optionalString(object, "shortcut") orelse return .ignored_malformed;
+    const description = optionalString(object, "description");
+    const command = optionalString(object, "command");
+    try registry.registerShortcut(shortcut, description, command, extension_path);
+    return .registered_shortcut;
+}
+
+fn applyRegisterFlagFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const name = optionalString(object, "name") orelse return .ignored_malformed;
+    const type_kind = parseFlagKind(optionalString(object, "valueType") orelse optionalString(object, "type") orelse "boolean") orelse return .ignored_malformed;
+    const description = optionalString(object, "description");
+    const default_value = parseFlagDefault(object);
+    try registry.registerFlag(name, type_kind, description, default_value, extension_path);
+    return .registered_flag;
+}
+
+fn parseFlagDefault(object: std.json.ObjectMap) FlagDefaultInput {
+    const default_val = object.get("default") orelse return .none;
+    return switch (default_val) {
+        .bool => |b| .{ .boolean = b },
+        .string => |s| .{ .string = s },
+        else => .none,
+    };
+}
+
+fn applyRegisterProviderFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const name = optionalString(object, "name") orelse return .ignored_malformed;
+    const display_name = optionalString(object, "displayName");
+    const base_url = optionalString(object, "baseUrl");
+    const api = optionalString(object, "api");
+
+    var inputs = std.ArrayList(ProviderModelInput).empty;
+    defer inputs.deinit(registry.allocator);
+    try collectProviderModelInputs(registry.allocator, object, &inputs);
+
+    const auth_header = optionalBool(object, "authHeader") orelse false;
+    const api_key_configured = (optionalBool(object, "apiKeyConfigured") orelse false) or object.get("apiKey") != null;
+
+    try registry.registerProviderFullWithAuthState(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header, api_key_configured);
+    try applyProviderOAuthFrame(registry, object, name);
+    return .registered_provider;
+}
+
+fn collectProviderModelInputs(allocator: std.mem.Allocator, object: std.json.ObjectMap, inputs: *std.ArrayList(ProviderModelInput)) !void {
+    const models_value = object.get("models") orelse return;
+    if (models_value != .array) return;
+    for (models_value.array.items) |model_value| {
+        if (model_value != .object) continue;
+        const id = optionalString(model_value.object, "id") orelse continue;
+        const display = optionalString(model_value.object, "name") orelse id;
+        try inputs.append(allocator, .{ .id = id, .name = display });
+    }
+}
+
+fn applyProviderOAuthFrame(registry: *Registry, object: std.json.ObjectMap, name: []const u8) !void {
+    const oauth_val = object.get("oauth") orelse return;
+    if (oauth_val != .object) return;
+    const idx = registry.findProviderIndex(name) orelse return;
+
+    const oauth_name = optionalString(oauth_val.object, "name") orelse name;
+    const oauth_name_dup = try registry.allocator.dupe(u8, oauth_name);
+    errdefer registry.allocator.free(oauth_name_dup);
+    registry.providers.items[idx].oauth = .{
+        .name = oauth_name_dup,
+    };
+}
+
+fn applyUnregisterProviderFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const name = optionalString(object, "name") orelse return .ignored_malformed;
+    _ = registry.unregisterProvider(name);
+    return .unregistered_provider;
+}
+
+fn applyRegisterCapabilityFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const id = optionalString(object, "id") orelse return .ignored_malformed;
+    const kind = optionalString(object, "kind") orelse return .ignored_malformed;
+    const title = optionalString(object, "title") orelse return .ignored_malformed;
+    const description = optionalString(object, "description");
+    const command = optionalString(object, "command");
+    const resource_path = optionalString(object, "resourcePath");
+    try registry.registerCapability(id, kind, title, description, command, resource_path, extension_path);
+    return .registered_capability;
+}
+
+fn applyUnregisterCapabilityFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const id = optionalString(object, "id") orelse return .ignored_malformed;
+    _ = registry.unregisterCapability(id);
+    return .unregistered_capability;
+}
+
+fn applyResourcesDiscoverFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    var discovery = ResourceDiscovery{
+        .extension_path = try registry.allocator.dupe(u8, extension_path),
+    };
+    errdefer discovery.deinit(registry.allocator);
+
+    try appendResourcePathFrameItems(registry.allocator, object, "skillPaths", &discovery.skill_paths);
+    try appendResourcePathFrameItems(registry.allocator, object, "promptPaths", &discovery.prompt_paths);
+    try appendResourcePathFrameItems(registry.allocator, object, "themePaths", &discovery.theme_paths);
+
+    try registry.resource_discoveries.append(registry.allocator, discovery);
+    return .resources_discovered;
+}
+
+fn appendResourcePathFrameItems(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field: []const u8,
+    list: *std.ArrayList([]u8),
+) !void {
+    const paths = object.get(field) orelse return;
+    if (paths != .array) return;
+    for (paths.array.items) |item| {
+        if (item != .string) continue;
+        const owned_path = try allocator.dupe(u8, item.string);
+        errdefer allocator.free(owned_path);
+        try list.append(allocator, owned_path);
+    }
+}
+
+fn applyExtensionUiRequestFrame(registry: *Registry, object: std.json.ObjectMap) !FrameOutcome {
+    if (optionalString(object, "id")) |id| {
+        try registry.recordUiRequest(id);
+    }
+    return .none;
+}
+
+fn applySetHeaderFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const lines = try optionalLinesArray(registry.allocator, object, "lines");
+    defer registry.allocator.free(lines);
+    try registry.setHeaderHook(lines, extension_path);
+    return .set_header_hook;
+}
+
+fn applyClearHeaderFrame(registry: *Registry) FrameOutcome {
+    _ = registry.clearHeaderHook();
+    return .cleared_header_hook;
+}
+
+fn applySetFooterFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const lines = try optionalLinesArray(registry.allocator, object, "lines");
+    defer registry.allocator.free(lines);
+    try registry.setFooterHook(lines, extension_path);
+    return .set_footer_hook;
+}
+
+fn applyClearFooterFrame(registry: *Registry) FrameOutcome {
+    _ = registry.clearFooterHook();
+    return .cleared_footer_hook;
+}
+
+fn applyRegisterTerminalInputFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const id = optionalString(object, "id") orelse return .ignored_malformed;
+    const consume = optionalBool(object, "consume") orelse false;
+    const transform_to = optionalString(object, "transformTo");
+    try registry.registerTerminalInput(id, consume, transform_to, extension_path);
+    return .registered_terminal_input;
+}
+
+fn applyUnregisterTerminalInputFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const id = optionalString(object, "id") orelse return .ignored_malformed;
+    _ = registry.unregisterTerminalInput(id);
+    return .unregistered_terminal_input;
+}
+
+fn applySetEditorComponentFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const label = optionalString(object, "label") orelse return .ignored_malformed;
+    try registry.setEditorComponentHook(label, extension_path);
+    return .set_editor_component_hook;
+}
+
+fn applyClearEditorComponentFrame(registry: *Registry) FrameOutcome {
+    _ = registry.clearEditorComponentHook();
+    return .cleared_editor_component_hook;
+}
+
+fn applySetWidgetFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const key = optionalString(object, "key") orelse return .ignored_malformed;
+    const lines = try optionalLinesArray(registry.allocator, object, "lines");
+    defer registry.allocator.free(lines);
+    const placement = parseWidgetPlacement(optionalString(object, "placement") orelse "aboveEditor");
+    try registry.setWidgetHook(key, lines, placement, extension_path);
+    return .set_widget_hook;
+}
+
+fn parseWidgetPlacement(placement: []const u8) WidgetPlacement {
+    if (std.mem.eql(u8, placement, "belowEditor")) return .below_editor;
+    return .above_editor;
+}
+
+fn applyClearWidgetFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const key = optionalString(object, "key") orelse return .ignored_malformed;
+    _ = registry.clearWidgetHook(key);
+    return .cleared_widget_hook;
+}
+
+fn applyClearUiHooksForReloadFrame(registry: *Registry) FrameOutcome {
+    registry.clearUiHooksForReload();
+    return .cleared_ui_hooks_for_reload;
+}
+
+fn applyClearExtensionRegistrationsFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const target_extension_path = optionalString(object, "extensionPath") orelse return .ignored_malformed;
+    registry.clearStaticRegistrationsForExtension(target_extension_path);
+    return .cleared_extension_registrations;
+}
+
+fn applyRegisterMessageRendererFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
+    try registry.registerMessageRenderer(custom_type, extension_path);
+    return .registered_message_renderer;
+}
+
+fn applyUnregisterMessageRendererFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
+    _ = registry.unregisterMessageRenderer(custom_type);
+    return .unregistered_message_renderer;
 }
 
 fn optionalBool(object: std.json.ObjectMap, field: []const u8) ?bool {

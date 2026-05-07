@@ -1,9 +1,12 @@
 const std = @import("std");
 const agent = @import("agent");
+const config_mod = @import("../config/config.zig");
+const enforcement = @import("enforcement.zig");
 const extension_events = @import("extension_events.zig");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
 const native_runtime = @import("native_runtime.zig");
+const resources_mod = @import("../resources/resources.zig");
 const tools_common = @import("../tools/common.zig");
 const wasm_host = @import("wasm/wasm_host_spike.zig");
 const wasm_manifest = @import("wasm/wasm_manifest.zig");
@@ -37,11 +40,70 @@ pub const RuntimeKind = enum {
     }
 };
 
-pub fn wasmPolicyLookupKey(allocator: std.mem.Allocator, manifest: WasmManifestHandoff) ![]u8 {
+pub const TypeScriptPolicyLookupOptions = struct {
+    configured_path: []const u8,
+    resolved_path: []const u8,
+    source_info: resources_mod.SourceInfo,
+};
+
+pub fn typeScriptPolicyLookupKey(allocator: std.mem.Allocator, options: TypeScriptPolicyLookupOptions) ![]u8 {
+    const configured_path = try toPolicyPathAlloc(allocator, options.configured_path);
+    defer allocator.free(configured_path);
+    const resolved_path = try toPolicyPathAlloc(allocator, options.resolved_path);
+    defer allocator.free(resolved_path);
+
+    if (configured_path.len >= 2 and configured_path[0] == '<' and configured_path[configured_path.len - 1] == '>') {
+        const source = if (options.source_info.source.len > 0) options.source_info.source else "temporary";
+        return std.fmt.allocPrint(allocator, "typescript:inline:{s}:{s}", .{ source, configured_path });
+    }
+
+    const scope = sourceScopeName(options.source_info.scope);
+    if (options.source_info.origin == .package) {
+        const entry_path = try relativePolicyPathAlloc(allocator, options.source_info.base_dir, resolved_path) orelse
+            try allocator.dupe(u8, resolved_path);
+        defer allocator.free(entry_path);
+        return std.fmt.allocPrint(
+            allocator,
+            "typescript:package:{s}:{s}:{s}:{s}",
+            .{ scope, options.source_info.source, entry_path, resolved_path },
+        );
+    }
+
+    return std.fmt.allocPrint(allocator, "typescript:local:{s}:{s}", .{ scope, resolved_path });
+}
+
+pub const WasmManifestPolicyLookupOptions = struct {
+    schema_version: []const u8,
+    id: []const u8,
+    version: []const u8,
+    package_root: []const u8,
+    manifest_path: []const u8,
+    artifact_path: []const u8,
+};
+
+pub fn wasmManifestPolicyLookupKey(allocator: std.mem.Allocator, options: WasmManifestPolicyLookupOptions) ![]u8 {
+    const package_root = try toPolicyPathAlloc(allocator, options.package_root);
+    defer allocator.free(package_root);
+    const manifest_path = try toPolicyPathAlloc(allocator, options.manifest_path);
+    defer allocator.free(manifest_path);
+    const artifact_path = try toPolicyPathAlloc(allocator, options.artifact_path);
+    defer allocator.free(artifact_path);
     return std.fmt.allocPrint(
         allocator,
-        "wasm:{s}:{s}:{s}:{s}:{s}",
-        .{ manifest.schema_version, manifest.id, manifest.version, manifest.artifact_path, manifest.artifact_absolute_path },
+        "wasm:manifest:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{ options.schema_version, options.id, options.version, package_root, manifest_path, artifact_path },
+    );
+}
+
+pub fn wasmPolicyLookupKey(allocator: std.mem.Allocator, manifest: WasmManifestHandoff) ![]u8 {
+    const manifest_path = try toPolicyPathAlloc(allocator, manifest.manifest_path orelse "");
+    defer allocator.free(manifest_path);
+    const artifact_absolute_path = try toPolicyPathAlloc(allocator, manifest.artifact_absolute_path);
+    defer allocator.free(artifact_absolute_path);
+    return std.fmt.allocPrint(
+        allocator,
+        "wasm:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{ manifest.schema_version, manifest.id, manifest.version, manifest.artifact_sha256 orelse "", manifest_path, artifact_absolute_path },
     );
 }
 
@@ -49,30 +111,71 @@ pub fn nativePolicyLookupKey(allocator: std.mem.Allocator, descriptor: NativeDes
     return std.fmt.allocPrint(
         allocator,
         "native:{s}:{s}:{s}",
-        .{ descriptor.id, descriptor.name, descriptor.version },
+        .{ descriptor.id, descriptor.version, descriptor.name },
     );
 }
 
 pub fn processJsonlPolicyLookupKey(allocator: std.mem.Allocator, options: ProcessJsonlOptions) ![]u8 {
-    var hasher = std.hash.Wyhash.init(0);
-    for (options.argv) |arg| updatePolicyHash(&hasher, arg);
-    if (options.cwd) |cwd| updatePolicyHash(&hasher, cwd);
-    updatePolicyHash(&hasher, options.initialize.cwd);
-    const digest = hasher.final();
-    const command_path = if (options.argv.len > 0) options.argv[0] else "";
-    const extension_path = if (options.argv.len > 1) options.argv[options.argv.len - 1] else "";
-    return std.fmt.allocPrint(
-        allocator,
-        "process_jsonl:{x}:{s}:{s}",
-        .{ digest, command_path, extension_path },
-    );
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("process_jsonl:{\"argv\":[");
+    for (options.argv, 0..) |arg, index| {
+        if (index > 0) try out.writer.writeAll(",");
+        const normalized = try toPolicyPathAlloc(allocator, arg);
+        defer allocator.free(normalized);
+        try writeJsonString(&out.writer, normalized);
+    }
+    try out.writer.writeAll("]");
+    if (options.extension_path) |extension_path| {
+        const normalized = try toPolicyPathAlloc(allocator, extension_path);
+        defer allocator.free(normalized);
+        try out.writer.writeAll(",\"extensionPath\":");
+        try writeJsonString(&out.writer, normalized);
+    }
+    if (options.cwd) |cwd| {
+        const resolved = try std.fs.path.resolve(allocator, &.{cwd});
+        defer allocator.free(resolved);
+        const normalized = try toPolicyPathAlloc(allocator, resolved);
+        defer allocator.free(normalized);
+        try out.writer.writeAll(",\"cwd\":");
+        try writeJsonString(&out.writer, normalized);
+    }
+    try out.writer.writeAll("}");
+    return out.toOwnedSlice();
 }
 
-fn updatePolicyHash(hasher: *std.hash.Wyhash, bytes: []const u8) void {
-    var length_bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &length_bytes, @intCast(bytes.len), .little);
-    hasher.update(&length_bytes);
-    hasher.update(bytes);
+fn toPolicyPathAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    const normalized = try allocator.dupe(u8, value);
+    for (normalized) |*char| {
+        if (char.* == '\\') char.* = '/';
+    }
+    return normalized;
+}
+
+fn sourceScopeName(scope: resources_mod.SourceScope) []const u8 {
+    return switch (scope) {
+        .temporary => "temporary",
+        .project => "project",
+        .user => "user",
+    };
+}
+
+fn relativePolicyPathAlloc(allocator: std.mem.Allocator, base_dir: ?[]const u8, file_path: []const u8) !?[]u8 {
+    const raw_base = base_dir orelse return null;
+    const base = try toPolicyPathAlloc(allocator, raw_base);
+    defer allocator.free(base);
+    var base_len = base.len;
+    while (base_len > 0 and base[base_len - 1] == '/') base_len -= 1;
+    const trimmed_base = base[0..base_len];
+    if (trimmed_base.len == 0) return null;
+    if (std.mem.eql(u8, trimmed_base, file_path)) return null;
+    if (!std.mem.startsWith(u8, file_path, trimmed_base)) return null;
+    if (file_path.len <= trimmed_base.len or file_path[trimmed_base.len] != '/') return null;
+    return try allocator.dupe(u8, file_path[trimmed_base.len + 1 ..]);
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try std.json.Stringify.value(value, .{}, writer);
 }
 
 pub const UnsupportedRuntimeOptions = struct {
@@ -80,6 +183,8 @@ pub const UnsupportedRuntimeOptions = struct {
 };
 
 pub const WasmManifestHandoff = struct {
+    package_root: ?[]const u8 = null,
+    manifest_path: ?[]const u8 = null,
     schema_version: []const u8,
     id: []const u8,
     name: []const u8,
@@ -88,14 +193,20 @@ pub const WasmManifestHandoff = struct {
     artifact_kind: wasm_manifest.ArtifactKind,
     artifact_path: []const u8,
     artifact_absolute_path: []const u8,
+    artifact_sha256: ?[]const u8 = null,
     tool_id: []const u8,
     tool_description: []const u8,
     input_schema_json: []const u8,
     output_schema_json: []const u8,
     requested_capabilities: []const wasm_manifest.Capability = &.{},
+    approved_capabilities: []const wasm_manifest.Capability = &.{},
+    resource_limits: enforcement.ResourceLimits = .{},
+    policy_lookup_key: ?[]const u8 = null,
 
     pub fn fromManifest(manifest: *const wasm_manifest.Manifest) WasmManifestHandoff {
         return .{
+            .package_root = manifest.package_root,
+            .manifest_path = manifest.manifest_path,
             .schema_version = manifest.schema_version,
             .id = manifest.id,
             .name = manifest.name,
@@ -104,11 +215,21 @@ pub const WasmManifestHandoff = struct {
             .artifact_kind = manifest.artifact_kind,
             .artifact_path = manifest.artifact_path,
             .artifact_absolute_path = manifest.artifact_absolute_path,
+            .artifact_sha256 = manifest.artifact_sha256,
             .tool_id = manifest.tool_id,
             .tool_description = manifest.tool_description,
             .input_schema_json = manifest.input_schema_json,
             .output_schema_json = manifest.output_schema_json,
             .requested_capabilities = manifest.requested_capabilities,
+            .resource_limits = .{
+                .max_children = manifest.resource_limits.max_children,
+                .depth = manifest.resource_limits.depth,
+                .turns = manifest.resource_limits.turns,
+                .timeout_ms = manifest.resource_limits.timeout_ms,
+                .output_bytes = manifest.resource_limits.output_bytes,
+                .output_lines = manifest.resource_limits.output_lines,
+                .tool_scopes = manifest.resource_limits.tool_scopes,
+            },
         };
     }
 
@@ -134,7 +255,7 @@ pub const WasmManifestHandoff = struct {
         phase: wasm_manifest.LifecyclePhase,
         mode: []const u8,
     ) ?wasm_manifest.CapabilityDenialDiagnostic {
-        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, &.{}, phase, mode);
+        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, self.approved_capabilities, phase, mode);
     }
 };
 
@@ -237,6 +358,60 @@ pub const RuntimeAdapter = struct {
         self.vtable.deinit(self.ptr);
     }
 };
+
+pub fn approvedCapabilitiesFromExtensionPolicy(
+    allocator: std.mem.Allocator,
+    policy: config_mod.ExtensionPolicy,
+) ![]wasm_manifest.Capability {
+    const approved_grants = policy.approved_grants orelse return allocator.alloc(wasm_manifest.Capability, 0);
+    var capabilities = std.ArrayList(wasm_manifest.Capability).empty;
+    errdefer capabilities.deinit(allocator);
+    for (approved_grants) |grant| {
+        if (wasm_manifest.parseCapability(grant)) |capability| {
+            try capabilities.append(allocator, capability);
+        }
+    }
+    return capabilities.toOwnedSlice(allocator);
+}
+
+pub fn enforcementResourceLimitsFromExtensionPolicy(
+    limits: ?config_mod.ExtensionResourceLimits,
+) enforcement.ResourceLimits {
+    const resource_limits = limits orelse return .{};
+    return .{
+        .max_children = resource_limits.max_children,
+        .depth = resource_limits.depth,
+        .turns = resource_limits.turns,
+        .timeout_ms = resource_limits.timeout_ms,
+        .output_bytes = resource_limits.output_bytes,
+        .output_lines = resource_limits.output_lines,
+        .tool_scopes = resource_limits.tool_scopes orelse &.{},
+    };
+}
+
+pub fn nativeResourceLimitsFromExtensionPolicy(
+    policy_limits: ?config_mod.ExtensionResourceLimits,
+    descriptor_limits: NativeResourceLimits,
+) NativeResourceLimits {
+    const limits = policy_limits orelse return descriptor_limits;
+    return .{
+        .max_children = narrowOptionalLimit(limits.max_children, descriptor_limits.max_children),
+        .depth = narrowOptionalLimit(limits.depth, descriptor_limits.depth),
+        .turns = narrowOptionalLimit(limits.turns, descriptor_limits.turns),
+        .timeout_ms = narrowOptionalLimit(limits.timeout_ms, descriptor_limits.timeout_ms),
+        .output_bytes = narrowOptionalLimit(limits.output_bytes, descriptor_limits.output_bytes),
+        .output_lines = narrowOptionalLimit(limits.output_lines, descriptor_limits.output_lines),
+        .tool_scopes = limits.tool_scopes orelse descriptor_limits.tool_scopes,
+    };
+}
+
+fn narrowOptionalLimit(policy_limit: ?u64, descriptor_limit: ?u64) ?u64 {
+    if (policy_limit) |policy_value| {
+        if (descriptor_limit) |descriptor_value| return @min(policy_value, descriptor_value);
+        return policy_value;
+    }
+    return descriptor_limit;
+}
 
 pub fn deinitAgentTool(allocator: std.mem.Allocator, tool: *agent.AgentTool) void {
     tools_common.deinitJsonValue(allocator, tool.parameters);
@@ -352,6 +527,8 @@ const process_jsonl_vtable: RuntimeAdapter.VTable = .{
 };
 
 const OwnedWasmManifest = struct {
+    package_root: ?[]u8,
+    manifest_path: ?[]u8,
     schema_version: []u8,
     id: []u8,
     name: []u8,
@@ -365,8 +542,14 @@ const OwnedWasmManifest = struct {
     input_schema_json: []u8,
     output_schema_json: []u8,
     requested_capabilities: []wasm_manifest.Capability,
+    resource_limits: enforcement.ResourceLimits,
+    policy_lookup_key: ?[]u8,
 
     fn clone(allocator: std.mem.Allocator, handoff: WasmManifestHandoff) !OwnedWasmManifest {
+        const package_root = if (handoff.package_root) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (package_root) |value| allocator.free(value);
+        const manifest_path = if (handoff.manifest_path) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (manifest_path) |value| allocator.free(value);
         const schema_version = try allocator.dupe(u8, handoff.schema_version);
         errdefer allocator.free(schema_version);
         const id = try allocator.dupe(u8, handoff.id);
@@ -391,7 +574,13 @@ const OwnedWasmManifest = struct {
         errdefer allocator.free(output_schema_json);
         const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, handoff.requested_capabilities);
         errdefer allocator.free(requested_capabilities);
+        var resource_limits = try cloneEnforcementResourceLimits(allocator, handoff.resource_limits);
+        errdefer deinitEnforcementResourceLimits(allocator, &resource_limits);
+        const policy_lookup_key = if (handoff.policy_lookup_key) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (policy_lookup_key) |value| allocator.free(value);
         return .{
+            .package_root = package_root,
+            .manifest_path = manifest_path,
             .schema_version = schema_version,
             .id = id,
             .name = name,
@@ -405,10 +594,14 @@ const OwnedWasmManifest = struct {
             .input_schema_json = input_schema_json,
             .output_schema_json = output_schema_json,
             .requested_capabilities = requested_capabilities,
+            .resource_limits = resource_limits,
+            .policy_lookup_key = policy_lookup_key,
         };
     }
 
     fn deinit(self: *OwnedWasmManifest, allocator: std.mem.Allocator) void {
+        if (self.package_root) |value| allocator.free(value);
+        if (self.manifest_path) |value| allocator.free(value);
         allocator.free(self.schema_version);
         allocator.free(self.id);
         allocator.free(self.name);
@@ -421,9 +614,51 @@ const OwnedWasmManifest = struct {
         allocator.free(self.input_schema_json);
         allocator.free(self.output_schema_json);
         allocator.free(self.requested_capabilities);
+        deinitEnforcementResourceLimits(allocator, &self.resource_limits);
+        if (self.policy_lookup_key) |value| allocator.free(value);
         self.* = undefined;
     }
 };
+
+fn cloneEnforcementResourceLimits(
+    allocator: std.mem.Allocator,
+    limits: enforcement.ResourceLimits,
+) !enforcement.ResourceLimits {
+    const tool_scopes = try cloneConstStringList(allocator, limits.tool_scopes);
+    errdefer freeConstStringList(allocator, tool_scopes);
+    return .{
+        .max_children = limits.max_children,
+        .depth = limits.depth,
+        .turns = limits.turns,
+        .timeout_ms = limits.timeout_ms,
+        .output_bytes = limits.output_bytes,
+        .output_lines = limits.output_lines,
+        .tool_scopes = tool_scopes,
+    };
+}
+
+fn deinitEnforcementResourceLimits(allocator: std.mem.Allocator, limits: *enforcement.ResourceLimits) void {
+    freeConstStringList(allocator, limits.tool_scopes);
+    limits.* = .{};
+}
+
+fn cloneConstStringList(
+    allocator: std.mem.Allocator,
+    values: []const []const u8,
+) ![]const []const u8 {
+    const cloned = try allocator.alloc([]const u8, values.len);
+    errdefer allocator.free(cloned);
+    for (values, 0..) |value, index| {
+        cloned[index] = try allocator.dupe(u8, value);
+        errdefer allocator.free(cloned[index]);
+    }
+    return cloned;
+}
+
+fn freeConstStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
 
 const WasmRuntime = struct {
     allocator: std.mem.Allocator,
@@ -432,6 +667,7 @@ const WasmRuntime = struct {
     mutex: std.Io.Mutex = .init,
     manifest: OwnedWasmManifest,
     host: wasm_host.Host,
+    accounting: enforcement.Accounting,
     unloaded: bool,
 
     fn start(allocator: std.mem.Allocator, io: std.Io, options: WasmOptions) !*WasmRuntime {
@@ -450,6 +686,7 @@ const WasmRuntime = struct {
             .state = extension_host.ProtocolState.init(allocator),
             .manifest = owned_manifest,
             .host = host,
+            .accounting = .{},
             .unloaded = false,
         };
         errdefer runtime.state.deinit();
@@ -508,6 +745,92 @@ const WasmRuntime = struct {
         try envelope.writer.writeAll(",\"message\":");
         try std.json.Stringify.value(message, .{}, &envelope.writer);
         try envelope.writer.writeAll("}");
+        try self.state.addDiagnostic(.host_error, .@"error", envelope.written());
+    }
+
+    fn enforceToolExecution(
+        self: *WasmRuntime,
+        delta: enforcement.UsageDelta,
+    ) !void {
+        const approved_tool_use = [_]wasm_manifest.Capability{.tool_use};
+        const decision = enforcement.decide(
+            .{
+                .runtime_kind = "wasm",
+                .extension_id = self.manifest.id,
+                .policy_lookup_key = self.manifest.policy_lookup_key,
+                .package_root = self.manifest.package_root,
+            },
+            .{
+                .approved_grants = approved_tool_use[0..],
+                .resource_limits = self.manifest.resource_limits,
+            },
+            .tool_use,
+            .{ .id = self.manifest.tool_id },
+            .call,
+            "wasm/tool-execute",
+            delta,
+            &self.accounting,
+        );
+        switch (decision) {
+            .allow => return,
+            .deny => |denial| {
+                try self.addDenialDiagnostic(denial);
+                return error.UnsupportedRuntimeCapability;
+            },
+        }
+    }
+
+    fn addDenialDiagnostic(self: *WasmRuntime, denial: enforcement.DenyDecision) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"category\":");
+        try std.json.Stringify.value(denial.category, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"capability\":");
+        try std.json.Stringify.value(denial.capability.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"branch\":");
+        try std.json.Stringify.value(denial.branch.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"phase\":");
+        try std.json.Stringify.value(denial.phase.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"mode\":");
+        try std.json.Stringify.value(denial.mode, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"principal\":{\"runtimeKind\":");
+        try std.json.Stringify.value(denial.principal.runtime_kind, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"extensionId\":");
+        try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        if (denial.principal.policy_lookup_key) |policy_lookup_key| {
+            try envelope.writer.writeAll(",\"policyLookupKey\":");
+            try std.json.Stringify.value(policy_lookup_key, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll(",\"toolId\":");
+        try std.json.Stringify.value(self.manifest.tool_id, .{}, &envelope.writer);
+        try envelope.writer.writeAll("},\"operation\":");
+        try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"target\":{\"id\":");
+        if (denial.target.id) |target_id| {
+            try std.json.Stringify.value(target_id, .{}, &envelope.writer);
+        } else {
+            try envelope.writer.writeAll("null");
+        }
+        try envelope.writer.writeAll("},\"reason\":");
+        try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"source\":{");
+        var wrote_source = false;
+        if (self.manifest.manifest_path) |manifest_path| {
+            try envelope.writer.writeAll("\"manifestPath\":");
+            try std.json.Stringify.value(manifest_path, .{}, &envelope.writer);
+            wrote_source = true;
+        }
+        if (self.manifest.package_root) |package_root| {
+            if (wrote_source) try envelope.writer.writeAll(",");
+            try envelope.writer.writeAll("\"packageRoot\":");
+            try std.json.Stringify.value(package_root, .{}, &envelope.writer);
+            wrote_source = true;
+        }
+        if (wrote_source) try envelope.writer.writeAll(",");
+        try envelope.writer.writeAll("\"artifactPath\":");
+        try std.json.Stringify.value(self.manifest.artifact_path, .{}, &envelope.writer);
+        try envelope.writer.writeAll("}");
+        try envelope.writer.writeAll(",\"message\":\"wasm tool execution denied by enforcement substrate\"}");
         try self.state.addDiagnostic(.host_error, .@"error", envelope.written());
     }
 
@@ -691,6 +1014,7 @@ fn wasmAgentToolExecute(
         }
     }
     if (!registered) return error.WasmToolNotRegistered;
+    try runtime.enforceToolExecution(.{ .turns = 1 });
 
     const output_json = runtime.host.callExecute(input_json) catch |err| switch (err) {
         error.InvalidJsonInput => {
@@ -706,6 +1030,10 @@ fn wasmAgentToolExecute(
         else => return err,
     };
     defer runtime.allocator.free(output_json);
+    try runtime.enforceToolExecution(.{
+        .output_bytes = output_json.len,
+        .output_lines = countLogicalLines(output_json),
+    });
     return .{ .content = try tools_common.makeTextContent(allocator, output_json) };
 }
 
@@ -714,6 +1042,15 @@ fn invalidInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentToolRes
         allocator,
         "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}",
     ) };
+}
+
+fn countLogicalLines(value: []const u8) u64 {
+    if (value.len == 0) return 0;
+    var lines: u64 = 1;
+    for (value) |byte| {
+        if (byte == '\n') lines += 1;
+    }
+    return lines;
 }
 
 fn wasmTakeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
@@ -1018,6 +1355,50 @@ test "extension runtime factory rejects remote runtime deterministically" {
 
 test "extension runtime policy lookup keys are canonical per runtime source" {
     const allocator = std.testing.allocator;
+    const local_source_info = resources_mod.SourceInfo{
+        .path = @constCast("/workspace/project/.pi/extensions/local.ts"),
+        .source = @constCast("local"),
+        .scope = .project,
+        .origin = .top_level,
+        .base_dir = @constCast("/workspace/project/.pi"),
+    };
+    const local_ts_key = try typeScriptPolicyLookupKey(allocator, .{
+        .configured_path = "/workspace/project/.pi/extensions/local.ts",
+        .resolved_path = "/workspace/project/.pi/extensions/local.ts",
+        .source_info = local_source_info,
+    });
+    defer allocator.free(local_ts_key);
+    try std.testing.expectEqualStrings("typescript:local:project:/workspace/project/.pi/extensions/local.ts", local_ts_key);
+
+    const package_source_info = resources_mod.SourceInfo{
+        .path = @constCast("/workspace/pkg/extensions/entry.ts"),
+        .source = @constCast("/workspace/pkg"),
+        .scope = .user,
+        .origin = .package,
+        .base_dir = @constCast("/workspace/pkg"),
+    };
+    const package_ts_key = try typeScriptPolicyLookupKey(allocator, .{
+        .configured_path = "/workspace/pkg/extensions/entry.ts",
+        .resolved_path = "/workspace/pkg/extensions/entry.ts",
+        .source_info = package_source_info,
+    });
+    defer allocator.free(package_ts_key);
+    try std.testing.expectEqualStrings("typescript:package:user:/workspace/pkg:extensions/entry.ts:/workspace/pkg/extensions/entry.ts", package_ts_key);
+
+    const inline_source_info = resources_mod.SourceInfo{
+        .path = @constCast("<inline:1>"),
+        .source = @constCast("inline"),
+        .scope = .temporary,
+        .origin = .top_level,
+    };
+    const inline_ts_key = try typeScriptPolicyLookupKey(allocator, .{
+        .configured_path = "<inline:1>",
+        .resolved_path = "<inline:1>",
+        .source_info = inline_source_info,
+    });
+    defer allocator.free(inline_ts_key);
+    try std.testing.expectEqualStrings("typescript:inline:inline:<inline:1>", inline_ts_key);
+
     var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
@@ -1025,29 +1406,54 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
     const wasm_handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
     const wasm_key = try wasmPolicyLookupKey(allocator, wasm_handoff);
     defer allocator.free(wasm_key);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_key, "wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_key, wasm_handoff.artifact_path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_key, wasm_handoff.artifact_absolute_path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, wasm_key, wasm_handoff.name) == null);
+    const expected_wasm_key = try std.fmt.allocPrint(
+        allocator,
+        "wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:fffac4554b1c0f2e8a8f44372f0766826ba4a06d60a314b67b7e78dca95c952e:{s}:{s}",
+        .{ manifest_result.valid.manifest_path, manifest_result.valid.artifact_absolute_path },
+    );
+    defer allocator.free(expected_wasm_key);
+    try std.testing.expectEqualStrings(expected_wasm_key, wasm_key);
+
+    const wasm_manifest_key = try wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = manifest_result.valid.schema_version,
+        .id = manifest_result.valid.id,
+        .version = manifest_result.valid.version,
+        .package_root = manifest_result.valid.package_root,
+        .manifest_path = manifest_result.valid.manifest_path,
+        .artifact_path = manifest_result.valid.artifact_path,
+    });
+    defer allocator.free(wasm_manifest_key);
+    const expected_wasm_manifest_key = try std.fmt.allocPrint(
+        allocator,
+        "wasm:manifest:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:{s}:{s}:wasm/plugin.wasm",
+        .{ manifest_result.valid.package_root, manifest_result.valid.manifest_path },
+    );
+    defer allocator.free(expected_wasm_manifest_key);
+    try std.testing.expectEqualStrings(expected_wasm_manifest_key, wasm_manifest_key);
 
     const native_key = try nativePolicyLookupKey(allocator, native_static_descriptor);
     defer allocator.free(native_key);
-    try std.testing.expectEqualStrings("native:com.pi.native-static-fixture:Native Static Fixture:0.1.0", native_key);
+    try std.testing.expectEqualStrings("native:com.pi.native-static-fixture:0.1.0:Native Static Fixture", native_key);
 
     const process_a = try processJsonlPolicyLookupKey(allocator, .{
         .argv = &.{ "/bin/pi-extension-host", "--runtime", "process_jsonl", "/workspace/ext-a" },
+        .cwd = "/workspace",
+        .extension_path = "/workspace/ext-a",
         .initialize = .{ .marker = "marker", .cwd = "/workspace", .fixture = "same-protocol" },
     });
     defer allocator.free(process_a);
     const process_b = try processJsonlPolicyLookupKey(allocator, .{
         .argv = &.{ "/bin/pi-extension-host", "--runtime", "process_jsonl", "/workspace/ext-b" },
+        .cwd = "/workspace",
+        .extension_path = "/workspace/ext-b",
         .initialize = .{ .marker = "marker", .cwd = "/workspace", .fixture = "same-protocol" },
     });
     defer allocator.free(process_b);
     try std.testing.expect(!std.mem.eql(u8, process_a, process_b));
-    try std.testing.expect(std.mem.indexOf(u8, process_a, "process_jsonl:") == 0);
-    try std.testing.expect(std.mem.indexOf(u8, process_a, "/bin/pi-extension-host") != null);
-    try std.testing.expect(std.mem.indexOf(u8, process_a, "/workspace/ext-a") != null);
+    try std.testing.expectEqualStrings(
+        "process_jsonl:{\"argv\":[\"/bin/pi-extension-host\",\"--runtime\",\"process_jsonl\",\"/workspace/ext-a\"],\"extensionPath\":\"/workspace/ext-a\",\"cwd\":\"/workspace\"}",
+        process_a,
+    );
 }
 
 test "extension runtime factory constructs wasm adapter and keeps native remote unsupported" {
@@ -1090,6 +1496,23 @@ const native_static_descriptor: NativeDescriptor = .{
     .version = "0.1.0",
     .description = "Statically linked native runtime fixture",
     .tools = &.{native_static_tool},
+};
+
+fn nativePersistedPolicyLimitStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_static_tool);
+    try api.spawnAgent("{\"task\":\"first\"}");
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.spawnAgent("{\"task\":\"second\"}"));
+}
+
+const native_persisted_policy_limit_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-persisted-policy-limit",
+    .name = "Native Persisted Policy Limit",
+    .version = "0.1.0",
+    .description = "Native fixture whose effective limits come from extension policy.",
+    .tools = &.{native_static_tool},
+    .requested_capabilities = &.{.agent_spawn},
+    .start = nativePersistedPolicyLimitStart,
 };
 
 const native_preready_tool: NativeToolDefinition = .{
@@ -1465,6 +1888,56 @@ test "native descriptor capability and resource metadata remains default deny" {
     try adapter.withRegistry(null, expectNativeStaticRegistry);
 }
 
+test "persisted native extension policy resource limits drive enforcement diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const native_key = try nativePolicyLookupKey(allocator, native_persisted_policy_limit_descriptor);
+    defer allocator.free(native_key);
+    const settings_json = try std.fmt.allocPrint(allocator,
+        \\{{"extensionPolicies":{{"{s}":{{"approvedGrants":["agent.spawn"],"resourceLimits":{{"maxChildren":1}}}}}}}}
+    , .{native_key});
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer @import("ai").model_registry.resetForTesting();
+
+    const policy = runtime_config.getExtensionPolicy(native_key).?;
+    const approved = try approvedCapabilitiesFromExtensionPolicy(allocator, policy);
+    defer allocator.free(approved);
+    const effective_limits = nativeResourceLimitsFromExtensionPolicy(policy.resource_limits, native_persisted_policy_limit_descriptor.resource_limits);
+    var effects = native_runtime.NativeHostEffects{};
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_persisted_policy_limit_descriptor,
+        .approved_capabilities = approved,
+        .resource_limits = effective_limits,
+        .policy_lookup_key = native_key,
+        .host_effects = &effects,
+    } });
+    defer adapter.deinit();
+
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(u64, 1), effects.agent_spawns);
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
+    const diagnostic = nativeRuntime(adapter.ptr).state.diagnostics.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"operation\":\"agent.spawn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"resource limit exceeded: maxChildren\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"native:com.pi.native-persisted-policy-limit:0.1.0:Native Persisted Policy Limit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"source\":{\"runtimeKind\":\"native\"") != null);
+}
+
 test "native runtime preserves ready boundary duplicate readiness and deterministic snapshots" {
     const allocator = std.testing.allocator;
     const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
@@ -1797,6 +2270,123 @@ test "wasm runtime handoff denies every canonical requested capability before re
             .manifest = handoff,
         } }));
     }
+}
+
+test "wasm runtime handoff exact approved grants permit matching requested capabilities" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const requested = [_]wasm_manifest.Capability{.file_read};
+    const approved = [_]wasm_manifest.Capability{.file_read};
+    var handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
+    handoff.requested_capabilities = requested[0..];
+    handoff.approved_capabilities = approved[0..];
+
+    try std.testing.expect(handoff.deniedRuntimeCapability(.initialize, "runtime/handoff") == null);
+    try handoff.validate();
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = handoff,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
+}
+
+test "persisted wasm extension policy resource limits reach tool enforcement diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const wasm_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(wasm_key);
+    const settings_json = try std.fmt.allocPrint(allocator,
+        \\{{"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["policy.allowed.tool"]}}}}}}}}
+    , .{wasm_key});
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer @import("ai").model_registry.resetForTesting();
+
+    const policy = runtime_config.getExtensionPolicy(wasm_key).?;
+    var handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
+    handoff.resource_limits = enforcementResourceLimitsFromExtensionPolicy(policy.resource_limits);
+    handoff.policy_lookup_key = wasm_key;
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{ .manifest = handoff } });
+    defer adapter.deinit();
+    try adapter.waitForReady(0);
+
+    var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\",\"maxLines\":1,\"maxBytes\":1024}", .{});
+    defer params.deinit();
+    try std.testing.expectError(
+        error.UnsupportedRuntimeCapability,
+        agent_tool.execute.?(allocator, "wasm-policy-tool-scope", params.value, agent_tool.execute_context, null, null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
+    const diagnostic = wasmRuntime(adapter.ptr).state.diagnostics.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"operation\":\"tool.use\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"tool target is outside toolScopes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"source\":{\"manifestPath\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"toolId\":\"builtin.truncateHead\"") != null);
+}
+
+test "wasm manifest handoff owns and enforces tool scopes after source deinit" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    try std.testing.expect(manifest_result == .valid);
+    allocator.free(manifest_result.valid.resource_limits.tool_scopes);
+    manifest_result.valid.resource_limits.tool_scopes = try allocator.alloc([]u8, 1);
+    manifest_result.valid.resource_limits.tool_scopes[0] = try allocator.dupe(u8, "policy.allowed.tool");
+    try std.testing.expectEqual(@as(usize, 1), manifest_result.valid.resource_limits.tool_scopes.len);
+    const source_scopes_ptr = manifest_result.valid.resource_limits.tool_scopes.ptr;
+    const source_scope_ptr = manifest_result.valid.resource_limits.tool_scopes[0].ptr;
+
+    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(0);
+
+    const runtime = wasmRuntime(adapter.ptr);
+    try std.testing.expectEqual(@as(usize, 1), runtime.manifest.resource_limits.tool_scopes.len);
+    try std.testing.expect(runtime.manifest.resource_limits.tool_scopes.ptr != source_scopes_ptr);
+    try std.testing.expect(runtime.manifest.resource_limits.tool_scopes[0].ptr != source_scope_ptr);
+    try std.testing.expectEqualStrings("policy.allowed.tool", runtime.manifest.resource_limits.tool_scopes[0]);
+
+    manifest_result.deinit(allocator);
+
+    var agent_tool = (try adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\",\"maxLines\":1,\"maxBytes\":1024}", .{});
+    defer params.deinit();
+    try std.testing.expectError(
+        error.UnsupportedRuntimeCapability,
+        agent_tool.execute.?(allocator, "wasm-manifest-owned-tool-scope", params.value, agent_tool.execute_context, null, null, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
+    const diagnostic = runtime.state.diagnostics.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"tool target is outside toolScopes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"toolId\":\"builtin.truncateHead\"") != null);
 }
 
 const WasmToolRegistryExpectContext = struct {
