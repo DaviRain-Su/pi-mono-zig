@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const vaxis = @import("vaxis");
 pub const ansi = @import("ansi.zig");
 pub const component = @import("component.zig");
@@ -112,4 +114,16 @@ test "exports vaxis module" {
     _ = vaxis.Vaxis;
     _ = vaxis.Tty;
     _ = vaxis.Loop;
+}
+
+test "vaxis kitty graphics delete commands suppress terminal replies" {
+    try std.testing.expectEqualStrings("\x1b_Ga=d,q=2\x1b\\", vaxis.ctlseqs.kitty_graphics_clear);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const vx: vaxis.Vaxis = undefined;
+    vx.freeImage(&output.writer, 42);
+
+    try std.testing.expectEqualStrings("\x1b_Ga=d,d=I,i=42,q=2\x1b\\", output.writer.buffered());
 }

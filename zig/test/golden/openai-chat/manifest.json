@@ -1,6 +1,6 @@
 {
   "captureBoundary": "TypeScript OpenAI Chat request after compat/message/tool/header/onPayload processing and before live HTTP",
-  "fixtureCount": 87,
+  "fixtureCount": 92,
   "generatedBy": "zig/test/generate-openai-chat-fixtures.ts",
   "network": "local mocked global fetch only; unhandled requests throw",
   "scenarioIds": [
@@ -83,6 +83,11 @@
     "usage-cache-write-exceeds-prompt",
     "usage-reasoning-tokens-included",
     "usage-latest-snapshot-wins",
+    "stream-mixed-interleaved-deltas",
+    "stream-mutating-tool-id-name",
+    "stream-indexed-and-no-index-tool-calls",
+    "stream-id-first-then-index-alias",
+    "stream-index-mutated-id-alias",
     "signature-stream-single-tool",
     "signature-stream-multi-tool",
     "signature-unmatched-ignored",

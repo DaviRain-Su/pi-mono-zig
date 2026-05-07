@@ -284,6 +284,9 @@ fn assistantMessageToStreamOutputValue(allocator: std.mem.Allocator, message: ty
                 try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "thinking") });
                 try block_object.put(allocator, try allocator.dupe(u8, "thinking"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
                 try block_object.put(allocator, try allocator.dupe(u8, "redacted"), .{ .bool = thinking.redacted });
+                if (types.thinkingSignature(thinking)) |sig| {
+                    try block_object.put(allocator, try allocator.dupe(u8, "thinkingSignature"), .{ .string = try allocator.dupe(u8, sig) });
+                }
             },
             .tool_call => |tool_call| {
                 try block_object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "toolCall") });

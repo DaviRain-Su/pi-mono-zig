@@ -459,6 +459,29 @@ fn renderSessionHtml(allocator: std.mem.Allocator, session: *const session_mod.A
         \\      border: 1px solid var(--border);
         \\      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
         \\    }
+        \\    .skill-user-entry { display: grid; gap: 14px; }
+        \\    .skill-invocation {
+        \\      border: 1px solid var(--border);
+        \\      border-radius: 12px;
+        \\      padding: 14px;
+        \\      background: var(--panel-alt);
+        \\    }
+        \\    .skill-invocation h3 {
+        \\      margin: 0 0 10px;
+        \\      font-size: 0.95rem;
+        \\      display: flex;
+        \\      align-items: center;
+        \\      gap: 8px;
+        \\      flex-wrap: wrap;
+        \\    }
+        \\    .skill-location { color: var(--muted); font-size: 0.82rem; margin-bottom: 12px; }
+        \\    .skill-invocation-content { color: var(--text); }
+        \\    .user-authored-prompt {
+        \\      border: 1px solid var(--border);
+        \\      border-radius: 12px;
+        \\      padding: 14px;
+        \\      background: color-mix(in srgb, var(--panel-alt) 75%, transparent);
+        \\    }
         \\    .thinking-block {
         \\      margin: 14px 0;
         \\      border: 1px dashed var(--border);
@@ -772,7 +795,7 @@ fn messageRoleClass(message: agent.AgentMessage) []const u8 {
 
 fn writeMessageHtml(writer: *std.Io.Writer, allocator: std.mem.Allocator, message: agent.AgentMessage) !void {
     switch (message) {
-        .user => |user_message| try writeContentBlocksHtml(writer, user_message.content),
+        .user => |user_message| try writeUserMessageHtml(writer, allocator, user_message.content),
         .assistant => |assistant_message| {
             try writeContentBlocksHtml(writer, assistant_message.content);
             if (assistant_message.tool_calls) |tool_calls| {
@@ -784,6 +807,173 @@ fn writeMessageHtml(writer: *std.Io.Writer, allocator: std.mem.Allocator, messag
             }
         },
         .tool_result => |tool_result| try writeToolResultHtml(writer, allocator, tool_result),
+    }
+}
+
+const ParsedSkillBlock = struct {
+    name: []const u8,
+    location: []const u8,
+    content: []const u8,
+    user_message: ?[]const u8,
+    user_content_start: usize,
+};
+
+fn writeUserMessageHtml(writer: *std.Io.Writer, allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) !void {
+    const text = try textBlocksToText(allocator, blocks);
+    defer allocator.free(text);
+
+    if (parseSkillBlock(text)) |skill_block| {
+        try writer.writeAll("<div class=\"skill-user-entry\">");
+        try writeSkillInvocationHtml(writer, skill_block);
+        if (skill_block.user_message != null or hasRenderableNonTextContent(blocks)) {
+            try writer.writeAll("<article class=\"user-authored-prompt\">");
+            try writeUserAuthoredPromptHtml(writer, blocks, skill_block.user_content_start);
+            try writer.writeAll("</article>");
+        }
+        try writer.writeAll("</div>");
+        return;
+    }
+
+    try writeContentBlocksHtml(writer, blocks);
+}
+
+fn textBlocksToText(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    for (blocks) |block| {
+        if (block == .text and block.text.text.len > 0) {
+            try writer.writer.writeAll(block.text.text);
+        }
+    }
+
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn parseSkillBlock(text: []const u8) ?ParsedSkillBlock {
+    const prefix = "<skill name=\"";
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+
+    const name_start = prefix.len;
+    const name_tail = text[name_start..];
+    const location_marker = "\" location=\"";
+    const name_end_relative = std.mem.indexOf(u8, name_tail, location_marker) orelse return null;
+    const name = name_tail[0..name_end_relative];
+
+    const location_start = name_start + name_end_relative + location_marker.len;
+    const location_tail = text[location_start..];
+    const header_end_marker = "\">\n";
+    const location_end_relative = std.mem.indexOf(u8, location_tail, header_end_marker) orelse return null;
+    const location = location_tail[0..location_end_relative];
+
+    const content_start = location_start + location_end_relative + header_end_marker.len;
+    const content_tail = text[content_start..];
+    const close_marker = "\n</skill>";
+    var content_end_relative: ?usize = null;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, content_tail, search_from, close_marker)) |close_relative| {
+        const candidate_trailing_start = content_start + close_relative + close_marker.len;
+        const candidate_trailing = text[candidate_trailing_start..];
+        if (candidate_trailing.len == 0 or std.mem.startsWith(u8, candidate_trailing, "\n\n")) {
+            content_end_relative = close_relative;
+        }
+        search_from = close_relative + close_marker.len;
+    }
+    const resolved_content_end_relative = content_end_relative orelse return null;
+    const content = content_tail[0..resolved_content_end_relative];
+
+    const trailing_start = content_start + resolved_content_end_relative + close_marker.len;
+    const trailing = text[trailing_start..];
+    if (trailing.len == 0) {
+        return .{
+            .name = name,
+            .location = location,
+            .content = content,
+            .user_message = null,
+            .user_content_start = text.len,
+        };
+    }
+    if (!std.mem.startsWith(u8, trailing, "\n\n")) return null;
+
+    const user_content_start = trailing_start + 2;
+    const user_message = std.mem.trim(u8, text[user_content_start..], &std.ascii.whitespace);
+    return .{
+        .name = name,
+        .location = location,
+        .content = content,
+        .user_message = if (user_message.len > 0) user_message else null,
+        .user_content_start = user_content_start,
+    };
+}
+
+fn writeSkillInvocationHtml(writer: *std.Io.Writer, skill_block: ParsedSkillBlock) !void {
+    try writer.writeAll("<article class=\"skill-invocation\"><h3><span class=\"badge\">skill</span> ");
+    try writeEscapedHtml(writer, skill_block.name);
+    try writer.writeAll("</h3><div class=\"skill-location\"><code>");
+    try writeEscapedHtml(writer, skill_block.location);
+    try writer.writeAll("</code></div><div class=\"skill-invocation-content\">");
+    try writeRichTextHtml(writer, skill_block.content);
+    try writer.writeAll("</div></article>");
+}
+
+fn hasRenderableNonTextContent(blocks: []const ai.ContentBlock) bool {
+    for (blocks) |block| {
+        switch (block) {
+            .image, .tool_call => return true,
+            .thinking => |thinking| {
+                if (std.mem.trim(u8, thinking.thinking, &std.ascii.whitespace).len > 0) return true;
+            },
+            .text => {},
+        }
+    }
+    return false;
+}
+
+fn writeUserAuthoredPromptHtml(writer: *std.Io.Writer, blocks: []const ai.ContentBlock, user_content_start: usize) !void {
+    var wrote_any = false;
+    var text_offset: usize = 0;
+
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                const block_start = text_offset;
+                const block_end = block_start + text.text.len;
+                text_offset = block_end;
+                if (block_end <= user_content_start) continue;
+                const local_start = if (block_start < user_content_start) user_content_start - block_start else 0;
+                const prompt_text = text.text[local_start..];
+                if (std.mem.trim(u8, prompt_text, &std.ascii.whitespace).len == 0) continue;
+                try writeRichTextHtml(writer, prompt_text);
+                wrote_any = true;
+            },
+            .image => |image| {
+                try writer.writeAll("<figure class=\"image-block\"><img alt=\"Session image\" src=\"data:");
+                try writeEscapedHtml(writer, image.mime_type);
+                try writer.writeAll(";base64,");
+                try writeEscapedHtml(writer, image.data);
+                try writer.writeAll("\" /><figcaption>");
+                try writeEscapedHtml(writer, image.mime_type);
+                try writer.writeAll("</figcaption></figure>");
+                wrote_any = true;
+            },
+            .thinking => |thinking| {
+                if (std.mem.trim(u8, thinking.thinking, &std.ascii.whitespace).len == 0) continue;
+                try writer.writeAll("<details class=\"thinking-block\"><summary>Thinking</summary>");
+                try writeRichTextHtml(writer, thinking.thinking);
+                try writer.writeAll("</details>");
+                wrote_any = true;
+            },
+            .tool_call => |tool_call| {
+                try writer.writeAll("<pre class=\"tool-preview\">");
+                try writeEscapedHtml(writer, tool_call.name);
+                try writer.writeAll("</pre>");
+                wrote_any = true;
+            },
+        }
+    }
+
+    if (!wrote_any) {
+        try writer.writeAll("<p class=\"empty\">No text content.</p>");
     }
 }
 
@@ -1243,6 +1433,98 @@ test "session advanced stats and exports cover markdown json and html output" {
     try std.testing.expect(std.mem.indexOf(u8, html_bytes, "tool-entry tool-result") != null);
     try std.testing.expect(std.mem.indexOf(u8, html_bytes, "call-read-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, html_bytes, "const answer: i32 = 42;") != null);
+}
+
+test "session html export renders skill wrapper separately from trailing user prompt" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer allocator.free(relative_dir);
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const absolute_dir = try std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_dir });
+    defer allocator.free(absolute_dir);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "system",
+        .model = agent.DEFAULT_MODEL,
+        .session_dir = absolute_dir,
+    });
+    defer session.deinit();
+
+    var user = try makeUserMessage(
+        "<skill name=\"reviewer\" location=\"/tmp/project/SKILL.md\">\n# Reviewer\n\nUse <danger> & `code`.\n</skill>\n\nPlease review `src/main.zig` & keep <xml> safe.",
+        1,
+    );
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    _ = try session.session_manager.appendMessage(user);
+    try session.agent.setMessages(&[_]agent.AgentMessage{user});
+
+    const html_path = try exportToHtml(allocator, std.testing.io, &session, null);
+    defer allocator.free(html_path);
+    const html_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, html_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(html_bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "skill-invocation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "reviewer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "Use &lt;danger&gt; &amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "user-authored-prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "Please review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "src/main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "keep &lt;xml&gt; safe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "&lt;skill name") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html_bytes, "&lt;/skill&gt;") == null);
+}
+
+test "parseSkillBlock keeps literal closing tag lines inside skill markdown" {
+    const parsed = parseSkillBlock(
+        "<skill name=\"reviewer\" location=\"/tmp/project/SKILL.md\">\n# Reviewer\n\nThe next line is documentation text:\n</skill>\n\nContinue reading the skill body.\n</skill>\n\nReview the patch.",
+    ) orelse return error.TestExpectedSkillBlock;
+
+    try std.testing.expectEqualStrings("reviewer", parsed.name);
+    try std.testing.expectEqualStrings("/tmp/project/SKILL.md", parsed.location);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.content, "The next line is documentation text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.content, "\n</skill>\n\nContinue reading") != null);
+    try std.testing.expectEqualStrings("Review the patch.", parsed.user_message.?);
+}
+
+test "session html export preserves user content block order after stripped skill wrapper" {
+    const allocator = std.testing.allocator;
+
+    const blocks = try allocator.alloc(ai.ContentBlock, 2);
+    blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, "<skill name=\"reviewer\" location=\"/tmp/project/SKILL.md\">\n# Reviewer\n</skill>\n\nPrompt before image.") } };
+    blocks[1] = .{ .image = .{
+        .mime_type = try allocator.dupe(u8, "image/png"),
+        .data = try allocator.dupe(u8, "QUJD"),
+    } };
+
+    var user = agent.AgentMessage{ .user = .{
+        .role = try allocator.dupe(u8, "user"),
+        .content = blocks,
+        .timestamp = 1,
+    } };
+    defer session_manager_mod.deinitMessage(allocator, &user);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    try writeUserMessageHtml(&writer.writer, allocator, user.user.content);
+    const html = writer.written();
+    const prompt_index = std.mem.indexOf(u8, html, "Prompt before image") orelse return error.TestExpectedPrompt;
+    const image_index = std.mem.indexOf(u8, html, "data:image/png;base64,QUJD") orelse return error.TestExpectedImage;
+
+    try std.testing.expect(prompt_index < image_index);
+    try std.testing.expect(std.mem.indexOf(u8, html, "&lt;skill name") == null);
 }
 
 fn makeUserMessage(text: []const u8, timestamp: i64) !agent.AgentMessage {

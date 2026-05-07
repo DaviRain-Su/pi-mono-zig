@@ -2147,6 +2147,419 @@ const scenarios: Scenario[] = [
 			],
 		},
 	},
+	{
+		id: "stream-mixed-interleaved-deltas",
+		title: "Interleaved text, reasoning, and parallel tool-call deltas keep independent ordered blocks",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "Stream mixed content without finalizing inactive accumulators.",
+				messages: [{ role: "user", content: "Mix text, reasoning, and tool calls." }],
+				tools: [
+					fixtureTool,
+					{
+						name: "get_time",
+						description: "Return the current time for a timezone.",
+						parameters: Type.Object({ timezone: Type.String() }),
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { role: "assistant", content: "Intro " }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { reasoning_content: "Think " }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_weather_mixed",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { content: "middle " }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { reasoning: "again " }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{ index: 0, function: { arguments: 'Berlin","unit":"celsius"}' } },
+									{
+										index: 1,
+										id: "call_time_mixed",
+										type: "function",
+										function: { name: "get_time", arguments: '{"timezone":"UTC"}' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: { content: "done." }, finish_reason: null }],
+				},
+				{
+					id: "chatcmpl-mixed-interleaved",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 30, completion_tokens: 12, total_tokens: 42 },
+				},
+			],
+		},
+	},
+	{
+		id: "stream-mutating-tool-id-name",
+		title: "Streaming tool calls preserve the first non-empty id and name when later chunks mutate them",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "Preserve first tool identity fields.",
+				messages: [{ role: "user", content: "Call the weather tool with mutating metadata." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-mutating-tool",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_original",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-mutating-tool",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_mutated",
+										type: "function",
+										function: { name: "mutated_weather", arguments: 'Paris","unit":"celsius"}' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-mutating-tool",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+				},
+			],
+		},
+	},
+	{
+		id: "stream-indexed-and-no-index-tool-calls",
+		title: "Indexed and id-keyed no-index tool calls accumulate independently",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "Keep indexed and no-index tool calls separate.",
+				messages: [{ role: "user", content: "Call weather and time tools." }],
+				tools: [
+					fixtureTool,
+					{
+						name: "get_time",
+						description: "Return the current time for a timezone.",
+						parameters: Type.Object({ timezone: Type.String() }),
+					},
+				],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-indexed-no-index",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										id: "call_no_index",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-indexed-no-index",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_indexed",
+										type: "function",
+										function: { name: "get_time", arguments: '{"timezone":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-indexed-no-index",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{ id: "call_no_index", function: { arguments: 'Rome","unit":"celsius"}' } },
+									{ index: 0, function: { arguments: 'UTC"}' } },
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-indexed-no-index",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 14, completion_tokens: 6, total_tokens: 20 },
+				},
+			],
+		},
+	},
+	{
+		id: "stream-id-first-then-index-alias",
+		title: "No-index tool call gains an index and continues by index without splitting",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "Alias id-keyed tool calls when a later stream index appears.",
+				messages: [{ role: "user", content: "Call weather with an id first and index later." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-id-first-index-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										id: "call_alias_index_late",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-id-first-index-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{ index: 0, id: "call_alias_index_late", function: { arguments: 'Berlin","unit":"' } },
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-id-first-index-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [{ index: 0, function: { arguments: 'celsius"}' } }],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-id-first-index-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 16, completion_tokens: 8, total_tokens: 24 },
+				},
+			],
+		},
+	},
+	{
+		id: "stream-index-mutated-id-alias",
+		title: "Indexed tool call aliases a later mutated id without overwriting first identity",
+		input: {
+			model: buildModel(),
+			context: {
+				systemPrompt: "Alias mutated tool ids to the first indexed block.",
+				messages: [{ role: "user", content: "Call weather with a mutating id." }],
+				tools: [fixtureTool],
+			},
+			options: {
+				apiKeyMode: "fixture-placeholder",
+			},
+			mockChunks: [
+				{
+					id: "chatcmpl-index-mutated-id-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_alias_original",
+										type: "function",
+										function: { name: "get_weather", arguments: '{"city":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-index-mutated-id-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: "call_alias_mutated",
+										type: "function",
+										function: { name: "mutated_weather", arguments: 'Paris","unit":"' },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-index-mutated-id-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [{ id: "call_alias_mutated", function: { arguments: 'celsius"}' } }],
+							},
+							finish_reason: null,
+						},
+					],
+				},
+				{
+					id: "chatcmpl-index-mutated-id-alias",
+					object: "chat.completion.chunk",
+					model: "gpt-4.1-fixture",
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+					usage: { prompt_tokens: 18, completion_tokens: 9, total_tokens: 27 },
+				},
+			],
+		},
+	},
 	// Signature parity scenarios (VAL-M8D-SIGNATURE-001 through VAL-M8D-SIGNATURE-012)
 	{
 		id: "signature-stream-single-tool",
@@ -2737,7 +3150,15 @@ function normalizeAssistantMessage(message: AssistantMessage): NormalizedAssista
 				return { type: "text", text: block.text };
 			}
 			if (block.type === "thinking") {
-				return { type: "thinking", thinking: block.thinking, redacted: block.redacted ?? false };
+				const thinking: Record<string, unknown> = {
+					type: "thinking",
+					thinking: block.thinking,
+					redacted: block.redacted ?? false,
+				};
+				if (block.thinkingSignature) {
+					thinking.thinkingSignature = block.thinkingSignature;
+				}
+				return thinking;
 			}
 			if (block.type === "toolCall") {
 				const tc: Record<string, unknown> = { type: "toolCall", id: block.id, name: block.name, arguments: block.arguments };
