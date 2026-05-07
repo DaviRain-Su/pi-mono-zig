@@ -1,15 +1,10 @@
 <p align="center">
   <a href="https://pi.dev">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://pi.dev/logo.svg">
-      <source media="(prefers-color-scheme: light)" srcset="https://huggingface.co/buckets/julien-c/my-training-bucket/resolve/pi-logo-dark.svg">
-      <img alt="pi logo" src="https://pi.dev/logo.svg" width="128">
-    </picture>
+    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
   </a>
 </p>
 <p align="center">
   <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://github.com/badlogic/pi-mono/actions/workflows/ci.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/badlogic/pi-mono/ci.yml?style=flat-square&branch=main" /></a>
 </p>
 <p align="center">
   <a href="https://pi.dev">pi.dev</a> domain graciously donated by
@@ -21,11 +16,18 @@
 
 ---
 
-# Pi Monorepo
+# Pi Agent Harness Mono Repo
 
-> **Looking for the pi coding agent?** See **[packages/coding-agent](packages/coding-agent)** for installation and usage.
+This is the home of the pi agent harness project including our self extensible coding agent.
 
-Tools for building AI agents.
+* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
+* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
+* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+
+To learn more about pi:
+
+* [Visit pi.dev](https://pi.dev), the project website with demos
+* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
 
 ## Share your OSS coding agent sessions
 
@@ -43,15 +45,15 @@ I regularly publish my own `pi-mono` work sessions here:
 
 - [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
 
-## Packages
+## All Packages
 
 | Package | Description |
 |---------|-------------|
-| **[@mariozechner/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
-| **[@mariozechner/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@mariozechner/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
-| **[@mariozechner/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
-| **[@mariozechner/pi-web-ui](packages/web-ui)** | Web components for AI chat interfaces |
+| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
+| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
+| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
+| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
+| **[@earendil-works/pi-web-ui](packages/web-ui)** | Web components for AI chat interfaces |
 
 ## Extension substrate
 
@@ -69,7 +71,7 @@ npm run check
 
 ## Chat bot workflows
 
-For Slack/chat automation, see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
+For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
 
 ## Contributing
 
