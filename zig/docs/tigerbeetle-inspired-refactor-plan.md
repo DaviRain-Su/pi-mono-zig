@@ -80,10 +80,10 @@ Acceptance criteria:
 Continue the screenshot maintainability slices now that the provider registry
 boilerplate and the `main.zig` package, run-mode, and extension CLI extraction
 slices are complete.
-The guarded pure wire/protocol helper extraction and the direct bash subsystem
-extraction from `ts_rpc_mode.zig` are now complete. Broader interactive,
-extension, provider-parser, and session/RPC decomposition remains later
-refactor work.
+The guarded pure wire/protocol helper extraction, direct bash subsystem
+extraction, and state/model/message JSON helper extraction from
+`ts_rpc_mode.zig` are now complete. Broader interactive, extension,
+provider-parser, and session/RPC decomposition remains later refactor work.
 
 ### 5. Interactive Mode Decomposition
 
@@ -247,17 +247,46 @@ payload parity helpers live behind that focused boundary. `openai.zig` still
 owns provider authentication, request headers, URL/Cloudflare/Copilot routing,
 HTTP streaming, response callbacks, stream contracts, and the OpenAI Chat SSE
 parser/state machine.
+`package_manager.zig` now delegates the interactive package config selector to
+`zig/src/coding_agent/packages/config_selector.zig`: config kind metadata,
+selector entries/state, settings-backed selector load/save, TUI rendering, and
+keyboard navigation live behind that focused package helper. The package manager
+still owns package command parsing, install/list/run/remove/update/self-update
+dispatch, non-interactive config toggle behavior, stdout/stderr routing, and
+exit-code behavior.
+`session_manager.zig` now delegates session JSONL header/entry ownership,
+parse/write codec helpers, message/content JSON conversion, and associated
+owned-value cleanup/clone helpers to
+`zig/src/coding_agent/sessions/session_jsonl.zig`. The session manager still
+owns session lifecycle orchestration, persistence timing, replay ordering,
+search indexing, tree/fork mutation, context reconstruction, label maps,
+corrupted-line warning policy, and missing-cwd preflight integration.
+`ts_rpc_mode.zig` now delegates TS-RPC state/model/message JSON writer and
+parser helpers to `zig/src/coding_agent/modes/ts_rpc_state_json.zig`: state,
+messages, model lists, model payloads, compaction results, session stats, fork
+message lists, image payload parsing, queue/thinking names, and queue text
+arrays live behind that focused boundary. The server still owns command
+dispatch, response/deferred-response ordering, direct bash routing, session
+replacement semantics, and extension UI correlation/cancel/timeout behavior.
 
 Remaining boundaries:
 
 - Further `ts_rpc_mode.zig` decomposition remains deferred beyond these guarded
-  wire/protocol and direct-bash helper extractions. Do not move extension
-  ABI/protocol, session lifecycle, extension UI response/cancel/timeout
-  behavior, deferred queue ordering, or broad command dispatch without a
-  separately assigned guarded slice.
+  wire/protocol, direct-bash, and state/model/message JSON helper extractions.
+  Do not move extension ABI/protocol, session lifecycle, extension UI
+  response/cancel/timeout behavior, deferred queue ordering, or broad command
+  dispatch without a separately assigned guarded slice.
 - OpenAI Chat SSE parser extraction remains deferred. Do not move
   `parseSseStreamLines` or related streaming response state out of `openai.zig`
   without a separately assigned parser-focused slice and local parity fixtures.
+- Further package-manager decomposition remains deferred. Do not move package
+  command parsing, package install/list/remove/update dispatch, self-update
+  behavior, or non-interactive config toggle stdout/stderr/exit behavior without
+  a separately assigned package-manager slice.
+- Further session-manager decomposition remains deferred. Do not move branch or
+  tree mutation, session lifecycle orchestration, replay/context semantics,
+  search ranking, corrupted-line warning output, or missing-cwd behavior without
+  a separately assigned session lifecycle/search slice.
 - Broad interactive-mode, extension-registry, provider parser/state-machine,
   session, build-graph, and extension ABI/interface decomposition remains
   deferred unless assigned explicitly.
@@ -301,6 +330,17 @@ Acceptance criteria:
   `cd zig && zig build test-tidy`, and `npm run check`.
 - Verification for the completed main CLI extension flag/registry-dump slice:
   `cd zig && zig build test`,
+  `cd zig && zig build test-ts-rpc-parity`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed package config selector boundary:
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed session JSONL codec boundary:
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-tui`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed TS-RPC state/model/message JSON boundary:
+  `cd zig && zig build test-coding-agent`,
   `cd zig && zig build test-ts-rpc-parity`,
   `cd zig && zig build test-tidy`, and `npm run check`.
 

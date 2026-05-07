@@ -55,10 +55,24 @@ The Zig implementation is now usable for the main coding-agent workflows:
 - TS-RPC direct bash execution is now isolated in `modes/ts_rpc_bash.zig`,
   preserving the server-owned command dispatch, deferred queue ordering, and
   TS-RPC wire response boundary
+- TS-RPC state/model/message JSON writing and parsing helpers are now isolated
+  in `modes/ts_rpc_state_json.zig`, preserving exact response bytes, queue
+  text arrays, image payload parsing, and server-owned command/extension UI
+  ordering in `ts_rpc_mode.zig`
 - OpenAI Chat request/message payload construction is now isolated in
   `providers/openai_chat_payload.zig`, preserving request JSON parity,
   tool-call normalization, cache-retention payload behavior, and provider-owned
   stream/SSE parser behavior in `openai.zig`
+- package config selector state, settings-backed load/save, TUI rendering, and
+  keyboard navigation are now isolated in
+  `coding_agent/packages/config_selector.zig`, preserving package command
+  parsing, non-interactive config toggles, config persistence, stdout/stderr,
+  and exit-code behavior in `package_manager.zig`
+- session JSONL header/entry data types, parse/write codec helpers,
+  message/content JSON conversion, and owned-value cleanup/clone helpers are
+  now isolated in `coding_agent/sessions/session_jsonl.zig`, preserving
+  storage bytes, replay/search/tree/fork/context behavior, parent metadata, and
+  corrupted-line compatibility policy in `session_manager.zig`
 - extension host process boundary and registration surface for tools,
   commands, shortcuts, flags, providers, widgets, editor hooks, header/footer
   hooks, terminal input hooks, and package-management commands
@@ -220,6 +234,36 @@ still routes `pi install --help` to package-command help before the normal CLI
 parser can treat it as top-level help or prompt input. The follow-up run-mode
 routing slice is recorded below.
 
+### Package Config Selector Boundary
+
+Resolved for the current large-file decomposition slice. The bare `pi config`
+interactive selector now lives in `coding_agent/packages/config_selector.zig`.
+The helper owns `ConfigKind`, selector entries/state, settings-backed selector
+load/save, vaxis rendering, and key handling for Up/Down, Space, Enter, Esc,
+`q`, and Ctrl-C. `package_manager.zig` still owns parse/dispatch, non-TTY config
+listing, `--toggle` behavior, package install/list/remove/update/self-update
+logic, stdout/stderr, and exit codes.
+
+Existing package-manager config selector tests continue to exercise selector
+navigation, toggle/save/cancel behavior, scope handling, and stdout/stderr
+fallback behavior through `zig build test-coding-agent`.
+
+### Session JSONL Codec Boundary
+
+Resolved for the current large-file decomposition slice. Session JSONL header
+and entry data types, exact-line serialization, line parsing, message/content
+JSON conversion, compaction summary encoding, custom message payload handling,
+and related owned-value cleanup/clone helpers now live in
+`coding_agent/sessions/session_jsonl.zig`.
+
+`session_manager.zig` still owns session creation/opening, persistence timing,
+corrupted-line warning output, label maps, replay ordering, search indexing,
+tree/fork mutation, context reconstruction, missing-cwd integration, and
+session lifecycle orchestration. Focused codec tests pin representative
+existing JSONL lines byte-for-byte, while session-manager tests continue to
+cover replay, search, labels, branch summaries, custom entries, context
+exclusion, corruption tolerance, and tree/fork behavior.
+
 ### CLI Run Mode Dispatch
 
 Resolved for the current maintainability slice. `main.zig` now delegates the
@@ -273,6 +317,20 @@ sanitization, truncation/retained logs, cancellation cleanup, live command-loop
 behavior, and the generated TypeScript bash-control fixture. The live TS-RPC
 parity harness remains the black-box guardrail for TS-vs-Zig direct bash wire
 bytes.
+
+### TS-RPC State/Message JSON Boundary
+
+Resolved for the current large-file decomposition slice. `ts_rpc_mode.zig` now
+delegates state, message, model, available-model, compaction-result,
+session-stat, fork-message, queue-text, thinking/queue-name, and image payload
+JSON helpers to `coding_agent/modes/ts_rpc_state_json.zig`.
+
+`ts_rpc_mode.zig` still owns command dispatch, response framing, deferred
+response priority and flush ordering, direct bash routing, session replacement,
+and extension UI request/response correlation. Focused helper tests pin stable
+model JSON and image parsing, while coding-agent and TS-RPC parity fixtures
+continue to guard exact public bytes, deferred queue behavior, direct bash
+boundaries, and extension UI flow ordering.
 
 ### OpenAI Chat Payload Boundary
 

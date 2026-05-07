@@ -3,6 +3,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const ts_rpc_wire = @import("ts_rpc_wire.zig");
 const ts_rpc_bash = @import("ts_rpc_bash.zig");
+const ts_rpc_state_json = @import("ts_rpc_state_json.zig");
 const json_event_wire = @import("json_event_wire.zig");
 const common = @import("../tools/common.zig");
 const truncate = @import("../tools/truncate.zig");
@@ -197,7 +198,7 @@ const PromptTask = struct {
         }
         if (self.id) |id_string| self.allocator.free(id_string);
         self.allocator.free(self.message);
-        deinitImages(self.allocator, self.images);
+        ts_rpc_state_json.deinitImages(self.allocator, self.images);
         self.allocator.destroy(self);
     }
 
@@ -830,12 +831,12 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            const images = parseImages(self.allocator, object) catch |err| {
+            const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
             var images_owned = true;
-            defer if (images_owned) deinitImages(self.allocator, images);
+            defer if (images_owned) ts_rpc_state_json.deinitImages(self.allocator, images);
             const streaming_behavior = parsePromptStreamingBehavior(object) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
@@ -901,11 +902,11 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            const images = parseImages(self.allocator, object) catch |err| {
+            const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            defer deinitImages(self.allocator, images);
+            defer ts_rpc_state_json.deinitImages(self.allocator, images);
             session.steer(message, images) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
@@ -924,11 +925,11 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            const images = parseImages(self.allocator, object) catch |err| {
+            const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            defer deinitImages(self.allocator, images);
+            defer ts_rpc_state_json.deinitImages(self.allocator, images);
             session.followUp(message, images) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
@@ -976,7 +977,7 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "get_state")) {
-            const data = try self.buildStateJson(session);
+            const data = try ts_rpc_state_json.buildStateJson(self.allocator, session);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
@@ -1003,7 +1004,7 @@ const TsRpcServer = struct {
                 return;
             };
             if (self.extension_host) |host| self.emitExtensionModelSelectEvent(host, model, prev_model, "set");
-            const data = try self.buildModelJson(model);
+            const data = try ts_rpc_state_json.buildModelJson(self.allocator, model);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
@@ -1015,14 +1016,14 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "get_available_models")) {
-            const data = try self.buildAvailableModelsJson();
+            const data = try ts_rpc_state_json.buildAvailableModelsJson(self.allocator);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
         }
 
         if (std.mem.eql(u8, command, "set_thinking_level")) {
-            const level = parseThinkingLevel(object, "level") catch |err| {
+            const level = ts_rpc_state_json.parseThinkingLevel(object, "level") catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
@@ -1043,20 +1044,20 @@ const TsRpcServer = struct {
                 return;
             }
             const prev_level = session.agent.getThinkingLevel();
-            const next_level = nextSupportedThinkingLevel(model, prev_level);
+            const next_level = ts_rpc_state_json.nextSupportedThinkingLevel(model, prev_level);
             session.setThinkingLevel(next_level) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
             if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, next_level, prev_level);
-            const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{thinkingLevelName(next_level)});
+            const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{ts_rpc_state_json.thinkingLevelName(next_level)});
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
         }
 
         if (std.mem.eql(u8, command, "set_steering_mode")) {
-            session.agent.steering_queue.mode = parseQueueMode(object, "mode") catch |err| {
+            session.agent.steering_queue.mode = ts_rpc_state_json.parseQueueMode(object, "mode") catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
@@ -1065,7 +1066,7 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "set_follow_up_mode")) {
-            session.agent.follow_up_queue.mode = parseQueueMode(object, "mode") catch |err| {
+            session.agent.follow_up_queue.mode = ts_rpc_state_json.parseQueueMode(object, "mode") catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
@@ -1085,7 +1086,7 @@ const TsRpcServer = struct {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            const data = try self.buildCompactionResultJson(result);
+            const data = try ts_rpc_state_json.buildCompactionResultJson(self.allocator, result);
             defer self.allocator.free(data);
             try self.writeCompactionEndEvent("manual", data, false, false);
             if (self.extension_host) |ext_host| self.emitSessionCompactEvent(ext_host);
@@ -1138,7 +1139,7 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "get_session_stats")) {
-            const data = try self.buildSessionStatsJson(session);
+            const data = try ts_rpc_state_json.buildSessionStatsJson(self.allocator, session);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
@@ -1218,7 +1219,7 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "get_fork_messages")) {
-            const data = try self.buildForkMessagesJson(session);
+            const data = try ts_rpc_state_json.buildForkMessagesJson(self.allocator, session);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
@@ -1260,7 +1261,7 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "get_messages")) {
-            const data = try self.buildMessagesJson(session.agent.getMessages());
+            const data = try ts_rpc_state_json.buildMessagesJson(self.allocator, session.agent.getMessages());
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
             return;
@@ -1827,9 +1828,9 @@ const TsRpcServer = struct {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"model_select\",\"model\":") catch return;
-        writeModelJson(self.allocator, &out.writer, model) catch return;
+        ts_rpc_state_json.writeModelJson(self.allocator, &out.writer, model) catch return;
         out.writer.writeAll(",\"previousModel\":") catch return;
-        writeModelJson(self.allocator, &out.writer, prev_model) catch return;
+        ts_rpc_state_json.writeModelJson(self.allocator, &out.writer, prev_model) catch return;
         out.writer.writeAll(",\"source\":") catch return;
         writeJsonString(self.allocator, &out.writer, source) catch return;
         out.writer.writeAll("}") catch return;
@@ -1842,9 +1843,9 @@ const TsRpcServer = struct {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"thinking_level_select\",\"level\":") catch return;
-        writeJsonString(self.allocator, &out.writer, thinkingLevelName(level)) catch return;
+        writeJsonString(self.allocator, &out.writer, ts_rpc_state_json.thinkingLevelName(level)) catch return;
         out.writer.writeAll(",\"previousLevel\":") catch return;
-        writeJsonString(self.allocator, &out.writer, thinkingLevelName(prev_level)) catch return;
+        writeJsonString(self.allocator, &out.writer, ts_rpc_state_json.thinkingLevelName(prev_level)) catch return;
         out.writer.writeAll("}") catch return;
         host.sendExtensionEventFrame(out.written());
     }
@@ -2006,9 +2007,9 @@ const TsRpcServer = struct {
         self.output_mutex.lockUncancelable(self.io);
         defer self.output_mutex.unlock(self.io);
         try self.stdout_writer.writeAll("{\"type\":\"queue_update\",\"steering\":");
-        try writeQueuedMessageTexts(self.allocator, self.stdout_writer, steering);
+        try ts_rpc_state_json.writeQueuedMessageTexts(self.allocator, self.stdout_writer, steering);
         try self.stdout_writer.writeAll(",\"followUp\":");
-        try writeQueuedMessageTexts(self.allocator, self.stdout_writer, follow_up);
+        try ts_rpc_state_json.writeQueuedMessageTexts(self.allocator, self.stdout_writer, follow_up);
         try self.stdout_writer.writeAll("}\n");
         try self.stdout_writer.flush();
     }
@@ -2043,161 +2044,6 @@ const TsRpcServer = struct {
             },
         }
         try self.stdout_writer.flush();
-    }
-
-    fn buildStateJson(self: *TsRpcServer, session: *session_mod.AgentSession) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        const writer = &out.writer;
-
-        try writer.writeAll("{\"model\":");
-        try writeModelJson(self.allocator, writer, session.agent.getModel());
-        try writer.writeAll(",\"thinkingLevel\":");
-        try writeJsonString(self.allocator, writer, thinkingLevelName(session.agent.getThinkingLevel()));
-        try writer.writeAll(",\"isStreaming\":");
-        try writer.writeAll(if (session.isStreaming()) "true" else "false");
-        try writer.writeAll(",\"isCompacting\":");
-        try writer.writeAll(if (session.isCompacting()) "true" else "false");
-        try writer.writeAll(",\"steeringMode\":");
-        try writeJsonString(self.allocator, writer, queueModeName(session.agent.steering_queue.mode));
-        try writer.writeAll(",\"followUpMode\":");
-        try writeJsonString(self.allocator, writer, queueModeName(session.agent.follow_up_queue.mode));
-        if (session.session_manager.getSessionFile()) |session_file| {
-            try writer.writeAll(",\"sessionFile\":");
-            try writeJsonString(self.allocator, writer, session_file);
-        }
-        try writer.writeAll(",\"sessionId\":");
-        try writeJsonString(self.allocator, writer, session.session_manager.getSessionId());
-        if (session.session_manager.getSessionName()) |session_name| {
-            try writer.writeAll(",\"sessionName\":");
-            try writeJsonString(self.allocator, writer, session_name);
-        }
-        try writer.writeAll(",\"autoCompactionEnabled\":");
-        try writer.writeAll(if (session.compaction_settings.enabled) "true" else "false");
-        try writer.print(",\"messageCount\":{d}", .{session.agent.getMessages().len});
-        try writer.print(",\"pendingMessageCount\":{d}", .{session.agent.steeringQueueLen() + session.agent.followUpQueueLen()});
-        try writer.writeAll("}");
-
-        return try self.allocator.dupe(u8, out.written());
-    }
-
-    fn buildMessagesJson(self: *TsRpcServer, messages: []const agent.AgentMessage) ![]u8 {
-        var array = std.json.Array.init(self.allocator);
-        errdefer array.deinit();
-        for (messages) |message| {
-            try array.append(try json_event_wire.messageToJsonValue(self.allocator, message));
-        }
-        const value = std.json.Value{ .object = blk: {
-            var object = try std.json.ObjectMap.init(self.allocator, &.{}, &.{});
-            errdefer object.deinit(self.allocator);
-            try object.put(self.allocator, try self.allocator.dupe(u8, "messages"), .{ .array = array });
-            break :blk object;
-        } };
-        defer common.deinitJsonValue(self.allocator, value);
-        return try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-    }
-
-    fn buildModelJson(self: *TsRpcServer, model: ai.Model) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        try writeModelJson(self.allocator, &out.writer, model);
-        return try self.allocator.dupe(u8, out.written());
-    }
-
-    fn buildAvailableModelsJson(self: *TsRpcServer) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        const registry = ai.model_registry.getDefault();
-        try out.writer.writeAll("{\"models\":[");
-        for (registry.models.items, 0..) |entry, index| {
-            if (index > 0) try out.writer.writeAll(",");
-            try writeModelJson(self.allocator, &out.writer, entry.model);
-        }
-        try out.writer.writeAll("]}");
-        return try self.allocator.dupe(u8, out.written());
-    }
-
-    fn buildCompactionResultJson(self: *TsRpcServer, result: session_mod.CompactionResult) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        try out.writer.writeAll("{\"summary\":");
-        try writeJsonString(self.allocator, &out.writer, result.summary);
-        try out.writer.writeAll(",\"firstKeptEntryId\":");
-        try writeJsonString(self.allocator, &out.writer, result.first_kept_entry_id);
-        try out.writer.print(",\"tokensBefore\":{d}", .{result.tokens_before});
-        try out.writer.writeAll("}");
-        return try self.allocator.dupe(u8, out.written());
-    }
-
-    fn buildSessionStatsJson(self: *TsRpcServer, session: *const session_mod.AgentSession) ![]u8 {
-        const stats = session_advanced.getSessionStats(session);
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        const writer = &out.writer;
-        try writer.writeAll("{");
-        if (stats.session_file) |session_file| {
-            try writer.writeAll("\"sessionFile\":");
-            try writeJsonString(self.allocator, writer, session_file);
-            try writer.writeAll(",");
-        }
-        try writer.writeAll("\"sessionId\":");
-        try writeJsonString(self.allocator, writer, stats.session_id);
-        try writer.print(
-            ",\"userMessages\":{d},\"assistantMessages\":{d},\"toolCalls\":{d},\"toolResults\":{d},\"totalMessages\":{d}",
-            .{ stats.user_messages, stats.assistant_messages, stats.tool_calls, stats.tool_results, stats.total_messages },
-        );
-        try writer.print(
-            ",\"tokens\":{{\"input\":{d},\"output\":{d},\"cacheRead\":{d},\"cacheWrite\":{d},\"total\":{d}}}",
-            .{ stats.tokens.input, stats.tokens.output, stats.tokens.cache_read, stats.tokens.cache_write, stats.tokens.total },
-        );
-        try writer.writeAll(",\"cost\":");
-        try writeJsonNumber(self.allocator, writer, stats.cost);
-        if (stats.context_usage) |context_usage| {
-            try writer.writeAll(",\"contextUsage\":{\"used\":");
-            if (context_usage.tokens) |tokens| {
-                try writer.print("{d}", .{tokens});
-            } else {
-                try writer.writeAll("null");
-            }
-            try writer.print(",\"available\":{d},\"percentage\":", .{context_usage.context_window});
-            if (context_usage.percent) |percent| {
-                try writeJsonNumber(self.allocator, writer, percent);
-            } else {
-                try writer.writeAll("null");
-            }
-            try writer.writeAll("}");
-        }
-        try writer.writeAll("}");
-        return try self.allocator.dupe(u8, out.written());
-    }
-
-    fn buildForkMessagesJson(self: *TsRpcServer, session: *const session_mod.AgentSession) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        try out.writer.writeAll("{\"messages\":[");
-        var first = true;
-        for (session.session_manager.getEntries()) |entry| {
-            switch (entry) {
-                .message => |message_entry| switch (message_entry.message) {
-                    .user => |user| {
-                        const text = try textBlocksConcat(self.allocator, user.content);
-                        defer self.allocator.free(text);
-                        if (text.len == 0) continue;
-                        if (!first) try out.writer.writeAll(",");
-                        first = false;
-                        try out.writer.writeAll("{\"entryId\":");
-                        try writeJsonString(self.allocator, &out.writer, message_entry.id);
-                        try out.writer.writeAll(",\"text\":");
-                        try writeJsonString(self.allocator, &out.writer, text);
-                        try out.writer.writeAll("}");
-                    },
-                    else => {},
-                },
-                else => {},
-            }
-        }
-        try out.writer.writeAll("]}");
-        return try self.allocator.dupe(u8, out.written());
     }
 
     fn writeCompactionStartEvent(self: *TsRpcServer, reason: []const u8) !void {
@@ -2512,48 +2358,6 @@ fn optionalBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     };
 }
 
-fn parseThinkingLevel(object: std.json.ObjectMap, key: []const u8) !agent.ThinkingLevel {
-    const value = try requiredString(object, key);
-    if (std.mem.eql(u8, value, "off")) return .off;
-    if (std.mem.eql(u8, value, "minimal")) return .minimal;
-    if (std.mem.eql(u8, value, "low")) return .low;
-    if (std.mem.eql(u8, value, "medium")) return .medium;
-    if (std.mem.eql(u8, value, "high")) return .high;
-    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
-    return error.InvalidFieldType;
-}
-
-fn nextSupportedThinkingLevel(model: ai.Model, current: agent.ThinkingLevel) agent.ThinkingLevel {
-    const levels = [_]agent.ThinkingLevel{ .off, .minimal, .low, .medium, .high, .xhigh };
-    const current_index = for (levels, 0..) |level, index| {
-        if (level == current) break index;
-    } else 0;
-
-    for (1..levels.len + 1) |offset| {
-        const candidate = levels[(current_index + offset) % levels.len];
-        if (ai.model_registry.thinkingLevelSupported(model, agentThinkingLevelToModel(candidate))) return candidate;
-    }
-    return .off;
-}
-
-fn agentThinkingLevelToModel(level: agent.ThinkingLevel) ai.types.ModelThinkingLevel {
-    return switch (level) {
-        .off => .off,
-        .minimal => .minimal,
-        .low => .low,
-        .medium => .medium,
-        .high => .high,
-        .xhigh => .xhigh,
-    };
-}
-
-fn parseQueueMode(object: std.json.ObjectMap, key: []const u8) !agent.QueueMode {
-    const value = try requiredString(object, key);
-    if (std.mem.eql(u8, value, "all")) return .all;
-    if (std.mem.eql(u8, value, "one-at-a-time")) return .one_at_a_time;
-    return error.InvalidFieldType;
-}
-
 fn parsePromptStreamingBehavior(object: std.json.ObjectMap) !?PromptStreamingBehavior {
     const value = object.get("streamingBehavior") orelse return null;
     const behavior = switch (value) {
@@ -2563,184 +2367,6 @@ fn parsePromptStreamingBehavior(object: std.json.ObjectMap) !?PromptStreamingBeh
     if (std.mem.eql(u8, behavior, "steer")) return .steer;
     if (std.mem.eql(u8, behavior, "followUp")) return .follow_up;
     return error.InvalidFieldType;
-}
-
-fn parseImages(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]ai.ImageContent {
-    const images_value = object.get("images") orelse return try allocator.alloc(ai.ImageContent, 0);
-    const images_array = switch (images_value) {
-        .array => |array| array,
-        else => return error.InvalidFieldType,
-    };
-
-    const images = try allocator.alloc(ai.ImageContent, images_array.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (images[0..initialized]) |image| {
-            allocator.free(image.data);
-            allocator.free(image.mime_type);
-        }
-        allocator.free(images);
-    }
-
-    for (images_array.items, 0..) |item, index| {
-        const image_object = switch (item) {
-            .object => |value| value,
-            else => return error.InvalidFieldType,
-        };
-        const data = requiredString(image_object, "data") catch return error.InvalidFieldType;
-        const mime_type = requiredString(image_object, "mimeType") catch return error.InvalidFieldType;
-        images[index] = .{
-            .data = try allocator.dupe(u8, data),
-            .mime_type = try allocator.dupe(u8, mime_type),
-        };
-        initialized += 1;
-    }
-    return images;
-}
-
-fn deinitImages(allocator: std.mem.Allocator, images: []ai.ImageContent) void {
-    for (images) |image| {
-        allocator.free(image.data);
-        allocator.free(image.mime_type);
-    }
-    allocator.free(images);
-}
-
-fn thinkingLevelName(level: agent.ThinkingLevel) []const u8 {
-    return @tagName(level);
-}
-
-fn queueModeName(mode: agent.QueueMode) []const u8 {
-    return switch (mode) {
-        .all => "all",
-        .one_at_a_time => "one-at-a-time",
-    };
-}
-
-fn writeModelJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, model: ai.Model) !void {
-    try writer.writeAll("{\"id\":");
-    try writeJsonString(allocator, writer, model.id);
-    try writer.writeAll(",\"name\":");
-    try writeJsonString(allocator, writer, model.name);
-    try writer.writeAll(",\"api\":");
-    try writeJsonString(allocator, writer, model.api);
-    try writer.writeAll(",\"provider\":");
-    try writeJsonString(allocator, writer, model.provider);
-    try writer.writeAll(",\"baseUrl\":");
-    try writeJsonString(allocator, writer, model.base_url);
-    try writer.writeAll(",\"reasoning\":");
-    try writer.writeAll(if (model.reasoning) "true" else "false");
-    if (model.thinking_level_map) |map| {
-        try writer.writeAll(",\"thinkingLevelMap\":{");
-        var first = true;
-        try writeThinkingLevelMapEntry(allocator, writer, "off", map.off, &first);
-        try writeThinkingLevelMapEntry(allocator, writer, "minimal", map.minimal, &first);
-        try writeThinkingLevelMapEntry(allocator, writer, "low", map.low, &first);
-        try writeThinkingLevelMapEntry(allocator, writer, "medium", map.medium, &first);
-        try writeThinkingLevelMapEntry(allocator, writer, "high", map.high, &first);
-        try writeThinkingLevelMapEntry(allocator, writer, "xhigh", map.xhigh, &first);
-        try writer.writeAll("}");
-    }
-    try writer.writeAll(",\"input\":[");
-    for (model.input_types, 0..) |input, index| {
-        if (index > 0) try writer.writeAll(",");
-        try writeJsonString(allocator, writer, input);
-    }
-    try writer.writeAll("],\"cost\":{\"input\":");
-    try writeJsonNumber(allocator, writer, model.cost.input);
-    try writer.writeAll(",\"output\":");
-    try writeJsonNumber(allocator, writer, model.cost.output);
-    try writer.writeAll(",\"cacheRead\":");
-    try writeJsonNumber(allocator, writer, model.cost.cache_read);
-    try writer.writeAll(",\"cacheWrite\":");
-    try writeJsonNumber(allocator, writer, model.cost.cache_write);
-    try writer.writeAll("}");
-    try writer.print(",\"contextWindow\":{d},\"maxTokens\":{d}", .{ model.context_window, model.max_tokens });
-    if (model.headers) |headers| {
-        try writer.writeAll(",\"headers\":{");
-        var iterator = headers.iterator();
-        var first = true;
-        while (iterator.next()) |entry| {
-            if (!first) try writer.writeAll(",");
-            first = false;
-            try writeJsonString(allocator, writer, entry.key_ptr.*);
-            try writer.writeAll(":");
-            try writeJsonString(allocator, writer, entry.value_ptr.*);
-        }
-        try writer.writeAll("}");
-    }
-    if (model.compat) |compat| {
-        const compat_json = try std.json.Stringify.valueAlloc(allocator, compat, .{});
-        defer allocator.free(compat_json);
-        try writer.writeAll(",\"compat\":");
-        try writer.writeAll(compat_json);
-    }
-    try writer.writeAll("}");
-}
-
-fn writeThinkingLevelMapEntry(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    key: []const u8,
-    mapping: ?ai.types.ThinkingLevelMapping,
-    first: *bool,
-) !void {
-    const value = mapping orelse return;
-    if (!first.*) try writer.writeAll(",");
-    first.* = false;
-    try writeJsonString(allocator, writer, key);
-    try writer.writeAll(":");
-    switch (value) {
-        .unsupported => try writer.writeAll("null"),
-        .mapped => |mapped| try writeJsonString(allocator, writer, mapped),
-    }
-}
-
-fn writeJsonNumber(allocator: std.mem.Allocator, writer: *std.Io.Writer, number: f64) !void {
-    _ = allocator;
-    try writer.print("{d}", .{number});
-}
-
-fn writeQueuedMessageTexts(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    messages: []const agent.AgentMessage,
-) !void {
-    try writer.writeAll("[");
-    var first = true;
-    for (messages) |message| {
-        const text = switch (message) {
-            .user => |user| firstTextBlock(user.content),
-            else => "",
-        };
-        if (!first) try writer.writeAll(",");
-        first = false;
-        try writeJsonString(allocator, writer, text);
-    }
-    try writer.writeAll("]");
-}
-
-fn writeJsonStringArray(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    values: []const []const u8,
-) !void {
-    try writer.writeAll("[");
-    for (values, 0..) |value, index| {
-        if (index > 0) try writer.writeAll(",");
-        try writeJsonString(allocator, writer, value);
-    }
-    try writer.writeAll("]");
-}
-
-fn firstTextBlock(blocks: []const ai.ContentBlock) []const u8 {
-    for (blocks) |block| {
-        switch (block) {
-            .text => |text| return text.text,
-            else => {},
-        }
-    }
-    return "";
 }
 
 fn textBlocksConcat(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
@@ -4081,7 +3707,7 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
     try std.testing.expect(!std.mem.eql(u8, original_session_id, session.session_manager.getSessionId()));
 
     try server.handleLine("{\"id\":\"new_state\",\"type\":\"get_state\"}");
-    const new_state = try server.buildStateJson(&session);
+    const new_state = try ts_rpc_state_json.buildStateJson(allocator, &session);
     defer allocator.free(new_state);
     const expected_new_state = try std.fmt.allocPrint(
         allocator,
@@ -4115,7 +3741,7 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
     try std.testing.expectEqual(@as(usize, 3), session.agent.getMessages().len);
 
     try server.handleLine("{\"id\":\"fork_messages\",\"type\":\"get_fork_messages\"}");
-    const fork_messages = try server.buildForkMessagesJson(&session);
+    const fork_messages = try ts_rpc_state_json.buildForkMessagesJson(allocator, &session);
     defer allocator.free(fork_messages);
     const expected_fork_messages = try std.fmt.allocPrint(
         allocator,
@@ -4147,7 +3773,7 @@ test "TS RPC M3 session host rebinds new switch fork clone and state" {
     );
 
     try server.handleLine("{\"id\":\"clone_state\",\"type\":\"get_state\"}");
-    const clone_state = try server.buildStateJson(&session);
+    const clone_state = try ts_rpc_state_json.buildStateJson(allocator, &session);
     defer allocator.free(clone_state);
     const expected_clone_state = try std.fmt.allocPrint(
         allocator,
@@ -4534,7 +4160,7 @@ test "VAL-M10-SESSION-007 clone preserves branch ancestry and parent file is unc
 
     // Capture parent get_messages branch view before clone (the cutoff/target
     // ancestry currently visible on the parent session).
-    const parent_branch_messages_before = try server.buildMessagesJson(session.agent.getMessages());
+    const parent_branch_messages_before = try ts_rpc_state_json.buildMessagesJson(allocator, session.agent.getMessages());
     defer allocator.free(parent_branch_messages_before);
 
     try server.handleLine("{\"id\":\"clone\",\"type\":\"clone\"}");
@@ -4573,7 +4199,7 @@ test "VAL-M10-SESSION-007 clone preserves branch ancestry and parent file is unc
     // Clone get_messages branch view matches the parent's branch view at the
     // cloned cutoff/target. Both must reflect the same root and second
     // user/assistant pairs in order.
-    const clone_branch_messages = try server.buildMessagesJson(session.agent.getMessages());
+    const clone_branch_messages = try ts_rpc_state_json.buildMessagesJson(allocator, session.agent.getMessages());
     defer allocator.free(clone_branch_messages);
     try std.testing.expectEqualStrings(parent_branch_messages_before, clone_branch_messages);
 
@@ -4600,7 +4226,7 @@ test "VAL-M10-SESSION-007 clone preserves branch ancestry and parent file is unc
     try std.testing.expectEqualStrings(parent_session_id, session.session_manager.getSessionId());
     try std.testing.expectEqualStrings(parent_leaf_id, session.session_manager.getLeafId().?);
     try std.testing.expectEqual(parent_message_count, session.agent.getMessages().len);
-    const parent_branch_messages_after_switch = try server.buildMessagesJson(session.agent.getMessages());
+    const parent_branch_messages_after_switch = try ts_rpc_state_json.buildMessagesJson(allocator, session.agent.getMessages());
     defer allocator.free(parent_branch_messages_after_switch);
     try std.testing.expectEqualStrings(parent_branch_messages_before, parent_branch_messages_after_switch);
 }
@@ -4858,7 +4484,7 @@ test "VAL-M10-SESSION-009 reconnect to existing runtime preserves session state"
         var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
         try server.start();
         try server.handleLine("{\"id\":\"first\",\"type\":\"get_state\"}");
-        const first_state = try server.buildStateJson(&session);
+        const first_state = try ts_rpc_state_json.buildStateJson(allocator, &session);
         defer allocator.free(first_state);
         try expectContains(stdout_capture.writer.buffered(), session_id_before);
         try expectContains(stdout_capture.writer.buffered(), first_state);
