@@ -3,12 +3,21 @@ import type { PathMetadata } from "./package-manager.js";
 export type SourceScope = "user" | "project" | "temporary";
 export type SourceOrigin = "package" | "top-level";
 
+export interface SourceProvenanceBinding {
+	lockEntryKey: string;
+	sourceIdentity: string;
+	packageRoot: string;
+	packageRootSha256: string;
+	artifactSha256?: string;
+}
+
 export interface SourceInfo {
 	path: string;
 	source: string;
 	scope: SourceScope;
 	origin: SourceOrigin;
 	baseDir?: string;
+	provenance?: SourceProvenanceBinding;
 }
 
 export function createSourceInfo(path: string, metadata: PathMetadata): SourceInfo {
@@ -18,6 +27,7 @@ export function createSourceInfo(path: string, metadata: PathMetadata): SourceIn
 		scope: metadata.scope,
 		origin: metadata.origin,
 		baseDir: metadata.baseDir,
+		provenance: metadata.provenance,
 	};
 }
 

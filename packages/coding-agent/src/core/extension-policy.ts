@@ -108,6 +108,24 @@ function toPolicyPath(value: string): string {
 	return value.split(sep).join("/");
 }
 
+function createLegacyWasmExtensionIdentityKey(manifest: WasmExtensionPackageManifest): string {
+	return `wasm:${manifest.schemaVersion}:${manifest.id}:${manifest.version}:${manifest.artifactSha256}:${toPolicyPath(
+		manifest.manifestPath,
+	)}:${toPolicyPath(manifest.artifactAbsolutePath)}`;
+}
+
+export function createWasmExtensionPolicyPrefix(options: {
+	schemaVersion: string;
+	id: string;
+	version: string;
+}): string {
+	return `wasm:package:${options.schemaVersion}:${options.id}:${options.version}:`;
+}
+
+export function createWasmExtensionLegacyPolicyKey(manifest: WasmExtensionPackageManifest): string {
+	return createLegacyWasmExtensionIdentityKey(manifest);
+}
+
 export function createWasmExtensionManifestPolicyKey(options: {
 	schemaVersion: string;
 	id: string;
@@ -158,10 +176,16 @@ export function createTypeScriptExtensionIdentity(options: {
 
 	if (sourceInfo.origin === "package") {
 		const entryPath = relativePolicyPath(sourceInfo.baseDir, resolvedPath) ?? resolvedPath;
+		const provenance = sourceInfo.provenance;
+		const key = provenance
+			? `typescript:package:${sourceInfo.scope}:${provenance.sourceIdentity}:${entryPath}:${toPolicyPath(
+					provenance.packageRoot,
+				)}:${provenance.packageRootSha256}:${resolvedPath}`
+			: `typescript:package:${sourceInfo.scope}:${sourceInfo.source}:${entryPath}:${resolvedPath}`;
 		return {
 			kind: "typescript-package",
 			runtimeKind: "typescript",
-			key: `typescript:package:${sourceInfo.scope}:${sourceInfo.source}:${entryPath}:${resolvedPath}`,
+			key,
 			displayName: entryPath,
 			configuredPath,
 			resolvedPath,
@@ -191,10 +215,21 @@ export function createWasmExtensionIdentity(
 	const manifestPath = toPolicyPath(manifest.manifestPath);
 	const packageRoot = toPolicyPath(manifest.packageRoot);
 	const artifactAbsolutePath = toPolicyPath(manifest.artifactAbsolutePath);
+	const provenance = sourceInfo.provenance;
+	const artifactSha256 = provenance?.artifactSha256 ?? manifest.artifactSha256;
+	const key = provenance
+		? `${createWasmExtensionPolicyPrefix({
+				schemaVersion: manifest.schemaVersion,
+				id: manifest.id,
+				version: manifest.version,
+			})}${sourceInfo.scope}:${provenance.sourceIdentity}:${toPolicyPath(provenance.packageRoot)}:${
+				provenance.packageRootSha256
+			}:${artifactSha256}:${manifestPath}:${artifactAbsolutePath}`
+		: createLegacyWasmExtensionIdentityKey(manifest);
 	return {
 		kind: "wasm-manifest",
 		runtimeKind: "wasm",
-		key: `wasm:${manifest.schemaVersion}:${manifest.id}:${manifest.version}:${manifest.artifactSha256}:${manifestPath}:${artifactAbsolutePath}`,
+		key,
 		displayName: manifest.id,
 		schemaVersion: manifest.schemaVersion,
 		manifestId: manifest.id,

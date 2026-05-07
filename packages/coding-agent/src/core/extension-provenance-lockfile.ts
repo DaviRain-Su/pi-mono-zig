@@ -73,6 +73,7 @@ export type ExtensionProvenanceDiagnosticCategory =
 	| "artifact_path_mismatch"
 	| "artifact_digest_mismatch"
 	| "package_root_digest_mismatch"
+	| "policy_digest_mismatch"
 	| "package_validation_failed";
 
 export interface ExtensionProvenanceDiagnostic {

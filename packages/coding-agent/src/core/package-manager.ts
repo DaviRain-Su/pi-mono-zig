@@ -40,7 +40,13 @@ import { CONFIG_DIR_NAME } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
-import { createWasmExtensionIdentity, type ExtensionPolicy, type WasmExtensionIdentity } from "./extension-policy.js";
+import {
+	createWasmExtensionIdentity,
+	createWasmExtensionLegacyPolicyKey,
+	createWasmExtensionPolicyPrefix,
+	type ExtensionPolicy,
+	type WasmExtensionIdentity,
+} from "./extension-policy.js";
 import {
 	createExtensionProvenanceLockEntry,
 	createMissingLockEntryDiagnostic,
@@ -58,7 +64,7 @@ import {
 } from "./extension-provenance-lockfile.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager, SettingsScope } from "./settings-manager.js";
-import { createSourceInfo } from "./source-info.js";
+import { createSourceInfo, type SourceProvenanceBinding } from "./source-info.js";
 import {
 	hasWasmExtensionManifest,
 	validateWasmExtensionPackage,
@@ -82,6 +88,7 @@ export interface PathMetadata {
 	scope: SourceScope;
 	origin: "package" | "top-level";
 	baseDir?: string;
+	provenance?: SourceProvenanceBinding;
 }
 
 export interface ResolvedResource {
@@ -1198,6 +1205,16 @@ export class DefaultPackageManager implements PackageManager {
 		return true;
 	}
 
+	private createSourceProvenanceBinding(lockEntry: ExtensionProvenanceLockEntry): SourceProvenanceBinding {
+		return {
+			lockEntryKey: lockEntry.key,
+			sourceIdentity: lockEntry.source.identity,
+			packageRoot: lockEntry.packageRoot,
+			packageRootSha256: lockEntry.digests.packageRootSha256,
+			artifactSha256: lockEntry.artifact?.sha256,
+		};
+	}
+
 	private verifyTrustedArtifactProvenance(
 		source: string,
 		scope: InstalledSourceScope,
@@ -1866,6 +1883,7 @@ export class DefaultPackageManager implements PackageManager {
 				if (!this.verifyTrustedLockEntryForSource(sourceStr, parsed, scope, lockEntry, accumulator)) {
 					continue;
 				}
+				metadata.provenance = this.createSourceProvenanceBinding(lockEntry);
 			}
 
 			if (parsed.type === "local") {
@@ -2647,9 +2665,29 @@ export class DefaultPackageManager implements PackageManager {
 		if (!hasWasmExtensionManifest(packageRoot)) {
 			return false;
 		}
-		const manifest = validateWasmExtensionPackage(packageRoot, {
-			resolveApprovedCapabilities: (request) => this.resolveApprovedWasmCapabilities(request, metadata),
-		});
+		let manifest: WasmExtensionPackageManifest;
+		try {
+			manifest = validateWasmExtensionPackage(packageRoot, {
+				resolveApprovedCapabilities: (request) => this.resolveApprovedWasmCapabilities(request, metadata),
+			});
+		} catch (error) {
+			if (!metadata.provenance) {
+				throw error;
+			}
+			const trustedManifest = validateWasmExtensionPackage(packageRoot, {
+				approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS,
+			});
+			const sourceInfo = createSourceInfo(trustedManifest.manifestPath, metadata);
+			const identity = createWasmExtensionIdentity(trustedManifest, sourceInfo);
+			const mismatchedPolicyKey = this.findMismatchedWasmPolicyKey(identity, trustedManifest);
+			if (mismatchedPolicyKey) {
+				accumulator.diagnostics.push(
+					this.createPolicyDigestMismatchDiagnostic(identity, metadata, mismatchedPolicyKey),
+				);
+				return true;
+			}
+			throw error;
+		}
 		this.addWasmExtensionPackage(accumulator.wasmExtensions, manifest, metadata, true);
 		return true;
 	}
@@ -2670,6 +2708,9 @@ export class DefaultPackageManager implements PackageManager {
 		if (finalIdentityPolicy) {
 			return finalIdentityPolicy;
 		}
+		if (metadata.provenance) {
+			return undefined;
+		}
 		return this.settingsManager.getExtensionPolicy(request.policyLookupKey);
 	}
 
@@ -2686,6 +2727,68 @@ export class DefaultPackageManager implements PackageManager {
 		} catch {
 			return undefined;
 		}
+	}
+
+	private resolveWasmPolicyForIdentity(
+		identity: WasmExtensionIdentity,
+		manifest: WasmExtensionPackageManifest,
+		metadata: PathMetadata,
+		diagnostics: ExtensionProvenanceDiagnostic[],
+	): ExtensionPolicy | undefined {
+		const policy = this.settingsManager.getExtensionPolicy(identity.key);
+		if (policy) {
+			return policy;
+		}
+		if (!metadata.provenance) {
+			return this.settingsManager.getExtensionPolicy(manifest.policyLookupKey);
+		}
+		const mismatchedPolicyKey = this.findMismatchedWasmPolicyKey(identity, manifest);
+		if (mismatchedPolicyKey) {
+			diagnostics.push(this.createPolicyDigestMismatchDiagnostic(identity, metadata, mismatchedPolicyKey));
+		}
+		return undefined;
+	}
+
+	private findMismatchedWasmPolicyKey(
+		identity: WasmExtensionIdentity,
+		manifest: WasmExtensionPackageManifest,
+	): string | undefined {
+		const policies = this.settingsManager.getExtensionPolicies();
+		if (policies[manifest.policyLookupKey]) {
+			return manifest.policyLookupKey;
+		}
+		const legacyIdentityKey = createWasmExtensionLegacyPolicyKey(manifest);
+		if (policies[legacyIdentityKey]) {
+			return legacyIdentityKey;
+		}
+		const digestBoundPrefix = createWasmExtensionPolicyPrefix({
+			schemaVersion: manifest.schemaVersion,
+			id: manifest.id,
+			version: manifest.version,
+		});
+		return Object.keys(policies).find((key) => key !== identity.key && key.startsWith(digestBoundPrefix));
+	}
+
+	private createPolicyDigestMismatchDiagnostic(
+		identity: WasmExtensionIdentity,
+		metadata: PathMetadata,
+		policyKey: string,
+	): ExtensionProvenanceDiagnostic {
+		return {
+			category: "policy_digest_mismatch",
+			scope: metadata.scope === "project" ? "project" : "user",
+			lockfilePath: this.getProvenanceLockfilePath(metadata.scope === "project" ? "project" : "user"),
+			phase: "resolve",
+			source: metadata.source,
+			message: `Extension policy digest mismatch for ${metadata.scope} package source ${metadata.source}`,
+			recoveryHint: "Update the extension policy after installing or updating the package provenance.",
+			field: "extensionPolicies",
+			expected: identity.key,
+			actual: policyKey,
+			packageRoot: identity.packageRoot,
+			manifestPath: identity.manifestPath,
+			artifactPath: identity.artifactPath,
+		};
 	}
 
 	private collectDefaultResources(
@@ -3057,7 +3160,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		return {
 			extensions: mapToResolved(accumulator.extensions),
-			wasmExtensions: this.mapWasmExtensionsToResolved(accumulator.wasmExtensions),
+			wasmExtensions: this.mapWasmExtensionsToResolved(accumulator.wasmExtensions, accumulator.diagnostics),
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),
@@ -3067,13 +3170,12 @@ export class DefaultPackageManager implements PackageManager {
 
 	private mapWasmExtensionsToResolved(
 		entries: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>,
+		diagnostics: ExtensionProvenanceDiagnostic[],
 	): ResolvedWasmExtensionPackage[] {
 		const resolved = Array.from(entries.values()).map(({ metadata, manifest, enabled }) => {
 			const sourceInfo = createSourceInfo(manifest.manifestPath, metadata);
 			const identity = createWasmExtensionIdentity(manifest, sourceInfo);
-			const effectivePolicy =
-				this.settingsManager.getExtensionPolicy(identity.key) ??
-				this.settingsManager.getExtensionPolicy(manifest.policyLookupKey);
+			const effectivePolicy = this.resolveWasmPolicyForIdentity(identity, manifest, metadata, diagnostics);
 			return {
 				...manifest,
 				path: manifest.manifestPath,

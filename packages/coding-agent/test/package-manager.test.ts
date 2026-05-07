@@ -858,6 +858,78 @@ Content`,
 			);
 		});
 
+		it("should ignore legacy Wasm manifest policies for locked packages", async () => {
+			const packageRoot = join(tempDir, "locked-legacy-policy-wasm");
+			mkdirSync(packageRoot, { recursive: true });
+			writeWasmPackage(packageRoot);
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			const legacyPolicyKey = createWasmExtensionManifestPolicyKey({
+				schemaVersion: "pi-extension.v0",
+				id: "com.example.local-wasm",
+				version: "0.1.0",
+				manifestPath: join(packageRoot, "pi-extension.json"),
+				packageRoot,
+				artifactPath: "wasm/plugin.wasm",
+			});
+			settingsManager.setExtensionPolicy(legacyPolicyKey, {
+				approvedGrants: ["file.read"],
+				resourceLimits: { turns: 1, toolScopes: ["fixture.echo"] },
+			});
+
+			const resolved = await packageManager.resolve();
+
+			expect(resolved.wasmExtensions).toHaveLength(1);
+			expect(resolved.wasmExtensions[0].effectivePolicy).toBeUndefined();
+			expect(resolved.diagnostics).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						category: "policy_digest_mismatch",
+						scope: "user",
+						actual: legacyPolicyKey,
+					}),
+				]),
+			);
+		});
+
+		it("should not reuse user-scope Wasm policies for project-scoped locked packages", async () => {
+			const packageRoot = join(tempDir, "cross-scope-policy-wasm");
+			mkdirSync(packageRoot, { recursive: true });
+			writeWasmPackage(packageRoot);
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			const userResolved = await packageManager.resolve();
+			const userIdentityKey = userResolved.wasmExtensions[0]?.identity.key;
+			expect(userIdentityKey).toBeDefined();
+			settingsManager.setExtensionPolicy(userIdentityKey!, {
+				approvedGrants: ["file.read"],
+				resourceLimits: { turns: 1 },
+			});
+			const userApprovedResolved = await packageManager.resolve();
+			expect(userApprovedResolved.wasmExtensions[0].effectivePolicy).toEqual({
+				approvedGrants: ["file.read"],
+				resourceLimits: { turns: 1 },
+			});
+
+			await packageManager.installAndPersist(packageRoot, { local: true });
+			await settingsManager.flush();
+			const projectResolved = await packageManager.resolve();
+
+			expect(projectResolved.wasmExtensions).toHaveLength(1);
+			expect(projectResolved.wasmExtensions[0].metadata.scope).toBe("project");
+			expect(projectResolved.wasmExtensions[0].identity.key).not.toBe(userIdentityKey);
+			expect(projectResolved.wasmExtensions[0].effectivePolicy).toBeUndefined();
+			expect(projectResolved.diagnostics).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						category: "policy_digest_mismatch",
+						scope: "project",
+						actual: userIdentityKey,
+					}),
+				]),
+			);
+		});
+
 		it("should reject legacy broad Wasm security grants as unknown", async () => {
 			for (const capability of ["network", "shell", "env", "model", "session"]) {
 				const unknownCapabilityPackage = join(tempDir, `unknown-${capability}-package`);

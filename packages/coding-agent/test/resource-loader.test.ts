@@ -253,9 +253,14 @@ Project skill`,
 			expect(local?.identity.displayName).not.toBe("mutable-label");
 
 			expect(packaged?.identity.kind).toBe("typescript-package");
-			expect(packaged?.identity.key).toBe(
-				`typescript:package:user:${packageRoot}:extensions/entry.ts:${packageEntryPath}`,
-			);
+			const packageLockfile = JSON.parse(readFileSync(join(agentDir, "extensions.lock.json"), "utf-8")) as {
+				entries: Array<{ digests: { packageRootSha256: string }; packageRoot: string }>;
+			};
+			expect(packaged?.identity.key).toContain("typescript:package:user:");
+			expect(packaged?.identity.key).toContain("extensions/entry.ts");
+			expect(packaged?.identity.key).toContain(packageLockfile.entries[0].packageRoot);
+			expect(packaged?.identity.key).toContain(packageLockfile.entries[0].digests.packageRootSha256);
+			expect(packaged?.identity.key).toContain(packageEntryPath);
 			expect(packaged?.identity.packageSource).toBe(packageRoot);
 			expect(packaged?.identity.entryPath).toBe("extensions/entry.ts");
 			expect(packaged?.identity.sourceInfo.origin).toBe("package");
@@ -301,6 +306,49 @@ export default function(pi) {
 			expect(loader.getExtensions().extensions).toHaveLength(0);
 			expect(loader.getExtensions().errors).toEqual([]);
 			expect(existsSync(sentinelPath)).toBe(false);
+		});
+
+		it("should ignore non-digest package TypeScript policies for locked packages", async () => {
+			const packageRoot = join(tempDir, "package-typescript-legacy-policy");
+			mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+			writeFileSync(
+				join(packageRoot, "package.json"),
+				JSON.stringify({
+					name: "package-typescript-legacy-policy",
+					version: "1.0.0",
+					pi: { extensions: ["extensions/entry.ts"] },
+				}),
+			);
+			const entryPath = join(packageRoot, "extensions", "entry.ts");
+			writeFileSync(
+				entryPath,
+				`export default function(pi) {
+	pi.registerCommand("legacy-package-policy", { handler: async () => {} });
+}`,
+			);
+
+			const settingsManager = SettingsManager.inMemory({ packages: [packageRoot] });
+			const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			settingsManager.setPackages([packageRoot]);
+			const legacyIdentityKey = `typescript:package:user:${packageRoot}:extensions/entry.ts:${entryPath}`;
+			settingsManager.setExtensionPolicy(legacyIdentityKey, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 1 },
+			});
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+
+			const loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded).toBeDefined();
+			expect(loaded?.identity.key).not.toBe(legacyIdentityKey);
+			expect(loaded?.effectivePolicy).toBeUndefined();
+			const lockfile = JSON.parse(readFileSync(join(agentDir, "extensions.lock.json"), "utf-8")) as {
+				entries: Array<{ digests: { packageRootSha256: string } }>;
+			};
+			expect(loaded?.identity.key).toContain(lockfile.entries[0].digests.packageRootSha256);
 		});
 
 		it("should snapshot effective extension policy by canonical TypeScript identity on reload", async () => {
