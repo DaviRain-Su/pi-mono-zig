@@ -59,6 +59,8 @@ The coding agent includes a static Zig native runtime adapter and a local WASM, 
 
 Bounded Sub-agent execution v0 adds product-neutral `sub_agent.delegate` and `/sub-agent` paths for a single bounded child execution, including limit, cancellation, and replay semantics. It does not include Workflow, Wiki, QA, or Review presets.
 
+Extension policy/config substrate adds canonical extension identities and persistent `extensionPolicies` with user/project policy merge. Policies default deny unless approved grants and resource limits allow execution, and denial diagnostics are auditable.
+
 Validation:
 
 ```bash
