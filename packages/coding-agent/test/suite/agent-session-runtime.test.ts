@@ -10,6 +10,13 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import {
+	createSubAgentExtension,
+	SUB_AGENT_DELEGATION_RESULT_ENTRY,
+	SUB_AGENT_READINESS_ENTRY,
+	SUB_AGENT_STATUS_MESSAGE,
+} from "../../src/core/extensions/subagent-extension.js";
+import { convertToLlm } from "../../src/core/messages.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type {
 	ExtensionAPI,
@@ -19,6 +26,7 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.js";
+import { createHarness, type Harness } from "./harness.js";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -590,5 +598,94 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(runtime.session.model?.id).toBe("faux-2");
 		expect(runtime.session.thinkingLevel).toBe("off");
+	});
+
+	it("keeps sub-agent replay records and status details outside model-visible context", async () => {
+		let delegateCalls = 0;
+		const harness: Harness = await createHarness({
+			extensionFactories: [
+				createSubAgentExtension({
+					approvedCapabilities: ["agent.delegate"],
+					delegate: (invocation) => {
+						delegateCalls++;
+						return {
+							type: "sub_agent_task_result",
+							agentId: invocation.agentId,
+							runId: invocation.runId,
+							taskId: invocation.taskId,
+							sessionId: invocation.sessionId,
+							parentAgentId: invocation.parentAgentId,
+							status: "completed",
+							content: [{ type: "text", text: "agent-session delegated" }],
+							startedAt: 10,
+							completedAt: 20,
+							resourceSummary: {
+								turns: 1,
+								outputBytes: 23,
+								outputLines: 1,
+								childrenStarted: 1,
+							},
+						};
+					},
+				}),
+			],
+		});
+		cleanups.push(() => harness.cleanup());
+
+		const payload = {
+			agentId: "agent-runtime",
+			runId: "run-runtime",
+			taskId: "task-runtime",
+			sessionId: "session-runtime",
+			parentAgentId: "parent-runtime",
+			route: "runtime-route",
+			input: { prompt: "delegate from runtime" },
+			limits: { maxChildren: 1, depth: 1, turns: 1, outputBytes: 256, outputLines: 5 },
+		};
+
+		await harness.session.prompt(`/sub-agent ${JSON.stringify(payload)}`);
+
+		expect(delegateCalls).toBe(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		const entries = harness.sessionManager.getEntries();
+		const customTypes = entries.filter((entry) => entry.type === "custom").map((entry) => entry.customType);
+		expect(customTypes).toEqual([SUB_AGENT_READINESS_ENTRY, SUB_AGENT_DELEGATION_RESULT_ENTRY]);
+		const statusEntry = entries.find(
+			(entry) => entry.type === "custom_message" && entry.customType === SUB_AGENT_STATUS_MESSAGE,
+		);
+		expect(statusEntry).toMatchObject({
+			type: "custom_message",
+			customType: SUB_AGENT_STATUS_MESSAGE,
+			content: "completed",
+			details: { type: "sub_agent_task_result", taskId: "task-runtime", status: "completed" },
+		});
+
+		const context = harness.sessionManager.buildSessionContext();
+		expect(context.messages).toHaveLength(1);
+		expect(context.messages[0]).toMatchObject({
+			role: "custom",
+			customType: SUB_AGENT_STATUS_MESSAGE,
+			content: "completed",
+		});
+		const modelVisibleStatus = JSON.stringify(convertToLlm(context.messages));
+		expect(modelVisibleStatus).toContain("completed");
+		expect(modelVisibleStatus).not.toContain("sub_agent_task_invocation");
+		expect(modelVisibleStatus).not.toContain("sub_agent_task_result");
+		expect(modelVisibleStatus).not.toContain("agent-session delegated");
+
+		harness.setResponses([
+			(providerRequest) => {
+				const modelVisibleMessages = JSON.stringify(providerRequest.messages);
+				expect(modelVisibleMessages).toContain("completed");
+				expect(modelVisibleMessages).not.toContain("sub_agent_task_invocation");
+				expect(modelVisibleMessages).not.toContain("sub_agent_task_result");
+				expect(modelVisibleMessages).not.toContain("agent-session delegated");
+				return fauxAssistantMessage("after status boundary");
+			},
+		]);
+
+		await harness.session.prompt("continue after sub-agent status");
+
+		expect(delegateCalls).toBe(1);
 	});
 });

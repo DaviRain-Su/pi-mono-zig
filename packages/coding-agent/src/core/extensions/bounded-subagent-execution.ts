@@ -98,7 +98,10 @@ export async function executeBoundedSubAgentTask(
 	const invocation = validateSubAgentTaskInvocationEnvelope(input);
 	const now = options.now ?? Date.now;
 	const replayed = options.store?.findResult?.(invocation);
-	if (replayed !== undefined) return validateSubAgentTaskResultEnvelope(replayed);
+	if (replayed !== undefined) {
+		const replayedResult = validateSubAgentTaskResultEnvelope(replayed);
+		if (replayKeyMatches(invocation, replayedResult)) return replayedResult;
+	}
 
 	if (invocation.cancellation?.state === "requested" || options.signal?.aborted === true) {
 		const propagatedInvocation = propagateCancellation(invocation, options.signal);
@@ -467,6 +470,15 @@ function normalizeResultIdentity(
 		...result,
 		...correlationFromInvocation(invocation),
 	});
+}
+
+function replayKeyMatches(invocation: SubAgentTaskInvocationEnvelope, result: SubAgentTaskResultEnvelope): boolean {
+	return (
+		result.agentId === invocation.agentId &&
+		result.runId === invocation.runId &&
+		result.taskId === invocation.taskId &&
+		result.sessionId === invocation.sessionId
+	);
 }
 
 function propagateCancellation(

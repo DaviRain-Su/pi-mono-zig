@@ -20,6 +20,8 @@ import {
 	createSubAgentExtension,
 	SUB_AGENT_DELEGATION_RESULT_ENTRY,
 	SUB_AGENT_READINESS_ENTRY,
+	SUB_AGENT_STATUS_MESSAGE,
+	type SubAgentDelegationInput,
 } from "../src/core/extensions/subagent-extension.js";
 import {
 	validateSubAgentReadinessEnvelope,
@@ -864,6 +866,49 @@ describe("bounded sub-agent execution seam", () => {
 			resourceSummary: { limitDetails: { timeoutMs: { limit: 1, truncated: true } } },
 		});
 	});
+
+	it("ignores stored results that do not match the exact replay key", async () => {
+		let delegateCalls = 0;
+		const replayCandidate = validateSubAgentTaskResultEnvelope({
+			type: "sub_agent_task_result",
+			agentId: invocation.agentId,
+			runId: invocation.runId,
+			taskId: "task-different",
+			sessionId: invocation.sessionId,
+			status: "completed",
+			content: [{ type: "text", text: "wrong replay" }],
+			startedAt: 1,
+			completedAt: 2,
+			resourceSummary: { turns: 1, outputBytes: 12, outputLines: 1, childrenStarted: 1 },
+		});
+
+		const result = await executeBoundedSubAgentTask(invocation, {
+			store: {
+				findResult: () => replayCandidate,
+			},
+			executor: () => {
+				delegateCalls++;
+				return {
+					type: "sub_agent_task_result",
+					agentId: invocation.agentId,
+					runId: invocation.runId,
+					taskId: invocation.taskId,
+					sessionId: invocation.sessionId,
+					status: "completed",
+					content: [{ type: "text", text: "fresh execution" }],
+					startedAt: 10,
+					completedAt: 20,
+					resourceSummary: { turns: 1, outputBytes: 15, outputLines: 1, childrenStarted: 1 },
+				};
+			},
+		});
+
+		expect(delegateCalls).toBe(1);
+		expect(result).toMatchObject({
+			taskId: invocation.taskId,
+			content: [{ type: "text", text: "fresh execution" }],
+		});
+	});
 });
 
 describe("neutral sub-agent delegation extension", () => {
@@ -933,6 +978,51 @@ describe("neutral sub-agent delegation extension", () => {
 		const text = result.content.find((block) => block.type === "text")?.text;
 		if (text === undefined) throw new Error("missing text result");
 		return text;
+	}
+
+	function completedResultFor(
+		input: SubAgentDelegationInput,
+		text: string,
+		timestamps: { startedAt: number; completedAt: number },
+	): ReturnType<typeof validateSubAgentTaskResultEnvelope> {
+		return validateSubAgentTaskResultEnvelope({
+			type: "sub_agent_task_result",
+			agentId: input.agentId,
+			runId: input.runId,
+			taskId: input.taskId,
+			sessionId: input.sessionId,
+			toolCallId: "toolCallId" in input ? input.toolCallId : undefined,
+			parentAgentId: input.parentAgentId,
+			parentRunId: "parentRunId" in input ? input.parentRunId : undefined,
+			parentTaskId: "parentTaskId" in input ? input.parentTaskId : undefined,
+			parentSessionId: "parentSessionId" in input ? input.parentSessionId : undefined,
+			parentId: "parentId" in input ? input.parentId : undefined,
+			status: "completed",
+			content: [{ type: "text", text }],
+			startedAt: timestamps.startedAt,
+			completedAt: timestamps.completedAt,
+			usage: { inputTokens: 11, outputTokens: 13, totalTokens: 24, toolCalls: 1 },
+			resourceSummary: {
+				turns: 1,
+				outputBytes: new TextEncoder().encode(text).length,
+				outputLines: text.length === 0 ? 0 : text.split(/\r\n|\r|\n/).length,
+				childrenStarted: 1,
+				limitDetails: {
+					outputBytes: {
+						limit: input.limits?.outputBytes,
+						actual: new TextEncoder().encode(text).length,
+						truncated: false,
+					},
+					outputLines: {
+						limit: input.limits?.outputLines,
+						actual: text.length === 0 ? 0 : text.split(/\r\n|\r|\n/).length,
+						truncated: false,
+					},
+					toolScopes: input.limits?.toolScopes,
+				},
+			},
+			details: { fixture: text },
+		});
 	}
 
 	beforeEach(() => {
@@ -1077,6 +1167,274 @@ describe("neutral sub-agent delegation extension", () => {
 		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
 	});
 
+	it("uses the exact four-field replay key and preserves lineage, usage, timestamps, and resources", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: (invocation) => {
+					delegateCalls++;
+					return completedResultFor(
+						{
+							...delegateInput,
+							taskId: invocation.taskId,
+							sessionId: invocation.sessionId,
+							toolCallId: invocation.toolCallId,
+							parentRunId: invocation.parentRunId,
+							parentTaskId: invocation.parentTaskId,
+							parentSessionId: invocation.parentSessionId,
+							parentId: invocation.parentId,
+						},
+						`executed:${invocation.taskId}:${delegateCalls}`,
+						{ startedAt: 101, completedAt: 202 },
+					);
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+
+		const lineageInput = {
+			...delegateInput,
+			toolCallId: "tool-call-first",
+			parentRunId: "parent-run-first",
+			parentTaskId: "parent-task-first",
+			parentSessionId: "parent-session-first",
+			parentId: "parent-entry-first",
+		};
+		const first = await tool!.execute("tool-call-first", lineageInput, undefined, undefined, runner.createContext());
+		const firstEnvelope = JSON.parse(textFromToolResult(first)) as Record<string, unknown>;
+
+		const replayWithChangedNonKeyFields = await tool!.execute(
+			"tool-call-replay-non-key",
+			{
+				...lineageInput,
+				toolCallId: "tool-call-changed",
+				parentRunId: "parent-run-changed",
+				parentTaskId: "parent-task-changed",
+				parentSessionId: "parent-session-changed",
+				parentId: "parent-entry-changed",
+				route: "changed-route",
+				input: { prompt: "changed prompt" },
+				limits: { ...delegateInput.limits, outputBytes: 128, outputLines: 2 },
+				metadata: { source: "changed" },
+			},
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replayEnvelope = JSON.parse(textFromToolResult(replayWithChangedNonKeyFields)) as Record<string, unknown>;
+
+		const newTask = await tool!.execute(
+			"tool-call-new-task",
+			{ ...lineageInput, taskId: "task-neutral-new" },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const newTaskEnvelope = JSON.parse(textFromToolResult(newTask)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(2);
+		expect(replayEnvelope).toEqual(firstEnvelope);
+		expect(firstEnvelope).toMatchObject({
+			toolCallId: "tool-call-first",
+			parentRunId: "parent-run-first",
+			parentTaskId: "parent-task-first",
+			parentSessionId: "parent-session-first",
+			parentId: "parent-entry-first",
+			startedAt: 101,
+			completedAt: 202,
+			usage: { inputTokens: 11, outputTokens: 13, totalTokens: 24, toolCalls: 1 },
+			resourceSummary: {
+				turns: 1,
+				childrenStarted: 1,
+				limitDetails: { toolScopes: ["read"] },
+			},
+		});
+		expect(newTaskEnvelope).toMatchObject({
+			taskId: "task-neutral-new",
+			content: [{ type: "text", text: "executed:task-neutral-new:2" }],
+		});
+	});
+
+	it("skips malformed replay records and uses the latest valid matching result", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: () => {
+					delegateCalls++;
+					throw new Error("manual replay fixtures must not execute");
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+
+		const skipMalformedInput = { ...delegateInput, taskId: "task-skip-malformed" };
+		const olderValid = completedResultFor(skipMalformedInput, "older valid", { startedAt: 1, completedAt: 2 });
+		sessionManager.appendCustomEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, olderValid);
+		sessionManager.appendCustomEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, {
+			...olderValid,
+			status: "not-a-valid-status",
+			content: [{ type: "text", text: "malformed newest" }],
+		});
+
+		const replayAfterMalformed = await tool!.execute(
+			"tool-call-skip-malformed",
+			skipMalformedInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replayAfterMalformedEnvelope = JSON.parse(textFromToolResult(replayAfterMalformed)) as Record<
+			string,
+			unknown
+		>;
+
+		const latestInput = { ...delegateInput, taskId: "task-latest-valid" };
+		const oldDuplicate = completedResultFor(latestInput, "old duplicate", { startedAt: 3, completedAt: 4 });
+		const latestDuplicate = completedResultFor(latestInput, "latest duplicate", { startedAt: 5, completedAt: 6 });
+		sessionManager.appendCustomEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, oldDuplicate);
+		sessionManager.appendCustomEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, latestDuplicate);
+
+		const replayLatest = await tool!.execute(
+			"tool-call-latest-valid",
+			latestInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replayLatestEnvelope = JSON.parse(textFromToolResult(replayLatest)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(0);
+		expect(replayAfterMalformedEnvelope).toEqual(olderValid);
+		expect(replayLatestEnvelope).toEqual(latestDuplicate);
+	});
+
+	it("replays after reopening a persisted session without appending duplicate records", async () => {
+		const persistentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sub-agent-reopen-"));
+		try {
+			let delegateCalls = 0;
+			const persistentSession = SessionManager.create(persistentDir, persistentDir);
+			persistentSession.appendMessage({ role: "user", content: "start persisted session", timestamp: 1 });
+			persistentSession.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "ready" }],
+				api: "faux",
+				provider: "faux",
+				model: "faux",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			});
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				createSubAgentExtension({
+					approvedCapabilities: ["agent.delegate"],
+					delegate: (invocation) => {
+						delegateCalls++;
+						return completedResultFor(
+							{ ...delegateInput, taskId: invocation.taskId, sessionId: invocation.sessionId },
+							"persisted replay",
+							{ startedAt: 500, completedAt: 700 },
+						);
+					},
+				}),
+				persistentDir,
+				createEventBus(),
+				runtime,
+				"<sub-agent-extension>",
+			);
+			const runner = new ExtensionRunner([extension], runtime, persistentDir, persistentSession, modelRegistry);
+			bindRunnerCore(runner, persistentSession);
+			const tool = runner.getToolDefinition("sub_agent.delegate");
+			expect(tool).toBeDefined();
+
+			const first = await tool!.execute(
+				"tool-call-persist",
+				{ ...delegateInput, taskId: "task-persisted-replay" },
+				undefined,
+				undefined,
+				runner.createContext(),
+			);
+			const firstEnvelope = JSON.parse(textFromToolResult(first)) as Record<string, unknown>;
+			const sessionFile = persistentSession.getSessionFile();
+			if (sessionFile === undefined) throw new Error("missing persisted session file");
+
+			const reopenedSession = SessionManager.open(sessionFile, persistentDir);
+			const reopenedRuntime = createExtensionRuntime();
+			const reopenedExtension = await loadExtensionFromFactory(
+				createSubAgentExtension({
+					approvedCapabilities: ["agent.delegate"],
+					delegate: () => {
+						delegateCalls++;
+						throw new Error("reopened replay must not execute");
+					},
+				}),
+				persistentDir,
+				createEventBus(),
+				reopenedRuntime,
+				"<sub-agent-extension>",
+			);
+			const reopenedRunner = new ExtensionRunner(
+				[reopenedExtension],
+				reopenedRuntime,
+				persistentDir,
+				reopenedSession,
+				modelRegistry,
+			);
+			bindRunnerCore(reopenedRunner, reopenedSession);
+			const reopenedTool = reopenedRunner.getToolDefinition("sub_agent.delegate");
+			expect(reopenedTool).toBeDefined();
+
+			const customCountBeforeReplay = reopenedSession.getEntries().filter((entry) => entry.type === "custom").length;
+			const replay = await reopenedTool!.execute(
+				"tool-call-reopened-replay",
+				{ ...delegateInput, taskId: "task-persisted-replay" },
+				undefined,
+				undefined,
+				reopenedRunner.createContext(),
+			);
+			const replayEnvelope = JSON.parse(textFromToolResult(replay)) as Record<string, unknown>;
+			const customEntries = reopenedSession.getEntries().filter((entry) => entry.type === "custom");
+			const context = reopenedSession.buildSessionContext();
+
+			expect(delegateCalls).toBe(1);
+			expect(replayEnvelope).toEqual(firstEnvelope);
+			expect(customEntries).toHaveLength(customCountBeforeReplay);
+			expect(customEntries.map((entry) => entry.customType)).toEqual([
+				SUB_AGENT_READINESS_ENTRY,
+				SUB_AGENT_DELEGATION_RESULT_ENTRY,
+			]);
+			expect(JSON.stringify(context.messages)).not.toContain("sub_agent_task_invocation");
+			expect(JSON.stringify(context.messages)).not.toContain("sub_agent_task_result");
+		} finally {
+			fs.rmSync(persistentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("propagates cancellation metadata and prevents delegated work when cancellation is requested", async () => {
 		let delegateCalls = 0;
 		const runtime = createExtensionRuntime();
@@ -1124,6 +1482,11 @@ describe("neutral sub-agent delegation extension", () => {
 			resourceSummary: { childrenStarted: 0 },
 		});
 		expect(sentMessages).toHaveLength(1);
+		expect(sentMessages[0]).toMatchObject({
+			customType: SUB_AGENT_STATUS_MESSAGE,
+			content: "cancelled",
+			details: { type: "sub_agent_task_result", status: "cancelled" },
+		});
 	});
 
 	it("replays denied limit and cancellation results without child side effects", async () => {
