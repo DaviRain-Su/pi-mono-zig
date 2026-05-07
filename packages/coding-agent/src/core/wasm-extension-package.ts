@@ -47,6 +47,7 @@ export interface WasmExtensionPackageManifest {
 	kind: "wasm-extension";
 	packageRoot: string;
 	manifestPath: string;
+	policyLookupKey: string;
 	schemaVersion: string;
 	id: string;
 	name: string;
@@ -72,13 +73,69 @@ export interface WasmExtensionResourceLimits {
 	toolScopes: string[];
 }
 
+export interface WasmExtensionPackagePolicyRequest {
+	packageRoot: string;
+	manifestPath: string;
+	policyLookupKey: string;
+	schemaVersion: string;
+	id: string;
+	name: string;
+	version: string;
+	description: string;
+	artifactPath: string;
+	toolId: string;
+	toolDescription: string;
+	capabilities: string[];
+	resourceLimits: WasmExtensionResourceLimits;
+}
+
+export interface WasmExtensionPackageValidationOptions {
+	approvedCapabilities?: readonly string[];
+	resolveApprovedCapabilities?: (request: WasmExtensionPackagePolicyRequest) => readonly string[] | undefined;
+}
+
 type JsonObject = Record<string, unknown>;
+
+function toPolicyPath(value: string): string {
+	return value.replace(/\\/g, "/");
+}
 
 export function hasWasmExtensionManifest(packageRoot: string): boolean {
 	return existsSync(join(packageRoot, WASM_EXTENSION_MANIFEST_NAME));
 }
 
-export function validateWasmExtensionPackage(packageRoot: string): WasmExtensionPackageManifest {
+export function validateWasmExtensionPackage(
+	packageRoot: string,
+	options: WasmExtensionPackageValidationOptions = {},
+): WasmExtensionPackageManifest {
+	const request = readWasmExtensionPackagePolicyRequest(packageRoot);
+	const approvedCapabilities = options.resolveApprovedCapabilities?.(request) ?? options.approvedCapabilities ?? [];
+	denyRequestedCapabilities(request.capabilities, approvedCapabilities);
+	const artifactAbsolutePath = validateArtifactPath(packageRoot, request.artifactPath);
+	const artifactSha256 = createHash("sha256").update(readFileSync(artifactAbsolutePath)).digest("hex");
+
+	return {
+		kind: "wasm-extension",
+		packageRoot: realpathSync(packageRoot),
+		manifestPath: request.manifestPath,
+		policyLookupKey: createManifestPolicyLookupKey(request),
+		schemaVersion: request.schemaVersion,
+		id: request.id,
+		name: request.name,
+		version: request.version,
+		description: request.description,
+		artifactKind: "wasm-component",
+		artifactPath: request.artifactPath,
+		artifactAbsolutePath,
+		artifactSha256,
+		toolId: request.toolId,
+		toolDescription: request.toolDescription,
+		capabilities: request.capabilities,
+		resourceLimits: request.resourceLimits,
+	};
+}
+
+export function readWasmExtensionPackagePolicyRequest(packageRoot: string): WasmExtensionPackagePolicyRequest {
 	const manifestPath = join(packageRoot, WASM_EXTENSION_MANIFEST_NAME);
 	let parsed: unknown;
 	try {
@@ -127,28 +184,39 @@ export function validateWasmExtensionPackage(packageRoot: string): WasmExtension
 
 	const capabilities = readCapabilities(root);
 	const resourceLimits = readResourceLimits(root);
-	denyRequestedCapabilities(capabilities);
-	const artifactAbsolutePath = validateArtifactPath(packageRoot, artifactPath);
-	const artifactSha256 = createHash("sha256").update(readFileSync(artifactAbsolutePath)).digest("hex");
-
 	return {
-		kind: "wasm-extension",
-		packageRoot: realpathSync(packageRoot),
 		manifestPath,
+		policyLookupKey: createManifestPolicyLookupKey({
+			packageRoot,
+			manifestPath,
+			schemaVersion,
+			id,
+			version,
+			artifactPath,
+		}),
 		schemaVersion,
 		id,
 		name,
 		version,
 		description,
-		artifactKind: "wasm-component",
 		artifactPath,
-		artifactAbsolutePath,
-		artifactSha256,
 		toolId,
 		toolDescription,
 		capabilities,
 		resourceLimits,
+		packageRoot,
 	};
+}
+
+function createManifestPolicyLookupKey(request: {
+	schemaVersion: string;
+	id: string;
+	version: string;
+	packageRoot: string;
+	manifestPath: string;
+	artifactPath: string;
+}): string {
+	return `wasm:manifest:${request.schemaVersion}:${request.id}:${request.version}:${toPolicyPath(request.packageRoot)}:${toPolicyPath(request.manifestPath)}:${toPolicyPath(request.artifactPath)}`;
 }
 
 function messageSuffix(error: unknown): string {
@@ -247,8 +315,12 @@ function readToolScopes(limits: JsonObject): string[] {
 	});
 }
 
-function denyRequestedCapabilities(capabilities: string[]): void {
+function denyRequestedCapabilities(capabilities: string[], approvedCapabilities: readonly string[]): void {
+	const approved = new Set(approvedCapabilities);
 	for (const [index, capability] of capabilities.entries()) {
+		if (approved.has(capability)) {
+			continue;
+		}
 		throw new Error(
 			`$.capabilities[${index}]: ${WASM_DENIED_CAPABILITY_CATEGORY}: capability "${capability}" is not approved for manifest-request`,
 		);

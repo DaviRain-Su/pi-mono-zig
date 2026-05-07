@@ -108,6 +108,17 @@ function toPolicyPath(value: string): string {
 	return value.split(sep).join("/");
 }
 
+export function createWasmExtensionManifestPolicyKey(options: {
+	schemaVersion: string;
+	id: string;
+	version: string;
+	manifestPath: string;
+	packageRoot: string;
+	artifactPath: string;
+}): string {
+	return `wasm:manifest:${options.schemaVersion}:${options.id}:${options.version}:${toPolicyPath(options.packageRoot)}:${toPolicyPath(options.manifestPath)}:${toPolicyPath(options.artifactPath)}`;
+}
+
 function relativePolicyPath(baseDir: string | undefined, filePath: string): string | undefined {
 	if (!baseDir) return undefined;
 	const rel = relative(baseDir, filePath);

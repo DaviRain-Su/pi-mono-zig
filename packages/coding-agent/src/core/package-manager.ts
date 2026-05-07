@@ -31,14 +31,16 @@ import { CONFIG_DIR_NAME } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
-import { createWasmExtensionIdentity, type WasmExtensionIdentity } from "./extension-policy.js";
+import { createWasmExtensionIdentity, type ExtensionPolicy, type WasmExtensionIdentity } from "./extension-policy.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
 import { createSourceInfo } from "./source-info.js";
 import {
 	hasWasmExtensionManifest,
 	validateWasmExtensionPackage,
+	WASM_CANONICAL_SECURITY_GRANTS,
 	type WasmExtensionPackageManifest,
+	type WasmExtensionPackagePolicyRequest,
 } from "./wasm-extension-package.js";
 
 const NETWORK_TIMEOUT_MS = 10000;
@@ -69,6 +71,7 @@ export interface ResolvedWasmExtensionPackage extends WasmExtensionPackageManife
 	enabled: boolean;
 	metadata: PathMetadata;
 	identity: WasmExtensionIdentity;
+	effectivePolicy?: ExtensionPolicy;
 }
 
 export interface ResolvedPaths {
@@ -979,7 +982,10 @@ export class DefaultPackageManager implements PackageManager {
 					throw new Error(`Path does not exist: ${resolved}`);
 				}
 				if (statSync(resolved).isDirectory() && hasWasmExtensionManifest(resolved)) {
-					validateWasmExtensionPackage(resolved);
+					const metadata: PathMetadata = { source, scope, origin: "package", baseDir: resolved };
+					validateWasmExtensionPackage(resolved, {
+						resolveApprovedCapabilities: (request) => this.resolveApprovedWasmCapabilities(request, metadata),
+					});
 				}
 				return;
 			}
@@ -2001,9 +2007,45 @@ export class DefaultPackageManager implements PackageManager {
 		if (!hasWasmExtensionManifest(packageRoot)) {
 			return false;
 		}
-		const manifest = validateWasmExtensionPackage(packageRoot);
+		const manifest = validateWasmExtensionPackage(packageRoot, {
+			resolveApprovedCapabilities: (request) => this.resolveApprovedWasmCapabilities(request, metadata),
+		});
 		this.addWasmExtensionPackage(accumulator.wasmExtensions, manifest, metadata, true);
 		return true;
+	}
+
+	private resolveApprovedWasmCapabilities(
+		request: WasmExtensionPackagePolicyRequest,
+		metadata: PathMetadata,
+	): readonly string[] {
+		const policy = this.resolveWasmPolicyForRequest(request, metadata);
+		return policy?.approvedGrants ?? [];
+	}
+
+	private resolveWasmPolicyForRequest(
+		request: WasmExtensionPackagePolicyRequest,
+		metadata: PathMetadata,
+	): ExtensionPolicy | undefined {
+		const finalIdentityPolicy = this.resolveFinalWasmIdentityPolicy(request, metadata);
+		if (finalIdentityPolicy) {
+			return finalIdentityPolicy;
+		}
+		return this.settingsManager.getExtensionPolicy(request.policyLookupKey);
+	}
+
+	private resolveFinalWasmIdentityPolicy(
+		request: WasmExtensionPackagePolicyRequest,
+		metadata: PathMetadata,
+	): ExtensionPolicy | undefined {
+		try {
+			const manifest = validateWasmExtensionPackage(request.packageRoot, {
+				approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS,
+			});
+			const identity = createWasmExtensionIdentity(manifest, createSourceInfo(manifest.manifestPath, metadata));
+			return this.settingsManager.getExtensionPolicy(identity.key);
+		} catch {
+			return undefined;
+		}
 	}
 
 	private collectDefaultResources(
@@ -2384,13 +2426,21 @@ export class DefaultPackageManager implements PackageManager {
 	private mapWasmExtensionsToResolved(
 		entries: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>,
 	): ResolvedWasmExtensionPackage[] {
-		const resolved = Array.from(entries.values()).map(({ metadata, manifest, enabled }) => ({
-			...manifest,
-			path: manifest.manifestPath,
-			enabled,
-			metadata,
-			identity: createWasmExtensionIdentity(manifest, createSourceInfo(manifest.manifestPath, metadata)),
-		}));
+		const resolved = Array.from(entries.values()).map(({ metadata, manifest, enabled }) => {
+			const sourceInfo = createSourceInfo(manifest.manifestPath, metadata);
+			const identity = createWasmExtensionIdentity(manifest, sourceInfo);
+			const effectivePolicy =
+				this.settingsManager.getExtensionPolicy(identity.key) ??
+				this.settingsManager.getExtensionPolicy(manifest.policyLookupKey);
+			return {
+				...manifest,
+				path: manifest.manifestPath,
+				enabled,
+				metadata,
+				identity,
+				effectivePolicy,
+			};
+		});
 		resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
 
 		const seen = new Set<string>();

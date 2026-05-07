@@ -6,6 +6,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createWasmExtensionManifestPolicyKey } from "../src/core/extension-policy.js";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { WASM_CANONICAL_SECURITY_GRANTS } from "../src/core/wasm-extension-package.js";
@@ -685,6 +686,93 @@ Content`,
 				);
 				expect(settingsManager.getGlobalSettings().packages ?? [], capability).toHaveLength(0);
 			}
+		});
+
+		it("should apply exact approved Wasm policy grants before artifact persistence", async () => {
+			const approvedCapabilityPackage = join(tempDir, "approved-capability-package");
+			mkdirSync(approvedCapabilityPackage, { recursive: true });
+			writeWasmPackage(approvedCapabilityPackage, {
+				artifactPath: "wasm/missing.wasm",
+				capabilities: ["file.read"],
+			});
+			rmSync(join(approvedCapabilityPackage, "wasm", "missing.wasm"));
+			settingsManager.setExtensionPolicy(
+				createWasmExtensionManifestPolicyKey({
+					schemaVersion: "pi-extension.v0",
+					id: "com.example.local-wasm",
+					version: "0.1.0",
+					manifestPath: join(approvedCapabilityPackage, "pi-extension.json"),
+					packageRoot: approvedCapabilityPackage,
+					artifactPath: "wasm/missing.wasm",
+				}),
+				{ approvedGrants: ["file.read"] },
+			);
+
+			await expect(packageManager.installAndPersist(approvedCapabilityPackage)).rejects.toThrow(
+				"$.artifact.path: artifact file was not found",
+			);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+		});
+
+		it("should not let Wasm resource limits or sibling grants approve requested capabilities", async () => {
+			const resourceOnlyPackage = join(tempDir, "resource-only-policy-package");
+			mkdirSync(resourceOnlyPackage, { recursive: true });
+			writeWasmPackage(resourceOnlyPackage, {
+				artifactPath: "wasm/missing.wasm",
+				capabilities: ["file.write"],
+				resourceLimits: { toolScopes: ["fixture.echo"], turns: 1 },
+			});
+			rmSync(join(resourceOnlyPackage, "wasm", "missing.wasm"));
+			const policyKey = createWasmExtensionManifestPolicyKey({
+				schemaVersion: "pi-extension.v0",
+				id: "com.example.local-wasm",
+				version: "0.1.0",
+				manifestPath: join(resourceOnlyPackage, "pi-extension.json"),
+				packageRoot: resourceOnlyPackage,
+				artifactPath: "wasm/missing.wasm",
+			});
+			settingsManager.setExtensionPolicy(policyKey, {
+				approvedGrants: ["file.read"],
+				resourceLimits: { toolScopes: ["fixture.echo"], turns: 1 },
+			});
+
+			await expect(packageManager.installAndPersist(resourceOnlyPackage)).rejects.toThrow(
+				'$.capabilities[0]: denied_capability: capability "file.write" is not approved for manifest-request',
+			);
+			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);
+		});
+
+		it("should resolve valid Wasm packages with final-identity approved policy snapshots", async () => {
+			const packageRoot = join(tempDir, "final-identity-approved-wasm");
+			mkdirSync(packageRoot, { recursive: true });
+			writeWasmPackage(packageRoot);
+			const baseline = await packageManager.resolveExtensionSources([packageRoot]);
+			const identityKey = baseline.wasmExtensions[0]?.identity.key;
+			expect(identityKey).toBeDefined();
+
+			settingsManager.setExtensionPolicy(identityKey!, {
+				approvedGrants: ["file.read"],
+				resourceLimits: { turns: 1, toolScopes: ["fixture.echo"] },
+			});
+			writeWasmPackage(packageRoot, { capabilities: ["file.read"] });
+
+			const approved = await packageManager.resolveExtensionSources([packageRoot]);
+
+			expect(approved.wasmExtensions).toHaveLength(1);
+			expect(approved.wasmExtensions[0].capabilities).toEqual(["file.read"]);
+			expect(approved.wasmExtensions[0].effectivePolicy).toEqual({
+				approvedGrants: ["file.read"],
+				resourceLimits: { turns: 1, toolScopes: ["fixture.echo"] },
+			});
+
+			settingsManager.setExtensionPolicy(identityKey!, { resourceLimits: { turns: 0 } });
+			expect(approved.wasmExtensions[0].effectivePolicy).toEqual({
+				approvedGrants: ["file.read"],
+				resourceLimits: { turns: 1, toolScopes: ["fixture.echo"] },
+			});
+			await expect(packageManager.installAndPersist(packageRoot)).rejects.toThrow(
+				'$.capabilities[0]: denied_capability: capability "file.read" is not approved for manifest-request',
+			);
 		});
 
 		it("should reject legacy broad Wasm security grants as unknown", async () => {
