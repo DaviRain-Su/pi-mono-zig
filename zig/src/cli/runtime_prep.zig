@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("agent");
 const cli = @import("args.zig");
 const bootstrap = @import("bootstrap.zig");
+const model_resolver = @import("model_resolver.zig");
 const config_mod = @import("../coding_agent/config/config.zig");
 const context_files_mod = @import("../coding_agent/resources/context_files.zig");
 const resources_mod = @import("../coding_agent/resources/resources.zig");
@@ -13,13 +14,20 @@ pub const PreparedCliRuntime = struct {
     context_files: []context_files_mod.ContextFile,
     system_prompt: []u8,
     session_dir: []u8,
-    expanded_prompt: ?[]u8,
+    expanded_messages: []const []const u8,
     provider_name: []const u8,
     model_name: ?[]const u8,
+    model_name_owned: bool = false,
+    model_warning: ?[]u8 = null,
+    model_error: ?[]u8 = null,
     thinking_level: agent.ThinkingLevel,
 
     pub fn deinit(self: *PreparedCliRuntime, allocator: std.mem.Allocator) void {
-        if (self.expanded_prompt) |prompt| allocator.free(prompt);
+        for (self.expanded_messages) |message| allocator.free(message);
+        if (self.expanded_messages.len > 0) allocator.free(self.expanded_messages);
+        if (self.model_name_owned and self.model_name != null) allocator.free(self.model_name.?);
+        if (self.model_warning) |warning| allocator.free(warning);
+        if (self.model_error) |message| allocator.free(message);
         allocator.free(self.session_dir);
         allocator.free(self.system_prompt);
         context_files_mod.deinitContextFiles(allocator, self.context_files);
@@ -78,13 +86,13 @@ pub fn prepareCliRuntime(
     const thinking_level = if (options.thinking) |level|
         mapThinkingLevel(level)
     else
-        runtime_config.settings.default_thinking_level orelse .off;
+        initial_model.thinking_level orelse runtime_config.settings.default_thinking_level orelse .off;
 
     const system_prompt = try coding_agent.buildSystemPrompt(allocator, .{
         .cwd = cwd,
         .current_date = current_date,
         .custom_prompt = options.system_prompt,
-        .append_prompt = options.append_system_prompt,
+        .append_prompts = options.append_system_prompt orelse &.{},
         .selected_tools = selected_tools,
         .context_files = context_files,
         .skills = resource_bundle.skills,
@@ -97,11 +105,11 @@ pub fn prepareCliRuntime(
         try runtime_config.effectiveSessionDir(allocator, env_map, cwd);
     errdefer allocator.free(session_dir);
 
-    const expanded_prompt = if (options.prompt) |prompt|
-        try resources_mod.expandPromptTemplate(allocator, prompt, resource_bundle.prompt_templates)
-    else
-        null;
-    errdefer if (expanded_prompt) |value| allocator.free(value);
+    const expanded_messages = try expandMessages(allocator, options.messages orelse &.{}, resource_bundle.prompt_templates);
+    errdefer {
+        for (expanded_messages) |message| allocator.free(message);
+        if (expanded_messages.len > 0) allocator.free(expanded_messages);
+    }
 
     return .{
         .runtime_config = runtime_config,
@@ -109,9 +117,12 @@ pub fn prepareCliRuntime(
         .context_files = context_files,
         .system_prompt = system_prompt,
         .session_dir = session_dir,
-        .expanded_prompt = expanded_prompt,
+        .expanded_messages = expanded_messages,
         .provider_name = provider_name,
         .model_name = model_name,
+        .model_name_owned = initial_model.model_name_owned,
+        .model_warning = initial_model.warning,
+        .model_error = initial_model.error_message,
         .thinking_level = thinking_level,
     };
 }
@@ -172,6 +183,10 @@ pub fn resolvePreflightSessionDir(
 const InitialModelSelection = struct {
     provider_name: []const u8,
     model_name: ?[]const u8,
+    model_name_owned: bool = false,
+    thinking_level: ?agent.ThinkingLevel = null,
+    warning: ?[]u8 = null,
+    error_message: ?[]u8 = null,
 };
 
 fn selectInitialModel(
@@ -180,17 +195,45 @@ fn selectInitialModel(
     runtime_config: *const config_mod.RuntimeConfig,
     options: *const cli.Args,
 ) !InitialModelSelection {
+    if (options.model) |cli_model| {
+        var resolved = try model_resolver.resolveCliModel(allocator, options.provider, cli_model);
+        errdefer resolved.deinit(allocator);
+
+        if (resolved.error_message) |_| {
+            return .{
+                .provider_name = options.provider orelse runtime_config.settings.default_provider orelse "openai",
+                .model_name = null,
+                .warning = resolved.warning,
+                .error_message = resolved.error_message,
+            };
+        }
+
+        if (resolved.provider_name) |provider_name| {
+            const owned_model_name = resolved.owned_model_name;
+            resolved.owned_model_name = null;
+            const warning = resolved.warning;
+            resolved.warning = null;
+            return .{
+                .provider_name = provider_name,
+                .model_name = if (owned_model_name) |owned| owned else resolved.model_name,
+                .model_name_owned = owned_model_name != null,
+                .thinking_level = if (resolved.thinking) |level| mapThinkingLevel(level) else null,
+                .warning = warning,
+            };
+        }
+    }
+
     if (options.provider != null or runtime_config.settings.default_provider != null) {
         return .{
             .provider_name = options.provider orelse runtime_config.settings.default_provider.?,
-            .model_name = options.model orelse runtime_config.settings.default_model,
+            .model_name = runtime_config.settings.default_model,
         };
     }
 
-    if (options.model != null or runtime_config.settings.default_model != null) {
+    if (runtime_config.settings.default_model != null) {
         return .{
             .provider_name = "openai",
-            .model_name = options.model orelse runtime_config.settings.default_model,
+            .model_name = runtime_config.settings.default_model,
         };
     }
 
@@ -209,6 +252,27 @@ fn selectInitialModel(
         .provider_name = "openai",
         .model_name = null,
     };
+}
+
+fn expandMessages(
+    allocator: std.mem.Allocator,
+    messages: []const []const u8,
+    prompt_templates: []const resources_mod.PromptTemplate,
+) ![]const []const u8 {
+    if (messages.len == 0) return &.{};
+
+    const expanded = try allocator.alloc([]const u8, messages.len);
+    errdefer allocator.free(expanded);
+    var initialized: usize = 0;
+    errdefer {
+        for (expanded[0..initialized]) |message| allocator.free(message);
+    }
+
+    for (messages, 0..) |message, index| {
+        expanded[index] = try resources_mod.expandPromptTemplate(allocator, message, prompt_templates);
+        initialized += 1;
+    }
+    return expanded;
 }
 
 fn settingsResources(settings: config_mod.Settings) resources_mod.SettingsResources {
@@ -285,4 +349,38 @@ test "runtimeConfigLoadOptions keeps model discovery enabled by default" {
 
     const options = runtimeConfigLoadOptions(&args, &env_map);
     try std.testing.expect(options.discover_models);
+}
+
+test "prepareCliRuntime resolves provider-prefixed CLI model and thinking suffix" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var args = try cli.parseArgs(allocator, &.{ "--model", "faux/faux-1:high" });
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, null);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqualStrings("faux", prepared.provider_name);
+    try std.testing.expectEqualStrings("faux-1", prepared.model_name.?);
+    try std.testing.expectEqual(agent.ThinkingLevel.high, prepared.thinking_level);
+    try std.testing.expect(prepared.model_error == null);
+}
+
+test "prepareCliRuntime reports missing CLI model without provider" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var args = try cli.parseArgs(allocator, &.{ "--model", "definitely-not-a-real-model" });
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, null);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expect(prepared.model_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.model_error.?, "not found") != null);
 }

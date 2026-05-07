@@ -46,6 +46,26 @@ pub fn runCliExecutable(
     args: []const []const u8,
     env_entries: []const struct { []const u8, []const u8 },
 ) !CliExecutableResult {
+    return runCliExecutableInner(allocator, tmp, args, null, env_entries);
+}
+
+pub fn runCliExecutableWithInput(
+    allocator: std.mem.Allocator,
+    tmp: anytype,
+    args: []const []const u8,
+    stdin_input: []const u8,
+    env_entries: []const struct { []const u8, []const u8 },
+) !CliExecutableResult {
+    return runCliExecutableInner(allocator, tmp, args, stdin_input, env_entries);
+}
+
+fn runCliExecutableInner(
+    allocator: std.mem.Allocator,
+    tmp: anytype,
+    args: []const []const u8,
+    stdin_input: ?[]const u8,
+    env_entries: []const struct { []const u8, []const u8 },
+) !CliExecutableResult {
     try tmp.dir.createDirPath(std.testing.io, "home");
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "project");
@@ -70,6 +90,51 @@ pub fn runCliExecutable(
     try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
     for (env_entries) |entry| {
         try env_map.put(entry[0], entry[1]);
+    }
+
+    if (stdin_input) |input| {
+        var child = try std.process.spawn(std.testing.io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = project_dir },
+            .environ_map = &env_map,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        defer child.kill(std.testing.io);
+
+        var stdin_file = child.stdin.?;
+        child.stdin = null;
+        try stdin_file.writeStreamingAll(std.testing.io, input);
+        stdin_file.close(std.testing.io);
+
+        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+        var multi_reader: std.Io.File.MultiReader = undefined;
+        multi_reader.init(allocator, std.testing.io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer multi_reader.deinit();
+
+        const stdout_reader = multi_reader.reader(0);
+        const stderr_reader = multi_reader.reader(1);
+        while (multi_reader.fill(64, .none)) |_| {
+            if (stdout_reader.buffered().len > 128 * 1024) return error.StreamTooLong;
+            if (stderr_reader.buffered().len > 128 * 1024) return error.StreamTooLong;
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            else => |e| return e,
+        }
+        try multi_reader.checkAnyError();
+
+        const term = try child.wait(std.testing.io);
+        const stdout_slice = try multi_reader.toOwnedSlice(0);
+        errdefer allocator.free(stdout_slice);
+        const stderr_slice = try multi_reader.toOwnedSlice(1);
+        errdefer allocator.free(stderr_slice);
+
+        return .{
+            .stdout = stdout_slice,
+            .stderr = stderr_slice,
+            .exit_code = exitCodeFromTerm(term),
+        };
     }
 
     const result = try std.process.run(allocator, std.testing.io, .{

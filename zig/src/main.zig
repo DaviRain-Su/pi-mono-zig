@@ -124,7 +124,8 @@ fn runCliWithInput(
     defer effective_env_map.deinit();
 
     if (options.@"export") |session_file| {
-        return output.runSessionExport(allocator, io, &effective_env_map, cwd_override, session_file, options.prompt, stdout, stderr) catch |err| {
+        const output_path = if (options.messages) |messages| if (messages.len > 0) messages[0] else null else null;
+        return output.runSessionExport(allocator, io, &effective_env_map, cwd_override, session_file, output_path, stdout, stderr) catch |err| {
             try stderr.print("Error: {s}\n", .{output.exportErrorMessage(err)});
             return 1;
         };
@@ -158,7 +159,7 @@ fn runCliWithInput(
         return 1;
     }
 
-    if ((options.mode == .rpc or options.mode == .ts_rpc) and options.prompt != null) {
+    if ((options.mode == .rpc or options.mode == .ts_rpc) and options.messages != null) {
         try stderr.writeAll("Error: Prompt arguments are not supported in RPC mode\n");
         return 1;
     }
@@ -225,7 +226,7 @@ fn runCliWithInput(
         &effective_env_map,
         cwd,
         options.file_args,
-        prepared.expanded_prompt,
+        prepared.expanded_messages,
         detected_stdin.content,
         stderr,
         .{ .auto_resize_images = prepared.runtime_config.imageAutoResize() },
@@ -288,9 +289,10 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc|ts-rpc>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--mode, -mode <mode>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "rpc, json-rpc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--tools, -t <names>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools, -nt") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-builtin-tools, -nbt") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-context-files, -nc") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--export <file>") != null);
@@ -432,6 +434,83 @@ test "runCli prints faux response end to end" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("hello from cli\n", stdout_capture.writer.buffered());
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli resolves provider-prefixed model without explicit provider" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_FAUX_RESPONSE", "provider inferred");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--model", "faux/faux-1", "--print", "hello" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("provider inferred\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "CLI positional messages remain separate through initial input prep" {
+    const allocator = std.testing.allocator;
+
+    var args = try cli.parseArgs(allocator, &.{ "first prompt", "second prompt", "third prompt" });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), args.messages.?.len);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var prepared_input = try input_prep.prepareInitialInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        "/tmp/project",
+        null,
+        args.messages.?,
+        null,
+        &stderr_capture.writer,
+        .{},
+    );
+    defer prepared_input.deinit(allocator);
+
+    try std.testing.expectEqualStrings("first prompt", prepared_input.prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), prepared_input.messages.len);
+    try std.testing.expectEqualStrings("second prompt", prepared_input.messages[0]);
+    try std.testing.expectEqualStrings("third prompt", prepared_input.messages[1]);
+}
+
+test "prepareCliRuntime resolves model thinking suffix" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var args = try cli.parseArgs(allocator, &.{ "--model", "faux/faux-1:high" });
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, null);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqualStrings("faux", prepared.provider_name);
+    try std.testing.expectEqualStrings("faux-1", prepared.model_name.?);
+    try std.testing.expectEqual(agent.ThinkingLevel.high, prepared.thinking_level);
+    try std.testing.expect(prepared.model_error == null);
 }
 
 test "runCli dispatches package commands before normal CLI parsing" {
@@ -923,6 +1002,56 @@ test "cli executable print mode json writes valid JSON lines to stdout" {
     try std.testing.expect(saw_agent_start);
     try std.testing.expect(saw_agent_end);
     try std.testing.expect(saw_response_text);
+}
+
+test "cli executable --mode rpc uses TS-compatible JSONL get_state" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var result = try cli_test.runCliExecutableWithInput(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--no-session", "--mode", "rpc" },
+        "{\"id\":\"state\",\"type\":\"get_state\"}\n",
+        &.{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expect(!cli_test.hasAnsiEscape(result.stdout));
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"id\":\"state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"type\":\"response\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"command\":\"get_state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"jsonrpc\"") == null);
+}
+
+test "cli executable -mode rpc uses TS-compatible JSONL get_state" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var result = try cli_test.runCliExecutableWithInput(
+        allocator,
+        tmp,
+        &.{ "--provider", "faux", "--no-session", "-mode", "rpc" },
+        "{\"id\":\"state_short\",\"type\":\"get_state\"}\n",
+        &.{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expect(!cli_test.hasAnsiEscape(result.stdout));
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"id\":\"state_short\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"type\":\"response\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"command\":\"get_state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"success\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"jsonrpc\"") == null);
 }
 
 test "runCli persists and continues sessions across runs" {
@@ -1913,7 +2042,8 @@ test "prepareCliRuntime loads defaults resources context and prompt templates" {
     try std.testing.expectEqualStrings("faux-1", prepared.model_name.?);
     try std.testing.expectEqual(agent.ThinkingLevel.minimal, prepared.thinking_level);
     try std.testing.expectEqualStrings("night", prepared.resource_bundle.selectedTheme().name);
-    try std.testing.expectEqualStrings("Fix parser bug please.", prepared.expanded_prompt.?);
+    try std.testing.expectEqual(@as(usize, 1), prepared.expanded_messages.len);
+    try std.testing.expectEqualStrings("Fix parser bug please.", prepared.expanded_messages[0]);
     try std.testing.expect(prepared.context_files.len >= 1);
     try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Project instructions from AGENTS.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "<available_skills>") != null);
@@ -1921,6 +2051,51 @@ test "prepareCliRuntime loads defaults resources context and prompt templates" {
     const expected_session_dir = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, "sessions" });
     defer allocator.free(expected_session_dir);
     try std.testing.expectEqualStrings(expected_session_dir, prepared.session_dir);
+}
+
+test "prepareCliRuntime appends repeatable CLI system prompts in order" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/settings.json",
+        .data =
+        \\{
+        \\  "defaultProvider": "faux",
+        \\  "defaultModel": "faux-1"
+        \\}
+        ,
+    });
+
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const repo_dir = try cli_test.makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(repo_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+
+    var args = try cli.parseArgs(allocator, &.{
+        "--append-system-prompt",
+        "First appended chunk.",
+        "--append-system-prompt",
+        "Second appended chunk.",
+    });
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, null);
+    defer prepared.deinit(allocator);
+
+    const first_index_opt = std.mem.indexOf(u8, prepared.system_prompt, "First appended chunk.");
+    const second_index_opt = std.mem.indexOf(u8, prepared.system_prompt, "Second appended chunk.");
+    try std.testing.expect(first_index_opt != null);
+    try std.testing.expect(second_index_opt != null);
+    try std.testing.expect(first_index_opt.? < second_index_opt.?);
 }
 
 test "prepareCliRuntime wires CLI resource overrides and discovery toggles" {
@@ -2049,7 +2224,8 @@ test "prepareCliRuntime wires CLI resource overrides and discovery toggles" {
     try std.testing.expectEqualStrings("reviewer", prepared.resource_bundle.skills[0].name);
     try std.testing.expectEqual(@as(usize, 1), prepared.resource_bundle.prompt_templates.len);
     try std.testing.expectEqualStrings("fix", prepared.resource_bundle.prompt_templates[0].name);
-    try std.testing.expectEqualStrings("CLI fix parser bug.", prepared.expanded_prompt.?);
+    try std.testing.expectEqual(@as(usize, 1), prepared.expanded_messages.len);
+    try std.testing.expectEqualStrings("CLI fix parser bug.", prepared.expanded_messages[0]);
     try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "CLI review skill") != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Default review skill") == null);
     try std.testing.expectEqualStrings("night", prepared.resource_bundle.selectedTheme().name);

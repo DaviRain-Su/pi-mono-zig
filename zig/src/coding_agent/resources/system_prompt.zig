@@ -21,7 +21,7 @@ pub const BuildSystemPromptOptions = struct {
     cwd: []const u8,
     current_date: []const u8,
     custom_prompt: ?[]const u8 = null,
-    append_prompt: ?[]const u8 = null,
+    append_prompts: []const []const u8 = &.{},
     selected_tools: ?[]const []const u8 = null,
     context_files: []const context_files_mod.ContextFile = &.{},
     skills: []const resources_mod.Skill = &.{},
@@ -41,7 +41,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: BuildSystemPromp
         try appendGuidelines(allocator, &prompt, options.selected_tools);
     }
 
-    if (options.append_prompt) |append_prompt| {
+    for (options.append_prompts) |append_prompt| {
         try prompt.appendSlice(allocator, "\n\n");
         try prompt.appendSlice(allocator, append_prompt);
     }
@@ -190,7 +190,7 @@ test "custom system prompt replaces default and appends extra text" {
     const prompt = try buildSystemPrompt(allocator, .{
         .cwd = "/tmp/project",
         .custom_prompt = "You are a terse assistant.",
-        .append_prompt = "Prefer short answers.",
+        .append_prompts = &.{"Prefer short answers."},
         .current_date = "2026-04-24",
     });
     defer allocator.free(prompt);
@@ -200,6 +200,25 @@ test "custom system prompt replaces default and appends extra text" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Available tools:") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Current date: 2026-04-24") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Current working directory: /tmp/project") != null);
+}
+
+test "system prompt appends repeatable extra text in order" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .cwd = "/tmp/project",
+        .custom_prompt = "Base prompt.",
+        .append_prompts = &.{ "First appended chunk.", "Second appended chunk." },
+        .current_date = "2026-04-24",
+    });
+    defer allocator.free(prompt);
+
+    const first_index_opt = std.mem.indexOf(u8, prompt, "First appended chunk.");
+    const second_index_opt = std.mem.indexOf(u8, prompt, "Second appended chunk.");
+    try std.testing.expect(first_index_opt != null);
+    try std.testing.expect(second_index_opt != null);
+    const first_index = first_index_opt.?;
+    const second_index = second_index_opt.?;
+    try std.testing.expect(first_index < second_index);
 }
 
 test "selected tools limit the visible tool list" {

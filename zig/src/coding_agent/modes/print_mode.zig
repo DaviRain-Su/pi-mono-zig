@@ -18,6 +18,7 @@ pub const RunPrintModeOptions = struct {
     install_signal_handlers: bool = true,
     config_errors: []const config_mod.ConfigError = &.{},
     initial_images: []const ai.ImageContent = &.{},
+    messages: []const []const u8 = &.{},
 };
 
 const SignalGuard = struct {
@@ -107,7 +108,7 @@ pub fn runPrintMode(
     allocator: std.mem.Allocator,
     io: std.Io,
     session: *session_mod.AgentSession,
-    input: anytype,
+    input: []const u8,
     options: RunPrintModeOptions,
     stdout_writer: *std.Io.Writer,
     stderr_writer: *std.Io.Writer,
@@ -159,6 +160,14 @@ pub fn runPrintMode(
         try stderr_writer.flush();
         return 1;
     };
+
+    for (options.messages) |message| {
+        session.prompt(message) catch |err| {
+            try stderr_writer.print("Error: {s}\n", .{@errorName(err)});
+            try stderr_writer.flush();
+            return 1;
+        };
+    }
 
     const message = findLastAssistantMessage(session.agent.getMessages()) orelse {
         try stderr_writer.writeAll("Error: missing completion result\n");

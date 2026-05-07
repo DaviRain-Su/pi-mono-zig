@@ -37,11 +37,19 @@ pub fn dispatchRunMode(
     const app_mode = dispatch_options.app_mode;
 
     if (app_mode == .print or app_mode == .json) {
-        if (initial_input.prompt == null) {
+        if (initial_input.prompt == null and initial_input.messages.len == 0) {
             try stderr.writeAll("Error: No prompt provided\n\n");
             try output.printUsage(allocator, dispatch_options.version, stdout);
             return 1;
         }
+    }
+
+    if (prepared.model_warning) |warning| {
+        try stderr.print("Warning: {s}\n", .{warning});
+    }
+    if (prepared.model_error) |message| {
+        try stderr.print("Error: {s}\n", .{message});
+        return 1;
     }
 
     if (app_mode != .interactive) {
@@ -108,6 +116,7 @@ pub fn dispatchRunMode(
             .model_patterns = options.models,
             .selected_tools = dispatch_options.selected_tools,
             .initial_prompt = initial_input.prompt,
+            .initial_messages = initial_input.messages,
             .initial_images = initial_input.images,
             .prompt_templates = prepared.resource_bundle.prompt_templates,
             .keybindings = &prepared.runtime_config.keybindings,
@@ -167,6 +176,7 @@ fn dispatchNonInteractiveMode(
             .model_patterns = options.models,
             .selected_tools = dispatch_options.selected_tools,
             .initial_prompt = null,
+            .initial_messages = &.{},
             .initial_images = &.{},
             .prompt_templates = prepared.resource_bundle.prompt_templates,
             .keybindings = &prepared.runtime_config.keybindings,
@@ -234,6 +244,7 @@ fn dispatchNonInteractiveMode(
             .mode = if (dispatch_options.app_mode == .json) .json else .text,
             .config_errors = prepared.runtime_config.errors,
             .initial_images = initial_input.images,
+            .messages = initial_input.messages,
         },
         stdout,
         stderr,

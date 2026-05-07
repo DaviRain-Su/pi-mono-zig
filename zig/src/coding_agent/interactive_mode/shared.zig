@@ -61,6 +61,7 @@ pub const RunInteractiveModeOptions = struct {
     model_patterns: ?[]const []const u8 = null,
     selected_tools: ?[]const []const u8 = null,
     initial_prompt: ?[]const u8 = null,
+    initial_messages: []const []const u8 = &.{},
     initial_images: []const ai.ImageContent = &.{},
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
     skills: []const resources_mod.Skill = &.{},

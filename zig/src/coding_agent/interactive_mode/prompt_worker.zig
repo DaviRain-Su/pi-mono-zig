@@ -23,7 +23,15 @@ pub const PromptWorker = struct {
         self.session = session;
         self.app_state = app_state;
         self.prompt_text = try allocator.dupe(u8, prompt_text);
+        errdefer {
+            allocator.free(self.prompt_text);
+            self.prompt_text = &.{};
+        }
         self.prompt_images = try cloneImageContents(allocator, prompt_images);
+        errdefer {
+            deinitImageContents(allocator, self.prompt_images);
+            self.prompt_images = &.{};
+        }
         self.running.store(true, .seq_cst);
         self.thread = try std.Thread.spawn(.{}, run, .{ self, allocator });
     }
@@ -52,6 +60,7 @@ pub const PromptWorker = struct {
             const message = std.fmt.allocPrint(allocator, "error: {s}", .{@errorName(err)}) catch return;
             defer allocator.free(message);
             self.app_state.appendError(message) catch {};
+            return;
         };
     }
 };

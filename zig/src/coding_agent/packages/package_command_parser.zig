@@ -242,8 +242,13 @@ pub fn parsePackageCommand(allocator: std.mem.Allocator, args: []const []const u
                 }
                 continue;
             }
-            if (saw_extension_source_owned) |existing| allocator.free(existing);
-            saw_extension_source_owned = try allocator.dupe(u8, args[next_index]);
+            if (saw_extension_source_owned != null) {
+                if (result.parse_error == null) {
+                    result.parse_error = try allocator.dupe(u8, "--extension can only be provided once.");
+                }
+            } else {
+                saw_extension_source_owned = try allocator.dupe(u8, args[next_index]);
+            }
             index += 1;
             continue;
         }

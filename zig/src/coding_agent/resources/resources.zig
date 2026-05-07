@@ -1526,10 +1526,20 @@ fn parseSource(source: []const u8) ParsedSource {
     if (std.mem.startsWith(u8, source, "git:")) {
         return .{ .git = .{ .normalized = std.mem.trim(u8, source["git:".len..], " ") } };
     }
+    if (isGitUrlSource(source)) {
+        return .{ .git = .{ .normalized = std.mem.trim(u8, source, " ") } };
+    }
     if (std.mem.startsWith(u8, source, "local:")) {
         return .{ .local = .{ .path = std.mem.trim(u8, source["local:".len..], " ") } };
     }
     return .{ .local = .{ .path = source } };
+}
+
+fn isGitUrlSource(source: []const u8) bool {
+    return std.mem.startsWith(u8, source, "https://") or
+        std.mem.startsWith(u8, source, "http://") or
+        std.mem.startsWith(u8, source, "ssh://") or
+        std.mem.startsWith(u8, source, "git://");
 }
 
 fn parseNpmName(spec: []const u8) []const u8 {

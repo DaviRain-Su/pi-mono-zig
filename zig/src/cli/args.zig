@@ -46,7 +46,7 @@ pub const Args = struct {
     provider: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
-    append_system_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const []const u8 = null,
     thinking: ?ThinkingLevel = null,
     extensions: ?[]const []const u8 = null,
     no_extensions: bool = false,
@@ -76,6 +76,7 @@ pub const Args = struct {
     @"export": ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
+    messages: ?[]const []const u8 = null,
     prompt: ?[]const u8 = null,
     prompt_owned: bool = false,
     file_args: ?[]const []const u8 = null,
@@ -83,11 +84,13 @@ pub const Args = struct {
 
     pub fn deinit(self: *Args, allocator: std.mem.Allocator) void {
         if (self.extensions) |extensions| allocator.free(extensions);
+        if (self.append_system_prompt) |append_system_prompt| allocator.free(append_system_prompt);
         if (self.skills) |skills| allocator.free(skills);
         if (self.prompt_templates) |prompt_templates| allocator.free(prompt_templates);
         if (self.themes) |themes| allocator.free(themes);
         if (self.tools) |tools| allocator.free(tools);
         if (self.models) |models| allocator.free(models);
+        if (self.messages) |messages| allocator.free(messages);
         if (self.file_args) |file_args| allocator.free(file_args);
         if (self.unknown_flags) |flags| allocator.free(flags);
         if (self.prompt_owned and self.prompt != null) allocator.free(self.prompt.?);
@@ -98,15 +101,18 @@ pub const Args = struct {
 pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseArgsError!Args {
     var result = Args{};
     errdefer result.deinit(allocator);
-    var prompt_builder = std.ArrayList(u8).empty;
-    var prompt_transferred = false;
-    defer if (!prompt_transferred) prompt_builder.deinit(allocator);
+    var messages_builder = std.ArrayList([]const u8).empty;
+    var messages_transferred = false;
+    defer if (!messages_transferred) messages_builder.deinit(allocator);
     var file_args_builder = std.ArrayList([]const u8).empty;
     var file_args_transferred = false;
     defer if (!file_args_transferred) file_args_builder.deinit(allocator);
     var extensions_builder = std.ArrayList([]const u8).empty;
     var extensions_transferred = false;
     defer if (!extensions_transferred) extensions_builder.deinit(allocator);
+    var append_system_prompt_builder = std.ArrayList([]const u8).empty;
+    var append_system_prompt_transferred = false;
+    defer if (!append_system_prompt_transferred) append_system_prompt_builder.deinit(allocator);
     var skills_builder = std.ArrayList([]const u8).empty;
     var skills_transferred = false;
     defer if (!skills_transferred) skills_builder.deinit(allocator);
@@ -194,7 +200,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             result.models = try parseCommaSeparatedList(allocator, argv[i]);
         } else if (std.mem.eql(u8, arg, "--list-models")) {
             result.list_models = true;
-            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) {
+            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-") and !std.mem.startsWith(u8, argv[i + 1], "@")) {
                 i += 1;
                 result.list_models_search = argv[i];
             }
@@ -202,11 +208,15 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             result.no_session = true;
         } else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             result.print = true;
-        } else if (std.mem.eql(u8, arg, "--mode")) {
+            if (i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "@") and (!std.mem.startsWith(u8, argv[i + 1], "-") or std.mem.startsWith(u8, argv[i + 1], "---"))) {
+                i += 1;
+                try messages_builder.append(allocator, argv[i]);
+            }
+        } else if (std.mem.eql(u8, arg, "--mode") or std.mem.eql(u8, arg, "-mode")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             result.mode = parseMode(argv[i]) orelse return error.InvalidMode;
-        } else if (std.mem.eql(u8, arg, "--tools")) {
+        } else if (std.mem.eql(u8, arg, "--tools") or std.mem.eql(u8, arg, "-t")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
             if (result.tools) |tools| {
@@ -214,7 +224,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
                 result.tools = null;
             }
             result.tools = try parseToolList(allocator, argv[i]);
-        } else if (std.mem.eql(u8, arg, "--no-tools")) {
+        } else if (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt")) {
             result.no_tools = true;
         } else if (std.mem.eql(u8, arg, "--no-builtin-tools") or std.mem.eql(u8, arg, "-nbt")) {
             result.no_builtin_tools = true;
@@ -225,7 +235,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
         } else if (std.mem.eql(u8, arg, "--append-system-prompt")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
-            result.append_system_prompt = argv[i];
+            try append_system_prompt_builder.append(allocator, argv[i]);
         } else if (std.mem.eql(u8, arg, "--no-context-files") or std.mem.eql(u8, arg, "-nc")) {
             result.no_context_files = true;
         } else if (std.mem.eql(u8, arg, "--offline")) {
@@ -277,17 +287,13 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
             // the caller can render `Error: Unknown option`.
             return error.UnknownOption;
         } else {
-            if (prompt_builder.items.len > 0) {
-                try prompt_builder.append(allocator, ' ');
-            }
-            try prompt_builder.appendSlice(allocator, arg);
+            try messages_builder.append(allocator, arg);
         }
     }
 
-    if (prompt_builder.items.len > 0) {
-        result.prompt = try prompt_builder.toOwnedSlice(allocator);
-        result.prompt_owned = true;
-        prompt_transferred = true;
+    if (messages_builder.items.len > 0) {
+        result.messages = try messages_builder.toOwnedSlice(allocator);
+        messages_transferred = true;
     }
 
     if (file_args_builder.items.len > 0) {
@@ -297,6 +303,10 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
     if (extensions_builder.items.len > 0) {
         result.extensions = try extensions_builder.toOwnedSlice(allocator);
         extensions_transferred = true;
+    }
+    if (append_system_prompt_builder.items.len > 0) {
+        result.append_system_prompt = try append_system_prompt_builder.toOwnedSlice(allocator);
+        append_system_prompt_transferred = true;
     }
     if (skills_builder.items.len > 0) {
         result.skills = try skills_builder.toOwnedSlice(allocator);
@@ -380,7 +390,7 @@ fn renderBaseHelp(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\pi - AI assistant (Zig rewrite) v{s}
         \\
         \\Usage:
-        \\  pi [options] [@files...] [prompt]
+        \\  pi [options] [@files...] [messages...]
         \\
         \\Commands:
         \\  pi install <source> [-l]       Install extension source and add to settings
@@ -416,12 +426,12 @@ fn renderBaseHelp(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --models <patterns>            Comma-separated model patterns for model selection
         \\  --list-models [search]         List available models and exit
         \\  --print, -p                    Non-interactive mode
-        \\  --mode <text|json|rpc|ts-rpc>  Output mode (default: text)
-        \\  --tools <names>                Comma-separated tool allowlist
-        \\  --no-tools                     Disable built-in tools by default
+        \\  --mode, -mode <mode>           Output mode: text, json, rpc, json-rpc (default: text; ts-rpc aliases rpc)
+        \\  --tools, -t <names>            Comma-separated tool allowlist
+        \\  --no-tools, -nt                Disable built-in tools by default
         \\  --no-builtin-tools, -nbt       Disable built-in tools by default but keep custom tools enabled
         \\  --system-prompt <text>         Replace the default system prompt
-        \\  --append-system-prompt <text>  Append text to the system prompt
+        \\  --append-system-prompt <text>  Append text to the system prompt (repeatable)
         \\  --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
         \\  --export <file>                Export session file to HTML or JSONL and exit
         \\  --verbose                      Force verbose startup
@@ -452,8 +462,12 @@ pub fn versionText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
 fn parseMode(value: []const u8) ?Mode {
     if (std.mem.eql(u8, value, "text")) return .text;
     if (std.mem.eql(u8, value, "json")) return .json;
-    if (std.mem.eql(u8, value, "rpc")) return .rpc;
+    // TypeScript `--mode rpc` is the JSONL command protocol implemented by
+    // `ts_rpc_mode.zig`. Keep the older Zig JSON-RPC protocol available under
+    // an explicit compatibility spelling.
+    if (std.mem.eql(u8, value, "rpc")) return .ts_rpc;
     if (std.mem.eql(u8, value, "ts-rpc")) return .ts_rpc;
+    if (std.mem.eql(u8, value, "json-rpc")) return .rpc;
     return null;
 }
 
@@ -522,11 +536,11 @@ test "parse args supports expected CLI flags" {
         "sonnet",
         "--no-session",
         "--print",
-        "--mode",
+        "-mode",
         "json",
-        "--tools",
+        "-t",
         "read, grep,ls",
-        "--no-tools",
+        "-nt",
         "--no-builtin-tools",
         "--no-context-files",
         "--offline",
@@ -574,7 +588,8 @@ test "parse args supports expected CLI flags" {
     try std.testing.expect(args.offline);
     try std.testing.expect(args.verbose);
     try std.testing.expectEqualStrings("session.jsonl", args.@"export".?);
-    try std.testing.expectEqualStrings("Summarize the repository", args.prompt.?);
+    try std.testing.expectEqual(@as(usize, 1), args.messages.?.len);
+    try std.testing.expectEqualStrings("Summarize the repository", args.messages.?[0]);
     try std.testing.expectEqual(@as(usize, 2), args.file_args.?.len);
     try std.testing.expectEqualStrings("prompt.md", args.file_args.?[0]);
     try std.testing.expectEqualStrings("image.png", args.file_args.?[1]);
@@ -586,10 +601,54 @@ test "parse args supports expected CLI flags" {
 
 test "parse args accepts TS RPC mode" {
     const allocator = std.testing.allocator;
-    var args = try parseArgs(allocator, &.{ "--mode", "ts-rpc" });
+    var args = try parseArgs(allocator, &.{ "--mode", "rpc" });
     defer args.deinit(allocator);
 
     try std.testing.expectEqual(Mode.ts_rpc, args.mode);
+}
+
+test "parse args keeps legacy JSON-RPC mode under explicit json-rpc spelling" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{ "--mode", "json-rpc" });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(Mode.rpc, args.mode);
+}
+
+test "parse args accepts TS-compatible short tool aliases" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{ "-nt", "-t", "read,bash" });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.no_tools);
+    try std.testing.expectEqual(@as(usize, 2), args.tools.?.len);
+    try std.testing.expectEqualStrings("read", args.tools.?[0]);
+    try std.testing.expectEqualStrings("bash", args.tools.?[1]);
+}
+
+test "parse args preserves repeatable append system prompt order" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{
+        "--append-system-prompt",
+        "First appended chunk.",
+        "--append-system-prompt",
+        "Second appended chunk.",
+    });
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), args.append_system_prompt.?.len);
+    try std.testing.expectEqualStrings("First appended chunk.", args.append_system_prompt.?[0]);
+    try std.testing.expectEqualStrings("Second appended chunk.", args.append_system_prompt.?[1]);
+}
+
+test "parse args consumes print prompt that starts with YAML frontmatter" {
+    const allocator = std.testing.allocator;
+    var args = try parseArgs(allocator, &.{ "-p", "---\ntitle: hello\n---\nSay hi." });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.print);
+    try std.testing.expectEqual(@as(usize, 1), args.messages.?.len);
+    try std.testing.expectEqualStrings("---\ntitle: hello\n---\nSay hi.", args.messages.?[0]);
 }
 
 test "parse args collects unknown long flags as boolean by default" {
@@ -712,7 +771,7 @@ test "parse args supports list-models without a search term" {
     try std.testing.expect(args.list_models_search == null);
 }
 
-test "parse args concatenates multiple positional prompts" {
+test "parse args keeps multiple positional messages separate" {
     const allocator = std.testing.allocator;
 
     var args = try parseArgs(allocator, &.{
@@ -722,8 +781,10 @@ test "parse args concatenates multiple positional prompts" {
     });
     defer args.deinit(allocator);
 
-    try std.testing.expect(args.prompt_owned);
-    try std.testing.expectEqualStrings("Summarize the repository", args.prompt.?);
+    try std.testing.expectEqual(@as(usize, 3), args.messages.?.len);
+    try std.testing.expectEqualStrings("Summarize", args.messages.?[0]);
+    try std.testing.expectEqualStrings("the", args.messages.?[1]);
+    try std.testing.expectEqualStrings("repository", args.messages.?[2]);
 }
 
 test "parse args keeps @file arguments separate from the prompt" {
@@ -737,7 +798,9 @@ test "parse args keeps @file arguments separate from the prompt" {
     });
     defer args.deinit(allocator);
 
-    try std.testing.expectEqualStrings("Explain this", args.prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), args.messages.?.len);
+    try std.testing.expectEqualStrings("Explain", args.messages.?[0]);
+    try std.testing.expectEqualStrings("this", args.messages.?[1]);
     try std.testing.expectEqual(@as(usize, 2), args.file_args.?.len);
     try std.testing.expectEqualStrings("notes.md", args.file_args.?[0]);
     try std.testing.expectEqualStrings("diagram.png", args.file_args.?[1]);
@@ -774,16 +837,19 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--mode <text|json|rpc|ts-rpc>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--tools <names>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--mode, -mode <mode>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "rpc, json-rpc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--append-system-prompt <text>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "repeatable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--tools, -t <names>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--no-tools, -nt") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-builtin-tools, -nbt") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--no-context-files, -nc") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--export <file>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--verbose") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--offline") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--help, -h") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "[@files...] [prompt]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "[@files...] [messages...]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") != null);
 }
 

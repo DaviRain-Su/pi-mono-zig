@@ -5,11 +5,12 @@ const config_selector = @import("config_selector.zig");
 const package_command_parser = @import("package_command_parser.zig");
 
 /// Package CLI subcommand parser/executor parity with the TypeScript
-/// `package-manager-cli.ts`. Scope for M12 m12-package-cli-local-fixtures:
-/// install/remove/uninstall/list and offline `update` against local
-/// fixture packages only. Network sources (npm/git) and self-update are
-/// intentionally out of scope; they live behind explicit error
-/// diagnostics until the broader M12 mission feature lands.
+/// `package-manager-cli.ts`. Local fixture behavior is preserved while
+/// npm/git install and update paths shell out through package-manager
+/// commands (overridden by tests to avoid real network work). Self-update
+/// supports the CLI surface and deterministic test override; native Zig
+/// builds without an override report that self-update is unsupported because
+/// they cannot safely prove global package-manager ownership.
 ///
 /// Mirrors `packages/coding-agent/src/package-manager-cli.ts` (parse +
 /// dispatch) and `packages/coding-agent/src/core/package-manager.ts`
@@ -24,11 +25,9 @@ const package_command_parser = @import("package_command_parser.zig");
 ///     a non-zero exit when nothing matched.
 ///   - `list` prints user/project package entries, grouped by scope,
 ///     with a deterministic ordering matching TS output.
-///   - `update` is an offline no-op: with no target it reports
-///     "Updated packages"; with a positional target it reports
-///     "Updated <source>" only when the source is currently installed,
-///     otherwise it errors with a missing-target diagnostic. No
-///     network access or filesystem mutation is performed.
+///   - `update` matches the TS command surface: all/extensions/source
+///     targets update configured packages, local sources are no-ops, and
+///     bare `update` also includes the self-update path.
 ///
 /// The CLI dispatcher is idempotent and uses temporary HOME/agent-dir
 /// settings paths for tests so deterministic fixture runs can compare
@@ -52,6 +51,14 @@ pub const packageCommandUsage = package_command_parser.packageCommandUsage;
 pub const ExecuteOptions = struct {
     cwd: []const u8,
     agent_dir: []const u8,
+    /// Optional command prefix used instead of `npm` for npm package installs
+    /// and updates. Tests pass a local fixture command here to avoid real
+    /// network/package-manager work.
+    npm_command_override: ?[]const []const u8 = null,
+    /// Optional command prefix used instead of `git` for git package installs
+    /// and updates. Tests pass a local fixture command here to avoid real
+    /// network/package-manager work.
+    git_command_override: ?[]const []const u8 = null,
     /// When non-null, used instead of detecting npm/bun for self-update.
     /// Slice of argv strings; the first element is the executable.
     /// Set to an empty slice to simulate "no package manager found".
@@ -221,7 +228,6 @@ fn executeInstall(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !ExecuteResult {
-    _ = stderr;
     const source = command.source orelse unreachable;
 
     const settings_path = try settingsPathForScope(allocator, options, command.local);
@@ -234,9 +240,21 @@ fn executeInstall(
     }
 
     const packages_array_ptr = try ensurePackagesArray(allocator, &settings_object);
-    if (findPackageIndex(packages_array_ptr.*, source) != null) {
+    const persisted_source = try normalizePackageSourceForSettings(allocator, source, command.local, options.cwd, options.agent_dir);
+    defer allocator.free(persisted_source);
+
+    const existing_index = try findPackageIndex(allocator, packages_array_ptr.*, source, command.local, options);
+    if (existing_index != null) {
         try stdout.print("Already installed: {s}\n", .{source});
         return .{ .exit_code = 0 };
+    }
+
+    if (!isLocalSource(source)) {
+        const installed = if (isNpmSource(source))
+            try executeNpmInstall(allocator, io, source, command.local, options, stderr)
+        else
+            try executeGitInstall(allocator, io, source, command.local, options, stderr);
+        if (!installed) return .{ .exit_code = 1 };
     }
 
     var entry_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
@@ -244,7 +262,7 @@ fn executeInstall(
         const cleanup: std.json.Value = .{ .object = entry_object };
         common.deinitJsonValue(allocator, cleanup);
     }
-    try entry_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, source) });
+    try entry_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, persisted_source) });
     try packages_array_ptr.*.append(.{ .object = entry_object });
 
     try writeSettingsObject(allocator, io, settings_path, settings_object);
@@ -276,7 +294,7 @@ fn executeRemove(
         return .{ .exit_code = 1 };
     }
 
-    const matched_index = findPackageIndex(packages_value_ptr.?.array, source);
+    const matched_index = try findPackageIndex(allocator, packages_value_ptr.?.array, source, command.local, options);
     if (matched_index == null) {
         try stderr.print("Error: No matching package found for {s}\n", .{source});
         return .{ .exit_code = 1 };
@@ -302,44 +320,485 @@ fn executeUpdate(
 
     switch (target) {
         .all => {
-            // When --self was also requested (e.g. via `pi update --self
-            // --extensions` or `pi update self --extensions`), run self-update
-            // first before reporting extension update.
-            if (command.update_self) {
-                const self_result = try executeSelfUpdate(allocator, io, command.force, options, stdout, stderr);
-                if (self_result.exit_code != 0) return self_result;
-            }
-            // Offline no-op for the local-fixtures scope: report the
-            // deterministic "Updated packages" line without mutating any
-            // settings on disk. Mirrors TS update path when no
-            // network work is needed.
+            const extensions_result = try executeExtensionUpdates(allocator, io, options, null, stderr);
+            if (extensions_result.exit_code != 0) return extensions_result;
             try stdout.print("Updated packages\n", .{});
-            return .{ .exit_code = 0 };
+            return executeSelfUpdate(allocator, io, command.force, options, stdout, stderr);
         },
         .self => {
             return executeSelfUpdate(allocator, io, command.force, options, stdout, stderr);
         },
         .extensions => {
-            // Update all extensions (offline no-op for local sources).
+            const extensions_result = try executeExtensionUpdates(allocator, io, options, null, stderr);
+            if (extensions_result.exit_code != 0) return extensions_result;
             try stdout.print("Updated packages\n", .{});
             return .{ .exit_code = 0 };
         },
         .source => |source| {
-            const found_scope = try findInstalledScope(allocator, io, options, source);
-            if (found_scope == null) {
-                try stderr.print(
-                    "Error: Package {s} is not installed.\n",
-                    .{source},
-                );
-                return .{ .exit_code = 1 };
-            }
+            const extensions_result = try executeExtensionUpdates(allocator, io, options, source, stderr);
+            if (extensions_result.exit_code != 0) return extensions_result;
             try stdout.print("Updated {s}\n", .{source});
             return .{ .exit_code = 0 };
         },
     }
 }
 
+const UpdateSource = struct {
+    source: []u8,
+    is_project: bool,
+
+    fn deinit(self: *UpdateSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        self.* = undefined;
+    }
+};
+
+fn freeUpdateSources(allocator: std.mem.Allocator, list: *std.ArrayList(UpdateSource)) void {
+    for (list.items) |*entry| entry.deinit(allocator);
+    list.deinit(allocator);
+}
+
+fn collectUpdateSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    source_filter: ?[]const u8,
+) !std.ArrayList(UpdateSource) {
+    var result: std.ArrayList(UpdateSource) = .empty;
+    errdefer freeUpdateSources(allocator, &result);
+
+    var user_sources = try collectScopePackages(allocator, io, options, false);
+    defer freeOwnedStrings(allocator, &user_sources);
+    for (user_sources.items) |entry| {
+        if (source_filter) |filter| {
+            if (!try packageSourcesMatchForScope(allocator, entry, filter, false, options)) continue;
+        }
+        try result.append(allocator, .{
+            .source = try allocator.dupe(u8, entry),
+            .is_project = false,
+        });
+    }
+
+    var project_sources = try collectScopePackages(allocator, io, options, true);
+    defer freeOwnedStrings(allocator, &project_sources);
+    for (project_sources.items) |entry| {
+        if (source_filter) |filter| {
+            if (!try packageSourcesMatchForScope(allocator, entry, filter, true, options)) continue;
+        }
+        try result.append(allocator, .{
+            .source = try allocator.dupe(u8, entry),
+            .is_project = true,
+        });
+    }
+
+    return result;
+}
+
+fn executeExtensionUpdates(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    source_filter: ?[]const u8,
+    stderr: *std.Io.Writer,
+) !ExecuteResult {
+    var sources = try collectUpdateSources(allocator, io, options, source_filter);
+    defer freeUpdateSources(allocator, &sources);
+
+    if (source_filter) |source| {
+        if (sources.items.len == 0) {
+            if (try findSuggestedConfiguredSource(allocator, io, options, source)) |suggestion| {
+                defer allocator.free(suggestion);
+                try stderr.print("Error: No matching package found for {s}. Did you mean {s}?\n", .{ source, suggestion });
+            } else {
+                try stderr.print("Error: No matching package found for {s}\n", .{source});
+            }
+            return .{ .exit_code = 1 };
+        }
+    }
+
+    for (sources.items) |entry| {
+        const updated = if (isNpmSource(entry.source))
+            try executeNpmUpdate(allocator, io, entry.source, entry.is_project, options, stderr)
+        else if (isGitSource(entry.source))
+            try executeGitUpdate(allocator, io, entry.source, entry.is_project, options, stderr)
+        else
+            true;
+        if (!updated) return .{ .exit_code = 1 };
+    }
+
+    return .{ .exit_code = 0 };
+}
+
+fn findSuggestedConfiguredSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    source: []const u8,
+) !?[]u8 {
+    var all_sources = try collectUpdateSources(allocator, io, options, null);
+    defer freeUpdateSources(allocator, &all_sources);
+
+    const trimmed = std.mem.trim(u8, source, " ");
+    for (all_sources.items) |entry| {
+        if (isNpmSource(entry.source)) {
+            const spec = std.mem.trim(u8, entry.source["npm:".len..], " ");
+            if (std.mem.eql(u8, trimmed, spec) or std.mem.eql(u8, trimmed, npmPackageName(spec))) {
+                return try allocator.dupe(u8, entry.source);
+            }
+        } else if (isGitSource(entry.source)) {
+            var info = (try parseGitSource(allocator, entry.source)) orelse continue;
+            defer info.deinit(allocator);
+            const shorthand = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ info.host, info.path });
+            defer allocator.free(shorthand);
+            if (std.mem.eql(u8, trimmed, shorthand)) {
+                return try allocator.dupe(u8, entry.source);
+            }
+            if (info.ref) |ref| {
+                const shorthand_with_ref = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ shorthand, ref });
+                defer allocator.free(shorthand_with_ref);
+                if (std.mem.eql(u8, trimmed, shorthand_with_ref)) {
+                    return try allocator.dupe(u8, entry.source);
+                }
+            }
+        }
+    }
+    return null;
+}
+
 const package_name = "@mariozechner/pi";
+
+const GitSourceInfo = struct {
+    repo: []u8,
+    host: []u8,
+    path: []u8,
+    ref: ?[]u8 = null,
+
+    fn deinit(self: *GitSourceInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.repo);
+        allocator.free(self.host);
+        allocator.free(self.path);
+        if (self.ref) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const PackageTool = enum { npm, git };
+const GitRefSplit = struct {
+    repo_part: []const u8,
+    ref: ?[]const u8,
+};
+
+fn isNpmSource(source: []const u8) bool {
+    return std.mem.startsWith(u8, source, "npm:");
+}
+
+fn isGitSource(source: []const u8) bool {
+    if (std.mem.startsWith(u8, source, "git:")) return true;
+    if (std.mem.startsWith(u8, source, "https://")) return true;
+    if (std.mem.startsWith(u8, source, "http://")) return true;
+    if (std.mem.startsWith(u8, source, "ssh://")) return true;
+    if (std.mem.startsWith(u8, source, "git://")) return true;
+    return false;
+}
+
+fn trimGitSuffix(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".git")) return path[0 .. path.len - ".git".len];
+    return path;
+}
+
+fn splitRef(source: []const u8) GitRefSplit {
+    if (std.mem.startsWith(u8, source, "git@")) {
+        const colon = std.mem.indexOfScalar(u8, source, ':') orelse return .{ .repo_part = source, .ref = null };
+        const after_colon = source[colon + 1 ..];
+        const at = std.mem.indexOfScalar(u8, after_colon, '@') orelse return .{ .repo_part = source, .ref = null };
+        if (at == 0 or at + 1 >= after_colon.len) return .{ .repo_part = source, .ref = null };
+        return .{
+            .repo_part = source[0 .. colon + 1 + at],
+            .ref = after_colon[at + 1 ..],
+        };
+    }
+
+    if (std.mem.indexOf(u8, source, "://")) |_| {
+        const scheme_end = std.mem.indexOf(u8, source, "://").? + "://".len;
+        const path_start = std.mem.indexOfScalarPos(u8, source, scheme_end, '/') orelse return .{ .repo_part = source, .ref = null };
+        const path = source[path_start + 1 ..];
+        const at = std.mem.indexOfScalar(u8, path, '@') orelse return .{ .repo_part = source, .ref = null };
+        if (at == 0 or at + 1 >= path.len) return .{ .repo_part = source, .ref = null };
+        return .{
+            .repo_part = source[0 .. path_start + 1 + at],
+            .ref = path[at + 1 ..],
+        };
+    }
+
+    const slash = std.mem.indexOfScalar(u8, source, '/') orelse return .{ .repo_part = source, .ref = null };
+    const path = source[slash + 1 ..];
+    const at = std.mem.indexOfScalar(u8, path, '@') orelse return .{ .repo_part = source, .ref = null };
+    if (at == 0 or at + 1 >= path.len) return .{ .repo_part = source, .ref = null };
+    return .{
+        .repo_part = source[0 .. slash + 1 + at],
+        .ref = path[at + 1 ..],
+    };
+}
+
+fn parseGitSource(allocator: std.mem.Allocator, source: []const u8) !?GitSourceInfo {
+    const without_prefix = if (std.mem.startsWith(u8, source, "git:")) source["git:".len..] else source;
+    if (!std.mem.startsWith(u8, source, "git:") and
+        !(std.mem.startsWith(u8, without_prefix, "https://") or
+            std.mem.startsWith(u8, without_prefix, "http://") or
+            std.mem.startsWith(u8, without_prefix, "ssh://") or
+            std.mem.startsWith(u8, without_prefix, "git://")))
+    {
+        return null;
+    }
+
+    const split = splitRef(without_prefix);
+    const repo_part = split.repo_part;
+    const ref_owned = if (split.ref) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (ref_owned) |value| allocator.free(value);
+
+    var repo_owned: []u8 = undefined;
+    var host_slice: []const u8 = undefined;
+    var path_slice: []const u8 = undefined;
+
+    if (std.mem.startsWith(u8, repo_part, "git@")) {
+        const colon = std.mem.indexOfScalar(u8, repo_part, ':') orelse return null;
+        host_slice = repo_part["git@".len..colon];
+        path_slice = repo_part[colon + 1 ..];
+        repo_owned = try allocator.dupe(u8, repo_part);
+    } else if (std.mem.indexOf(u8, repo_part, "://")) |_| {
+        const scheme_end = std.mem.indexOf(u8, repo_part, "://").? + "://".len;
+        const path_start = std.mem.indexOfScalarPos(u8, repo_part, scheme_end, '/') orelse return null;
+        host_slice = repo_part[scheme_end..path_start];
+        if (std.mem.indexOfScalar(u8, host_slice, '@')) |at| host_slice = host_slice[at + 1 ..];
+        path_slice = repo_part[path_start + 1 ..];
+        repo_owned = try allocator.dupe(u8, repo_part);
+    } else {
+        const slash = std.mem.indexOfScalar(u8, repo_part, '/') orelse return null;
+        host_slice = repo_part[0..slash];
+        path_slice = repo_part[slash + 1 ..];
+        if (std.mem.indexOfScalar(u8, host_slice, '.') == null and !std.mem.eql(u8, host_slice, "localhost")) return null;
+        repo_owned = try std.fmt.allocPrint(allocator, "https://{s}", .{repo_part});
+    }
+    errdefer allocator.free(repo_owned);
+
+    const normalized_path = trimGitSuffix(std.mem.trim(u8, path_slice, "/"));
+    if (host_slice.len == 0 or normalized_path.len == 0 or std.mem.indexOfScalar(u8, normalized_path, '/') == null) return null;
+
+    return .{
+        .repo = repo_owned,
+        .host = try allocator.dupe(u8, host_slice),
+        .path = try allocator.dupe(u8, normalized_path),
+        .ref = ref_owned,
+    };
+}
+
+fn commandPrefix(options: ExecuteOptions, kind: PackageTool) []const []const u8 {
+    return switch (kind) {
+        .npm => options.npm_command_override orelse &.{"npm"},
+        .git => options.git_command_override orelse &.{"git"},
+    };
+}
+
+fn runExternalCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prefix: []const []const u8,
+    args: []const []const u8,
+    cwd: ?[]const u8,
+    stderr: *std.Io.Writer,
+) !bool {
+    var argv = try allocator.alloc([]const u8, prefix.len + args.len);
+    defer allocator.free(argv);
+    @memcpy(argv[0..prefix.len], prefix);
+    @memcpy(argv[prefix.len..], args);
+
+    var display: std.ArrayList(u8) = .empty;
+    defer display.deinit(allocator);
+    for (argv, 0..) |arg, index| {
+        if (index > 0) try display.append(allocator, ' ');
+        try display.appendSlice(allocator, arg);
+    }
+
+    const result = (if (cwd) |path|
+        std.process.run(allocator, io, .{
+            .argv = argv,
+            .cwd = .{ .path = path },
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+        })
+    else
+        std.process.run(allocator, io, .{
+            .argv = argv,
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+        })) catch |err| {
+        try stderr.print("Error: Failed to run {s}: {s}\n", .{ display.items, @errorName(err) });
+        return false;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return true;
+            try stderr.print("Error: {s} exited with code {d}\n", .{ display.items, code });
+            if (result.stderr.len > 0) try stderr.print("{s}", .{result.stderr});
+            return false;
+        },
+        .signal => |signal| {
+            try stderr.print("Error: {s} terminated by signal {d}\n", .{ display.items, signal });
+            return false;
+        },
+        else => {
+            try stderr.print("Error: {s} terminated abnormally\n", .{display.items});
+            return false;
+        },
+    }
+}
+
+fn ensureNpmProject(allocator: std.mem.Allocator, io: std.Io, install_root: []const u8) !void {
+    try std.Io.Dir.createDirPath(.cwd(), io, install_root);
+
+    const gitignore_path = try std.fs.path.join(allocator, &.{ install_root, ".gitignore" });
+    defer allocator.free(gitignore_path);
+    const gitignore_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), io, gitignore_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!gitignore_exists) try common.writeFileAbsolute(io, gitignore_path, "*\n!.gitignore\n", true);
+
+    const package_json_path = try std.fs.path.join(allocator, &.{ install_root, "package.json" });
+    defer allocator.free(package_json_path);
+    const package_json_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), io, package_json_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!package_json_exists) try common.writeFileAbsolute(io, package_json_path, "{\n  \"name\": \"pi-extensions\",\n  \"private\": true\n}\n", true);
+}
+
+fn npmInstallRoot(allocator: std.mem.Allocator, options: ExecuteOptions, is_project: bool) ![]u8 {
+    if (is_project) return std.fs.path.join(allocator, &.{ options.cwd, ".pi", "packages", "npm" });
+    return std.fs.path.join(allocator, &.{ options.agent_dir, "packages", "npm" });
+}
+
+fn executeNpmInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    stderr: *std.Io.Writer,
+) !bool {
+    const spec = std.mem.trim(u8, source["npm:".len..], " ");
+    const prefix = commandPrefix(options, .npm);
+    const install_root = try npmInstallRoot(allocator, options, is_project);
+    defer allocator.free(install_root);
+    try ensureNpmProject(allocator, io, install_root);
+    return runExternalCommand(allocator, io, prefix, &.{ "install", spec, "--prefix", install_root }, null, stderr);
+}
+
+fn executeNpmUpdate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    stderr: *std.Io.Writer,
+) !bool {
+    const spec = std.mem.trim(u8, source["npm:".len..], " ");
+    const pkg_name = npmPackageName(spec);
+    const latest_spec = try std.fmt.allocPrint(allocator, "{s}@latest", .{pkg_name});
+    defer allocator.free(latest_spec);
+    const prefix = commandPrefix(options, .npm);
+    const install_root = try npmInstallRoot(allocator, options, is_project);
+    defer allocator.free(install_root);
+    try ensureNpmProject(allocator, io, install_root);
+    return runExternalCommand(allocator, io, prefix, &.{ "install", latest_spec, "--prefix", install_root }, null, stderr);
+}
+
+fn gitInstallRoot(allocator: std.mem.Allocator, options: ExecuteOptions, is_project: bool) ![]u8 {
+    if (is_project) return std.fs.path.join(allocator, &.{ options.cwd, ".pi", "packages", "git" });
+    return std.fs.path.join(allocator, &.{ options.agent_dir, "packages", "git" });
+}
+
+fn gitInstallPath(allocator: std.mem.Allocator, options: ExecuteOptions, source: []const u8, is_project: bool) ![]u8 {
+    const root = try gitInstallRoot(allocator, options, is_project);
+    defer allocator.free(root);
+    const normalized = std.mem.trim(u8, normalizeGitSource(source), " ");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const hex = try std.fmt.allocPrint(allocator, "{s}", .{digest_hex[0..]});
+    defer allocator.free(hex);
+    return std.fs.path.join(allocator, &.{ root, hex });
+}
+
+fn executeGitInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    stderr: *std.Io.Writer,
+) !bool {
+    var info = (try parseGitSource(allocator, source)) orelse {
+        try stderr.print("Error: Unsupported git source: {s}\n", .{source});
+        return false;
+    };
+    defer info.deinit(allocator);
+
+    const target_dir = try gitInstallPath(allocator, options, source, is_project);
+    defer allocator.free(target_dir);
+    const target_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), io, target_dir, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (target_exists) return true;
+
+    const root = try gitInstallRoot(allocator, options, is_project);
+    defer allocator.free(root);
+    try std.Io.Dir.createDirPath(.cwd(), io, root);
+    const gitignore_path = try std.fs.path.join(allocator, &.{ root, ".gitignore" });
+    defer allocator.free(gitignore_path);
+    const gitignore_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), io, gitignore_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!gitignore_exists) try common.writeFileAbsolute(io, gitignore_path, "*\n!.gitignore\n", true);
+
+    const parent = std.fs.path.dirname(target_dir) orelse root;
+    try std.Io.Dir.createDirPath(.cwd(), io, parent);
+    const prefix = commandPrefix(options, .git);
+    if (!try runExternalCommand(allocator, io, prefix, &.{ "clone", info.repo, target_dir }, null, stderr)) return false;
+    if (info.ref) |ref| {
+        if (!try runExternalCommand(allocator, io, prefix, &.{ "checkout", ref }, target_dir, stderr)) return false;
+    }
+    return true;
+}
+
+fn executeGitUpdate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    stderr: *std.Io.Writer,
+) !bool {
+    var info = (try parseGitSource(allocator, source)) orelse return true;
+    defer info.deinit(allocator);
+    if (info.ref != null) return true;
+
+    const target_dir = try gitInstallPath(allocator, options, source, is_project);
+    defer allocator.free(target_dir);
+    const target_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), io, target_dir, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!target_exists) return executeGitInstall(allocator, io, source, is_project, options, stderr);
+
+    const prefix = commandPrefix(options, .git);
+    return runExternalCommand(allocator, io, prefix, &.{ "pull", "--ff-only" }, target_dir, stderr);
+}
 
 /// Detect whether npm or bun is available in PATH and return the update
 /// command argv as a heap-allocated slice of heap-allocated strings.
@@ -387,13 +846,11 @@ fn executeSelfUpdate(
 ) !ExecuteResult {
     _ = force; // Version check skipped: always run when requested.
 
-    // Resolve argv: use test override when present, otherwise detect.
-    var detected_argv: ?[][]u8 = null;
-    defer if (detected_argv) |argv| {
-        for (argv) |arg| allocator.free(arg);
-        allocator.free(argv);
-    };
-
+    // Resolve argv: use test override when present. Without an override,
+    // native Zig builds cannot safely prove the executable is managed by a
+    // writable global package manager the way the TypeScript Node entrypoint
+    // can, so surface the same user-facing unsupported diagnostic instead of
+    // running an unsafe global install command.
     const argv: []const []const u8 = if (options.self_update_command_override) |override| blk: {
         if (override.len == 0) {
             // Empty override means "no package manager found".
@@ -404,16 +861,12 @@ fn executeSelfUpdate(
             return .{ .exit_code = 1 };
         }
         break :blk override;
-    } else blk: {
-        detected_argv = try detectSelfUpdateCommand(allocator, io);
-        if (detected_argv == null) {
-            try stderr.print(
-                "error: pi cannot self-update this installation.\nRun: npm install -g {s}\n",
-                .{package_name},
-            );
-            return .{ .exit_code = 1 };
-        }
-        break :blk detected_argv.?;
+    } else {
+        try stderr.print(
+            "error: pi cannot self-update this installation.\nUpdate {s} using the package manager, wrapper, or source checkout that provides this installation.\n",
+            .{package_name},
+        );
+        return .{ .exit_code = 1 };
     };
 
     // Build display string: space-join argv.
@@ -603,13 +1056,7 @@ fn writePackageCommandHelp(stdout: *std.Io.Writer, command: PackageCommand) !voi
 }
 
 fn isLocalSource(source: []const u8) bool {
-    if (std.mem.startsWith(u8, source, "npm:")) return false;
-    if (std.mem.startsWith(u8, source, "git:")) return false;
-    if (std.mem.startsWith(u8, source, "git@")) return false;
-    if (std.mem.startsWith(u8, source, "https://")) return false;
-    if (std.mem.startsWith(u8, source, "http://")) return false;
-    if (std.mem.startsWith(u8, source, "ssh://")) return false;
-    return true;
+    return !isNpmSource(source) and !isGitSource(source);
 }
 
 /// Strips the npm: prefix and version specifier to get the package name.
@@ -646,10 +1093,7 @@ fn computeInstalledPath(
     agent_dir: []const u8,
 ) ![]u8 {
     if (isLocalSource(source)) {
-        if (std.fs.path.isAbsolute(source)) {
-            return allocator.dupe(u8, source);
-        }
-        return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, source });
+        return resolveLocalPathFromScopeBase(allocator, source, is_project, cwd, agent_dir);
     }
     if (std.mem.startsWith(u8, source, "npm:")) {
         const spec = std.mem.trim(u8, source["npm:".len..], " ");
@@ -661,19 +1105,113 @@ fn computeInstalledPath(
         defer allocator.free(base);
         return std.fs.path.join(allocator, &[_][]const u8{ base, pkg_name });
     }
-    // git and URL-based sources: hash the normalized form
-    const normalized = normalizeGitSource(source);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const hex_str = try std.fmt.allocPrint(allocator, "{s}", .{hex[0..]});
-    defer allocator.free(hex_str);
-    const base = if (is_project)
-        try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "git" })
-    else
-        try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "git" });
-    defer allocator.free(base);
-    return std.fs.path.join(allocator, &[_][]const u8{ base, hex_str });
+    if (try parseGitSource(allocator, source)) |info_value| {
+        var info = info_value;
+        defer info.deinit(allocator);
+        const base = if (is_project)
+            try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "git" })
+        else
+            try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "git" });
+        defer allocator.free(base);
+        const normalized = std.mem.trim(u8, normalizeGitSource(source), " ");
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
+        const digest_hex = std.fmt.bytesToHex(digest, .lower);
+        const hex = try std.fmt.allocPrint(allocator, "{s}", .{digest_hex[0..]});
+        defer allocator.free(hex);
+        return std.fs.path.join(allocator, &[_][]const u8{ base, hex });
+    }
+    return allocator.dupe(u8, source);
+}
+
+fn localBaseDirForScope(
+    allocator: std.mem.Allocator,
+    is_project: bool,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    if (is_project) return std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" });
+    return allocator.dupe(u8, agent_dir);
+}
+
+fn expandHomePath(allocator: std.mem.Allocator, input: []const u8) !?[]u8 {
+    if (input.len == 0 or input[0] != '~') return null;
+    if (input.len > 1 and input[1] != '/') return null;
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.span(home_ptr);
+    if (input.len == 1) return try allocator.dupe(u8, home);
+    return try std.fs.path.join(allocator, &[_][]const u8{ home, input[2..] });
+}
+
+fn resolveLocalPathFromCwd(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    source: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    if (try expandHomePath(allocator, trimmed)) |expanded| return expanded;
+    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, trimmed });
+}
+
+fn resolveLocalPathFromScopeBase(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    is_project: bool,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    if (try expandHomePath(allocator, trimmed)) |expanded| return expanded;
+    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
+    const base_dir = try localBaseDirForScope(allocator, is_project, cwd, agent_dir);
+    defer allocator.free(base_dir);
+    return std.fs.path.resolve(allocator, &[_][]const u8{ base_dir, trimmed });
+}
+
+fn normalizePackageSourceForSettings(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    is_project: bool,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    if (!isLocalSource(source)) return allocator.dupe(u8, source);
+
+    const base_dir = try localBaseDirForScope(allocator, is_project, cwd, agent_dir);
+    defer allocator.free(base_dir);
+    const resolved = try resolveLocalPathFromCwd(allocator, cwd, source);
+    defer allocator.free(resolved);
+    const relative = try std.fs.path.relative(allocator, cwd, null, base_dir, resolved);
+    if (relative.len == 0) {
+        allocator.free(relative);
+        return allocator.dupe(u8, ".");
+    }
+    return relative;
+}
+
+fn packageSourcesMatchForScope(
+    allocator: std.mem.Allocator,
+    configured_source: []const u8,
+    input_source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+) !bool {
+    if (std.mem.eql(u8, configured_source, input_source)) return true;
+    if (isLocalSource(configured_source) and isLocalSource(input_source)) {
+        const configured_path = try resolveLocalPathFromScopeBase(
+            allocator,
+            configured_source,
+            is_project,
+            options.cwd,
+            options.agent_dir,
+        );
+        defer allocator.free(configured_path);
+        const input_path = try resolveLocalPathFromCwd(allocator, options.cwd, input_source);
+        defer allocator.free(input_path);
+        return std.mem.eql(u8, configured_path, input_path);
+    }
+    return false;
 }
 
 /// Returns true when the settings JSON object for a package has any
@@ -827,13 +1365,21 @@ fn ensurePackagesArray(
     return &settings_object.getPtr("packages").?.array;
 }
 
-fn findPackageIndex(array: std.json.Array, source: []const u8) ?usize {
+fn findPackageIndex(
+    allocator: std.mem.Allocator,
+    array: std.json.Array,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+) !?usize {
     for (array.items, 0..) |item, idx| {
         switch (item) {
-            .string => |s| if (std.mem.eql(u8, s, source)) return idx,
+            .string => |s| if (try packageSourcesMatchForScope(allocator, s, source, is_project, options)) return idx,
             .object => |obj| {
                 if (obj.get("source")) |value| {
-                    if (value == .string and std.mem.eql(u8, value.string, source)) return idx;
+                    if (value == .string) {
+                        if (try packageSourcesMatchForScope(allocator, value.string, source, is_project, options)) return idx;
+                    }
                 }
             },
             else => {},
@@ -934,6 +1480,21 @@ fn readSettings(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .limited(1024 * 1024));
 }
 
+fn readFirstPackageSource(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const settings = try readSettings(allocator, path);
+    defer allocator.free(settings);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, settings, .{});
+    defer parsed.deinit();
+    const packages = parsed.value.object.get("packages").?.array;
+    const first = packages.items[0];
+    return switch (first) {
+        .string => |source| try allocator.dupe(u8, source),
+        .object => |object| try allocator.dupe(u8, object.get("source").?.string),
+        else => error.InvalidPackageSource,
+    };
+}
+
 fn runCommand(
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -953,6 +1514,16 @@ fn runCommand(
     return executePackageCommand(allocator, std.testing.io, parsed, options, &stdout_writer.writer, &stderr_writer.writer);
 }
 
+fn fakeNetworkOptions(cwd: []const u8, agent_dir: []const u8) ExecuteOptions {
+    return .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .npm_command_override = &.{"/usr/bin/true"},
+        .git_command_override = &.{"/usr/bin/true"},
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+}
+
 test "VAL-M12-PKG-001 local fixture installs at user scope" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -965,7 +1536,7 @@ test "VAL-M12-PKG-001 local fixture installs at user scope" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -986,8 +1557,10 @@ test "VAL-M12-PKG-001 local fixture installs at user scope" {
     defer allocator.free(settings_path);
     const settings = try readSettings(allocator, settings_path);
     defer allocator.free(settings);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/pkg", false, cwd, agent_dir);
+    defer allocator.free(expected_source);
     try std.testing.expect(std.mem.indexOf(u8, settings, "\"packages\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, settings, "\"./fixtures/pkg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings, expected_source) != null);
 }
 
 test "VAL-M12-PKG-002 local fixture installs at project scope" {
@@ -1001,7 +1574,7 @@ test "VAL-M12-PKG-002 local fixture installs at project scope" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -1021,7 +1594,9 @@ test "VAL-M12-PKG-002 local fixture installs at project scope" {
     defer allocator.free(project_settings_path);
     const project_settings = try readSettings(allocator, project_settings_path);
     defer allocator.free(project_settings);
-    try std.testing.expect(std.mem.indexOf(u8, project_settings, "\"./fixtures/pkg\"") != null);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/pkg", true, cwd, agent_dir);
+    defer allocator.free(expected_source);
+    try std.testing.expect(std.mem.indexOf(u8, project_settings, expected_source) != null);
 
     // User-scope settings.json should not exist after a project-scope install.
     const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
@@ -1045,7 +1620,7 @@ test "VAL-M12-PKG-003 list reports user and project packages" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -1064,10 +1639,14 @@ test "VAL-M12-PKG-003 list reports user and project packages" {
 
     const result = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const expected_user_source = try normalizePackageSourceForSettings(allocator, "./fixtures/user-pkg", false, cwd, agent_dir);
+    defer allocator.free(expected_user_source);
+    const expected_project_source = try normalizePackageSourceForSettings(allocator, "./fixtures/project-pkg", true, cwd, agent_dir);
+    defer allocator.free(expected_project_source);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "User packages:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "./fixtures/user-pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, expected_user_source) != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Project packages:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "./fixtures/project-pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, expected_project_source) != null);
 }
 
 test "VAL-M12-PKG-004 remove detaches package without deleting other settings" {
@@ -1080,7 +1659,7 @@ test "VAL-M12-PKG-004 remove detaches package without deleting other settings" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Pre-populate user settings with an unrelated key alongside a package.
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
@@ -1118,7 +1697,7 @@ test "VAL-M12-PKG-005 uninstall alias matches remove" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -1152,7 +1731,7 @@ test "VAL-M12-PKG-006 update no-op leaves settings unchanged" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -1172,7 +1751,7 @@ test "VAL-M12-PKG-006 update no-op leaves settings unchanged" {
 
     const result = try runCommand(allocator, &.{"update"}, options, &stdout_buf, &stderr_buf);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expectEqualStrings("Updated packages\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("Updated packages\nUpdated pi\n", stdout_buf.items);
 
     const after = try readSettings(allocator, settings_path);
     defer allocator.free(after);
@@ -1189,7 +1768,7 @@ test "VAL-M12-PKG-007 targeted update reports configured package" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -1229,7 +1808,7 @@ test "VAL-M12-PKG-008 targeted update missing package errors and leaves settings
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -1256,7 +1835,7 @@ test "VAL-M12-PKG-008 targeted update missing package errors and leaves settings
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings("", stdout_buf.items);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "./fixtures/missing") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "is not installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "No matching package found") != null);
 
     const after = try readSettings(allocator, settings_path);
     defer allocator.free(after);
@@ -1306,7 +1885,7 @@ test "VAL-M12-PKG-009 manifest-declared resources are discoverable after install
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     const fixture_root = try makeAbsoluteTmpPath(allocator, tmp, "repo/fixtures/manifest-pkg");
     defer allocator.free(fixture_root);
@@ -1548,7 +2127,7 @@ test "VAL-M12-PKG-014 config --toggle persists pattern in scoped settings.json" 
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Pre-populate user settings with an unrelated key to assert we
     // never wipe other settings while writing the toggle.
@@ -1612,7 +2191,7 @@ test "VAL-M12-PKG-014 config --toggle -l writes project-scope settings only" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -1659,7 +2238,7 @@ test "VAL-PKG-101 npm scoped package accepted and persisted" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -1694,7 +2273,7 @@ test "VAL-PKG-102 npm unscoped package accepted and persisted" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -1728,7 +2307,7 @@ test "VAL-PKG-103 npm source install/remove round-trips correctly" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Pre-populate with unrelated key to verify preservation.
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
@@ -1767,7 +2346,7 @@ test "VAL-PKG-104 npm duplicate install is a no-op" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -1791,6 +2370,155 @@ test "VAL-PKG-104 npm duplicate install is a no-op" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, settings, "npm:@scope/pkg"));
 }
 
+test "VAL-PKG-105 npm install invokes configured package command without real network" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const record_path = try makeAbsoluteTmpPath(allocator, tmp, "npm-install-args.txt");
+    defer allocator.free(record_path);
+    const script = try std.fmt.allocPrint(allocator, "printf '%s\\n' \"$@\" > '{s}'", .{record_path});
+    defer allocator.free(script);
+    const npm_command = [_][]const u8{ "/bin/sh", "-c", script, "fake-npm" };
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .npm_command_override = npm_command[0..],
+        .git_command_override = &.{"/usr/bin/true"},
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "npm:@scope/pkg" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const record = try readSettings(allocator, record_path);
+    defer allocator.free(record);
+    const expected_root = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "npm" });
+    defer allocator.free(expected_root);
+    const expected = try std.fmt.allocPrint(allocator, "install\n@scope/pkg\n--prefix\n{s}\n", .{expected_root});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, record);
+    try std.testing.expect(std.mem.indexOf(u8, record, "packages/npm") != null);
+}
+
+test "VAL-PKG-106 npm update --extension invokes latest install without self-update" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const record_path = try makeAbsoluteTmpPath(allocator, tmp, "npm-update-args.txt");
+    defer allocator.free(record_path);
+    const script = try std.fmt.allocPrint(allocator, "printf '%s\\n' \"$@\" > '{s}'", .{record_path});
+    defer allocator.free(script);
+    const npm_command = [_][]const u8{ "/bin/sh", "-c", script, "fake-npm" };
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .npm_command_override = npm_command[0..],
+        .git_command_override = &.{"/usr/bin/true"},
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "packages": ["npm:@scope/pkg"] }
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "update", "--extension", "npm:@scope/pkg" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("Updated npm:@scope/pkg\n", stdout_buf.items);
+
+    const record = try readSettings(allocator, record_path);
+    defer allocator.free(record);
+    const expected_root = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "npm" });
+    defer allocator.free(expected_root);
+    const expected = try std.fmt.allocPrint(allocator, "install\n@scope/pkg@latest\n--prefix\n{s}\n", .{expected_root});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, record);
+    try std.testing.expect(std.mem.indexOf(u8, record, "packages/npm") != null);
+}
+
+test "VAL-PKG-108 npm project install and update use package resource root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const record_path = try makeAbsoluteTmpPath(allocator, tmp, "npm-project-args.txt");
+    defer allocator.free(record_path);
+    const script = try std.fmt.allocPrint(allocator, "printf '%s\\n' \"$@\" >> '{s}'; printf -- '--\\n' >> '{s}'", .{ record_path, record_path });
+    defer allocator.free(script);
+    const npm_command = [_][]const u8{ "/bin/sh", "-c", script, "fake-npm" };
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .npm_command_override = npm_command[0..],
+        .git_command_override = &.{"/usr/bin/true"},
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const source = "npm:@scope/project-pkg";
+    const install_result = try runCommand(allocator, &.{ "install", source, "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const update_result = try runCommand(allocator, &.{ "update", "--extension", source }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), update_result.exit_code);
+
+    const expected_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "npm" });
+    defer allocator.free(expected_root);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "install\n@scope/project-pkg\n--prefix\n{s}\n--\ninstall\n@scope/project-pkg@latest\n--prefix\n{s}\n--\n",
+        .{ expected_root, expected_root },
+    );
+    defer allocator.free(expected);
+    const record = try readSettings(allocator, record_path);
+    defer allocator.free(record);
+    try std.testing.expectEqualStrings(expected, record);
+    try std.testing.expect(std.mem.indexOf(u8, record, ".pi/packages/npm") != null);
+}
+
+test "VAL-PKG-107 duplicate --extension is rejected like TypeScript" {
+    const allocator = std.testing.allocator;
+    var parsed = try parsePackageCommand(allocator, &.{ "update", "--extension", "npm:one", "--extension", "npm:two" });
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.parse_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.parse_error.?, "--extension can only be provided once") != null);
+}
+
 test "VAL-PKG-110 git:github.com prefix source accepted" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1801,7 +2529,7 @@ test "VAL-PKG-110 git:github.com prefix source accepted" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -1819,7 +2547,7 @@ test "VAL-PKG-110 git:github.com prefix source accepted" {
     try std.testing.expect(std.mem.indexOf(u8, settings, "\"git:github.com/user/repo\"") != null);
 }
 
-test "VAL-PKG-111 git@ SSH source accepted" {
+test "VAL-PKG-111 git:git@ SSH source accepted" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1829,7 +2557,7 @@ test "VAL-PKG-111 git@ SSH source accepted" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -1838,19 +2566,19 @@ test "VAL-PKG-111 git@ SSH source accepted" {
 
     const result = try runCommand(
         allocator,
-        &.{ "install", "git@github.com:user/repo.git" },
+        &.{ "install", "git:git@github.com:user/repo.git" },
         options,
         &buf_a,
         &buf_b,
     );
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Installed git@github.com:user/repo.git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf_a.items, "Installed git:git@github.com:user/repo.git") != null);
 
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
     const settings = try readSettings(allocator, settings_path);
     defer allocator.free(settings);
-    try std.testing.expect(std.mem.indexOf(u8, settings, "\"git@github.com:user/repo.git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"git:git@github.com:user/repo.git\"") != null);
 }
 
 test "VAL-PKG-112 https:// git URL source accepted" {
@@ -1863,7 +2591,7 @@ test "VAL-PKG-112 https:// git URL source accepted" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -1897,7 +2625,7 @@ test "VAL-PKG-113 ssh:// git URL source accepted" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -1931,7 +2659,7 @@ test "VAL-PKG-114 git source install/remove round-trips correctly" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -1968,7 +2696,7 @@ test "VAL-PKG-115 git source duplicate install is a no-op" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -1991,6 +2719,241 @@ test "VAL-PKG-115 git source duplicate install is a no-op" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, settings, "git:github.com/user/repo"));
 }
 
+test "VAL-PKG-116 git install uses package resource roots for user and project scopes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const record_path = try makeAbsoluteTmpPath(allocator, tmp, "git-install-args.txt");
+    defer allocator.free(record_path);
+    const script = try std.fmt.allocPrint(allocator, "printf '%s\\n' \"$@\" >> '{s}'; printf -- '--\\n' >> '{s}'", .{ record_path, record_path });
+    defer allocator.free(script);
+    const git_command = [_][]const u8{ "/bin/sh", "-c", script, "fake-git" };
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .npm_command_override = &.{"/usr/bin/true"},
+        .git_command_override = git_command[0..],
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const user_source = "git:github.com/user/repo";
+    const project_source = "git:github.com/user/project-repo";
+    const user_result = try runCommand(allocator, &.{ "install", user_source }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), user_result.exit_code);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const project_result = try runCommand(allocator, &.{ "install", project_source, "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), project_result.exit_code);
+
+    const user_target = try gitInstallPath(allocator, options, user_source, false);
+    defer allocator.free(user_target);
+    const project_target = try gitInstallPath(allocator, options, project_source, true);
+    defer allocator.free(project_target);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "clone\nhttps://github.com/user/repo\n{s}\n--\nclone\nhttps://github.com/user/project-repo\n{s}\n--\n",
+        .{ user_target, project_target },
+    );
+    defer allocator.free(expected);
+
+    const record = try readSettings(allocator, record_path);
+    defer allocator.free(record);
+    try std.testing.expectEqualStrings(expected, record);
+    try std.testing.expect(std.mem.indexOf(u8, user_target, "packages/git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_target, ".pi/packages/git") != null);
+}
+
+test "VAL-PKG-117 git update runs in package resource target directory" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const record_path = try makeAbsoluteTmpPath(allocator, tmp, "git-update-args.txt");
+    defer allocator.free(record_path);
+    const script = try std.fmt.allocPrint(allocator, "pwd > '{s}'; printf -- '--\\n' >> '{s}'; printf '%s\\n' \"$@\" >> '{s}'", .{ record_path, record_path, record_path });
+    defer allocator.free(script);
+    const git_command = [_][]const u8{ "/bin/sh", "-c", script, "fake-git" };
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .npm_command_override = &.{"/usr/bin/true"},
+        .git_command_override = git_command[0..],
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    const source = "git:github.com/user/repo";
+    const target = try gitInstallPath(allocator, options, source, false);
+    defer allocator.free(target);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, target);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try common.writeFileAbsolute(std.testing.io, settings_path,
+        \\{ "packages": ["git:github.com/user/repo"] }
+    , true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "update", "--extension", source }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const record = try readSettings(allocator, record_path);
+    defer allocator.free(record);
+    const expected = try std.fmt.allocPrint(allocator, "{s}\n--\npull\n--ff-only\n", .{target});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, record);
+    try std.testing.expect(std.mem.indexOf(u8, record, "packages/git") != null);
+}
+
+test "VAL-PKG-118 persisted https git source is resource-loader discoverable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = fakeNetworkOptions(cwd, agent_dir);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const source = "https://github.com/user/resource-pkg";
+    const result = try runCommand(allocator, &.{ "install", source }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const persisted_source = try readFirstPackageSource(allocator, settings_path);
+    defer allocator.free(persisted_source);
+    try std.testing.expectEqualStrings(source, persisted_source);
+
+    const install_path = try gitInstallPath(allocator, options, persisted_source, false);
+    defer allocator.free(install_path);
+    const extension_dir = try std.fs.path.join(allocator, &[_][]const u8{ install_path, "extensions" });
+    defer allocator.free(extension_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, extension_dir);
+    const extension_path = try std.fs.path.join(allocator, &[_][]const u8{ extension_dir, "main.ts" });
+    defer allocator.free(extension_path);
+    try common.writeFileAbsolute(std.testing.io, extension_path, "export default {};\n", true);
+
+    var package_config = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, persisted_source) };
+    defer package_config.deinit(allocator);
+    var resolved = try resources_mod.resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.extensions.len);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.extensions[0].path, "extensions/main.ts"));
+}
+
+test "VAL-PKG-119 normalized local package sources are resource-loader discoverable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/user-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/project-pkg/extensions");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/user-pkg/extensions/user.ts",
+        .data = "export default {};\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/project-pkg/extensions/project.ts",
+        .data = "export default {};\n",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = fakeNetworkOptions(cwd, agent_dir);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const user_result = try runCommand(allocator, &.{ "install", "./fixtures/user-pkg" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), user_result.exit_code);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const project_result = try runCommand(allocator, &.{ "install", "./fixtures/project-pkg", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), project_result.exit_code);
+
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    const user_source = try readFirstPackageSource(allocator, user_settings_path);
+    defer allocator.free(user_source);
+    const expected_user_source = try normalizePackageSourceForSettings(allocator, "./fixtures/user-pkg", false, cwd, agent_dir);
+    defer allocator.free(expected_user_source);
+    try std.testing.expectEqualStrings(expected_user_source, user_source);
+
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const project_source = try readFirstPackageSource(allocator, project_settings_path);
+    defer allocator.free(project_source);
+    const expected_project_source = try normalizePackageSourceForSettings(allocator, "./fixtures/project-pkg", true, cwd, agent_dir);
+    defer allocator.free(expected_project_source);
+    try std.testing.expectEqualStrings(expected_project_source, project_source);
+
+    var user_package = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, user_source) };
+    defer user_package.deinit(allocator);
+    var project_package = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, project_source) };
+    defer project_package.deinit(allocator);
+    var resolved = try resources_mod.resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{user_package} },
+        .project = .{ .packages = &.{project_package} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    var saw_user = false;
+    var saw_project = false;
+    for (resolved.extensions) |entry| {
+        if (std.mem.endsWith(u8, entry.path, "extensions/user.ts")) saw_user = true;
+        if (std.mem.endsWith(u8, entry.path, "extensions/project.ts")) saw_project = true;
+    }
+    try std.testing.expect(saw_user);
+    try std.testing.expect(saw_project);
+}
+
 test "VAL-PKG-150 list shows installed path for each package" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2002,7 +2965,7 @@ test "VAL-PKG-150 list shows installed path for each package" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Install using the absolute fixture path so the resolved path is deterministic.
     const pkg_path = try makeAbsoluteTmpPath(allocator, tmp, "repo/fixtures/my-pkg");
@@ -2035,7 +2998,7 @@ test "VAL-PKG-151 list shows (filtered) indicator for filtered packages" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Manually write settings with one filtered and one unfiltered package.
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
@@ -2073,7 +3036,7 @@ test "VAL-PKG-152 list groups user and project packages with headers" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -2105,7 +3068,7 @@ test "VAL-PKG-153 list prints No packages installed. when empty" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -2127,7 +3090,7 @@ test "VAL-M12-PKG-015 release and binary packaging surfaces stay excluded" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2353,7 +3316,7 @@ test "VAL-PKG-131 --extensions flag resolves update_target to .extensions" {
     try std.testing.expect(parsed.update_target.? == .extensions);
 
     // Verify execution: prints "Updated packages", no self-update output.
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
     var stderr_buf: std.ArrayList(u8) = .empty;
@@ -2374,7 +3337,7 @@ test "VAL-PKG-132 --extension <source> updates a single package" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Verify parsing: update_target must be .{ .source = "npm:@foo/bar" }.
     var parsed = try parsePackageCommand(allocator, &.{ "update", "--extension", "npm:@foo/bar" });
@@ -2421,7 +3384,7 @@ test "VAL-PKG-133 --extension without value reports error" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2455,7 +3418,7 @@ test "VAL-PKG-134 --extension combined with --self or --extensions reports confl
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2487,7 +3450,7 @@ test "VAL-PKG-135 --extension combined with positional source reports conflict" 
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2558,7 +3521,7 @@ test "VAL-PKG-140 bare pi config exits 0 and shows configurable kinds" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2585,7 +3548,7 @@ test "VAL-PKG-141 config selector shows current enable/disable state from settin
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     // Pre-populate settings with enabled and disabled entries.
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
@@ -2629,7 +3592,7 @@ test "VAL-PKG-142 config selector toggle replaces stale entries" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -2670,7 +3633,7 @@ test "VAL-PKG-143 config selector respects --local scope" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2717,7 +3680,7 @@ test "VAL-PKG-160 local path install still works at user scope" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2738,7 +3701,9 @@ test "VAL-PKG-160 local path install still works at user scope" {
     defer allocator.free(settings_path);
     const settings = try readSettings(allocator, settings_path);
     defer allocator.free(settings);
-    try std.testing.expect(std.mem.indexOf(u8, settings, "\"./fixtures/pkg\"") != null);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/pkg", false, cwd, agent_dir);
+    defer allocator.free(expected_source);
+    try std.testing.expect(std.mem.indexOf(u8, settings, expected_source) != null);
 }
 
 test "VAL-PKG-161 local path install still works at project scope with -l" {
@@ -2752,7 +3717,7 @@ test "VAL-PKG-161 local path install still works at project scope with -l" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2771,7 +3736,9 @@ test "VAL-PKG-161 local path install still works at project scope with -l" {
     defer allocator.free(project_path);
     const project = try readSettings(allocator, project_path);
     defer allocator.free(project);
-    try std.testing.expect(std.mem.indexOf(u8, project, "\"./fixtures/pkg\"") != null);
+    const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/pkg", true, cwd, agent_dir);
+    defer allocator.free(expected_source);
+    try std.testing.expect(std.mem.indexOf(u8, project, expected_source) != null);
 
     // User settings must not exist.
     const user_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
@@ -2793,7 +3760,7 @@ test "VAL-PKG-162 local path remove still works and preserves other settings" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -2835,7 +3802,7 @@ test "VAL-PKG-163 remove of non-existent local path reports error" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -2863,7 +3830,7 @@ test "VAL-PKG-164 pi uninstall alias still works for remove" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -2896,7 +3863,7 @@ test "VAL-PKG-165 local path duplicate install is a no-op" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var buf_a: std.ArrayList(u8) = .empty;
     defer buf_a.deinit(allocator);
@@ -2929,7 +3896,7 @@ test "VAL-PKG-166 update no-op for local packages leaves settings unchanged" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -2965,7 +3932,7 @@ test "VAL-PKG-167 targeted update of installed local source confirms without mut
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var ignored: std.ArrayList(u8) = .empty;
     defer ignored.deinit(allocator);
@@ -3007,7 +3974,7 @@ test "VAL-PKG-168 targeted update of missing source reports error" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -3028,7 +3995,7 @@ test "VAL-PKG-168 targeted update of missing source reports error" {
     );
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "./fixtures/missing") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "is not installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "No matching package found") != null);
     try std.testing.expectEqualStrings("", stdout_buf.items);
 }
 
@@ -3041,7 +4008,7 @@ test "VAL-PKG-170 help text for update documents all flags" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
@@ -3064,7 +4031,7 @@ test "VAL-PKG-172 unknown flag on any command reports error with usage" {
     defer allocator.free(cwd);
     const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
     defer allocator.free(agent_dir);
-    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const options = fakeNetworkOptions(cwd, agent_dir);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);

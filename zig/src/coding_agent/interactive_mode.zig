@@ -346,6 +346,9 @@ pub fn runInteractiveMode(
 
     if (options.initial_prompt) |initial_prompt| {
         if (initial_prompt.len > 0) {
+            for (options.initial_messages) |message| {
+                try bootstrap.session.followUp(message, &.{});
+            }
             try prompt_worker.start(allocator, &bootstrap.session, &app_state, initial_prompt, options.initial_images);
             prompt_worker_active = true;
         }

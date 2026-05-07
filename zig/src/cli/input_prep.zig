@@ -17,6 +17,7 @@ pub const CliStdin = struct {
 
 pub const PreparedInitialInput = struct {
     prompt: ?[]u8 = null,
+    messages: []const []const u8 = &.{},
     images: []ai.ImageContent = &.{},
 
     pub fn deinit(self: *PreparedInitialInput, allocator: std.mem.Allocator) void {
@@ -81,7 +82,7 @@ pub fn prepareInitialInput(
     env_map: *const std.process.Environ.Map,
     cwd: []const u8,
     file_args: ?[]const []const u8,
-    prompt: ?[]const u8,
+    messages: []const []const u8,
     stdin_content: ?[]const u8,
     stderr: *std.Io.Writer,
     options: PrepareInitialInputOptions,
@@ -137,13 +138,14 @@ pub fn prepareInitialInput(
     defer prompt_builder.deinit(allocator);
     if (stdin_content) |content| try prompt_builder.appendSlice(allocator, content);
     if (file_text.items.len > 0) try prompt_builder.appendSlice(allocator, file_text.items);
-    if (prompt) |text| try prompt_builder.appendSlice(allocator, text);
+    if (messages.len > 0) try prompt_builder.appendSlice(allocator, messages[0]);
 
     return .{
         .prompt = if (prompt_builder.items.len > 0)
             try prompt_builder.toOwnedSlice(allocator)
         else
             null,
+        .messages = if (messages.len > 1) messages[1..] else &.{},
         .images = try images.toOwnedSlice(allocator),
     };
 }
@@ -220,4 +222,33 @@ fn appendFileImage(
         defer allocator.free(note);
         try file_text.appendSlice(allocator, note);
     }
+}
+
+test "prepareInitialInput keeps follow-up positional messages separate" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var prepared = try prepareInitialInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        "/tmp/project",
+        null,
+        &.{ "first prompt", "second prompt", "third prompt" },
+        null,
+        &stderr_capture.writer,
+        .{},
+    );
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqualStrings("first prompt", prepared.prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), prepared.messages.len);
+    try std.testing.expectEqualStrings("second prompt", prepared.messages[0]);
+    try std.testing.expectEqualStrings("third prompt", prepared.messages[1]);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
