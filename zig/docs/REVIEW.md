@@ -15,8 +15,12 @@ The Zig implementation is now usable for the main coding-agent workflows:
 - interactive mode and print mode
 - interactive-mode login/auth, session lifecycle, and slash command routing
   are split into focused Zig helper modules while preserving current behavior
-- interactive input dispatch has a distinct key-resolution module and an
+- interactive input dispatch has a distinct key-resolution module, a focused
+  overlay-input helper for model/session/tree/scoped-model selector keys, and an
   exhaustive app-action executor, preserving configurable keybinding behavior
+- active-operation status rendering has a focused formatting helper for spinner,
+  elapsed, retry countdown, and cancel/interrupt hint text while the render
+  pipeline remains owned by `rendering.zig`
 - JSON event output
 - TS-RPC mode with golden parity coverage
 - session create / continue / resume / fork / clone
@@ -346,6 +350,50 @@ construction, Cloudflare/Copilot routing, HTTP streaming, `on_response`, stream
 contract error mapping, and the OpenAI Chat SSE parser/state machine. Chat SSE
 parser extraction remains explicitly deferred to a parser-focused slice with
 local parity fixtures.
+
+### Extension Registry Snapshot Boundary
+
+Resolved for the current large-file decomposition slice.
+`extension_registry.zig` now delegates deterministic registry snapshot JSON
+construction to `extensions/extension_registry_snapshot.zig`. The helper owns
+snapshot root assembly, per-surface JSON value construction, optional string
+fields, flag/default value conversion, injection hook serialization, and owned
+JSON value cleanup used by CLI/TS-RPC registry dumps.
+
+`extension_registry.zig` still owns registry mutation APIs, host frame
+application, provider/tool/command/shortcut/flag/capability/widget
+registration, unregister behavior, provider auth-state registration, UI hook
+lifecycle mutation, command resolution, and runtime-facing surface counts.
+Further registry extraction remains deferred to separately guarded slices so
+extension ABI/protocol and runtime lifecycle behavior stay unchanged.
+
+### Overlay Input Boundary
+
+Resolved for the current large-file decomposition slice.
+`input_dispatch.zig` now delegates model, session, tree, and scoped-model
+overlay-specific interactive key handling to `interactive_mode/overlay_input.zig`.
+The helper owns overlay search editing, configured overlay action matching,
+model scope toggling, session sort/scope/path/rename/delete navigation,
+scoped-model toggle/reorder/save handling, and tree filter/fold/label/summary
+key handling.
+
+`input_dispatch.zig` still owns main `handleInputKeyWithModifiers` orchestration,
+selector commit side effects, editor submission, broad app-action dispatch,
+queue/dequeue behavior, auth-flow input, and extension-dialog routing. Further
+input-dispatch decomposition remains deferred to separately guarded slices.
+
+### Active Operation Rendering Boundary
+
+Resolved for the current large-file decomposition slice.
+`rendering.zig` now delegates pure active-operation display formatting to
+`interactive_mode/active_operation_rendering.zig`. The helper owns active
+operation display kinds/snapshots, spinner frame selection, elapsed-time
+calculation, retry countdown text, and interrupt/cancel hint formatting.
+
+`rendering.zig` still owns `AppState`, active-operation lifecycle mutation,
+screen/task/footer drawing, terminal layout, markdown/chat rendering, and
+completion cleanup. Further rendering decomposition remains deferred to
+separately guarded slices.
 
 ## Recommended Next Work Order
 

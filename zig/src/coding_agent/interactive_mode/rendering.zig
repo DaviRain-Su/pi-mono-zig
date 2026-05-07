@@ -11,6 +11,7 @@ const extension_registry = @import("../extensions/extension_registry.zig");
 const common = @import("../tools/common.zig");
 const bash_execution = @import("bash_execution.zig");
 const user_bash_task_mod = @import("user_bash_task.zig");
+const active_operation_rendering = @import("active_operation_rendering.zig");
 const shared = @import("shared.zig");
 const formatting = @import("formatting.zig");
 const overlays = @import("overlays.zig");
@@ -125,22 +126,8 @@ pub const RenderStateSnapshot = struct {
     }
 };
 
-pub const ActiveOperationKind = enum {
-    agent_wait,
-    tool_execution,
-    retry,
-    compaction,
-    bash_execution,
-};
-
-pub const ActiveOperationSnapshot = struct {
-    kind: ActiveOperationKind,
-    label: []u8,
-    start_ms: i64,
-    delay_ms: u64 = 0,
-    attempt: u32 = 0,
-    max_attempts: u32 = 0,
-};
+pub const ActiveOperationKind = active_operation_rendering.ActiveOperationKind;
+pub const ActiveOperationSnapshot = active_operation_rendering.ActiveOperationSnapshot;
 
 const ActiveOperationState = struct {
     kind: ActiveOperationKind,
@@ -3024,7 +3011,7 @@ fn formatFooterLineWithTerminalForDisplay(
     width: usize,
     now_ms: i64,
 ) ![]u8 {
-    const active_status = try formatActiveOperationStatus(allocator, keybindings, snapshot, now_ms) orelse
+    const active_status = try active_operation_rendering.formatStatus(allocator, keybindings, snapshot.active_operation, now_ms) orelse
         return render_text.formatFooterLineWithTerminal(allocator, theme, snapshot, terminal_name, width);
     defer allocator.free(active_status);
 
@@ -3040,7 +3027,7 @@ fn formatFooterTextForDisplay(
     width: usize,
     now_ms: i64,
 ) ![]u8 {
-    const active_status = try formatActiveOperationStatus(allocator, keybindings, snapshot, now_ms) orelse
+    const active_status = try active_operation_rendering.formatStatus(allocator, keybindings, snapshot.active_operation, now_ms) orelse
         return render_text.formatFooterText(allocator, snapshot, width);
     defer allocator.free(active_status);
 
@@ -3099,72 +3086,13 @@ fn formatTaskHeaderTextForDisplay(
     mode: LayoutMode,
     now_ms: i64,
 ) ![]u8 {
-    const active_status = try formatActiveOperationStatus(allocator, keybindings, snapshot, now_ms) orelse
+    const active_status = try active_operation_rendering.formatStatus(allocator, keybindings, snapshot.active_operation, now_ms) orelse
         return render_text.formatTaskHeaderTextForMode(allocator, snapshot, width, mode);
     defer allocator.free(active_status);
 
     var display_snapshot = snapshot.*;
     display_snapshot.status = active_status;
     return render_text.formatTaskHeaderTextForMode(allocator, &display_snapshot, width, mode);
-}
-
-fn formatActiveOperationStatus(
-    allocator: std.mem.Allocator,
-    keybindings: ?*const keybindings_mod.Keybindings,
-    snapshot: *const RenderStateSnapshot,
-    now_ms: i64,
-) !?[]u8 {
-    const operation = snapshot.active_operation orelse return null;
-    const interrupt_label = try actionLabel(allocator, keybindings, .interrupt, "Esc");
-    defer allocator.free(interrupt_label);
-    const elapsed_ms = activeOperationElapsedMs(operation.start_ms, now_ms);
-    const elapsed_seconds = elapsed_ms / 1000;
-    const frame = activeOperationFrame(operation.start_ms, now_ms);
-
-    return switch (operation.kind) {
-        .agent_wait => try std.fmt.allocPrint(
-            allocator,
-            "{s} {s} {d}s elapsed ({s} to interrupt)",
-            .{ frame, operation.label, elapsed_seconds, interrupt_label },
-        ),
-        .tool_execution => try std.fmt.allocPrint(
-            allocator,
-            "{s} Running {s} {d}s elapsed ({s} to interrupt)",
-            .{ frame, operation.label, elapsed_seconds, interrupt_label },
-        ),
-        .bash_execution => try std.fmt.allocPrint(
-            allocator,
-            "{s} Running bash {d}s elapsed ({s} to interrupt)",
-            .{ frame, elapsed_seconds, interrupt_label },
-        ),
-        .compaction => try std.fmt.allocPrint(
-            allocator,
-            "{s} {s} {d}s elapsed ({s} to cancel)",
-            .{ frame, operation.label, elapsed_seconds, interrupt_label },
-        ),
-        .retry => {
-            const remaining_ms = operation.delay_ms -| elapsed_ms;
-            const remaining_seconds = (remaining_ms + 999) / 1000;
-            return try std.fmt.allocPrint(
-                allocator,
-                "{s} Retrying ({d}/{d}) in {d}s... ({s} to cancel)",
-                .{ frame, operation.attempt, operation.max_attempts, remaining_seconds, interrupt_label },
-            );
-        },
-    };
-}
-
-fn activeOperationElapsedMs(start_ms: i64, now_ms: i64) u64 {
-    if (now_ms <= start_ms) return 0;
-    return @intCast(now_ms - start_ms);
-}
-
-fn activeOperationFrame(start_ms: i64, now_ms: i64) []const u8 {
-    const elapsed_ms = activeOperationElapsedMs(start_ms, now_ms);
-    const frames = tui.components.loader.DEFAULT_SPINNER_FRAMES[0..];
-    if (frames.len == 0) return "";
-    const frame_index = @as(usize, @intCast(elapsed_ms / tui.components.loader.DEFAULT_INTERVAL_MS)) % frames.len;
-    return frames[frame_index];
 }
 
 pub fn formatFooterText(allocator: std.mem.Allocator, snapshot: *const RenderStateSnapshot, width: usize) ![]u8 {

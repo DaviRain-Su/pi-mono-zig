@@ -113,11 +113,13 @@ Acceptance criteria:
 ### 6. Input Dispatch Decomposition
 
 Status: Completed/currently covered for the Task 6 slice. Key-to-action
-resolution now lives behind the focused `input_resolution.zig` resolver, while
-`input_dispatch.zig` remains the executor/dispatcher for resolved app/editor
-actions and input-event message actions. Configured keybindings remain the only
-source of non-legacy matching, and legacy defaults are suppressed when an
-effective keybinding map rebinds those actions.
+resolution now lives behind the focused `input_resolution.zig` resolver, and
+overlay-specific model/session/tree/scoped-model key handling now lives behind
+`overlay_input.zig`. `input_dispatch.zig` remains the executor/dispatcher for
+resolved app/editor actions, selector commit side effects, editor submission,
+and input-event message actions. Configured keybindings remain the only source
+of non-legacy matching, and legacy defaults are suppressed when an effective
+keybinding map rebinds those actions.
 
 - Split key-to-action resolution from action execution. Completed for main
   editor, autocomplete, parsed input-event follow-up/dequeue, and app/editor
@@ -128,9 +130,10 @@ effective keybinding map rebinds those actions.
   main app-action executor now uses an exhaustive `Action` switch with explicit
   no-op coverage for overlay-scoped actions, so adding an action requires
   dispatch review at compile time.
-- Leave overlay-internal selector key execution behavior-preserving in this
-  slice; broader extension bridge coordination and extension ABI/protocol
-  refactors remain deferred to their own follow-up work.
+- Overlay-internal selector key execution was extracted behavior-preservingly
+  into `overlay_input.zig` for model, session, tree, and scoped-model overlays.
+  Broader extension bridge coordination and extension ABI/protocol refactors
+  remain deferred to their own follow-up work.
 
 Acceptance criteria:
 
@@ -268,6 +271,30 @@ message lists, image payload parsing, queue/thinking names, and queue text
 arrays live behind that focused boundary. The server still owns command
 dispatch, response/deferred-response ordering, direct bash routing, session
 replacement semantics, and extension UI correlation/cancel/timeout behavior.
+`extension_registry.zig` now delegates deterministic registry snapshot JSON
+construction to
+`zig/src/coding_agent/extensions/extension_registry_snapshot.zig`: snapshot root
+assembly, per-surface JSON value construction, optional field conversion,
+flag/default value conversion, injection hook serialization, and owned JSON
+value cleanup live behind that focused boundary. The registry module still owns
+registration/mutation APIs, host frame application, unregister behavior,
+extension provider auth-state registration, UI hook lifecycle mutation, command
+resolution, and runtime-facing registry surface counts.
+`input_dispatch.zig` now delegates overlay-specific interactive key handling to
+`zig/src/coding_agent/interactive_mode/overlay_input.zig`: model scope/search,
+session search/sort/scope/rename/delete navigation, scoped-model enable/reorder/save
+handling, tree search/filter/fold/label/summary handling, and shared overlay
+search editing live behind that focused boundary. The input dispatcher still owns
+main `handleInputKeyWithModifiers` orchestration, selector commit side effects,
+editor submission, app-action dispatch, queue/dequeue, auth-flow input, and
+extension-dialog routing.
+`rendering.zig` now delegates active-operation status formatting to
+`zig/src/coding_agent/interactive_mode/active_operation_rendering.zig`: active
+operation display kinds/snapshots, spinner frame selection, elapsed-time
+calculation, retry countdown text, and interrupt/cancel hint formatting live
+behind that focused rendering helper. `rendering.zig` still owns `AppState`,
+active-operation lifecycle mutation, screen/task/footer drawing, layout,
+markdown rendering, and the broader render pipeline.
 
 Remaining boundaries:
 
@@ -287,9 +314,24 @@ Remaining boundaries:
   tree mutation, session lifecycle orchestration, replay/context semantics,
   search ranking, corrupted-line warning output, or missing-cwd behavior without
   a separately assigned session lifecycle/search slice.
-- Broad interactive-mode, extension-registry, provider parser/state-machine,
-  session, build-graph, and extension ABI/interface decomposition remains
-  deferred unless assigned explicitly.
+- Further extension-registry decomposition remains deferred beyond the snapshot
+  helper boundary. Do not move `applyHostFrame`, extension ABI/protocol
+  parsing, provider auth-state registration, UI hook mutation lifecycle,
+  unregister semantics, or runtime lifecycle integration without a separately
+  assigned guarded slice.
+- Further input-dispatch decomposition remains deferred beyond the overlay-input
+  helper boundary. Do not move main `handleInputKeyWithModifiers`,
+  `submitEditorText`, selector commit side effects, broad app-action dispatch,
+  queue/dequeue, auth-flow input, or extension-dialog routing without a
+  separately assigned guarded slice.
+- Further active-operation rendering decomposition remains deferred beyond the
+  pure status-formatting helper boundary. Do not move `AppState`,
+  active-operation lifecycle mutation, task/footer drawing, terminal layout, or
+  markdown/chat rendering out of `rendering.zig` without a separately assigned
+  guarded slice.
+- Broad interactive-mode, provider parser/state-machine, session, build-graph,
+  and extension ABI/interface decomposition remains deferred unless assigned
+  explicitly.
 
 Acceptance criteria:
 
@@ -342,6 +384,17 @@ Acceptance criteria:
 - Verification for the completed TS-RPC state/model/message JSON boundary:
   `cd zig && zig build test-coding-agent`,
   `cd zig && zig build test-ts-rpc-parity`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed extension registry snapshot boundary:
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed overlay input boundary:
+  `cd zig && zig build test-tui`,
+  `cd zig && zig build test-coding-agent`,
+  `cd zig && zig build test-tidy`, and `npm run check`.
+- Verification for the completed active-operation rendering boundary:
+  `cd zig && zig build test-tui`,
+  `cd zig && zig build test-coding-agent`,
   `cd zig && zig build test-tidy`, and `npm run check`.
 
 ### 9. Session and RPC Decomposition

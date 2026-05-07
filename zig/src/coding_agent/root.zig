@@ -27,6 +27,7 @@ pub const interactive_mode = @import("interactive_mode.zig");
 pub const file_image = @import("resources/file_image.zig");
 pub const mcp_stdio = @import("modes/mcp_stdio.zig");
 pub const interactive_mode_rendering_test_modules = struct {
+    pub const active_operation_rendering = @import("interactive_mode/active_operation_rendering.zig");
     pub const rendering = @import("interactive_mode/rendering.zig");
     pub const extension_ui_bridge = @import("interactive_mode/extension_ui_bridge.zig");
     pub const prompt_rendering = @import("interactive_mode/prompt_rendering.zig");
