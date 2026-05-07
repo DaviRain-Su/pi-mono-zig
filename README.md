@@ -53,6 +53,16 @@ I regularly publish my own `pi-mono` work sessions here:
 | **[@mariozechner/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 | **[@mariozechner/pi-web-ui](packages/web-ui)** | Web components for AI chat interfaces |
 
+## Extension substrate
+
+The coding agent includes a static Zig native runtime adapter and a local WASM, `process_jsonl`, and native runtime substrate. The substrate provides generic enforcement boundaries and child-agent readiness for sub-agent extensions.
+
+Validation:
+
+```bash
+npm run check
+```
+
 ## Chat bot workflows
 
 For Slack/chat automation, see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
