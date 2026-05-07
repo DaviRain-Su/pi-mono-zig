@@ -755,10 +755,11 @@ fn parseSseStreamLines(
     }
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
+    const had_tool_calls = tool_calls.items.len > 0;
     output.content = try content_blocks.toOwnedSlice(allocator);
-    output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
+    // Tool calls live inline in output.content; legacy field intentionally null.
 
-    if (output.tool_calls != null and output.stop_reason == .stop) {
+    if (had_tool_calls and output.stop_reason == .stop) {
         output.stop_reason = .tool_use;
     }
     if (output.usage.total_tokens == 0) {
@@ -785,9 +786,8 @@ fn finalizeOutputFromPartials(
     if (output.content.len == 0 and content_blocks.items.len > 0) {
         output.content = try content_blocks.toOwnedSlice(allocator);
     }
-    if (output.tool_calls == null and tool_calls.items.len > 0) {
-        output.tool_calls = try tool_calls.toOwnedSlice(allocator);
-    }
+    // Tool calls live inline in output.content; legacy field intentionally null.
+    // tool_calls is borrow-only bookkeeping.
 }
 
 fn emitRuntimeFailure(
@@ -956,17 +956,29 @@ fn finalizeCurrentBlock(
                 else
                     tool_call.partial_json.items;
                 const arguments = try parseStreamingJsonToValue(allocator, arguments_source);
-                const stored_tool_call = types.ToolCall{
-                    .id = try allocator.dupe(u8, final_id),
-                    .name = try allocator.dupe(u8, final_name),
-                    .arguments = arguments,
+                const stored_tool_call = blk: {
+                    errdefer freeJsonValue(allocator, arguments);
+                    const id = try allocator.dupe(u8, final_id);
+                    errdefer allocator.free(id);
+                    const name = try allocator.dupe(u8, final_name);
+                    errdefer allocator.free(name);
+                    break :blk types.ToolCall{
+                        .id = id,
+                        .name = name,
+                        .arguments = arguments,
+                    };
                 };
+                var stored_tool_call_transferred = false;
+                errdefer if (!stored_tool_call_transferred) freeToolCallOwned(allocator, stored_tool_call);
+                // Single allocation: content_blocks holds the canonical strings;
+                // tool_calls retains a borrow-only copy. tool_calls.deinit only
+                // frees its buffer, so output.content owns the strings exclusively.
                 try tool_calls.append(allocator, stored_tool_call);
-                try content_blocks.append(allocator, .{ .tool_call = .{
-                    .id = try allocator.dupe(u8, stored_tool_call.id),
-                    .name = try allocator.dupe(u8, stored_tool_call.name),
-                    .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
-                } });
+                errdefer if (!stored_tool_call_transferred) {
+                    _ = tool_calls.pop();
+                };
+                try content_blocks.append(allocator, .{ .tool_call = stored_tool_call });
+                stored_tool_call_transferred = true;
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),

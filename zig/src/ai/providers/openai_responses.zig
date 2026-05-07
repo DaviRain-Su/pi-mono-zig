@@ -618,10 +618,11 @@ fn parseSseStreamLines(
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
     try flushPendingFinalizedToolCalls(allocator, &pending_tool_calls, &content_blocks, &tool_calls);
     try finalizeActiveToolCalls(allocator, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
+    const had_tool_calls = tool_calls.items.len > 0;
     output.content = try content_blocks.toOwnedSlice(allocator);
-    output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
+    // Tool calls live inline in output.content; legacy field intentionally null.
 
-    if (output.tool_calls != null and output.stop_reason == .stop) {
+    if (had_tool_calls and output.stop_reason == .stop) {
         output.stop_reason = .tool_use;
     }
     if (output.usage.total_tokens == 0) {
@@ -652,9 +653,8 @@ fn finalizeOutputFromPartials(
     if (output.content.len == 0 and content_blocks.items.len > 0) {
         output.content = try content_blocks.toOwnedSlice(allocator);
     }
-    if (output.tool_calls == null and tool_calls.items.len > 0) {
-        output.tool_calls = try tool_calls.toOwnedSlice(allocator);
-    }
+    // Tool calls live inline in output.content; legacy field intentionally null.
+    // tool_calls is borrow-only bookkeeping.
 }
 
 fn emitRuntimeFailure(
@@ -879,23 +879,34 @@ fn finalizeActiveToolCallAt(
         }
         break :blk try parseStreamingJsonToValue(allocator, tool_call.partial_json.items);
     } else try parseStreamingJsonToValue(allocator, tool_call.partial_json.items);
-    errdefer freeJsonValue(allocator, arguments);
 
-    const stored_tool_call = types.ToolCall{
-        .id = try allocator.dupe(u8, final_id),
-        .name = try allocator.dupe(u8, final_name),
-        .arguments = arguments,
+    const stored_tool_call = blk: {
+        errdefer freeJsonValue(allocator, arguments);
+        const id = try allocator.dupe(u8, final_id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, final_name);
+        errdefer allocator.free(name);
+        break :blk types.ToolCall{
+            .id = id,
+            .name = name,
+            .arguments = arguments,
+        };
     };
-    errdefer freeToolCallOwned(allocator, stored_tool_call);
+    var stored_tool_call_owned = true;
+    errdefer if (stored_tool_call_owned) freeToolCallOwned(allocator, stored_tool_call);
 
     if (tool_call.event_index == content_blocks.items.len) {
         try appendFinalizedToolCallCopies(allocator, stored_tool_call, content_blocks, tool_calls);
         try flushPendingFinalizedToolCalls(allocator, pending_tool_calls, content_blocks, tool_calls);
     } else {
+        const pending_tool_call = try cloneToolCallOwned(allocator, stored_tool_call);
+        var pending_tool_call_transferred = false;
+        errdefer if (!pending_tool_call_transferred) freeToolCallOwned(allocator, pending_tool_call);
         try pending_tool_calls.append(allocator, .{
             .event_index = tool_call.event_index,
-            .tool_call = try cloneToolCallOwned(allocator, stored_tool_call),
+            .tool_call = pending_tool_call,
         });
+        pending_tool_call_transferred = true;
     }
     stream_ptr.push(.{
         .event_type = .toolcall_end,
@@ -906,6 +917,7 @@ fn finalizeActiveToolCallAt(
             .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
         },
     });
+    stored_tool_call_owned = false;
     freeToolCallOwned(allocator, stored_tool_call);
 }
 
@@ -952,8 +964,18 @@ fn appendFinalizedToolCallCopies(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
 ) !void {
-    try tool_calls.append(allocator, try cloneToolCallOwned(allocator, source));
-    try content_blocks.append(allocator, .{ .tool_call = try cloneToolCallOwned(allocator, source) });
+    // Single allocation: clone once, content_blocks owns the strings via the
+    // inline tool_call block; tool_calls retains a borrow-only copy whose
+    // ArrayList.deinit only frees its buffer.
+    const owned = try cloneToolCallOwned(allocator, source);
+    var owned_transferred = false;
+    errdefer if (!owned_transferred) freeToolCallOwned(allocator, owned);
+    try tool_calls.append(allocator, owned);
+    errdefer if (!owned_transferred) {
+        _ = tool_calls.pop();
+    };
+    try content_blocks.append(allocator, .{ .tool_call = owned });
+    owned_transferred = true;
 }
 
 fn flushPendingFinalizedToolCalls(
@@ -973,6 +995,7 @@ fn flushPendingFinalizedToolCalls(
 
         const index = pending_index orelse return;
         const pending = pending_tool_calls.orderedRemove(index);
+        errdefer freeToolCallOwned(allocator, pending.tool_call);
         try appendFinalizedToolCallCopies(allocator, pending.tool_call, content_blocks, tool_calls);
         freeToolCallOwned(allocator, pending.tool_call);
     }
@@ -1047,17 +1070,28 @@ fn finalizeCurrentBlock(
                 else
                     tool_call.partial_json.items;
                 const arguments = try parseStreamingJsonToValue(allocator, arguments_source);
-                const stored_tool_call = types.ToolCall{
-                    .id = try allocator.dupe(u8, final_id),
-                    .name = try allocator.dupe(u8, final_name),
-                    .arguments = arguments,
+                const stored_tool_call = blk: {
+                    const id = try allocator.dupe(u8, final_id);
+                    errdefer allocator.free(id);
+                    const name = try allocator.dupe(u8, final_name);
+                    errdefer allocator.free(name);
+                    break :blk types.ToolCall{
+                        .id = id,
+                        .name = name,
+                        .arguments = arguments,
+                    };
                 };
+                var stored_tool_call_transferred = false;
+                errdefer if (!stored_tool_call_transferred) freeToolCallOwned(allocator, stored_tool_call);
+                // Single allocation: content_blocks holds the canonical strings;
+                // tool_calls retains a borrow-only copy. tool_calls.deinit only
+                // frees its buffer, so output.content owns the strings exclusively.
                 try tool_calls.append(allocator, stored_tool_call);
-                try content_blocks.append(allocator, .{ .tool_call = .{
-                    .id = try allocator.dupe(u8, stored_tool_call.id),
-                    .name = try allocator.dupe(u8, stored_tool_call.name),
-                    .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
-                } });
+                errdefer if (!stored_tool_call_transferred) {
+                    _ = tool_calls.pop();
+                };
+                try content_blocks.append(allocator, .{ .tool_call = stored_tool_call });
+                stored_tool_call_transferred = true;
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),
@@ -2063,11 +2097,18 @@ fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) vo
 }
 
 fn cloneToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) !types.ToolCall {
+    const id = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, tool_call.name);
+    errdefer allocator.free(name);
+    const arguments = try cloneJsonValue(allocator, tool_call.arguments);
+    errdefer freeJsonValue(allocator, arguments);
+    const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
     return .{
-        .id = try allocator.dupe(u8, tool_call.id),
-        .name = try allocator.dupe(u8, tool_call.name),
-        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
-        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+        .id = id,
+        .name = name,
+        .arguments = arguments,
+        .thought_signature = thought_signature,
     };
 }
 
@@ -2818,14 +2859,11 @@ test "parseSseStreamLines streams tool calls and finalizes arguments" {
     const event6 = stream.next().?;
     try std.testing.expectEqual(types.EventType.done, event6.event_type);
     try std.testing.expect(event6.message != null);
-    try std.testing.expect(event6.message.?.tool_calls != null);
-    try std.testing.expectEqual(@as(usize, 1), event6.message.?.tool_calls.?.len);
-    try std.testing.expectEqualStrings("call_1|fc_1", event6.message.?.tool_calls.?[0].id);
-    try std.testing.expectEqualStrings("Berlin", event6.message.?.tool_calls.?[0].arguments.object.get("city").?.string);
     try std.testing.expectEqual(@as(usize, 1), event6.message.?.content.len);
     try std.testing.expect(event6.message.?.content[0] == .tool_call);
     try std.testing.expectEqualStrings("call_1|fc_1", event6.message.?.content[0].tool_call.id);
     try std.testing.expectEqualStrings("Berlin", event6.message.?.content[0].tool_call.arguments.object.get("city").?.string);
+    try std.testing.expect(event6.message.?.tool_calls == null);
     try std.testing.expectEqual(types.StopReason.tool_use, event6.message.?.stop_reason);
     try std.testing.expectEqualStrings("resp_tool", event6.message.?.response_id.?);
 
@@ -2886,14 +2924,13 @@ test "parseSseStreamLines separates interleaved calls and lets final/object argu
     try std.testing.expect(done != null);
     const message = done.?.message.?;
     try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
-    try std.testing.expectEqual(@as(usize, 2), message.tool_calls.?.len);
-    try std.testing.expectEqualStrings("call_1|fc_1", message.tool_calls.?[0].id);
-    try std.testing.expectEqualStrings("Berlin", message.tool_calls.?[0].arguments.object.get("city").?.string);
-    try std.testing.expectEqualStrings("call_2|fc_2", message.tool_calls.?[1].id);
-    try std.testing.expectEqual(@as(i64, 2), message.tool_calls.?[1].arguments.object.get("count").?.integer);
-    try std.testing.expect(message.tool_calls.?[1].arguments.object.get("nested").?.object.get("ok").?.bool);
+    try std.testing.expect(message.tool_calls == null);
+    try std.testing.expectEqual(@as(usize, 2), message.content.len);
+    try std.testing.expectEqualStrings("call_1|fc_1", message.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("call_2|fc_2", message.content[1].tool_call.id);
     try std.testing.expectEqualStrings("Berlin", message.content[0].tool_call.arguments.object.get("city").?.string);
     try std.testing.expectEqual(@as(i64, 2), message.content[1].tool_call.arguments.object.get("count").?.integer);
+    try std.testing.expect(message.content[1].tool_call.arguments.object.get("nested").?.object.get("ok").?.bool);
 
     freeAssistantMessageOwned(allocator, message);
 }
@@ -2966,12 +3003,10 @@ test "parseSseStreamLines preserves reserved indexes for out-of-order tool call 
     try std.testing.expect(done.message != null);
     const message = done.message.?;
     try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
-    try std.testing.expectEqual(@as(usize, 2), message.tool_calls.?.len);
+    try std.testing.expect(message.tool_calls == null);
     try std.testing.expectEqual(@as(usize, 2), message.content.len);
     try std.testing.expect(message.content[0] == .tool_call);
     try std.testing.expect(message.content[1] == .tool_call);
-    try std.testing.expectEqualStrings("call_1|fc_1", message.tool_calls.?[0].id);
-    try std.testing.expectEqualStrings("call_2|fc_2", message.tool_calls.?[1].id);
     try std.testing.expectEqualStrings("call_1|fc_1", message.content[0].tool_call.id);
     try std.testing.expectEqualStrings("call_2|fc_2", message.content[1].tool_call.id);
     try std.testing.expectEqual(@as(i64, 1), message.content[0].tool_call.arguments.object.get("value").?.integer);

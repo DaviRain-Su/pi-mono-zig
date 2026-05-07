@@ -822,7 +822,7 @@ test "parse anthropic stream emits tool call and thinking events" {
     try std.testing.expect(done.message.?.content[1] == .tool_call);
     try std.testing.expectEqualStrings("todoWrite", done.message.?.content[1].tool_call.name);
     try std.testing.expectEqualStrings("item", done.message.?.content[1].tool_call.arguments.object.get("todos").?.string);
-    try std.testing.expectEqualStrings(done.message.?.tool_calls.?[0].id, done.message.?.content[1].tool_call.id);
+    try std.testing.expect(done.message.?.tool_calls == null);
 }
 
 test "parse kimi anthropic-compatible stream repairs malformed json and ignores unknown events" {
@@ -1113,10 +1113,7 @@ test "parse kimi anthropic-compatible stream ignores orphan tool input deltas af
     try std.testing.expectEqualStrings("tool_kimi_code_review", done_message.?.content[0].tool_call.id);
     try std.testing.expectEqualStrings("ls", done_message.?.content[0].tool_call.name);
     try std.testing.expectEqualStrings("/Users/davirian/dev/active/pi-mono-davirain", done_message.?.content[0].tool_call.arguments.object.get("path").?.string);
-    try std.testing.expect(done_message.?.tool_calls != null);
-    try std.testing.expectEqual(@as(usize, 1), done_message.?.tool_calls.?.len);
-    try std.testing.expectEqualStrings("tool_kimi_code_review", done_message.?.tool_calls.?[0].id);
-    try std.testing.expectEqualStrings("/Users/davirian/dev/active/pi-mono-davirain", done_message.?.tool_calls.?[0].arguments.object.get("path").?.string);
+    try std.testing.expect(done_message.?.tool_calls == null);
 }
 
 test "parse kimi anthropic-compatible stream finalizes recoverable partial EOF" {
@@ -1851,11 +1848,9 @@ fn parseSseStreamLines(
     output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
     calculateCost(model, &output.usage);
     output.content = try content_blocks.toOwnedSlice(allocator);
-    // Anthropic uses dual allocation: each tool call has separate copies in
-    // `tool_calls` and inline `content`. The legacy field still owns the
-    // ArrayList copies so they are freed via freeAssistantMessage. Inline
-    // content is the canonical source consumers read from.
-    output.tool_calls = if (tool_calls.items.len > 0) try tool_calls.toOwnedSlice(allocator) else null;
+    // Tool calls live inline in output.content; legacy AssistantMessage.tool_calls
+    // is intentionally left null. tool_calls ArrayList holds borrow-only copies
+    // and tool_calls.deinit only releases its buffer.
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -1891,17 +1886,31 @@ fn finalizeOutputFromPartials(
             .tool_call => |tool| {
                 var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
                 defer parsed_arguments.deinit();
-                const final_tool_call = types.ToolCall{
-                    .id = try allocator.dupe(u8, tool.id),
-                    .name = try allocator.dupe(u8, tool.name),
-                    .arguments = try cloneJsonValue(allocator, parsed_arguments.value),
+                const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
+                const final_tool_call = blk: {
+                    errdefer freeJsonValue(allocator, arguments);
+                    const id = try allocator.dupe(u8, tool.id);
+                    errdefer allocator.free(id);
+                    const name = try allocator.dupe(u8, tool.name);
+                    errdefer allocator.free(name);
+                    break :blk types.ToolCall{
+                        .id = id,
+                        .name = name,
+                        .arguments = arguments,
+                    };
                 };
+                var final_tool_call_transferred = false;
+                errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
+                // Single allocation: content_blocks holds the canonical ToolCall
+                // value; tool_calls keeps a borrow-only copy (shared pointers)
+                // for length checks. ArrayList.deinit only frees its buffer, so
+                // the strings end up owned exclusively by output.content.
                 try tool_calls.append(allocator, final_tool_call);
-                try content_blocks.append(allocator, .{ .tool_call = .{
-                    .id = try allocator.dupe(u8, final_tool_call.id),
-                    .name = try allocator.dupe(u8, final_tool_call.name),
-                    .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
-                } });
+                errdefer if (!final_tool_call_transferred) {
+                    _ = tool_calls.pop();
+                };
+                try content_blocks.append(allocator, .{ .tool_call = final_tool_call });
+                final_tool_call_transferred = true;
                 stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
             },
         }
@@ -1910,9 +1919,7 @@ fn finalizeOutputFromPartials(
     output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
     calculateCost(model, &output.usage);
     if (output.content.len == 0 and content_blocks.items.len > 0) output.content = try content_blocks.toOwnedSlice(allocator);
-    // See note in the main streaming path: legacy field retains ownership of
-    // the dual-allocation ArrayList copies for cleanup.
-    if (output.tool_calls == null and tool_calls.items.len > 0) output.tool_calls = try tool_calls.toOwnedSlice(allocator);
+    // Tool calls are emitted inline; legacy field intentionally null.
 }
 
 fn emitRuntimeFailure(
@@ -2176,7 +2183,7 @@ fn handleContentBlockStart(
         return AnthropicError.InvalidAnthropicChunk;
     }
 
-    const event_index = active_blocks.items.len;
+    const event_index = anthropic_index;
     if (std.mem.eql(u8, block_type.string, "text")) {
         try active_blocks.append(allocator, .{
             .anthropic_index = anthropic_index,
@@ -2391,7 +2398,7 @@ fn createImplicitActiveBlock(
     anthropic_index: usize,
     delta_type: []const u8,
 ) !*BlockEntry {
-    const event_index = active_blocks.items.len;
+    const event_index = anthropic_index;
     if (std.mem.eql(u8, delta_type, "text_delta")) {
         try active_blocks.append(allocator, .{
             .anthropic_index = anthropic_index,
@@ -2471,17 +2478,28 @@ fn handleContentBlockStop(
             var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
             defer parsed_arguments.deinit();
             const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
-            const final_tool_call = types.ToolCall{
-                .id = try allocator.dupe(u8, tool.id),
-                .name = try allocator.dupe(u8, tool.name),
-                .arguments = arguments,
+            const final_tool_call = blk: {
+                errdefer freeJsonValue(allocator, arguments);
+                const id = try allocator.dupe(u8, tool.id);
+                errdefer allocator.free(id);
+                const name = try allocator.dupe(u8, tool.name);
+                errdefer allocator.free(name);
+                break :blk types.ToolCall{
+                    .id = id,
+                    .name = name,
+                    .arguments = arguments,
+                };
             };
+            var final_tool_call_transferred = false;
+            errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
+            // Single allocation: content_blocks owns the strings; tool_calls
+            // keeps a borrow-only copy for downstream length checks.
             try tool_calls.append(allocator, final_tool_call);
-            try content_blocks.append(allocator, .{ .tool_call = .{
-                .id = try allocator.dupe(u8, final_tool_call.id),
-                .name = try allocator.dupe(u8, final_tool_call.name),
-                .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
-            } });
+            errdefer if (!final_tool_call_transferred) {
+                _ = tool_calls.pop();
+            };
+            try content_blocks.append(allocator, .{ .tool_call = final_tool_call });
+            final_tool_call_transferred = true;
             stream_ptr.push(.{
                 .event_type = .toolcall_end,
                 .content_index = @intCast(entry.event_index),
@@ -3370,7 +3388,8 @@ test "parseSseStreamLines finalizes partial Anthropic blocks before provider err
     try std.testing.expectEqualStrings("partial text", terminal.message.?.content[0].text.text);
     try std.testing.expectEqualStrings("partial thought", terminal.message.?.content[1].thinking.thinking);
     try std.testing.expectEqualStrings("sig-1", terminal.message.?.content[1].thinking.signature.?);
-    try std.testing.expectEqualStrings("item", terminal.message.?.tool_calls.?[0].arguments.object.get("todos").?.string);
+    try std.testing.expectEqualStrings("item", terminal.message.?.content[2].tool_call.arguments.object.get("todos").?.string);
+    try std.testing.expect(terminal.message.?.tool_calls == null);
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, redacted_secret_placeholder) == null);
     try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);

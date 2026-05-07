@@ -692,16 +692,19 @@ fn parseSseStreamLines(
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr);
 
+    const had_tool_calls = tool_calls.items.len > 0;
+
     if (content_blocks.items.len > 0) {
         const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
         for (content_blocks.items, 0..) |block, index| blocks[index] = block;
         output.content = blocks;
     }
 
-    if (tool_calls.items.len > 0) {
-        const output_tool_calls = try allocator.alloc(types.ToolCall, tool_calls.items.len);
-        for (tool_calls.items, 0..) |tool_call, index| output_tool_calls[index] = tool_call;
-        output.tool_calls = output_tool_calls;
+    // Tool calls live inline in output.content; legacy field intentionally null.
+    // tool_calls is borrow-only bookkeeping.
+
+    if (had_tool_calls and output.stop_reason == .stop) {
+        output.stop_reason = .tool_use;
     }
 
     stream_ptr.push(.{
@@ -726,12 +729,8 @@ fn finalizeOutputFromPartials(
         output.content = blocks;
         content_blocks.clearRetainingCapacity();
     }
-    if (output.tool_calls == null and tool_calls.items.len > 0) {
-        const output_tool_calls = try allocator.alloc(types.ToolCall, tool_calls.items.len);
-        for (tool_calls.items, 0..) |tool_call, index| output_tool_calls[index] = tool_call;
-        output.tool_calls = output_tool_calls;
-        tool_calls.clearRetainingCapacity();
-    }
+    // Tool calls live inline in output.content; legacy field intentionally null.
+    // tool_calls is borrow-only bookkeeping.
 }
 
 fn emitRuntimeFailure(
@@ -842,16 +841,14 @@ fn finishCurrentBlock(
                 const arguments = try parseStreamingJsonToValue(allocator, std.mem.trim(u8, tool_call.partial_args.items, " "));
                 errdefer freeJsonValue(allocator, arguments);
 
-                const placeholder = try allocator.dupe(u8, "");
-                errdefer allocator.free(placeholder);
-                try content_blocks.append(allocator, .{ .text = .{ .text = placeholder } });
-                errdefer _ = content_blocks.pop();
-
                 const stored_tool_call: types.ToolCall = .{
                     .id = id,
                     .name = name,
                     .arguments = arguments,
                 };
+                // Inline tool call is canonical; tool_calls keeps a borrow-only copy.
+                try content_blocks.append(allocator, .{ .tool_call = stored_tool_call });
+                errdefer _ = content_blocks.pop();
                 try tool_calls.append(allocator, stored_tool_call);
                 errdefer _ = tool_calls.pop();
                 stream_ptr.push(.{
@@ -1230,16 +1227,17 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
     try std.testing.expectEqual(types.StopReason.tool_use, event6.message.?.stop_reason);
     try std.testing.expectEqual(@as(u32, 10), event6.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 5), event6.message.?.usage.output);
-    try std.testing.expect(event6.message.?.tool_calls != null);
-    try std.testing.expectEqual(@as(usize, 1), event6.message.?.tool_calls.?.len);
-    try std.testing.expectEqualStrings("run_terminal", event6.message.?.tool_calls.?[0].name);
-    try std.testing.expect(event6.message.?.tool_calls.?[0].arguments == .object);
-    try std.testing.expectEqualStrings("echo hello", event6.message.?.tool_calls.?[0].arguments.object.get("command").?.string);
-    try std.testing.expect(event5.tool_call.?.id.ptr == event6.message.?.tool_calls.?[0].id.ptr);
-    try std.testing.expect(event5.tool_call.?.name.ptr == event6.message.?.tool_calls.?[0].name.ptr);
+    try std.testing.expect(event6.message.?.tool_calls == null);
+    try std.testing.expectEqual(@as(usize, 1), event6.message.?.content.len);
+    try std.testing.expect(event6.message.?.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("run_terminal", event6.message.?.content[0].tool_call.name);
+    try std.testing.expect(event6.message.?.content[0].tool_call.arguments == .object);
+    try std.testing.expectEqualStrings("echo hello", event6.message.?.content[0].tool_call.arguments.object.get("command").?.string);
+    try std.testing.expect(event5.tool_call.?.id.ptr == event6.message.?.content[0].tool_call.id.ptr);
+    try std.testing.expect(event5.tool_call.?.name.ptr == event6.message.?.content[0].tool_call.name.ptr);
     try std.testing.expect(
         event5.tool_call.?.arguments.object.get("command").?.string.ptr ==
-            event6.message.?.tool_calls.?[0].arguments.object.get("command").?.string.ptr,
+            event6.message.?.content[0].tool_call.arguments.object.get("command").?.string.ptr,
     );
 
     freeAssistantMessageOwned(allocator, event6.message.?);
