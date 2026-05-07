@@ -1,9 +1,12 @@
 import { type Static, Type } from "typebox";
 import type { CustomEntry } from "../session-manager.js";
 import {
+	type BoundedSubAgentExecutor,
+	defaultBoundedSubAgentExecutor,
+	executeBoundedSubAgentTask,
+} from "./bounded-subagent-execution.js";
+import {
 	type SubAgentCancellationMetadata,
-	type SubAgentResourceLimits,
-	type SubAgentResourceSummary,
 	type SubAgentTaskInvocationEnvelope,
 	type SubAgentTaskResultEnvelope,
 	validateSubAgentTaskInvocationEnvelope,
@@ -97,30 +100,30 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 			ctx: ExtensionContext,
 		): Promise<SubAgentTaskResultEnvelope> => {
 			const invocation = buildInvocation(params, signal);
-			const replayed = findRecordedDelegationResult(ctx, invocation);
-			if (replayed) return replayed;
-
-			if (invocation.cancellation?.state === "requested" || signal?.aborted === true) {
-				const propagatedInvocation = propagateCancellation(invocation, signal);
-				pi.appendEntry(SUB_AGENT_READINESS_ENTRY, propagatedInvocation);
-				const result = buildCancelledResult(propagatedInvocation);
-				pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, result);
-				return result;
-			}
-
-			pi.appendEntry(SUB_AGENT_READINESS_ENTRY, invocation);
-
-			const denialReason = delegationDenialReason(approvedCapabilities, invocation.limits);
-			if (denialReason) {
-				const result = buildDeniedResult(invocation, denialReason);
-				pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, result);
-				return result;
-			}
-
-			const delegated = await (options.delegate ?? defaultDelegate)(invocation, { signal, context: ctx });
-			const result = validateSubAgentTaskResultEnvelope(delegated);
-			pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, result);
-			return result;
+			const executor: BoundedSubAgentExecutor = async (boundedInvocation, executionContext) => {
+				const delegate = options.delegate ?? defaultDelegate;
+				return delegate(boundedInvocation, { signal: executionContext.signal, context: ctx });
+			};
+			return executeBoundedSubAgentTask(invocation, {
+				signal,
+				executor,
+				store: {
+					findResult: (candidate) => findRecordedDelegationResult(ctx, candidate),
+					appendInvocation: (candidate) => pi.appendEntry(SUB_AGENT_READINESS_ENTRY, candidate),
+					appendResult: (result) => pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, result),
+				},
+				admission: () =>
+					approvedCapabilities.has("agent.delegate")
+						? undefined
+						: {
+								reason: "denied_capability",
+								message: "grant is not approved",
+								details: {
+									capability: "agent.delegate",
+									operation: "agent.delegate",
+								},
+							},
+			});
 		};
 
 		pi.registerTool({
@@ -186,177 +189,14 @@ function normalizeCancellation(
 	return cancellation;
 }
 
-function propagateCancellation(
-	invocation: SubAgentTaskInvocationEnvelope,
-	signal: AbortSignal | undefined,
-): SubAgentTaskInvocationEnvelope {
-	return validateSubAgentTaskInvocationEnvelope({
-		...invocation,
-		cancellation: {
-			...invocation.cancellation,
-			state: "propagated",
-			reason: invocation.cancellation?.reason ?? (signal?.aborted === true ? "abort signal requested" : "cancelled"),
-			propagatedFrom: invocation.cancellation?.propagatedFrom ?? invocation.parentRunId ?? invocation.runId,
-		},
-	});
-}
-
-function delegationDenialReason(
-	approvedCapabilities: ReadonlySet<SubAgentDelegationCapability>,
-	limits: SubAgentResourceLimits | undefined,
-): string | undefined {
-	if (!approvedCapabilities.has("agent.delegate")) return "grant is not approved";
-	if (limits?.maxChildren !== undefined && limits.maxChildren < 1) return "resource limit exceeded: maxChildren";
-	if (limits?.depth !== undefined && limits.depth < 1) return "resource limit exceeded: depth";
-	if (limits?.turns !== undefined && limits.turns < 1) return "resource limit exceeded: turns";
-	if (limits?.timeoutMs !== undefined && limits.timeoutMs < 1) return "resource limit exceeded: timeoutMs";
-	return undefined;
-}
-
-function buildDeniedResult(invocation: SubAgentTaskInvocationEnvelope, reason: string): SubAgentTaskResultEnvelope {
-	return validateSubAgentTaskResultEnvelope({
-		...correlationFromInvocation(invocation),
-		type: "sub_agent_task_result",
-		status: "failed",
-		startedAt: Date.now(),
-		completedAt: Date.now(),
-		error: {
-			reason: reason === "grant is not approved" ? "denied_capability" : "resource_limit_exceeded",
-			message: reason,
-			details: {
-				capability: "agent.delegate",
-				operation: "agent.delegate",
-			},
-		},
-		details: {
-			capability: "agent.delegate",
-			operation: "agent.delegate",
-			replayed: false,
-		},
-		resourceSummary: zeroResourceSummary(invocation.limits),
-	});
-}
-
-function buildCancelledResult(invocation: SubAgentTaskInvocationEnvelope): SubAgentTaskResultEnvelope {
-	return validateSubAgentTaskResultEnvelope({
-		...correlationFromInvocation(invocation),
-		type: "sub_agent_task_result",
-		status: "cancelled",
-		startedAt: Date.now(),
-		completedAt: Date.now(),
-		error: {
-			reason: "cancelled",
-			message: invocation.cancellation?.reason ?? "delegation cancelled",
-			details: { cancellation: invocation.cancellation },
-		},
-		details: {
-			capability: "agent.delegate",
-			operation: "agent.delegate",
-			cancellation: invocation.cancellation,
-		},
-		resourceSummary: zeroResourceSummary(invocation.limits),
-	});
-}
-
-function correlationFromInvocation(invocation: SubAgentTaskInvocationEnvelope): Record<string, unknown> {
-	return {
-		agentId: invocation.agentId,
-		runId: invocation.runId,
-		taskId: invocation.taskId,
-		sessionId: invocation.sessionId,
-		toolCallId: invocation.toolCallId,
-		parentAgentId: invocation.parentAgentId,
-		parentRunId: invocation.parentRunId,
-		parentTaskId: invocation.parentTaskId,
-		parentSessionId: invocation.parentSessionId,
-		parentId: invocation.parentId,
-	};
-}
-
-function zeroResourceSummary(limits: SubAgentResourceLimits | undefined): SubAgentResourceSummary {
-	return {
-		turns: 0,
-		outputBytes: 0,
-		outputLines: 0,
-		childrenStarted: 0,
-		limitDetails: limitDetailsForActuals(limits, {
-			turns: 0,
-			outputBytes: 0,
-			outputLines: 0,
-			childrenStarted: 0,
-		}),
-	};
-}
-
-const defaultDelegate: SubAgentDelegationHost = (invocation) => {
-	const text = `delegated:${invocation.route ?? "default"}:${JSON.stringify(invocation.input)}`;
-	const outputBytes = new TextEncoder().encode(text).length;
-	const outputLines = countLines(text);
-	return validateSubAgentTaskResultEnvelope({
-		...correlationFromInvocation(invocation),
-		type: "sub_agent_task_result",
-		status: "completed",
-		content: [{ type: "text", text }],
-		startedAt: Date.now(),
-		completedAt: Date.now(),
-		resourceSummary: {
-			turns: 1,
-			outputBytes,
-			outputLines,
-			childrenStarted: 1,
-			limitDetails: limitDetailsForActuals(invocation.limits, {
-				turns: 1,
-				outputBytes,
-				outputLines,
-				childrenStarted: 1,
-			}),
-		},
-		details: {
-			capability: "agent.delegate",
-			operation: "agent.delegate",
-			route: invocation.route,
-		},
+const defaultDelegate: SubAgentDelegationHost = (invocation, context) => {
+	return defaultBoundedSubAgentExecutor(invocation, {
+		invocation,
+		signal: context.signal ?? new AbortController().signal,
+		consumeTurn: () => {},
+		runTool: async () => ({ ok: true }),
 	});
 };
-
-function limitDetailsForActuals(
-	limits: SubAgentResourceLimits | undefined,
-	actuals: { turns: number; outputBytes: number; outputLines: number; childrenStarted: number },
-): SubAgentResourceSummary["limitDetails"] {
-	if (!limits) return undefined;
-	const details: NonNullable<SubAgentResourceSummary["limitDetails"]> = {};
-	if (limits.turns !== undefined) {
-		details.turns = { limit: limits.turns, actual: actuals.turns, truncated: actuals.turns > limits.turns };
-	}
-	if (limits.outputBytes !== undefined) {
-		details.outputBytes = {
-			limit: limits.outputBytes,
-			actual: actuals.outputBytes,
-			truncated: actuals.outputBytes > limits.outputBytes,
-		};
-	}
-	if (limits.outputLines !== undefined) {
-		details.outputLines = {
-			limit: limits.outputLines,
-			actual: actuals.outputLines,
-			truncated: actuals.outputLines > limits.outputLines,
-		};
-	}
-	if (limits.maxChildren !== undefined) {
-		details.maxChildren = {
-			limit: limits.maxChildren,
-			actual: actuals.childrenStarted,
-			truncated: actuals.childrenStarted > limits.maxChildren,
-		};
-	}
-	if (limits.toolScopes !== undefined) details.toolScopes = limits.toolScopes;
-	return details;
-}
-
-function countLines(text: string): number {
-	if (text.length === 0) return 0;
-	return text.split(/\r\n|\r|\n/).length;
-}
 
 function findRecordedDelegationResult(
 	ctx: ExtensionContext,

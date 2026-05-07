@@ -4,6 +4,19 @@
 
 export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.js";
 export type { SourceInfo } from "../source-info.js";
+export type {
+	BoundedSubAgentAdmissionDenial,
+	BoundedSubAgentExecutionContext,
+	BoundedSubAgentExecutionOptions,
+	BoundedSubAgentExecutionStore,
+	BoundedSubAgentExecutor,
+	BoundedSubAgentToolHandler,
+	BoundedSubAgentToolResult,
+} from "./bounded-subagent-execution.js";
+export {
+	defaultBoundedSubAgentExecutor,
+	executeBoundedSubAgentTask,
+} from "./bounded-subagent-execution.js";
 export {
 	createExtensionRuntime,
 	discoverAndLoadExtensions,

@@ -9,6 +9,7 @@ import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createEventBus } from "../src/core/event-bus.js";
+import { executeBoundedSubAgentTask } from "../src/core/extensions/bounded-subagent-execution.js";
 import {
 	createExtensionRuntime,
 	discoverAndLoadExtensions,
@@ -497,6 +498,340 @@ describe("sub-agent readiness envelope validation", () => {
 		} finally {
 			fs.rmSync(sessionDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("bounded sub-agent execution seam", () => {
+	const invocation = validateSubAgentTaskInvocationEnvelope({
+		type: "sub_agent_task_invocation",
+		agentId: "agent-core",
+		runId: "run-core",
+		taskId: "task-core",
+		sessionId: "session-core",
+		toolCallId: "tool-call-core",
+		parentAgentId: "parent-agent",
+		parentRunId: "parent-run",
+		parentTaskId: "parent-task",
+		parentSessionId: "parent-session",
+		parentId: "parent-record",
+		route: "core",
+		input: { prompt: "bounded" },
+		limits: { maxChildren: 1, depth: 1, turns: 2, timeoutMs: 1000, outputBytes: 64, outputLines: 4 },
+	});
+
+	it("accepts only substrate envelopes and preserves invocation identity and lineage", async () => {
+		await expect(
+			executeBoundedSubAgentTask(
+				{ ...invocation, agentId: "" },
+				{
+					executor: () => {
+						throw new Error("invalid invocation must not execute");
+					},
+				},
+			),
+		).rejects.toThrow("$.agentId: must not be empty");
+
+		const result = await executeBoundedSubAgentTask(invocation, {
+			executor: (received) => ({
+				type: "sub_agent_task_result",
+				agentId: "wrong-agent",
+				runId: "wrong-run",
+				taskId: "wrong-task",
+				sessionId: "wrong-session",
+				parentAgentId: "wrong-parent",
+				status: "completed",
+				content: [{ type: "text", text: "done" }],
+				startedAt: 10,
+				completedAt: 20,
+				resourceSummary: { turns: 1, outputBytes: 4, outputLines: 1, childrenStarted: 1 },
+				details: { receivedTaskId: received.taskId },
+			}),
+		});
+
+		expect(validateSubAgentTaskResultEnvelope(result)).toBe(result);
+		expect(result).toMatchObject({
+			agentId: "agent-core",
+			runId: "run-core",
+			taskId: "task-core",
+			sessionId: "session-core",
+			toolCallId: "tool-call-core",
+			parentAgentId: "parent-agent",
+			parentRunId: "parent-run",
+			parentTaskId: "parent-task",
+			parentSessionId: "parent-session",
+			parentId: "parent-record",
+			status: "completed",
+		});
+	});
+
+	it("enforces single-child, depth, turn, output, and tool-scope limits deterministically", async () => {
+		let delegateCalls = 0;
+		const maxChildrenDenied = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-max-children", limits: { ...invocation.limits, maxChildren: 0 } },
+			{
+				executor: () => {
+					delegateCalls++;
+					throw new Error("maxChildren denial must be side-effect free");
+				},
+			},
+		);
+		const depthDenied = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-depth", limits: { ...invocation.limits, depth: 0 } },
+			{
+				executor: () => {
+					delegateCalls++;
+					throw new Error("depth denial must be side-effect free");
+				},
+			},
+		);
+		const turnsDenied = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-turns", limits: { ...invocation.limits, turns: 0 } },
+			{
+				executor: () => {
+					delegateCalls++;
+					throw new Error("turn denial must be side-effect free");
+				},
+			},
+		);
+
+		expect(delegateCalls).toBe(0);
+		expect(maxChildrenDenied).toMatchObject({
+			status: "failed",
+			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: maxChildren" },
+			resourceSummary: { childrenStarted: 0 },
+		});
+		expect(depthDenied.error?.message).toBe("resource limit exceeded: depth");
+		expect(turnsDenied.error?.message).toBe("resource limit exceeded: turns");
+
+		const runtimeTurnsDenied = await executeBoundedSubAgentTask(invocation, {
+			executor: () => ({
+				type: "sub_agent_task_result",
+				agentId: invocation.agentId,
+				runId: invocation.runId,
+				taskId: invocation.taskId,
+				sessionId: invocation.sessionId,
+				status: "completed",
+				content: [{ type: "text", text: "over-turn" }],
+				startedAt: 1,
+				completedAt: 2,
+				resourceSummary: { turns: 3, outputBytes: 9, outputLines: 1, childrenStarted: 1 },
+			}),
+		});
+		expect(runtimeTurnsDenied).toMatchObject({
+			status: "failed",
+			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: turns" },
+			resourceSummary: {
+				turns: 2,
+				limitDetails: { turns: { limit: 2, actual: 3, truncated: true, reason: "resource limit exceeded: turns" } },
+			},
+		});
+
+		const truncated = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-output", limits: { ...invocation.limits, outputBytes: 5, outputLines: 2 } },
+			{
+				executor: () => ({
+					type: "sub_agent_task_result",
+					agentId: invocation.agentId,
+					runId: invocation.runId,
+					taskId: "task-output",
+					sessionId: invocation.sessionId,
+					status: "completed",
+					content: [{ type: "text", text: "line1\nline2\nline3" }],
+					startedAt: 1,
+					completedAt: 2,
+					resourceSummary: { turns: 1, childrenStarted: 1 },
+				}),
+			},
+		);
+		const text = (truncated.content as Array<{ text: string }>)[0]?.text ?? "";
+		expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(5);
+		expect(text.split(/\r\n|\r|\n/)).toHaveLength(1);
+		expect(truncated.resourceSummary).toMatchObject({
+			outputBytes: 5,
+			outputLines: 1,
+			limitDetails: {
+				outputBytes: { limit: 5, actual: 17, truncated: true },
+				outputLines: { limit: 2, actual: 3, truncated: true },
+			},
+		});
+
+		let allowedToolCalls = 0;
+		const scopedToolDenied = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-tools", limits: { ...invocation.limits, toolScopes: ["read"] } },
+			{
+				tools: {
+					read: () => {
+						allowedToolCalls++;
+						return { ok: true };
+					},
+					write: () => {
+						throw new Error("disallowed scoped tool must not run");
+					},
+				},
+				executor: async (_received, context) => {
+					await context.runTool("read", {});
+					await context.runTool("write", {});
+					return {
+						type: "sub_agent_task_result",
+						agentId: invocation.agentId,
+						runId: invocation.runId,
+						taskId: "task-tools",
+						sessionId: invocation.sessionId,
+						status: "completed",
+						startedAt: 1,
+						completedAt: 2,
+						resourceSummary: { turns: 1, childrenStarted: 1 },
+					};
+				},
+			},
+		);
+		expect(allowedToolCalls).toBe(1);
+		expect(scopedToolDenied).toMatchObject({
+			status: "failed",
+			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: toolScopes" },
+			resourceSummary: { limitDetails: { toolScopes: ["read"] } },
+		});
+	});
+
+	it("persists records, propagates cancellation and timeout, and replays without re-execution", async () => {
+		const records: Array<{ customType: string; data: unknown }> = [];
+		const findResult = () =>
+			records.find((record) => record.customType === SUB_AGENT_DELEGATION_RESULT_ENTRY)?.data as
+				| ReturnType<typeof validateSubAgentTaskResultEnvelope>
+				| undefined;
+
+		let delegateCalls = 0;
+		const first = await executeBoundedSubAgentTask(invocation, {
+			store: {
+				findResult,
+				appendInvocation: (entry) => records.push({ customType: SUB_AGENT_READINESS_ENTRY, data: entry }),
+				appendResult: (entry) => records.push({ customType: SUB_AGENT_DELEGATION_RESULT_ENTRY, data: entry }),
+			},
+			executor: () => {
+				delegateCalls++;
+				return {
+					type: "sub_agent_task_result",
+					agentId: invocation.agentId,
+					runId: invocation.runId,
+					taskId: invocation.taskId,
+					sessionId: invocation.sessionId,
+					status: "completed",
+					content: [{ type: "text", text: "persisted" }],
+					startedAt: 100,
+					completedAt: 200,
+					usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3, toolCalls: 0 },
+					resourceSummary: { turns: 1, outputBytes: 9, outputLines: 1, childrenStarted: 1 },
+				};
+			},
+		});
+		const replay = await executeBoundedSubAgentTask(invocation, {
+			store: {
+				findResult,
+				appendInvocation: (entry) => records.push({ customType: SUB_AGENT_READINESS_ENTRY, data: entry }),
+				appendResult: (entry) => records.push({ customType: SUB_AGENT_DELEGATION_RESULT_ENTRY, data: entry }),
+			},
+			executor: () => {
+				delegateCalls++;
+				throw new Error("replay must not execute");
+			},
+		});
+
+		expect(delegateCalls).toBe(1);
+		expect(replay).toEqual(first);
+		expect(records.map((record) => record.customType)).toEqual([
+			SUB_AGENT_READINESS_ENTRY,
+			SUB_AGENT_DELEGATION_RESULT_ENTRY,
+		]);
+
+		let cancelledCalls = 0;
+		const cancelled = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-cancel", cancellation: { state: "requested", reason: "parent cancelled" } },
+			{
+				executor: () => {
+					cancelledCalls++;
+					throw new Error("pre-cancelled invocation must not execute");
+				},
+			},
+		);
+		expect(cancelledCalls).toBe(0);
+		expect(cancelled).toMatchObject({
+			status: "cancelled",
+			error: { reason: "cancelled" },
+			resourceSummary: { childrenStarted: 0 },
+		});
+
+		const parentCancellation = new AbortController();
+		let observedParentAbort = false;
+		const inFlightCancelled = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-in-flight-cancel" },
+			{
+				signal: parentCancellation.signal,
+				executor: async (_received, context) => {
+					await new Promise<void>((resolve) => {
+						context.signal.addEventListener(
+							"abort",
+							() => {
+								observedParentAbort = true;
+								resolve();
+							},
+							{ once: true },
+						);
+						parentCancellation.abort("parent cancellation");
+					});
+					return {
+						type: "sub_agent_task_result",
+						agentId: invocation.agentId,
+						runId: invocation.runId,
+						taskId: "task-in-flight-cancel",
+						sessionId: invocation.sessionId,
+						status: "completed",
+						startedAt: 1,
+						completedAt: 2,
+					};
+				},
+			},
+		);
+		expect(observedParentAbort).toBe(true);
+		expect(inFlightCancelled).toMatchObject({
+			status: "cancelled",
+			error: { reason: "cancelled" },
+			resourceSummary: { childrenStarted: 1 },
+		});
+
+		let observedAbort = false;
+		const timedOut = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-timeout", limits: { ...invocation.limits, timeoutMs: 1 } },
+			{
+				executor: async (_received, context) => {
+					await new Promise<void>((resolve) => {
+						context.signal.addEventListener(
+							"abort",
+							() => {
+								observedAbort = true;
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+					return {
+						type: "sub_agent_task_result",
+						agentId: invocation.agentId,
+						runId: invocation.runId,
+						taskId: "task-timeout",
+						sessionId: invocation.sessionId,
+						status: "completed",
+						startedAt: 1,
+						completedAt: 2,
+					};
+				},
+			},
+		);
+		expect(observedAbort).toBe(true);
+		expect(timedOut).toMatchObject({
+			status: "failed",
+			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: timeoutMs" },
+			resourceSummary: { limitDetails: { timeoutMs: { limit: 1, truncated: true } } },
+		});
 	});
 });
 
