@@ -854,7 +854,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			// Kimi Code docs require the fixed model id `kimi-for-coding` for
 			// both Anthropic-compatible and OpenAI-compatible APIs. models.dev
 			// can include transient backend ids; keep only the public alias.
-			const canonicalModel = kimiModels["kimi-for-coding"] ?? kimiModels.k2p5;
+			const canonicalModel = kimiModels["kimi-for-coding"] ?? kimiModels.k2p6 ?? kimiModels.k2p5;
 
 			if (canonicalModel?.tool_call === true) {
 				const input: ("text" | "image")[] = canonicalModel.modalities?.input?.includes("image")
