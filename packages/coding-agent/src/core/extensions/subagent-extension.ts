@@ -183,10 +183,17 @@ function normalizeCancellation(
 		return {
 			...cancellation,
 			state: "requested",
-			reason: cancellation?.reason ?? "abort signal requested",
+			reason: cancellation?.reason ?? signalCancellationReason(signal),
 		};
 	}
 	return cancellation;
+}
+
+function signalCancellationReason(signal: AbortSignal): string {
+	const reason = signal.reason as unknown;
+	if (typeof reason === "string" && reason.length > 0) return reason;
+	if (reason instanceof Error && reason.message.length > 0) return reason.message;
+	return "abort signal requested";
 }
 
 const defaultDelegate: SubAgentDelegationHost = (invocation, context) => {

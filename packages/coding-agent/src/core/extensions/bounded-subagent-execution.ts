@@ -382,25 +382,19 @@ function enforceRuntimeBoundaries(
 
 function boundOutput(content: unknown, limits: SubAgentResourceLimits | undefined): OutputAccounting {
 	const text = extractSingleText(content);
-	const actualText = text ?? (content === undefined ? "" : JSON.stringify(content));
+	const actualText = text ?? stringifyContentForLimitAccounting(content);
 	const actualBytes = textEncoder.encode(actualText).length;
 	const actualLines = countLines(actualText);
-	if (text === undefined) {
-		return {
-			content,
-			actualBytes,
-			actualLines,
-			boundedBytes: actualBytes,
-			boundedLines: actualLines,
-			truncatedBytes: false,
-			truncatedLines: false,
-		};
-	}
-	const lineBounded = truncateLines(text, limits?.outputLines);
+	const lineBounded = truncateLines(actualText, limits?.outputLines);
 	const byteBounded = truncateUtf8(lineBounded.text, limits?.outputBytes);
 	const boundedText = byteBounded.text;
 	return {
-		content: replaceSingleText(content, boundedText),
+		content:
+			text === undefined
+				? boundedText === actualText
+					? content
+					: boundedText
+				: replaceSingleText(content, boundedText),
 		actualBytes,
 		actualLines,
 		boundedBytes: textEncoder.encode(boundedText).length,
@@ -408,6 +402,16 @@ function boundOutput(content: unknown, limits: SubAgentResourceLimits | undefine
 		truncatedBytes: byteBounded.truncated,
 		truncatedLines: lineBounded.truncated,
 	};
+}
+
+function stringifyContentForLimitAccounting(content: unknown): string {
+	if (content === undefined) return "";
+	try {
+		const encoded = JSON.stringify(content);
+		return encoded === undefined ? String(content) : encoded;
+	} catch {
+		return String(content);
+	}
 }
 
 function extractSingleText(content: unknown): string | undefined {
@@ -472,13 +476,21 @@ function propagateCancellation(
 	const cancellation: SubAgentCancellationMetadata = {
 		...invocation.cancellation,
 		state: "propagated",
-		reason: invocation.cancellation?.reason ?? (signal?.aborted === true ? "abort signal requested" : "cancelled"),
+		reason: invocation.cancellation?.reason ?? signalCancellationReason(signal) ?? "cancelled",
 		propagatedFrom: invocation.cancellation?.propagatedFrom ?? invocation.parentRunId ?? invocation.runId,
 	};
 	return validateSubAgentTaskInvocationEnvelope({
 		...invocation,
 		cancellation,
 	});
+}
+
+function signalCancellationReason(signal: AbortSignal | undefined): string | undefined {
+	if (signal?.aborted !== true) return undefined;
+	const reason = signal.reason as unknown;
+	if (typeof reason === "string" && reason.length > 0) return reason;
+	if (reason instanceof Error && reason.message.length > 0) return reason.message;
+	return "abort signal requested";
 }
 
 function buildCancelledResult(

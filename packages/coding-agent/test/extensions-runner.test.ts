@@ -655,6 +655,36 @@ describe("bounded sub-agent execution seam", () => {
 			},
 		});
 
+		const persistedObjectResults: unknown[] = [];
+		const boundedObject = await executeBoundedSubAgentTask(
+			{ ...invocation, taskId: "task-object-output", limits: { ...invocation.limits, outputBytes: 12 } },
+			{
+				store: {
+					appendResult: (entry) => persistedObjectResults.push(entry),
+				},
+				executor: () => ({
+					type: "sub_agent_task_result",
+					agentId: invocation.agentId,
+					runId: invocation.runId,
+					taskId: "task-object-output",
+					sessionId: invocation.sessionId,
+					status: "completed",
+					content: { text: "0123456789abcdef" },
+					startedAt: 1,
+					completedAt: 2,
+					resourceSummary: { turns: 1, childrenStarted: 1 },
+				}),
+			},
+		);
+		expect(typeof boundedObject.content).toBe("string");
+		expect(new TextEncoder().encode(boundedObject.content as string).length).toBeLessThanOrEqual(12);
+		expect(boundedObject.content).not.toContain("abcdef");
+		expect(boundedObject.resourceSummary).toMatchObject({
+			outputBytes: 12,
+			limitDetails: { outputBytes: { limit: 12, actual: 27, truncated: true } },
+		});
+		expect((persistedObjectResults[0] as { content?: unknown }).content).toBe(boundedObject.content);
+
 		let allowedToolCalls = 0;
 		const scopedToolDenied = await executeBoundedSubAgentTask(
 			{ ...invocation, taskId: "task-tools", limits: { ...invocation.limits, toolScopes: ["read"] } },
@@ -794,7 +824,8 @@ describe("bounded sub-agent execution seam", () => {
 		expect(observedParentAbort).toBe(true);
 		expect(inFlightCancelled).toMatchObject({
 			status: "cancelled",
-			error: { reason: "cancelled" },
+			error: { reason: "cancelled", message: "parent cancellation" },
+			details: { cancellation: { state: "propagated", reason: "parent cancellation" } },
 			resourceSummary: { childrenStarted: 1 },
 		});
 
@@ -944,7 +975,15 @@ describe("neutral sub-agent delegation extension", () => {
 			undefined,
 			runner.createContext(),
 		);
+		const replay = await tool!.execute(
+			"tool-call-denied-replay",
+			delegateInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
 		const envelope = JSON.parse(textFromToolResult(result)) as Record<string, unknown>;
+		const replayEnvelope = JSON.parse(textFromToolResult(replay)) as Record<string, unknown>;
 
 		expect(delegateCalls).toBe(0);
 		expect(envelope.status).toBe("failed");
@@ -954,6 +993,7 @@ describe("neutral sub-agent delegation extension", () => {
 			operation: "agent.delegate",
 			replayed: false,
 		});
+		expect(replayEnvelope).toEqual(envelope);
 		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
 		expect(
 			sessionManager
@@ -1084,6 +1124,90 @@ describe("neutral sub-agent delegation extension", () => {
 			resourceSummary: { childrenStarted: 0 },
 		});
 		expect(sentMessages).toHaveLength(1);
+	});
+
+	it("replays denied limit and cancellation results without child side effects", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: async () => {
+					delegateCalls++;
+					throw new Error("denied limit or cancelled delegation must not execute");
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+
+		const maxChildrenInput = {
+			...delegateInput,
+			taskId: "task-limit-replay",
+			limits: { ...delegateInput.limits, maxChildren: 0 },
+		};
+		const firstLimit = await tool!.execute(
+			"tool-call-limit",
+			maxChildrenInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replayLimit = await tool!.execute(
+			"tool-call-limit-replay",
+			maxChildrenInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const limitEnvelope = JSON.parse(textFromToolResult(firstLimit)) as Record<string, unknown>;
+		const replayLimitEnvelope = JSON.parse(textFromToolResult(replayLimit)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(0);
+		expect(replayLimitEnvelope).toEqual(limitEnvelope);
+		expect(limitEnvelope).toMatchObject({
+			status: "failed",
+			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: maxChildren" },
+			resourceSummary: { childrenStarted: 0 },
+		});
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
+
+		const cancelledInput = {
+			...delegateInput,
+			taskId: "task-cancel-replay",
+			cancellation: { state: "requested" as const, reason: "cancel before execution" },
+		};
+		const firstCancelled = await tool!.execute(
+			"tool-call-cancel",
+			cancelledInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replayCancelled = await tool!.execute(
+			"tool-call-cancel-replay",
+			cancelledInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const cancelledEnvelope = JSON.parse(textFromToolResult(firstCancelled)) as Record<string, unknown>;
+		const replayCancelledEnvelope = JSON.parse(textFromToolResult(replayCancelled)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(0);
+		expect(replayCancelledEnvelope).toEqual(cancelledEnvelope);
+		expect(cancelledEnvelope).toMatchObject({
+			status: "cancelled",
+			error: { reason: "cancelled", message: "cancel before execution" },
+			resourceSummary: { childrenStarted: 0 },
+		});
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(4);
 	});
 });
 
