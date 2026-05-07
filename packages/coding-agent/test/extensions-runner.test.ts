@@ -662,7 +662,9 @@ describe("bounded sub-agent execution seam", () => {
 			{ ...invocation, taskId: "task-object-output", limits: { ...invocation.limits, outputBytes: 12 } },
 			{
 				store: {
-					appendResult: (entry) => persistedObjectResults.push(entry),
+					appendResult: (entry) => {
+						persistedObjectResults.push(entry);
+					},
 				},
 				executor: () => ({
 					type: "sub_agent_task_result",
@@ -736,8 +738,12 @@ describe("bounded sub-agent execution seam", () => {
 		const first = await executeBoundedSubAgentTask(invocation, {
 			store: {
 				findResult,
-				appendInvocation: (entry) => records.push({ customType: SUB_AGENT_READINESS_ENTRY, data: entry }),
-				appendResult: (entry) => records.push({ customType: SUB_AGENT_DELEGATION_RESULT_ENTRY, data: entry }),
+				appendInvocation: (entry) => {
+					records.push({ customType: SUB_AGENT_READINESS_ENTRY, data: entry });
+				},
+				appendResult: (entry) => {
+					records.push({ customType: SUB_AGENT_DELEGATION_RESULT_ENTRY, data: entry });
+				},
 			},
 			executor: () => {
 				delegateCalls++;
@@ -759,8 +765,12 @@ describe("bounded sub-agent execution seam", () => {
 		const replay = await executeBoundedSubAgentTask(invocation, {
 			store: {
 				findResult,
-				appendInvocation: (entry) => records.push({ customType: SUB_AGENT_READINESS_ENTRY, data: entry }),
-				appendResult: (entry) => records.push({ customType: SUB_AGENT_DELEGATION_RESULT_ENTRY, data: entry }),
+				appendInvocation: (entry) => {
+					records.push({ customType: SUB_AGENT_READINESS_ENTRY, data: entry });
+				},
+				appendResult: (entry) => {
+					records.push({ customType: SUB_AGENT_DELEGATION_RESULT_ENTRY, data: entry });
+				},
 			},
 			executor: () => {
 				delegateCalls++;
@@ -1165,6 +1175,150 @@ describe("neutral sub-agent delegation extension", () => {
 		});
 		expect(replayEnvelope).toEqual(firstEnvelope);
 		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
+	});
+
+	it("emits read-only readiness observations for recorded and replayed delegation records", async () => {
+		let delegateCalls = 0;
+		const observed: Array<{
+			observer: string;
+			type: string;
+			taskId: string;
+			phase: string;
+			owner: string;
+			readOnly: true;
+		}> = [];
+		const runtime = createExtensionRuntime();
+		const observerOne = await loadExtensionFromFactory(
+			(pi) => {
+				pi.on("sub_agent_readiness", (event) => {
+					observed.push({
+						observer: "one",
+						type: event.envelope.type,
+						taskId: event.envelope.taskId,
+						phase: event.phase,
+						owner: event.owner,
+						readOnly: event.readOnly,
+					});
+					return { cancel: true, spawnPolicy: { automatic: true } } as unknown as undefined;
+				});
+			},
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<readiness-observer-one>",
+		);
+		const observerTwo = await loadExtensionFromFactory(
+			(pi) => {
+				pi.on("sub_agent_readiness", (event) => {
+					observed.push({
+						observer: "two",
+						type: event.envelope.type,
+						taskId: event.envelope.taskId,
+						phase: event.phase,
+						owner: event.owner,
+						readOnly: event.readOnly,
+					});
+				});
+			},
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<readiness-observer-two>",
+		);
+		const subAgent = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: (invocation) => {
+					delegateCalls++;
+					return completedResultFor(invocation, "observed delegation", { startedAt: 30, completedAt: 40 });
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner(
+			[observerOne, observerTwo, subAgent],
+			runtime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+		bindRunnerCore(runner, sessionManager);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+
+		const first = await tool!.execute(
+			"tool-call-observed",
+			{ ...delegateInput, taskId: "task-observed" },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replay = await tool!.execute(
+			"tool-call-observed-replay",
+			{ ...delegateInput, taskId: "task-observed" },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const firstEnvelope = JSON.parse(textFromToolResult(first)) as Record<string, unknown>;
+		const replayEnvelope = JSON.parse(textFromToolResult(replay)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(1);
+		expect(replayEnvelope).toEqual(firstEnvelope);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
+		expect(observed).toEqual([
+			{
+				observer: "one",
+				type: "sub_agent_task_invocation",
+				taskId: "task-observed",
+				phase: "recorded",
+				owner: "agent",
+				readOnly: true,
+			},
+			{
+				observer: "two",
+				type: "sub_agent_task_invocation",
+				taskId: "task-observed",
+				phase: "recorded",
+				owner: "agent",
+				readOnly: true,
+			},
+			{
+				observer: "one",
+				type: "sub_agent_task_result",
+				taskId: "task-observed",
+				phase: "recorded",
+				owner: "agent",
+				readOnly: true,
+			},
+			{
+				observer: "two",
+				type: "sub_agent_task_result",
+				taskId: "task-observed",
+				phase: "recorded",
+				owner: "agent",
+				readOnly: true,
+			},
+			{
+				observer: "one",
+				type: "sub_agent_task_result",
+				taskId: "task-observed",
+				phase: "replayed",
+				owner: "agent",
+				readOnly: true,
+			},
+			{
+				observer: "two",
+				type: "sub_agent_task_result",
+				taskId: "task-observed",
+				phase: "replayed",
+				owner: "agent",
+				readOnly: true,
+			},
+		]);
 	});
 
 	it("uses the exact four-field replay key and preserves lineage, usage, timestamps, and resources", async () => {

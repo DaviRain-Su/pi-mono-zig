@@ -325,6 +325,8 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/** Emit a read-only sub-agent readiness observation to subscribers. */
+	emitSubAgentReadiness?(event: Omit<SubAgentReadinessEvent, "type" | "readOnly">): Promise<void>;
 }
 
 /**

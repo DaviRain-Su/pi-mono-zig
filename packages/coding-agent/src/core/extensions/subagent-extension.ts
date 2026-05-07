@@ -100,17 +100,27 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 			ctx: ExtensionContext,
 		): Promise<SubAgentTaskResultEnvelope> => {
 			const invocation = buildInvocation(params, signal);
+			let replayedResult: SubAgentTaskResultEnvelope | undefined;
 			const executor: BoundedSubAgentExecutor = async (boundedInvocation, executionContext) => {
 				const delegate = options.delegate ?? defaultDelegate;
 				return delegate(boundedInvocation, { signal: executionContext.signal, context: ctx });
 			};
-			return executeBoundedSubAgentTask(invocation, {
+			const result = await executeBoundedSubAgentTask(invocation, {
 				signal,
 				executor,
 				store: {
-					findResult: (candidate) => findRecordedDelegationResult(ctx, candidate),
-					appendInvocation: (candidate) => pi.appendEntry(SUB_AGENT_READINESS_ENTRY, candidate),
-					appendResult: (result) => pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, result),
+					findResult: (candidate) => {
+						replayedResult = findRecordedDelegationResult(ctx, candidate);
+						return replayedResult;
+					},
+					appendInvocation: async (candidate) => {
+						pi.appendEntry(SUB_AGENT_READINESS_ENTRY, candidate);
+						await emitReadinessObservation(ctx, candidate, "recorded");
+					},
+					appendResult: async (candidate) => {
+						pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, candidate);
+						await emitReadinessObservation(ctx, candidate, "recorded");
+					},
 				},
 				admission: () =>
 					approvedCapabilities.has("agent.delegate")
@@ -124,6 +134,10 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 								},
 							},
 			});
+			if (replayedResult !== undefined) {
+				await emitReadinessObservation(ctx, replayedResult, "replayed");
+			}
+			return result;
 		};
 
 		pi.registerTool({
@@ -154,6 +168,19 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 			},
 		});
 	};
+}
+
+async function emitReadinessObservation(
+	ctx: ExtensionContext,
+	envelope: SubAgentTaskInvocationEnvelope | SubAgentTaskResultEnvelope,
+	phase: "recorded" | "replayed",
+): Promise<void> {
+	await ctx.emitSubAgentReadiness?.({
+		envelope,
+		phase,
+		owner: "agent",
+		signal: ctx.signal,
+	});
 }
 
 function parseCommandPayload(args: string): SubAgentDelegationInput {

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, registerFauxProvider } from "@mariozechner/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@mariozechner/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -687,5 +687,121 @@ describe("AgentSessionRuntime characterization", () => {
 		await harness.session.prompt("continue after sub-agent status");
 
 		expect(delegateCalls).toBe(1);
+	});
+
+	it("routes assistant sub-agent tool calls through bounded delegation with read-only observations", async () => {
+		let delegateCalls = 0;
+		const observed: Array<{ type: string; taskId: string; phase: string; readOnly: true }> = [];
+		const payload = {
+			agentId: "agent-toolcall",
+			runId: "run-toolcall",
+			taskId: "task-toolcall",
+			sessionId: "session-toolcall",
+			toolCallId: "tool-call-toolcall",
+			parentAgentId: "parent-toolcall",
+			route: "assistant-tool-call",
+			input: { prompt: "delegate from assistant tool call" },
+			limits: { maxChildren: 1, depth: 1, turns: 1, outputBytes: 256, outputLines: 5 },
+		};
+		const harness: Harness = await createHarness({
+			extensionFactories: [
+				createSubAgentExtension({
+					approvedCapabilities: ["agent.delegate"],
+					delegate: (invocation) => {
+						delegateCalls++;
+						return {
+							type: "sub_agent_task_result",
+							agentId: invocation.agentId,
+							runId: invocation.runId,
+							taskId: invocation.taskId,
+							sessionId: invocation.sessionId,
+							toolCallId: invocation.toolCallId,
+							parentAgentId: invocation.parentAgentId,
+							status: "completed",
+							content: [{ type: "text", text: "assistant tool-call delegated" }],
+							startedAt: 100,
+							completedAt: 200,
+							resourceSummary: {
+								turns: 1,
+								outputBytes: 29,
+								outputLines: 1,
+								childrenStarted: 1,
+							},
+						};
+					},
+				}),
+				(pi) => {
+					pi.on("sub_agent_readiness", (event) => {
+						observed.push({
+							type: event.envelope.type,
+							taskId: event.envelope.taskId,
+							phase: event.phase,
+							readOnly: event.readOnly,
+						});
+						return { cancel: true, automaticSpawn: true } as unknown as undefined;
+					});
+				},
+			],
+		});
+		cleanups.push(() => harness.cleanup());
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("sub_agent.delegate", payload, { id: "tool-call-toolcall" }), {
+				stopReason: "toolUse",
+			}),
+			(providerRequest) => {
+				const toolResult = providerRequest.messages.find((message) => message.role === "toolResult");
+				const toolText =
+					toolResult?.role === "toolResult"
+						? toolResult.content
+								.filter((part): part is { type: "text"; text: string } => part.type === "text")
+								.map((part) => part.text)
+								.join("\n")
+						: "";
+				expect(toolText).toContain("assistant tool-call delegated");
+				expect(toolText).toContain('"type":"sub_agent_task_result"');
+				return fauxAssistantMessage("after assistant tool-call");
+			},
+		]);
+
+		await harness.session.prompt("delegate using the sub-agent tool");
+
+		expect(delegateCalls).toBe(1);
+		expect(observed).toEqual([
+			{ type: "sub_agent_task_invocation", taskId: "task-toolcall", phase: "recorded", readOnly: true },
+			{ type: "sub_agent_task_result", taskId: "task-toolcall", phase: "recorded", readOnly: true },
+		]);
+		const entries = harness.sessionManager.getEntries();
+		expect(entries.filter((entry) => entry.type === "custom").map((entry) => entry.customType)).toEqual([
+			SUB_AGENT_READINESS_ENTRY,
+			SUB_AGENT_DELEGATION_RESULT_ENTRY,
+		]);
+		const toolResult = harness.session.messages.find(
+			(message) => message.role === "toolResult" && message.toolName === "sub_agent.delegate",
+		);
+		expect(toolResult).toMatchObject({
+			role: "toolResult",
+			toolCallId: "tool-call-toolcall",
+			isError: false,
+		});
+		expect(JSON.stringify(toolResult)).toContain("assistant tool-call delegated");
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("sub_agent.delegate", payload, { id: "tool-call-toolcall-replay" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("after replay"),
+		]);
+
+		await harness.session.prompt("delegate using the sub-agent tool again");
+
+		expect(delegateCalls).toBe(1);
+		expect(observed.at(-1)).toEqual({
+			type: "sub_agent_task_result",
+			taskId: "task-toolcall",
+			phase: "replayed",
+			readOnly: true,
+		});
+		expect(entries.filter((entry) => entry.type === "custom")).toHaveLength(2);
 	});
 });

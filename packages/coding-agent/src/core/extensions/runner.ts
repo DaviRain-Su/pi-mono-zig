@@ -630,6 +630,17 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			emitSubAgentReadiness: async (event) => {
+				runner.assertActive();
+				await runner.emit({
+					type: "sub_agent_readiness",
+					envelope: event.envelope,
+					phase: event.phase,
+					owner: event.owner,
+					readOnly: true,
+					signal: event.signal,
+				});
+			},
 		};
 	}
 

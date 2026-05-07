@@ -41,8 +41,8 @@ export interface BoundedSubAgentAdmissionDenial {
 
 export interface BoundedSubAgentExecutionStore {
 	findResult?: (invocation: SubAgentTaskInvocationEnvelope) => SubAgentTaskResultEnvelope | undefined;
-	appendInvocation?: (invocation: SubAgentTaskInvocationEnvelope) => void;
-	appendResult?: (result: SubAgentTaskResultEnvelope) => void;
+	appendInvocation?: (invocation: SubAgentTaskInvocationEnvelope) => Promise<void> | void;
+	appendResult?: (result: SubAgentTaskResultEnvelope) => Promise<void> | void;
 }
 
 export interface BoundedSubAgentExecutionOptions {
@@ -105,13 +105,13 @@ export async function executeBoundedSubAgentTask(
 
 	if (invocation.cancellation?.state === "requested" || options.signal?.aborted === true) {
 		const propagatedInvocation = propagateCancellation(invocation, options.signal);
-		options.store?.appendInvocation?.(propagatedInvocation);
+		await options.store?.appendInvocation?.(propagatedInvocation);
 		const result = buildCancelledResult(propagatedInvocation, now);
-		options.store?.appendResult?.(result);
+		await options.store?.appendResult?.(result);
 		return result;
 	}
 
-	options.store?.appendInvocation?.(invocation);
+	await options.store?.appendInvocation?.(invocation);
 
 	const admissionDenial = options.admission?.(invocation);
 	if (admissionDenial !== undefined) {
@@ -121,14 +121,14 @@ export async function executeBoundedSubAgentTask(
 			details: admissionDenial.details,
 			resourceSummary: zeroResourceSummary(invocation.limits),
 		});
-		options.store?.appendResult?.(result);
+		await options.store?.appendResult?.(result);
 		return result;
 	}
 
 	const admissionLimit = exhaustedAdmissionLimit(invocation.limits);
 	if (admissionLimit !== undefined) {
 		const result = buildResourceLimitResult(invocation, now, admissionLimit, zeroResourceSummary(invocation.limits));
-		options.store?.appendResult?.(result);
+		await options.store?.appendResult?.(result);
 		return result;
 	}
 
@@ -189,11 +189,11 @@ export async function executeBoundedSubAgentTask(
 						zeroResourceSummary(invocation.limits),
 					)
 				: buildCancelledResult(propagateCancellation(invocation, options.signal), now);
-			options.store?.appendResult?.(cancelled);
+			await options.store?.appendResult?.(cancelled);
 			return cancelled;
 		}
 		const bounded = enforceRuntimeBoundaries(invocation, result, runtime, now);
-		options.store?.appendResult?.(bounded);
+		await options.store?.appendResult?.(bounded);
 		return bounded;
 	} catch (error) {
 		const result =
@@ -218,7 +218,7 @@ export async function executeBoundedSubAgentTask(
 							details: {},
 							resourceSummary: summaryFromRuntime(invocation.limits, runtime),
 						});
-		options.store?.appendResult?.(result);
+		await options.store?.appendResult?.(result);
 		return result;
 	} finally {
 		if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);

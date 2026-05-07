@@ -42,6 +42,10 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
 
+fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
+}
+
 fn expectValidJsonl(comptime name: []const u8) !void {
     const bytes = try readFixture(name);
     defer std.testing.allocator.free(bytes);
@@ -75,6 +79,16 @@ test "TS RPC fixture files are checked in and valid JSONL" {
     try expectContains(manifest, "captureMethod");
     try expectContains(manifest, "runRpcMode");
     try expectContains(manifest, "AgentSession.subscribe");
+}
+
+test "TS RPC fixtures do not expose sub-agent readiness replay wire data" {
+    inline for (fixture_files) |file| {
+        const bytes = try readFixture(file);
+        defer std.testing.allocator.free(bytes);
+        try expectNotContains(bytes, "sub_agent_readiness");
+        try expectNotContains(bytes, "sub_agent_task_invocation");
+        try expectNotContains(bytes, "sub_agent_task_result");
+    }
 }
 
 test "TS RPC response fixtures preserve parse and unknown-command quirks" {
