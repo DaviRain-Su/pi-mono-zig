@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -445,6 +445,172 @@ export default function(pi) {
 			expect(refreshed?.identity.key).not.toBe(originalIdentityKey);
 			expect(refreshed?.effectivePolicy).toBeUndefined();
 			expect(refreshed?.commands.has("digest-policy-visible")).toBe(false);
+		});
+
+		it("should enforce package trust across install, load, policy, refresh, tamper, and scope precedence", async () => {
+			const packageRoot = join(tempDir, "package-cross-flow");
+			const sentinelPath = join(tempDir, "tampered-cross-flow-imported");
+			mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+			writeFileSync(
+				join(packageRoot, "package.json"),
+				JSON.stringify({
+					name: "package-cross-flow",
+					version: "1.0.0",
+					pi: { extensions: ["extensions/entry.ts"] },
+				}),
+			);
+			const entryPath = join(packageRoot, "extensions", "entry.ts");
+			writeFileSync(
+				entryPath,
+				`export default function(pi) {
+	const policy = pi.getExtensionPolicy();
+	if (policy?.resourceLimits?.turns === 1) {
+		pi.registerCommand("user-cross-flow-policy", { handler: async () => {} });
+	}
+	if (policy?.resourceLimits?.turns === 2) {
+		pi.registerCommand("project-cross-flow-policy", { handler: async () => {} });
+	}
+	if (policy?.resourceLimits?.turns === 3) {
+		pi.registerCommand("refreshed-cross-flow-policy", { handler: async () => {} });
+	}
+}`,
+			);
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 1;\n");
+
+			const settingsManager = SettingsManager.inMemory();
+			const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			const userLockPath = join(agentDir, "extensions.lock.json");
+			const projectLockPath = join(cwd, ".pi", "extensions.lock.json");
+			expect(existsSync(userLockPath)).toBe(false);
+			expect(existsSync(projectLockPath)).toBe(false);
+
+			await packageManager.installAndPersist(packageRoot);
+			await settingsManager.flush();
+			expect(existsSync(userLockPath)).toBe(true);
+			expect(existsSync(projectLockPath)).toBe(false);
+			const userLockBytes = readFileSync(userLockPath, "utf-8");
+			const userLock = JSON.parse(userLockBytes) as {
+				entries: Array<{ digests: { packageRootSha256: string }; packageRoot: string }>;
+			};
+			expect(userLock.entries[0].packageRoot).toBe(realpathSync(packageRoot));
+
+			await loader.reload();
+			let loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.identity.kind).toBe("typescript-package");
+			expect(loaded?.identity.sourceInfo.scope).toBe("user");
+			expect(loaded?.identity.key).toContain(userLock.entries[0].digests.packageRootSha256);
+			const userIdentityKey = loaded!.identity.key;
+			settingsManager.setExtensionPolicy(userIdentityKey, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 1 },
+			});
+
+			await loader.reload();
+			loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.effectivePolicy).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 1 },
+			});
+			expect(loaded?.commands.has("user-cross-flow-policy")).toBe(true);
+
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 2;\n");
+			await packageManager.installAndPersist(packageRoot, { local: true });
+			await settingsManager.flush();
+			expect(readFileSync(userLockPath, "utf-8")).toBe(userLockBytes);
+			expect(existsSync(projectLockPath)).toBe(true);
+			const projectLock = JSON.parse(readFileSync(projectLockPath, "utf-8")) as {
+				entries: Array<{ digests: { packageRootSha256: string }; packageRoot: string }>;
+			};
+			expect(projectLock.entries[0].packageRoot).toBe(realpathSync(packageRoot));
+			expect(projectLock.entries[0].digests.packageRootSha256).not.toBe(
+				userLock.entries[0].digests.packageRootSha256,
+			);
+
+			await loader.reload();
+			loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.identity.sourceInfo.scope).toBe("project");
+			expect(loaded?.identity.key).not.toBe(userIdentityKey);
+			expect(loaded?.identity.key).toContain(projectLock.entries[0].digests.packageRootSha256);
+			expect(loaded?.effectivePolicy).toBeUndefined();
+			expect(loaded?.commands.has("user-cross-flow-policy")).toBe(false);
+			const projectIdentityKey = loaded!.identity.key;
+			settingsManager.setExtensionPolicy(projectIdentityKey, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 2 },
+			});
+
+			await loader.reload();
+			loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.effectivePolicy).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 2 },
+			});
+			expect(loaded?.commands.has("project-cross-flow-policy")).toBe(true);
+
+			writeFileSync(join(packageRoot, "extensions", "helper.ts"), "export const helper = 3;\n");
+			await packageManager.installAndPersist(packageRoot, { local: true });
+			await settingsManager.flush();
+			const refreshedProjectLockBytes = readFileSync(projectLockPath, "utf-8");
+			const refreshedProjectLock = JSON.parse(refreshedProjectLockBytes) as typeof projectLock;
+			expect(refreshedProjectLock.entries[0].digests.packageRootSha256).not.toBe(
+				projectLock.entries[0].digests.packageRootSha256,
+			);
+
+			await loader.reload();
+			loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.identity.key).not.toBe(projectIdentityKey);
+			expect(loaded?.effectivePolicy).toBeUndefined();
+			expect(loaded?.commands.has("project-cross-flow-policy")).toBe(false);
+			const refreshedProjectIdentityKey = loaded!.identity.key;
+			settingsManager.setExtensionPolicy(refreshedProjectIdentityKey, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 3 },
+			});
+
+			await loader.reload();
+			loaded = loader.getExtensions().extensions.find((extension) => extension.path === entryPath);
+			expect(loaded?.effectivePolicy).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 3 },
+			});
+			expect(loaded?.commands.has("refreshed-cross-flow-policy")).toBe(true);
+
+			const projectSettingsBeforeTamper = JSON.stringify(settingsManager.getProjectSettings());
+			writeFileSync(
+				entryPath,
+				`import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(sentinelPath)}, "imported");
+export default function(pi) {
+	pi.registerCommand("tampered-cross-flow-policy", { handler: async () => {} });
+}`,
+			);
+
+			await loader.reload();
+			expect(loader.getExtensions().extensions.find((extension) => extension.path === entryPath)).toBeUndefined();
+			expect(existsSync(sentinelPath)).toBe(false);
+			expect(readFileSync(projectLockPath, "utf-8")).toBe(refreshedProjectLockBytes);
+			expect(JSON.stringify(settingsManager.getProjectSettings())).toBe(projectSettingsBeforeTamper);
+
+			const temporaryPackageRoot = join(tempDir, "temporary-cross-flow-package");
+			mkdirSync(join(temporaryPackageRoot, "extensions"), { recursive: true });
+			writeFileSync(
+				join(temporaryPackageRoot, "package.json"),
+				JSON.stringify({
+					name: "temporary-cross-flow-package",
+					version: "1.0.0",
+					pi: { extensions: ["extensions/entry.ts"] },
+				}),
+			);
+			const temporaryEntryPath = join(temporaryPackageRoot, "extensions", "entry.ts");
+			writeFileSync(temporaryEntryPath, "export default function() {}\n");
+
+			const temporaryResolved = await packageManager.resolveExtensionSources([temporaryPackageRoot], {
+				temporary: true,
+			});
+			expect(temporaryResolved.extensions.map((extension) => extension.path)).toEqual([temporaryEntryPath]);
+			expect(readFileSync(userLockPath, "utf-8")).toBe(userLockBytes);
+			expect(readFileSync(projectLockPath, "utf-8")).toBe(refreshedProjectLockBytes);
 		});
 
 		it("should expose locked WASM packages through resource-loader and runner with digest-bound policy", async () => {
