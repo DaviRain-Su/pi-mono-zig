@@ -15,6 +15,7 @@ pub const extension_host = @import("extensions/extension_host.zig");
 pub const extension_runtime = @import("extensions/extension_runtime.zig");
 pub const extension_flags = @import("extensions/extension_flags.zig");
 pub const extension_registry = @import("extensions/extension_registry.zig");
+pub const enforcement = @import("extensions/enforcement.zig");
 pub const wasm_manifest = @import("extensions/wasm/wasm_manifest.zig");
 pub const wasm_wit_contract = @import("extensions/wasm/wasm_wit_contract.zig");
 pub const wasm_host_spike = @import("extensions/wasm/wasm_host_spike.zig");
@@ -91,6 +92,7 @@ test {
     _ = @import("extensions/extension_runtime.zig");
     _ = @import("extensions/extension_flags.zig");
     _ = @import("extensions/extension_registry.zig");
+    _ = @import("extensions/enforcement.zig");
     _ = @import("extensions/wasm/wasm_manifest.zig");
     _ = @import("extensions/wasm/wasm_wit_contract.zig");
     _ = @import("extensions/wasm/wasm_host_spike.zig");
