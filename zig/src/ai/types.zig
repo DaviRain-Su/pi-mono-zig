@@ -534,51 +534,25 @@ pub const SimpleStreamOptions = struct {
     mistral_prompt_mode: ?[]const u8 = null,
     mistral_reasoning_effort: ?[]const u8 = null,
 
-    /// Convert SimpleStreamOptions to StreamOptions
+    /// Convert SimpleStreamOptions to StreamOptions.
+    ///
+    /// Same-named fields are copied via comptime field iteration so adding
+    /// a field on either struct keeps the two in sync without manual edits.
+    /// Fields without a same-named twin (anthropic_*, responses_reasoning_summary,
+    /// responses_service_tier, responses_text_verbosity) keep StreamOptions'
+    /// own defaults. Special mappings live below the loop.
     pub fn toStreamOptions(self: SimpleStreamOptions) StreamOptions {
-        return .{
-            .temperature = self.temperature,
-            .max_tokens = self.max_tokens,
-            .api_key = self.api_key,
-            .transport = self.transport,
-            .cache_retention = self.cache_retention,
-            .session_id = self.session_id,
-            .headers = self.headers,
-            .timeout_ms = self.timeout_ms,
-            .max_retries = self.max_retries,
-            .on_payload = self.on_payload,
-            .on_response = self.on_response,
-            .max_retry_delay_ms = self.max_retry_delay_ms,
-            .metadata = self.metadata,
-            .signal = self.signal,
-            .bedrock_region = self.bedrock_region,
-            .bedrock_profile = self.bedrock_profile,
-            .bedrock_bearer_token = self.bedrock_bearer_token,
-            .bedrock_tool_choice = self.bedrock_tool_choice,
-            .bedrock_reasoning = self.reasoning,
-            .bedrock_thinking_budgets = self.thinking_budgets,
-            .bedrock_interleaved_thinking = self.bedrock_interleaved_thinking,
-            .bedrock_thinking_display = self.bedrock_thinking_display,
-            .bedrock_request_metadata = self.bedrock_request_metadata,
-            .google_tool_choice = self.google_tool_choice,
-            .google_thinking = self.google_thinking,
-            .openai_tool_choice = self.openai_tool_choice,
-            .openai_reasoning_effort = self.openai_reasoning_effort,
-            .anthropic_thinking_enabled = null,
-            .anthropic_thinking_budget_tokens = null,
-            .anthropic_thinking_display = null,
-            .anthropic_effort = null,
-            .anthropic_interleaved_thinking = null,
-            .anthropic_tool_choice = null,
-            .responses_reasoning_effort = self.reasoning,
-            .responses_text_verbosity = null,
-            .azure_api_version = self.azure_api_version,
-            .azure_resource_name = self.azure_resource_name,
-            .azure_base_url = self.azure_base_url,
-            .azure_deployment_name = self.azure_deployment_name,
-            .mistral_prompt_mode = self.mistral_prompt_mode,
-            .mistral_reasoning_effort = self.mistral_reasoning_effort,
-        };
+        var opts: StreamOptions = .{};
+        inline for (@typeInfo(SimpleStreamOptions).@"struct".fields) |field| {
+            if (comptime @hasField(StreamOptions, field.name)) {
+                @field(opts, field.name) = @field(self, field.name);
+            }
+        }
+        // Generic `reasoning` fans out to provider-specific knobs.
+        opts.bedrock_reasoning = self.reasoning;
+        opts.responses_reasoning_effort = self.reasoning;
+        opts.bedrock_thinking_budgets = self.thinking_budgets;
+        return opts;
     }
 };
 

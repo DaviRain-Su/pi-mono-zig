@@ -361,6 +361,9 @@ pub const StreamingResponse = struct {
     }
 
     fn consumeLiveLineDelimiter(self: *StreamingResponse, reader: *std.Io.Reader) !?[]const u8 {
+        // streamDelimiterLimit stops at the '\n' but does not consume it, so we
+        // discard exactly that one delimiter byte here. Any error must be
+        // interpreted relative to deadline/abort state observed by the watchdog.
         reader.discardAll(1) catch |err| {
             if (self.currentTerminationReason()) |reason| {
                 self.done = true;

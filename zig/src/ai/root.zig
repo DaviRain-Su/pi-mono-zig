@@ -7,12 +7,29 @@ pub const model_discovery = @import("model_discovery.zig");
 pub const json_parse = @import("json_parse.zig");
 pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
-pub const stream_module = @import("stream.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
-pub const abort_signal = @import("shared/abort_signal.zig");
-pub const provider_error = @import("shared/provider_error.zig");
-pub const provider_json = @import("shared/provider_json.zig");
-pub const provider_stream = @import("shared/provider_stream.zig");
+
+pub const oauth = struct {
+    pub const pkce = @import("oauth/pkce.zig");
+    pub const types = @import("oauth/types.zig");
+};
+
+pub const shared = struct {
+    pub const abort_signal = @import("shared/abort_signal.zig");
+    pub const overflow = @import("shared/overflow.zig");
+    pub const provider_error = @import("shared/provider_error.zig");
+    pub const provider_json = @import("shared/provider_json.zig");
+    pub const provider_stream = @import("shared/provider_stream.zig");
+    pub const simple_options = @import("shared/simple_options.zig");
+    pub const transform_messages = @import("shared/transform_messages.zig");
+};
+
+// Backwards-compatible top-level aliases for existing call sites under ai.*.
+pub const abort_signal = shared.abort_signal;
+pub const provider_error = shared.provider_error;
+pub const provider_json = shared.provider_json;
+pub const provider_stream = shared.provider_stream;
+
 pub const providers = struct {
     pub const openai = @import("providers/openai.zig");
     pub const openai_responses = @import("providers/openai_responses.zig");
@@ -27,7 +44,13 @@ pub const providers = struct {
     pub const register_builtins = @import("providers/register_builtins.zig");
     pub const kimi = @import("providers/kimi.zig");
     pub const faux = @import("providers/faux.zig");
+    pub const cloudflare = @import("providers/cloudflare.zig");
+    pub const github_copilot_headers = @import("providers/github_copilot_headers.zig");
 };
+
+// Internal alias so the public `stream` / `complete` re-exports below do not
+// collide with a public module name.
+const stream_ops = @import("stream.zig");
 
 // Re-export commonly used types
 pub const Model = types.Model;
@@ -56,10 +79,10 @@ pub const textSignature = types.textSignature;
 pub const thinkingSignature = types.thinkingSignature;
 pub const hasInlineToolCalls = types.hasInlineToolCalls;
 pub const collectAssistantToolCalls = types.collectAssistantToolCalls;
-pub const stream = stream_module.stream;
-pub const complete = stream_module.complete;
-pub const streamSimple = stream_module.streamSimple;
-pub const completeSimple = stream_module.completeSimple;
+pub const stream = stream_ops.stream;
+pub const complete = stream_ops.complete;
+pub const streamSimple = stream_ops.streamSimple;
+pub const completeSimple = stream_ops.completeSimple;
 pub const getEnvApiKey = env_api_keys.getEnvApiKey;
 
 test {
@@ -86,9 +109,13 @@ test {
     _ = @import("stream.zig");
     _ = @import("env_api_keys.zig");
     _ = @import("oauth/types.zig");
+    _ = @import("oauth/pkce.zig");
     _ = @import("shared/abort_signal.zig");
+    _ = @import("shared/overflow.zig");
     _ = @import("shared/provider_error.zig");
     _ = @import("shared/provider_json.zig");
     _ = @import("shared/provider_stream.zig");
+    _ = @import("shared/simple_options.zig");
+    _ = @import("shared/transform_messages.zig");
     _ = @import("providers/faux.zig");
 }

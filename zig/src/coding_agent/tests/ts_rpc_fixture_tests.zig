@@ -38,6 +38,16 @@ fn readFixture(comptime name: []const u8) ![]u8 {
     );
 }
 
+fn readRepoFile(comptime path: []const u8) ![]u8 {
+    return std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .unlimited,
+    );
+}
+
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
@@ -63,6 +73,32 @@ fn expectValidJsonl(comptime name: []const u8) !void {
         parsed.deinit();
     }
     try std.testing.expect(line_count > 0);
+}
+
+test "VAL-UPSYNC-003 TS RPC fixture generator imports current workspace package scope" {
+    const generator = try readRepoFile("test/generate-ts-rpc-fixtures.ts");
+    defer std.testing.allocator.free(generator);
+
+    try expectContains(generator, "from \"@earendil-works/pi-agent-core\"");
+    try expectContains(generator, "from \"@earendil-works/pi-ai\"");
+    try expectNotContains(generator, "from \"@mariozechner/pi-agent-core\"");
+    try expectNotContains(generator, "from \"@mariozechner/pi-ai\"");
+}
+
+test "VAL-UPSYNC-002 extension fixture imports current scope and loader keeps legacy alias" {
+    const fixture = try readRepoFile("test/fixtures/extensions/registration-fixture/extension.ts");
+    defer std.testing.allocator.free(fixture);
+
+    try expectContains(fixture, "from \"@earendil-works/pi-coding-agent\"");
+    try expectNotContains(fixture, "from \"@mariozechner/pi-coding-agent\"");
+
+    const loader = try readRepoFile("../packages/coding-agent/src/core/extensions/loader.ts");
+    defer std.testing.allocator.free(loader);
+
+    try expectContains(loader, "\"@earendil-works/pi-coding-agent\": _bundledPiCodingAgent");
+    try expectContains(loader, "\"@mariozechner/pi-coding-agent\": _bundledPiCodingAgent");
+    try expectContains(loader, "\"@earendil-works/pi-coding-agent\": piCodingAgentEntry");
+    try expectContains(loader, "\"@mariozechner/pi-coding-agent\": piCodingAgentEntry");
 }
 
 test "TS RPC fixture files are checked in and valid JSONL" {

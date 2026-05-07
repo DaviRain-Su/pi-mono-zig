@@ -6,45 +6,36 @@ pub const AdjustedThinkingTokens = struct {
     thinking_budget: u32,
 };
 
+/// Build a StreamOptions baseline from optional simple options + an explicit
+/// api_key override. Same-named fields are propagated via comptime iteration
+/// so the two structs stay in sync as fields are added; only fields with
+/// different names or fallback semantics are handled explicitly below.
 pub fn buildBaseOptions(
     model: types.Model,
     options: ?types.SimpleStreamOptions,
     api_key: ?[]const u8,
 ) types.StreamOptions {
-    return .{
-        .temperature = if (options) |value| value.temperature else null,
-        .max_tokens = if (options) |value|
-            value.max_tokens orelse defaultMaxTokens(model)
-        else
-            defaultMaxTokens(model),
-        .api_key = api_key orelse if (options) |value| value.api_key else null,
-        .transport = if (options) |value| value.transport else .auto,
-        .cache_retention = if (options) |value| value.cache_retention else .unset,
-        .session_id = if (options) |value| value.session_id else null,
-        .headers = if (options) |value| value.headers else null,
-        .on_payload = if (options) |value| value.on_payload else null,
-        .on_response = if (options) |value| value.on_response else null,
-        .signal = if (options) |value| value.signal else null,
-        .max_retry_delay_ms = if (options) |value| value.max_retry_delay_ms else 60000,
-        .metadata = if (options) |value| value.metadata else null,
-        .bedrock_region = if (options) |value| value.bedrock_region else null,
-        .bedrock_profile = if (options) |value| value.bedrock_profile else null,
-        .bedrock_bearer_token = if (options) |value| value.bedrock_bearer_token else null,
-        .bedrock_tool_choice = if (options) |value| value.bedrock_tool_choice else null,
-        .bedrock_reasoning = if (options) |value| value.reasoning else null,
-        .bedrock_thinking_budgets = if (options) |value| value.thinking_budgets else null,
-        .bedrock_interleaved_thinking = if (options) |value| value.bedrock_interleaved_thinking else null,
-        .bedrock_thinking_display = if (options) |value| value.bedrock_thinking_display else null,
-        .bedrock_request_metadata = if (options) |value| value.bedrock_request_metadata else null,
-        .google_tool_choice = if (options) |value| value.google_tool_choice else null,
-        .google_thinking = if (options) |value| value.google_thinking else null,
-        .azure_api_version = if (options) |value| value.azure_api_version else null,
-        .azure_resource_name = if (options) |value| value.azure_resource_name else null,
-        .azure_base_url = if (options) |value| value.azure_base_url else null,
-        .azure_deployment_name = if (options) |value| value.azure_deployment_name else null,
-        .mistral_prompt_mode = if (options) |value| value.mistral_prompt_mode else null,
-        .mistral_reasoning_effort = if (options) |value| value.mistral_reasoning_effort else null,
-    };
+    var opts: types.StreamOptions = .{};
+
+    if (options) |value| {
+        inline for (@typeInfo(types.SimpleStreamOptions).@"struct".fields) |field| {
+            if (comptime @hasField(types.StreamOptions, field.name)) {
+                @field(opts, field.name) = @field(value, field.name);
+            }
+        }
+        // Generic reasoning maps onto Bedrock-specific knobs at this layer;
+        // anthropic / responses / mistral mappings happen later in stream.zig.
+        opts.bedrock_reasoning = value.reasoning;
+        opts.bedrock_thinking_budgets = value.thinking_budgets;
+        opts.max_tokens = value.max_tokens orelse defaultMaxTokens(model);
+    } else {
+        opts.max_tokens = defaultMaxTokens(model);
+    }
+
+    // Explicit api_key parameter wins over any value carried in SimpleStreamOptions.
+    if (api_key) |key| opts.api_key = key;
+
+    return opts;
 }
 
 pub fn clampReasoning(effort: ?types.ThinkingLevel) ?types.ThinkingLevel {
