@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("agent");
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
+const enforcement = @import("enforcement.zig");
 const tools_common = @import("../tools/common.zig");
 const wasm_manifest = @import("wasm/wasm_manifest.zig");
 
@@ -107,6 +108,15 @@ pub const NativeDescriptor = struct {
         return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, &.{}, phase, mode);
     }
 
+    pub fn deniedCapabilityWithApprovals(
+        self: NativeDescriptor,
+        approved_capabilities: []const wasm_manifest.Capability,
+        phase: wasm_manifest.LifecyclePhase,
+        mode: []const u8,
+    ) ?wasm_manifest.CapabilityDenialDiagnostic {
+        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, approved_capabilities, phase, mode);
+    }
+
     pub fn firstForbiddenField(self: NativeDescriptor) ?[]const u8 {
         if (self.library_path != null) return "library_path";
         if (self.dynamic_library_path != null) return "dynamic_library_path";
@@ -128,7 +138,76 @@ pub const NativeDescriptor = struct {
 
 pub const NativeOptions = struct {
     descriptor: *const NativeDescriptor,
+    approved_capabilities: []const wasm_manifest.Capability = &.{},
+    host_effects: ?*NativeHostEffects = null,
 };
+
+pub const NativeHostEffects = struct {
+    sandbox_root: ?[]const u8 = null,
+    file_reads: u64 = 0,
+    file_writes: u64 = 0,
+    network_requests: u64 = 0,
+    shell_runs: u64 = 0,
+    env_reads: u64 = 0,
+    model_calls: u64 = 0,
+    session_reads: u64 = 0,
+    session_writes: u64 = 0,
+    ui_notifications: u64 = 0,
+    tool_uses: u64 = 0,
+    agent_spawns: u64 = 0,
+    agent_delegations: u64 = 0,
+
+    fn ensureSandboxPath(self: NativeHostEffects, path: []const u8) !void {
+        const root = self.sandbox_root orelse return;
+        if (isPathWithinSandbox(root, path)) return;
+        return error.NativeHostSandboxDenied;
+    }
+
+    fn recordFileRead(self: *NativeHostEffects, path: []const u8) !void {
+        try self.ensureSandboxPath(path);
+        self.file_reads += 1;
+    }
+
+    fn recordFileWrite(self: *NativeHostEffects, path: []const u8) !void {
+        try self.ensureSandboxPath(path);
+        self.file_writes += 1;
+    }
+
+    fn total(self: NativeHostEffects) u64 {
+        return self.file_reads +
+            self.file_writes +
+            self.network_requests +
+            self.shell_runs +
+            self.env_reads +
+            self.model_calls +
+            self.session_reads +
+            self.session_writes +
+            self.ui_notifications +
+            self.tool_uses +
+            self.agent_spawns +
+            self.agent_delegations;
+    }
+};
+
+fn isPathWithinSandbox(root: []const u8, path: []const u8) bool {
+    if (root.len == 0) return false;
+    if (std.mem.eql(u8, root, path)) return true;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (root[root.len - 1] == std.fs.path.sep) return true;
+    return path.len > root.len and path[root.len] == std.fs.path.sep;
+}
+
+fn nativeResourceLimitsToEnforcement(limits: NativeResourceLimits) enforcement.ResourceLimits {
+    return .{
+        .max_children = limits.max_children,
+        .depth = limits.depth,
+        .turns = limits.turns,
+        .timeout_ms = limits.timeout_ms,
+        .output_bytes = limits.output_bytes,
+        .output_lines = limits.output_lines,
+        .tool_scopes = limits.tool_scopes,
+    };
+}
 
 const NativeToolBinding = struct {
     runtime: *NativeRuntime,
@@ -196,67 +275,69 @@ pub const NativeHostApi = struct {
     }
 
     pub fn readFile(self: *NativeHostApi, path: []const u8) !void {
-        _ = path;
-        return self.denyCapability(.file_read, .initialize, "file.read");
+        try self.enforceOperation(.file_read, .{ .id = path }, .initialize, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| try effects.recordFileRead(path);
     }
 
     pub fn writeFile(self: *NativeHostApi, path: []const u8, contents: []const u8) !void {
-        _ = path;
         _ = contents;
-        return self.denyCapability(.file_write, .initialize, "file.write");
+        try self.enforceOperation(.file_write, .{ .id = path }, .initialize, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| try effects.recordFileWrite(path);
     }
 
     pub fn requestNetwork(self: *NativeHostApi, url: []const u8) !void {
-        _ = url;
-        return self.denyCapability(.network_request, .initialize, "network.request");
+        try self.enforceOperation(.network_request, .{ .id = url }, .initialize, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.network_requests += 1;
     }
 
     pub fn runShell(self: *NativeHostApi, command: []const u8) !void {
-        _ = command;
-        return self.denyCapability(.shell_run, .initialize, "shell.run");
+        try self.enforceOperation(.shell_run, .{ .id = command }, .initialize, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.shell_runs += 1;
     }
 
     pub fn readEnv(self: *NativeHostApi, name: []const u8) !void {
-        _ = name;
-        return self.denyCapability(.env_read, .initialize, "env.read");
+        try self.enforceOperation(.env_read, .{ .id = name }, .initialize, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.env_reads += 1;
     }
 
     pub fn callModel(self: *NativeHostApi, model: []const u8, payload_json: []const u8) !void {
-        _ = model;
-        _ = payload_json;
-        return self.denyCapability(.model_call, .initialize, "model.call");
+        try self.enforceOperation(.model_call, .{ .id = model }, .call, "native/host-api", .{
+            .turns = 1,
+            .output_bytes = payload_json.len,
+        });
+        if (self.runtime.host_effects) |effects| effects.model_calls += 1;
     }
 
     pub fn readSession(self: *NativeHostApi, session_id: []const u8) !void {
-        _ = session_id;
-        return self.denyCapability(.session_read, .initialize, "session.read");
+        try self.enforceOperation(.session_read, .{ .id = session_id }, .call, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.session_reads += 1;
     }
 
     pub fn writeSession(self: *NativeHostApi, session_id: []const u8, payload_json: []const u8) !void {
-        _ = session_id;
         _ = payload_json;
-        return self.denyCapability(.session_write, .initialize, "session.write");
+        try self.enforceOperation(.session_write, .{ .id = session_id }, .call, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.session_writes += 1;
     }
 
     pub fn notifyUi(self: *NativeHostApi, payload_json: []const u8) !void {
-        _ = payload_json;
-        return self.denyCapability(.ui_notify, .initialize, "ui.notify");
+        try self.enforceOperation(.ui_notify, .{ .id = payload_json }, .call, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.ui_notifications += 1;
     }
 
     pub fn useTool(self: *NativeHostApi, name: []const u8, payload_json: []const u8) !void {
-        _ = name;
         _ = payload_json;
-        return self.denyCapability(.tool_use, .call, "tool.use");
+        try self.enforceOperation(.tool_use, .{ .id = name }, .call, "native/host-api", .{ .turns = 1 });
+        if (self.runtime.host_effects) |effects| effects.tool_uses += 1;
     }
 
     pub fn spawnAgent(self: *NativeHostApi, task_json: []const u8) !void {
-        _ = task_json;
-        return self.denyCapability(.agent_spawn, .call, "agent.spawn");
+        try self.enforceOperation(.agent_spawn, .{ .id = task_json }, .call, "native/host-api", .{ .children_started = 1 });
+        if (self.runtime.host_effects) |effects| effects.agent_spawns += 1;
     }
 
     pub fn delegateAgent(self: *NativeHostApi, task_json: []const u8) !void {
-        _ = task_json;
-        return self.denyCapability(.agent_delegate, .call, "agent.delegate");
+        try self.enforceOperation(.agent_delegate, .{ .id = task_json }, .call, "native/host-api", .{ .turns = 1 });
+        if (self.runtime.host_effects) |effects| effects.agent_delegations += 1;
     }
 
     pub fn emitEvent(self: *NativeHostApi, frame_json: []const u8) !void {
@@ -269,13 +350,41 @@ pub const NativeHostApi = struct {
         return error.UnsupportedNativeHostOperation;
     }
 
-    fn denyCapability(
+    fn enforceOperation(
         self: *NativeHostApi,
-        capability: wasm_manifest.Capability,
+        operation: enforcement.Operation,
+        target: enforcement.OperationTarget,
         phase: wasm_manifest.LifecyclePhase,
-        operation: []const u8,
+        mode: []const u8,
+        delta: enforcement.UsageDelta,
     ) !void {
-        const denial = wasm_manifest.denyRuntimeCapability(capability, phase, "native/host-api");
+        const decision = enforcement.decide(
+            .{
+                .runtime_kind = "native",
+                .extension_id = self.runtime.descriptor.id,
+                .package_root = "native://static",
+            },
+            .{
+                .approved_grants = self.runtime.approved_capabilities,
+                .resource_limits = nativeResourceLimitsToEnforcement(self.runtime.descriptor.resource_limits),
+            },
+            operation,
+            target,
+            phase,
+            mode,
+            delta,
+            &self.runtime.accounting,
+        );
+        switch (decision) {
+            .allow => return,
+            .deny => |denial| {
+                try self.addDenialDiagnostic(denial);
+                return error.UnsupportedRuntimeCapability;
+            },
+        }
+    }
+
+    fn addDenialDiagnostic(self: *NativeHostApi, denial: enforcement.DenyDecision) !void {
         var envelope: std.Io.Writer.Allocating = .init(self.runtime.allocator);
         defer envelope.deinit();
         try envelope.writer.writeAll("{\"category\":");
@@ -288,11 +397,26 @@ pub const NativeHostApi = struct {
         try std.json.Stringify.value(denial.phase.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"mode\":");
         try std.json.Stringify.value(denial.mode, .{}, &envelope.writer);
-        try envelope.writer.writeAll(",\"operation\":");
-        try std.json.Stringify.value(operation, .{}, &envelope.writer);
-        try envelope.writer.writeAll(",\"message\":\"native host API operation denied by default\"}");
+        try envelope.writer.writeAll(",\"principal\":{\"runtimeKind\":");
+        try std.json.Stringify.value(denial.principal.runtime_kind, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"extensionId\":");
+        try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        if (denial.principal.package_root) |package_root| {
+            try envelope.writer.writeAll(",\"packageRoot\":");
+            try std.json.Stringify.value(package_root, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("},\"operation\":");
+        try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"target\":{\"id\":");
+        if (denial.target.id) |target_id| {
+            try std.json.Stringify.value(target_id, .{}, &envelope.writer);
+        } else {
+            try envelope.writer.writeAll("null");
+        }
+        try envelope.writer.writeAll("},\"reason\":");
+        try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"message\":\"native host API operation denied by enforcement substrate\"}");
         try self.runtime.state.addDiagnostic(.host_error, .@"error", envelope.written());
-        return error.UnsupportedRuntimeCapability;
     }
 };
 
@@ -302,12 +426,15 @@ pub const NativeRuntime = struct {
     state: extension_host.ProtocolState,
     mutex: std.Io.Mutex = .init,
     descriptor: *const NativeDescriptor,
+    approved_capabilities: []const wasm_manifest.Capability,
+    accounting: enforcement.Accounting,
+    host_effects: ?*NativeHostEffects,
     tool_bindings: []NativeToolBinding,
     unloaded: bool,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);
-        if (options.descriptor.deniedCapability(.initialize, "native/descriptor") != null) return error.UnsupportedRuntimeCapability;
+        if (options.descriptor.deniedCapabilityWithApprovals(options.approved_capabilities, .initialize, "native/descriptor") != null) return error.UnsupportedRuntimeCapability;
 
         const tool_bindings = try allocator.alloc(NativeToolBinding, options.descriptor.tools.len);
         var runtime_initialized = false;
@@ -319,6 +446,9 @@ pub const NativeRuntime = struct {
             .io = io,
             .state = extension_host.ProtocolState.init(allocator),
             .descriptor = options.descriptor,
+            .approved_capabilities = options.approved_capabilities,
+            .accounting = .{},
+            .host_effects = options.host_effects,
             .tool_bindings = tool_bindings,
             .unloaded = false,
         };
@@ -525,4 +655,201 @@ fn invalidNativeInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentT
         allocator,
         "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object with string field value\"}}",
     ) };
+}
+
+const native_enforcement_matrix_tool: NativeToolDefinition = .{
+    .name = "native.enforcement.matrix",
+    .label = "Native Enforcement Matrix",
+    .description = "Test-only native tool used to assert operation gate side effects.",
+    .input_schema_json = "{\"type\":\"object\"}",
+    .extension_path = "native://enforcement/matrix",
+};
+
+fn nativeSandboxPath(allocator: std.mem.Allocator, effects: ?*NativeHostEffects, leaf: []const u8) ![]u8 {
+    const sandbox_root = (effects orelse return error.NativeHostSandboxDenied).sandbox_root orelse return error.NativeHostSandboxDenied;
+    return std.fs.path.join(allocator, &.{ sandbox_root, leaf });
+}
+
+fn nativeDeniedOperationMatrixStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_enforcement_matrix_tool);
+
+    const read_path = try nativeSandboxPath(api.runtime.allocator, api.runtime.host_effects, "read.txt");
+    defer api.runtime.allocator.free(read_path);
+    const write_path = try nativeSandboxPath(api.runtime.allocator, api.runtime.host_effects, "write.txt");
+    defer api.runtime.allocator.free(write_path);
+
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.readFile(read_path));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.writeFile(write_path, "blocked"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.requestNetwork("https://example.invalid/blocked"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.runShell("echo blocked"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.readEnv("PI_BLOCKED"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.callModel("fake-model", "{\"prompt\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.readSession("session-blocked"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.writeSession("session-blocked", "{\"blocked\":true}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.notifyUi("{\"message\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.useTool("native.enforcement.matrix", "{\"blocked\":true}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.spawnAgent("{\"task\":\"blocked\"}"));
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.delegateAgent("{\"task\":\"blocked\"}"));
+}
+
+fn nativeAllowedOperationMatrixStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_enforcement_matrix_tool);
+
+    const read_path = try nativeSandboxPath(api.runtime.allocator, api.runtime.host_effects, "read.txt");
+    defer api.runtime.allocator.free(read_path);
+    const write_path = try nativeSandboxPath(api.runtime.allocator, api.runtime.host_effects, "write.txt");
+    defer api.runtime.allocator.free(write_path);
+
+    try api.readFile(read_path);
+    try api.writeFile(write_path, "allowed");
+    try api.requestNetwork("fake://network/request");
+    try api.runShell("fake-shell --no-side-effects");
+    try api.readEnv("PI_FAKE_ENV");
+    try api.callModel("fake-model", "{\"prompt\":\"allowed\"}");
+    try api.readSession("session-allowed");
+    try api.writeSession("session-allowed", "{\"allowed\":true}");
+    try api.notifyUi("{\"message\":\"allowed\"}");
+    try api.useTool("native.enforcement.matrix", "{\"allowed\":true}");
+    try api.spawnAgent("{\"task\":\"allowed\"}");
+    try api.delegateAgent("{\"task\":\"allowed\"}");
+}
+
+const native_denied_operation_matrix_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-denied-operation-matrix",
+    .name = "Native Denied Operation Matrix",
+    .version = "0.1.0",
+    .description = "Exercises every denied native host operation without side effects.",
+    .tools = &.{native_enforcement_matrix_tool},
+    .start = nativeDeniedOperationMatrixStart,
+};
+
+const native_allowed_operation_matrix_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-allowed-operation-matrix",
+    .name = "Native Allowed Operation Matrix",
+    .version = "0.1.0",
+    .description = "Exercises every allowed native host operation using fake/sandbox effects.",
+    .tools = &.{native_enforcement_matrix_tool},
+    .requested_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    .resource_limits = .{
+        .turns = 8,
+        .output_bytes = 1024,
+        .output_lines = 64,
+        .max_children = 2,
+        .depth = 1,
+        .tool_scopes = &.{"native.enforcement.matrix"},
+    },
+    .start = nativeAllowedOperationMatrixStart,
+};
+
+fn makeNativeAbsoluteTestPath(allocator: std.mem.Allocator, tmp: anytype, relative_path: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        relative_path,
+    });
+}
+
+test "native host operation gates deny side effects through enforcement matrix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "sandbox", .default_dir);
+    const sandbox_root = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox");
+    defer allocator.free(sandbox_root);
+
+    var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
+    const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &native_denied_operation_matrix_descriptor,
+        .host_effects = &effects,
+    });
+    defer runtime.deinit();
+
+    try runtime.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 12), runtime.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 12), runtime.diagnosticCategoryCount(.host_error));
+    try std.testing.expectEqual(@as(u64, 0), effects.total());
+    try std.testing.expectEqual(@as(u64, 0), runtime.accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 0), runtime.accounting.turns);
+    try std.testing.expectEqual(@as(u64, 0), runtime.accounting.children_started);
+
+    const expected = [_]struct {
+        capability: wasm_manifest.Capability,
+        operation: []const u8,
+    }{
+        .{ .capability = .file_read, .operation = "file.read" },
+        .{ .capability = .file_write, .operation = "file.write" },
+        .{ .capability = .network_request, .operation = "network.request" },
+        .{ .capability = .shell_run, .operation = "shell.run" },
+        .{ .capability = .env_read, .operation = "env.read" },
+        .{ .capability = .model_call, .operation = "model.call" },
+        .{ .capability = .session_read, .operation = "session.read" },
+        .{ .capability = .session_write, .operation = "session.write" },
+        .{ .capability = .ui_notify, .operation = "ui.notify" },
+        .{ .capability = .tool_use, .operation = "tool.use" },
+        .{ .capability = .agent_spawn, .operation = "agent.spawn" },
+        .{ .capability = .agent_delegate, .operation = "agent.delegate" },
+    };
+
+    for (expected) |entry| {
+        var found = false;
+        for (runtime.state.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "\"category\":\"denied_capability\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, entry.capability.jsonName()) != null and
+                std.mem.indexOf(u8, diagnostic.message, entry.capability.enforcementBranch().jsonName()) != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"phase\":") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"mode\":\"native/host-api\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"principal\":{\"runtimeKind\":\"native\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, entry.operation) != null)
+            {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "native host operation gates allow only fake and sandbox side effects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "sandbox", .default_dir);
+    const sandbox_root = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox");
+    defer allocator.free(sandbox_root);
+
+    var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
+    const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &native_allowed_operation_matrix_descriptor,
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+        .host_effects = &effects,
+    });
+    defer runtime.deinit();
+
+    try runtime.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 0), runtime.diagnosticCount());
+    try std.testing.expectEqual(@as(u64, 1), effects.file_reads);
+    try std.testing.expectEqual(@as(u64, 1), effects.file_writes);
+    try std.testing.expectEqual(@as(u64, 1), effects.network_requests);
+    try std.testing.expectEqual(@as(u64, 1), effects.shell_runs);
+    try std.testing.expectEqual(@as(u64, 1), effects.env_reads);
+    try std.testing.expectEqual(@as(u64, 1), effects.model_calls);
+    try std.testing.expectEqual(@as(u64, 1), effects.session_reads);
+    try std.testing.expectEqual(@as(u64, 1), effects.session_writes);
+    try std.testing.expectEqual(@as(u64, 1), effects.ui_notifications);
+    try std.testing.expectEqual(@as(u64, 1), effects.tool_uses);
+    try std.testing.expectEqual(@as(u64, 1), effects.agent_spawns);
+    try std.testing.expectEqual(@as(u64, 1), effects.agent_delegations);
+    try std.testing.expectEqual(@as(u64, 12), effects.total());
+    try std.testing.expectEqual(@as(u64, 12), runtime.accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 3), runtime.accounting.turns);
+    try std.testing.expect(runtime.accounting.output_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), runtime.accounting.children_started);
 }
