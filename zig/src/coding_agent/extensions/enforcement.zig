@@ -100,24 +100,54 @@ pub const OperationTarget = struct {
 
 pub const UsageDelta = struct {
     turns: u64 = 0,
+    elapsed_ms: u64 = 0,
     output_bytes: u64 = 0,
     output_lines: u64 = 0,
     children_started: u64 = 0,
+    depth: u64 = 0,
+    replay_key: ?[]const u8 = null,
 };
 
 pub const Accounting = struct {
     allowed_operations: u64 = 0,
+    denied_operations: u64 = 0,
     turns: u64 = 0,
+    elapsed_ms: u64 = 0,
     output_bytes: u64 = 0,
     output_lines: u64 = 0,
     children_started: u64 = 0,
+    max_depth_observed: u64 = 0,
+    replay_keys_recorded: usize = 0,
+    replay_key_hashes: [64]u64 = [_]u64{0} ** 64,
 
     pub fn applyAllowed(self: *Accounting, delta: UsageDelta) void {
         self.allowed_operations += 1;
         self.turns += delta.turns;
+        self.elapsed_ms += delta.elapsed_ms;
         self.output_bytes += delta.output_bytes;
         self.output_lines += delta.output_lines;
         self.children_started += delta.children_started;
+        self.max_depth_observed = @max(self.max_depth_observed, delta.depth);
+        if (delta.replay_key) |replay_key| self.recordReplayKey(replay_key);
+    }
+
+    pub fn recordDenied(self: *Accounting) void {
+        self.denied_operations += 1;
+    }
+
+    pub fn hasReplayKey(self: Accounting, replay_key: []const u8) bool {
+        const hash = replayKeyHash(replay_key);
+        for (self.replay_key_hashes[0..self.replay_keys_recorded]) |recorded_hash| {
+            if (recorded_hash == hash) return true;
+        }
+        return false;
+    }
+
+    fn recordReplayKey(self: *Accounting, replay_key: []const u8) void {
+        if (self.hasReplayKey(replay_key)) return;
+        if (self.replay_keys_recorded >= self.replay_key_hashes.len) return;
+        self.replay_key_hashes[self.replay_keys_recorded] = replayKeyHash(replay_key);
+        self.replay_keys_recorded += 1;
     }
 };
 
@@ -130,6 +160,7 @@ pub const AllowDecision = struct {
     operation: Operation,
     target: OperationTarget,
     usage_delta: UsageDelta,
+    replayed: bool = false,
 };
 
 pub const DenyDecision = struct {
@@ -185,14 +216,34 @@ pub fn decide(
 ) Decision {
     const grant = operation.requiredGrant();
     if (!hasGrant(policy.approved_grants, grant)) {
-        return deny(principal, operation, target, phase, mode, "grant is not approved");
+        return deny(accounting, principal, operation, target, phase, mode, "grant is not approved");
     }
 
     if (operation == .tool_use and policy.resource_limits.tool_scopes.len > 0) {
-        const target_id = target.id orelse return deny(principal, operation, target, phase, mode, "tool target is required when toolScopes are constrained");
+        const target_id = target.id orelse return deny(accounting, principal, operation, target, phase, mode, "tool target is required when toolScopes are constrained");
         if (!containsString(policy.resource_limits.tool_scopes, target_id)) {
-            return deny(principal, operation, target, phase, mode, "tool target is outside toolScopes");
+            return deny(accounting, principal, operation, target, phase, mode, "tool target is outside toolScopes");
         }
+    }
+
+    if (delta.replay_key) |replay_key| {
+        if (accounting.hasReplayKey(replay_key)) {
+            return .{ .allow = .{
+                .capability = grant,
+                .branch = operation.branch(),
+                .phase = phase,
+                .mode = mode,
+                .principal = principal,
+                .operation = operation,
+                .target = target,
+                .usage_delta = delta,
+                .replayed = true,
+            } };
+        }
+    }
+
+    if (limitExceededReason(policy.resource_limits, accounting.*, delta)) |reason| {
+        return deny(accounting, principal, operation, target, phase, mode, reason);
     }
 
     accounting.applyAllowed(delta);
@@ -209,6 +260,7 @@ pub fn decide(
 }
 
 fn deny(
+    accounting: *Accounting,
     principal: Principal,
     operation: Operation,
     target: OperationTarget,
@@ -216,6 +268,7 @@ fn deny(
     mode: []const u8,
     reason: []const u8,
 ) Decision {
+    accounting.recordDenied();
     return .{ .deny = .{
         .capability = operation.requiredGrant(),
         .branch = operation.branch(),
@@ -226,6 +279,39 @@ fn deny(
         .target = target,
         .reason = reason,
     } };
+}
+
+fn limitExceededReason(limits: ResourceLimits, accounting: Accounting, delta: UsageDelta) ?[]const u8 {
+    if (limits.turns) |limit| {
+        if (wouldExceed(accounting.turns, delta.turns, limit)) return "resource limit exceeded: turns";
+    }
+    if (limits.timeout_ms) |limit| {
+        if (wouldExceed(accounting.elapsed_ms, delta.elapsed_ms, limit)) return "resource limit exceeded: timeoutMs";
+    }
+    if (limits.output_bytes) |limit| {
+        if (wouldExceed(accounting.output_bytes, delta.output_bytes, limit)) return "resource limit exceeded: outputBytes";
+    }
+    if (limits.output_lines) |limit| {
+        if (wouldExceed(accounting.output_lines, delta.output_lines, limit)) return "resource limit exceeded: outputLines";
+    }
+    if (limits.max_children) |limit| {
+        if (wouldExceed(accounting.children_started, delta.children_started, limit)) return "resource limit exceeded: maxChildren";
+    }
+    if (limits.depth) |limit| {
+        if (@max(accounting.max_depth_observed, delta.depth) > limit) return "resource limit exceeded: depth";
+    }
+    return null;
+}
+
+fn wouldExceed(current: u64, delta: u64, limit: u64) bool {
+    if (current > limit) return true;
+    return delta > limit - current;
+}
+
+fn replayKeyHash(replay_key: []const u8) u64 {
+    const hash = std.hash.Wyhash.hash(0, replay_key);
+    if (hash == 0) return 1;
+    return hash;
 }
 
 fn hasGrant(grants: []const Grant, needle: Grant) bool {
@@ -352,7 +438,14 @@ test "enforcement decisions deny unapproved grants before accounting" {
         try std.testing.expectEqual(.initialize, decision.deny.phase);
         try std.testing.expectEqualStrings("runtime/import", decision.deny.mode);
         try std.testing.expectEqual(operation, decision.deny.operation);
-        try std.testing.expectEqual(before, accounting);
+        try std.testing.expectEqual(@as(u64, before.denied_operations + 1), accounting.denied_operations);
+        try std.testing.expectEqual(before.allowed_operations, accounting.allowed_operations);
+        try std.testing.expectEqual(before.turns, accounting.turns);
+        try std.testing.expectEqual(before.elapsed_ms, accounting.elapsed_ms);
+        try std.testing.expectEqual(before.output_bytes, accounting.output_bytes);
+        try std.testing.expectEqual(before.output_lines, accounting.output_lines);
+        try std.testing.expectEqual(before.children_started, accounting.children_started);
+        try std.testing.expectEqual(before.max_depth_observed, accounting.max_depth_observed);
     }
 }
 
@@ -382,7 +475,14 @@ test "enforcement approved grant allows only its matching operation branch and r
             } else {
                 try std.testing.expect(decision == .deny);
                 try std.testing.expectEqual(requested_operation.requiredGrant(), decision.deny.capability);
-                try std.testing.expectEqual(before, accounting);
+                try std.testing.expectEqual(@as(u64, before.denied_operations + 1), accounting.denied_operations);
+                try std.testing.expectEqual(before.allowed_operations, accounting.allowed_operations);
+                try std.testing.expectEqual(before.turns, accounting.turns);
+                try std.testing.expectEqual(before.elapsed_ms, accounting.elapsed_ms);
+                try std.testing.expectEqual(before.output_bytes, accounting.output_bytes);
+                try std.testing.expectEqual(before.output_lines, accounting.output_lines);
+                try std.testing.expectEqual(before.children_started, accounting.children_started);
+                try std.testing.expectEqual(before.max_depth_observed, accounting.max_depth_observed);
             }
         }
     }
@@ -405,6 +505,7 @@ test "enforcement resource limits constrain without granting and tool scopes nar
     );
     try std.testing.expect(no_grant == .deny);
     try std.testing.expectEqual(Grant.tool_use, no_grant.deny.capability);
+    try std.testing.expectEqual(@as(u64, 1), denied_accounting.denied_operations);
     try std.testing.expectEqual(@as(u64, 0), denied_accounting.allowed_operations);
     try std.testing.expectEqual(@as(u64, 0), denied_accounting.turns);
 
@@ -421,6 +522,7 @@ test "enforcement resource limits constrain without granting and tool scopes nar
     );
     try std.testing.expect(out_of_scope == .deny);
     try std.testing.expectEqualStrings("tool target is outside toolScopes", out_of_scope.deny.reason);
+    try std.testing.expectEqual(@as(u64, 1), scoped_accounting.denied_operations);
     try std.testing.expectEqual(@as(u64, 0), scoped_accounting.allowed_operations);
 
     const in_scope = decide(
@@ -435,5 +537,192 @@ test "enforcement resource limits constrain without granting and tool scopes nar
     );
     try std.testing.expect(in_scope == .allow);
     try std.testing.expectEqual(@as(u64, 1), scoped_accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 1), scoped_accounting.denied_operations);
     try std.testing.expectEqual(@as(u64, 1), scoped_accounting.turns);
+}
+
+test "enforcement accounting is replay-safe for repeated operation id" {
+    var accounting = Accounting{};
+    const first = decide(
+        test_principal,
+        .{ .approved_grants = &.{.model_call}, .resource_limits = .{ .turns = 2, .output_bytes = 20 } },
+        .model_call,
+        .{ .id = "fake-model" },
+        .call,
+        "policy/decision",
+        .{ .turns = 1, .output_bytes = 10, .replay_key = "model-call-1" },
+        &accounting,
+    );
+    try std.testing.expect(first == .allow);
+    try std.testing.expect(!first.allow.replayed);
+    try std.testing.expectEqual(@as(u64, 1), accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 1), accounting.turns);
+    try std.testing.expectEqual(@as(u64, 10), accounting.output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), accounting.replay_keys_recorded);
+
+    const replay = decide(
+        test_principal,
+        .{ .approved_grants = &.{.model_call}, .resource_limits = .{ .turns = 2, .output_bytes = 20 } },
+        .model_call,
+        .{ .id = "fake-model" },
+        .call,
+        "policy/replay",
+        .{ .turns = 1, .output_bytes = 10, .replay_key = "model-call-1" },
+        &accounting,
+    );
+    try std.testing.expect(replay == .allow);
+    try std.testing.expect(replay.allow.replayed);
+    try std.testing.expectEqual(@as(u64, 1), accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 1), accounting.turns);
+    try std.testing.expectEqual(@as(u64, 10), accounting.output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), accounting.replay_keys_recorded);
+}
+
+test "enforcement denied attempts record deterministic counter without usage accounting" {
+    var accounting = Accounting{};
+    const denied = decide(
+        test_principal,
+        .{ .approved_grants = &.{}, .resource_limits = .{ .turns = 0, .output_bytes = 0, .max_children = 0 } },
+        .agent_spawn,
+        .{ .id = "child-task" },
+        .call,
+        "policy/decision",
+        .{ .turns = 1, .output_bytes = 10, .children_started = 1 },
+        &accounting,
+    );
+    try std.testing.expect(denied == .deny);
+    try std.testing.expectEqualStrings("grant is not approved", denied.deny.reason);
+    try std.testing.expectEqual(@as(u64, 1), accounting.denied_operations);
+    try std.testing.expectEqual(@as(u64, 0), accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 0), accounting.turns);
+    try std.testing.expectEqual(@as(u64, 0), accounting.output_bytes);
+    try std.testing.expectEqual(@as(u64, 0), accounting.children_started);
+}
+
+test "enforcement checks grants before numeric resource limits" {
+    var accounting = Accounting{};
+    const denied = decide(
+        test_principal,
+        .{ .approved_grants = &.{}, .resource_limits = .{ .turns = 0, .output_bytes = 0, .max_children = 0 } },
+        .model_call,
+        .{ .id = "fake-model" },
+        .call,
+        "policy/decision",
+        .{ .turns = 1, .output_bytes = 1, .children_started = 1 },
+        &accounting,
+    );
+    try std.testing.expect(denied == .deny);
+    try std.testing.expectEqualStrings("grant is not approved", denied.deny.reason);
+    try std.testing.expectEqual(@as(u64, 1), accounting.denied_operations);
+    try std.testing.expectEqual(@as(u64, 0), accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 0), accounting.turns);
+    try std.testing.expectEqual(@as(u64, 0), accounting.output_bytes);
+    try std.testing.expectEqual(@as(u64, 0), accounting.children_started);
+}
+
+test "enforcement allows exact numeric limits and denies exceeded limits" {
+    var accounting = Accounting{};
+    const exact = decide(
+        test_principal,
+        .{ .approved_grants = &.{.model_call}, .resource_limits = .{ .turns = 2, .timeout_ms = 50, .output_bytes = 12, .output_lines = 3, .depth = 1 } },
+        .model_call,
+        .{ .id = "fake-model" },
+        .call,
+        "policy/decision",
+        .{ .turns = 2, .elapsed_ms = 50, .output_bytes = 12, .output_lines = 3, .depth = 1 },
+        &accounting,
+    );
+    try std.testing.expect(exact == .allow);
+    try std.testing.expectEqual(@as(u64, 1), accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 2), accounting.turns);
+    try std.testing.expectEqual(@as(u64, 50), accounting.elapsed_ms);
+    try std.testing.expectEqual(@as(u64, 12), accounting.output_bytes);
+    try std.testing.expectEqual(@as(u64, 3), accounting.output_lines);
+    try std.testing.expectEqual(@as(u64, 1), accounting.max_depth_observed);
+
+    const exceeded = decide(
+        test_principal,
+        .{ .approved_grants = &.{.model_call}, .resource_limits = .{ .turns = 2 } },
+        .model_call,
+        .{ .id = "fake-model" },
+        .call,
+        "policy/decision",
+        .{ .turns = 1 },
+        &accounting,
+    );
+    try std.testing.expect(exceeded == .deny);
+    try std.testing.expectEqualStrings("resource limit exceeded: turns", exceeded.deny.reason);
+    try std.testing.expectEqual(@as(u64, 1), accounting.denied_operations);
+    try std.testing.expectEqual(@as(u64, 1), accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 2), accounting.turns);
+
+    var child_accounting = Accounting{};
+    const child_exact = decide(
+        test_principal,
+        .{ .approved_grants = &.{.agent_spawn}, .resource_limits = .{ .max_children = 2 } },
+        .agent_spawn,
+        .{ .id = "child-task" },
+        .call,
+        "policy/decision",
+        .{ .children_started = 2 },
+        &child_accounting,
+    );
+    try std.testing.expect(child_exact == .allow);
+    const child_exceeded = decide(
+        test_principal,
+        .{ .approved_grants = &.{.agent_spawn}, .resource_limits = .{ .max_children = 2 } },
+        .agent_spawn,
+        .{ .id = "child-task" },
+        .call,
+        "policy/decision",
+        .{ .children_started = 1 },
+        &child_accounting,
+    );
+    try std.testing.expect(child_exceeded == .deny);
+    try std.testing.expectEqualStrings("resource limit exceeded: maxChildren", child_exceeded.deny.reason);
+    try std.testing.expectEqual(@as(u64, 2), child_accounting.children_started);
+
+    const exceeded_cases = [_]struct {
+        limits: ResourceLimits,
+        delta: UsageDelta,
+        reason: []const u8,
+    }{
+        .{
+            .limits = .{ .timeout_ms = 10 },
+            .delta = .{ .elapsed_ms = 11 },
+            .reason = "resource limit exceeded: timeoutMs",
+        },
+        .{
+            .limits = .{ .output_bytes = 10 },
+            .delta = .{ .output_bytes = 11 },
+            .reason = "resource limit exceeded: outputBytes",
+        },
+        .{
+            .limits = .{ .output_lines = 2 },
+            .delta = .{ .output_lines = 3 },
+            .reason = "resource limit exceeded: outputLines",
+        },
+        .{
+            .limits = .{ .depth = 1 },
+            .delta = .{ .depth = 2 },
+            .reason = "resource limit exceeded: depth",
+        },
+    };
+    for (exceeded_cases) |case| {
+        var case_accounting = Accounting{};
+        const decision = decide(
+            test_principal,
+            .{ .approved_grants = &.{.model_call}, .resource_limits = case.limits },
+            .model_call,
+            .{ .id = "fake-model" },
+            .call,
+            "policy/decision",
+            case.delta,
+            &case_accounting,
+        );
+        try std.testing.expect(decision == .deny);
+        try std.testing.expectEqualStrings(case.reason, decision.deny.reason);
+        try std.testing.expectEqual(@as(u64, 1), case_accounting.denied_operations);
+        try std.testing.expectEqual(@as(u64, 0), case_accounting.allowed_operations);
+    }
 }

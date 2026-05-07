@@ -716,6 +716,19 @@ fn nativeAllowedOperationMatrixStart(api: *NativeHostApi) !void {
     try api.delegateAgent("{\"task\":\"allowed\"}");
 }
 
+fn nativeAgentLimitBoundaryStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_enforcement_matrix_tool);
+
+    try api.spawnAgent("{\"task\":\"spawn-one\"}");
+    try api.spawnAgent("{\"task\":\"spawn-two\"}");
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.spawnAgent("{\"task\":\"spawn-three\"}"));
+
+    try api.delegateAgent("{\"task\":\"delegate-one\"}");
+    try api.delegateAgent("{\"task\":\"delegate-two\"}");
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, api.delegateAgent("{\"task\":\"delegate-three\"}"));
+}
+
 const native_denied_operation_matrix_descriptor: NativeDescriptor = .{
     .id = "com.pi.native-denied-operation-matrix",
     .name = "Native Denied Operation Matrix",
@@ -741,6 +754,20 @@ const native_allowed_operation_matrix_descriptor: NativeDescriptor = .{
         .tool_scopes = &.{"native.enforcement.matrix"},
     },
     .start = nativeAllowedOperationMatrixStart,
+};
+
+const native_agent_limit_boundary_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-agent-limit-boundaries",
+    .name = "Native Agent Limit Boundaries",
+    .version = "0.1.0",
+    .description = "Exercises sub-agent relevant native host gates at exact and exceeded resource limits.",
+    .tools = &.{native_enforcement_matrix_tool},
+    .requested_capabilities = &.{ .agent_spawn, .agent_delegate },
+    .resource_limits = .{
+        .turns = 2,
+        .max_children = 2,
+    },
+    .start = nativeAgentLimitBoundaryStart,
 };
 
 fn makeNativeAbsoluteTestPath(allocator: std.mem.Allocator, tmp: anytype, relative_path: []const u8) ![]u8 {
@@ -852,4 +879,44 @@ test "native host operation gates allow only fake and sandbox side effects" {
     try std.testing.expectEqual(@as(u64, 3), runtime.accounting.turns);
     try std.testing.expect(runtime.accounting.output_bytes > 0);
     try std.testing.expectEqual(@as(u64, 1), runtime.accounting.children_started);
+}
+
+test "native agent host operation gates enforce exact and exceeded resource boundaries" {
+    const allocator = std.testing.allocator;
+    var effects = NativeHostEffects{};
+    const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &native_agent_limit_boundary_descriptor,
+        .approved_capabilities = &.{ .agent_spawn, .agent_delegate },
+        .host_effects = &effects,
+    });
+    defer runtime.deinit();
+
+    try runtime.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.registryFramesApplied());
+    try std.testing.expectEqual(@as(u64, 2), effects.agent_spawns);
+    try std.testing.expectEqual(@as(u64, 2), effects.agent_delegations);
+    try std.testing.expectEqual(@as(u64, 4), effects.total());
+    try std.testing.expectEqual(@as(u64, 4), runtime.accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 2), runtime.accounting.children_started);
+    try std.testing.expectEqual(@as(u64, 2), runtime.accounting.turns);
+    try std.testing.expectEqual(@as(u64, 2), runtime.accounting.denied_operations);
+    try std.testing.expectEqual(@as(usize, 2), runtime.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 2), runtime.diagnosticCategoryCount(.host_error));
+
+    var max_children_denial = false;
+    var turns_denial = false;
+    for (runtime.state.diagnostics.items) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, "\"operation\":\"agent.spawn\"") != null and
+            std.mem.indexOf(u8, diagnostic.message, "\"reason\":\"resource limit exceeded: maxChildren\"") != null)
+        {
+            max_children_denial = true;
+        }
+        if (std.mem.indexOf(u8, diagnostic.message, "\"operation\":\"agent.delegate\"") != null and
+            std.mem.indexOf(u8, diagnostic.message, "\"reason\":\"resource limit exceeded: turns\"") != null)
+        {
+            turns_denial = true;
+        }
+    }
+    try std.testing.expect(max_children_denial);
+    try std.testing.expect(turns_denial);
 }
