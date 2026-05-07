@@ -31,8 +31,10 @@ import { CONFIG_DIR_NAME } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
+import { createWasmExtensionIdentity, type WasmExtensionIdentity } from "./extension-policy.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
+import { createSourceInfo } from "./source-info.js";
 import {
 	hasWasmExtensionManifest,
 	validateWasmExtensionPackage,
@@ -66,6 +68,7 @@ export interface ResolvedWasmExtensionPackage extends WasmExtensionPackageManife
 	path: string;
 	enabled: boolean;
 	metadata: PathMetadata;
+	identity: WasmExtensionIdentity;
 }
 
 export interface ResolvedPaths {
@@ -2386,6 +2389,7 @@ export class DefaultPackageManager implements PackageManager {
 			path: manifest.manifestPath,
 			enabled,
 			metadata,
+			identity: createWasmExtensionIdentity(manifest, createSourceInfo(manifest.manifestPath, metadata)),
 		}));
 		resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
 

@@ -48,6 +48,27 @@ export {
 	shouldCompact,
 } from "./core/compaction/index.js";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.js";
+export type {
+	CanonicalExtensionGrant,
+	CanonicalExtensionIdentity,
+	ExtensionPolicy,
+	ExtensionPolicyRuntimeKind,
+	ExtensionResourceLimits,
+	NativeExtensionIdentity,
+	ProcessJsonlExtensionIdentity,
+	TypeScriptExtensionIdentity,
+	WasmExtensionIdentity,
+} from "./core/extension-policy.js";
+export {
+	CANONICAL_EXTENSION_GRANTS,
+	createNativeExtensionIdentity,
+	createProcessJsonlExtensionIdentity,
+	createTypeScriptExtensionIdentity,
+	createWasmExtensionIdentity,
+	isCanonicalExtensionGrant,
+	normalizeWasmResourceLimits,
+	validateExtensionPolicyShape,
+} from "./core/extension-policy.js";
 // Extension system
 export type {
 	AgentEndEvent,

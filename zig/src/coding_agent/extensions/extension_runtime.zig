@@ -37,6 +37,44 @@ pub const RuntimeKind = enum {
     }
 };
 
+pub fn wasmPolicyLookupKey(allocator: std.mem.Allocator, manifest: WasmManifestHandoff) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "wasm:{s}:{s}:{s}:{s}:{s}",
+        .{ manifest.schema_version, manifest.id, manifest.version, manifest.artifact_path, manifest.artifact_absolute_path },
+    );
+}
+
+pub fn nativePolicyLookupKey(allocator: std.mem.Allocator, descriptor: NativeDescriptor) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "native:{s}:{s}:{s}",
+        .{ descriptor.id, descriptor.name, descriptor.version },
+    );
+}
+
+pub fn processJsonlPolicyLookupKey(allocator: std.mem.Allocator, options: ProcessJsonlOptions) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (options.argv) |arg| updatePolicyHash(&hasher, arg);
+    if (options.cwd) |cwd| updatePolicyHash(&hasher, cwd);
+    updatePolicyHash(&hasher, options.initialize.cwd);
+    const digest = hasher.final();
+    const command_path = if (options.argv.len > 0) options.argv[0] else "";
+    const extension_path = if (options.argv.len > 1) options.argv[options.argv.len - 1] else "";
+    return std.fmt.allocPrint(
+        allocator,
+        "process_jsonl:{x}:{s}:{s}",
+        .{ digest, command_path, extension_path },
+    );
+}
+
+fn updatePolicyHash(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    var length_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length_bytes, @intCast(bytes.len), .little);
+    hasher.update(&length_bytes);
+    hasher.update(bytes);
+}
+
 pub const UnsupportedRuntimeOptions = struct {
     label: ?[]const u8 = null,
 };
@@ -976,6 +1014,40 @@ test "extension runtime factory rejects remote runtime deterministically" {
     try std.testing.expectEqualStrings("wasm", RuntimeKind.wasm.jsonName());
     try std.testing.expectEqualStrings("native", RuntimeKind.native.jsonName());
     try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
+}
+
+test "extension runtime policy lookup keys are canonical per runtime source" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const wasm_handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
+    const wasm_key = try wasmPolicyLookupKey(allocator, wasm_handoff);
+    defer allocator.free(wasm_key);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_key, "wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_key, wasm_handoff.artifact_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_key, wasm_handoff.artifact_absolute_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_key, wasm_handoff.name) == null);
+
+    const native_key = try nativePolicyLookupKey(allocator, native_static_descriptor);
+    defer allocator.free(native_key);
+    try std.testing.expectEqualStrings("native:com.pi.native-static-fixture:Native Static Fixture:0.1.0", native_key);
+
+    const process_a = try processJsonlPolicyLookupKey(allocator, .{
+        .argv = &.{ "/bin/pi-extension-host", "--runtime", "process_jsonl", "/workspace/ext-a" },
+        .initialize = .{ .marker = "marker", .cwd = "/workspace", .fixture = "same-protocol" },
+    });
+    defer allocator.free(process_a);
+    const process_b = try processJsonlPolicyLookupKey(allocator, .{
+        .argv = &.{ "/bin/pi-extension-host", "--runtime", "process_jsonl", "/workspace/ext-b" },
+        .initialize = .{ .marker = "marker", .cwd = "/workspace", .fixture = "same-protocol" },
+    });
+    defer allocator.free(process_b);
+    try std.testing.expect(!std.mem.eql(u8, process_a, process_b));
+    try std.testing.expect(std.mem.indexOf(u8, process_a, "process_jsonl:") == 0);
+    try std.testing.expect(std.mem.indexOf(u8, process_a, "/bin/pi-extension-host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_a, "/workspace/ext-a") != null);
 }
 
 test "extension runtime factory constructs wasm adapter and keeps native remote unsupported" {

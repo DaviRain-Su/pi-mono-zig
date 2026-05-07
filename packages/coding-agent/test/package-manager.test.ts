@@ -30,8 +30,11 @@ function writeWasmPackage(
 		artifactPath?: string;
 		artifactBytes?: Buffer | string;
 		capabilities?: string[];
+		id?: string;
+		name?: string;
 		resourceLimits?: Record<string, unknown>;
 		toolId?: string;
+		version?: string;
 	} = {},
 ): void {
 	const artifactPath = options.artifactPath ?? "wasm/plugin.wasm";
@@ -55,6 +58,15 @@ function writeWasmPackage(
 		},
 		capabilities: options.capabilities ?? [],
 	};
+	if (options.id !== undefined) {
+		manifest.id = options.id;
+	}
+	if (options.name !== undefined) {
+		manifest.name = options.name;
+	}
+	if (options.version !== undefined) {
+		manifest.version = options.version;
+	}
 	if (options.resourceLimits !== undefined) {
 		manifest.resourceLimits = options.resourceLimits;
 	}
@@ -541,6 +553,35 @@ Content`,
 			expect(result.wasmExtensions).toHaveLength(1);
 			expect(result.wasmExtensions[0].capabilities).toEqual([]);
 			expect(result.wasmExtensions[0].resourceLimits).toEqual(resourceLimits);
+		});
+
+		it("should expose canonical WASM policy identities with artifact metadata and name-collision resistance", async () => {
+			const firstPackage = join(tempDir, "wasm-principal-a");
+			const secondPackage = join(tempDir, "wasm-principal-b");
+			writeWasmPackage(firstPackage, {
+				id: "com.example.same-principal-id",
+				name: "Same Display Name",
+				artifactBytes: Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01]),
+			});
+			writeWasmPackage(secondPackage, {
+				id: "com.example.same-principal-id",
+				name: "Same Display Name",
+				artifactBytes: Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x02]),
+			});
+
+			const result = await packageManager.resolveExtensionSources([firstPackage, secondPackage], { local: true });
+
+			expect(result.wasmExtensions).toHaveLength(2);
+			const identities = result.wasmExtensions.map((extension) => extension.identity);
+			expect(new Set(identities.map((identity) => identity.key)).size).toBe(2);
+			expect(identities[0].kind).toBe("wasm-manifest");
+			expect(identities[0].manifestId).toBe("com.example.same-principal-id");
+			expect(identities[0].name).toBe("Same Display Name");
+			expect(identities[0].key).toContain("wasm:pi-extension.v0:com.example.same-principal-id:");
+			expect(identities[0].key).toContain(result.wasmExtensions[0].artifactSha256);
+			expect(identities[0].key).toContain(result.wasmExtensions[0].artifactAbsolutePath);
+			expect(identities[0].key).not.toBe("Same Display Name");
+			expect(identities.map((identity) => identity.sourceInfo.origin)).toEqual(["package", "package"]);
 		});
 
 		it("should reject invalid Wasm resource limits deterministically", async () => {

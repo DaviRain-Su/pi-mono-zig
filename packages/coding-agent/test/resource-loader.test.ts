@@ -186,6 +186,81 @@ Project skill`,
 			expect(extensionsResult.extensions[0].path).toBe(join(cwd, ".pi", "extensions", "shared.ts"));
 		});
 
+		it("should assign canonical policy identities to local, inline, and package TypeScript extensions", async () => {
+			const projectExtensionDir = join(cwd, ".pi", "extensions");
+			mkdirSync(projectExtensionDir, { recursive: true });
+			const localExtensionPath = join(projectExtensionDir, "policy-principal.ts");
+			writeFileSync(
+				localExtensionPath,
+				`export default function(pi) {
+	pi.registerCommand("mutable-label", { handler: async () => {} });
+}`,
+			);
+
+			const packageRoot = join(tempDir, "package-with-extension");
+			mkdirSync(join(packageRoot, "extensions"), { recursive: true });
+			writeFileSync(
+				join(packageRoot, "package.json"),
+				JSON.stringify({
+					name: "fixture-policy-package",
+					version: "1.0.0",
+					pi: { extensions: ["extensions/entry.ts"] },
+				}),
+			);
+			const packageEntryPath = join(packageRoot, "extensions", "entry.ts");
+			writeFileSync(
+				packageEntryPath,
+				`export default function(pi) {
+	pi.registerCommand("package-command", { handler: async () => {} });
+}`,
+			);
+			writeFileSync(
+				join(packageRoot, "extensions", "helper.ts"),
+				`export default function(pi) {
+	pi.registerCommand("undeclared-helper", { handler: async () => {} });
+}`,
+			);
+
+			const settingsManager = SettingsManager.inMemory({ packages: [packageRoot] });
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				extensionFactories: [
+					(pi) => {
+						pi.registerCommand("inline-command", { handler: async () => {} });
+					},
+				],
+			});
+			await loader.reload();
+
+			const extensions = loader.getExtensions().extensions;
+			const byPath = new Map(extensions.map((extension) => [extension.path, extension]));
+			const local = byPath.get(localExtensionPath);
+			const packaged = byPath.get(packageEntryPath);
+			const inline = byPath.get("<inline:1>");
+
+			expect(local?.identity.kind).toBe("typescript-local");
+			expect(local?.identity.key).toBe(`typescript:local:project:${localExtensionPath}`);
+			expect(local?.identity.sourceInfo.path).toBe(localExtensionPath);
+			expect(local?.identity.sourceInfo.scope).toBe("project");
+			expect(local?.identity.sourceInfo.origin).toBe("top-level");
+			expect(local?.identity.displayName).not.toBe("mutable-label");
+
+			expect(packaged?.identity.kind).toBe("typescript-package");
+			expect(packaged?.identity.key).toBe(
+				`typescript:package:user:${packageRoot}:extensions/entry.ts:${packageEntryPath}`,
+			);
+			expect(packaged?.identity.packageSource).toBe(packageRoot);
+			expect(packaged?.identity.entryPath).toBe("extensions/entry.ts");
+			expect(packaged?.identity.sourceInfo.origin).toBe("package");
+			expect(byPath.has(join(packageRoot, "extensions", "helper.ts"))).toBe(false);
+
+			expect(inline?.identity.kind).toBe("typescript-inline");
+			expect(inline?.identity.key).toBe("typescript:inline:inline:<inline:1>");
+			expect(inline?.identity.resolvedPath).toBe("<inline:1>");
+		});
+
 		it("should keep both extensions loaded when command names collide", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			const projectExtDir = join(cwd, ".pi", "extensions");

@@ -27,6 +27,7 @@ import * as _bundledPiCodingAgent from "../../index.js";
 import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
+import { createTypeScriptExtensionIdentity } from "../extension-policy.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
 import { hasWasmExtensionManifest } from "../wasm-extension-package.js";
 import type {
@@ -375,10 +376,12 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 			: "local";
 	const baseDir = extensionPath.startsWith("<") ? undefined : path.dirname(resolvedPath);
 
+	const sourceInfo = createSyntheticSourceInfo(extensionPath, { source, baseDir });
 	return {
 		path: extensionPath,
 		resolvedPath,
-		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
+		sourceInfo,
+		identity: createTypeScriptExtensionIdentity({ configuredPath: extensionPath, resolvedPath, sourceInfo }),
 		handlers: new Map(),
 		tools: new Map(),
 		messageRenderers: new Map(),

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CANONICAL_EXTENSION_GRANTS, validateExtensionPolicyShape } from "../src/core/extension-policy.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
@@ -22,6 +23,39 @@ describe("SettingsManager", () => {
 		if (existsSync(testDir)) {
 			rmSync(testDir, { recursive: true });
 		}
+	});
+
+	describe("extension policy shape", () => {
+		it("should separate canonical approved grants from resource limits", () => {
+			const policy = validateExtensionPolicyShape({
+				approvedGrants: ["agent.delegate", "tool.use"],
+				resourceLimits: {
+					turns: 2,
+					timeoutMs: 1000,
+					toolScopes: ["fixture.echo"],
+				},
+			});
+
+			expect(CANONICAL_EXTENSION_GRANTS).toContain("agent.delegate");
+			expect(policy.approvedGrants).toEqual(["agent.delegate", "tool.use"]);
+			expect(policy.resourceLimits).toEqual({
+				turns: 2,
+				timeoutMs: 1000,
+				toolScopes: ["fixture.echo"],
+			});
+		});
+
+		it("should reject unknown grants and malformed resource limits deterministically", () => {
+			expect(() => validateExtensionPolicyShape({ approvedGrants: ["agent"] })).toThrow(
+				'$.approvedGrants[0]: unknown grant "agent"',
+			);
+			expect(() => validateExtensionPolicyShape({ resourceLimits: { shell: 1 } })).toThrow(
+				"$.resourceLimits.shell: unsupported resource limit",
+			);
+			expect(() => validateExtensionPolicyShape({ resourceLimits: { toolScopes: [""] } })).toThrow(
+				"$.resourceLimits.toolScopes[0]: must not be empty",
+			);
+		});
 	});
 
 	describe("preserves externally added settings", () => {

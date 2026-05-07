@@ -10,6 +10,7 @@ import { getModel } from "@mariozechner/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { createTypeScriptExtensionIdentity } from "../src/core/extension-policy.js";
 import {
 	createExtensionRuntime,
 	type Extension,
@@ -72,10 +73,16 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			},
 		]);
 
+		const sourceInfo = createSyntheticSourceInfo("<test:test-extension>", { source: "test" });
 		return {
 			path: "test-extension",
 			resolvedPath: "/test/test-extension.ts",
-			sourceInfo: createSyntheticSourceInfo("<test:test-extension>", { source: "test" }),
+			sourceInfo,
+			identity: createTypeScriptExtensionIdentity({
+				configuredPath: "test-extension",
+				resolvedPath: "/test/test-extension.ts",
+				sourceInfo,
+			}),
 			handlers,
 			tools: new Map(),
 			messageRenderers: new Map(),
@@ -227,10 +234,16 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 	}, 120000);
 
 	it("should continue with default compaction if extension throws error", async () => {
+		const sourceInfo = createSyntheticSourceInfo("<test:throwing-extension>", { source: "test" });
 		const throwingExtension: Extension = {
 			path: "throwing-extension",
 			resolvedPath: "/test/throwing-extension.ts",
-			sourceInfo: createSyntheticSourceInfo("<test:throwing-extension>", { source: "test" }),
+			sourceInfo,
+			identity: createTypeScriptExtensionIdentity({
+				configuredPath: "throwing-extension",
+				resolvedPath: "/test/throwing-extension.ts",
+				sourceInfo,
+			}),
 			handlers: new Map<string, ((event: any, ctx: any) => Promise<any>)[]>([
 				[
 					"session_before_compact",
@@ -276,10 +289,16 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 	it("should call multiple extensions in order", async () => {
 		const callOrder: string[] = [];
 
+		const sourceInfo1 = createSyntheticSourceInfo("<test:extension1>", { source: "test" });
 		const extension1: Extension = {
 			path: "extension1",
 			resolvedPath: "/test/extension1.ts",
-			sourceInfo: createSyntheticSourceInfo("<test:extension1>", { source: "test" }),
+			sourceInfo: sourceInfo1,
+			identity: createTypeScriptExtensionIdentity({
+				configuredPath: "extension1",
+				resolvedPath: "/test/extension1.ts",
+				sourceInfo: sourceInfo1,
+			}),
 			handlers: new Map<string, ((event: any, ctx: any) => Promise<any>)[]>([
 				[
 					"session_before_compact",
@@ -307,10 +326,16 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			shortcuts: new Map(),
 		};
 
+		const sourceInfo2 = createSyntheticSourceInfo("<test:extension2>", { source: "test" });
 		const extension2: Extension = {
 			path: "extension2",
 			resolvedPath: "/test/extension2.ts",
-			sourceInfo: createSyntheticSourceInfo("<test:extension2>", { source: "test" }),
+			sourceInfo: sourceInfo2,
+			identity: createTypeScriptExtensionIdentity({
+				configuredPath: "extension2",
+				resolvedPath: "/test/extension2.ts",
+				sourceInfo: sourceInfo2,
+			}),
 			handlers: new Map<string, ((event: any, ctx: any) => Promise<any>)[]>([
 				[
 					"session_before_compact",
