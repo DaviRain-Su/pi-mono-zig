@@ -8,8 +8,18 @@ import * as path from "node:path";
 import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { createExtensionRuntime, discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
+import { createEventBus } from "../src/core/event-bus.js";
+import {
+	createExtensionRuntime,
+	discoverAndLoadExtensions,
+	loadExtensionFromFactory,
+} from "../src/core/extensions/loader.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
+import {
+	createSubAgentExtension,
+	SUB_AGENT_DELEGATION_RESULT_ENTRY,
+	SUB_AGENT_READINESS_ENTRY,
+} from "../src/core/extensions/subagent-extension.js";
 import {
 	validateSubAgentReadinessEnvelope,
 	validateSubAgentTaskInvocationEnvelope,
@@ -487,6 +497,258 @@ describe("sub-agent readiness envelope validation", () => {
 		} finally {
 			fs.rmSync(sessionDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("neutral sub-agent delegation extension", () => {
+	let tempDir: string;
+	let sessionManager: SessionManager;
+	let modelRegistry: ModelRegistry;
+
+	const delegateInput = {
+		agentId: "agent-neutral",
+		runId: "run-neutral",
+		taskId: "task-neutral",
+		sessionId: "session-neutral",
+		parentAgentId: "parent-agent",
+		route: "neutral-route",
+		input: { prompt: "summarize neutrally" },
+		limits: { maxChildren: 1, depth: 1, turns: 2, outputBytes: 512, outputLines: 10, toolScopes: ["read"] },
+		metadata: { source: "test" },
+	};
+
+	function bindRunnerCore(
+		runner: ExtensionRunner,
+		sessionManager: SessionManager,
+		sentMessages: unknown[] = [],
+	): void {
+		const defaultActions: ExtensionActions = {
+			sendMessage: () => {},
+			sendUserMessage: () => {},
+			appendEntry: () => {},
+			setSessionName: () => {},
+			getSessionName: () => undefined,
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: () => {},
+			refreshTools: () => {},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => "off",
+			setThinkingLevel: () => {},
+		};
+		const defaultContextActions: ExtensionContextActions = {
+			getModel: () => undefined,
+			isIdle: () => true,
+			getSignal: () => undefined,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: () => {},
+			getSystemPrompt: () => "",
+		};
+		runner.bindCore(
+			{
+				...defaultActions,
+				sendMessage: (message) => {
+					sentMessages.push(message);
+				},
+				appendEntry: (customType, data) => {
+					sessionManager.appendCustomEntry(customType, data);
+				},
+			},
+			defaultContextActions,
+		);
+	}
+
+	function textFromToolResult(result: { content: Array<{ type: string; text?: string }> }): string {
+		const text = result.content.find((block) => block.type === "text")?.text;
+		if (text === undefined) throw new Error("missing text result");
+		return text;
+	}
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sub-agent-extension-test-"));
+		sessionManager = SessionManager.inMemory(tempDir);
+		const authStorage = AuthStorage.create(path.join(tempDir, "auth.json"));
+		modelRegistry = ModelRegistry.create(authStorage);
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("registers neutral tool and command while default-denying delegation without side effects", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				delegate: async () => {
+					delegateCalls++;
+					throw new Error("delegate must not run without grant");
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager);
+
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+		expect(runner.getRegisteredCommands().map((command) => command.name)).toContain("sub-agent");
+
+		const result = await tool!.execute(
+			"tool-call-denied",
+			delegateInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const envelope = JSON.parse(textFromToolResult(result)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(0);
+		expect(envelope.status).toBe("failed");
+		expect(envelope.error).toMatchObject({ reason: "denied_capability" });
+		expect(envelope.details).toMatchObject({
+			capability: "agent.delegate",
+			operation: "agent.delegate",
+			replayed: false,
+		});
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom")
+				.map((entry) => entry.customType),
+		).toEqual([SUB_AGENT_READINESS_ENTRY, SUB_AGENT_DELEGATION_RESULT_ENTRY]);
+	});
+
+	it("delegates through the neutral substrate and replays recorded results without re-execution", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: async (invocation) => {
+					delegateCalls++;
+					return {
+						type: "sub_agent_task_result",
+						agentId: invocation.agentId,
+						runId: invocation.runId,
+						taskId: invocation.taskId,
+						sessionId: invocation.sessionId,
+						parentAgentId: invocation.parentAgentId,
+						status: "completed",
+						content: [{ type: "text", text: "delegated done" }],
+						startedAt: 10,
+						completedAt: 20,
+						usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3, toolCalls: 0 },
+						resourceSummary: {
+							turns: 1,
+							outputBytes: 14,
+							outputLines: 1,
+							childrenStarted: 1,
+							limitDetails: {
+								outputBytes: { limit: 512, actual: 14, truncated: false },
+								outputLines: { limit: 10, actual: 1, truncated: false },
+								toolScopes: ["read"],
+							},
+						},
+						details: { substrate: "generic" },
+					};
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		expect(tool).toBeDefined();
+
+		const first = await tool!.execute(
+			"tool-call-allowed",
+			delegateInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const replay = await tool!.execute(
+			"tool-call-replay",
+			delegateInput,
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const firstEnvelope = JSON.parse(textFromToolResult(first)) as Record<string, unknown>;
+		const replayEnvelope = JSON.parse(textFromToolResult(replay)) as Record<string, unknown>;
+
+		expect(delegateCalls).toBe(1);
+		expect(firstEnvelope).toMatchObject({ status: "completed", content: [{ text: "delegated done" }] });
+		expect(firstEnvelope.resourceSummary).toMatchObject({
+			turns: 1,
+			outputBytes: 14,
+			outputLines: 1,
+			childrenStarted: 1,
+		});
+		expect(replayEnvelope).toEqual(firstEnvelope);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
+	});
+
+	it("propagates cancellation metadata and prevents delegated work when cancellation is requested", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: async () => {
+					delegateCalls++;
+					throw new Error("cancelled delegation must not execute");
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		const sentMessages: unknown[] = [];
+		bindRunnerCore(runner, sessionManager, sentMessages);
+		const command = runner.getCommand("sub-agent");
+		expect(command).toBeDefined();
+
+		await command!.handler(
+			JSON.stringify({
+				...delegateInput,
+				taskId: "task-cancelled",
+				cancellation: { state: "requested", reason: "user cancelled" },
+			}),
+			runner.createCommandContext(),
+		);
+
+		const customEntries = sessionManager.getEntries().filter((entry) => entry.type === "custom");
+		const readiness = customEntries.find((entry) => entry.customType === SUB_AGENT_READINESS_ENTRY);
+		const result = customEntries.find((entry) => entry.customType === SUB_AGENT_DELEGATION_RESULT_ENTRY);
+		expect(delegateCalls).toBe(0);
+		expect(readiness?.data).toMatchObject({
+			type: "sub_agent_task_invocation",
+			taskId: "task-cancelled",
+			cancellation: { state: "propagated", reason: "user cancelled" },
+		});
+		expect(result?.data).toMatchObject({
+			type: "sub_agent_task_result",
+			status: "cancelled",
+			error: { reason: "cancelled" },
+			resourceSummary: { childrenStarted: 0 },
+		});
+		expect(sentMessages).toHaveLength(1);
 	});
 });
 

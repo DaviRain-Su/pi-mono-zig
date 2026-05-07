@@ -20,6 +20,22 @@ export type {
 } from "./runner.js";
 export { ExtensionRunner } from "./runner.js";
 export type {
+	SubAgentDelegationCapability,
+	SubAgentDelegationHost,
+	SubAgentDelegationHostContext,
+	SubAgentDelegationInput,
+	SubAgentExtensionOptions,
+} from "./subagent-extension.js";
+export {
+	createSubAgentExtension,
+	SUB_AGENT_DELEGATION_COMMAND,
+	SUB_AGENT_DELEGATION_RESULT_ENTRY,
+	SUB_AGENT_DELEGATION_TOOL,
+	SUB_AGENT_READINESS_ENTRY,
+	SUB_AGENT_STATUS_MESSAGE,
+	subAgentDelegationInputSchema,
+} from "./subagent-extension.js";
+export type {
 	SubAgentCancellationMetadata,
 	SubAgentCancellationState,
 	SubAgentCorrelationIds,

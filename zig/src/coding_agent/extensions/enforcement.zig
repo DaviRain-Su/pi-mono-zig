@@ -578,6 +578,92 @@ test "enforcement accounting is replay-safe for repeated operation id" {
     try std.testing.expectEqual(@as(usize, 1), accounting.replay_keys_recorded);
 }
 
+test "sub-agent spawn and delegation stay separate default-deny operations with replay-safe delegate accounting" {
+    var denied_accounting = Accounting{};
+    const denied_delegate = decide(
+        test_principal,
+        .{ .approved_grants = &.{}, .resource_limits = .{ .turns = 0, .max_children = 0 } },
+        .agent_delegate,
+        .{ .id = "sub-agent-task" },
+        .call,
+        "sub-agent/delegate",
+        .{ .turns = 1, .output_bytes = 12, .output_lines = 1, .children_started = 1 },
+        &denied_accounting,
+    );
+    try std.testing.expect(denied_delegate == .deny);
+    try std.testing.expectEqual(Grant.agent_delegate, denied_delegate.deny.capability);
+    try std.testing.expectEqualStrings("grant is not approved", denied_delegate.deny.reason);
+    try std.testing.expectEqual(@as(u64, 1), denied_accounting.denied_operations);
+    try std.testing.expectEqual(@as(u64, 0), denied_accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 0), denied_accounting.turns);
+    try std.testing.expectEqual(@as(u64, 0), denied_accounting.output_bytes);
+    try std.testing.expectEqual(@as(u64, 0), denied_accounting.children_started);
+
+    var spawn_only_accounting = Accounting{};
+    const spawn_only_delegate = decide(
+        test_principal,
+        .{ .approved_grants = &.{.agent_spawn}, .resource_limits = .{ .turns = 1, .max_children = 1 } },
+        .agent_delegate,
+        .{ .id = "sub-agent-task" },
+        .call,
+        "sub-agent/delegate",
+        .{ .turns = 1, .children_started = 1 },
+        &spawn_only_accounting,
+    );
+    try std.testing.expect(spawn_only_delegate == .deny);
+    try std.testing.expectEqual(Grant.agent_delegate, spawn_only_delegate.deny.capability);
+    try std.testing.expectEqual(@as(u64, 0), spawn_only_accounting.children_started);
+
+    var delegate_only_accounting = Accounting{};
+    const delegate_only_spawn = decide(
+        test_principal,
+        .{ .approved_grants = &.{.agent_delegate}, .resource_limits = .{ .turns = 2, .max_children = 1 } },
+        .agent_spawn,
+        .{ .id = "sub-agent-task" },
+        .call,
+        "sub-agent/spawn",
+        .{ .children_started = 1 },
+        &delegate_only_accounting,
+    );
+    try std.testing.expect(delegate_only_spawn == .deny);
+    try std.testing.expectEqual(Grant.agent_spawn, delegate_only_spawn.deny.capability);
+    try std.testing.expectEqual(@as(u64, 0), delegate_only_accounting.children_started);
+
+    const allowed_delegate = decide(
+        test_principal,
+        .{ .approved_grants = &.{.agent_delegate}, .resource_limits = .{ .turns = 2, .output_bytes = 24, .output_lines = 2 } },
+        .agent_delegate,
+        .{ .id = "sub-agent-task" },
+        .call,
+        "sub-agent/delegate",
+        .{ .turns = 1, .output_bytes = 12, .output_lines = 1, .replay_key = "sub-agent-task/run-1" },
+        &delegate_only_accounting,
+    );
+    try std.testing.expect(allowed_delegate == .allow);
+    try std.testing.expect(!allowed_delegate.allow.replayed);
+    try std.testing.expectEqual(@as(u64, 1), delegate_only_accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 1), delegate_only_accounting.turns);
+    try std.testing.expectEqual(@as(u64, 12), delegate_only_accounting.output_bytes);
+    try std.testing.expectEqual(@as(u64, 1), delegate_only_accounting.output_lines);
+
+    const replayed_delegate = decide(
+        test_principal,
+        .{ .approved_grants = &.{.agent_delegate}, .resource_limits = .{ .turns = 1, .output_bytes = 12, .output_lines = 1 } },
+        .agent_delegate,
+        .{ .id = "sub-agent-task" },
+        .call,
+        "sub-agent/replay",
+        .{ .turns = 1, .output_bytes = 12, .output_lines = 1, .replay_key = "sub-agent-task/run-1" },
+        &delegate_only_accounting,
+    );
+    try std.testing.expect(replayed_delegate == .allow);
+    try std.testing.expect(replayed_delegate.allow.replayed);
+    try std.testing.expectEqual(@as(u64, 1), delegate_only_accounting.allowed_operations);
+    try std.testing.expectEqual(@as(u64, 1), delegate_only_accounting.turns);
+    try std.testing.expectEqual(@as(u64, 12), delegate_only_accounting.output_bytes);
+    try std.testing.expectEqual(@as(u64, 1), delegate_only_accounting.output_lines);
+}
+
 test "enforcement denied attempts record deterministic counter without usage accounting" {
     var accounting = Accounting{};
     const denied = decide(
