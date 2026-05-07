@@ -1090,8 +1090,18 @@ describe("neutral sub-agent delegation extension", () => {
 		expect(envelope.error).toMatchObject({
 			reason: "denied_capability",
 			details: {
+				category: "denied_capability",
 				capability: "agent.delegate",
 				operation: "agent.delegate",
+				branch: "agent.delegate",
+				phase: "call",
+				mode: "typescript/sub-agent-admission",
+				reason: "grant is not approved",
+				principal: {
+					runtimeKind: "typescript",
+					extensionId: extension.identity.key,
+				},
+				target: { id: "sub_agent.delegate" },
 				extensionIdentity: extension.identity.key,
 				runtimeKind: "typescript",
 				source: {
@@ -1101,11 +1111,18 @@ describe("neutral sub-agent delegation extension", () => {
 			},
 		});
 		expect(envelope.details).toMatchObject({
+			category: "denied_capability",
 			capability: "agent.delegate",
 			operation: "agent.delegate",
+			branch: "agent.delegate",
+			phase: "call",
+			mode: "typescript/sub-agent-admission",
+			reason: "grant is not approved",
 			replayed: false,
 			extensionIdentity: extension.identity.key,
 		});
+		expect(JSON.stringify(envelope)).not.toContain("bearer");
+		expect(JSON.stringify(envelope)).not.toContain("apiKey");
 		expect(replayEnvelope).toEqual(envelope);
 		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(2);
 		expect(
@@ -1187,7 +1204,37 @@ describe("neutral sub-agent delegation extension", () => {
 		expect(delegateCalls).toBe(1);
 		expect(deniedEnvelope).toMatchObject({
 			status: "failed",
-			error: { reason: "resource_limit_exceeded", message: "resource limit exceeded: turns" },
+			error: {
+				reason: "resource_limit_exceeded",
+				message: "resource limit exceeded: turns",
+				details: {
+					category: "resource_limit_exceeded",
+					capability: "agent.delegate",
+					operation: "agent.delegate",
+					branch: "agent.delegate",
+					phase: "call",
+					mode: "typescript/sub-agent-execution",
+					reason: "resource limit exceeded: turns",
+					principal: {
+						runtimeKind: "typescript",
+						extensionId: extension.identity.key,
+					},
+					target: { id: "sub_agent.delegate" },
+					extensionIdentity: extension.identity.key,
+					limit: "turns",
+				},
+			},
+			details: {
+				category: "resource_limit_exceeded",
+				capability: "agent.delegate",
+				operation: "agent.delegate",
+				branch: "agent.delegate",
+				phase: "call",
+				mode: "typescript/sub-agent-execution",
+				reason: "resource limit exceeded: turns",
+				extensionIdentity: extension.identity.key,
+				limit: "turns",
+			},
 			resourceSummary: { turns: 0, childrenStarted: 0 },
 		});
 	});

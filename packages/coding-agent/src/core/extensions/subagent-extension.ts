@@ -105,7 +105,7 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 			const policy = pi.getExtensionPolicy();
 			const approvedCapabilities = approvedCapabilitiesFor(policy, fallbackApprovedCapabilities);
 			const policyDetails = policyDiagnosticDetails(pi.getExtensionIdentity());
-			const invocation = buildInvocation(params, signal, policy?.resourceLimits);
+			const invocation = buildInvocation(params, signal, policy?.resourceLimits, policyDetails);
 			let replayedResult: SubAgentTaskResultEnvelope | undefined;
 			const executor: BoundedSubAgentExecutor = async (boundedInvocation, executionContext) => {
 				const delegate = options.delegate ?? defaultDelegate;
@@ -135,8 +135,13 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 								reason: "denied_capability",
 								message: "grant is not approved",
 								details: {
+									category: "denied_capability",
 									capability: "agent.delegate",
 									operation: "agent.delegate",
+									branch: "agent.delegate",
+									phase: "call",
+									mode: "typescript/sub-agent-admission",
+									reason: "grant is not approved",
 									...policyDetails,
 								},
 							},
@@ -200,11 +205,16 @@ function buildInvocation(
 	params: SubAgentDelegationInput,
 	signal: AbortSignal | undefined,
 	policyLimits: ExtensionResourceLimits | undefined,
+	policyDetails: Record<string, unknown>,
 ): SubAgentTaskInvocationEnvelope {
 	const cancellation = normalizeCancellation(params.cancellation, signal);
 	const candidate: Record<string, unknown> = {
 		...params,
 		type: "sub_agent_task_invocation",
+		metadata: {
+			...params.metadata,
+			policyDiagnostics: policyDetails,
+		},
 	};
 	const limits = narrowResourceLimits(policyLimits, params.limits);
 	if (limits !== undefined) candidate.limits = limits;
@@ -273,6 +283,13 @@ function policyDiagnosticDetails(identity: TypeScriptExtensionIdentity): Record<
 		extensionKind: identity.kind,
 		extensionDisplayName: identity.displayName,
 		runtimeKind: identity.runtimeKind,
+		principal: {
+			runtimeKind: identity.runtimeKind,
+			extensionId: identity.key,
+			extensionKind: identity.kind,
+			displayName: identity.displayName,
+		},
+		target: { id: SUB_AGENT_DELEGATION_TOOL },
 		source: sourceDiagnosticDetails(identity.sourceInfo),
 	};
 }

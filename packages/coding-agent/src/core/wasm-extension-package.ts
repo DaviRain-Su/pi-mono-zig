@@ -94,6 +94,38 @@ export interface WasmExtensionPackageValidationOptions {
 	resolveApprovedCapabilities?: (request: WasmExtensionPackagePolicyRequest) => readonly string[] | undefined;
 }
 
+export interface WasmExtensionCapabilityDenialDetails {
+	category: typeof WASM_DENIED_CAPABILITY_CATEGORY;
+	capability: string;
+	operation: string;
+	branch: string;
+	phase: "validate";
+	mode: "manifest-request";
+	reason: "grant is not approved";
+	path: string;
+	principal: {
+		runtimeKind: "wasm";
+		extensionId: string;
+		policyLookupKey: string;
+		toolId: string;
+	};
+	source: {
+		manifestPath: string;
+		packageRoot: string;
+		artifactPath: string;
+	};
+}
+
+export class WasmExtensionCapabilityDenialError extends Error {
+	readonly details: WasmExtensionCapabilityDenialDetails;
+
+	constructor(message: string, details: WasmExtensionCapabilityDenialDetails) {
+		super(message);
+		this.name = "WasmExtensionCapabilityDenialError";
+		this.details = details;
+	}
+}
+
 type JsonObject = Record<string, unknown>;
 
 function toPolicyPath(value: string): string {
@@ -110,7 +142,7 @@ export function validateWasmExtensionPackage(
 ): WasmExtensionPackageManifest {
 	const request = readWasmExtensionPackagePolicyRequest(packageRoot);
 	const approvedCapabilities = options.resolveApprovedCapabilities?.(request) ?? options.approvedCapabilities ?? [];
-	denyRequestedCapabilities(request.capabilities, approvedCapabilities);
+	denyRequestedCapabilities(request, approvedCapabilities);
 	const artifactAbsolutePath = validateArtifactPath(packageRoot, request.artifactPath);
 	const artifactSha256 = createHash("sha256").update(readFileSync(artifactAbsolutePath)).digest("hex");
 
@@ -315,15 +347,69 @@ function readToolScopes(limits: JsonObject): string[] {
 	});
 }
 
-function denyRequestedCapabilities(capabilities: string[], approvedCapabilities: readonly string[]): void {
+function denyRequestedCapabilities(
+	request: WasmExtensionPackagePolicyRequest,
+	approvedCapabilities: readonly string[],
+): void {
 	const approved = new Set(approvedCapabilities);
-	for (const [index, capability] of capabilities.entries()) {
+	for (const [index, capability] of request.capabilities.entries()) {
 		if (approved.has(capability)) {
 			continue;
 		}
-		throw new Error(
-			`$.capabilities[${index}]: ${WASM_DENIED_CAPABILITY_CATEGORY}: capability "${capability}" is not approved for manifest-request`,
-		);
+		const path = `$.capabilities[${index}]`;
+		const message = `${path}: ${WASM_DENIED_CAPABILITY_CATEGORY}: capability "${capability}" is not approved for manifest-request`;
+		throw new WasmExtensionCapabilityDenialError(message, {
+			category: WASM_DENIED_CAPABILITY_CATEGORY,
+			capability,
+			operation: capability,
+			branch: wasmCapabilityBranch(capability),
+			phase: "validate",
+			mode: "manifest-request",
+			reason: "grant is not approved",
+			path,
+			principal: {
+				runtimeKind: "wasm",
+				extensionId: request.id,
+				policyLookupKey: request.policyLookupKey,
+				toolId: request.toolId,
+			},
+			source: {
+				manifestPath: request.manifestPath,
+				packageRoot: request.packageRoot,
+				artifactPath: request.artifactPath,
+			},
+		});
+	}
+}
+
+function wasmCapabilityBranch(capability: string): string {
+	switch (capability) {
+		case "file.read":
+			return "filesystem.read";
+		case "file.write":
+			return "filesystem.write";
+		case "network.request":
+			return "network.request";
+		case "shell.run":
+			return "shell.process";
+		case "env.read":
+			return "environment.variable";
+		case "model.call":
+			return "model.call";
+		case "session.read":
+			return "session.read";
+		case "session.write":
+			return "session.write";
+		case "ui.notify":
+			return "ui.notification";
+		case "tool.use":
+			return "tool.execution";
+		case "agent.spawn":
+			return "agent.spawn";
+		case "agent.delegate":
+			return "agent.delegate";
+		default:
+			return capability;
 	}
 }
 

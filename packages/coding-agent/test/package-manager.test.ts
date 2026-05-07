@@ -9,7 +9,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createWasmExtensionManifestPolicyKey } from "../src/core/extension-policy.js";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
-import { WASM_CANONICAL_SECURITY_GRANTS } from "../src/core/wasm-extension-package.js";
+import {
+	WASM_CANONICAL_SECURITY_GRANTS,
+	WasmExtensionCapabilityDenialError,
+} from "../src/core/wasm-extension-package.js";
 import { shouldUseWindowsShell } from "../src/utils/child-process.js";
 
 function normalizeForMatch(value: string): string {
@@ -527,8 +530,30 @@ Content`,
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
 
-			await expect(packageManager.installAndPersist(deniedCapabilityPackage)).rejects.toThrow(
-				'$.capabilities[0]: denied_capability: capability "file.read" is not approved for manifest-request',
+			await expect(packageManager.installAndPersist(deniedCapabilityPackage)).rejects.toMatchObject({
+				message:
+					'$.capabilities[0]: denied_capability: capability "file.read" is not approved for manifest-request',
+				details: {
+					category: "denied_capability",
+					capability: "file.read",
+					operation: "file.read",
+					branch: "filesystem.read",
+					phase: "validate",
+					mode: "manifest-request",
+					reason: "grant is not approved",
+					path: "$.capabilities[0]",
+					principal: {
+						runtimeKind: "wasm",
+						extensionId: "com.example.local-wasm",
+						toolId: "fixture.echo",
+					},
+					source: {
+						artifactPath: "wasm/missing.wasm",
+					},
+				},
+			});
+			await expect(packageManager.installAndPersist(deniedCapabilityPackage)).rejects.toBeInstanceOf(
+				WasmExtensionCapabilityDenialError,
 			);
 			expect(events.some((event) => event.type === "complete")).toBe(false);
 			expect(settingsManager.getGlobalSettings().packages ?? []).toHaveLength(0);

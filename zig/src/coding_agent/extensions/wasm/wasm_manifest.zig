@@ -209,10 +209,16 @@ pub const Diagnostic = struct {
     phase: LifecyclePhase,
     path: []u8,
     capability: ?Capability = null,
+    operation: ?Capability = null,
+    branch: ?CapabilityEnforcementBranch = null,
+    mode: ?[]u8 = null,
+    reason: ?[]u8 = null,
     message: []u8,
 
     pub fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
+        if (self.mode) |mode| allocator.free(mode);
+        if (self.reason) |reason| allocator.free(reason);
         allocator.free(self.message);
         self.* = undefined;
     }
@@ -499,12 +505,24 @@ fn invalidCapabilityDenial(
     defer allocator.free(message);
     const diagnostics = try allocator.alloc(Diagnostic, 1);
     errdefer allocator.free(diagnostics);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const owned_mode = try allocator.dupe(u8, denial.mode);
+    errdefer allocator.free(owned_mode);
+    const owned_reason = try allocator.dupe(u8, "grant is not approved");
+    errdefer allocator.free(owned_reason);
+    const owned_message = try allocator.dupe(u8, message);
+    errdefer allocator.free(owned_message);
     diagnostics[0] = .{
         .category = denial.category,
         .phase = denial.phase,
-        .path = try allocator.dupe(u8, path),
+        .path = owned_path,
         .capability = denial.capability,
-        .message = try allocator.dupe(u8, message),
+        .operation = denial.capability,
+        .branch = denial.branch,
+        .mode = owned_mode,
+        .reason = owned_reason,
+        .message = owned_message,
     };
     return .{ .invalid = diagnostics };
 }
@@ -845,6 +863,10 @@ fn expectDeniedCapability(
     try std.testing.expectEqual(expected_phase, diagnostics[0].phase);
     try std.testing.expectEqualStrings(expected_path, diagnostics[0].path);
     try std.testing.expectEqual(expected_capability, diagnostics[0].capability.?);
+    try std.testing.expectEqual(expected_capability, diagnostics[0].operation.?);
+    try std.testing.expectEqual(expected_capability.enforcementBranch(), diagnostics[0].branch.?);
+    try std.testing.expectEqualStrings("manifest-request", diagnostics[0].mode.?);
+    try std.testing.expectEqualStrings("grant is not approved", diagnostics[0].reason.?);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message, expected_capability.jsonName()) != null);
 }
 

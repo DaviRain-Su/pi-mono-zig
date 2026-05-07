@@ -576,6 +576,11 @@ function buildFailedResult(
 	},
 ): SubAgentTaskResultEnvelope {
 	const timestamp = now();
+	const auditDetails = auditDetailsFromInvocation(invocation, options.reason, options.message);
+	const details = {
+		...auditDetails,
+		...options.details,
+	};
 	return validateSubAgentTaskResultEnvelope({
 		...correlationFromInvocation(invocation),
 		type: "sub_agent_task_result",
@@ -585,16 +590,36 @@ function buildFailedResult(
 		error: {
 			reason: options.reason,
 			message: options.message,
-			details: options.details,
+			details,
 		},
 		details: {
-			capability: "agent.delegate",
-			operation: "agent.delegate",
+			...details,
 			replayed: false,
-			...options.details,
 		},
 		resourceSummary: options.resourceSummary,
 	});
+}
+
+function auditDetailsFromInvocation(
+	invocation: SubAgentTaskInvocationEnvelope,
+	category: string,
+	reason: string,
+): Record<string, unknown> {
+	const policyDiagnostics =
+		invocation.metadata?.policyDiagnostics !== null && typeof invocation.metadata?.policyDiagnostics === "object"
+			? (invocation.metadata.policyDiagnostics as Record<string, unknown>)
+			: {};
+	return {
+		category,
+		capability: "agent.delegate",
+		operation: "agent.delegate",
+		branch: "agent.delegate",
+		phase: "call",
+		mode: "typescript/sub-agent-execution",
+		reason,
+		target: { id: "sub_agent.delegate" },
+		...policyDiagnostics,
+	};
 }
 
 function summaryFromRuntime(
