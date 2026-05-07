@@ -408,6 +408,14 @@ describe("sub-agent readiness envelope validation", () => {
 				},
 			}),
 		).toThrow("$.resourceSummary.limitDetails.outputBytes.limit: expected non-negative number");
+		expect(() =>
+			validateSubAgentTaskResultEnvelope({
+				...result,
+				resourceSummary: {
+					limitDetails: { outputBytes: { limit: 4096, actual: 5000 } },
+				},
+			}),
+		).toThrow("$.resourceSummary.limitDetails.outputBytes.truncated: missing required field");
 	});
 
 	it("persists readiness records as replay-only session data outside LLM context", () => {
@@ -443,11 +451,14 @@ describe("sub-agent readiness envelope validation", () => {
 			const readinessEntry = reopened.getEntry(readinessId);
 			expect(readinessEntry?.type).toBe("custom");
 			if (readinessEntry?.type !== "custom") throw new Error("missing readiness custom entry");
+			expect(readinessEntry.id).toBe(readinessId);
 			expect(readinessEntry.customType).toBe("sub_agent.readiness");
 			expect(readinessEntry.parentId).toBe(userId);
+			expect(readinessEntry.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 			expect(readinessEntry.data).toMatchObject({
 				type: "sub_agent_task_invocation",
 				taskId: "task-opaque",
+				parentSessionId: "parent-session",
 				parentRunId: "parent-run",
 				cancellation: { state: "pending" },
 			});

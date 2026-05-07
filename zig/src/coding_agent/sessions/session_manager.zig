@@ -3250,7 +3250,7 @@ test "session manager replays sub-agent readiness records as data only" {
 
     const readiness_data = try parseJsonTestValue(
         std.testing.allocator,
-        "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"parentRunId\":\"parent-run\",\"input\":{\"text\":\"summarize\"},\"limits\":{\"maxChildren\":0,\"depth\":1,\"turns\":3,\"timeoutMs\":2500,\"outputBytes\":4096,\"outputLines\":80,\"toolScopes\":[\"read-only\"]},\"cancellation\":{\"signalId\":\"cancel-1\",\"state\":\"pending\",\"parentRunId\":\"parent-run\",\"parentTaskId\":\"parent-task\"}}",
+        "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent-opaque\",\"runId\":\"run-opaque\",\"taskId\":\"task-opaque\",\"sessionId\":\"session-opaque\",\"parentRunId\":\"parent-run\",\"parentSessionId\":\"parent-session\",\"input\":{\"text\":\"summarize\"},\"limits\":{\"maxChildren\":0,\"depth\":1,\"turns\":3,\"timeoutMs\":2500,\"outputBytes\":4096,\"outputLines\":80,\"toolScopes\":[\"read-only\"]},\"cancellation\":{\"signalId\":\"cancel-1\",\"state\":\"pending\",\"parentRunId\":\"parent-run\",\"parentTaskId\":\"parent-task\"}}",
     );
     defer common.deinitJsonValue(std.testing.allocator, readiness_data);
     const readiness_id = try manager.appendCustomEntry("sub_agent.readiness", readiness_data);
@@ -3284,12 +3284,15 @@ test "session manager replays sub-agent readiness records as data only" {
     const readiness_entry = reopened.getEntry(readiness_id);
     try std.testing.expect(readiness_entry != null);
     try std.testing.expect(readiness_entry.?.* == .custom);
+    try std.testing.expectEqualStrings(readiness_id, readiness_entry.?.custom.id);
     try std.testing.expectEqualStrings("sub_agent.readiness", readiness_entry.?.custom.custom_type);
     try std.testing.expectEqualStrings(user_id, readiness_entry.?.custom.parent_id.?);
+    try std.testing.expect(readiness_entry.?.custom.timestamp.len > 0);
     try std.testing.expect(readiness_entry.?.custom.data != null);
     const data_object = readiness_entry.?.custom.data.?.object;
     try std.testing.expectEqualStrings("sub_agent_task_invocation", data_object.get("type").?.string);
     try std.testing.expectEqualStrings("task-opaque", data_object.get("taskId").?.string);
+    try std.testing.expectEqualStrings("parent-session", data_object.get("parentSessionId").?.string);
     try std.testing.expectEqualStrings("parent-run", data_object.get("parentRunId").?.string);
     try std.testing.expectEqualStrings("pending", data_object.get("cancellation").?.object.get("state").?.string);
 

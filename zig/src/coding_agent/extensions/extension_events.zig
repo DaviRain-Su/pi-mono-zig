@@ -651,7 +651,7 @@ fn limitDetailObjectDiagnostic(allocator: std.mem.Allocator, object: std.json.Ob
     }
     if (try requiredNonNegativeNumberDiagnostic(allocator, object, parent_path, "limit")) |diagnostic| return diagnostic;
     if (try optionalNonNegativeNumberDiagnostic(allocator, object, parent_path, "actual")) |diagnostic| return diagnostic;
-    if (try optionalBooleanDiagnostic(allocator, object, parent_path, "truncated")) |diagnostic| return diagnostic;
+    if (try requiredBooleanDiagnostic(allocator, object, parent_path, "truncated")) |diagnostic| return diagnostic;
     if (try optionalStringDiagnostic(allocator, object, parent_path, "reason")) |diagnostic| return diagnostic;
     return null;
 }
@@ -715,8 +715,12 @@ fn nonNegativeNumberValueDiagnostic(allocator: std.mem.Allocator, value: std.jso
     return (try invalidReadiness(allocator, path, "expected non-negative number")).invalid;
 }
 
-fn optionalBooleanDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
-    const value = object.get(field) orelse return null;
+fn requiredBooleanDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8, field: []const u8) !?SubAgentReadinessDiagnostic {
+    const value = object.get(field) orelse {
+        const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ parent_path, field });
+        defer allocator.free(path);
+        return (try invalidReadiness(allocator, path, "missing required field")).invalid;
+    };
     switch (value) {
         .bool => return null,
         else => {},
@@ -2006,6 +2010,11 @@ test "sub-agent readiness envelope validation rejects missing ids product fields
             .json = "{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"status\":\"completed\",\"startedAt\":1,\"completedAt\":2,\"resourceSummary\":{\"limitDetails\":{\"outputBytes\":{\"limit\":-1}}}}",
             .path = "$.resourceSummary.limitDetails.outputBytes.limit",
             .message = "expected non-negative number",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"status\":\"completed\",\"startedAt\":1,\"completedAt\":2,\"resourceSummary\":{\"limitDetails\":{\"outputBytes\":{\"limit\":4096,\"actual\":5000}}}}",
+            .path = "$.resourceSummary.limitDetails.outputBytes.truncated",
+            .message = "missing required field",
         },
     };
 

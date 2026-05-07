@@ -46,7 +46,7 @@ export type SubAgentNumericResourceLimit =
 export interface SubAgentResourceLimitDetail {
 	limit: number;
 	actual?: number;
-	truncated?: boolean;
+	truncated: boolean;
 	reason?: string;
 }
 
@@ -278,7 +278,7 @@ function validateLimitDetail(object: JsonObject, field: SubAgentNumericResourceL
 	}
 	nonNegativeNumber(object, path, "limit", true);
 	nonNegativeNumber(object, path, "actual", false);
-	optionalBoolean(object, path, "truncated");
+	requiredBoolean(object, path, "truncated");
 	const reason = optionalString(object, path, "reason");
 	if (reason !== undefined && reason.length === 0) throw new Error(`${path}.reason: must not be empty`);
 }
@@ -342,9 +342,8 @@ function optionalString(object: JsonObject, parentPath: string, field: string): 
 	return value;
 }
 
-function optionalBoolean(object: JsonObject, parentPath: string, field: string): boolean | undefined {
-	const value = object[field];
-	if (value === undefined) return undefined;
+function requiredBoolean(object: JsonObject, parentPath: string, field: string): boolean {
+	const value = requiredValue(object, parentPath, field);
 	if (typeof value !== "boolean") throw new Error(`${parentPath}.${field}: expected boolean`);
 	return value;
 }
