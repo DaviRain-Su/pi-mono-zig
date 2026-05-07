@@ -13,11 +13,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import type { ExtensionFactory } from "../src/core/extensions/index.js";
+import { createSubAgentExtension, SUB_AGENT_STATUS_MESSAGE } from "../src/core/extensions/subagent-extension.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.js";
-import { createTestResourceLoader } from "./utilities.js";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
@@ -93,10 +95,16 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): {
+async function createRuntimeHost(options: {
+	withAuth: boolean;
+	responseDelayMs: number;
+	model?: Model<any>;
+	extensionFactories?: ExtensionFactory[];
+	onProviderCall?: () => void;
+}): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
-} {
+}> {
 	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
@@ -113,6 +121,7 @@ function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number
 			tools: [],
 		},
 		streamFn: (_model, _context, _options) => {
+			options.onProviderCall?.();
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: createAssistantMessage("") });
@@ -132,13 +141,16 @@ function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 	}
 
+	const extensionsResult = options.extensionFactories
+		? await createTestExtensionsResult(options.extensionFactories, tempDir)
+		: undefined;
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
 		cwd: tempDir,
 		modelRegistry,
-		resourceLoader: createTestResourceLoader(),
+		resourceLoader: createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined),
 	});
 
 	const runtimeHost = {
@@ -168,18 +180,25 @@ function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number
 	};
 }
 
-async function startRpcMode(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
+async function startRpcMode(options: {
+	withAuth: boolean;
+	responseDelayMs: number;
+	model?: Model<any>;
+	extensionFactories?: ExtensionFactory[];
+	onProviderCall?: () => void;
+}): Promise<{
 	lineHandler: (line: string) => void;
 	cleanup: () => Promise<void>;
+	runtimeHost: AgentSessionRuntime;
 }> {
 	rpcIo.outputLines = [];
 	rpcIo.lineHandler = undefined;
 
-	const { runtimeHost, cleanup } = createRuntimeHost(options);
+	const { runtimeHost, cleanup } = await createRuntimeHost(options);
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
 
-	return { lineHandler: rpcIo.lineHandler!, cleanup };
+	return { lineHandler: rpcIo.lineHandler!, cleanup, runtimeHost };
 }
 
 describe("RPC prompt response semantics", () => {
@@ -243,6 +262,145 @@ describe("RPC prompt response semantics", () => {
 					success: true,
 				});
 			});
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("exposes the neutral sub-agent command and executes it via RPC prompt without a provider turn", async () => {
+		let delegateCalls = 0;
+		let providerCalls = 0;
+		const payload = {
+			agentId: "agent-rpc",
+			runId: "run-rpc",
+			taskId: "task-rpc",
+			sessionId: "session-rpc",
+			parentAgentId: "parent-rpc",
+			route: "rpc-route",
+			input: { prompt: "delegate from rpc" },
+			limits: { maxChildren: 1, depth: 1, turns: 1, outputBytes: 256, outputLines: 5 },
+		};
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			onProviderCall: () => {
+				providerCalls++;
+			},
+			extensionFactories: [
+				createSubAgentExtension({
+					approvedCapabilities: ["agent.delegate"],
+					delegate: (invocation) => {
+						delegateCalls++;
+						return {
+							type: "sub_agent_task_result",
+							agentId: invocation.agentId,
+							runId: invocation.runId,
+							taskId: invocation.taskId,
+							sessionId: invocation.sessionId,
+							parentAgentId: invocation.parentAgentId,
+							status: "completed",
+							content: [{ type: "text", text: "rpc delegated" }],
+							startedAt: 10,
+							completedAt: 20,
+							resourceSummary: {
+								turns: 1,
+								outputBytes: 13,
+								outputLines: 1,
+								childrenStarted: 1,
+							},
+						};
+					},
+				}),
+			],
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "commands", type: "get_commands" }));
+			await vi.waitFor(() => {
+				const commandResponse = parseOutputLines(rpcIo.outputLines).find(
+					(record) => record.id === "commands" && record.type === "response" && record.command === "get_commands",
+				);
+				expect(commandResponse).toBeDefined();
+				const commands = (commandResponse?.data as { commands?: Array<{ name: string; description?: string }> })
+					.commands;
+				const subAgentCommand = commands?.find((command) => command.name === "sub-agent");
+				expect(subAgentCommand).toBeDefined();
+				expect(JSON.stringify(subAgentCommand)).not.toMatch(/Workflow|Wiki|QA|Review|preset/i);
+			});
+
+			rpcIo.outputLines = [];
+			lineHandler(
+				JSON.stringify({
+					id: "sub-agent-prompt",
+					type: "prompt",
+					message: `/sub-agent ${JSON.stringify(payload)}`,
+				}),
+			);
+
+			await vi.waitFor(() => {
+				const responses = getPromptResponses(rpcIo.outputLines, "sub-agent-prompt");
+				expect(responses).toHaveLength(1);
+				expect(responses[0]).toMatchObject({ success: true });
+
+				const records = parseOutputLines(rpcIo.outputLines);
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						type: "message_end",
+						message: expect.objectContaining({
+							role: "custom",
+							customType: SUB_AGENT_STATUS_MESSAGE,
+							content: "completed",
+							details: expect.objectContaining({
+								type: "sub_agent_task_result",
+								taskId: "task-rpc",
+								status: "completed",
+							}),
+						}),
+					}),
+				);
+			});
+
+			expect(delegateCalls).toBe(1);
+			expect(providerCalls).toBe(0);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("surfaces invalid sub-agent RPC prompt payloads before delegation or status side effects", async () => {
+		let delegateCalls = 0;
+		const { lineHandler, cleanup, runtimeHost } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				createSubAgentExtension({
+					approvedCapabilities: ["agent.delegate"],
+					delegate: () => {
+						delegateCalls++;
+						throw new Error("invalid RPC command payload must not delegate");
+					},
+				}),
+			],
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "invalid-sub-agent", type: "prompt", message: "/sub-agent {not-json" }));
+
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "invalid-sub-agent")).toHaveLength(1);
+				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual(
+					expect.objectContaining({
+						type: "extension_error",
+						extensionPath: "command:sub-agent",
+						event: "command",
+						error: expect.any(String),
+					}),
+				);
+			});
+
+			expect(delegateCalls).toBe(0);
+			expect(runtimeHost.session.sessionManager.getEntries()).toHaveLength(0);
+			expect(JSON.stringify(parseOutputLines(rpcIo.outputLines))).not.toContain(SUB_AGENT_STATUS_MESSAGE);
 		} finally {
 			await cleanup();
 		}

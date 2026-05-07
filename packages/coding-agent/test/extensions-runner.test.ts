@@ -1489,6 +1489,64 @@ describe("neutral sub-agent delegation extension", () => {
 		});
 	});
 
+	it("rejects invalid tool and command payloads before persistence, status messages, or delegation", async () => {
+		let delegateCalls = 0;
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				approvedCapabilities: ["agent.delegate"],
+				delegate: async () => {
+					delegateCalls++;
+					throw new Error("invalid payload must not delegate");
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<sub-agent-extension>",
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		const sentMessages: unknown[] = [];
+		bindRunnerCore(runner, sessionManager, sentMessages);
+		const tool = runner.getToolDefinition("sub_agent.delegate");
+		const command = runner.getCommand("sub-agent");
+		expect(tool).toBeDefined();
+		expect(command).toBeDefined();
+
+		await expect(
+			tool!.execute(
+				"tool-call-invalid-missing-agent",
+				{ ...delegateInput, agentId: "" },
+				undefined,
+				undefined,
+				runner.createContext(),
+			),
+		).rejects.toThrow("$.agentId: must not be empty");
+		await expect(
+			tool!.execute(
+				"tool-call-invalid-product-field",
+				{ ...delegateInput, ui: { preset: "workflow" } } as SubAgentDelegationInput,
+				undefined,
+				undefined,
+				runner.createContext(),
+			),
+		).rejects.toThrow("$.ui: product UX/spawn policy is not allowed");
+		await expect(command!.handler("{not-json", runner.createCommandContext())).rejects.toThrow();
+		await expect(
+			command!.handler(JSON.stringify({ ...delegateInput, taskId: "" }), runner.createCommandContext()),
+		).rejects.toThrow("$.taskId: must not be empty");
+		await expect(
+			command!.handler(
+				JSON.stringify({ ...delegateInput, spawnPolicy: { automatic: true } }),
+				runner.createCommandContext(),
+			),
+		).rejects.toThrow("$.spawnPolicy: product UX/spawn policy is not allowed");
+
+		expect(delegateCalls).toBe(0);
+		expect(sentMessages).toHaveLength(0);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(0);
+	});
+
 	it("replays denied limit and cancellation results without child side effects", async () => {
 		let delegateCalls = 0;
 		const runtime = createExtensionRuntime();
