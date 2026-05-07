@@ -25,6 +25,13 @@ export interface ExtensionPolicy {
 	resourceLimits?: ExtensionResourceLimits;
 }
 
+export type ExtensionPolicyMap = Record<string, ExtensionPolicy>;
+
+export interface ExtensionPolicyMapValidationResult {
+	policies: ExtensionPolicyMap;
+	errors: Error[];
+}
+
 export type ExtensionPolicyRuntimeKind = "typescript" | "wasm" | "native" | "process_jsonl";
 
 interface ExtensionIdentityBase {
@@ -95,6 +102,7 @@ const RESOURCE_LIMIT_FIELDS = new Set([
 	"outputLines",
 	"toolScopes",
 ]);
+const POLICY_FIELDS = new Set(["approvedGrants", "resourceLimits"]);
 
 function toPolicyPath(value: string): string {
 	return value.split(sep).join("/");
@@ -241,6 +249,11 @@ export function validateExtensionPolicyShape(value: unknown, path = "$"): Extens
 		throw new Error(`${path}: expected object`);
 	}
 	const object = value as Record<string, unknown>;
+	for (const key of Object.keys(object)) {
+		if (!POLICY_FIELDS.has(key)) {
+			throw new Error(`${path}.${key}: unsupported policy field`);
+		}
+	}
 	const policy: ExtensionPolicy = {};
 
 	if (Object.hasOwn(object, "approvedGrants")) {
@@ -266,6 +279,76 @@ export function validateExtensionPolicyShape(value: unknown, path = "$"): Extens
 	return policy;
 }
 
+export function validateExtensionPolicyMap(value: unknown, path = "$"): ExtensionPolicyMapValidationResult {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`${path}: expected object`);
+	}
+
+	const policies: ExtensionPolicyMap = {};
+	const errors: Error[] = [];
+	for (const [identity, policyValue] of Object.entries(value as Record<string, unknown>)) {
+		const policyPath = `${path}[${JSON.stringify(identity)}]`;
+		if (identity.length === 0) {
+			errors.push(new Error(`${policyPath}: extension identity must not be empty`));
+			continue;
+		}
+		try {
+			policies[identity] = validateExtensionPolicyShape(policyValue, policyPath);
+		} catch (error) {
+			errors.push(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
+
+	return { policies, errors };
+}
+
+export function mergeExtensionPolicy(base: ExtensionPolicy | undefined, override: ExtensionPolicy): ExtensionPolicy {
+	const merged: ExtensionPolicy = {};
+	if (base?.approvedGrants !== undefined) {
+		merged.approvedGrants = [...base.approvedGrants];
+	}
+	if (base?.resourceLimits !== undefined) {
+		merged.resourceLimits = { ...base.resourceLimits };
+		if (base.resourceLimits.toolScopes !== undefined) {
+			merged.resourceLimits.toolScopes = [...base.resourceLimits.toolScopes];
+		}
+	}
+
+	if (override.approvedGrants !== undefined) {
+		merged.approvedGrants = [...override.approvedGrants];
+	}
+	if (override.resourceLimits !== undefined) {
+		merged.resourceLimits = {
+			...(merged.resourceLimits ?? {}),
+			...override.resourceLimits,
+			toolScopes:
+				override.resourceLimits.toolScopes !== undefined
+					? [...override.resourceLimits.toolScopes]
+					: merged.resourceLimits?.toolScopes,
+		};
+	}
+
+	return merged;
+}
+
+export function mergeExtensionPolicyMaps(
+	base: ExtensionPolicyMap | undefined,
+	overrides: ExtensionPolicyMap | undefined,
+): ExtensionPolicyMap | undefined {
+	if (!base && !overrides) {
+		return undefined;
+	}
+
+	const merged: ExtensionPolicyMap = {};
+	for (const [identity, policy] of Object.entries(base ?? {})) {
+		merged[identity] = mergeExtensionPolicy(undefined, policy);
+	}
+	for (const [identity, policy] of Object.entries(overrides ?? {})) {
+		merged[identity] = mergeExtensionPolicy(merged[identity], policy);
+	}
+	return merged;
+}
+
 function validateResourceLimits(value: unknown, path: string): ExtensionResourceLimits {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
 		throw new Error(`${path}: expected object`);
@@ -276,15 +359,30 @@ function validateResourceLimits(value: unknown, path: string): ExtensionResource
 			throw new Error(`${path}.${key}: unsupported resource limit`);
 		}
 	}
-	return {
-		maxChildren: optionalResourceLimitInteger(object, path, "maxChildren"),
-		depth: optionalResourceLimitInteger(object, path, "depth"),
-		turns: optionalResourceLimitInteger(object, path, "turns"),
-		timeoutMs: optionalResourceLimitInteger(object, path, "timeoutMs"),
-		outputBytes: optionalResourceLimitInteger(object, path, "outputBytes"),
-		outputLines: optionalResourceLimitInteger(object, path, "outputLines"),
-		toolScopes: optionalToolScopes(object, path),
-	};
+	const limits: ExtensionResourceLimits = {};
+	setResourceLimitInteger(limits, object, path, "maxChildren");
+	setResourceLimitInteger(limits, object, path, "depth");
+	setResourceLimitInteger(limits, object, path, "turns");
+	setResourceLimitInteger(limits, object, path, "timeoutMs");
+	setResourceLimitInteger(limits, object, path, "outputBytes");
+	setResourceLimitInteger(limits, object, path, "outputLines");
+	const toolScopes = optionalToolScopes(object, path);
+	if (toolScopes !== undefined) {
+		limits.toolScopes = toolScopes;
+	}
+	return limits;
+}
+
+function setResourceLimitInteger(
+	limits: ExtensionResourceLimits,
+	object: Record<string, unknown>,
+	path: string,
+	field: keyof Omit<ExtensionResourceLimits, "toolScopes">,
+): void {
+	const value = optionalResourceLimitInteger(object, path, field);
+	if (value !== undefined) {
+		limits[field] = value;
+	}
 }
 
 function optionalResourceLimitInteger(

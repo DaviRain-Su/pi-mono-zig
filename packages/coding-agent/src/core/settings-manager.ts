@@ -4,6 +4,13 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import {
+	type ExtensionPolicy,
+	type ExtensionPolicyMap,
+	mergeExtensionPolicyMaps,
+	validateExtensionPolicyMap,
+	validateExtensionPolicyShape,
+} from "./extension-policy.js";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -110,6 +117,7 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+	extensionPolicies?: ExtensionPolicyMap; // Approved extension grants and resource limits keyed by canonical identity
 }
 
 /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
@@ -121,6 +129,11 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 		const baseValue = base[key];
 
 		if (overrideValue === undefined) {
+			continue;
+		}
+
+		if (key === "extensionPolicies") {
+			result.extensionPolicies = mergeExtensionPolicyMaps(base.extensionPolicies, overrides.extensionPolicies);
 			continue;
 		}
 
@@ -152,6 +165,12 @@ export interface SettingsStorage {
 export interface SettingsError {
 	scope: SettingsScope;
 	error: Error;
+}
+
+interface SettingsLoadResult {
+	settings: Settings;
+	fatalError: Error | null;
+	errors: Error[];
 }
 
 export class FileSettingsStorage implements SettingsStorage {
@@ -280,19 +299,19 @@ export class SettingsManager {
 		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
 		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project");
 		const initialErrors: SettingsError[] = [];
-		if (globalLoad.error) {
-			initialErrors.push({ scope: "global", error: globalLoad.error });
+		for (const error of globalLoad.errors) {
+			initialErrors.push({ scope: "global", error });
 		}
-		if (projectLoad.error) {
-			initialErrors.push({ scope: "project", error: projectLoad.error });
+		for (const error of projectLoad.errors) {
+			initialErrors.push({ scope: "project", error });
 		}
 
 		return new SettingsManager(
 			storage,
 			globalLoad.settings,
 			projectLoad.settings,
-			globalLoad.error,
-			projectLoad.error,
+			globalLoad.errors[0] ?? null,
+			projectLoad.errors[0] ?? null,
 			initialErrors,
 		);
 	}
@@ -305,7 +324,7 @@ export class SettingsManager {
 		return SettingsManager.fromStorage(storage);
 	}
 
-	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope): Settings {
+	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope): SettingsLoadResult {
 		let content: string | undefined;
 		storage.withLock(scope, (current) => {
 			content = current;
@@ -313,25 +332,24 @@ export class SettingsManager {
 		});
 
 		if (!content) {
-			return {};
+			return { settings: {}, fatalError: null, errors: [] };
 		}
-		const settings = JSON.parse(content);
-		return SettingsManager.migrateSettings(settings);
+		const settings = JSON.parse(content) as Record<string, unknown>;
+		const errors: Error[] = [];
+		return { settings: SettingsManager.migrateSettings(settings, errors), fatalError: null, errors };
 	}
 
-	private static tryLoadFromStorage(
-		storage: SettingsStorage,
-		scope: SettingsScope,
-	): { settings: Settings; error: Error | null } {
+	private static tryLoadFromStorage(storage: SettingsStorage, scope: SettingsScope): SettingsLoadResult {
 		try {
-			return { settings: SettingsManager.loadFromStorage(storage, scope), error: null };
+			return SettingsManager.loadFromStorage(storage, scope);
 		} catch (error) {
-			return { settings: {}, error: error as Error };
+			const loadError = error instanceof Error ? error : new Error(String(error));
+			return { settings: {}, fatalError: loadError, errors: [loadError] };
 		}
 	}
 
 	/** Migrate old settings format to new format */
-	private static migrateSettings(settings: Record<string, unknown>): Settings {
+	private static migrateSettings(settings: Record<string, unknown>, errors: Error[] = []): Settings {
 		// Migrate queueMode -> steeringMode
 		if ("queueMode" in settings && !("steeringMode" in settings)) {
 			settings.steeringMode = settings.queueMode;
@@ -389,7 +407,24 @@ export class SettingsManager {
 			delete retrySettings.maxDelayMs;
 		}
 
+		SettingsManager.validateExtensionPoliciesSetting(settings, errors);
+
 		return settings as Settings;
+	}
+
+	private static validateExtensionPoliciesSetting(settings: Record<string, unknown>, errors: Error[]): void {
+		if (!Object.hasOwn(settings, "extensionPolicies")) {
+			return;
+		}
+
+		try {
+			const result = validateExtensionPolicyMap(settings.extensionPolicies, "$.extensionPolicies");
+			settings.extensionPolicies = result.policies;
+			errors.push(...result.errors);
+		} catch (error) {
+			errors.push(error instanceof Error ? error : new Error(String(error)));
+			delete settings.extensionPolicies;
+		}
 	}
 
 	getGlobalSettings(): Settings {
@@ -403,12 +438,15 @@ export class SettingsManager {
 	async reload(): Promise<void> {
 		await this.writeQueue;
 		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
-		if (!globalLoad.error) {
+		if (!globalLoad.fatalError) {
 			this.globalSettings = globalLoad.settings;
-			this.globalSettingsLoadError = null;
+			this.globalSettingsLoadError = globalLoad.errors[0] ?? null;
+			for (const error of globalLoad.errors) {
+				this.recordError("global", error);
+			}
 		} else {
-			this.globalSettingsLoadError = globalLoad.error;
-			this.recordError("global", globalLoad.error);
+			this.globalSettingsLoadError = globalLoad.fatalError;
+			this.recordError("global", globalLoad.fatalError);
 		}
 
 		this.modifiedFields.clear();
@@ -417,12 +455,15 @@ export class SettingsManager {
 		this.modifiedProjectNestedFields.clear();
 
 		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project");
-		if (!projectLoad.error) {
+		if (!projectLoad.fatalError) {
 			this.projectSettings = projectLoad.settings;
-			this.projectSettingsLoadError = null;
+			this.projectSettingsLoadError = projectLoad.errors[0] ?? null;
+			for (const error of projectLoad.errors) {
+				this.recordError("project", error);
+			}
 		} else {
-			this.projectSettingsLoadError = projectLoad.error;
-			this.recordError("project", projectLoad.error);
+			this.projectSettingsLoadError = projectLoad.fatalError;
+			this.recordError("project", projectLoad.fatalError);
 		}
 
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
@@ -497,9 +538,7 @@ export class SettingsManager {
 		modifiedNestedFields: Map<keyof Settings, Set<string>>,
 	): void {
 		this.storage.withLock(scope, (current) => {
-			const currentFileSettings = current
-				? SettingsManager.migrateSettings(JSON.parse(current) as Record<string, unknown>)
-				: {};
+			const currentFileSettings = current ? SettingsManager.parseCurrentSettingsForWrite(current) : {};
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
@@ -519,6 +558,15 @@ export class SettingsManager {
 
 			return JSON.stringify(mergedSettings, null, 2);
 		});
+	}
+
+	private static parseCurrentSettingsForWrite(current: string): Settings {
+		const errors: Error[] = [];
+		const settings = SettingsManager.migrateSettings(JSON.parse(current) as Record<string, unknown>, errors);
+		if (errors.length > 0) {
+			throw errors[0];
+		}
+		return settings;
 	}
 
 	private save(): void {
@@ -1063,5 +1111,50 @@ export class SettingsManager {
 		this.globalSettings.warnings = { ...warnings };
 		this.markModified("warnings");
 		this.save();
+	}
+
+	getExtensionPolicies(): ExtensionPolicyMap {
+		return structuredClone(this.settings.extensionPolicies ?? {});
+	}
+
+	getExtensionPolicy(identityKey: string): ExtensionPolicy | undefined {
+		const policy = this.settings.extensionPolicies?.[identityKey];
+		return policy ? structuredClone(policy) : undefined;
+	}
+
+	setExtensionPolicy(identityKey: string, policy: ExtensionPolicy): void {
+		this.validateExtensionPolicyIdentity(identityKey);
+		const normalizedPolicy = validateExtensionPolicyShape(
+			policy,
+			`$.extensionPolicies[${JSON.stringify(identityKey)}]`,
+		);
+		if (!this.globalSettings.extensionPolicies) {
+			this.globalSettings.extensionPolicies = {};
+		}
+		this.globalSettings.extensionPolicies[identityKey] = normalizedPolicy;
+		this.markModified("extensionPolicies", identityKey);
+		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.save();
+	}
+
+	setProjectExtensionPolicy(identityKey: string, policy: ExtensionPolicy): void {
+		this.validateExtensionPolicyIdentity(identityKey);
+		const normalizedPolicy = validateExtensionPolicyShape(
+			policy,
+			`$.extensionPolicies[${JSON.stringify(identityKey)}]`,
+		);
+		const projectSettings = structuredClone(this.projectSettings);
+		if (!projectSettings.extensionPolicies) {
+			projectSettings.extensionPolicies = {};
+		}
+		projectSettings.extensionPolicies[identityKey] = normalizedPolicy;
+		this.markProjectModified("extensionPolicies", identityKey);
+		this.saveProjectSettings(projectSettings);
+	}
+
+	private validateExtensionPolicyIdentity(identityKey: string): void {
+		if (identityKey.length === 0) {
+			throw new Error('$.extensionPolicies[""]: extension identity must not be empty');
+		}
 	}
 }

@@ -49,12 +49,242 @@ describe("SettingsManager", () => {
 			expect(() => validateExtensionPolicyShape({ approvedGrants: ["agent"] })).toThrow(
 				'$.approvedGrants[0]: unknown grant "agent"',
 			);
+			expect(() => validateExtensionPolicyShape({ approvedGrants: [1] })).toThrow(
+				"$.approvedGrants[0]: expected string",
+			);
+			expect(() => validateExtensionPolicyShape({ resourceLimits: [] })).toThrow(
+				"$.resourceLimits: expected object",
+			);
 			expect(() => validateExtensionPolicyShape({ resourceLimits: { shell: 1 } })).toThrow(
 				"$.resourceLimits.shell: unsupported resource limit",
+			);
+			expect(() => validateExtensionPolicyShape({ resourceLimits: { turns: 1.5 } })).toThrow(
+				"$.resourceLimits.turns: expected non-negative integer",
+			);
+			expect(() =>
+				validateExtensionPolicyShape({ resourceLimits: { timeoutMs: Number.MAX_SAFE_INTEGER + 1 } }),
+			).toThrow("$.resourceLimits.timeoutMs: expected non-negative integer");
+			expect(() => validateExtensionPolicyShape({ resourceLimits: { toolScopes: "fixture.echo" } })).toThrow(
+				"$.resourceLimits.toolScopes: expected array",
+			);
+			expect(() => validateExtensionPolicyShape({ resourceLimits: { toolScopes: [1] } })).toThrow(
+				"$.resourceLimits.toolScopes[0]: expected string",
 			);
 			expect(() => validateExtensionPolicyShape({ resourceLimits: { toolScopes: [""] } })).toThrow(
 				"$.resourceLimits.toolScopes[0]: must not be empty",
 			);
+			expect(() => validateExtensionPolicyShape({ approvalPrompt: true })).toThrow(
+				"$.approvalPrompt: unsupported policy field",
+			);
+		});
+	});
+
+	describe("extension policy persistence", () => {
+		const identityA = "typescript:local:project:/tmp/policy-a.ts";
+		const identityB = "typescript:local:project:/tmp/policy-b.ts";
+
+		it("should round-trip user and project policies without leaking across scopes", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
+			rmSync(join(projectDir, ".pi"), { recursive: true });
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(existsSync(join(projectDir, ".pi"))).toBe(false);
+
+			manager.setExtensionPolicy(identityA, {
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 2, toolScopes: ["fixture.echo"] },
+			});
+			await manager.flush();
+
+			const userRoundTrip = SettingsManager.create(projectDir, agentDir);
+			expect(userRoundTrip.getGlobalSettings().extensionPolicies?.[identityA]).toEqual({
+				approvedGrants: ["agent.delegate"],
+				resourceLimits: { turns: 2, toolScopes: ["fixture.echo"] },
+			});
+			expect(userRoundTrip.getGlobalSettings().theme).toBe("dark");
+			const userSettingsText = readFileSync(settingsPath, "utf-8");
+			expect(userSettingsText).toContain('\n  "extensionPolicies":');
+			expect(JSON.parse(userSettingsText).extensionPolicies[identityA].approvedGrants).toEqual(["agent.delegate"]);
+
+			userRoundTrip.setProjectExtensionPolicy(identityB, {
+				approvedGrants: ["tool.use"],
+				resourceLimits: { toolScopes: [] },
+			});
+			await userRoundTrip.flush();
+
+			const projectSettingsPath = join(projectDir, ".pi", "settings.json");
+			const projectRoundTrip = SettingsManager.create(projectDir, agentDir);
+			expect(existsSync(projectSettingsPath)).toBe(true);
+			expect(projectRoundTrip.getProjectSettings().extensionPolicies?.[identityB]).toEqual({
+				approvedGrants: ["tool.use"],
+				resourceLimits: { toolScopes: [] },
+			});
+			expect(projectRoundTrip.getGlobalSettings().extensionPolicies?.[identityB]).toBeUndefined();
+		});
+
+		it("should merge effective policies deterministically with project overrides", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					extensionPolicies: {
+						[identityB]: { approvedGrants: ["file.read"] },
+						[identityA]: {
+							approvedGrants: ["agent.delegate", "tool.use"],
+							resourceLimits: {
+								turns: 5,
+								timeoutMs: 1000,
+								outputLines: 20,
+								toolScopes: ["fixture.echo", "fixture.read"],
+							},
+						},
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".pi", "settings.json"),
+				JSON.stringify({
+					extensionPolicies: {
+						[identityA]: {
+							approvedGrants: ["tool.use"],
+							resourceLimits: {
+								turns: 1,
+								toolScopes: [],
+							},
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getExtensionPolicy(identityA)).toEqual({
+				approvedGrants: ["tool.use"],
+				resourceLimits: {
+					turns: 1,
+					timeoutMs: 1000,
+					outputLines: 20,
+					toolScopes: [],
+				},
+			});
+			expect(manager.getExtensionPolicy(identityB)).toEqual({ approvedGrants: ["file.read"] });
+			expect(manager.getExtensionPolicies()).toEqual(manager.getExtensionPolicies());
+		});
+
+		it("should keep invalid policy entries granular and preserve valid scopes", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					extensionPolicies: {
+						[identityA]: { approvedGrants: ["agent.delegate"] },
+						[identityB]: { approvedGrants: ["agent"] },
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".pi", "settings.json"),
+				JSON.stringify({
+					extensionPolicies: {
+						[identityB]: { resourceLimits: { turns: 1 } },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const errors = manager.drainErrors();
+
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.scope).toBe("global");
+			expect(errors[0]?.error.message).toBe(
+				'$.extensionPolicies["typescript:local:project:/tmp/policy-b.ts"].approvedGrants[0]: unknown grant "agent"',
+			);
+			expect(manager.getGlobalSettings().extensionPolicies?.[identityA]).toEqual({
+				approvedGrants: ["agent.delegate"],
+			});
+			expect(manager.getGlobalSettings().extensionPolicies?.[identityB]).toBeUndefined();
+			expect(manager.getExtensionPolicy(identityB)).toEqual({ resourceLimits: { turns: 1 } });
+		});
+
+		it("should reject malformed policy maps without dropping unrelated settings", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					theme: "dark",
+					extensionPolicies: [],
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const errors = manager.drainErrors();
+
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.scope).toBe("global");
+			expect(errors[0]?.error.message).toBe("$.extensionPolicies: expected object");
+			expect(manager.getTheme()).toBe("dark");
+			expect(manager.getExtensionPolicies()).toEqual({});
+		});
+
+		it("should preserve externally added policy entries when writing unrelated settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					extensionPolicies: {
+						[identityA]: { approvedGrants: ["agent.delegate"] },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const currentSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			currentSettings.extensionPolicies[identityB] = { resourceLimits: { outputLines: 4 } };
+			writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2));
+
+			manager.setTheme("light");
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.extensionPolicies[identityA]).toEqual({ approvedGrants: ["agent.delegate"] });
+			expect(savedSettings.extensionPolicies[identityB]).toEqual({ resourceLimits: { outputLines: 4 } });
+			expect(savedSettings.theme).toBe("light");
+		});
+
+		it("should skip writes while policy load errors are active", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					extensionPolicies: {
+						[identityA]: { approvedGrants: ["network"] },
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setTheme("light");
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.theme).toBeUndefined();
+			expect(savedSettings.extensionPolicies[identityA]).toEqual({ approvedGrants: ["network"] });
+			expect(manager.drainErrors()).toHaveLength(1);
+		});
+
+		it("should support in-memory policy tests and reload updates", async () => {
+			const manager = SettingsManager.inMemory({
+				extensionPolicies: {
+					[identityA]: { approvedGrants: ["agent.delegate"] },
+				},
+			});
+
+			expect(manager.getExtensionPolicy(identityA)).toEqual({ approvedGrants: ["agent.delegate"] });
+
+			manager.setExtensionPolicy(identityB, { resourceLimits: { maxChildren: 0 } });
+			await manager.flush();
+			await manager.reload();
+
+			expect(manager.getExtensionPolicy(identityA)).toEqual({ approvedGrants: ["agent.delegate"] });
+			expect(manager.getExtensionPolicy(identityB)).toEqual({ resourceLimits: { maxChildren: 0 } });
 		});
 	});
 

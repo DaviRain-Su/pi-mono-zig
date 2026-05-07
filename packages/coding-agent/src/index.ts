@@ -52,6 +52,7 @@ export type {
 	CanonicalExtensionGrant,
 	CanonicalExtensionIdentity,
 	ExtensionPolicy,
+	ExtensionPolicyMap,
 	ExtensionPolicyRuntimeKind,
 	ExtensionResourceLimits,
 	NativeExtensionIdentity,
@@ -66,7 +67,10 @@ export {
 	createTypeScriptExtensionIdentity,
 	createWasmExtensionIdentity,
 	isCanonicalExtensionGrant,
+	mergeExtensionPolicy,
+	mergeExtensionPolicyMaps,
 	normalizeWasmResourceLimits,
+	validateExtensionPolicyMap,
 	validateExtensionPolicyShape,
 } from "./core/extension-policy.js";
 // Extension system
